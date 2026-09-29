@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.11.2 — `cv stats --tokens`
+
+- **`cv stats --tokens`** totals token usage per harness and model over any query slice:
+  uncached input, cache writes, cache reads, output, reasoning, provider cost. It widens each Claude
+  session to its sub-agent and `Workflow`-agent forest, which the catalog does not list and which
+  on an orchestrating session holds most of the spend. It counts a Claude response once even though
+  Claude Code writes one line per content block and copies history into resumed sessions (deduped
+  by API `message.id`). `--json` adds a `tokens` object; without the flag the payload is unchanged.
+- **`Usage` has one meaning across harnesses.** `input_tokens` is now the *uncached* prompt
+  everywhere (Anthropic's convention), with `Usage::prompt_tokens()` / `total_tokens()` for the
+  sums. Codex and Gemini report cached tokens as a subset of input; their adapters now subtract on
+  parse and their emitters add back on emit. Before, a Codex → Claude port wrote cached tokens
+  twice into the Claude `usage` block, and `cv doctor` sized a Codex session's peak context at
+  roughly double. **Library consumers reading a Codex or Gemini `Usage.input_tokens` see a smaller
+  number now; add `cache_read_tokens` for the old one.**
+- **Codex: a re-emitted `token_count` no longer counts as a second call.** Codex repeats its last
+  snapshot (same running `total_token_usage`), for example after a user message. The adapter paired
+  only the first copy with its `token_usage_record`, so each repeat attached stale usage to the next
+  reply or to a synthetic carrier. On one 7,700-snapshot rollout that inflated usage from 834.5M to
+  1.06B; after the fix cv matches the rollout's own `thread_token_usage` to the token.
+
 ## 0.11.1 — packaging fix
 
 `clustervision-core` 0.11.0 could not be published to crates.io. `formats.rs` embeds the 22 format
