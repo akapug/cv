@@ -1,6 +1,6 @@
 //! The Claude Code adapter reads transcripts from more than one `projects/` directory: the default
 //! `~/.claude/projects`, `$CLAUDE_CONFIG_DIR/projects`, each entry of `$CLUSTERVISION_CLAUDE_ROOTS`,
-//! and each line of `$CLUSTERVISION_HOME/claude-roots` (an entry may hold one `*` segment).
+//! and each line of `$CLUSTERVISION_HOME/claude-roots` (an entry may hold `*` segments).
 //!
 //! These tests mutate process-global env (`HOME`, `CLUSTERVISION_HOME`, `CLAUDE_CONFIG_DIR`,
 //! `CLUSTERVISION_CLAUDE_ROOTS`), so every test holds a static mutex for its whole body (the
@@ -162,6 +162,33 @@ fn wildcard_root_finds_every_seat_including_later_ones() {
         vec!["seatonesess", "seatthreesess", "seattwosess"],
         "a seat added later is found without rebuilding the adapter"
     );
+}
+
+/// Every `*` segment of an entry expands, so a layout that nests instances under each agent
+/// (`seats/*/instances/*/claude`) is covered by one line.
+#[test]
+fn every_wildcard_segment_expands() {
+    let w = World::new("wild2");
+    let seats = w.base.join("seats");
+    write_session(
+        &seats.join("codex/instances/c1/claude/projects"),
+        "-work-proj",
+        "instonesess",
+    );
+    write_session(
+        &seats.join("codex/instances/c2/claude/projects"),
+        "-work-proj",
+        "insttwosess",
+    );
+    write_session(
+        &seats.join("kimi/instances/k1/claude/projects"),
+        "-work-proj",
+        "instkimisess",
+    );
+    write_session(&seats.join("codex/claude/projects"), "-work-proj", "flatsess"); // not this entry's layout
+    std::env::set_var("CLUSTERVISION_CLAUDE_ROOTS", seats.join("*/instances/*/claude"));
+
+    assert_eq!(discovered(), vec!["instkimisess", "instonesess", "insttwosess"]);
 }
 
 /// `$CLUSTERVISION_HOME/claude-roots` holds one entry per line; blank lines and `#` comments are
