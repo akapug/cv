@@ -1001,6 +1001,51 @@ fn stats_and_timeline() {
     assert!(pos(&out, "betasess") < pos(&out, "alphases"), "{out}");
 }
 
+#[test]
+fn stats_tokens_totals_usage_per_model() {
+    let w = World::new("stats-tokens");
+    let reply = |uuid: &str, id: &str, model: &str| {
+        serde_json::json!({
+            "type": "assistant", "uuid": uuid, "sessionId": "s", "timestamp": "2026-03-01T09:05:00Z",
+            "message": {"id": id, "role": "assistant", "model": model,
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 5, "cache_read_input_tokens": 2_000_000,
+                          "cache_creation_input_tokens": 1_000, "output_tokens": 300}}
+        })
+    };
+    w.write_session(
+        "toksess",
+        &[
+            user_line("u1", "2026-03-01T09:00:00Z", "go"),
+            reply("a1", "msg_1", "claude-opus-5-5"),
+            // The same streamed response's second content-block line: one call, not two.
+            reply("a2", "msg_1", "claude-opus-5-5"),
+            reply("a3", "msg_2", "claude-fable-5-1"),
+        ],
+    );
+
+    let (out, _) = w.cv_ok(&["stats", "--tokens"]);
+    assert!(out.contains("1 repeated usage record(s) skipped"), "{out}");
+    assert!(out.contains("claude-opus-5-5"), "{out}");
+    assert!(out.contains("claude-fable-5-1"), "{out}");
+    // 2 calls × (5 + 2,000,000 + 1,000 + 300) = 4,002,610.
+    assert!(out.contains("4.0M"), "{out}");
+
+    let (json, _) = w.cv_ok(&["stats", "--tokens", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["tokens"]["total"]["calls"], 2);
+    assert_eq!(v["tokens"]["total"]["total"], 4_002_610);
+    assert_eq!(v["tokens"]["total"]["uncached"], 2_610);
+    assert_eq!(v["tokens"]["duplicates"], 1);
+
+    let (json, _) = w.cv_ok(&["stats", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(
+        v.get("tokens").is_none(),
+        "without --tokens the payload stays catalog-only"
+    );
+}
+
 /// Resolution by unique id prefix works across commands (find() contract the CLI leans on).
 #[test]
 fn id_prefix_resolution() {

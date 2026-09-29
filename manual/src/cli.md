@@ -384,7 +384,17 @@ Fleet analytics: totals, a per-harness breakdown, your busiest directories, and 
 cv stats
 cv stats -q "touched:src/ir.rs has:errors"   # analytics over a slice
 cv stats --json
+cv stats -q "cwd:dev/fn" --tokens            # + token usage per harness and model
 ```
+
+`--tokens` parses every matched transcript, and every Claude sub-agent and `Workflow` agent under
+it, and totals token usage per harness and model: uncached input, cache writes, cache reads,
+output, and provider-reported cost where the harness records one. The counts are disjoint, so rows
+from different harnesses add up; `uncached` is input + cache writes + output, the part that was not
+re-read from cache. A response Claude Code wrote as several lines (or copied into a resumed
+session) is counted once. It is slower than plain `stats`, which reads only the catalog: about a
+minute over 1,600 transcripts. With `--json` the payload gains a `tokens` object
+(`total`, `by_harness[]`, `by_model[]`).
 
 ```text
 ✦ clustervision fleet stats

@@ -365,6 +365,10 @@ enum Cmd {
         /// Emit the analytics as one JSON object (snake_case keys) instead of the report.
         #[arg(long)]
         json: bool,
+        /// Also total token usage per harness and model. Parses every matched transcript and its
+        /// sub-agents (slower than the catalog-only default); `--json` adds a `tokens` object.
+        #[arg(long)]
+        tokens: bool,
     },
     /// Compare two sessions message-by-message (great for loom branches).
     Diff {
@@ -970,7 +974,7 @@ fn run() -> Result<()> {
             }
             pack::cmd_pack(&task, &format, harness, limit, out, util::parse_thinking(&thinking)?)
         }
-        Cmd::Stats { query, json } => browse::cmd_stats(query, json),
+        Cmd::Stats { query, json, tokens } => browse::cmd_stats(query, json, tokens),
         Cmd::Prune {
             id,
             harness,

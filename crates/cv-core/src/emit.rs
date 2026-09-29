@@ -1995,8 +1995,12 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
 fn codex_token_usage(usage: Option<&crate::ir::Usage>) -> Option<Value> {
     let u = usage?;
     let mut m = Map::new();
+    // The IR's `input_tokens` excludes the cache counts; Codex's includes them.
+    let input = u
+        .input_tokens
+        .map(|i| i + u.cache_read_tokens.unwrap_or(0) + u.cache_creation_tokens.unwrap_or(0));
     for (key, val) in [
-        ("input_tokens", u.input_tokens),
+        ("input_tokens", input),
         ("cached_input_tokens", u.cache_read_tokens),
         ("cache_write_input_tokens", u.cache_creation_tokens),
         ("output_tokens", u.output_tokens),
@@ -2009,9 +2013,9 @@ fn codex_token_usage(usage: Option<&crate::ir::Usage>) -> Option<Value> {
     if u.input_tokens.is_none() && u.output_tokens.is_none() && u.cache_read_tokens.is_none() {
         return None;
     }
-    // Codex's own totals are input + output (cached input is a *subset* of `input_tokens`, not an
-    // addend — 35507 + 55 = 35562 in a real 0.155 record whose cached count was 34432).
-    let total: u64 = u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0);
+    // Codex's own totals are input + output (cached input is a *subset* of its `input_tokens`, not
+    // an addend — 35507 + 55 = 35562 in a real 0.155 record whose cached count was 34432).
+    let total: u64 = u.total_tokens();
     m.insert("total_tokens".into(), json!(total));
     Some(Value::Object(m))
 }
@@ -2984,8 +2988,9 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 // back into `Usage`), so token counts survive a port into Gemini.
                 if let Some(u) = &msg.usage {
                     let mut tokens = Map::new();
+                    // Gemini's `input` includes `cached`; the IR's excludes it.
                     if let Some(x) = u.input_tokens {
-                        tokens.insert("input".into(), json!(x));
+                        tokens.insert("input".into(), json!(x + u.cache_read_tokens.unwrap_or(0)));
                     }
                     if let Some(x) = u.output_tokens {
                         tokens.insert("output".into(), json!(x));

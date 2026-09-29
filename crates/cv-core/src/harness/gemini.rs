@@ -1237,11 +1237,14 @@ fn value_to_text(v: &Value) -> String {
     }
 }
 
+/// Gemini's `tokens.input` is the API's `promptTokenCount`, which *includes* `cached`; the IR's
+/// disjoint `input_tokens` is the remainder (the emitter adds `cached` back).
 fn parse_tokens(v: &Value) -> Option<Usage> {
     let obj = v.as_object()?;
     let get = |k: &str| obj.get(k).and_then(Value::as_u64);
+    let cached = get("cached");
     Some(Usage {
-        input_tokens: get("input"),
+        input_tokens: get("input").map(|i| i.saturating_sub(cached.unwrap_or(0))),
         output_tokens: get("output"),
         cache_read_tokens: get("cached"),
         cache_creation_tokens: None,
@@ -1362,6 +1365,17 @@ mod tests {
     fn fixture(name: &str) -> String {
         let path = format!("{}/tests/fixtures/gemini/{}", env!("CARGO_MANIFEST_DIR"), name);
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"))
+    }
+
+    #[test]
+    fn tokens_input_is_made_disjoint_from_cached() {
+        // Gemini's `input` is `promptTokenCount`, which includes `cached`.
+        let u = parse_tokens(&serde_json::json!({"input": 1000, "output": 40, "cached": 600})).unwrap();
+        assert_eq!(
+            (u.input_tokens, u.cache_read_tokens, u.output_tokens),
+            (Some(400), Some(600), Some(40))
+        );
+        assert_eq!(u.prompt_tokens(), 1000, "the prompt the model read is unchanged");
     }
 
     #[test]

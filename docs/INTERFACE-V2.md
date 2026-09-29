@@ -191,6 +191,11 @@ pub enum Origin {
     Unknown,
 }
 
+/// The four token counts are DISJOINT (Anthropic's convention): `input_tokens` is the uncached
+/// prompt only, and the prompt the model read is input + cache_read + cache_creation
+/// (`Usage::prompt_tokens`). Providers that report cached tokens as a subset of input (Codex,
+/// Gemini) are normalized on parse and re-inclusived on emit, so sums across harnesses mean one
+/// thing. `reasoning_tokens` is a subset of `output_tokens`.
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,

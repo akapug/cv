@@ -736,8 +736,17 @@ impl Block {
     }
 }
 
+/// One model call's token accounting.
+///
+/// The four token counts are **disjoint**: `input_tokens` is the *uncached* prompt only, and the
+/// prompt the model actually read is `input_tokens + cache_read_tokens + cache_creation_tokens`
+/// ([`Usage::prompt_tokens`]). That is Anthropic's convention; providers that report cached tokens
+/// as a *subset* of input (OpenAI/Codex, Google/Gemini) are normalized by their adapter on parse
+/// and re-inclusived by their emitter, so a sum over any mix of harnesses means one thing.
+/// `reasoning_tokens`, where reported, is a subset of `output_tokens`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
+    /// Uncached prompt tokens (disjoint from the two cache counts).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -752,6 +761,18 @@ pub struct Usage {
     /// Provider-reported cost in USD, when the harness stores it (Goose, OpenCode, Codex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+}
+
+impl Usage {
+    /// Every prompt token the call read: uncached input + cache reads + cache writes.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens.unwrap_or(0) + self.cache_read_tokens.unwrap_or(0) + self.cache_creation_tokens.unwrap_or(0)
+    }
+
+    /// Prompt plus output: the call's whole token throughput.
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens() + self.output_tokens.unwrap_or(0)
+    }
 }
 
 /// A lightweight handle to a session discovered on disk, cheap to produce for listings/search
