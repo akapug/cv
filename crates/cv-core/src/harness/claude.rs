@@ -60,8 +60,8 @@ impl Claude {
     ///    which every cv process (CLI, MCP servers, daemon) reads alike.
     ///
     /// An entry from 3 or 4 may name a Claude config dir (one that holds `projects/`) or a projects
-    /// dir itself, may start with `~`, and may hold one path segment that is exactly `*`, which
-    /// stands for every entry of the directory before it (`~/.agents/*/claude`).
+    /// dir itself, may start with `~`, and may hold path segments that are exactly `*`; each stands
+    /// for every entry of the directory before it (`~/.agents/*/claude`, `~/.agents/*/instances/*/claude`).
     pub fn new() -> Self {
         let home = dirs::home_dir();
         let mut entries: Vec<PathBuf> = Vec::new();
@@ -110,7 +110,7 @@ impl Claude {
     }
 }
 
-/// `entry` with its first path segment that is exactly `*` replaced by each entry of the directory
+/// `entry` with each path segment that is exactly `*` replaced by each entry of the directory
 /// before it (names starting with `.` skipped, like a shell glob), sorted so the root order is
 /// stable. An entry with no `*` is returned as is; a `*` under a missing directory matches nothing.
 fn expand_star(entry: &Path) -> Vec<PathBuf> {
@@ -137,7 +137,8 @@ fn expand_star(entry: &Path) -> Vec<PathBuf> {
             })
             .collect();
         out.sort();
-        return out;
+        // A later `*` in the tail (`agents/*/instances/*/claude`) expands the same way.
+        return out.iter().flat_map(|p| expand_star(p)).collect();
     }
     vec![entry.to_path_buf()]
 }

@@ -67,7 +67,7 @@ verbatim carrier record under `ParseOptions::complete`) and `cv_byte_offset`.
 - **Other roots:** when `CLAUDE_CONFIG_DIR` is set, Claude Code uses that directory instead of
   `~/.claude`, with the same layout below it. cv reads `$CLAUDE_CONFIG_DIR/projects`,
   `~/.claude/projects`, each entry of `$CLUSTERVISION_CLAUDE_ROOTS`, and each line of
-  `$CLUSTERVISION_HOME/claude-roots` (an entry may hold one `*` segment); see the manual's
+  `$CLUSTERVISION_HOME/claude-roots` (an entry may hold `*` segments); see the manual's
   harnesses chapter.
 - **cwd encoding (dir name):** leading `-`, then `/` → `-`, and `.` → `-`. **Lossy / not reversible**
   (original `-` and `.` collide). → *Do not decode the dir name; read `cwd` from inside the transcript.*

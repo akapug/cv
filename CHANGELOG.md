@@ -8,8 +8,8 @@
   now reads a list of roots: `$CLAUDE_CONFIG_DIR/projects`, `~/.claude/projects`, each entry of
   `$CLUSTERVISION_CLAUDE_ROOTS`, and each line of `$CLUSTERVISION_HOME/claude-roots` (blank lines
   and `#` comments skipped). An entry can be a config dir or a `projects/` dir, can start with `~`,
-  and can hold one `*` segment (`~/.agents/*/claude`) that is expanded on every scan, so an agent
-  added later is found. Missing roots are skipped, a directory named twice is read once, and a
+  and can hold `*` segments (`~/.agents/*/claude`, `~/.agents/*/instances/*/claude`) that are
+  expanded on every scan, so an agent added later is found. Missing roots are skipped, a directory named twice is read once, and a
   config dir with no `projects/` yet is skipped rather than read as one. `storage_root()` is the
   first root that exists. `Adapter` gains `storage_roots()` (default: the one storage root); the
   catalog watches every root and re-discovers the harness when a root appears that it does not

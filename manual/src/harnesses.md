@@ -68,15 +68,17 @@ can hold sessions in many places. clustervision reads all of them, in this order
    Blank lines and lines that start with `#` are ignored.
 
 An entry can name a Claude config dir (a directory that contains `projects/`) or a `projects/`
-directory itself, and it can start with `~`. One path segment can be exactly `*`: it matches each
-entry of the directory before it. For example, this line in `~/.clustervision/claude-roots` reads
-every agent that has its own config dir under `~/.agents/`:
+directory itself, and it can start with `~`. A path segment that is exactly `*` matches each entry
+of the directory before it, and an entry can have more than one. For example, these lines in
+`~/.clustervision/claude-roots` read every agent that has its own config dir under `~/.agents/`,
+and every instance of an agent that runs several:
 
 ```text
 ~/.agents/*/claude
+~/.agents/*/instances/*/claude
 ```
 
-cv expands the `*` again each time it looks for sessions, so it finds an agent that you add later
+cv expands each `*` every time it looks for sessions, so it finds an agent that you add later
 without a restart. Entries that do not exist are ignored. A directory that you name more than once
 (for example, through a symlink) is read once. A config dir that does not contain `projects/` yet has
 no sessions, and cv skips it until `projects/` appears.
