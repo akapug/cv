@@ -226,6 +226,9 @@ pub fn blocks<'m>(model: &'m TaskReadModel, task_id: &str) -> Vec<&'m TaskProjec
 /// inbox groups these first (`decisions owed`), because a decision nobody sees is the slowest
 /// blocker a fleet has.
 pub const DECISION_TAG: &str = "decision";
+/// A decision the decider parked for discussion (`cv task discuss` / the page's "needs discussion"):
+/// it stays open and resolvable, but it is no longer *owed* — the ball is with whoever posed it.
+pub const DISCUSS_TAG: &str = "discuss";
 
 /// The shortest id-prefix length (never below `min`, never above the full id) at which every id
 /// in `ids` is distinguishable from every other. UUID v7 task ids open within the same second
@@ -253,6 +256,9 @@ pub enum InboxReason {
     /// A live decision (a posed one, or a task tagged [`DECISION_TAG`]) assigned to you: someone
     /// is waiting on your call, not your work. Listed before everything else.
     DecisionOwed,
+    /// A decision you parked with [`DISCUSS_TAG`]: open, still yours to resolve, but the next
+    /// move is the poser's answer to your note — it is not counted as owed.
+    Discussing,
     /// Open task assigned to you, not yet claimed.
     AssignedOpen,
     /// You claimed it; it is yours to finish.
@@ -309,6 +315,10 @@ fn base_inbox_reason(task: &TaskProjection, endpoint: &str) -> Option<(InboxReas
         && !task.state.is_terminal()
         && (task.is_decision() || task.tags.iter().any(|t| t == DECISION_TAG))
     {
+        if task.tags.iter().any(|t| t == DISCUSS_TAG) {
+            // Parked: ages from the discussion request (its last event), not from the pose.
+            return Some((InboxReason::Discussing, task.last_ts));
+        }
         // A posed decision ages from when it was asked, not from the last note on it.
         let since = task.decision.as_ref().map(|d| d.posed_at).unwrap_or(task.last_ts);
         return Some((InboxReason::DecisionOwed, since));

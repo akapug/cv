@@ -568,6 +568,8 @@ pub(crate) struct InboxPage {
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct InboxCounts {
     pub decisions: usize,
+    /// Decisions parked for discussion (open, not owed).
+    pub discussing: usize,
     pub assigned: usize,
     pub claimed: usize,
     pub reviews: usize,
@@ -702,6 +704,7 @@ pub(crate) fn inbox_page(
     let count = |r: InboxReason| items.iter().filter(|i| i.reason == Some(r)).count();
     let counts = InboxCounts {
         decisions: count(InboxReason::DecisionOwed),
+        discussing: count(InboxReason::Discussing),
         assigned: count(InboxReason::AssignedOpen),
         claimed: count(InboxReason::ClaimedByYou),
         reviews: count(InboxReason::AwaitingYourReview),
@@ -724,6 +727,7 @@ pub(crate) fn inbox_page(
 /// what others wait on you for.
 pub(crate) const INBOX_GROUPS: &[(InboxReason, &str)] = &[
     (InboxReason::DecisionOwed, "decisions owed"),
+    (InboxReason::Discussing, "in discussion (parked, still yours to resolve)"),
     (InboxReason::AssignedOpen, "assigned actions"),
     (InboxReason::ClaimedByYou, "claimed work"),
     (InboxReason::AwaitingYourReview, "reviews"),

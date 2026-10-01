@@ -136,7 +136,7 @@
   const S = {
     who: '', pane: 'decisions', page: null, lanes: null, backlog: null, events: null,
     busy: false, expanded: {}, sel: 0, filter: '', lanesSession: '', help: false,
-    backlogRepo: '', backlogState: '', backlogAll: false, eventsMine: false
+    backlogRepo: '', backlogState: '', backlogAll: false, eventsMine: false, drafts: {}, discussOpen: {}, doneOpen: {}
   };
   const $ = (s) => document.querySelector(s);
   const el = (tag, attrs, children) => {
@@ -224,9 +224,9 @@
   function counters() {
     const p = S.page; if (!p) return;
     const c = p.counts;
-    $('#counter').textContent = c.decisions + ' owed · ' + c.assigned + ' assigned · ' + c.claimed + ' claimed · ' + c.reviews + ' reviews · ' + c.unread + ' unread' +
+    $('#counter').textContent = c.decisions + ' owed' + (c.discussing ? ' · ' + c.discussing + ' in discussion' : '') + ' · ' + c.assigned + ' assigned · ' + c.claimed + ' claimed · ' + c.reviews + ' reviews · ' + c.unread + ' unread' +
       (p.hidden ? ' · ' + p.hidden + ' older hidden' : '') + ' · ' + fmtHm(new Date().toISOString());
-    $('#n-decisions').textContent = c.decisions ? ' ' + c.decisions : '';
+    $('#n-decisions').textContent = (c.decisions || c.discussing) ? ' ' + c.decisions + (c.discussing ? '+' + c.discussing : '') : '';
     $('#n-actions').textContent = (c.assigned + c.claimed + c.reviews + c.unlanded) ? ' ' + (c.assigned + c.claimed + c.reviews + c.unlanded) : '';
     $('#n-closed').textContent = c.closed ? ' ' + c.closed : '';
     if (S.lanes) $('#n-lanes').textContent = ' ' + S.lanes.counts.running + '/' + S.lanes.counts.total;
@@ -237,8 +237,8 @@
   // ---------- items for keyboard ----------
   function visibleItems() {
     const p = S.page; if (!p) return [];
-    if (S.pane === 'decisions') return p.items.filter((i) => i.reason === 'decision_owed' && matches(i.title + ' ' + i.body + ' ' + (i.tags || []).join(' ')));
-    if (S.pane === 'actions') return p.items.filter((i) => i.reason !== 'decision_owed' && matches(i.title + ' ' + i.body));
+    if (S.pane === 'decisions') return p.items.filter((i) => (i.reason === 'decision_owed' || i.reason === 'discussing') && matches(i.title + ' ' + i.body + ' ' + (i.tags || []).join(' ')));
+    if (S.pane === 'actions') return p.items.filter((i) => i.reason !== 'decision_owed' && i.reason !== 'discussing' && matches(i.title + ' ' + i.body));
     if (S.pane === 'closed') return p.closed.filter((i) => matches(i.title + ' ' + i.body));
     if (S.pane === 'backlog') return (S.backlog ? S.backlog.tasks : []).filter((t) => matches(t.title + ' ' + t.body + ' ' + (t.tags || []).join(' ') + ' ' + (t.assignee || '')));
     if (S.pane === 'lanes') return (S.lanes ? S.lanes.lanes : []).filter((l) => matches((l.description || '') + ' ' + l.agent_id + ' ' + (l.last_tool || '')));
@@ -261,6 +261,12 @@
           main.appendChild(el('h2', { text: g[1] + ' (' + its.length + ')' }));
           its.forEach((i) => { main.appendChild(card(i, false, items.indexOf(i))); k++; });
         });
+      } else if (S.pane === 'decisions') {
+        const owed = items.filter((i) => i.reason === 'decision_owed'), parked = items.filter((i) => i.reason === 'discussing');
+        if (owed.length) main.appendChild(el('h2', { text: 'owed (' + owed.length + ')' }));
+        owed.forEach((i) => main.appendChild(card(i, false, items.indexOf(i))));
+        if (parked.length) main.appendChild(el('h2', { text: 'in discussion (' + parked.length + ') — parked, the ball is with whoever posed it; resolve when ready' }));
+        parked.forEach((i) => main.appendChild(card(i, false, items.indexOf(i))));
       } else {
         items.forEach((i, k) => main.appendChild(card(i, closed, k)));
       }
@@ -289,7 +295,10 @@
       if (i.body.length > 360) kids.push(el('button', { class: 'more', text: long ? 'show all (x)' : 'less (x)', onclick: () => { S.expanded[i.id] = !S.expanded[i.id]; render(); } }));
     }
     if (i.decision) kids.push(decisionBlock(i, closed));
-    if (!closed && !i.decision) kids.push(actionBlock(i));
+    else if (!closed && (i.reason === 'decision_owed' || i.reason === 'discussing')) kids.push(taggedDecisionBlock(i));
+    else if (!closed) kids.push(actionBlock(i));
+    if (!closed && S.discussOpen[i.id]) kids.push(inlineBox(i, 'discuss', 'what needs discussing? (⌘⏎ sends)', 'Park for discussion'));
+    if (!closed && S.doneOpen[i.id]) kids.push(inlineBox(i, 'done', 'observed where? a path, url, or a word (⌘⏎ sends)', 'Mark done'));
     if (closed) kids.push(el('div', { class: 'actions' }, [el('button', { class: 'btn quiet', text: 'Reopen as a new task', onclick: () => act(i, 'reopen', {}) })]));
     kids.push(el('div', { class: 'err', id: 'err-' + i.id }));
     if (i.notes.length) {
@@ -300,7 +309,7 @@
         el('div', { class: 'text', text: n.text })]))));
     }
     if (!closed) {
-      const ta = el('textarea', { placeholder: 'note… (n)', rows: '1', id: 'note-' + i.id, onkeydown: (ev) => { if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') { ev.preventDefault(); if (ta.value.trim()) act(i, 'note', { text: ta.value }); } } });
+      const ta = draftArea('note-' + i.id, 'note… (n)', (text) => act(i, 'note', { text }));
       kids.push(el('div', { class: 'notebox' }, [ta, el('button', { class: 'btn', text: 'Save', title: '⌘⏎', onclick: () => { if (ta.value.trim()) act(i, 'note', { text: ta.value }); } })]));
     }
     return el('div', { class: 'card' + (i.unread && !closed ? ' unread' : '') + (k === S.sel ? ' sel' : ''), onclick: () => { S.sel = k; S.keyboard = false; document.querySelectorAll('.card.sel').forEach((c) => c.classList.remove('sel')); }, 'data-k': k }, kids);
@@ -314,8 +323,10 @@
     }
     const buttons = [el('button', { class: 'btn primary', onclick: () => act(i, 'resolve', { accept_default: true }) }, [el('kbd', { text: 'a' }), 'accept the default'])];
     d.alternatives.forEach((o, n) => buttons.push(el('button', { class: 'btn', title: o, onclick: () => act(i, 'resolve', { choice: o }) }, [el('kbd', { text: String(n + 1) }), o])));
-    buttons.push(el('button', { class: 'btn quiet', onclick: () => discuss(i) }, [el('kbd', { text: 'd' }), 'needs discussion']));
+    if (i.reason !== 'discussing') buttons.push(el('button', { class: 'btn quiet', onclick: () => discuss(i) }, [el('kbd', { text: 'd' }), 'needs discussion']));
+    const parked = i.reason === 'discussing' ? latestDiscussNote(i) : null;
     return el('div', { class: 'decision' }, [
+      parked ? el('p', { class: 'default' }, [el('b', { text: 'you asked: ' }), parked]) : null,
       el('p', { class: 'default' }, [el('b', { text: 'default: ' }), d.default_choice ? d.default_choice : d['default']]),
       closed ? null : el('div', { class: 'choices' }, buttons)]);
   }
@@ -328,8 +339,36 @@
     return el('div', { class: 'actions' }, b);
   }
 
-  function discuss(i) { const why = prompt('What needs discussing? (optional)'); if (why === null) return; act(i, 'discuss', { text: why }); }
-  function doneTask(i) { const obs = prompt('Observed where? (a path, url, or a word — optional)'); if (obs === null) return; act(i, 'done', { observed: obs }); }
+  function discuss(i) { S.discussOpen[i.id] = !S.discussOpen[i.id]; render(); setTimeout(() => { const t = document.getElementById('discuss-' + i.id); if (t) t.focus(); }, 0); }
+  function doneTask(i) { S.doneOpen[i.id] = !S.doneOpen[i.id]; render(); setTimeout(() => { const t = document.getElementById('done-' + i.id); if (t) t.focus(); }, 0); }
+  function latestDiscussNote(i) { const n = (i.notes || []).slice().reverse().find((x) => /^NEEDS DISCUSSION:/.test(x.text)); return n ? n.text.replace(/^(NEEDS DISCUSSION:\s*)+/, '') : null; }
+  // A textarea whose draft survives re-renders (the page refreshes every 30 s).
+  function draftArea(id, placeholder, send) {
+    const ta = el('textarea', { placeholder, rows: '1', id, oninput: (ev) => { S.drafts[id] = ev.target.value; },
+      onkeydown: (ev) => { if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') { ev.preventDefault(); if (ta.value.trim()) { send(ta.value); } } } });
+    if (S.drafts[id]) ta.value = S.drafts[id];
+    return ta;
+  }
+  function inlineBox(i, verb, placeholder, label) {
+    const id = verb + '-' + i.id;
+    const send = (text) => { if (verb === 'discuss') act(i, 'discuss', { text }); else act(i, 'done', { observed: text }); };
+    const ta = draftArea(id, placeholder, send);
+    return el('div', { class: 'notebox' }, [ta,
+      el('button', { class: 'btn primary', text: label, onclick: () => send(ta.value) }),
+      el('button', { class: 'btn quiet', text: 'cancel', onclick: () => { if (verb === 'discuss') S.discussOpen[i.id] = false; else S.doneOpen[i.id] = false; render(); } })]);
+  }
+  // A decision that was TAGGED, not posed: no options to click. It is answered by a note and closed,
+  // or parked for discussion.
+  function taggedDecisionBlock(i) {
+    const parked = i.reason === 'discussing' ? latestDiscussNote(i) : null;
+    const last = (i.notes || []).slice().reverse().find((x) => !/^NEEDS DISCUSSION:/.test(x.text));
+    return el('div', { class: 'decision' }, [
+      parked ? el('p', { class: 'default' }, [el('b', { text: 'you asked: ' }), parked]) : null,
+      el('p', { class: 'default' }, [el('b', { text: 'no options were posed: ' }), 'answer in a note, then close it; or park it for discussion']),
+      el('div', { class: 'choices' }, [
+        el('button', { class: 'btn primary', title: last ? 'closes with your last note as the answer: ' + last.text : 'write a note first', onclick: () => { if (last) act(i, 'done', { observed: 'answered: ' + last.text }); else toast('write the answer as a note first'); } }, [el('kbd', { text: 'a' }), last ? 'my last note is the answer — close it' : 'answer in a note first']),
+        i.reason !== 'discussing' ? el('button', { class: 'btn quiet', onclick: () => discuss(i) }, [el('kbd', { text: 'd' }), 'needs discussion']) : null])]);
+  }
 
   function act(i, verb, body) {
     if (S.busy) return;
@@ -338,6 +377,7 @@
     fetch('/api/task/' + encodeURIComponent(i.id) + '/' + verb, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       .then((r) => r.json()).then((res) => {
         S.busy = false;
+        if (!res.error) { delete S.drafts[(verb === 'note' ? 'note-' : verb + '-') + i.id]; S.discussOpen[i.id] = false; S.doneOpen[i.id] = false; }
         if (res.error) { const e = document.getElementById('err-' + i.id); if (e) e.textContent = res.error; document.querySelectorAll('.btn').forEach((b) => { b.disabled = false; }); return; }
         toast(verb + ' ✓ ' + (res.task_state || ''));
         load();
@@ -455,7 +495,7 @@
   function renderHelp() {
     const old = document.querySelector('.help'); if (old) old.remove();
     if (!S.help) return;
-    const rows = [['j / k', 'next / previous'], ['a', 'accept the default'], ['1-9', 'choose option n'], ['d', 'needs discussion'], ['n', 'note (⌘⏎ saves)'],
+    const rows = [['j / k', 'next / previous'], ['a', 'accept the default'], ['1-9', 'choose option n'], ['d', 'park for discussion'], ['n', 'note (⌘⏎ saves)'],
       ['x', 'expand / collapse'], ['i', 'copy the task id'], ['p', 'copy the issue path'], ['/', 'filter'], ['g then d/a/l/b/e/c', 'go to a pane'], ['r', 'reload'], ['?', 'this']];
     const grid = el('div'); rows.forEach((r) => { grid.appendChild(el('kbd', { text: r[0] })); grid.appendChild(el('span', { text: r[1] })); });
     document.body.appendChild(el('div', { class: 'help' }, [el('h3', { text: 'keys' }), grid]));
@@ -481,8 +521,12 @@
       case 'x': if (cur) { const key = S.pane === 'lanes' ? 'l:' + cur.agent_id : S.pane === 'backlog' ? 'b:' + cur.id : cur.id; S.expanded[key] = !S.expanded[key]; render(); } break;
       case 'i': if (cur) copy(cur.id || cur.agent_id, 'id'); break;
       case 'p': if (cur && cur.issue) copy(cur.issue, 'path'); break;
-      case 'a': if (inboxPane && cur && cur.decision && !cur.decision.resolution) act(cur, 'resolve', { accept_default: true }); break;
-      case 'd': if (inboxPane && cur && cur.decision && !cur.decision.resolution) discuss(cur); break;
+      case 'a':
+        if (!inboxPane || !cur) break;
+        if (cur.decision && !cur.decision.resolution) act(cur, 'resolve', { accept_default: true });
+        else if (!cur.decision && (cur.reason === 'decision_owed' || cur.reason === 'discussing')) { const b = document.querySelector('.card.sel .decision .btn.primary'); if (b) b.click(); }
+        break;
+      case 'd': if (inboxPane && cur && cur.reason !== 'discussing' && !(cur.decision && cur.decision.resolution)) discuss(cur); break;
       case 'n': if (cur) { const ta = document.getElementById('note-' + cur.id); if (ta) { ta.focus(); ev.preventDefault(); } else if (S.pane === 'backlog') { S.expanded['b:' + cur.id] = true; render(); } } break;
       default:
         if (/^[1-9]$/.test(ev.key) && inboxPane && cur && cur.decision && !cur.decision.resolution) {
@@ -498,7 +542,7 @@
   $('#filter').addEventListener('input', (ev) => { S.filter = ev.target.value; S.sel = 0; render(); });
   $('#who').addEventListener('change', () => { S.who = $('#who').value.trim(); persist(); load(); });
   params(); persist(); load();
-  setInterval(() => { if (!S.busy && document.visibilityState === 'visible' && !document.activeElement.matches('textarea')) load(); }, S.pane === 'lanes' ? 20000 : 30000);
+  setInterval(() => { if (!S.busy && document.visibilityState === 'visible' && !document.activeElement.matches('textarea, input')) load(); }, 30000);
 })();
 </script>
 </body>

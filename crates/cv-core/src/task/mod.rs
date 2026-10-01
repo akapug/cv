@@ -54,7 +54,7 @@ pub use project::{
     age_short, awaiting_review, blocks, branch_carriers, debt, effective_display, in_scope, inbox, involves,
     is_blocked, list, parse_duration, parse_since, propose_collision_warnings, resolve_id, same_actor,
     unique_prefix_len, uuid_v7_timestamp, AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason, TaskFilter,
-    DECISION_TAG, STATE_VOCABULARY,
+    DECISION_TAG, DISCUSS_TAG, STATE_VOCABULARY,
 };
 pub use provenance::{freshness_from_heartbeat, Freshness, Provenance};
 pub use reduce::{
