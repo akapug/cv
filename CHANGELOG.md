@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.12.0 — the orchestrator's instruments
+
+Three commands for a session that is running a swarm, written from a day of running one with
+twenty lanes and doing each of these by hand (a thirty-line Python over `cv show --json`, three
+times). All three are in the Read group, take `harness:id` or a prefix, have `--json`, and reach
+MCP through the generated tool list like every other command.
+
+- **`cv prompts <session>`** prints only what the person said: every human-typed prompt and every
+  `AskUserQuestion` answer, in order, with message indices and timestamps. `--pre-compaction [N]`
+  narrows to the span the Nth compaction discarded, the same window `cv show --pre-compaction`
+  reads. Prompts are printed whole. On the session this was built against, 38 lines and 6 answers
+  out of 10,297 records.
+- **`cv lanes <session>`** is the sub-agent forest as a status table: one row per lane with its
+  model, start, duration, tokens (deduplicated by API `message.id`, as `cv stats --tokens`
+  counts), tool calls, status and either the last line of its return or — for a running lane —
+  its last tool call. `--running` / `--done` / `--stranded` filter. **Stranded** is the class that
+  parked four lanes in one day: the harness reports the lane *completed* and its final text says
+  it is waiting (`Waiting on notifications`, `I'll continue when the monitor fires`); nothing will
+  wake it. Each stranded row carries `→ resume: SendMessage to <agentId>`, and a stranded lane
+  never counts as done. Status comes from the most authoritative source and the JSON names it:
+  a `Workflow` journal, else the parent's last `<task-notification>` for the agent, else the
+  child's `SubagentStop` hook, else `running`.
+- **`cv deferrals <session>`** is a linter for promises: every place the assistant put something
+  off ("later lane", "follow-up", "not tonight", "queued for", "ember's call", "when X lands",
+  "after FINAL", …) with message index and context. `--open-tasks` cross-references every task in
+  the store (three or more shared significant words is a MATCH; the words are printed so the
+  match can be judged) and **exits 1 while any deferral is UNMATCHED**, so a closeout can gate on
+  it. `--since <msg>` restricts to the post-compaction region.
+
+### `cv task` ergonomics
+
+- `open --body-file <path>` and `note --file <path>` (`-` for stdin). Bodies were 500-character
+  shell strings.
+- `open --tags a,b`, `cv task tag <id> a,b`, `list --tag <t>`. The `decision` tag on an assigned
+  task is a decision owed, and `inbox` lists it first.
+- `open --blocked-by <id>` / `open --blocks <id>` and `cv task block <id> --by <id>`: relations
+  stored as `blocked_by` events on the blocked task. Blocked-ness is computed at read time from the
+  blocker's live state — a blocker finishing or being abandoned unblocks with no further event.
+  `list` marks blocked rows `⊘`; `show` prints `blocked by:` and `blocks:`. Relations are resolved
+  before the open is written, so a typo refuses the command instead of opening a half-related task.
+- `inbox <who>` groups: decisions owed · claimed · reviews · unlanded · assigned, unclaimed.
+- `list --tsv` (full id, state, assignee, repo basename, age, title, blocked_by) and `list --wide`
+  (a second line with tags, repo, blockers, the body's first line).
+- **`cv task sweep --repo <path>`** lists the tasks git and the filesystem say are probably done —
+  an `--issue` path that no longer exists, a title/body naming a branch now merged into main, a
+  proposed revision whose branch is merged — and never closes one.
+- **Task ids no longer collide in every list.** UUID v7 ids opened within one second share their
+  first eight hex digits; `list`/`inbox`/`debt` printed 8-char prefixes, so a batch of 23 tasks
+  rendered as 23 copies of `01a0f52e` and `show` refused every one. Every list now renders the
+  shortest prefix that keeps the ids distinct.
+
+### Wire
+
+- Two new task event kinds, `tagged { tags }` and `blocked_by { task }`, and two projection
+  fields, `tags` and `blocked_by`, on `TaskProjection` and `TaskRow` (every surface). Both are
+  omitted when empty, so a log that never used them serializes byte-for-byte as before; the golden
+  fixture gained specimens of both (`GOLDEN_REGEN=1`, snapshot diff reviewed: only the specimen
+  task changed). `TaskFilter` gained `tag`; `task_list` (MCP) and `GET /api/tasks` (cvd) accept it.
+  `InboxReason` gained `decision_owed`.
+- **Claude adapter:** Claude Code ≥ 2.1 writes a slash command's bookkeeping (`<command-name>…`,
+  `<local-command-stdout>…`) as `user` records; they now classify as `notice`/`harness`, as the
+  older `system`/`local_command` records always did. The typed `/compact` line stays a human
+  prompt. Text is untouched.
+- `cv schema --json` publishes the `prompt_row`, `lane` and `deferral` shapes. `cv recipes` has
+  three more entries.
+
+### Build
+
+- `make install` (= `cargo install --path crates/cv --force --target-dir target`, plus `cv-mcp`
+  and `cvd`) and `make version`, so the installed binary and the checkout can be compared in one
+  line. The installed `cv` on the machine this was written on was two releases behind the
+  checkout; `cv --version` had said so all along.
+- The clap-tree unit tests run on a 16 MB thread: `Cli::command()` for the grown enum overflows
+  the default 2 MB test-thread stack in a debug build (the binary's main thread is fine).
+
 ## 0.11.2 — `cv stats --tokens`
 
 - **`cv stats --tokens`** totals token usage per harness and model over any query slice:

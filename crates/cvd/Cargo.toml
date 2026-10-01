@@ -15,10 +15,10 @@ name = "cvd"
 path = "src/main.rs"
 
 [dependencies]
-cv-core = { path = "../cv-core", version = "0.11", package = "clustervision-core" }
+cv-core = { path = "../cv-core", version = "0.12", package = "clustervision-core" }
 # The full-text/semantic index `cv search` uses. The daemon serves the SAME index through
 # `/api/search`, so the dashboard can search a corpus it has not downloaded.
-cv-search = { path = "../cv-search", version = "0.11" }
+cv-search = { path = "../cv-search", version = "0.12" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

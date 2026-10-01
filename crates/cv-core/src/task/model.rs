@@ -88,6 +88,18 @@ pub enum TaskEventKind {
     Superseded {
         by_task: String,
     },
+    /// Add tags (deduplicated, lowercase labels such as `decision`, `deploy`, `lean`). Tags are
+    /// additive: a task's tag set is the union of every `tagged` event on it.
+    Tagged {
+        tags: Vec<String>,
+    },
+    /// Record that this task cannot proceed until `task` reaches a terminal state. The relation
+    /// is stored on the BLOCKED task; "X blocks Y" is written as a `blocked_by` on Y. Whether a
+    /// task is blocked *now* is computed at read time from the blocker's current state, never
+    /// stored — so a blocker finishing or being abandoned unblocks without another event.
+    BlockedBy {
+        task: String,
+    },
 
     // ── land facet (revision-scoped) ────────────────────────────────────────
     /// Attach a reviewed code revision. Proposing again supersedes the prior revision — that is
@@ -159,7 +171,8 @@ impl TaskEventKind {
     /// [`crate::task::require_actor`]). The store's TOFU token gate ([`crate::task::identity`])
     /// applies only to these: a bound endpoint must present its token to stamp one of them, and a
     /// first-use token binds on one of them. Bookkeeping kinds (open/note/done/abandon/supersede/
-    /// reroute) stay token-optional by design — impersonating them changes no lifecycle authority.
+    /// reroute/tag/block) stay token-optional by design — impersonating them changes no lifecycle
+    /// authority.
     pub fn is_identity_bearing(&self) -> bool {
         matches!(
             self,
@@ -181,6 +194,8 @@ impl TaskEventKind {
             TaskEventKind::Done { .. } => "done",
             TaskEventKind::Abandoned { .. } => "abandoned",
             TaskEventKind::Superseded { .. } => "superseded",
+            TaskEventKind::Tagged { .. } => "tagged",
+            TaskEventKind::BlockedBy { .. } => "blocked_by",
             TaskEventKind::RevisionProposed { .. } => "revision_proposed",
             TaskEventKind::ReviewRerouted { .. } => "review_rerouted",
             TaskEventKind::ReviewPassed { .. } => "review_passed",

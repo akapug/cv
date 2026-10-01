@@ -20,6 +20,8 @@ pub struct TaskFilter {
     /// When false (default), terminal tasks (done/abandoned/superseded, landed included) are
     /// hidden unless `state` explicitly asks for them.
     pub include_terminal: bool,
+    /// Only tasks carrying this tag (exact, case-sensitive — tags are stored as given).
+    pub tag: Option<String>,
 }
 
 /// The effective-state vocabulary [`TaskFilter::state`] accepts: every base [`TaskState`] plus
@@ -72,15 +74,68 @@ pub fn list<'m>(model: &'m TaskReadModel, filter: &TaskFilter) -> Result<Vec<&'m
                     return false;
                 }
             }
+            if let Some(tag) = &filter.tag {
+                if !t.tags.iter().any(|have| have == tag) {
+                    return false;
+                }
+            }
             true
         })
         .collect())
+}
+
+/// Is `task` blocked *right now*: does any task it recorded a `blocked_by` on still sit in a
+/// non-terminal base state? A blocker the log does not know (opened in another store, or a typo
+/// that slipped past the front-end) counts as blocking — an unknown dependency is not a cleared
+/// one. A blocker that finished, was abandoned or superseded no longer blocks; nothing has to be
+/// appended to unblock.
+pub fn is_blocked(model: &TaskReadModel, task: &TaskProjection) -> bool {
+    task.blocked_by
+        .iter()
+        .any(|id| model.tasks.get(id).is_none_or(|b| !b.state.is_terminal()))
+}
+
+/// The tasks that recorded a `blocked_by` on `task_id` — the reverse relation (`blocks:` in
+/// `cv task show`). Oldest first (task ids are time-sortable).
+pub fn blocks<'m>(model: &'m TaskReadModel, task_id: &str) -> Vec<&'m TaskProjection> {
+    model
+        .tasks
+        .values()
+        .filter(|t| t.blocked_by.iter().any(|b| b == task_id))
+        .collect()
+}
+
+/// The tag that marks a task as a *decision owed* by its assignee rather than work to do — the
+/// inbox groups these first (`decisions owed`), because a decision nobody sees is the slowest
+/// blocker a fleet has.
+pub const DECISION_TAG: &str = "decision";
+
+/// The shortest id-prefix length (never below `min`, never above the full id) at which every id
+/// in `ids` is distinguishable from every other. UUID v7 task ids open within the same second
+/// share their first eight hex digits, so an 8-char prefix — fine for session ids — collides
+/// across any batch of tasks opened together; every row renderer sizes its prefix with this.
+pub fn unique_prefix_len<'a>(ids: impl IntoIterator<Item = &'a str>, min: usize) -> usize {
+    let ids: Vec<&str> = ids.into_iter().collect();
+    let longest = ids.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut len = min.min(longest.max(min));
+    while len < longest {
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        let distinct = ids.iter().all(|id| seen.insert(id.get(..len).unwrap_or(id)));
+        if distinct {
+            break;
+        }
+        len += 1;
+    }
+    len
 }
 
 /// Why a task appears in someone's inbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxReason {
+    /// A live task tagged [`DECISION_TAG`] and assigned to you: someone is waiting on your call,
+    /// not your work. Listed before everything else.
+    DecisionOwed,
     /// Open task assigned to you, not yet claimed.
     AssignedOpen,
     /// You claimed it; it is yours to finish.
@@ -133,6 +188,12 @@ pub fn inbox<'m>(model: &'m TaskReadModel, endpoint: &str) -> Vec<InboxEntry<'m>
 }
 
 fn base_inbox_reason(task: &TaskProjection, endpoint: &str) -> Option<(InboxReason, DateTime<Utc>)> {
+    if task.assignee.as_deref() == Some(endpoint)
+        && !task.state.is_terminal()
+        && task.tags.iter().any(|t| t == DECISION_TAG)
+    {
+        return Some((InboxReason::DecisionOwed, task.last_ts));
+    }
     match task.state {
         TaskState::Open if task.assignee.as_deref() == Some(endpoint) => {
             Some((InboxReason::AssignedOpen, task.last_ts))

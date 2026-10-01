@@ -62,7 +62,32 @@ open ──claim──► claimed ──done──► done
   task, live revision or not.
 
 Task ids are time-sortable UUIDs (v7) and, as everywhere in clustervision, a **unique prefix
-is enough** on the command line.
+is enough** on the command line. Because v7 ids opened within the same second share their first
+eight hex digits, every list renders ids at the shortest length that keeps them distinct (never
+below eight) — a batch of 23 tasks opened by one orchestrator used to print as 23 copies of
+`01a0f52e`, none of which `show` would accept.
+
+### Bodies, tags and relations
+
+- **`--body-file <path>`** (`-` for stdin) reads the body from a file; `note --file` does the same
+  for notes. A brief is a document, not a 500-character shell string.
+- **`--tags a,b`** labels a task; `list --tag <t>` filters on a label, and `cv task tag <id> a,b`
+  adds labels later (additive, never removes). One label is load-bearing: a task tagged
+  **`decision`** and assigned to someone is a decision they owe, and the inbox lists it first.
+- **`--blocked-by <id>`** records that this task waits on another; **`--blocks <id>`** records the
+  same relation on the *other* task (`cv task block <id> --by <blocker>` after the fact). Both are
+  resolved before the open is written, so a typo refuses the command rather than opening a task
+  with half its relations. Whether a task is blocked *now* is computed when you look — any
+  blocker still in a non-terminal state — so a blocker finishing, or being abandoned, unblocks
+  without another event. `list` marks blocked rows with `⊘`; `show` prints `blocked by:` (with
+  each blocker's state) and `blocks:` (the reverse).
+- **`list --tsv`** prints one tab-separated row per task — full id, state, assignee, repo
+  basename, age, title, blocked_by — for `cut`/`awk`/`sort`; **`list --wide`** adds a second line
+  per task with its tags, repo, blockers and the body's first line.
+
+Tags and relations are events like everything else (`tagged`, `blocked_by`), folded by the
+reducer into `tags` / `blocked_by` on the projection; both are omitted from the wire when empty,
+so a log that never used them serializes exactly as before.
 
 ## The land facet: revisions
 
@@ -205,12 +230,15 @@ vocabulary, never a silently-empty list:
 Error: unknown state "redy" (expected one of open|claimed|done|abandoned|superseded|awaiting_review|ready|merged_local|landed|refuted)
 ```
 
-**`cv task inbox [who]`** — "what needs me", **stalest first** (age is the escalation
-mechanism; there is no other). Bare `cv task inbox` means *my* inbox via `$CV_ENDPOINT`. Four
-reasons, each with an honest aging anchor:
+**`cv task inbox [who]`** — "what needs me", **grouped by reason and stalest first within a
+group** (age is the escalation mechanism; there is no other). Bare `cv task inbox` means *my*
+inbox via `$CV_ENDPOINT`. The groups print in this order — `decisions owed`, `claimed`,
+`reviews`, `unlanded`, `assigned, unclaimed` — because a decision nobody sees is the slowest
+blocker a fleet has. Five reasons, each with an honest aging anchor:
 
 | Reason | You appear because | Ages since |
 | --- | --- | --- |
+| `DecisionOwed` | a live task tagged `decision` is assigned to you | the last event |
 | `AssignedOpen` | an open task is assigned to you, unclaimed | the last event |
 | `ClaimedByYou` | you claimed it; it's yours to finish | the last event |
 | `AwaitingYourReview` | a revision awaits your verdict | the **propose** |
@@ -230,7 +258,16 @@ $ cv task debt
 verified as of 2026-07-17 00:18:46
 ```
 
-All three take `--json` for the full wire shapes (the same rows MCP and the HTTP API serve).
+**`cv task sweep --repo <path>`** — candidates for closing, observed rather than asserted:
+every non-terminal task (in that repo, or with no repo) whose `--issue` path no longer exists
+(tried against the task's repo, the swept repo, the directory above it and the cwd), or whose
+title/body names a branch now merged into the repo's main (`git branch --merged`, local and
+remote-tracking; a name has to look like a branch — a separator, a digit, or eight characters —
+so a branch called `fix` does not sweep every task that says "fix"), or whose proposed revision's
+branch is merged. It prints them as *probably done* with the reason and **never closes one**;
+`done --observed` or `abandon --reason` is still a decision someone makes having read why.
+
+All of these take `--json` for the full wire shapes (the same rows MCP and the HTTP API serve).
 
 ## Identity: `CV_ENDPOINT`
 

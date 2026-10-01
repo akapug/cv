@@ -1,15 +1,54 @@
 //! `cv task` — the fleet task substrate: open/claim/propose/review/verify dispatch objects whose
 //! landing state is *observed* from git, never taken on an agent's word.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
+use cv_core::ir::truncate;
 use cv_core::sanitize::sanitize_line;
-use cv_core::task::{self, InboxRow, TaskEventKind, TaskRow, TaskStore};
+use cv_core::task::{self, InboxReason, InboxRow, TaskEventKind, TaskProjection, TaskReadModel, TaskRow, TaskStore};
 
-use crate::util::{fmt_local, short_id};
+use crate::util::fmt_local;
+
+/// A text argument that may come from a file: `--body-file`/`--file` (`-` reads stdin). Bodies
+/// were 500-char shell strings before this existed; a brief is a document.
+fn read_text_arg(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading the text from stdin")?;
+        return Ok(buf);
+    }
+    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// `a,b, c` → `["a", "b", "c"]`: trimmed, empties dropped, duplicates collapsed in order.
+fn parse_tags(csv: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in csv.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if !out.iter().any(|have| have == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// The id-prefix length that keeps every task in `model` distinguishable (never below 8). Task
+/// ids are UUID v7: a batch opened in one second shares its first eight hex digits, so the usual
+/// 8-char prefix was ambiguous for every task opened that way — `cv task show <prefix>` refused
+/// what `cv task list` had just printed.
+fn prefix_len(model: &TaskReadModel) -> usize {
+    task::unique_prefix_len(model.tasks.keys().map(String::as_str), 8)
+}
+
+fn prefix(id: &str, len: usize) -> &str {
+    id.get(..len).unwrap_or(id)
+}
 
 /// Identity resolution (G4) for chat-grade verbs: explicit `--from`, else `CV_ENDPOINT`, else
 /// the literal `"cv"` (a human opening a task from a shell owes no ceremony). Shared logic lives
@@ -29,8 +68,11 @@ pub(crate) enum TaskCmd {
     /// Open a new task. Prints its id.
     Open {
         title: String,
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "", conflicts_with = "body_file")]
         body: String,
+        /// Read the body from a file (`-` for stdin) — a brief is a document, not a shell string.
+        #[arg(long = "body-file", value_name = "PATH")]
+        body_file: Option<PathBuf>,
         /// Repository this task's code work happens in (enables propose/verify/debt).
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -42,6 +84,17 @@ pub(crate) enum TaskCmd {
         channel: String,
         #[arg(long)]
         assignee: Option<String>,
+        /// Comma-separated tags (`decision,deploy`); `list --tag` filters on them and a `decision`
+        /// tag on an assigned task puts it in the assignee's inbox under "decisions owed".
+        #[arg(long, value_name = "A,B")]
+        tags: Option<String>,
+        /// This task waits on another (id or unique prefix). Repeatable. Blocked-ness is computed
+        /// from the blocker's live state — it clears by itself when the blocker finishes.
+        #[arg(long = "blocked-by", value_name = "ID")]
+        blocked_by: Vec<String>,
+        /// Another task waits on this one (writes a `blocked_by` on THAT task). Repeatable.
+        #[arg(long = "blocks", value_name = "ID")]
+        blocks: Vec<String>,
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
@@ -55,11 +108,21 @@ pub(crate) enum TaskCmd {
         assignee: Option<String>,
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Only tasks carrying this tag.
+        #[arg(long)]
+        tag: Option<String>,
         /// Include terminal tasks.
         #[arg(long)]
         all: bool,
         #[arg(long)]
         json: bool,
+        /// Tab-separated rows for scripts: full id, state, assignee, repo basename, age, title,
+        /// blocked_by — no alignment, no truncation.
+        #[arg(long, conflicts_with = "json")]
+        tsv: bool,
+        /// Two lines per task: the row, then tags · repo · blockers · the body's first line.
+        #[arg(long, conflicts_with_all = ["json", "tsv"])]
+        wide: bool,
     },
     /// Show one task (id may be a unique prefix).
     Show {
@@ -94,7 +157,12 @@ pub(crate) enum TaskCmd {
     /// Record a progress note.
     Note {
         id: String,
-        text: String,
+        /// The note. Omit it and pass `--file` to read the note from a file.
+        #[arg(required_unless_present = "file", conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the note from a file (`-` for stdin).
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
         #[arg(long = "session-ref")]
         session_ref: Option<String>,
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
@@ -142,6 +210,39 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
+    },
+    /// Add tags to a task (comma-separated; additive, never removes).
+    Tag {
+        id: String,
+        #[arg(value_name = "A,B")]
+        tags: String,
+        /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Record that a task waits on another: `cv task block <id> --by <blocker>`.
+    Block {
+        id: String,
+        /// The task that must finish first (id or unique prefix).
+        #[arg(long = "by", value_name = "ID")]
+        by_task: String,
+        /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Candidates for closing, from what git and the filesystem say — never closes anything.
+    /// Lists non-terminal tasks whose `--issue` path no longer exists, or whose title/body names a
+    /// branch now merged into the repo's main (`git branch --merged`).
+    Sweep {
+        /// The repository to observe (branches are read from it; a task's own `--repo` must
+        /// match, or be unset).
+        #[arg(long)]
+        repo: PathBuf,
+        /// The branch merged work lands on (default: `main`, else `master` if that is what exists).
+        #[arg(long)]
+        main: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Propose a reviewed revision: cv resolves the branch tip and computes the range patch-id
     /// from git itself (identity is observed, never typed).
@@ -254,6 +355,12 @@ fn replay_loud() -> Result<cv_core::task::ReplayOutcome> {
 /// the TOFU credential presented on identity-bearing appends (`--token`, else `$CV_TOKEN`); it is
 /// inert for bookkeeping verbs and for endpoints that have never bound a token.
 fn append_and_report(task_id: Option<&str>, from: &str, kind: TaskEventKind, token: Option<String>) -> Result<()> {
+    append_event(task_id, from, kind, token).map(|_| ())
+}
+
+/// [`append_and_report`], returning the event's task id (what `open` needs to attach its tags
+/// and relations to the task it just created).
+fn append_event(task_id: Option<&str>, from: &str, kind: TaskEventKind, token: Option<String>) -> Result<String> {
     let store = TaskStore::default_store().with_token(task::token(token));
     let report = task::append_and_notify(&store, task_id, from, kind, Vec::new())?;
     for w in report.replay_warnings.iter().chain(&report.warnings) {
@@ -263,13 +370,13 @@ fn append_and_report(task_id: Option<&str>, from: &str, kind: TaskEventKind, tok
     println!(
         "✦ {} {} → {}",
         report.event.kind.tag(),
-        short_id(&report.event.task_id),
+        prefix(&report.event.task_id, 13),
         state
     );
     if matches!(report.event.kind, TaskEventKind::Opened { .. }) {
         println!("{}", report.event.task_id);
     }
-    Ok(())
+    Ok(report.event.task_id)
 }
 
 fn resolve<'m>(model: &'m cv_core::task::TaskReadModel, prefix: &str) -> Result<&'m str> {
@@ -279,41 +386,114 @@ fn resolve<'m>(model: &'m cv_core::task::TaskReadModel, prefix: &str) -> Result<
 /// One `cv task list` row: id, age since last event (G8), state, assignee, title — rendered from
 /// the shared [`TaskRow`] shape (built via [`TaskRow::full`], whose `last_ts` anchors the age).
 /// All free-text fields are terminal-sanitized (G5) — the log is forever, so every reader strips.
-fn task_row(r: &TaskRow, now: DateTime<Utc>) -> String {
+fn task_row(r: &TaskRow, now: DateTime<Utc>, plen: usize, blocked: bool) -> String {
     let assignee = r.assignee.as_deref().unwrap_or("-");
     format!(
-        "{}  {:>4}  {:16} {:20} {}",
-        short_id(&r.id),
+        "{:<plen$}  {:>4}  {:16} {:20} {}{}",
+        prefix(&r.id, plen),
         task::age_short(r.last_ts.unwrap_or(now), now),
         r.effective_state,
         sanitize_line(assignee),
+        if blocked { "⊘ " } else { "" },
         sanitize_line(&r.title)
     )
 }
 
+/// `--tsv`: full id, state, assignee, repo basename, age, title, blocked_by — one tab between
+/// fields, tabs/newlines inside a field replaced, nothing aligned or cut. For `cut`/`awk`/`sort`.
+fn task_row_tsv(r: &TaskRow, now: DateTime<Utc>) -> String {
+    let cell = |s: &str| sanitize_line(s).replace(['\t', '\n'], " ");
+    let repo = r
+        .repo
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    [
+        r.id.clone(),
+        r.effective_state.clone(),
+        cell(r.assignee.as_deref().unwrap_or("")),
+        cell(&repo),
+        task::age_short(r.last_ts.unwrap_or(now), now),
+        cell(&r.title),
+        r.blocked_by.join(","),
+    ]
+    .join("\t")
+}
+
+/// `--wide`: the row, then a second line with tags · repo · blockers · the body's first line.
+fn task_row_wide(t: &TaskProjection, model: &TaskReadModel, now: DateTime<Utc>, plen: usize) -> String {
+    let mut out = task_row(&TaskRow::full(t), now, plen, task::is_blocked(model, t));
+    let mut facts: Vec<String> = Vec::new();
+    if !t.tags.is_empty() {
+        facts.push(format!("#{}", t.tags.join(" #")));
+    }
+    if let Some(repo) = &t.repo {
+        facts.push(
+            repo.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+    }
+    if !t.blocked_by.is_empty() {
+        let names: Vec<String> = t
+            .blocked_by
+            .iter()
+            .map(|b| match model.tasks.get(b) {
+                Some(bt) => format!("{} [{}]", prefix(b, plen), task::effective_display(bt)),
+                None => format!("{} [unknown]", prefix(b, plen)),
+            })
+            .collect();
+        facts.push(format!("blocked by {}", names.join(", ")));
+    }
+    let body = t.body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if !body.is_empty() {
+        facts.push(truncate(&sanitize_line(body), 160));
+    }
+    if !facts.is_empty() {
+        out.push_str("\n    ");
+        out.push_str(&sanitize_line(&facts.join(" · ")));
+    }
+    out
+}
+
 /// One `cv task inbox` row, stalest first upstream: a `⏰` leads anything waiting > 24h. A
 /// projection of age, not an escalation — the marker is the whole mechanism.
-fn inbox_row(r: &InboxRow, now: DateTime<Utc>) -> String {
+fn inbox_row(r: &InboxRow, now: DateTime<Utc>, plen: usize) -> String {
     let stale = now.signed_duration_since(r.since) > chrono::Duration::hours(24);
     format!(
-        "{} {}  {:>4}  {:24} {}",
+        "{} {:<plen$}  {:>4}  {:16} {}",
         if stale { "⏰" } else { "  " },
-        short_id(&r.id),
+        prefix(&r.id, plen),
         task::age_short(r.since, now),
-        format!("{:?}", r.reason),
+        r.effective_state,
         sanitize_line(&r.title)
     )
 }
+
+/// The inbox's groups, in the order they are printed: a decision owed is the slowest blocker a
+/// fleet has, so it comes first; then the work that is yours; then what others wait on you for.
+const INBOX_GROUPS: &[(InboxReason, &str)] = &[
+    (InboxReason::DecisionOwed, "decisions owed"),
+    (InboxReason::ClaimedByYou, "claimed"),
+    (InboxReason::AwaitingYourReview, "reviews"),
+    (InboxReason::YourUnlandedWork, "unlanded"),
+    (InboxReason::AssignedOpen, "assigned, unclaimed"),
+];
 
 pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
     match action {
         TaskCmd::Open {
             title,
             body,
+            body_file,
             repo,
             issue,
             channel,
             assignee,
+            tags,
+            blocked_by,
+            blocks,
             from,
         } => {
             let repo = match repo {
@@ -323,9 +503,26 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 ),
                 None => None,
             };
-            append_and_report(
+            let body = match &body_file {
+                Some(p) => read_text_arg(p)?,
+                None => body,
+            };
+            let tags = tags.as_deref().map(parse_tags).unwrap_or_default();
+            // Relations name other tasks: resolve every prefix BEFORE the open, so a typo refuses
+            // the whole command instead of leaving a task opened with half its relations.
+            let (blocked_by, blocks) = {
+                let outcome = replay_loud()?;
+                let res = |ids: Vec<String>| -> Result<Vec<String>> {
+                    ids.iter()
+                        .map(|p| resolve(&outcome.model, p).map(str::to_string))
+                        .collect()
+                };
+                (res(blocked_by)?, res(blocks)?)
+            };
+            let from = from_or_cv(from);
+            let id = append_event(
                 None,
-                &from_or_cv(from),
+                &from,
                 TaskEventKind::Opened {
                     title,
                     body,
@@ -335,14 +532,27 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     assignee,
                 },
                 None,
-            )
+            )?;
+            if !tags.is_empty() {
+                append_and_report(Some(&id), &from, TaskEventKind::Tagged { tags }, None)?;
+            }
+            for b in blocked_by {
+                append_and_report(Some(&id), &from, TaskEventKind::BlockedBy { task: b }, None)?;
+            }
+            for other in blocks {
+                append_and_report(Some(&other), &from, TaskEventKind::BlockedBy { task: id.clone() }, None)?;
+            }
+            Ok(())
         }
         TaskCmd::List {
             state,
             assignee,
             repo,
+            tag,
             all,
             json,
+            tsv,
+            wide,
         } => {
             let outcome = replay_loud()?;
             let filter = task::TaskFilter {
@@ -350,19 +560,36 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 assignee,
                 repo,
                 include_terminal: all,
+                tag,
             };
             let tasks = task::list(&outcome.model, &filter).map_err(|e| anyhow::anyhow!(e))?;
             if json {
                 // The full projections, unchanged wire shape (`show --json` sibling).
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
-            } else {
-                let now = Utc::now();
+                return Ok(());
+            }
+            let now = Utc::now();
+            if tsv {
                 for t in &tasks {
-                    println!("{}", task_row(&TaskRow::full(t), now));
+                    println!("{}", task_row_tsv(&TaskRow::full(t), now));
                 }
-                if tasks.is_empty() {
-                    println!("(no matching tasks)");
+                return Ok(());
+            }
+            let plen = prefix_len(&outcome.model);
+            for t in &tasks {
+                if wide {
+                    println!("{}", task_row_wide(t, &outcome.model, now, plen));
+                } else {
+                    println!(
+                        "{}",
+                        task_row(&TaskRow::full(t), now, plen, task::is_blocked(&outcome.model, t))
+                    );
                 }
+            }
+            if tasks.is_empty() {
+                println!("(no matching tasks)");
+            } else if tasks.iter().any(|t| task::is_blocked(&outcome.model, t)) {
+                println!("⊘ = blocked by a task that has not finished");
             }
             Ok(())
         }
@@ -413,6 +640,32 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 }
                 println!("  channel:  #{}", sanitize_line(&t.channel));
                 println!("  assignee: {}", sanitize_line(t.assignee.as_deref().unwrap_or("-")));
+                if !t.tags.is_empty() {
+                    println!("  tags:     {}", sanitize_line(&t.tags.join(", ")));
+                }
+                let plen = prefix_len(&outcome.model);
+                for b in &t.blocked_by {
+                    match outcome.model.tasks.get(b) {
+                        Some(bt) => println!(
+                            "  blocked by: {} [{}] {}",
+                            prefix(b, plen),
+                            task::effective_display(bt),
+                            sanitize_line(&bt.title)
+                        ),
+                        None => println!("  blocked by: {} [unknown task]", prefix(b, plen)),
+                    }
+                }
+                if task::is_blocked(&outcome.model, t) {
+                    println!("  ⊘ BLOCKED — a blocker above has not finished");
+                }
+                for other in task::blocks(&outcome.model, &t.task_id) {
+                    println!(
+                        "  blocks:   {} [{}] {}",
+                        prefix(&other.task_id, plen),
+                        task::effective_display(other),
+                        sanitize_line(&other.title)
+                    );
+                }
                 println!(
                     "  opened:   {} by {}",
                     fmt_local(t.opened_at, "%Y-%m-%d %H:%M"),
@@ -499,11 +752,17 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         TaskCmd::Note {
             id,
             text,
+            file,
             session_ref,
             from,
         } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
+            let text = match (text, file) {
+                (Some(t), _) => t,
+                (None, Some(f)) => read_text_arg(&f)?,
+                (None, None) => unreachable!("clap requires text or --file"),
+            };
             append_and_report(
                 Some(&id),
                 &from_or_cv(from),
@@ -562,6 +821,27 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 None,
             )
         }
+        TaskCmd::Tag { id, tags, from } => {
+            let outcome = replay_loud()?;
+            let id = resolve(&outcome.model, &id)?.to_string();
+            let tags = parse_tags(&tags);
+            if tags.is_empty() {
+                bail!("no tags given (comma-separated, e.g. `decision,deploy`)");
+            }
+            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Tagged { tags }, None)
+        }
+        TaskCmd::Block { id, by_task, from } => {
+            let outcome = replay_loud()?;
+            let id = resolve(&outcome.model, &id)?.to_string();
+            let by_task = resolve(&outcome.model, &by_task)?.to_string();
+            append_and_report(
+                Some(&id),
+                &from_or_cv(from),
+                TaskEventKind::BlockedBy { task: by_task },
+                None,
+            )
+        }
+        TaskCmd::Sweep { repo, main, json } => cmd_sweep(&repo, main, json),
         TaskCmd::Propose {
             id,
             branch,
@@ -690,11 +970,20 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             } else {
                 let rows = InboxRow::compute(&outcome.model, &who);
                 let now = Utc::now();
-                for r in &rows {
-                    println!("{}", inbox_row(r, now));
-                }
+                let plen = prefix_len(&outcome.model);
                 if rows.is_empty() {
                     println!("(inbox empty for {})", sanitize_line(&who));
+                }
+                // Grouped, stalest first within a group (the rows arrive stalest first overall).
+                for (reason, label) in INBOX_GROUPS {
+                    let group: Vec<&InboxRow> = rows.iter().filter(|r| r.reason == *reason).collect();
+                    if group.is_empty() {
+                        continue;
+                    }
+                    println!("{label} ({}):", group.len());
+                    for r in group {
+                        println!("{}", inbox_row(r, now, plen));
+                    }
                 }
             }
             Ok(())
@@ -751,6 +1040,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 return Ok(());
             }
             let report = task::DebtReport::compute(&outcome.model, hb.as_ref(), repo.as_deref());
+            let plen = prefix_len(&outcome.model);
             // Rows arrive repo-ascending (no-repo first), oldest first within a repo: render a
             // group header at each repo transition.
             let mut current: Option<&Option<std::path::PathBuf>> = None;
@@ -768,7 +1058,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 let age = now.signed_duration_since(row.since);
                 println!(
                     "  {}  rev{} {} [{}] unlanded for {}h · {} — {}",
-                    short_id(&row.id),
+                    prefix(&row.id, plen),
                     row.revision,
                     sanitize_line(&row.branch),
                     row.state.as_str(),
@@ -788,7 +1078,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 for row in &report.awaiting_review {
                     println!(
                         "  {}  rev{} {} → {} waiting {} — {}",
-                        short_id(&row.id),
+                        prefix(&row.id, plen),
                         row.revision,
                         sanitize_line(&row.branch),
                         sanitize_line(row.reviewer.as_deref().unwrap_or("(reviewer unbound)")),
@@ -809,7 +1099,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     .unwrap_or_default();
                 println!(
                     "⚠ SUSPECT {}  rev{} {}{} — {}",
-                    short_id(&s.task_id),
+                    prefix(&s.task_id, plen),
                     s.revision,
                     sanitize_line(&s.detail),
                     fresh,
@@ -1004,7 +1294,7 @@ fn cmd_verify(id: Option<String>, all: bool, fetch: bool, skip_landed: bool) -> 
         eprintln!("⚠ {}", sanitize_line(w));
     }
     for ev in &appended {
-        println!("✦ observed {} on {}", ev.kind.tag(), short_id(&ev.task_id));
+        println!("✦ observed {} on {}", ev.kind.tag(), prefix(&ev.task_id, 13));
     }
     if appended.is_empty() {
         println!("(nothing new observed)");
@@ -1037,6 +1327,8 @@ mod tests {
             abandoned_reason: None,
             done_observed: None,
             done_check: None,
+            tags: Vec::new(),
+            blocked_by: Vec::new(),
         }
     }
 
@@ -1044,7 +1336,7 @@ mod tests {
     fn task_row_shows_age_and_strips_ansi() {
         let t = proj("evil\u{1b}]0;pwn\u{7}title\u{1b}[31m!", "2026-07-13T00:00:00Z");
         let now: DateTime<Utc> = "2026-07-16T00:00:00Z".parse().unwrap();
-        let row = task_row(&TaskRow::full(&t), now);
+        let row = task_row(&TaskRow::full(&t), now, 8, false);
         assert!(row.contains("  3d  "), "age column from last_ts: {row}");
         assert!(row.contains("eviltitle!"), "payload stripped: {row}");
         assert!(!row.contains('\u{1b}'), "no ESC survives: {row}");
@@ -1059,7 +1351,7 @@ mod tests {
             reason: InboxReason::ClaimedByYou,
             since: "2026-07-13T00:00:00Z".parse().unwrap(),
         });
-        let row = inbox_row(&stale, now);
+        let row = inbox_row(&stale, now, 8);
         assert!(row.starts_with("⏰"), "24h+ rows lead with the marker: {row}");
         assert!(row.contains("tred") && !row.contains('\u{1b}'), "{row}");
 
@@ -1068,9 +1360,55 @@ mod tests {
             reason: InboxReason::ClaimedByYou,
             since: "2026-07-15T12:00:00Z".parse().unwrap(),
         });
-        let row = inbox_row(&fresh, now);
+        let row = inbox_row(&fresh, now, 8);
         assert!(!row.contains('⏰'), "young rows carry no marker: {row}");
         assert!(row.contains("12h"), "{row}");
+    }
+
+    #[test]
+    fn blocked_rows_carry_the_marker_and_tsv_is_one_line_per_task() {
+        let mut t = proj("tab\tin\ntitle", "2026-07-13T00:00:00Z");
+        t.blocked_by = vec!["00000000-0000-7000-8000-000000000009".into()];
+        let now: DateTime<Utc> = "2026-07-16T00:00:00Z".parse().unwrap();
+        let row = task_row(&TaskRow::full(&t), now, 13, true);
+        assert!(row.contains("⊘ tab"), "{row}");
+        assert!(
+            row.starts_with("00000000-0000  "),
+            "prefix is sized by the caller: {row}"
+        );
+        let tsv = task_row_tsv(&TaskRow::full(&t), now);
+        assert_eq!(tsv.lines().count(), 1, "{tsv:?}");
+        let cells: Vec<&str> = tsv.split('\t').collect();
+        assert_eq!(cells.len(), 7, "{cells:?}");
+        assert_eq!(cells[0], t.task_id);
+        assert_eq!(cells[5], "tab in title");
+        assert_eq!(cells[6], "00000000-0000-7000-8000-000000000009");
+    }
+
+    #[test]
+    fn tags_parse_trimmed_and_deduplicated() {
+        assert_eq!(parse_tags(" a, b ,,a,c "), vec!["a", "b", "c"]);
+        assert!(parse_tags(", ,").is_empty());
+    }
+
+    #[test]
+    fn sweep_helpers_tell_branches_from_words_and_paths_from_handles() {
+        assert!(branch_like("sdk-ts-repair"));
+        assert!(branch_like("k-ran"));
+        assert!(branch_like("feature/x"));
+        assert!(branch_like("p3b1"));
+        assert!(!branch_like("fix"));
+        assert!(!branch_like("final"));
+        let toks = branch_tokens("one commit on branch `sdk-ts-repair` (see docs/plan.md).");
+        assert!(toks.contains("sdk-ts-repair"), "{toks:?}");
+        assert!(toks.contains("docs/plan.md"), "{toks:?}");
+        assert_eq!(
+            issue_path("claudesplosion/planning/SESSION-STATE.md"),
+            Some("claudesplosion/planning/SESSION-STATE.md")
+        );
+        assert_eq!(issue_path("#42"), None);
+        assert_eq!(issue_path("https://github.com/x/y/issues/4"), None);
+        assert_eq!(issue_path("memory/x.md"), Some("memory/x.md"));
     }
 
     #[test]
@@ -1080,4 +1418,193 @@ mod tests {
         // The unset-env cases are exercised end-to-end in tests/cli.rs (spawned process with a
         // controlled environment — no process-global set_var races here).
     }
+}
+
+// ===================== cv task sweep =====================
+
+/// What `git` in `repo` says has landed: every local branch merged into `main`, plus every
+/// remote-tracking branch merged into it with its remote prefix stripped — the names a task's
+/// body would mention. `main` itself is excluded.
+fn merged_branches(repo: &Path, main: &str) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for extra in [&[][..], &["-r"][..]] {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
+            .arg(repo)
+            .arg("branch")
+            .args(extra)
+            .arg("--format=%(refname:short)")
+            .arg("--merged")
+            .arg(main);
+        let o = cmd
+            .output()
+            .with_context(|| format!("running git branch --merged in {}", repo.display()))?;
+        if !o.status.success() {
+            bail!(
+                "git branch --merged {main} failed in {}: {}",
+                repo.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let name = line.trim();
+            if name.is_empty() || name.ends_with("/HEAD") {
+                continue;
+            }
+            let short = name.split_once('/').map(|(_, rest)| rest).unwrap_or(name);
+            for n in [name, short] {
+                if n != main {
+                    out.insert(n.to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Does `repo` have a ref named `name`?
+fn has_ref(repo: &Path, name: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", name])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// A branch name worth matching against prose: it must look like a branch, not a word — a
+/// separator or a digit, or eight characters — so a branch called `fix` does not sweep every task
+/// whose body says "fix".
+fn branch_like(name: &str) -> bool {
+    name.contains(['-', '/', '_', '.']) || name.chars().any(|c| c.is_ascii_digit()) || name.len() >= 8
+}
+
+/// The branch-shaped tokens of a text (letters, digits and `-_./`), deduplicated.
+fn branch_tokens(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.')))
+        .map(|t| t.trim_matches(|c| matches!(c, '.' | '/')))
+        .filter(|t| t.len() >= 3)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Does `issue` read as a path (as opposed to `#42` or a URL)? A slash or a file extension and no
+/// whitespace.
+fn issue_path(issue: &str) -> Option<&str> {
+    let i = issue.trim();
+    let looks = !i.contains(char::is_whitespace)
+        && !i.contains("://")
+        && (i.contains('/') || Path::new(i).extension().is_some());
+    looks.then_some(i)
+}
+
+#[derive(serde::Serialize)]
+struct SweepRow<'a> {
+    task_id: &'a str,
+    title: &'a str,
+    state: String,
+    reasons: Vec<String>,
+}
+
+/// `cv task sweep --repo <path>`: the tasks the world says are probably done. Observed from git
+/// and the filesystem; prints candidates and never closes one (a human or the agent that owns
+/// the task does that, with `done`/`abandon`, having read why).
+fn cmd_sweep(repo: &Path, main: Option<String>, json: bool) -> Result<()> {
+    let repo = repo
+        .canonicalize()
+        .with_context(|| format!("repo {} not found", repo.display()))?;
+    let main = match main {
+        Some(m) => m,
+        None if has_ref(&repo, "main") => "main".into(),
+        None if has_ref(&repo, "master") => "master".into(),
+        None => bail!(
+            "{} has neither `main` nor `master`; pass --main <branch>",
+            repo.display()
+        ),
+    };
+    let merged = merged_branches(&repo, &main)?;
+    let outcome = replay_loud()?;
+    let mut rows: Vec<SweepRow<'_>> = Vec::new();
+    for t in outcome.model.tasks.values() {
+        if t.state.is_terminal() || t.repo.as_deref().is_some_and(|r| r != repo) {
+            continue;
+        }
+        let mut reasons = Vec::new();
+        if let Some(p) = t.issue.as_deref().and_then(issue_path) {
+            // A relative issue path was typed from *somewhere*: the task's repo, the swept repo,
+            // the directory above it (`~/dev/<other-repo>/…` is the common spelling), or the
+            // current directory. It is missing only when none of them has it.
+            let p = Path::new(p);
+            let bases: Vec<PathBuf> = if p.is_absolute() {
+                vec![PathBuf::new()]
+            } else {
+                let mut b: Vec<PathBuf> = Vec::new();
+                b.extend(t.repo.clone());
+                b.push(repo.clone());
+                b.extend(repo.parent().map(Path::to_path_buf));
+                b.extend(std::env::current_dir().ok());
+                b.dedup();
+                b
+            };
+            if !bases.iter().any(|b| b.join(p).exists()) {
+                let tried: Vec<String> = bases.iter().map(|b| b.join(p).display().to_string()).collect();
+                reasons.push(format!("issue path no longer exists ({})", tried.join(", ")));
+            }
+        }
+        let mentioned = branch_tokens(&format!("{}\n{}", t.title, t.body));
+        for b in mentioned
+            .iter()
+            .filter(|b| branch_like(b) && merged.contains(b.as_str()))
+        {
+            reasons.push(format!("names branch `{b}`, merged into {main}"));
+        }
+        if let Some(rev) = t.current_revision() {
+            if !rev.state.is_terminal() && merged.contains(&rev.revision.branch) {
+                reasons.push(format!(
+                    "rev{} branch `{}` is merged into {main} (run `cv task verify`)",
+                    rev.revision.n, rev.revision.branch
+                ));
+            }
+        }
+        if !reasons.is_empty() {
+            rows.push(SweepRow {
+                task_id: &t.task_id,
+                title: &t.title,
+                state: task::effective_display(t),
+                reasons,
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.task_id.cmp(b.task_id));
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!(
+            "nothing to sweep: no open task names a branch merged into {main} or a missing issue path ({} merged branch(es) observed)",
+            merged.len()
+        );
+        return Ok(());
+    }
+    let plen = prefix_len(&outcome.model);
+    println!(
+        "# probably done — {} candidate(s) in {} (observed: {} branch(es) merged into {main}); nothing was closed\n",
+        rows.len(),
+        repo.display(),
+        merged.len()
+    );
+    for r in &rows {
+        println!(
+            "{:<plen$}  {:16} {}",
+            prefix(r.task_id, plen),
+            r.state,
+            sanitize_line(r.title)
+        );
+        for reason in &r.reasons {
+            println!("{:plen$}  ↳ {}", "", sanitize_line(reason));
+        }
+    }
+    println!("\nclose what is really done: `cv task done <id> --observed <evidence>` · drop the rest: `cv task abandon <id> --reason …`");
+    Ok(())
 }

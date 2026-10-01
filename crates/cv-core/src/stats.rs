@@ -184,7 +184,7 @@ struct UsageHit {
 /// response's `usage`, and a resumed session copies its predecessor's history into the new file —
 /// so the same `message.id` recurs within and across transcripts. Other harnesses record usage once
 /// per call and carry no such id, so they are never deduplicated.
-fn usage_key(h: Harness, m: &Message) -> Option<String> {
+pub(crate) fn usage_key(h: Harness, m: &Message) -> Option<String> {
     match h {
         Harness::Claude => m
             .harness_extra(Harness::Claude)

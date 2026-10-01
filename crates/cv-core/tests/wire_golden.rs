@@ -31,6 +31,8 @@ const ALL_EVENT_TAGS: &[&str] = &[
     "done",
     "abandoned",
     "superseded",
+    "tagged",
+    "blocked_by",
     "revision_proposed",
     "review_rerouted",
     "review_passed",
@@ -407,6 +409,22 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
         &c,
         "agent:owner",
         20,
+        TaskEventKind::Tagged {
+            tags: vec!["decision".into(), "gate".into()],
+        },
+    );
+    push(
+        &mut events,
+        &c,
+        "agent:owner",
+        21,
+        TaskEventKind::BlockedBy { task: a.clone() },
+    );
+    push(
+        &mut events,
+        &c,
+        "agent:owner",
+        22,
         TaskEventKind::Superseded { by_task: a.clone() },
     );
 

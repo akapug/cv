@@ -299,6 +299,7 @@ fn task_tool_list() -> Value {
                     "state": { "type": "string", "description": "Effective-state filter." },
                     "assignee": { "type": "string", "description": "Assignee endpoint filter." },
                     "repo": { "type": "string", "description": "Repo path filter." },
+                    "tag": { "type": "string", "description": "Only tasks carrying this tag." },
                     "all": { "type": "boolean", "description": "Include terminal tasks (default false)." }
                 }
             }
@@ -1084,6 +1085,7 @@ fn task_list(args: &Value) -> anyhow::Result<String> {
         assignee: arg_str(args, "assignee").map(String::from),
         repo: arg_str(args, "repo").map(std::path::PathBuf::from),
         include_terminal: args.get("all").and_then(Value::as_bool).unwrap_or(false),
+        tag: arg_str(args, "tag").map(String::from),
     };
     let tasks: Vec<cv_core::task::TaskRow> = cv_core::task::list(&outcome.model, &filter)
         .map_err(|e| anyhow::anyhow!(e))?

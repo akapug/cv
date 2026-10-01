@@ -36,6 +36,12 @@ pub struct TaskRow {
     pub opened_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_ts: Option<DateTime<Utc>>,
+    /// Tags and blockers ride every surface, omitted when empty — a task that has neither
+    /// serializes byte-for-byte as it did before they existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
 }
 
 impl TaskRow {
@@ -50,6 +56,8 @@ impl TaskRow {
             channel: t.channel.clone(),
             opened_at: None,
             last_ts: None,
+            tags: t.tags.clone(),
+            blocked_by: t.blocked_by.clone(),
         }
     }
 

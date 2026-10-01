@@ -35,7 +35,7 @@ The principle behind all of it: **one name, one meaning, no grammar to memorize.
 
 | Group | What they have in common | Commands |
 | --- | --- | --- |
-| **[Read](#read)** | read-only over existing sessions | [`ls`](#cv-ls) [`show`](#cv-show) [`cat`](#cv-cat) [`search`](#cv-search) [`events`](#cv-events) [`touched`](#cv-touched) [`tools`](#cv-tools) [`tree`](#cv-tree) [`workflow`](#cv-workflow) [`compaction`](#cv-compaction) [`timeline`](#cv-timeline) [`stats`](#cv-stats) [`diff`](#cv-diff) [`blame`](#cv-blame) [`doctor`](#cv-doctor) |
+| **[Read](#read)** | read-only over existing sessions | [`ls`](#cv-ls) [`show`](#cv-show) [`cat`](#cv-cat) [`search`](#cv-search) [`events`](#cv-events) [`touched`](#cv-touched) [`tools`](#cv-tools) [`tree`](#cv-tree) [`workflow`](#cv-workflow) [`compaction`](#cv-compaction) [`prompts`](#cv-prompts) [`lanes`](#cv-lanes) [`deferrals`](#cv-deferrals) [`timeline`](#cv-timeline) [`stats`](#cv-stats) [`diff`](#cv-diff) [`blame`](#cv-blame) [`doctor`](#cv-doctor) |
 | **[Reshape](#reshape)** | produce a **new** session id from existing ones; the source is never touched | [`prune`](#cv-prune) [`splice`](#cv-splice) [`loom`](#cv-loom) [`port`](#cv-port) [`redact`](#cv-redact) [`resume`](#cv-resume) |
 | **[Export](#export)** | produce something that is *not* a session | [`export`](#cv-export) [`dataset`](#cv-dataset) [`pack`](#cv-pack) |
 | **[Fleet & live](#fleet--live)** | multi-agent coordination and live views | [`task`](#cv-task) [`board`](#cv-board) [`scry`](#cv-scry) [`share`](#cv-share) |
@@ -353,6 +353,64 @@ cv compaction 77230e3d --json        # boundaries + each one's pre-compaction sp
 ```
 
 Boundaries are found by [`MessageKind::CompactionBoundary`](architecture.md#the-unified-ir), not by any harness's private field, so this works the same across harnesses that record compaction at all. To *read* the span a compaction discarded, jump straight to it with [`cv show --pre-compaction`](#cv-show).
+
+### `cv prompts`
+
+Only what the person said. Every human-typed prompt (`kind: prompt`, `origin: human`) and every `AskUserQuestion` answer (the tool results that begin `The user answered` / `Your questions have been answered`), in order, each with its message index and local timestamp. An orchestrator re-reading its brief after a compaction, or a reviewer asking "what was actually asked for?", gets the 40 lines that matter out of a 10,000-record transcript.
+
+```sh
+cv prompts 0c315aee                       # [idx] time  user|answer, then the full text
+cv prompts 0c315aee --json                # [{index, timestamp, kind: prompt|answer, text}]
+cv prompts 0c315aee --pre-compaction      # only the span the first compaction discarded (--pre-compaction 2 for the second)
+```
+
+The bookkeeping rows a slash command leaves behind (`<command-name>/compact</command-name>`, `<local-command-stdout>…`) are not prompts — Claude Code ≥ 2.1 writes them as `user` records, and the adapter classifies them as harness notices — so `/compact` appears once, as the line the person typed. Prompts are printed whole, never truncated; `cv show --around <index>` jumps to the conversation around any of them.
+
+### `cv lanes`
+
+The sub-agent forest as a status table — what `cv show --subagents` lists, with the numbers an orchestrator actually wants per lane: model, start, duration, tokens (deduplicated by API message id, like `cv stats --tokens`), tool calls, status, and either the last line of its return or, for a running lane, its last tool call.
+
+```sh
+cv lanes 0c315aee                 # launch order, one row + one detail line per lane
+cv lanes 0c315aee --running       # no stop recorded: still at it (shows the last tool call)
+cv lanes 0c315aee --done          # finished for real
+cv lanes 0c315aee --stranded      # the strand class, each with `→ resume: SendMessage to <agentId>`
+cv lanes 0c315aee --json          # [{agent_id, model, tokens: {total, …}, status, status_source, last_text, stranded, …}]
+```
+
+```text
+AGENT     STATUS     MODEL          STARTED         DUR  TOKENS CALLS  DESCRIPTION
+acd03d62  completed  opus-4-1       09-30 23:05  1h12m    4.8M   203  K-STREAM: append payload + receiver leg
+          ↩ `git status` shows only the three prover files and `build-logs/` that were already there before…
+a1e1ce3d  running    opus-4-1       10-01 00:11  2h01m    2.1M    88  K-SPK: kernel items for SPK hosting
+          ↪ Bash · ssh persvati 'cd /home/ember/build/mini-datamodel-20260930/k-spk/src && lake build'
+```
+
+**Status** comes from the most authoritative source available, and the JSON says which (`status_source`): a `Workflow` run's journal (`done` / `partial` / …), else the parent transcript's last `<task-notification>` for the agent (`completed` / `failed` / `killed` / `stopped` — read from the `queue-operation` records the harness writes the moment a child stops, so it does not depend on the notification ever reaching the conversation), else the child's own `SubagentStop` hook (`stopped`), else `running`.
+
+**Stranded** is the class that parked four lanes in one day: the harness reports the lane *completed*, and its final text says it is waiting — `Waiting on notifications`, `I'll continue when the monitor fires`, `waiting for the … verdict`. Nothing will wake it. `--stranded` lists exactly those, with the resume hint; a stranded lane never counts as done (`--done` and the header's `completed` exclude it). The phrase set is `cv_core::lanes::STRAND_PATTERNS`; only the last two sentences of the text are consulted, so a report that mentions waiting and then concludes is not stranded.
+
+### `cv deferrals`
+
+A linter for promises. Every place the assistant put something off — "later lane", "follow-up", "not tonight", "queued for …", "ember's call", "decision for", "integrator item", "when X lands", "after FINAL", "deferred", "a later pass", "out of scope" — with its message index, timestamp and ~100 characters of context. The complaint it answers: *we can't just remark these things into the context log.*
+
+```sh
+cv deferrals 0c315aee                      # every deferral, oldest first
+cv deferrals 0c315aee --since 1591         # only the post-compaction region
+cv deferrals 0c315aee --open-tasks         # cross-reference the task store; exit 1 while any is UNMATCHED
+cv deferrals 0c315aee --open-tasks --json  # [{index, timestamp, phrase, context, matched?: {task_id, title, state, shared}}]
+```
+
+```text
+[1423] 2026-09-30 20:13  "after FINAL"    …Host umbrella — is queued for the standing integrator right after FINAL-1 lands, since it…
+       MATCHED   01a0f52e-76a0 [open] STANDING INTEGRATOR on final: merge landed branches continuously…  (shared: integrator, landed, umbrella)
+[3707] 2026-09-30 22:31  "integrator item" …ranch into the persvati base, note the collisions for the integrator, record it.
+       UNMATCHED
+
+✗ 30 deferral(s) have no task — `cv task open` each, or say why not
+```
+
+`--open-tasks` scores each deferral's sentence against every task's title, body and issue (terminal tasks included — a deferral may already be done): three or more shared significant words is a MATCH, the task with the most wins, ties to the newer task. It is a heuristic and says so (`shared:` lists the words), so a closeout reads the matches rather than trusting them. The non-zero exit is the point: `cv deferrals <id> --open-tasks || echo "open the rest first"`.
 
 ### `cv timeline`
 
@@ -696,8 +754,8 @@ It gets its own chapter: **[`cv pack` — the context compiler](pack.md)**.
 The fleet's durable dispatch objects: open/claim/note/done plus reviewed code **revisions** whose landing is *observed from git by cv* (`cv task verify`), never asserted by an agent. The verbs:
 
 ```text
-open · list · show · claim · release · note · done · abandon · supersede
-propose · reroute · pass · refute · verify · inbox · debt · stats
+open · list · show · claim · release · note · tag · block · done · abandon · supersede
+propose · reroute · pass · refute · verify · inbox · debt · stats · sweep
 ```
 
 This is a big enough topic to get its own chapter — see **[the task substrate](tasks.md)** for the lifecycle, the four laws, the verifier, and a worked end-to-end example.

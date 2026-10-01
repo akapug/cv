@@ -134,6 +134,9 @@ call gets `--json` appended (and so returns machine output rather than rendered 
 | `tree` | `id` | no | A session's message threading (DAG if parent ids exist, else a numbered list). |
 | `workflow` | `id` | yes | A `Workflow` run, first-class: phase tree, agents and outcomes, totals, driving script. Without `run_id`, lists the session's runs. |
 | `compaction` | `id` | yes | Every compaction boundary, its trigger, pre-compaction size, and the seeding summary. |
+| `prompts` | `id` | yes | Only what the person said: human prompts and `AskUserQuestion` answers, with message indices. `pre_compaction` narrows to a discarded span. |
+| `lanes` | `id` | yes | The sub-agent forest as a status table: model, duration, tokens, tool calls, status, last line; `stranded` lists lanes parked on a promise. |
+| `deferrals` | `id` | yes | Every deferral phrase in the assistant's text with context; `open_tasks` marks each MATCHED/UNMATCHED against the task store. |
 | `timeline` | — | yes | Unified chronological feed across all harnesses. |
 | `stats` | — | yes | Fleet analytics over all discovered sessions. |
 | `diff` | `a`, `b` | no | Compare two sessions message-by-message (great for loom branches). |

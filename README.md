@@ -116,7 +116,13 @@ Or from source:
 
 ```sh
 cargo build --release          # → target/release/{cv, cv-mcp, cvd, cv-tui, cv-search}
+make install                   # = cargo install --path crates/cv --force --target-dir target  → ~/.cargo/bin/cv
+cv --version                   # cv 0.12.0 (<git sha>) — compare against `git rev-parse --short=12 HEAD`
 ```
+
+`cv --version` prints the commit the binary was built from (`-dirty` when the tree had edits), so
+an installed `cv` that lags the checkout is visible at a glance; `make install` reuses the
+workspace's `target/release` instead of rebuilding from scratch in a temp dir.
 
 ## 🧠 Let agents read each other's minds (MCP)
 

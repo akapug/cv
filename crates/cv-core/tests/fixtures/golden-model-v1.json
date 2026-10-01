@@ -168,14 +168,21 @@
       "assignee": null,
       "opened_by": "agent:owner",
       "opened_at": "2026-07-16T12:19:00Z",
-      "last_event_id": "00000000-0000-7000-8000-000000000021",
-      "last_ts": "2026-07-16T12:20:00Z",
+      "last_event_id": "00000000-0000-7000-8000-000000000023",
+      "last_ts": "2026-07-16T12:22:00Z",
       "revisions": [],
       "notes": [],
       "superseded_by": "00000000-0000-7000-8000-000000000001",
       "abandoned_reason": null,
       "done_observed": null,
-      "done_check": null
+      "done_check": null,
+      "tags": [
+        "decision",
+        "gate"
+      ],
+      "blocked_by": [
+        "00000000-0000-7000-8000-000000000001"
+      ]
     }
   }
 }

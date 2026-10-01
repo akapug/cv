@@ -1138,7 +1138,7 @@ fn task_surfaces_sanitize_and_age() {
     assert!(ok);
     let (out, _) = w.cv_ok(&["task", "inbox", "agent:demo"]);
     assert!(!out.contains('\u{1b}'), "inbox leaks ESC:\n{out:?}");
-    assert!(out.contains("ClaimedByYou"), "{out}");
+    assert!(out.contains("claimed (1):"), "inbox groups by reason:\n{out}");
 
     let (out, _) = w.cv_ok(&["task", "debt"]);
     assert!(!out.contains('\u{1b}'), "debt leaks ESC:\n{out:?}");
@@ -1377,4 +1377,279 @@ fn board_read_sanitizes_and_from_defaults_to_cv_endpoint() {
     assert!(!out.contains('\u{1b}'), "board read leaks ESC:\n{out:?}");
     assert!(out.contains("hi there!"), "{out}");
     assert!(out.contains("agent:board"), "CV_ENDPOINT is the default sender:\n{out}");
+}
+
+// ───────────────────────── cv task ergonomics (0.12.0) ─────────────────────────
+
+/// `--body-file`, `--tags`/`list --tag`, `--blocked-by`/`--blocks` with the blocked marker and
+/// `show`'s relation lines, `note --file`, `--tsv`, `--wide`.
+#[test]
+fn task_open_relations_tags_and_file_bodies() {
+    let w = World::new("task-ergo");
+    let brief = w.base.join("brief.md");
+    fs::write(
+        &brief,
+        "# The brief\n\nA body that is a document, not a shell string.\n",
+    )
+    .unwrap();
+
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "FOUNDATION: the thing others wait on",
+        "--tags",
+        "lean,deploy",
+    ]);
+    let a = opened_task_id(&out);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "DEPENDENT: needs the foundation",
+        "--body-file",
+        brief.to_str().unwrap(),
+        "--blocked-by",
+        &a,
+        "--tags",
+        "lean",
+    ]);
+    let b = opened_task_id(&out);
+    let (out, _) = w.cv_ok(&["task", "open", "UPSTREAM: blocks the foundation", "--blocks", &a]);
+    let c = opened_task_id(&out);
+
+    // The body came from the file.
+    let (json, _) = w.cv_ok(&["task", "show", &b, "--json"]);
+    let t: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(t["body"].as_str().unwrap().contains("not a shell string"), "{json}");
+    assert_eq!(t["tags"], serde_json::json!(["lean"]), "{json}");
+    assert_eq!(t["blocked_by"], serde_json::json!([a]), "{json}");
+    // `--blocks` wrote the relation on the OTHER task.
+    let (json, _) = w.cv_ok(&["task", "show", &a, "--json"]);
+    let t: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(t["blocked_by"], serde_json::json!([c]), "{json}");
+    assert_eq!(t["tags"], serde_json::json!(["lean", "deploy"]), "{json}");
+
+    // show: tags, blocked by (with the blocker's state and title), blocks (the reverse).
+    let (out, _) = w.cv_ok(&["task", "show", &a]);
+    assert!(out.contains("tags:     lean, deploy"), "{out}");
+    assert!(
+        out.contains("blocked by: ") && out.contains("[open] UPSTREAM: blocks the foundation"),
+        "{out}"
+    );
+    assert!(out.contains("⊘ BLOCKED"), "{out}");
+    assert!(
+        out.contains("blocks:   ") && out.contains("DEPENDENT: needs the foundation"),
+        "{out}"
+    );
+
+    // list: blocked rows carry the marker; --tag filters; ids are rendered at a unique length.
+    let (out, _) = w.cv_ok(&["task", "list"]);
+    let blocked_rows = |out: &str| {
+        out.lines()
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_hexdigit()) && l.contains("⊘ "))
+            .count()
+    };
+    assert_eq!(blocked_rows(&out), 2, "A and B are blocked:\n{out}");
+    assert!(out.contains("⊘ = blocked"), "{out}");
+    let (out, _) = w.cv_ok(&["task", "list", "--tag", "deploy"]);
+    assert!(out.contains("FOUNDATION") && !out.contains("DEPENDENT"), "{out}");
+    let (out, _) = w.cv_ok(&["task", "list"]);
+    for line in out.lines().filter(|l| l.starts_with(|c: char| c.is_ascii_hexdigit())) {
+        let shown = line.split_whitespace().next().unwrap();
+        let (ok, _, _, err) = w.cv(&["task", "show", shown]);
+        assert!(ok, "the prefix `list` prints must resolve in `show`: {shown}\n{err}");
+    }
+
+    // Finishing the upstream task unblocks A without another event.
+    w.cv_ok(&["task", "done", &c, "--observed", "merged"]);
+    let (out, _) = w.cv_ok(&["task", "show", &a]);
+    assert!(!out.contains("⊘ BLOCKED"), "{out}");
+    let (out, _) = w.cv_ok(&["task", "list"]);
+    assert_eq!(blocked_rows(&out), 1, "only B stays blocked:\n{out}");
+
+    // tsv: one line per task, seven cells, full ids, no alignment.
+    let (out, _) = w.cv_ok(&["task", "list", "--tsv"]);
+    assert_eq!(out.lines().count(), 2, "{out}");
+    let cells: Vec<&str> = out.lines().find(|l| l.starts_with(&b)).unwrap().split('\t').collect();
+    assert_eq!(cells.len(), 7, "{cells:?}");
+    assert_eq!(cells[1], "open");
+    assert_eq!(cells[5], "DEPENDENT: needs the foundation");
+    assert_eq!(cells[6], a);
+
+    // wide: a second line with tags, blockers and the body's first line.
+    let (out, _) = w.cv_ok(&["task", "list", "--wide"]);
+    assert!(
+        out.contains("#lean · blocked by ") && out.contains("[open] · # The brief"),
+        "{out}"
+    );
+
+    // note --file.
+    let note = w.base.join("note.txt");
+    fs::write(&note, "progress from a file").unwrap();
+    w.cv_ok(&["task", "note", &b, "--file", note.to_str().unwrap()]);
+    let (out, _) = w.cv_ok(&["task", "show", &b]);
+    assert!(out.contains("progress from a file"), "{out}");
+    let (ok, ..) = w.cv(&["task", "note", &b]);
+    assert!(!ok, "note needs text or --file");
+
+    // tag / block verbs after the fact; a self-block is refused; an unknown blocker is refused.
+    w.cv_ok(&["task", "tag", &b, "decision"]);
+    let (json, _) = w.cv_ok(&["task", "show", &b, "--json"]);
+    assert!(json.contains("\"decision\""), "{json}");
+    let (ok, _, _, err) = w.cv(&["task", "block", &b, "--by", &b]);
+    assert!(!ok && err.contains("cannot block itself"), "{err}");
+    let (ok, _, _, err) = w.cv(&["task", "open", "typo", "--blocked-by", "ffffffff"]);
+    assert!(
+        !ok && err.contains("no task matches"),
+        "relations resolve before the open:\n{err}"
+    );
+    let (out, _) = w.cv_ok(&["task", "list", "--all"]);
+    assert!(!out.contains("typo"), "a refused open leaves nothing behind:\n{out}");
+}
+
+/// `inbox` groups by reason, decisions first: a `decision`-tagged task assigned to you is a
+/// decision owed, not work.
+#[test]
+fn task_inbox_groups_decisions_first() {
+    let w = World::new("task-inbox");
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "pick the enrollment rate",
+        "--assignee",
+        "ember",
+        "--tags",
+        "decision",
+    ]);
+    let d = opened_task_id(&out);
+    w.cv_ok(&["task", "open", "write the docs", "--assignee", "ember"]);
+    let (out, _) = w.cv_ok(&["task", "open", "the claimed one"]);
+    let c = opened_task_id(&out);
+    let (ok, ..) = w.cv_env(&["task", "claim", &c], &[("CV_ENDPOINT", "ember")]);
+    assert!(ok);
+
+    let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
+    let dec = out.find("decisions owed (1):").expect(&out);
+    let claimed = out.find("claimed (1):").expect(&out);
+    let assigned = out.find("assigned, unclaimed (1):").expect(&out);
+    assert!(dec < claimed && claimed < assigned, "group order:\n{out}");
+    assert!(out.contains("pick the enrollment rate"), "{out}");
+    let (json, _) = w.cv_ok(&["task", "inbox", "ember", "--json"]);
+    assert!(json.contains("\"decision_owed\""), "{json}");
+    assert!(json.contains(&d), "{json}");
+    let (out, _) = w.cv_ok(&["task", "inbox", "nobody"]);
+    assert!(out.contains("(inbox empty for nobody)"), "{out}");
+}
+
+/// `sweep` observes git and the filesystem and prints candidates; it closes nothing.
+#[test]
+fn task_sweep_names_merged_branches_and_missing_issue_paths_without_closing() {
+    let w = World::new("task-sweep");
+    let repo = w.base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("HOME", &w.home)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    fs::write(repo.join("a.txt"), "a").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    git(&["checkout", "-q", "-b", "k-ran"]);
+    fs::write(repo.join("b.txt"), "b").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "work"]);
+    git(&["checkout", "-q", "main"]);
+    git(&["merge", "-q", "--no-ff", "-m", "merge", "k-ran"]);
+    git(&["checkout", "-q", "-b", "p3b1"]);
+    fs::write(repo.join("c.txt"), "c").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "unmerged work"]);
+    git(&["checkout", "-q", "main"]);
+    fs::write(repo.join("plan.md"), "plan").unwrap();
+
+    let r = repo.to_str().unwrap();
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "K-RAN: run claim",
+        "--repo",
+        r,
+        "--body",
+        "one commit on branch `k-ran`, not pushed",
+    ]);
+    let merged = opened_task_id(&out);
+    w.cv_ok(&[
+        "task",
+        "open",
+        "P3B1: receiver",
+        "--repo",
+        r,
+        "--body",
+        "work is on `p3b1`",
+    ]);
+    w.cv_ok(&["task", "open", "PLAN: keep", "--repo", r, "--issue", "plan.md"]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "GONE: issue file deleted",
+        "--repo",
+        r,
+        "--issue",
+        "docs/gone.md",
+    ]);
+    let gone = opened_task_id(&out);
+    w.cv_ok(&[
+        "task",
+        "open",
+        "WORDS: a body that says fix and main",
+        "--repo",
+        r,
+        "--body",
+        "fix main",
+    ]);
+    w.cv_ok(&[
+        "task",
+        "open",
+        "OTHER REPO: names k-ran but lives elsewhere",
+        "--repo",
+        w.base.to_str().unwrap(),
+        "--body",
+        "k-ran",
+    ]);
+
+    let (out, _) = w.cv_ok(&["task", "sweep", "--repo", r]);
+    assert!(out.contains("2 candidate(s)"), "{out}");
+    assert!(
+        out.contains("K-RAN: run claim") && out.contains("names branch `k-ran`, merged into main"),
+        "{out}"
+    );
+    assert!(
+        out.contains("GONE: issue file deleted") && out.contains("issue path no longer exists"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("P3B1") && !out.contains("PLAN:") && !out.contains("WORDS") && !out.contains("OTHER REPO"),
+        "{out}"
+    );
+    assert!(out.contains("nothing was closed"), "{out}");
+    // Nothing changed state.
+    let (json, _) = w.cv_ok(&["task", "show", &merged, "--json"]);
+    assert!(json.contains("\"state\": \"open\""), "{json}");
+    let (json, _) = w.cv_ok(&["task", "sweep", "--repo", r, "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|x| x["task_id"] == gone));
 }

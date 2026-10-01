@@ -326,7 +326,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clustervision"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -335,12 +335,14 @@ dependencies = [
  "cv-llm",
  "cv-search",
  "libc",
+ "regex",
+ "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "clustervision-core"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -490,7 +492,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "cv-llm"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clustervision-core",
@@ -501,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "cv-mcp"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -514,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "cv-search"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -530,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "cv-sim"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -542,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "cv-tui"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -556,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "cv-web"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "clustervision-core",
  "serde_json",
@@ -567,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "cvd"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "chrono",

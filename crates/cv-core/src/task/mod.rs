@@ -49,8 +49,9 @@ pub use model::{
     RevisionState, TaskEvent, TaskEventKind, TaskState, VERIFIER_BY,
 };
 pub use project::{
-    age_short, awaiting_review, branch_carriers, debt, effective_display, inbox, list, propose_collision_warnings,
-    resolve_id, AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason, TaskFilter, STATE_VOCABULARY,
+    age_short, awaiting_review, blocks, branch_carriers, debt, effective_display, inbox, is_blocked, list,
+    propose_collision_warnings, resolve_id, unique_prefix_len, AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason,
+    TaskFilter, DECISION_TAG, STATE_VOCABULARY,
 };
 pub use provenance::{freshness_from_heartbeat, Freshness, Provenance};
 pub use reduce::{

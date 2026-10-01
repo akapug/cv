@@ -21,6 +21,7 @@ pub mod harness;
 pub mod html;
 pub mod ingest;
 pub mod ir;
+pub mod lanes;
 pub mod lazy;
 pub(crate) mod lockfile;
 pub mod loom;

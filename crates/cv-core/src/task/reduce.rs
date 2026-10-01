@@ -220,6 +220,15 @@ pub struct TaskProjection {
     /// How the completion was verified, when a passing check was attached to the `Done`. `None` =
     /// self-reported (the view/provenance layer labels the two distinctly).
     pub done_check: Option<DoneCheck>,
+    /// The union of every `tagged` event's labels, in first-seen order. Omitted from the wire when
+    /// empty, so a log that never tagged anything serializes exactly as it did before tags existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Task ids this task is waiting on (`blocked_by` events, deduplicated, first-seen order).
+    /// Whether the task is blocked *now* is [`super::project::is_blocked`], computed from each
+    /// blocker's current state. Omitted from the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
 }
 
 impl TaskProjection {
@@ -254,6 +263,8 @@ impl TaskProjection {
             abandoned_reason: None,
             done_observed: None,
             done_check: None,
+            tags: Vec::new(),
+            blocked_by: Vec::new(),
         }
     }
 
@@ -410,6 +421,22 @@ impl TaskReducer {
                 require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
                 task.superseded_by = Some(by_task.clone());
                 task.state = TaskState::Superseded;
+            }
+            TaskEventKind::Tagged { tags } => {
+                // Tags are bookkeeping, like notes: allowed while the task is live, never on a
+                // terminal one (a done task's labels are part of the record, not a surface to edit).
+                require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                for t in tags {
+                    if !task.tags.iter().any(|have| have == t) {
+                        task.tags.push(t.clone());
+                    }
+                }
+            }
+            TaskEventKind::BlockedBy { task: blocker } => {
+                require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                if !task.blocked_by.iter().any(|have| have == blocker) {
+                    task.blocked_by.push(blocker.clone());
+                }
             }
 
             // ── land facet ────────────────────────────────────────────────
@@ -706,6 +733,34 @@ fn validate_event_shape(event: &TaskEvent) -> Result<(), ReduceError> {
         TaskEventKind::Done { .. } => Ok(()),
         TaskEventKind::Abandoned { reason } => require_nonempty("reason", reason),
         TaskEventKind::Superseded { by_task } => require_nonempty("by_task", by_task),
+        TaskEventKind::Tagged { tags } => {
+            if tags.is_empty() {
+                return Err(ReduceError::InvalidField {
+                    field: "tags",
+                    value: "[]".into(),
+                });
+            }
+            for t in tags {
+                require_nonempty("tags[]", t)?;
+                if t.chars().any(|c| c.is_whitespace() || c == ',') {
+                    return Err(ReduceError::InvalidField {
+                        field: "tags[]",
+                        value: t.clone(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        TaskEventKind::BlockedBy { task } => {
+            require_nonempty("task", task)?;
+            if task == &event.task_id {
+                return Err(ReduceError::InvalidField {
+                    field: "task",
+                    value: format!("{task} (a task cannot block itself)"),
+                });
+            }
+            Ok(())
+        }
         TaskEventKind::RevisionProposed { revision } => validate_revision(revision),
         TaskEventKind::ReviewRerouted { from, to } => {
             require_nonempty("from", from)?;
