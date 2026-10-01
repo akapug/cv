@@ -414,8 +414,27 @@ pub(crate) fn event_json(ev: &TaskEvent, model: &TaskReadModel) -> serde_json::V
                 obj.insert("assignee".into(), serde_json::Value::String(a.clone()));
             }
         }
+        // The same telling detail the text feed prints, so a page need not know every kind.
+        obj.insert("detail".into(), serde_json::Value::String(event_detail(ev)));
     }
     v
+}
+
+/// The telling detail of one event (what `event_text` prints after the kind), sanitized.
+pub(crate) fn event_detail(ev: &TaskEvent) -> String {
+    match &ev.kind {
+        TaskEventKind::Noted { text, .. } => truncate(&sanitize_line(text), 160),
+        TaskEventKind::Resolved { choice, note } => match note {
+            Some(n) => format!("→ {} ({})", sanitize_line(choice), truncate(&sanitize_line(n), 80)),
+            None => format!("→ {}", sanitize_line(choice)),
+        },
+        TaskEventKind::Posed { default_choice, .. } => format!("default: {}", sanitize_line(default_choice)),
+        TaskEventKind::Opened { title, .. } => truncate(&sanitize_line(title), 120),
+        TaskEventKind::Claimed { assignee } => format!("by {}", sanitize_line(assignee)),
+        TaskEventKind::Done { observed, .. } => observed.as_deref().map(|o| truncate(&sanitize_line(o), 120)).unwrap_or_default(),
+        TaskEventKind::Tagged { tags } => tags.iter().map(|t| format!("#{}", sanitize_line(t))).collect::<Vec<_>>().join(" "),
+        _ => String::new(),
+    }
 }
 
 /// One event as a human line: time, kind, task, actor, and the telling detail.

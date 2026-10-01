@@ -21,6 +21,10 @@
 //! - `POST /api/task/<id>/reopen`         a closed task comes back as a NEW task (the record stays)
 //! - `GET /api/events?since=&kind=&by=&not_by=&assignee=&task=`  JSON lines — the same query as
 //!   `cv task events`, so a poller and the page see one feed.
+//! - `GET /api/lanes?session=<id>`        the sub-agent forest of a session (`cv lanes`), running
+//!   first — the orchestrator's live lane table beside the inbox.
+//! - `GET /api/backlog?repo=&state=&tag=&all=1` every open task (`cv task list` with no window);
+//!   `all=1` includes terminal ones.
 //!
 //! Every POST takes `who` in the body (else the server's `--assignee`).
 
@@ -236,6 +240,14 @@ fn handle(mut request: Request, ctx: &Ctx) {
             Ok(lines) => text_response(200, "application/x-ndjson; charset=utf-8", lines),
             Err(e) => json_response(400, &json!({"error": e.to_string()})),
         },
+        (Method::Get, ["api", "lanes"]) => {
+            let (status, v) = api_lanes(&q);
+            json_response(status, &v)
+        }
+        (Method::Get, ["api", "backlog"]) => {
+            let (status, v) = api_backlog(&q);
+            json_response(status, &v)
+        }
         (Method::Post, ["api", "task", id, verb]) => {
             let who = body
                 .get("who")
@@ -315,6 +327,88 @@ fn api_task(id: &str, events: bool) -> (u16, Value) {
             v["events"] = json!(history);
         }
         (200, v)
+    })
+}
+
+/// `cv lanes <session>` as JSON: every sub-agent, running first, then by start time (newest
+/// first). The page polls this beside the inbox so the orchestrator's forest and the human's
+/// decisions sit on one screen.
+fn api_lanes(q: &Query) -> (u16, Value) {
+    let Some(session) = q.get("session") else {
+        return (400, json!({"error": "which session? pass ?session=<id prefix>"}));
+    };
+    let (r, _adapter) = match crate::util::resolve(&session, None) {
+        Ok(x) => x,
+        Err(e) => return (404, json!({"error": e.to_string()})),
+    };
+    let mut lanes = cv_core::lanes::lanes_of(&r);
+    lanes.sort_by(|a, b| {
+        b.is_running()
+            .cmp(&a.is_running())
+            .then_with(|| b.started_at.cmp(&a.started_at))
+    });
+    let running = lanes.iter().filter(|l| l.is_running()).count();
+    let stranded = lanes.iter().filter(|l| l.stranded).count();
+    let done = lanes.iter().filter(|l| l.is_done()).count();
+    (
+        200,
+        json!({
+            "session": r.id,
+            "counts": {"total": lanes.len(), "running": running, "done": done, "stranded": stranded},
+            "lanes": lanes,
+        }),
+    )
+}
+
+/// `cv task list` with no time window: the whole open backlog (or everything with `all=1`),
+/// one compact row per task, newest activity first.
+fn api_backlog(q: &Query) -> (u16, Value) {
+    with_replay(|outcome| {
+        let filter = task::TaskFilter {
+            state: q.get("state"),
+            assignee: q.get("assignee"),
+            repo: q.get("repo").map(std::path::PathBuf::from),
+            include_terminal: q.get("all").is_some(),
+            tag: q.get("tag"),
+            touched_since: None,
+            or_involving: None,
+            decisions: None,
+        };
+        let mut tasks = match task::list(&outcome.model, &filter) {
+            Ok(t) => t,
+            Err(e) => return (400, json!({"error": e})),
+        };
+        tasks.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        let now = Utc::now();
+        let rows: Vec<Value> = tasks
+            .iter()
+            .map(|t| {
+                json!({
+                    "id": t.task_id,
+                    "short": &t.task_id[..t.task_id.len().min(13)],
+                    "title": t.title,
+                    "state": task::effective_display(t),
+                    "assignee": t.assignee,
+                    "opened_by": t.opened_by,
+                    "repo": t.repo,
+                    "issue": t.issue,
+                    "tags": t.tags,
+                    "blocked": task::is_blocked(&outcome.model, t),
+                    "decision": t.decision.is_some(),
+                    "notes": t.notes.len(),
+                    "last_ts": t.last_ts,
+                    "age": task::age_short(t.last_ts, now),
+                    "body": t.body,
+                })
+            })
+            .collect();
+        let mut repos: Vec<String> = tasks
+            .iter()
+            .filter_map(|t| t.repo.as_ref().map(|p| p.display().to_string()))
+            .collect();
+        repos.sort();
+        repos.dedup();
+        (200, json!({"count": rows.len(), "repos": repos, "tasks": rows, "warnings": outcome.warnings}))
     })
 }
 
