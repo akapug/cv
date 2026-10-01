@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.13.0 — decisions are a kind; a human can drain the inbox
+
+Written from the first day a human was on the other end of `cv task`: an orchestrator had filed
+~15 "DECIDE (…, default stands if silent): …" items as free-text notes on one assigned task, and
+the person asked "how do I access this inbox?" and "is there a web interface where I can see these
+and drain them?".
+
+- **Decisions.** Two new event kinds, `posed {options, default, deadline?, source?}` and
+  `resolved {choice, note?}`, and a terminal `TaskState::Resolved`. A task with a `posed` event is
+  of kind `decision`: `done` is refused on it ("answer it with resolve"), a second `posed` is
+  refused (amend by posing anew), the choice must be one of the posed options, and `resolved` is
+  identity-bearing — who decided is the fact, so it is never a shared sink. `cv task decide --for
+  <who> --default … [--option …]… [--by <when>]` poses one (`opened` + `tagged decision` +
+  `posed`); `cv task resolve <id> --accept-default | --choice "…" [--note …]` answers it; with no
+  identity the error prints the exact command with the decision's owner filled in.
+- **`cv task split <id>`** turns every leading-`DECIDE` note on a task into its own decision:
+  title = the parenthetical label + the question's first clause (parentheticals dropped), default
+  = the `Default =` / `Default if silent:` / `Recommend:` clause (several are joined; none means
+  "as proposed"), options = the `alternative =` clauses; each is assigned like the parent, carries
+  the note as its body and `source`, and blocks the parent. The notes stay; `show` points each at
+  its decision; a second run creates nothing; mid-text `DECIDE`s are counted, not split.
+- **`cv task inbox <who>`** now leads with decisions, each with `⇒ default: … · alt: … · by …` on
+  the next line, then assigned actions, claimed work, reviews, unlanded. `--md` renders the whole
+  inbox as a Markdown page (every body, the first line of every note, a resolve command per
+  decision). `--unread` keeps items whose last event is not `<who>`'s (`web:<who>` counts as
+  `<who>`). `--json` carries the decision facet.
+- **`cv task serve [--bind 127.0.0.1:7777] [--assignee <who>] [--open]`**: a web inbox served by
+  cv itself — one inline page, no external JS/CSS, theme-aware, phone-width — with the decisions'
+  options as buttons (Accept default / each alternative / Needs discussion), Done/Claim/Release on
+  actions, notes with a Save box, Open/Resolved/All filters and a counter line. Every button
+  records the same event the CLI would, as `web:<who>`, through `/api/task/<id>/{resolve,done,
+  note,discuss,claim,release,reopen}`; `/api/inbox?who=` and `/api/events?since=` are the CLI's
+  own queries. Loopback only unless `--bind 0.0.0.0:…` is passed; a DNS-named `Host` is refused
+  (rebinding), an IP literal is accepted (a phone on the LAN). Uses `tiny_http`, already in the
+  workspace through cvd. "Reopen" on a closed item opens a NEW task (terminal stays terminal).
+- **The feed.** `cv task events [--since <when|event-id>] [--kind resolved,done,noted] [--by]
+  [--not-by] [--assignee] [--task]` prints one JSON line per event (the event's fields plus
+  `title`, `task_state`, `assignee`) and the next cursor on stderr; `--text` for people. `cv task
+  watch --assignee <who> --since …` is that minus the caller's own events. No push channel: poll.
+- **Scope.** Bare `cv task list` / `inbox` show tasks touched in the last 14 days or involving
+  `$CV_ENDPOINT` (opener, assignee, note author, reviewer, resolver), and print the hidden count
+  on the last line; `--all` lifts it, `--since 90d` widens it. MCP and HTTP still see everything.
+- **`cv task show`**: `--brief` (one line per note, the body's first line), `--notes-last N`,
+  `--notes-grep PATTERN`; a decision block (default, options, resolution or the resolve command).
+- **stdin.** `cv task note <id> -`, `--body -`, `--note -` read stdin (zsh eats backticks inside
+  double quotes; a heredoc does not).
+- **Paths.** `--issue` is absolutized at open time (cwd, else the task's `--repo`, else cwd
+  lexically); handles and URLs pass through. `--repo` was already canonicalized.
+- **`cv lanes`**: `--since 2h` keeps lanes active in the window; a lane with no stop recorded
+  anywhere whose transcript ends in a text-only final turn and has been quiet ≥ 10 min reads
+  `returned` (status source `transcript`) — a lost notification — and counts as done; a running
+  lane quiet for an hour or more says so (`⚠ quiet 14h`).
+- Board notifications now carry the task's title, so `cv board read tasks` reads as a timeline.
+- Golden fixture: additive only (a decision specimen task; every prior task serializes
+  byte-identically).
+
 ## 0.12.0 — the orchestrator's instruments
 
 Three commands for a session that is running a swarm, written from a day of running one with

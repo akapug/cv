@@ -243,6 +243,28 @@ fn build_world(tag: &str) -> World {
             ),
         ],
     );
+    // ddd4: finished — the transcript ends in a final report — but no SubagentStop and no
+    // <task-notification> ever recorded it (the harness restarted). It must not read as running.
+    w.write_agent(
+        SID,
+        "ddd4",
+        "LANE-D: lost notification",
+        &[
+            user("q0", "2026-10-01T10:01:30Z", "You are lane D."),
+            assistant_tool(
+                "q1",
+                "2026-10-01T10:01:40Z",
+                "Bash",
+                serde_json::json!({"command": "cargo test"}),
+            ),
+            tool_result("q2", "2026-10-01T10:05:00Z", "toolu_q1", "ok"),
+            assistant(
+                "q3",
+                "2026-10-01T10:06:00Z",
+                "Lane D report.\nAll 12 tests pass; nothing left to do.",
+            ),
+        ],
+    );
     w
 }
 
@@ -304,9 +326,14 @@ fn lanes_table_status_tokens_and_the_strand_class() {
     let w = build_world("lanes");
     let (out, _) = w.cv_ok(&["lanes", SID]);
     assert!(
-        out.contains("3 sub-agents: 1 running · 1 completed · 0 other · 1 STRANDED"),
+        out.contains("4 sub-agents: 1 running · 2 completed (1 returned without a stop record) · 0 other · 1 STRANDED"),
         "{out}"
     );
+    // The lost-notification lane: `returned`, its report on the ↩ line, counted as done, and
+    // explained in the footer.
+    assert!(out.contains("ddd4      returned"), "{out}");
+    assert!(out.contains("↩ All 12 tests pass; nothing left to do."), "{out}");
+    assert!(out.contains("the harness lost the notification"), "{out}");
     // Launch order, one row per lane, the telling columns present.
     let a = out.find("aaa1").unwrap();
     let b = out.find("bbb2").unwrap();
@@ -337,15 +364,28 @@ fn lanes_table_status_tokens_and_the_strand_class() {
     );
     let (out, _) = w.cv_ok(&["lanes", SID, "--running"]);
     assert!(out.contains("ccc3") && !out.contains("aaa1"), "{out}");
+    assert!(!out.contains("ddd4"), "a returned lane is not running:\n{out}");
     let (out, _) = w.cv_ok(&["lanes", SID, "--done"]);
     assert!(
-        out.contains("aaa1") && !out.contains("ccc3") && !out.contains("bbb2"),
+        out.contains("aaa1") && out.contains("ddd4") && !out.contains("ccc3") && !out.contains("bbb2"),
         "{out}"
     );
+    // --since: a window on activity (the fixture is long past; a huge window keeps it, a tiny
+    // one empties it).
+    let (out, _) = w.cv_ok(&["lanes", SID, "--since", "9000h"]);
+    assert!(out.contains("4 sub-agents") && out.contains("active since"), "{out}");
+    let (out, _) = w.cv_ok(&["lanes", SID, "--since", "1s"]);
+    assert!(out.contains("no sub-agents") || out.contains("0 sub-agents"), "{out}");
+    let (ok, _, _, err) = w.cv(&["lanes", SID, "--since", "soon"]);
+    assert!(!ok && err.contains("--since takes a duration"), "{err}");
 
     let (json, _) = w.cv_ok(&["lanes", SID, "--json"]);
     let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 4);
+    let d = rows.iter().find(|r| r["agent_id"] == "ddd4").unwrap();
+    assert_eq!(d["status"], "returned");
+    assert_eq!(d["status_source"], "transcript");
+    assert_eq!(d["stranded"], false);
     let by_id = |id: &str| rows.iter().find(|r| r["agent_id"] == id).unwrap().clone();
     let a = by_id("aaa1");
     assert_eq!(a["status"], "completed");

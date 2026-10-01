@@ -1086,6 +1086,8 @@ fn task_list(args: &Value) -> anyhow::Result<String> {
         repo: arg_str(args, "repo").map(std::path::PathBuf::from),
         include_terminal: args.get("all").and_then(Value::as_bool).unwrap_or(false),
         tag: arg_str(args, "tag").map(String::from),
+        // MCP/HTTP see the whole store: scoping is the shell's default, not the wire's.
+        ..Default::default()
     };
     let tasks: Vec<cv_core::task::TaskRow> = cv_core::task::list(&outcome.model, &filter)
         .map_err(|e| anyhow::anyhow!(e))?

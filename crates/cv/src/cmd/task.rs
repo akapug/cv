@@ -10,8 +10,9 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use cv_core::ir::truncate;
 use cv_core::sanitize::sanitize_line;
-use cv_core::task::{self, InboxReason, InboxRow, TaskEventKind, TaskProjection, TaskReadModel, TaskRow, TaskStore};
+use cv_core::task::{self, TaskEventKind, TaskProjection, TaskReadModel, TaskRow, TaskStore};
 
+use super::task_ops::{self, DecisionSpec, EventFilter, Since};
 use crate::util::fmt_local;
 
 /// A text argument that may come from a file: `--body-file`/`--file` (`-` reads stdin). Bodies
@@ -42,12 +43,60 @@ fn parse_tags(csv: &str) -> Vec<String> {
 /// ids are UUID v7: a batch opened in one second shares its first eight hex digits, so the usual
 /// 8-char prefix was ambiguous for every task opened that way — `cv task show <prefix>` refused
 /// what `cv task list` had just printed.
-fn prefix_len(model: &TaskReadModel) -> usize {
+pub(crate) fn prefix_len(model: &TaskReadModel) -> usize {
     task::unique_prefix_len(model.tasks.keys().map(String::as_str), 8)
 }
 
-fn prefix(id: &str, len: usize) -> &str {
+pub(crate) fn prefix(id: &str, len: usize) -> &str {
     id.get(..len).unwrap_or(id)
+}
+
+/// A text argument where `-` means stdin (`--body -`, `--note -`, a bare `-` note).
+fn text_or_stdin(text: String) -> Result<String> {
+    if text == "-" {
+        read_text_arg(Path::new("-"))
+    } else {
+        Ok(text)
+    }
+}
+
+/// `--issue` absolutized at open time, because the record outlives the shell it was typed in —
+/// a relative `--issue` made `sweep` report "issue path no longer exists" the next day. A
+/// relative path is taken against the current directory; when it is not there but is under the
+/// task's `--repo`, the repo wins (that is where it was meant). Nothing found: joined to the cwd
+/// lexically. Handles (`#42`) and URLs pass through untouched.
+fn absolutize_issue(issue: Option<String>, repo: Option<&Path>) -> Option<String> {
+    let issue = issue?;
+    let Some(p) = issue_path(&issue) else {
+        return Some(issue);
+    };
+    let p = Path::new(p);
+    if p.is_absolute() {
+        return Some(issue);
+    }
+    let cwd = std::env::current_dir().ok();
+    let in_cwd = cwd.as_ref().map(|d| d.join(p));
+    let in_repo = repo.map(|r| r.join(p));
+    let chosen = match (&in_cwd, &in_repo) {
+        (Some(c), _) if c.exists() => c.clone(),
+        (_, Some(r)) if r.exists() => r.clone(),
+        (Some(c), _) => c.clone(),
+        (None, Some(r)) => r.clone(),
+        (None, None) => p.to_path_buf(),
+    };
+    let abs = chosen.canonicalize().unwrap_or(chosen);
+    Some(abs.display().to_string())
+}
+
+/// The caller's own endpoint for scoping (`$CV_ENDPOINT`), and the default 14-day window.
+fn scope_window(all: bool, since: Option<&str>, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+    if all {
+        return Ok(None);
+    }
+    match since {
+        Some(s) => Ok(Some(task::parse_since(s, now).map_err(|e| anyhow::anyhow!(e))?)),
+        None => Ok(Some(now - chrono::Duration::days(14))),
+    }
 }
 
 /// Identity resolution (G4) for chat-grade verbs: explicit `--from`, else `CV_ENDPOINT`, else
@@ -68,6 +117,8 @@ pub(crate) enum TaskCmd {
     /// Open a new task. Prints its id.
     Open {
         title: String,
+        /// The body; `-` reads it from stdin (the natural form for a heredoc — backticks inside a
+        /// double-quoted shell string are command-substituted by zsh).
         #[arg(long, default_value = "", conflicts_with = "body_file")]
         body: String,
         /// Read the body from a file (`-` for stdin) — a brief is a document, not a shell string.
@@ -76,7 +127,8 @@ pub(crate) enum TaskCmd {
         /// Repository this task's code work happens in (enables propose/verify/debt).
         #[arg(long)]
         repo: Option<PathBuf>,
-        /// External issue/work handle, free-form.
+        /// External issue/work handle, free-form. A relative path is made absolute at open time
+        /// (the record outlives the shell it was typed in).
         #[arg(long)]
         issue: Option<String>,
         /// Board channel task notifications post to.
@@ -99,9 +151,10 @@ pub(crate) enum TaskCmd {
         #[arg(long)]
         from: Option<String>,
     },
-    /// List tasks (non-terminal by default).
+    /// List tasks: non-terminal, touched in the last 14 days or involving you ($CV_ENDPOINT).
+    /// The hidden count is the last line; `--all` lifts both the window and the terminal filter.
     List {
-        /// Filter by effective state (open|claimed|awaiting_review|ready|merged_local|landed|done|...).
+        /// Filter by effective state (open|claimed|resolved|awaiting_review|ready|landed|done|...).
         #[arg(long)]
         state: Option<String>,
         #[arg(long)]
@@ -111,9 +164,17 @@ pub(crate) enum TaskCmd {
         /// Only tasks carrying this tag.
         #[arg(long)]
         tag: Option<String>,
-        /// Include terminal tasks.
+        /// Only decisions (posed questions) / only actions (work).
+        #[arg(long, group = "kind")]
+        decisions: bool,
+        #[arg(long, group = "kind")]
+        actions: bool,
+        /// Everything: every project, every age, terminal tasks included.
         #[arg(long)]
         all: bool,
+        /// Widen or narrow the window: tasks touched since (`30d`, `2h`, `2026-09-01`, an event id).
+        #[arg(long, value_name = "WHEN", conflicts_with = "all")]
+        since: Option<String>,
         #[arg(long)]
         json: bool,
         /// Tab-separated rows for scripts: full id, state, assignee, repo basename, age, title,
@@ -132,6 +193,16 @@ pub(crate) enum TaskCmd {
         /// Also print the raw event history.
         #[arg(long)]
         events: bool,
+        /// One line per note (author, time, first 150 chars) and the body's first line — a
+        /// 26-note task on one screen.
+        #[arg(long)]
+        brief: bool,
+        /// Only the last N notes.
+        #[arg(long = "notes-last", value_name = "N")]
+        notes_last: Option<usize>,
+        /// Only notes matching this regex (case-insensitive).
+        #[arg(long = "notes-grep", value_name = "PATTERN")]
+        notes_grep: Option<String>,
     },
     /// Claim an open task (first writer wins).
     Claim {
@@ -154,10 +225,10 @@ pub(crate) enum TaskCmd {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Record a progress note.
+    /// Record a progress note. `cv task note <id> -` reads the note from stdin.
     Note {
         id: String,
-        /// The note. Omit it and pass `--file` to read the note from a file.
+        /// The note (`-` = stdin). Omit it and pass `--file` to read the note from a file.
         #[arg(required_unless_present = "file", conflicts_with = "file")]
         text: Option<String>,
         /// Read the note from a file (`-` for stdin).
@@ -229,6 +300,126 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
+    },
+    /// Pose a decision for someone: a task of kind `decision` with a default that stands if they
+    /// stay silent, the alternatives, and an optional deadline. Prints its id.
+    Decide {
+        title: String,
+        /// Who owes the decision (their `cv task inbox` lists it first).
+        #[arg(long = "for", value_name = "WHO")]
+        for_who: String,
+        /// The option that stands if nobody speaks (always one of the options).
+        #[arg(long, value_name = "OPTION")]
+        default: String,
+        /// Another admissible option. Repeatable.
+        #[arg(long = "option", value_name = "OPTION")]
+        options: Vec<String>,
+        /// When the default stands: a duration (`3d`, `48h`), a date (`2026-10-03`) or a datetime.
+        #[arg(long = "by", value_name = "WHEN")]
+        by: Option<String>,
+        /// The question in full (`-` = stdin).
+        #[arg(long, default_value = "", conflicts_with = "body_file")]
+        body: String,
+        #[arg(long = "body-file", value_name = "PATH")]
+        body_file: Option<PathBuf>,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        issue: Option<String>,
+        #[arg(long, default_value = "tasks")]
+        channel: String,
+        /// Extra tags (`decision` is always added).
+        #[arg(long, value_name = "A,B")]
+        tags: Option<String>,
+        /// This decision blocks another task (writes a `blocked_by` on THAT task). Repeatable.
+        #[arg(long = "blocks", value_name = "ID")]
+        blocks: Vec<String>,
+        /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Answer a decision: `--accept-default`, or `--choice "<option>"` (one of the posed options).
+    /// Records WHO resolved it: pass `--from <you>` or set `CV_ENDPOINT` once.
+    Resolve {
+        id: String,
+        #[arg(long, value_name = "OPTION", group = "answer", required = true)]
+        choice: Option<String>,
+        #[arg(long = "accept-default", group = "answer")]
+        accept_default: bool,
+        /// Why (`-` = stdin).
+        #[arg(long)]
+        note: Option<String>,
+        /// The resolver, recorded in `by`. Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+        /// TOFU per-endpoint token authenticating the `--from` claim. Default: $CV_TOKEN.
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Turn every leading-`DECIDE` note on a task into its own decision task (title = the label
+    /// and the question's first clause; default = the text after `Default =`/`Default if
+    /// silent:`/`Recommend:`; options = the `alternative =` clauses), assigned to the task's
+    /// assignee and blocking the task. The notes stay; `show` points each at its decision.
+    Split {
+        id: String,
+        /// Print what would be created without writing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// New task events since a point in time, one JSON line each (the poll surface: hand the
+    /// last event id back as the next `--since`). `--text` renders one human line per event.
+    Events {
+        /// A duration (`2h`), a date, a datetime, an RFC 3339 timestamp, or an event id (exclusive).
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
+        /// Only these kinds (comma-separated: `resolved,done,noted`; `note`/`resolve` spellings ok).
+        #[arg(long, value_name = "K,K")]
+        kind: Option<String>,
+        /// Only events by this endpoint.
+        #[arg(long)]
+        by: Option<String>,
+        /// Hide events by this endpoint (`web:<x>` counts as `<x>`).
+        #[arg(long = "not-by", value_name = "WHO")]
+        not_by: Option<String>,
+        /// Only events on tasks assigned to this endpoint.
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Only events on this task (id or prefix).
+        #[arg(long)]
+        task: Option<String>,
+        /// One human line per event instead of JSON lines.
+        #[arg(long)]
+        text: bool,
+    },
+    /// What `<assignee>` did on their tasks since `--since`: `events --assignee <who>` minus the
+    /// caller's own events (so an orchestrator polling at each check-in sees only the news).
+    Watch {
+        #[arg(long)]
+        assignee: String,
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
+        /// Whose events to hide. Default: $CV_ENDPOINT.
+        #[arg(long = "not-by", value_name = "WHO")]
+        not_by: Option<String>,
+        #[arg(long)]
+        text: bool,
+    },
+    /// A local web inbox served by cv itself: decisions with their options as buttons, actions,
+    /// claimed work, notes — every button records the same event the CLI would. Loopback only
+    /// unless `--bind 0.0.0.0:<port>` is passed explicitly (then any device on the LAN can act as
+    /// `web:<assignee>`).
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        bind: String,
+        /// Whose inbox the page opens on (`?who=` overrides per request). Default: $CV_ENDPOINT.
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Open the page in the default browser once the server is up.
+        #[arg(long)]
+        open: bool,
     },
     /// Candidates for closing, from what git and the filesystem say — never closes anything.
     /// Lists non-terminal tasks whose `--issue` path no longer exists, or whose title/body names a
@@ -318,12 +509,25 @@ pub(crate) enum TaskCmd {
         #[arg(long = "skip-landed")]
         skip_landed: bool,
     },
-    /// What needs `<who>`: assigned/claimed tasks, reviews awaiting them, their unlanded work.
+    /// What needs `<who>`: decisions owed (default + options on one line each), then assigned
+    /// actions, claimed work, reviews, unlanded work. Same 14-day window as `list`.
     Inbox {
         /// Endpoint to compute the inbox for. Default: $CV_ENDPOINT, else "cv".
         who: Option<String>,
         #[arg(long)]
         json: bool,
+        /// The whole inbox as a Markdown page: each item's body and the first line of each note.
+        #[arg(long, conflicts_with = "json")]
+        md: bool,
+        /// Only items whose last event is NOT by `<who>` (news for them).
+        #[arg(long)]
+        unread: bool,
+        /// Every age (no 14-day window).
+        #[arg(long)]
+        all: bool,
+        /// Items touched since (`30d`, `2026-09-01`, …).
+        #[arg(long, value_name = "WHEN", conflicts_with = "all")]
+        since: Option<String>,
     },
     /// Reviewed-but-unlanded work, grouped by repo, oldest first. The honest debt view.
     Debt {
@@ -457,30 +661,6 @@ fn task_row_wide(t: &TaskProjection, model: &TaskReadModel, now: DateTime<Utc>, 
     out
 }
 
-/// One `cv task inbox` row, stalest first upstream: a `⏰` leads anything waiting > 24h. A
-/// projection of age, not an escalation — the marker is the whole mechanism.
-fn inbox_row(r: &InboxRow, now: DateTime<Utc>, plen: usize) -> String {
-    let stale = now.signed_duration_since(r.since) > chrono::Duration::hours(24);
-    format!(
-        "{} {:<plen$}  {:>4}  {:16} {}",
-        if stale { "⏰" } else { "  " },
-        prefix(&r.id, plen),
-        task::age_short(r.since, now),
-        r.effective_state,
-        sanitize_line(&r.title)
-    )
-}
-
-/// The inbox's groups, in the order they are printed: a decision owed is the slowest blocker a
-/// fleet has, so it comes first; then the work that is yours; then what others wait on you for.
-const INBOX_GROUPS: &[(InboxReason, &str)] = &[
-    (InboxReason::DecisionOwed, "decisions owed"),
-    (InboxReason::ClaimedByYou, "claimed"),
-    (InboxReason::AwaitingYourReview, "reviews"),
-    (InboxReason::YourUnlandedWork, "unlanded"),
-    (InboxReason::AssignedOpen, "assigned, unclaimed"),
-];
-
 pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
     match action {
         TaskCmd::Open {
@@ -503,9 +683,10 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 ),
                 None => None,
             };
+            let issue = absolutize_issue(issue, repo.as_deref());
             let body = match &body_file {
                 Some(p) => read_text_arg(p)?,
-                None => body,
+                None => text_or_stdin(body)?,
             };
             let tags = tags.as_deref().map(parse_tags).unwrap_or_default();
             // Relations name other tasks: resolve every prefix BEFORE the open, so a typo refuses
@@ -549,20 +730,48 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             assignee,
             repo,
             tag,
+            decisions,
+            actions,
             all,
+            since,
             json,
             tsv,
             wide,
         } => {
             let outcome = replay_loud()?;
+            let now = Utc::now();
+            let touched_since = scope_window(all, since.as_deref(), now)?;
+            let caller = task::default_endpoint();
             let filter = task::TaskFilter {
                 state,
                 assignee,
                 repo,
                 include_terminal: all,
                 tag,
+                touched_since,
+                or_involving: caller,
+                decisions: if decisions {
+                    Some(true)
+                } else if actions {
+                    Some(false)
+                } else {
+                    None
+                },
             };
             let tasks = task::list(&outcome.model, &filter).map_err(|e| anyhow::anyhow!(e))?;
+            // What the window hid: the same filter with no window, minus what it kept.
+            let hidden = if touched_since.is_some() {
+                let unscoped = task::TaskFilter {
+                    touched_since: None,
+                    or_involving: None,
+                    ..filter.clone()
+                };
+                task::list(&outcome.model, &unscoped)
+                    .map(|v| v.len().saturating_sub(tasks.len()))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             if json {
                 // The full projections, unchanged wire shape (`show --json` sibling).
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
@@ -591,18 +800,32 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             } else if tasks.iter().any(|t| task::is_blocked(&outcome.model, t)) {
                 println!("⊘ = blocked by a task that has not finished");
             }
+            if hidden > 0 {
+                println!("({hidden} older task(s) hidden — `--all`, or `--since 90d`)");
+            }
             Ok(())
         }
-        TaskCmd::Show { id, json, events } => {
+        TaskCmd::Show {
+            id,
+            json,
+            events,
+            brief,
+            notes_last,
+            notes_grep,
+        } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             let t = &outcome.model.tasks[&id];
+            let grep = match &notes_grep {
+                Some(p) => Some(regex::RegexBuilder::new(p).case_insensitive(true).build()?),
+                None => None,
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(t)?);
             } else {
                 // Every free-text field below came from the durable log — sanitize at render
                 // (G5): titles, notes, endpoints, and branch names are all untrusted.
-                println!("task {}  [{}]", t.task_id, task::effective_display(t));
+                println!("task {}  [{}]  {}", t.task_id, task::effective_display(t), t.kind());
                 // Provenance for the terminal facts: a self-reported completion is labeled as
                 // such (never silently equal to a verified land), and landing carries the
                 // verifier's freshness read.
@@ -630,7 +853,11 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 }
                 println!("  title:    {}", sanitize_line(&t.title));
                 if !t.body.is_empty() {
-                    println!("  body:     {}", sanitize_line(&t.body));
+                    if brief {
+                        println!("  body:     {}", task_ops::first_line(&t.body, 160));
+                    } else {
+                        println!("  body:     {}", sanitize_line(&t.body));
+                    }
                 }
                 if let Some(repo) = &t.repo {
                     println!("  repo:     {}", repo.display());
@@ -671,6 +898,40 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     fmt_local(t.opened_at, "%Y-%m-%d %H:%M"),
                     sanitize_line(&t.opened_by)
                 );
+                if let Some(d) = &t.decision {
+                    let deadline = d
+                        .deadline
+                        .map(|dl| format!(" · {}", task_ops::deadline_phrase(dl, show_now)))
+                        .unwrap_or_default();
+                    println!(
+                        "  decision: posed {} by {}{deadline}",
+                        fmt_local(d.posed_at, "%Y-%m-%d %H:%M"),
+                        sanitize_line(&d.posed_by)
+                    );
+                    println!("    default:  {}", sanitize_line(&d.default_choice));
+                    for a in d.alternatives() {
+                        println!("    option:   {}", sanitize_line(a));
+                    }
+                    match &d.resolution {
+                        Some(r) => println!(
+                            "    resolved: {} — by {}, {}{}{}",
+                            sanitize_line(&r.choice),
+                            sanitize_line(&r.by),
+                            fmt_local(r.ts, "%Y-%m-%d %H:%M"),
+                            if r.accepted_default { " (the default)" } else { "" },
+                            r.note
+                                .as_deref()
+                                .map(|n| format!(" · {}", sanitize_line(n)))
+                                .unwrap_or_default()
+                        ),
+                        None if !t.state.is_terminal() => println!(
+                            "    resolve:  cv task resolve {} --accept-default --from {}",
+                            prefix(&t.task_id, plen),
+                            sanitize_line(t.assignee.as_deref().unwrap_or("<you>"))
+                        ),
+                        None => {}
+                    }
+                }
                 for rev in &t.revisions {
                     println!(
                         "  rev {}: {} [{}] {} → {}",
@@ -717,13 +978,42 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                         println!("         ⚠ {}", sanitize_line(&issue.describe()));
                     }
                 }
-                for note in &t.notes {
+                let children = task_ops::split_children(&outcome.model);
+                let selected: Vec<&cv_core::task::Note> = t
+                    .notes
+                    .iter()
+                    .filter(|n| grep.as_ref().is_none_or(|re| re.is_match(&n.text)))
+                    .collect();
+                let skip = notes_last.map_or(0, |k| selected.len().saturating_sub(k));
+                let shown = &selected[skip..];
+                if !t.notes.is_empty() && (brief || shown.len() != t.notes.len()) {
                     println!(
-                        "  note ({}, {}): {}",
-                        sanitize_line(&note.by),
-                        fmt_local(note.ts, "%Y-%m-%d %H:%M"),
-                        sanitize_line(&note.text)
+                        "  notes:    {} of {} (newest last){}",
+                        shown.len(),
+                        t.notes.len(),
+                        if brief { " — one line each; drop --brief for the full text" } else { "" }
                     );
+                }
+                for note in shown {
+                    let split = children
+                        .get(&note.event_id)
+                        .map(|c| format!("  → split into {}", prefix(c, plen)))
+                        .unwrap_or_default();
+                    if brief {
+                        println!(
+                            "    {} {:<24} {}{split}",
+                            fmt_local(note.ts, "%m-%d %H:%M"),
+                            truncate(&sanitize_line(&note.by), 24),
+                            task_ops::first_line(&note.text, 150)
+                        );
+                    } else {
+                        println!(
+                            "  note ({}, {}): {}{split}",
+                            sanitize_line(&note.by),
+                            fmt_local(note.ts, "%Y-%m-%d %H:%M"),
+                            sanitize_line(&note.text)
+                        );
+                    }
                 }
             }
             if events {
@@ -759,7 +1049,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             let text = match (text, file) {
-                (Some(t), _) => t,
+                (Some(t), _) => text_or_stdin(t)?,
                 (None, Some(f)) => read_text_arg(&f)?,
                 (None, None) => unreachable!("clap requires text or --file"),
             };
@@ -959,34 +1249,271 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             fetch,
             skip_landed,
         } => cmd_verify(id, all, fetch, skip_landed),
-        TaskCmd::Inbox { who, json } => {
+        TaskCmd::Inbox {
+            who,
+            json,
+            md,
+            unread,
+            all,
+            since,
+        } => {
             // Bare `cv task inbox` means "my inbox": the spawner-set CV_ENDPOINT, else "cv".
             let who = from_or_cv(who);
             let outcome = replay_loud()?;
+            let now = Utc::now();
+            let window = scope_window(all, since.as_deref(), now)?;
+            let caller = task::default_endpoint();
+            let page = task_ops::inbox_page(&outcome, &who, caller.as_deref(), window, unread, now);
             if json {
-                // The full entries, unchanged wire shape.
-                let entries = task::inbox(&outcome.model, &who);
+                // The full entries, unchanged wire shape (`task` embeds the whole projection,
+                // decision facet included); `--unread`/the window narrow which entries appear.
+                let keep: std::collections::HashSet<&str> = page.items.iter().map(|i| i.id.as_str()).collect();
+                let entries: Vec<_> = task::inbox(&outcome.model, &who)
+                    .into_iter()
+                    .filter(|e| keep.contains(e.task.task_id.as_str()))
+                    .collect();
                 println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if md {
+                print!("{}", task_ops::render_inbox_md(&page));
             } else {
-                let rows = InboxRow::compute(&outcome.model, &who);
-                let now = Utc::now();
-                let plen = prefix_len(&outcome.model);
-                if rows.is_empty() {
-                    println!("(inbox empty for {})", sanitize_line(&who));
-                }
-                // Grouped, stalest first within a group (the rows arrive stalest first overall).
-                for (reason, label) in INBOX_GROUPS {
-                    let group: Vec<&InboxRow> = rows.iter().filter(|r| r.reason == *reason).collect();
-                    if group.is_empty() {
-                        continue;
-                    }
-                    println!("{label} ({}):", group.len());
-                    for r in group {
-                        println!("{}", inbox_row(r, now, plen));
-                    }
-                }
+                print!("{}", task_ops::render_inbox_text(&page));
             }
             Ok(())
+        }
+        TaskCmd::Decide {
+            title,
+            for_who,
+            default,
+            options,
+            by,
+            body,
+            body_file,
+            repo,
+            issue,
+            channel,
+            tags,
+            blocks,
+            from,
+        } => {
+            let repo = match repo {
+                Some(r) => Some(
+                    r.canonicalize()
+                        .with_context(|| format!("repo {} not found", r.display()))?,
+                ),
+                None => None,
+            };
+            let body = match &body_file {
+                Some(p) => read_text_arg(p)?,
+                None => text_or_stdin(body)?,
+            };
+            let now = Utc::now();
+            let deadline = match by {
+                Some(b) => Some(task::parse_deadline(&b, now).map_err(|e| anyhow::anyhow!(e))?),
+                None => None,
+            };
+            let blocks = {
+                let outcome = replay_loud()?;
+                blocks
+                    .iter()
+                    .map(|p| resolve(&outcome.model, p).map(str::to_string))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let issue = absolutize_issue(issue, repo.as_deref());
+            let spec = DecisionSpec {
+                title,
+                body,
+                for_who,
+                default_choice: default,
+                options,
+                deadline,
+                repo,
+                issue,
+                channel,
+                tags: tags.as_deref().map(parse_tags).unwrap_or_default(),
+                source: None,
+                blocks,
+            };
+            let store = TaskStore::default_store();
+            let (events, warnings) = task_ops::pose(&store, &from_or_cv(from), spec)?;
+            for w in &warnings {
+                eprintln!("⚠ {}", sanitize_line(w));
+            }
+            let id = events[0].task_id.clone();
+            let for_who = match &events[0].kind {
+                TaskEventKind::Opened { assignee, .. } => assignee.clone().unwrap_or_default(),
+                _ => String::new(),
+            };
+            println!("✦ decision {} posed for {}", prefix(&id, 13), sanitize_line(&for_who));
+            println!("{id}");
+            Ok(())
+        }
+        TaskCmd::Resolve {
+            id,
+            choice,
+            accept_default,
+            note,
+            from,
+            token,
+        } => {
+            let outcome = replay_loud()?;
+            let id = resolve(&outcome.model, &id)?.to_string();
+            let t = &outcome.model.tasks[&id];
+            // The resolver is the fact that matters; never guessed. The error names the cure
+            // with the decision's own assignee filled in.
+            let from = match from.or_else(task::default_endpoint) {
+                Some(f) => f,
+                None => bail!(
+                    "a resolution records WHO decided: this decision is for {owner} — if that is you,\n  \
+                     cv task resolve {short} {answer} --from {owner}\n  (or `export CV_ENDPOINT={owner}` once)",
+                    owner = t.assignee.as_deref().unwrap_or("<you>"),
+                    short = prefix(&id, 13),
+                    answer = match &choice {
+                        Some(c) => format!("--choice {c:?}"),
+                        None => "--accept-default".into(),
+                    }
+                ),
+            };
+            let note = match note {
+                Some(n) => Some(text_or_stdin(n)?),
+                None => None,
+            };
+            let store = TaskStore::default_store();
+            let answer = task_ops::Answer::from_flags(choice, accept_default)?;
+            let report = task_ops::resolve(&store, &outcome.model, &from, token, &id, answer, note)?;
+            for w in report.replay_warnings.iter().chain(&report.warnings) {
+                eprintln!("⚠ {}", sanitize_line(w));
+            }
+            if let TaskEventKind::Resolved { choice, .. } = &report.event.kind {
+                println!(
+                    "✦ resolved {} → {} (by {})",
+                    prefix(&id, 13),
+                    sanitize_line(choice),
+                    sanitize_line(&from)
+                );
+            }
+            Ok(())
+        }
+        TaskCmd::Split { id, dry_run, from } => {
+            let outcome = replay_loud()?;
+            let id = resolve(&outcome.model, &id)?.to_string();
+            let plan = task_ops::plan_split(&outcome.model, &id)?;
+            let plen = prefix_len(&outcome.model);
+            let t = &outcome.model.tasks[&id];
+            if plan.items.is_empty() {
+                println!(
+                    "no leading-DECIDE notes on {} ({} note(s){})",
+                    prefix(&id, plen),
+                    t.notes.len(),
+                    if plan.mid_text > 0 {
+                        format!("; {} mention DECIDE mid-text — split takes notes that START with DECIDE", plan.mid_text)
+                    } else {
+                        String::new()
+                    }
+                );
+                return Ok(());
+            }
+            println!(
+                "# {} DECIDE note(s) on {} — {}{}",
+                plan.items.len(),
+                prefix(&id, plen),
+                sanitize_line(&t.title),
+                if dry_run { " (dry run: nothing written)" } else { "" }
+            );
+            for (i, item) in plan.items.iter().enumerate() {
+                println!(
+                    "{:>2}. {}{}",
+                    i + 1,
+                    sanitize_line(&item.title),
+                    match &item.existing {
+                        Some(c) => format!("  (already split → {})", prefix(c, plen)),
+                        None => String::new(),
+                    }
+                );
+                println!("    default: {}", sanitize_line(&item.default_choice));
+                for o in item.options.iter().skip(1) {
+                    println!("    option:  {}", sanitize_line(o));
+                }
+                println!(
+                    "    from note by {} at {}",
+                    sanitize_line(&item.note_by),
+                    fmt_local(item.note_ts, "%m-%d %H:%M")
+                );
+            }
+            if plan.mid_text > 0 {
+                println!(
+                    "({} other note(s) mention DECIDE mid-text; not split — move the DECIDE to the front of a note to split it)",
+                    plan.mid_text
+                );
+            }
+            if dry_run {
+                return Ok(());
+            }
+            let store = TaskStore::default_store();
+            let (created, warnings) = task_ops::run_split(&store, &outcome.model, &from_or_cv(from), &plan)?;
+            for w in &warnings {
+                eprintln!("⚠ {}", sanitize_line(w));
+            }
+            println!();
+            for (_, child) in &created {
+                println!("✦ decision {} posed for {}", prefix(child, 13), sanitize_line(t.assignee.as_deref().unwrap_or("-")));
+            }
+            println!(
+                "{} decision(s) created, each blocking {} · `cv task inbox {}` lists them first",
+                created.len(),
+                prefix(&id, plen),
+                sanitize_line(t.assignee.as_deref().unwrap_or("<assignee>"))
+            );
+            Ok(())
+        }
+        TaskCmd::Events {
+            since,
+            kind,
+            by,
+            not_by,
+            assignee,
+            task: task_id,
+            text,
+        } => {
+            let outcome = replay_loud()?;
+            let now = Utc::now();
+            let task_id = match task_id {
+                Some(p) => Some(resolve(&outcome.model, &p)?.to_string()),
+                None => None,
+            };
+            let f = EventFilter {
+                since: Since::parse(since.as_deref(), now)?,
+                kinds: kind
+                    .as_deref()
+                    .map(|k| k.split(',').map(task_ops::kind_tag).collect())
+                    .unwrap_or_default(),
+                by,
+                not_by,
+                assignee,
+                task: task_id,
+            };
+            print_events(&outcome, &f, text)
+        }
+        TaskCmd::Watch {
+            assignee,
+            since,
+            not_by,
+            text,
+        } => {
+            let outcome = replay_loud()?;
+            let now = Utc::now();
+            let f = EventFilter {
+                since: Since::parse(since.as_deref(), now)?,
+                kinds: Vec::new(),
+                by: None,
+                not_by: not_by.or_else(task::default_endpoint),
+                assignee: Some(assignee),
+                task: None,
+            };
+            print_events(&outcome, &f, text)
+        }
+        TaskCmd::Serve { bind, assignee, open } => {
+            let who = assignee.or_else(task::default_endpoint);
+            super::task_serve::run(&bind, who, open)
         }
         TaskCmd::Debt { repo, json } => {
             let outcome = replay_loud()?;
@@ -1130,6 +1657,25 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `cv task events` / `cv task watch`: one line per event, JSON by default (the poll surface),
+/// `--text` for people. The next cursor (the last event id) goes to stderr so stdout stays pure.
+fn print_events(outcome: &cv_core::task::ReplayOutcome, f: &EventFilter, text: bool) -> Result<()> {
+    let events = task_ops::select_events(outcome, f);
+    let plen = prefix_len(&outcome.model);
+    for ev in &events {
+        if text {
+            println!("{}", task_ops::event_text(ev, &outcome.model, plen));
+        } else {
+            println!("{}", serde_json::to_string(&task_ops::event_json(ev, &outcome.model))?);
+        }
+    }
+    match events.last() {
+        Some(last) => eprintln!("# {} event(s) · next: --since {}", events.len(), last.id),
+        None => eprintln!("# no events"),
+    }
+    Ok(())
 }
 
 /// A compact human phrase for a fact's freshness — how it was learned and when. Reused across the
@@ -1305,7 +1851,7 @@ fn cmd_verify(id: Option<String>, all: bool, fetch: bool, skip_landed: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cv_core::task::{InboxEntry, InboxReason, TaskProjection, TaskState};
+    use cv_core::task::{TaskProjection, TaskState};
 
     fn proj(title: &str, last_ts: &str) -> TaskProjection {
         TaskProjection {
@@ -1329,6 +1875,7 @@ mod tests {
             done_check: None,
             tags: Vec::new(),
             blocked_by: Vec::new(),
+            decision: None,
         }
     }
 
@@ -1340,29 +1887,6 @@ mod tests {
         assert!(row.contains("  3d  "), "age column from last_ts: {row}");
         assert!(row.contains("eviltitle!"), "payload stripped: {row}");
         assert!(!row.contains('\u{1b}'), "no ESC survives: {row}");
-    }
-
-    #[test]
-    fn inbox_row_marks_older_than_24h_and_strips_ansi() {
-        let t = proj("t\u{1b}[31mred", "2026-07-13T00:00:00Z");
-        let now: DateTime<Utc> = "2026-07-16T00:00:00Z".parse().unwrap();
-        let stale = InboxRow::from_entry(&InboxEntry {
-            task: &t,
-            reason: InboxReason::ClaimedByYou,
-            since: "2026-07-13T00:00:00Z".parse().unwrap(),
-        });
-        let row = inbox_row(&stale, now, 8);
-        assert!(row.starts_with("⏰"), "24h+ rows lead with the marker: {row}");
-        assert!(row.contains("tred") && !row.contains('\u{1b}'), "{row}");
-
-        let fresh = InboxRow::from_entry(&InboxEntry {
-            task: &t,
-            reason: InboxReason::ClaimedByYou,
-            since: "2026-07-15T12:00:00Z".parse().unwrap(),
-        });
-        let row = inbox_row(&fresh, now, 8);
-        assert!(!row.contains('⏰'), "young rows carry no marker: {row}");
-        assert!(row.contains("12h"), "{row}");
     }
 
     #[test]

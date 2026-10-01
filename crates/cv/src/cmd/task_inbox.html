@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>cv inbox</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --fg: #1a1a1a; --muted: #6b6b66; --card: #ffffff; --line: #dcdcd6;
+    --accent: #2457c5; --accent-fg: #ffffff; --ok: #1f7a3a; --warn: #b4540a; --soft: #eef1f8;
+    --danger: #a32d2d; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141416; --fg: #ececea; --muted: #9a9a94; --card: #1e1e22; --line: #34343a;
+      --accent: #7ea2ff; --accent-fg: #0b1430; --ok: #6fd48c; --warn: #f0a252; --soft: #26293a;
+      --danger: #ff8080;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  body { padding: 0 16px calc(24px + env(safe-area-inset-bottom)); max-width: 820px; margin: 0 auto; }
+  header { position: sticky; top: 0; background: var(--bg); padding: 12px 0 8px; z-index: 2;
+    border-bottom: 1px solid var(--line); }
+  h1 { font-size: 20px; margin: 0 0 4px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  h1 input { font: inherit; font-weight: 600; width: 10ch; background: transparent; color: var(--fg);
+    border: 0; border-bottom: 1px dashed var(--line); padding: 0 2px; }
+  .counter { color: var(--muted); font-size: 13px; }
+  .tabs { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  .tabs button, .btn { font: inherit; font-size: 14px; padding: 6px 12px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+  .tabs button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+    margin: 22px 0 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 14px; margin: 0 0 10px; }
+  .card.unread { border-left: 3px solid var(--accent); }
+  .title { font-weight: 600; font-size: 16px; margin: 0; overflow-wrap: anywhere; }
+  .meta { color: var(--muted); font-size: 12.5px; margin: 4px 0 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .meta code { font-family: var(--mono); font-size: 12px; }
+  .stale { color: var(--warn); }
+  .overdue { color: var(--danger); font-weight: 600; }
+  .body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; margin: 0 0 8px; }
+  .body.clipped { max-height: 7.2em; overflow: hidden; position: relative; }
+  .more { color: var(--accent); background: none; border: 0; padding: 0; font: inherit; font-size: 13px; cursor: pointer; }
+  .decision { background: var(--soft); border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
+  .decision .default { margin: 0 0 8px; }
+  .decision .default b { color: var(--ok); }
+  .choices { display: flex; flex-wrap: wrap; gap: 8px; }
+  .choices .btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .choices .btn.quiet { color: var(--muted); }
+  .btn.danger { color: var(--danger); }
+  .btn:disabled { opacity: .5; cursor: progress; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+  .notes { margin: 8px 0 0; padding: 0; list-style: none; font-size: 13.5px; }
+  .notes li { padding: 6px 0; border-top: 1px dashed var(--line); overflow-wrap: anywhere; }
+  .notes .who { color: var(--muted); font-size: 12px; }
+  .notes .text { white-space: pre-wrap; }
+  .notebox { display: flex; gap: 8px; margin-top: 8px; }
+  .notebox textarea { flex: 1; font: inherit; font-size: 14px; min-height: 38px; padding: 8px 10px;
+    border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); resize: vertical; }
+  .resolved { color: var(--ok); }
+  .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+  .err { color: var(--danger); font-size: 13px; margin: 6px 0; white-space: pre-wrap; }
+  .tag { font-size: 11px; border: 1px solid var(--line); border-radius: 6px; padding: 0 5px; color: var(--muted); }
+  footer { color: var(--muted); font-size: 12px; margin-top: 24px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Inbox · <input id="who" value="" placeholder="who?" aria-label="whose inbox"></h1>
+  <div class="counter" id="counter">loading…</div>
+  <div class="tabs">
+    <button data-scope="open" class="on">Open</button>
+    <button data-scope="closed">Resolved</button>
+    <button data-scope="all">All</button>
+    <button id="refresh" title="reload">↻</button>
+  </div>
+</header>
+<main id="main"></main>
+<footer>served by <code>cv task serve</code> · every button records the same event the CLI would, as <code>web:&lt;who&gt;</code></footer>
+<script>
+(function () {
+  'use strict';
+  var state = { who: '', scope: 'open', page: null, busy: false, expanded: {} };
+  var $ = function (s) { return document.querySelector(s); };
+  var el = function (tag, attrs, children) {
+    var e = document.createElement(tag);
+    if (attrs) Object.keys(attrs).forEach(function (k) {
+      if (k === 'class') e.className = attrs[k];
+      else if (k === 'text') e.textContent = attrs[k];
+      else if (k.slice(0, 2) === 'on') e.addEventListener(k.slice(2), attrs[k]);
+      else e.setAttribute(k, attrs[k]);
+    });
+    (children || []).forEach(function (c) { if (c != null) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+    return e;
+  };
+  var GROUPS = [
+    ['decision_owed', 'Decisions owed'],
+    ['assigned_open', 'Assigned actions'],
+    ['claimed_by_you', 'Claimed work'],
+    ['awaiting_your_review', 'Reviews'],
+    ['your_unlanded_work', 'Unlanded']
+  ];
+
+  function params() {
+    var p = new URLSearchParams(location.search);
+    state.who = p.get('who') || '';
+    $('#who').value = state.who;
+  }
+
+  function load() {
+    var url = '/api/inbox' + (state.who ? '?who=' + encodeURIComponent(state.who) : '');
+    return fetch(url, { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (page) {
+      if (page.error) { $('#counter').textContent = page.error; $('#main').textContent = ''; return; }
+      state.page = page;
+      if (!state.who) { state.who = page.who; $('#who').value = page.who; }
+      render();
+    }).catch(function (e) { $('#counter').textContent = 'cannot reach cv task serve: ' + e; });
+  }
+
+  function fmtTs(iso) {
+    var d = new Date(iso);
+    var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+    return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  function render() {
+    var page = state.page, c = page.counts, main = $('#main');
+    $('#counter').textContent = c.decisions + ' decision' + (c.decisions === 1 ? '' : 's') + ' owed · ' +
+      c.assigned + ' assigned · ' + c.claimed + ' claimed · ' + c.reviews + ' review' + (c.reviews === 1 ? '' : 's') +
+      ' · ' + c.unread + ' unread' + (page.hidden ? ' · ' + page.hidden + ' older hidden' : '') +
+      ' · ' + c.closed + ' closed';
+    main.textContent = '';
+    var any = false;
+    if (state.scope !== 'closed') {
+      GROUPS.forEach(function (g) {
+        var items = page.items.filter(function (i) { return i.reason === g[0]; });
+        if (!items.length) return;
+        any = true;
+        main.appendChild(el('h2', { text: g[1] + ' (' + items.length + ')' }));
+        items.forEach(function (i) { main.appendChild(card(i, false)); });
+      });
+    }
+    if (state.scope !== 'open' && page.closed.length) {
+      any = true;
+      main.appendChild(el('h2', { text: 'Closed (' + page.closed.length + ')' }));
+      page.closed.forEach(function (i) { main.appendChild(card(i, true)); });
+    }
+    if (!any) main.appendChild(el('div', { class: 'empty', text: state.scope === 'closed' ? 'nothing closed in the window' : 'nothing waits on you ( ◕‿◕ )' }));
+  }
+
+  function card(i, closed) {
+    var meta = [el('code', { text: i.short }), el('span', { text: i.state })];
+    if (i.decision) meta.push(el('span', { class: i.stale && !closed ? 'stale' : '', text: 'asked ' + i.age + ' ago by ' + i.opened_by }));
+    else meta.push(el('span', { class: i.stale && !closed ? 'stale' : '', text: (closed ? 'closed ' : 'waiting ') + i.age + ' ago' }));
+    if (i.decision && i.decision.deadline_phrase) meta.push(el('span', { class: /OVERDUE/.test(i.decision.deadline_phrase) ? 'overdue' : '', text: i.decision.deadline_phrase }));
+    if (i.unread && !closed) meta.push(el('span', { text: 'last: ' + i.last_by }));
+    if (i.blocked) meta.push(el('span', { class: 'tag', text: 'blocked' }));
+    (i.tags || []).forEach(function (t) { if (t !== 'decision') meta.push(el('span', { class: 'tag', text: '#' + t })); });
+
+    var kids = [el('p', { class: 'title', text: i.title }), el('div', { class: 'meta' }, meta)];
+    if (i.body && i.body.trim()) {
+      var long = i.body.length > 420 && !state.expanded[i.id];
+      var body = el('div', { class: 'body' + (long ? ' clipped' : ''), text: i.body });
+      kids.push(body);
+      if (long) kids.push(el('button', { class: 'more', text: 'show all', onclick: function () { state.expanded[i.id] = true; render(); } }));
+    }
+    if (i.decision) kids.push(decisionBlock(i, closed));
+    if (!closed && !i.decision) kids.push(actionBlock(i));
+    if (closed) kids.push(el('div', { class: 'actions' }, [el('button', { class: 'btn quiet', text: 'Reopen as a new task', onclick: function () { act(i, 'reopen', {}); } })]));
+    kids.push(el('div', { class: 'err', id: 'err-' + i.id }));
+    if (i.notes.length) {
+      kids.push(el('ul', { class: 'notes' }, i.notes.map(function (n) {
+        return el('li', {}, [
+          el('div', { class: 'who', text: n.by + ' · ' + fmtTs(n.ts) + (n.split_into ? ' · split into ' + n.split_into.slice(0, 13) : '') }),
+          el('div', { class: 'text', text: n.text })
+        ]);
+      })));
+    }
+    if (!closed) {
+      var ta = el('textarea', { placeholder: 'note…', rows: '1' });
+      kids.push(el('div', { class: 'notebox' }, [ta, el('button', { class: 'btn', text: 'Save', onclick: function () {
+        if (!ta.value.trim()) return;
+        act(i, 'note', { text: ta.value });
+      } })]));
+    }
+    return el('div', { class: 'card' + (i.unread && !closed ? ' unread' : '') }, kids);
+  }
+
+  function decisionBlock(i, closed) {
+    var d = i.decision;
+    if (d.resolution) {
+      var r = d.resolution;
+      return el('div', { class: 'decision' }, [
+        el('p', { class: 'default resolved', text: '✓ ' + r.choice + (r.accepted_default ? ' (the default)' : '') + ' — ' + r.by + ', ' + fmtTs(r.ts) + (r.note ? ' · ' + r.note : '') })
+      ]);
+    }
+    var buttons = [el('button', { class: 'btn primary', text: 'Accept default', onclick: function () { act(i, 'resolve', { accept_default: true }); } })];
+    d.alternatives.forEach(function (o) {
+      buttons.push(el('button', { class: 'btn', text: o.length > 60 ? o.slice(0, 57) + '…' : o, title: o, onclick: function () { act(i, 'resolve', { choice: o }); } }));
+    });
+    buttons.push(el('button', { class: 'btn quiet', text: 'Needs discussion', onclick: function () {
+      var why = prompt('What needs discussing? (optional)') ;
+      if (why === null) return;
+      act(i, 'discuss', { text: why });
+    } }));
+    return el('div', { class: 'decision' }, [
+      el('p', { class: 'default' }, [el('b', { text: 'default: ' }), d.default_choice ? d.default_choice : d['default']]),
+      closed ? null : el('div', { class: 'choices' }, buttons)
+    ]);
+  }
+
+  function actionBlock(i) {
+    var b = [];
+    if (i.reason === 'assigned_open') b.push(el('button', { class: 'btn', text: 'Claim', onclick: function () { act(i, 'claim', {}); } }));
+    if (i.reason === 'claimed_by_you') b.push(el('button', { class: 'btn quiet', text: 'Release', onclick: function () { act(i, 'release', {}); } }));
+    if (i.reason === 'assigned_open' || i.reason === 'claimed_by_you') b.push(el('button', { class: 'btn primary', text: 'Done', onclick: function () {
+      var obs = prompt('Observed where? (a path, url, or a word — optional)');
+      if (obs === null) return;
+      act(i, 'done', { observed: obs });
+    } }));
+    return el('div', { class: 'actions' }, b);
+  }
+
+  function act(i, verb, body) {
+    if (state.busy) return;
+    state.busy = true;
+    body.who = state.who;
+    document.querySelectorAll('.btn').forEach(function (b) { b.disabled = true; });
+    fetch('/api/task/' + encodeURIComponent(i.id) + '/' + verb, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); }).then(function (res) {
+      state.busy = false;
+      if (res.error) { var e = document.getElementById('err-' + i.id); if (e) e.textContent = res.error; document.querySelectorAll('.btn').forEach(function (b) { b.disabled = false; }); return; }
+      load();
+    }).catch(function (e) { state.busy = false; alert('request failed: ' + e); load(); });
+  }
+
+  document.querySelectorAll('.tabs button[data-scope]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      document.querySelectorAll('.tabs button[data-scope]').forEach(function (x) { x.classList.remove('on'); });
+      b.classList.add('on');
+      state.scope = b.getAttribute('data-scope');
+      render();
+    });
+  });
+  $('#refresh').addEventListener('click', load);
+  $('#who').addEventListener('change', function () {
+    state.who = $('#who').value.trim();
+    var p = new URLSearchParams(location.search); p.set('who', state.who);
+    history.replaceState(null, '', '?' + p.toString());
+    load();
+  });
+  params();
+  load();
+  setInterval(function () { if (!state.busy && document.visibilityState === 'visible') load(); }, 30000);
+})();
+</script>
+</body>
+</html>

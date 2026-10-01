@@ -207,10 +207,27 @@ fn lane_passes(l: &Lane, f: LaneFilter) -> bool {
     }
 }
 
-pub(crate) fn cmd_lanes(id: &str, harness: Option<String>, filter: LaneFilter, json: bool) -> Result<()> {
+pub(crate) fn cmd_lanes(
+    id: &str,
+    harness: Option<String>,
+    filter: LaneFilter,
+    since: Option<String>,
+    json: bool,
+) -> Result<()> {
     let want = parse_harness(&harness)?;
     let (r, _adapter) = resolve(id, want)?;
-    let all = cv_core::lanes::lanes_of(&r);
+    let since = match since {
+        Some(s) => {
+            let d = cv_core::task::parse_duration(&s)
+                .ok_or_else(|| anyhow::anyhow!("--since takes a duration: 30m, 2h, 1d, 1w (got {s:?})"))?;
+            Some(chrono::Utc::now() - d)
+        }
+        None => None,
+    };
+    let all: Vec<Lane> = cv_core::lanes::lanes_of(&r)
+        .into_iter()
+        .filter(|l| since.is_none_or(|t| l.active_since(t)))
+        .collect();
     let lanes: Vec<&Lane> = all.iter().filter(|l| lane_passes(l, filter)).collect();
 
     if json {
@@ -224,17 +241,26 @@ pub(crate) fn cmd_lanes(id: &str, harness: Option<String>, filter: LaneFilter, j
     let running = all.iter().filter(|l| l.is_running()).count();
     let done = all.iter().filter(|l| l.is_done()).count();
     let stranded = all.iter().filter(|l| l.stranded).count();
+    let returned = all.iter().filter(|l| l.lost_notification() && !l.stranded).count();
     // The four add up to the forest: running, done, stranded, and the rest (failed / killed /
     // stopped without a waiting text / journaled partials).
     let other = all.len() - running - done - stranded;
-    let scope = match filter {
+    let mut scope = match filter {
         LaneFilter::All => String::new(),
         LaneFilter::Running => format!(" · showing {} running", lanes.len()),
         LaneFilter::Done => format!(" · showing {} done", lanes.len()),
         LaneFilter::Stranded => format!(" · showing {} stranded", lanes.len()),
     };
+    if let Some(t) = since {
+        scope.push_str(&format!(" · active since {}", fmt_local(t, "%m-%d %H:%M")));
+    }
+    let lost = if returned > 0 {
+        format!(" ({returned} returned without a stop record)")
+    } else {
+        String::new()
+    };
     println!(
-        "# lanes of {} — {} sub-agents: {running} running · {done} completed · {other} other · {stranded} STRANDED{scope}\n",
+        "# lanes of {} — {} sub-agents: {running} running · {done} completed{lost} · {other} other · {stranded} STRANDED{scope}\n",
         short_id(&r.id),
         all.len(),
     );
@@ -271,9 +297,16 @@ pub(crate) fn cmd_lanes(id: &str, harness: Option<String>, filter: LaneFilter, j
             desc,
             wf,
         );
-        // Running: where it is. Otherwise: how it concluded (the last line of its return).
+        // Running: where it is — and for how long nothing has happened (a lane quiet for hours
+        // mid tool call is usually dead, killed by a restart; the harness still says nothing).
         let detail = if l.is_running() {
-            l.last_tool.as_deref().map(|t| format!("↪ {t}"))
+            let quiet = l
+                .last_turn_at
+                .map(|t| chrono::Utc::now().signed_duration_since(t))
+                .filter(|d| d.num_minutes() >= 60)
+                .map(|d| format!(" · ⚠ quiet {}", cv_core::task::age_short(chrono::Utc::now() - d, chrono::Utc::now())))
+                .unwrap_or_default();
+            l.last_tool.as_deref().map(|t| format!("↪ {t}{quiet}"))
         } else {
             l.last_text.as_deref().map(|t| format!("↩ {}", last_line(t)))
         };
@@ -287,6 +320,11 @@ pub(crate) fn cmd_lanes(id: &str, harness: Option<String>, filter: LaneFilter, j
     if stranded > 0 && filter != LaneFilter::Stranded {
         println!(
             "\n⚠ {stranded} lane(s) stopped on a promise nothing will keep — `--stranded` lists them with resume hints"
+        );
+    }
+    if returned > 0 && filter != LaneFilter::Running {
+        println!(
+            "\n{returned} lane(s) show `returned`: the transcript ends in a final report and no stop was ever recorded — the harness lost the notification (a restart). Their returns are the ↩ lines; they count as done."
         );
     }
     Ok(())

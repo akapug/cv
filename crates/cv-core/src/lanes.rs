@@ -56,9 +56,16 @@ pub enum StatusSource {
     TaskNotification,
     /// The child's own `SubagentStop` hook attachment after its last turn (`stopped`).
     SubagentStop,
-    /// Nothing says it stopped: the transcript ends mid-work (`running`).
+    /// Nothing says it stopped: the transcript ends mid-work (`running`) — or, with no stop
+    /// recorded anywhere, it ends in a final report that has sat untouched for
+    /// [`RETURNED_QUIET_SECS`] (`returned`: the lane finished and the harness lost the
+    /// notification, typically across a restart).
     Transcript,
 }
+
+/// How long a transcript must be quiet after a text-only final turn before `returned` is
+/// inferred — long enough that a tool call still being streamed out never reads as a return.
+pub const RETURNED_QUIET_SECS: i64 = 600;
 
 /// One sub-agent, summarized.
 #[derive(Debug, Clone, Serialize)]
@@ -88,7 +95,8 @@ pub struct Lane {
     pub messages: usize,
     pub tool_calls: u64,
     pub tokens: LaneTokens,
-    /// `running` · `completed` · `stopped` · `failed` · `killed`, or a journaled workflow status.
+    /// `running` · `completed` · `stopped` · `failed` · `killed` · `returned` (finished, no stop
+    /// recorded — a lost notification), or a journaled workflow status.
     pub status: String,
     pub status_source: StatusSource,
     /// The last assistant text turn — the return value for a finished agent, the last narration
@@ -106,7 +114,17 @@ impl Lane {
     /// Finished for real: a terminal status AND not stranded. A stranded lane is `completed` as
     /// far as the harness knows — that is exactly the trap — so it never counts as done here.
     pub fn is_done(&self) -> bool {
-        matches!(self.status.as_str(), "completed" | "done") && !self.stranded
+        matches!(self.status.as_str(), "completed" | "done" | "returned") && !self.stranded
+    }
+
+    /// Finished with no stop recorded anywhere: the harness lost this lane's notification.
+    pub fn lost_notification(&self) -> bool {
+        self.status == "returned"
+    }
+
+    /// Any activity (start or last turn) at or after `since`.
+    pub fn active_since(&self, since: DateTime<Utc>) -> bool {
+        self.started_at.is_some_and(|t| t >= since) || self.last_turn_at.is_some_and(|t| t >= since)
     }
 
     pub fn is_running(&self) -> bool {
@@ -198,6 +216,9 @@ struct Pass {
     tokens: LaneTokens,
     last_text: Option<String>,
     last_tool: Option<String>,
+    /// The transcript's last conversational turn is an assistant text with no tool call: the
+    /// shape of a final report (a running lane ends in a tool call or a tool result).
+    ends_in_report: bool,
 }
 
 fn pass(r: &SessionRef) -> Option<Pass> {
@@ -215,7 +236,17 @@ fn pass(r: &SessionRef) -> Option<Pass> {
             if m.kind.is_model_visible() && matches!(m.role, Role::User | Role::Assistant) {
                 p.messages += 1;
             }
+            if m.role == Role::User && matches!(m.kind, MessageKind::Prompt | MessageKind::ToolResult) {
+                p.ends_in_report = false;
+            }
             if m.role == Role::Assistant {
+                let calls_a_tool = m.content.iter().any(|b| matches!(b, Block::ToolUse { .. }));
+                let has_text = m.kind == MessageKind::Reply && m.text().is_some_and(|t| !t.trim().is_empty());
+                if calls_a_tool {
+                    p.ends_in_report = false;
+                } else if has_text {
+                    p.ends_in_report = true;
+                }
                 if p.model.is_none() {
                     p.model = m.model.clone().filter(|s| !s.is_empty());
                 }
@@ -246,8 +277,15 @@ fn pass(r: &SessionRef) -> Option<Pass> {
     Some(p)
 }
 
-/// Resolve the status of one lane from its three possible sources, most authoritative first.
-fn status_of(sub: &SubagentInfo, end: &SubagentEnd, notice: Option<&TaskNotice>) -> (String, StatusSource) {
+/// Resolve the status of one lane from its three possible sources, most authoritative first;
+/// with none of them, the transcript's own shape decides between `running` and `returned`.
+fn status_of(
+    sub: &SubagentInfo,
+    end: &SubagentEnd,
+    notice: Option<&TaskNotice>,
+    ends_in_report: bool,
+    now: DateTime<Utc>,
+) -> (String, StatusSource) {
     if let Some(s) = sub.result_status.as_deref().filter(|s| !s.is_empty()) {
         return (s.to_string(), StatusSource::Journal);
     }
@@ -266,6 +304,16 @@ fn status_of(sub: &SubagentInfo, end: &SubagentEnd, notice: Option<&TaskNotice>)
     if end.stopped() == Some(true) {
         return ("stopped".into(), StatusSource::SubagentStop);
     }
+    // No journal, no notification, no stop hook — but the transcript ends in a final report and
+    // has been quiet for a while: the lane returned and nobody recorded it (a harness restart
+    // drops the pending notification). One "running" row was a lane that had finished 15 h
+    // earlier, found this way.
+    let quiet = end
+        .last_turn_at
+        .is_some_and(|t| now.signed_duration_since(t).num_seconds() >= RETURNED_QUIET_SECS);
+    if ends_in_report && quiet {
+        return ("returned".into(), StatusSource::Transcript);
+    }
     ("running".into(), StatusSource::Transcript)
 }
 
@@ -273,7 +321,7 @@ fn lane_of(sub: SubagentInfo, notices: &HashMap<String, TaskNotice>) -> Option<L
     let p = pass(&sub.session)?;
     let end = subagent_end(&sub.session.path);
     let agent_id = sub.agent_id().to_string();
-    let (status, status_source) = status_of(&sub, &end, notices.get(&agent_id));
+    let (status, status_source) = status_of(&sub, &end, notices.get(&agent_id), p.ends_in_report, Utc::now());
     let started_at = sub.session.created_at;
     let last_turn_at = end.last_turn_at.or(sub.session.updated_at);
     let duration_ms = match (started_at, last_turn_at) {
@@ -282,7 +330,7 @@ fn lane_of(sub: SubagentInfo, notices: &HashMap<String, TaskNotice>) -> Option<L
     };
     // A workflow agent's journaled summary is its real return; a direct agent's is its last text.
     let last_text = sub.result_summary.clone().or(p.last_text);
-    let parked = matches!(status.as_str(), "completed" | "stopped");
+    let parked = matches!(status.as_str(), "completed" | "stopped" | "returned");
     let stranded = parked && last_text.as_deref().is_some_and(text_is_waiting);
     Some(Lane {
         agent_id,

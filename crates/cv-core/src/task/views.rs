@@ -82,6 +82,20 @@ pub struct InboxRow {
     /// nor HTTP ever carried it.
     #[serde(skip)]
     pub since: DateTime<Utc>,
+    /// The decision facet when the row is a posed decision: what the default is, every option,
+    /// and the deadline. Absent (and off the wire) for actions and for tag-only decisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<InboxDecision>,
+}
+
+/// The one-screen summary of a posed decision an inbox row carries.
+#[derive(Clone, Debug, Serialize)]
+pub struct InboxDecision {
+    #[serde(rename = "default")]
+    pub default_choice: String,
+    pub options: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DateTime<Utc>>,
 }
 
 impl InboxRow {
@@ -97,6 +111,11 @@ impl InboxRow {
             reason: e.reason,
             effective_state: project::effective_display(e.task),
             since: e.since,
+            decision: e.task.decision.as_ref().map(|d| InboxDecision {
+                default_choice: d.default_choice.clone(),
+                options: d.options.clone(),
+                deadline: d.deadline,
+            }),
         }
     }
 }

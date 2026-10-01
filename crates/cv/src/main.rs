@@ -376,6 +376,9 @@ enum Cmd {
         /// resume hint.
         #[arg(long, group = "lane_filter")]
         stranded: bool,
+        /// Only lanes active in this window: started or last turned within `2h`, `30m`, `1d`, …
+        #[arg(long, value_name = "DUR")]
+        since: Option<String>,
         /// Emit the lanes as one JSON array (snake_case; `cv schema` has the shape).
         #[arg(long)]
         json: bool,
@@ -1142,6 +1145,7 @@ fn run() -> Result<()> {
             running,
             done,
             stranded,
+            since,
             json,
         } => {
             let filter = if running {
@@ -1153,7 +1157,7 @@ fn run() -> Result<()> {
             } else {
                 orchestrate::LaneFilter::All
             };
-            orchestrate::cmd_lanes(&id, harness, filter, json)
+            orchestrate::cmd_lanes(&id, harness, filter, since, json)
         }
         Cmd::Deferrals {
             id,

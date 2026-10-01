@@ -134,13 +134,40 @@ The MCP tools are **generated from the CLI** — same names, same flags, same JS
 
 ## 📋 Dispatch work you can trust (`cv task`)
 
-A durable task object for agent fleets, built on one law: **landing state is observed, never
-attested**. An agent can claim a task and propose a reviewed branch — but `landed` is only ever
-written by cv itself, after running git (`merge-base` ancestry, `git cherry` patch-id
-equivalence, whole-branch range patch-id). An agent *saying* "done" moves nothing.
+**If you are the human the fleet is waiting on**, these are the commands you run:
 
 ```sh
-cv task open "port the auth module" --repo ~/proj      # dispatch
+cv task serve --open                                   # a web inbox served by cv itself: decisions as buttons, notes, Done
+cv task inbox ember                                    # what needs you: decisions first (default + options), then actions
+cv task show <id> --brief                              # one task, one line per note
+cv task resolve <id> --accept-default --from ember     # answer a decision (or --choice "<option>"; --note - reads stdin)
+```
+
+`export CV_ENDPOINT=ember` once and `--from` is implied. `cv task inbox ember --md` renders the
+whole inbox as a Markdown page (bodies, the first line of every note) to paste anywhere;
+`--unread` keeps only items someone else touched last. Bare `list`/`inbox` show the last 14 days
+(or anything involving you) and say how many older tasks they hid — `--all` / `--since 90d`.
+
+**Decisions are a kind of task.** An orchestrator poses one with a default that stands if you say
+nothing, the alternatives, and an optional deadline; resolving records *who* chose, which is why
+`resolve` wants an identity. A task that already carries `DECIDE (…): …` notes becomes decisions
+with `cv task split <id>`.
+
+```sh
+cv task decide "K-PORTAL: who births the guest cell" --for ember \
+    --default "the concierge births it" --option "the receiver allocates it" --by 3d --body -
+cv task split 01a0f54c                                 # every leading-DECIDE note → its own decision, blocking the task
+cv task events --since <last-event-id> --kind resolved,done,noted   # the poll surface: JSON lines, next cursor on stderr
+cv task watch --assignee ember --since 2h              # what ember did on their tasks, minus your own events
+```
+
+For agents, the substrate is built on one law: **landing state is observed, never attested**. An
+agent can claim a task and propose a reviewed branch — but `landed` is only ever written by cv
+itself, after running git (`merge-base` ancestry, `git cherry` patch-id equivalence, whole-branch
+range patch-id). An agent *saying* "done" moves nothing.
+
+```sh
+cv task open "port the auth module" --repo ~/proj --body -   # dispatch (stdin body; --issue paths are absolutized)
 cv task claim <id> --from agent:claude-1               # first writer wins (flock CAS)
 cv task propose <id> --branch task/auth                # sha + patch-id read FROM git
 cv task pass <id> --from agent:codex-1 --session <sid> # cross-family check read from transcripts
@@ -148,10 +175,17 @@ cv task verify --all                                   # cv observes what actual
 cv task debt                                           # reviewed-but-unlanded work, loudly
 ```
 
-Same substrate over MCP (`task_open` … `task_verify`) and cvd HTTP (`/api/tasks`,
-`/api/tasks/debt`, `/api/tasks/inbox/{who}`). Notifications ride the board; state lives in a
-replayed event log (`~/.clustervision/tasks/events.jsonl`) that refuses events its own reducer
-would reject.
+Same substrate over MCP (`task_open` … `task_verify`), cvd HTTP (`/api/tasks`, `/api/tasks/debt`,
+`/api/tasks/inbox/{who}`) and `cv task serve` (`/api/inbox`, `/api/task/<id>/{resolve,done,note,
+discuss,claim,release,reopen}`, `/api/events` — the same query as `cv task events`). State lives in
+a replayed event log (`~/.clustervision/tasks/events.jsonl`) that refuses events its own reducer
+would reject; every append is one event, never an edit.
+
+**`task` and `board`:** the board is the fleet's chat; tasks are its commitments. Every task event
+posts a one-line notification (`task 01a0f54c: resolved — K-PORTAL: who births…`) to the task's
+channel (`tasks` by default), so `cv board read tasks` is the task store as a timeline — the
+human-readable twin of `cv task events`, which is the same history as JSON lines with a cursor.
+The board never holds task state; the event log does.
 
 ## 📡 Archive your whole fleet (`cvd`)
 
