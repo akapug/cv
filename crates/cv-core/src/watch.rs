@@ -388,6 +388,62 @@ mod tests {
         assert!(checked >= 8, "only {checked} fixtures parsed standalone");
     }
 
+    /// A transcript REWRITTEN under a byte mark (truncated, or replaced by different content) is
+    /// not an append, so no count can recover "what was seen then". What must hold is that the mark
+    /// still resolves to something the new file can index: past the new end it resolves to the
+    /// whole file (nothing re-emitted, nothing invented), and inside a replaced prefix it resolves
+    /// to that prefix's own count. Neither Claude's `/compact` (it appends) nor `cv prune` (it
+    /// writes a new session) rewrites in place; this pins the failure mode should anything else.
+    #[test]
+    fn a_byte_mark_on_a_rewritten_transcript_resolves_within_the_new_file() {
+        let dir = std::env::temp_dir().join(format!("cv-watch-rewrite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        for h in [Harness::Claude, Harness::Codex] {
+            let full: Vec<u8> = if h == Harness::Codex {
+                CODEX.as_bytes().to_vec()
+            } else {
+                std::fs::read(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/claude/rich_blocks.jsonl"
+                ))
+                .unwrap()
+            };
+            let r = sref(h, path.clone());
+            let adapter = harness::for_harness(h).unwrap();
+            let mark = Mark::Bytes(full.len() as u64);
+
+            // Truncated to its first half (cut on a line boundary).
+            let half = full[..full.len() / 2].iter().rposition(|b| *b == b'\n').unwrap() + 1;
+            std::fs::write(&path, &full[..half]).unwrap();
+            let now = adapter.parse(&r).unwrap().messages.len();
+            assert_eq!(
+                resolve(&r, mark),
+                Some(now),
+                "{h}: a mark past the end is the whole file"
+            );
+            let (total, fresh) = tail(&r, now, usize::MAX).unwrap();
+            assert_eq!((total, fresh.len()), (now, 0), "{h}: nothing re-emitted");
+
+            // Replaced: the old file's length now cuts through different records.
+            let mut other = full[half..].to_vec();
+            other.extend_from_slice(&full);
+            std::fs::write(&path, &other).unwrap();
+            let total = adapter.parse(&r).unwrap().messages.len();
+            let seen = resolve(&r, mark).unwrap();
+            std::fs::write(dir.join("prefix.jsonl"), &other[..full.len()]).unwrap();
+            let prefix = adapter
+                .parse(&sref(h, dir.join("prefix.jsonl")))
+                .unwrap()
+                .messages
+                .len();
+            assert_eq!(seen, prefix, "{h}: a mark inside a rewrite is that prefix's count");
+            assert!(seen <= total, "{h}");
+            assert_eq!(tail(&r, seen, usize::MAX).unwrap().1.len(), total - seen, "{h}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn baseline_is_a_byte_mark_only_for_append_only_transcripts() {
         let dir = std::env::temp_dir().join(format!("cv-watch-mark-{}", std::process::id()));
