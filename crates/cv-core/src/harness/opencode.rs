@@ -240,18 +240,6 @@ impl Adapter for OpenCode {
         Ok(out)
     }
 
-    fn message_count(&self, r: &SessionRef) -> Result<Option<usize>> {
-        // The database can answer from its index; a file-backed session cannot without a parse.
-        // Gated exactly as `stream`'s database path is: without `sqlite` there is no database
-        // reader, so there is no index to ask either.
-        #[cfg(feature = "sqlite")]
-        if db::is_db_ref(r) {
-            return db::message_count(&r.path, &r.id).map(Some);
-        }
-        let _ = r;
-        Ok(None)
-    }
-
     fn parse(&self, r: &SessionRef) -> Result<Session> {
         crate::stream::collect(self, r)
     }
@@ -466,40 +454,6 @@ mod db {
             })
             .collect();
         Ok(refs)
-    }
-
-    /// The count a parse would report for one session, from the database's own index: no message
-    /// body is read, which is the whole point (a streaming count peaked at 587 MB across 213
-    /// sessions, task/4088).
-    ///
-    /// A message row EXISTS whether or not it maps to an IR message, and `build_messages` drops
-    /// one whose parts contribute no content, whose bag holds no extra fact, and whose kind is the
-    /// default for its role. A plain `COUNT(*)` therefore OVER-counts, and a mark that disagrees
-    /// with the parse makes a follower skip a message it never reported. So the count is taken
-    /// with the same evidence the mapping uses — see `build_messages` for what each clause means.
-    pub(super) fn message_count(db: &Path, session_id: &str) -> Result<usize> {
-        let conn = open_ro(db)?;
-        // `EXISTS` rather than a join, so a message with many parts counts once.
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM message m WHERE m.session_id = ?1 AND ( \
-                 EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id AND ( \
-                     (json_extract(p.data, '$.type') = 'text' \
-                      AND COALESCE(json_extract(p.data, '$.text'), '') <> '') \
-                  OR (json_extract(p.data, '$.type') = 'reasoning' \
-                      AND (COALESCE(json_extract(p.data, '$.text'), '') <> '' \
-                           OR json_extract(p.data, '$.metadata') IS NOT NULL)) \
-                  OR json_extract(p.data, '$.type') IN ('tool', 'file', 'agent') \
-                 )) \
-              OR EXISTS (SELECT 1 FROM json_each(m.data) WHERE key IN ( \
-                     'agent', 'mode', 'providerID', 'finish', 'error', 'variant', \
-                     'structured', 'format', 'system', 'tools') AND json_each.value IS NOT NULL) \
-              OR json_extract(m.data, '$.path.cwd') IS NOT NULL \
-              OR json_extract(m.data, '$.role') IN ('system') \
-             )",
-            rusqlite::params![session_id],
-            |row| row.get::<_, i64>(0),
-        )?;
-        Ok(n.max(0) as usize)
     }
 
     /// One row as a JSON object keyed by column name (`NULL`s dropped, JSON columns decoded).

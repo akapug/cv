@@ -93,20 +93,12 @@ pub fn baseline(r: &SessionRef) -> Option<Mark> {
 
 /// The message count a full parse of `r` returns, without holding the parsed session.
 ///
-/// A harness that can answer this from its OWN index should: see
-/// [`Adapter::message_count`], which a SQLite-backed store answers without
-/// reading a single message. `tail` is the general fallback, and it streams
-/// the whole session — on a large corpus that is the difference between
-/// megabytes and a gigabyte at baseline time.
+/// It is the parse's own count by construction: the session is streamed through the adapter and
+/// nothing is kept. A count taken any other way (a row count, a hand-written survival query) is a
+/// second definition of "which records become messages" that has to agree with the adapter's
+/// mapping forever, and a mark that disagrees with the parse makes a follower skip or repeat.
 fn count(r: &SessionRef) -> Option<usize> {
-    indexed_count(r).or_else(|| tail(r, usize::MAX, 0).map(|(total, _)| total))
-}
-
-/// The count from the adapter's own index, when it has one. `None` for every
-/// harness that must read to answer, which keeps their behaviour byte-identical.
-fn indexed_count(r: &SessionRef) -> Option<usize> {
-    let adapter = harness::for_harness(r.harness)?;
-    adapter.message_count(r).ok().flatten()
+    tail(r, usize::MAX, 0).map(|(total, _)| total)
 }
 
 /// What a full parse of `r` returns past the first `skip` messages: `(total, messages[skip..])`,

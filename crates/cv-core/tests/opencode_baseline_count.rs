@@ -1,22 +1,18 @@
-//! An opencode baseline must not read a session to count it (task/4088).
+//! An opencode baseline mark must be the count a parse gives (task/4088).
 //!
 //! OpenCode keeps its sessions in SQLite rather than in append-only files, so
-//! PR #18's byte mark does not apply and `watch::baseline` falls through to
-//! `count()`, which streams the WHOLE session just to learn how many messages
-//! it holds. Measured by the task/4063 builder: with 213 opencode sessions the
-//! baseline peaked at 587 MB, against 18 MB for codex and 22 MB for claude —
-//! the broad-filter peak PR #18 set out to remove, still there, entirely in
-//! this one adapter.
+//! PR #18's byte mark does not apply and `watch::baseline` takes an eager
+//! count. Whatever that count is, it has to equal the number of IR messages a
+//! parse builds, or a follower loses or repeats messages, the failure `Mark`
+//! exists to prevent.
 //!
-//! THE OBVIOUS CURE IS WRONG, and the second arm below proves it rather than
-//! asserting it. The task proposed "count messages per session with a SQL
-//! COUNT". A message exists in the database whether or not it maps to an IR
-//! message: `build_messages` returns nothing for a record whose parts
-//! contribute no content AND whose bag holds no extra fact AND whose kind is
-//! the default for its role. Measured on that shape, the SQL count says 5
-//! where a parse says 4. A mark that disagrees with the parse loses or
-//! repeats messages — the exact failure `Mark` exists to prevent — so the
-//! count has to match the SURVIVAL RULE, not the row count.
+//! A database row count is NOT that number, in both directions. A record that
+//! maps to nothing (no content, no extra fact, the default kind for its role)
+//! is a row the parse drops (the second arm). A tool part that carries a result
+//! is two IR messages from one row, and a record with no content survives on
+//! its bag or its kind (the third arm). A SQL query that tried to restate the
+//! mapping's survival rule undercounted 183 of 328 sessions in a real store, so
+//! the count is taken through the mapping itself.
 #![cfg(feature = "sqlite")]
 
 use cv_core::harness::opencode::OpenCode;
@@ -143,6 +139,89 @@ fn a_message_that_maps_to_nothing_is_not_counted() {
         baseline(r),
         Some(Mark::Messages(parsed)),
         "the mark must count what a parse counts, not what the table holds"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Every record shape `build_messages` maps, against the mark. The two arms above hold one text
+/// part per message, so they never reach the shapes where the row count and the parse part ways
+/// in the other direction: a tool part that carries a result is TWO IR messages (the call, and a
+/// trailing `Role::Tool` result), and a record with no content still survives on its bag
+/// (step/patch parts), its kind (`summary: true`, a `subtask`) or an inline summary body. On
+/// ember's 328-session `opencode.db` a hand-written survival query undercounted 183 of them by
+/// 6,787 messages in all, and an undercounted mark re-emits that many old messages as new.
+#[test]
+fn the_mark_counts_what_the_parse_builds_for_every_record_shape() {
+    let dir = tmp("shapes");
+    let db = plant_db(&dir, 1, 0);
+    let conn = Connection::open(&db).unwrap();
+    let mut t = 10;
+    let mut message = |mid: &str, data: &str, parts: &[&str]| {
+        t += 1;
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1,'ses_000',?2,?2,?3)",
+            rusqlite::params![mid, t, data],
+        )
+        .unwrap();
+        for (i, p) in parts.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+                 VALUES (?1, ?2, 'ses_000', ?3, ?3, ?4)",
+                rusqlite::params![format!("{mid}_p{i}"), mid, t, p],
+            )
+            .unwrap();
+        }
+    };
+    // 1: an ordinary prompt.
+    message("m01", r#"{"role":"user"}"#, &[r#"{"type":"text","text":"run it"}"#]);
+    // 2: a completed tool call is the call AND its result.
+    message(
+        "m02",
+        r#"{"role":"assistant"}"#,
+        &[
+            r#"{"type":"step-start"}"#,
+            r#"{"type":"tool","callID":"c1","tool":"bash","state":{"status":"completed","input":{},"output":"ok"}}"#,
+            r#"{"type":"step-finish"}"#,
+        ],
+    );
+    // 2: a failed tool call too.
+    message(
+        "m03",
+        r#"{"role":"assistant"}"#,
+        &[r#"{"type":"tool","callID":"c2","tool":"bash","state":{"status":"error","input":{},"error":"boom"}}"#],
+    );
+    // 1: no content, but the step parts are kept in the bag.
+    message(
+        "m04",
+        r#"{"role":"assistant"}"#,
+        &[r#"{"type":"step-start"}"#, r#"{"type":"step-finish"}"#],
+    );
+    // 1: a compaction summary marker with no parts.
+    message("m05", r#"{"role":"assistant","summary":true}"#, &[]);
+    // 1: an older inline summary body with no parts.
+    message("m06", r#"{"role":"user","summary":{"body":"what came before"}}"#, &[]);
+    // 1: a subtask spawn.
+    message(
+        "m07",
+        r#"{"role":"user"}"#,
+        &[r#"{"type":"subtask","agent":"general","prompt":"look"}"#],
+    );
+    // 0: reasoning with metadata but neither text nor a signature contributes nothing.
+    message(
+        "m08",
+        r#"{"role":"assistant"}"#,
+        &[r#"{"type":"reasoning","text":"","metadata":{"openai":{"itemId":"r1"}}}"#],
+    );
+    drop(conn);
+
+    let (adapter, rs) = refs(&db);
+    let r = &rs[0];
+    let parsed = adapter.parse(r).expect("parse").messages.len();
+    assert_eq!(parsed, 9, "1 + 2 + 2 + 1 + 1 + 1 + 1 + 0");
+    assert_eq!(
+        baseline(r),
+        Some(Mark::Messages(parsed)),
+        "the mark must count what a parse builds"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
