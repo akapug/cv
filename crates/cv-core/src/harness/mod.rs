@@ -158,6 +158,22 @@ pub trait Adapter: Send + Sync {
     /// Cheaply enumerate sessions without fully parsing them.
     fn discover(&self) -> Result<Vec<SessionRef>>;
 
+    /// The session's IR message count, from this adapter's OWN index when it has one, without
+    /// reading the session's messages. `Ok(None)` means "no index; read it" (the default), which
+    /// keeps every adapter that must parse byte-identical.
+    ///
+    /// This exists for the baseline in [`crate::watch`]: a follower's first call used to parse
+    /// every matching session in full just to learn this number. A SQLite-backed store already
+    /// knows it, and asking the database costs one query instead of a whole transcript.
+    ///
+    /// IT MUST EQUAL [`parse`](Adapter::parse)'s count, NOT the table's row count. A record that
+    /// maps to no IR message (no content, no extra facts, the default kind for its role) is a row
+    /// a `COUNT(*)` would include and a parse would not, and a mark that disagrees with the parse
+    /// makes a follower skip or repeat a message — the failure the mark exists to prevent.
+    fn message_count(&self, _r: &SessionRef) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
     /// Fully parse one discovered session into the IR.
     ///
     /// Adapters with a native [`stream`](Adapter::stream) implement this as

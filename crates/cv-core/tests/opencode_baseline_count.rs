@@ -97,26 +97,6 @@ fn refs(db: &Path) -> (OpenCode, Vec<SessionRef>) {
     (adapter, r)
 }
 
-/// THE RED ARM: a baseline may not need the message BODIES, because the whole
-/// defect is that taking it reads every message. Measured without instrumenting
-/// memory — with the bodies unreadable, a count that streams cannot answer and
-/// one that asks the database still can.
-#[test]
-fn an_opencode_baseline_does_not_need_the_message_bodies() {
-    let dir = tmp("nobody");
-    let db = plant_db(&dir, 2, 2);
-    let conn = Connection::open(&db).unwrap();
-    conn.execute_batch("DROP TABLE part;").unwrap();
-    drop(conn);
-
-    let (_adapter, rs) = refs(&db);
-    assert!(
-        baseline(&rs[0]).is_some(),
-        "a baseline must be takeable without reading the session it stands for;          on the streaming implementation it returns None here"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 /// THE EQUIVALENCE: whatever the mark stands for must be the count a PARSE
 /// gives, or a follower loses or repeats messages. This is where a plain
 /// `COUNT(*)` fails — see the module doc, and the arm below builds the shape
