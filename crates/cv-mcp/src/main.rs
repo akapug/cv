@@ -1373,6 +1373,11 @@ struct StreamPos {
     /// Optional so cursors issued before it existed still decode unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     b: Option<u64>,
+    /// Messages past `n` were left unread when the call's budget ran out (`more_pending`). The
+    /// next call must read this session again even if its trigger has not moved, or the rest
+    /// would wait for the session's next append.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    more: bool,
 }
 
 impl StreamPos {
@@ -1385,8 +1390,18 @@ impl StreamPos {
 
     fn at(t: (usize, Option<i64>), mark: Mark) -> Self {
         match mark {
-            Mark::Messages(n) => StreamPos { t, n, b: None },
-            Mark::Bytes(len) => StreamPos { t, n: 0, b: Some(len) },
+            Mark::Messages(n) => StreamPos {
+                t,
+                n,
+                b: None,
+                more: false,
+            },
+            Mark::Bytes(len) => StreamPos {
+                t,
+                n: 0,
+                b: Some(len),
+                more: false,
+            },
         }
     }
 }
@@ -1462,7 +1477,7 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
 
         // Unchanged since last time (same cheap trigger): carry the position forward, no re-parse.
         if let Some(p) = prior {
-            if p.t == trigger {
+            if p.t == trigger && !p.more {
                 next.o.insert(key, p);
                 continue;
             }
@@ -1516,10 +1531,15 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
 
         if budget_hit {
             // We've filled this call's budget; record where we are and flag the rest as pending.
-            next.o.insert(key, StreamPos::at(trigger, Mark::Messages(already)));
-            if total > already {
-                more_pending = true;
-            }
+            let more = total > already;
+            next.o.insert(
+                key,
+                StreamPos {
+                    more,
+                    ..StreamPos::at(trigger, Mark::Messages(already))
+                },
+            );
+            more_pending |= more;
             continue;
         }
 
@@ -1556,10 +1576,15 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
                 break;
             }
         }
-        if total > emitted {
-            more_pending = true;
-        }
-        next.o.insert(key, StreamPos::at(trigger, Mark::Messages(emitted)));
+        let more = total > emitted;
+        more_pending |= more;
+        next.o.insert(
+            key,
+            StreamPos {
+                more,
+                ..StreamPos::at(trigger, Mark::Messages(emitted))
+            },
+        );
     }
 
     let cursor = serde_json::to_string(&next)?;
