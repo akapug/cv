@@ -161,6 +161,27 @@ pub fn stream_reader<R: BufRead>(
     stream_reader_from(id, reader, source_path, 0, opts, sink)
 }
 
+/// How many messages a full parse of the transcript's first `len` bytes yields — the count a
+/// parse would have returned when the file was `len` bytes long, since a Claude transcript only
+/// grows by appending. Streams the prefix, so peak memory is O(largest line).
+pub(crate) fn count_prefix(r: &SessionRef, len: u64) -> Result<usize> {
+    use std::io::Read as _;
+    let file = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
+    let mut n = 0usize;
+    let mut count = |_: Message| {
+        n += 1;
+        Flow::Continue
+    };
+    stream_reader(
+        &r.id,
+        BufReader::new(file.take(len)),
+        Some(r.path.clone()),
+        &ParseOptions::full(),
+        &mut count,
+    );
+    Ok(n)
+}
+
 /// [`stream_reader`] generalized to a reader positioned at byte `start_off` (a **record start**)
 /// of the source — the seek-cooperation entry [`crate::offsets::stream_range`] drives after
 /// seeking to a recorded message offset. Every claude record parses independently of the skipped

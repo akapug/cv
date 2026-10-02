@@ -679,6 +679,10 @@ fn observe_stream_bounded_read_only_tail() {
             .any(|m| m["text"].as_str().unwrap_or("").contains("ZEBRA_TAIL_MARKER")),
         "the appended message must be drained: {text}"
     );
+    assert_eq!(
+        v["count"], 1,
+        "exactly the one appended message, nothing from before: {text}"
+    );
     assert!(
         msgs.iter()
             .all(|m| m["text"].as_str().unwrap_or("").contains("ZEBRA_TAIL_MARKER")

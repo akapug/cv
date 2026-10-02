@@ -528,6 +528,33 @@ fn flush_all_but_held(scratch: &mut Vec<Message>, sink: &mut dyn MessageSink) ->
     Flow::Continue
 }
 
+/// How many messages a parse of a plain `.jsonl` rollout's first `len` bytes yields — the count a
+/// parse would have returned when the file was `len` bytes long, since a live rollout only grows by
+/// appending. Both passes read only the prefix, so `has_events` is decided exactly as it was then.
+/// Not for `.jsonl.zst` (a byte prefix of a zstd stream is not a prefix of the rollout).
+pub(crate) fn count_prefix(r: &SessionRef, len: u64) -> Result<usize> {
+    use std::io::Read as _;
+    let open = || -> Result<BufReader<std::io::Take<fs::File>>> {
+        let f = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
+        Ok(BufReader::new(f.take(len)))
+    };
+    let has_events = detect_has_events(open()?);
+    let mut n = 0usize;
+    let mut count = |_: Message| {
+        n += 1;
+        Flow::Continue
+    };
+    stream_jsonl(
+        &r.id,
+        open()?,
+        Some(r.path.clone()),
+        has_events,
+        &ParseOptions::full(),
+        &mut count,
+    );
+    Ok(n)
+}
+
 /// Streaming parse of a modern `.jsonl` rollout: emit each record's messages to `sink` and drop them
 /// before the next line, so peak memory is O(largest line) rather than O(whole file). Returns the
 /// [`Session`] metadata with empty `messages`.

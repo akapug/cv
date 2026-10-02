@@ -44,7 +44,7 @@ mod cli_tools;
 
 use anyhow::Context as _;
 use cli_tools::CliTools;
-use cv_core::watch::{Filter, Watcher};
+use cv_core::watch::{Filter, Mark, Watcher};
 use cv_core::{Block, Harness, SessionRef};
 use serde_json::{json, Value};
 use std::sync::OnceLock;
@@ -1398,8 +1398,29 @@ fn await_omen(args: &Value) -> anyhow::Result<String> {
 struct StreamPos {
     /// `(message_count, updated_at_millis)` — the same cheap change-signal `watch::Watcher` uses.
     t: (usize, Option<i64>),
-    /// Parsed IR messages already reported for this session.
+    /// Parsed IR messages already reported for this session (meaningless while `b` is set).
     n: usize,
+    /// A baseline taken without parsing: the transcript's byte length then (see
+    /// [`cv_core::watch::Mark::Bytes`]). Resolved to `n` the first time the session changes.
+    /// Optional so cursors issued before it existed still decode unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    b: Option<u64>,
+}
+
+impl StreamPos {
+    fn mark(&self) -> Mark {
+        match self.b {
+            Some(len) => Mark::Bytes(len),
+            None => Mark::Messages(self.n),
+        }
+    }
+
+    fn at(t: (usize, Option<i64>), mark: Mark) -> Self {
+        match mark {
+            Mark::Messages(n) => StreamPos { t, n, b: None },
+            Mark::Bytes(len) => StreamPos { t, n: 0, b: Some(len) },
+        }
+    }
 }
 
 /// The opaque `since_cursor`: a per-session offset map. Serialized to a compact JSON string and
@@ -1479,13 +1500,41 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
             }
         }
 
-        // Establish the true parsed offset. The cheap discover `message_count` is NOT the parsed IR
-        // length for several harnesses (codex/claude add reasoning/tool/system turns), so we parse —
-        // exactly as `watch::Watcher` does — to avoid re-emitting or skipping messages.
-        let Some(session) = cv_core::find(&r.id, Some(r.harness))
+        // A baseline call emits nothing, so it only has to record where each session stands —
+        // without parsing it where the transcript is append-only (the parse moves to the first
+        // call that sees the session change). A session that can't be read gets no entry.
+        if baseline {
+            if let Some(mark) = cv_core::watch::baseline(r) {
+                next.o.insert(key, StreamPos::at(trigger, mark));
+            }
+            continue;
+        }
+        // The prior position as a parsed-message count (a byte baseline resolves here, once).
+        let prior_n = match prior.map(|p| (p, cv_core::watch::resolve(r, p.mark()))) {
+            Some((_, Some(n))) => Some(n),
+            Some((p, None)) => {
+                // Unreadable right now: keep the prior position so a transient failure isn't a skip.
+                next.o.insert(key, p);
+                continue;
+            }
+            None => None,
+        };
+
+        // Parse to find what was appended. The cheap discover `message_count` is NOT the parsed IR
+        // length for several harnesses (codex/claude add reasoning/tool/system turns), so the position
+        // compared against is always a parsed count — exactly as `watch::Watcher` keeps it. Only the
+        // messages past it are held, and no more than this call can still emit (+1 to see that the
+        // budget ran out, exactly as walking the whole tail would).
+        let skip = prior_n.unwrap_or(0);
+        let keep = if budget_hit {
+            0
+        } else {
+            max_messages.saturating_sub(out_msgs.len()) + 1
+        };
+        let Some((total, fresh)) = cv_core::find(&r.id, Some(r.harness))
             .ok()
             .flatten()
-            .and_then(|(sref, adapter)| adapter.parse(&sref).ok())
+            .and_then(|(sref, _)| cv_core::watch::tail(&sref, skip, keep))
         else {
             // Parse failed: keep the prior position (or none) so a transient failure isn't a skip.
             if let Some(p) = prior {
@@ -1493,19 +1542,13 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
             }
             continue;
         };
-        let total = session.messages.len();
 
-        // On a baseline call (no incoming cursor at all) we record positions but emit nothing, so
-        // the caller starts following from "now" (mirrors await_omen's emit_existing=false).
-        let already = match prior {
-            Some(p) => p.n.min(total),
-            None if baseline => total,
-            None => 0,
-        };
+        // A session the cursor has never seen started after the caller did: all of it is new.
+        let already = skip.min(total);
 
         if budget_hit {
             // We've filled this call's budget; record where we are and flag the rest as pending.
-            next.o.insert(key, StreamPos { t: trigger, n: already });
+            next.o.insert(key, StreamPos::at(trigger, Mark::Messages(already)));
             if total > already {
                 more_pending = true;
             }
@@ -1513,7 +1556,7 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
         }
 
         let mut emitted = already;
-        for m in &session.messages[already..] {
+        for m in &fresh {
             if out_msgs.len() >= max_messages {
                 budget_hit = true;
                 break;
@@ -1548,7 +1591,7 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
         if total > emitted {
             more_pending = true;
         }
-        next.o.insert(key, StreamPos { t: trigger, n: emitted });
+        next.o.insert(key, StreamPos::at(trigger, Mark::Messages(emitted)));
     }
 
     let cursor = serde_json::to_string(&next)?;
