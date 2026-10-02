@@ -241,11 +241,15 @@ impl Adapter for OpenCode {
     }
 
     fn message_count(&self, r: &SessionRef) -> Result<Option<usize>> {
-        // A file-backed session cannot answer without a parse; the database can.
-        if !db::is_db_ref(r) {
-            return Ok(None);
+        // The database can answer from its index; a file-backed session cannot without a parse.
+        // Gated exactly as `stream`'s database path is: without `sqlite` there is no database
+        // reader, so there is no index to ask either.
+        #[cfg(feature = "sqlite")]
+        if db::is_db_ref(r) {
+            return db::message_count(&r.path, &r.id).map(Some);
         }
-        db::message_count(&r.path, &r.id).map(Some)
+        let _ = r;
+        Ok(None)
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
