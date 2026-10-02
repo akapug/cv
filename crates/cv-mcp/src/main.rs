@@ -1472,12 +1472,14 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
     let max_messages = arg_usize(args, "max_messages", 50)?.max(1);
     let char_cap = arg_usize(args, "char_cap", 16_000)?.max(1);
 
-    // Decode the prior cursor (a fresh baseline if absent / unparseable / from an older schema).
-    let baseline = arg_str(args, "since_cursor").is_none();
-    let prev: StreamCursor = arg_str(args, "since_cursor")
+    // Decode the prior cursor: a fresh baseline if absent / unparseable / from another schema. An
+    // unusable cursor is NOT "no prior positions": that would make every session look new and dump
+    // its whole history.
+    let prev: Option<StreamCursor> = arg_str(args, "since_cursor")
         .and_then(|c| serde_json::from_str::<StreamCursor>(c).ok())
-        .filter(|c| c.v == STREAM_CURSOR_VERSION)
-        .unwrap_or_default();
+        .filter(|c| c.v == STREAM_CURSOR_VERSION);
+    let baseline = prev.is_none();
+    let prev = prev.unwrap_or_default();
 
     // `sessions()` is the catalog fast path (~ms) vs `discover_all`'s stat-the-fleet scan
     // (~seconds) — it matters here because observe_stream is *polled*. Freshness is carried by the

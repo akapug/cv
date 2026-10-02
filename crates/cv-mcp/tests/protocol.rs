@@ -767,3 +767,39 @@ fn observe_stream_bounded_read_only_tail() {
         "observe_stream must not write the board (fleet channel must be empty): {text}"
     );
 }
+
+/// A `since_cursor` this build cannot use (garbage, or another schema version) is a fresh
+/// baseline, as `observe_stream`'s doc says: it records where every session stands and emits
+/// nothing. Treating it as "no prior positions" instead makes every matching session look new,
+/// and the call dumps the whole history of each one.
+#[test]
+fn observe_stream_unusable_cursor_is_a_fresh_baseline() {
+    let mut s = Server::spawn("observe-badcursor");
+    s.request(1, "initialize", json!({}));
+    let mut id = 2;
+    for bad in ["not a cursor", r#"{"v":99,"o":{}}"#, r#"{"v":1}"#] {
+        let (text, is_err) = s.call_tool(
+            id,
+            "observe_stream",
+            json!({"cwd_contains": "/work/proj", "since_cursor": bad}),
+        );
+        id += 1;
+        assert!(!is_err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["count"], 0,
+            "an unusable cursor must not dump history ({bad}): {text}"
+        );
+        assert_eq!(v["baseline"], true, "an unusable cursor is a baseline ({bad}): {text}");
+        // ...and the cursor it hands back follows from there: nothing new, nothing drained.
+        let cursor = v["cursor"].as_str().unwrap().to_string();
+        let (text, _) = s.call_tool(
+            id,
+            "observe_stream",
+            json!({"cwd_contains": "/work/proj", "since_cursor": cursor}),
+        );
+        id += 1;
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["count"], 0, "{text}");
+    }
+}
