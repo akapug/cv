@@ -305,6 +305,9 @@ fn tasks(query: &str) -> (u16, Value) {
             assignee: params.get("assignee"),
             repo: params.get("repo").map(std::path::PathBuf::from),
             include_terminal: params.get("all").is_some_and(|v| v == "1" || v == "true"),
+            tag: params.get("tag"),
+            // The HTTP surface sees the whole store: scoping is the shell's default.
+            ..Default::default()
         };
         // An unknown state string is a clear 400 (naming the vocabulary), not a silent [].
         let tasks: Vec<cv_core::task::TaskRow> = match cv_core::task::list(&outcome.model, &filter) {

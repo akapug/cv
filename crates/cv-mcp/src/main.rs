@@ -44,7 +44,7 @@ mod cli_tools;
 
 use anyhow::Context as _;
 use cli_tools::CliTools;
-use cv_core::watch::{Filter, Watcher};
+use cv_core::watch::{Filter, Mark, Watcher};
 use cv_core::{Block, Harness, SessionRef};
 use serde_json::{json, Value};
 use std::sync::OnceLock;
@@ -102,6 +102,9 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("cv-mcp: stdout write failed: {e:#}");
                 break;
             }
+            // The frame (and the tool call that built it) is done: hand its freed heap back.
+            drop(msg);
+            tokio::task::spawn_blocking(release_freed_heap);
         }
     });
 
@@ -296,6 +299,7 @@ fn task_tool_list() -> Value {
                     "state": { "type": "string", "description": "Effective-state filter." },
                     "assignee": { "type": "string", "description": "Assignee endpoint filter." },
                     "repo": { "type": "string", "description": "Repo path filter." },
+                    "tag": { "type": "string", "description": "Only tasks carrying this tag." },
                     "all": { "type": "boolean", "description": "Include terminal tasks (default false)." }
                 }
             }
@@ -690,6 +694,31 @@ fn tool_text_result(text: &str, is_error: bool) -> Value {
     })
 }
 
+/// Return freed heap pages to the OS after a request.
+///
+/// cv-mcp lives as long as the host session (days), and the in-process tools (`observe_stream`,
+/// `await_omen`, `task_*`) parse whole transcripts, so one call can transiently allocate ~1 GB
+/// across several blocking-pool threads. glibc frees that memory but keeps it mapped in each
+/// thread's arena: without a trim, RSS stays at the high-water mark of the largest call ever made,
+/// times however many arenas were touched. `malloc_trim(0)` releases the free pages of every arena
+/// (measured: 938 MB → 77 MB after one call mix). The live data is untouched, so behaviour is
+/// unchanged; the cost is a walk of the free lists, small next to a tool call. Other allocators
+/// (musl, macOS) return memory on their own, so this is a no-op there.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_freed_heap() {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+    }
+    // SAFETY: glibc's malloc_trim takes only a padding size, touches no caller memory, and
+    // locks each arena while it trims, so it is safe to call from any thread at any time.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_freed_heap() {}
+
 async fn write_message(stdout: &mut tokio::io::Stdout, msg: &Value) -> anyhow::Result<()> {
     let mut buf = serde_json::to_vec(msg)?;
     buf.push(b'\n');
@@ -1056,6 +1085,9 @@ fn task_list(args: &Value) -> anyhow::Result<String> {
         assignee: arg_str(args, "assignee").map(String::from),
         repo: arg_str(args, "repo").map(std::path::PathBuf::from),
         include_terminal: args.get("all").and_then(Value::as_bool).unwrap_or(false),
+        tag: arg_str(args, "tag").map(String::from),
+        // MCP/HTTP see the whole store: scoping is the shell's default, not the wire's.
+        ..Default::default()
     };
     let tasks: Vec<cv_core::task::TaskRow> = cv_core::task::list(&outcome.model, &filter)
         .map_err(|e| anyhow::anyhow!(e))?
@@ -1366,8 +1398,44 @@ fn await_omen(args: &Value) -> anyhow::Result<String> {
 struct StreamPos {
     /// `(message_count, updated_at_millis)` — the same cheap change-signal `watch::Watcher` uses.
     t: (usize, Option<i64>),
-    /// Parsed IR messages already reported for this session.
+    /// Parsed IR messages already reported for this session (meaningless while `b` is set).
     n: usize,
+    /// A baseline taken without parsing: the transcript's byte length then (see
+    /// [`cv_core::watch::Mark::Bytes`]). Resolved to `n` the first time the session changes.
+    /// Optional so cursors issued before it existed still decode unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    b: Option<u64>,
+    /// Messages past `n` were left unread when the call's budget ran out (`more_pending`). The
+    /// next call must read this session again even if its trigger has not moved, or the rest
+    /// would wait for the session's next append.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    more: bool,
+}
+
+impl StreamPos {
+    fn mark(&self) -> Mark {
+        match self.b {
+            Some(len) => Mark::Bytes(len),
+            None => Mark::Messages(self.n),
+        }
+    }
+
+    fn at(t: (usize, Option<i64>), mark: Mark) -> Self {
+        match mark {
+            Mark::Messages(n) => StreamPos {
+                t,
+                n,
+                b: None,
+                more: false,
+            },
+            Mark::Bytes(len) => StreamPos {
+                t,
+                n: 0,
+                b: Some(len),
+                more: false,
+            },
+        }
+    }
 }
 
 /// The opaque `since_cursor`: a per-session offset map. Serialized to a compact JSON string and
@@ -1404,12 +1472,14 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
     let max_messages = arg_usize(args, "max_messages", 50)?.max(1);
     let char_cap = arg_usize(args, "char_cap", 16_000)?.max(1);
 
-    // Decode the prior cursor (a fresh baseline if absent / unparseable / from an older schema).
-    let baseline = arg_str(args, "since_cursor").is_none();
-    let prev: StreamCursor = arg_str(args, "since_cursor")
+    // Decode the prior cursor: a fresh baseline if absent / unparseable / from another schema. An
+    // unusable cursor is NOT "no prior positions": that would make every session look new and dump
+    // its whole history.
+    let prev: Option<StreamCursor> = arg_str(args, "since_cursor")
         .and_then(|c| serde_json::from_str::<StreamCursor>(c).ok())
-        .filter(|c| c.v == STREAM_CURSOR_VERSION)
-        .unwrap_or_default();
+        .filter(|c| c.v == STREAM_CURSOR_VERSION);
+    let baseline = prev.is_none();
+    let prev = prev.unwrap_or_default();
 
     // `sessions()` is the catalog fast path (~ms) vs `discover_all`'s stat-the-fleet scan
     // (~seconds) — it matters here because observe_stream is *polled*. Freshness is carried by the
@@ -1441,19 +1511,47 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
 
         // Unchanged since last time (same cheap trigger): carry the position forward, no re-parse.
         if let Some(p) = prior {
-            if p.t == trigger {
+            if p.t == trigger && !p.more {
                 next.o.insert(key, p);
                 continue;
             }
         }
 
-        // Establish the true parsed offset. The cheap discover `message_count` is NOT the parsed IR
-        // length for several harnesses (codex/claude add reasoning/tool/system turns), so we parse —
-        // exactly as `watch::Watcher` does — to avoid re-emitting or skipping messages.
-        let Some(session) = cv_core::find(&r.id, Some(r.harness))
+        // A baseline call emits nothing, so it only has to record where each session stands —
+        // without parsing it where the transcript is append-only (the parse moves to the first
+        // call that sees the session change). A session that can't be read gets no entry.
+        if baseline {
+            if let Some(mark) = cv_core::watch::baseline(r) {
+                next.o.insert(key, StreamPos::at(trigger, mark));
+            }
+            continue;
+        }
+        // The prior position as a parsed-message count (a byte baseline resolves here, once).
+        let prior_n = match prior.map(|p| (p, cv_core::watch::resolve(r, p.mark()))) {
+            Some((_, Some(n))) => Some(n),
+            Some((p, None)) => {
+                // Unreadable right now: keep the prior position so a transient failure isn't a skip.
+                next.o.insert(key, p);
+                continue;
+            }
+            None => None,
+        };
+
+        // Parse to find what was appended. The cheap discover `message_count` is NOT the parsed IR
+        // length for several harnesses (codex/claude add reasoning/tool/system turns), so the position
+        // compared against is always a parsed count — exactly as `watch::Watcher` keeps it. Only the
+        // messages past it are held, and no more than this call can still emit (+1 to see that the
+        // budget ran out, exactly as walking the whole tail would).
+        let skip = prior_n.unwrap_or(0);
+        let keep = if budget_hit {
+            0
+        } else {
+            max_messages.saturating_sub(out_msgs.len()) + 1
+        };
+        let Some((total, fresh)) = cv_core::find(&r.id, Some(r.harness))
             .ok()
             .flatten()
-            .and_then(|(sref, adapter)| adapter.parse(&sref).ok())
+            .and_then(|(sref, _)| cv_core::watch::tail(&sref, skip, keep))
         else {
             // Parse failed: keep the prior position (or none) so a transient failure isn't a skip.
             if let Some(p) = prior {
@@ -1461,27 +1559,26 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
             }
             continue;
         };
-        let total = session.messages.len();
 
-        // On a baseline call (no incoming cursor at all) we record positions but emit nothing, so
-        // the caller starts following from "now" (mirrors await_omen's emit_existing=false).
-        let already = match prior {
-            Some(p) => p.n.min(total),
-            None if baseline => total,
-            None => 0,
-        };
+        // A session the cursor has never seen started after the caller did: all of it is new.
+        let already = skip.min(total);
 
         if budget_hit {
             // We've filled this call's budget; record where we are and flag the rest as pending.
-            next.o.insert(key, StreamPos { t: trigger, n: already });
-            if total > already {
-                more_pending = true;
-            }
+            let more = total > already;
+            next.o.insert(
+                key,
+                StreamPos {
+                    more,
+                    ..StreamPos::at(trigger, Mark::Messages(already))
+                },
+            );
+            more_pending |= more;
             continue;
         }
 
         let mut emitted = already;
-        for m in &session.messages[already..] {
+        for m in &fresh {
             if out_msgs.len() >= max_messages {
                 budget_hit = true;
                 break;
@@ -1513,10 +1610,15 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
                 break;
             }
         }
-        if total > emitted {
-            more_pending = true;
-        }
-        next.o.insert(key, StreamPos { t: trigger, n: emitted });
+        let more = total > emitted;
+        more_pending |= more;
+        next.o.insert(
+            key,
+            StreamPos {
+                more,
+                ..StreamPos::at(trigger, Mark::Messages(emitted))
+            },
+        );
     }
 
     let cursor = serde_json::to_string(&next)?;

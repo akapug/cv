@@ -78,6 +78,18 @@ pub enum ReduceError {
     },
     #[error("invalid {field}: {value:?}")]
     InvalidField { field: &'static str, value: String },
+    #[error("task {task_id} already has a posed decision (amend by posing a new task, never by rewriting)")]
+    AlreadyPosed { task_id: String },
+    #[error("task {task_id}: {event} requires a posed decision (this task is work, not a question — use done)")]
+    MissingDecision { task_id: String, event: &'static str },
+    #[error("task {task_id}: {choice:?} is not one of the posed options ({options})")]
+    UnknownChoice {
+        task_id: String,
+        choice: String,
+        options: String,
+    },
+    #[error("task {task_id} is a decision: answer it with resolve (--choice or --accept-default), not done")]
+    DecisionNeedsResolve { task_id: String },
 }
 
 /// A recorded anomaly that did not change state (the task/revision stays actionable).
@@ -197,6 +209,49 @@ impl EffectiveState {
     }
 }
 
+/// The decision facet of a task (present once a `posed` event applied): the question's options,
+/// the default that stands if nobody speaks, the deadline for that, and the answer once given.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Decision {
+    /// Every admissible choice, the default first.
+    pub options: Vec<String>,
+    #[serde(rename = "default")]
+    pub default_choice: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DateTime<Utc>>,
+    /// The note event this decision was split out of, when it was (`cv task split`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub posed_at: DateTime<Utc>,
+    pub posed_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<Resolution>,
+}
+
+impl Decision {
+    /// The options other than the default, in posed order.
+    pub fn alternatives(&self) -> impl Iterator<Item = &str> {
+        self.options
+            .iter()
+            .map(String::as_str)
+            .filter(move |o| *o != self.default_choice)
+    }
+}
+
+/// How a decision was answered: the literal choice (never "the default" by reference — the record
+/// stays readable if the default ever reads differently), by whom, when, and any note.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Resolution {
+    pub choice: String,
+    pub by: String,
+    pub ts: DateTime<Utc>,
+    pub event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// `choice == default` at resolve time: the resolver accepted the proposed default.
+    pub accepted_default: bool,
+}
+
 /// Read model for one task.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskProjection {
@@ -220,9 +275,37 @@ pub struct TaskProjection {
     /// How the completion was verified, when a passing check was attached to the `Done`. `None` =
     /// self-reported (the view/provenance layer labels the two distinctly).
     pub done_check: Option<DoneCheck>,
+    /// The union of every `tagged` event's labels, in first-seen order. Omitted from the wire when
+    /// empty, so a log that never tagged anything serializes exactly as it did before tags existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Task ids this task is waiting on (`blocked_by` events, deduplicated, first-seen order).
+    /// Whether the task is blocked *now* is [`super::project::is_blocked`], computed from each
+    /// blocker's current state. Omitted from the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
+    /// The decision facet, once a `posed` event applied. `None` = this task is work (kind
+    /// `action`); `Some` = it is a question (kind `decision`). Omitted from the wire when absent, so
+    /// every pre-decision projection serializes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<Decision>,
 }
 
 impl TaskProjection {
+    /// Is this a decision (a question to answer) rather than an action (work to do)?
+    pub fn is_decision(&self) -> bool {
+        self.decision.is_some()
+    }
+
+    /// `decision` or `action`: the task's kind, derived from whether a decision was posed.
+    pub fn kind(&self) -> &'static str {
+        if self.is_decision() {
+            "decision"
+        } else {
+            "action"
+        }
+    }
+
     fn opened(event: &TaskEvent, kind: &TaskEventKind) -> TaskProjection {
         let TaskEventKind::Opened {
             title,
@@ -254,6 +337,9 @@ impl TaskProjection {
             abandoned_reason: None,
             done_observed: None,
             done_check: None,
+            tags: Vec::new(),
+            blocked_by: Vec::new(),
+            decision: None,
         }
     }
 
@@ -386,6 +472,11 @@ impl TaskReducer {
             }
             TaskEventKind::Done { observed, check } => {
                 require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                if task.decision.is_some() {
+                    return Err(ReduceError::DecisionNeedsResolve {
+                        task_id: task.task_id.clone(),
+                    });
+                }
                 if let Some(rev) = task.current_revision() {
                     if !rev.state.is_terminal() {
                         return Err(ReduceError::DoneWithLiveRevision {
@@ -410,6 +501,72 @@ impl TaskReducer {
                 require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
                 task.superseded_by = Some(by_task.clone());
                 task.state = TaskState::Superseded;
+            }
+            TaskEventKind::Tagged { tags } => {
+                // Tags are bookkeeping, like notes: allowed while the task is live, never on a
+                // terminal one (a done task's labels are part of the record, not a surface to edit).
+                require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                for t in tags {
+                    if !task.tags.iter().any(|have| have == t) {
+                        task.tags.push(t.clone());
+                    }
+                }
+            }
+            TaskEventKind::BlockedBy { task: blocker } => {
+                require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                if !task.blocked_by.iter().any(|have| have == blocker) {
+                    task.blocked_by.push(blocker.clone());
+                }
+            }
+
+            // ── decision facet ────────────────────────────────────────────
+            TaskEventKind::Posed {
+                options,
+                default_choice,
+                deadline,
+                source,
+            } => {
+                require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                if task.decision.is_some() {
+                    return Err(ReduceError::AlreadyPosed {
+                        task_id: task.task_id.clone(),
+                    });
+                }
+                task.decision = Some(Decision {
+                    options: options.clone(),
+                    default_choice: default_choice.clone(),
+                    deadline: *deadline,
+                    source: source.clone(),
+                    posed_at: event.ts,
+                    posed_by: event.by.clone(),
+                    resolution: None,
+                });
+            }
+            TaskEventKind::Resolved { choice, note } => {
+                require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                let task_id = task.task_id.clone();
+                let Some(decision) = task.decision.as_mut() else {
+                    return Err(ReduceError::MissingDecision {
+                        task_id,
+                        event: kind.tag_static(),
+                    });
+                };
+                if !decision.options.iter().any(|o| o == choice) {
+                    return Err(ReduceError::UnknownChoice {
+                        task_id,
+                        choice: choice.clone(),
+                        options: decision.options.join(" | "),
+                    });
+                }
+                decision.resolution = Some(Resolution {
+                    choice: choice.clone(),
+                    by: event.by.clone(),
+                    ts: event.ts,
+                    event_id: event.id.clone(),
+                    note: note.clone(),
+                    accepted_default: *choice == decision.default_choice,
+                });
+                task.state = TaskState::Resolved;
             }
 
             // ── land facet ────────────────────────────────────────────────
@@ -706,6 +863,59 @@ fn validate_event_shape(event: &TaskEvent) -> Result<(), ReduceError> {
         TaskEventKind::Done { .. } => Ok(()),
         TaskEventKind::Abandoned { reason } => require_nonempty("reason", reason),
         TaskEventKind::Superseded { by_task } => require_nonempty("by_task", by_task),
+        TaskEventKind::Tagged { tags } => {
+            if tags.is_empty() {
+                return Err(ReduceError::InvalidField {
+                    field: "tags",
+                    value: "[]".into(),
+                });
+            }
+            for t in tags {
+                require_nonempty("tags[]", t)?;
+                if t.chars().any(|c| c.is_whitespace() || c == ',') {
+                    return Err(ReduceError::InvalidField {
+                        field: "tags[]",
+                        value: t.clone(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        TaskEventKind::BlockedBy { task } => {
+            require_nonempty("task", task)?;
+            if task == &event.task_id {
+                return Err(ReduceError::InvalidField {
+                    field: "task",
+                    value: format!("{task} (a task cannot block itself)"),
+                });
+            }
+            Ok(())
+        }
+        TaskEventKind::Posed {
+            options,
+            default_choice,
+            ..
+        } => {
+            require_nonempty("default", default_choice)?;
+            for o in options {
+                require_nonempty("options[]", o)?;
+            }
+            if !options.iter().any(|o| o == default_choice) {
+                return Err(ReduceError::InvalidField {
+                    field: "options",
+                    value: format!("{} (the default {default_choice:?} must be one of them)", options.join(" | ")),
+                });
+            }
+            let mut seen = std::collections::HashSet::new();
+            if let Some(dup) = options.iter().find(|o| !seen.insert(o.as_str())) {
+                return Err(ReduceError::InvalidField {
+                    field: "options",
+                    value: format!("{dup:?} appears twice"),
+                });
+            }
+            Ok(())
+        }
+        TaskEventKind::Resolved { choice, .. } => require_nonempty("choice", choice),
         TaskEventKind::RevisionProposed { revision } => validate_revision(revision),
         TaskEventKind::ReviewRerouted { from, to } => {
             require_nonempty("from", from)?;
@@ -1311,5 +1521,152 @@ mod tests {
         let rev = m.tasks[&task].current_revision().unwrap();
         assert_eq!(rev.state, RevisionState::Landed);
         assert!(rev.local_merge.is_none());
+    }
+
+    fn posed(options: &[&str], default: &str) -> TaskEventKind {
+        TaskEventKind::Posed {
+            options: options.iter().map(|s| s.to_string()).collect(),
+            default_choice: default.into(),
+            deadline: None,
+            source: None,
+        }
+    }
+
+    /// The decision facet: posing makes a task a decision; resolving answers it with one of the
+    /// posed options and is terminal; `done` is refused on a decision; a second pose is refused.
+    #[test]
+    fn decision_pose_resolve_round_trip_and_refusals() {
+        let mut log = Log::new();
+        let task = log.open(AUTHOR);
+        assert!(!log.reduce().unwrap().tasks[&task].is_decision());
+        log.push(&task, AUTHOR, posed(&["keep", "delete"], "keep"));
+        let m = log.reduce().unwrap();
+        let t = &m.tasks[&task];
+        assert!(t.is_decision());
+        assert_eq!(t.kind(), "decision");
+        assert_eq!(t.state, TaskState::Open, "posing does not change the base state");
+        let d = t.decision.as_ref().unwrap();
+        assert_eq!(d.default_choice, "keep");
+        assert_eq!(d.alternatives().collect::<Vec<_>>(), vec!["delete"]);
+        assert_eq!(d.posed_by, AUTHOR);
+        assert!(d.resolution.is_none());
+
+        // done is the wrong verb for a question.
+        log.push(
+            &task,
+            OTHER,
+            TaskEventKind::Done {
+                observed: None,
+                check: None,
+            },
+        );
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::DecisionNeedsResolve { .. }
+        ));
+        log.events.pop();
+
+        // A choice outside the posed options is refused.
+        log.push(
+            &task,
+            OTHER,
+            TaskEventKind::Resolved {
+                choice: "burn it".into(),
+                note: None,
+            },
+        );
+        assert!(matches!(log.reduce().unwrap_err(), ReduceError::UnknownChoice { .. }));
+        log.events.pop();
+
+        // A second pose is refused: amendments are new decisions.
+        log.push(&task, AUTHOR, posed(&["keep", "delete", "archive"], "keep"));
+        assert!(matches!(log.reduce().unwrap_err(), ReduceError::AlreadyPosed { .. }));
+        log.events.pop();
+
+        // Resolving with a non-default option: terminal, literal choice, accepted_default false.
+        let ev = log.push(
+            &task,
+            OTHER,
+            TaskEventKind::Resolved {
+                choice: "delete".into(),
+                note: Some("the twin goes".into()),
+            },
+        );
+        let m = log.reduce().unwrap();
+        let t = &m.tasks[&task];
+        assert_eq!(t.state, TaskState::Resolved);
+        assert!(t.state.is_terminal());
+        assert_eq!(t.effective_state().as_str(), "resolved");
+        let r = t.decision.as_ref().unwrap().resolution.as_ref().unwrap();
+        assert_eq!((r.choice.as_str(), r.by.as_str(), r.accepted_default), ("delete", OTHER, false));
+        assert_eq!(r.event_id, ev.id);
+        assert_eq!(r.note.as_deref(), Some("the twin goes"));
+
+        // Nothing applies after a resolution (terminal), including a note.
+        log.push(
+            &task,
+            AUTHOR,
+            TaskEventKind::Noted {
+                text: "late".into(),
+                session_ref: None,
+            },
+        );
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::InvalidTransition { .. }
+        ));
+    }
+
+    /// `resolved` on a plain task is refused (there is nothing to choose from), and a pose whose
+    /// default is not among its options — or that lists an option twice — never enters the log.
+    #[test]
+    fn resolve_needs_a_pose_and_a_pose_needs_its_default_among_the_options() {
+        let mut log = Log::new();
+        let task = log.open(AUTHOR);
+        log.push(
+            &task,
+            OTHER,
+            TaskEventKind::Resolved {
+                choice: "yes".into(),
+                note: None,
+            },
+        );
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::MissingDecision { .. }
+        ));
+        log.events.pop();
+        log.push(&task, AUTHOR, posed(&["a", "b"], "c"));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::InvalidField { field: "options", .. }
+        ));
+        log.events.pop();
+        log.push(&task, AUTHOR, posed(&["a", "a"], "a"));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::InvalidField { field: "options", .. }
+        ));
+        log.events.pop();
+        log.push(&task, AUTHOR, posed(&["a"], ""));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::InvalidField { field: "default", .. }
+        ));
+        log.events.pop();
+        // Accepting the default is recorded as the literal choice.
+        log.push(&task, AUTHOR, posed(&["a", "b"], "a"));
+        log.push(
+            &task,
+            OTHER,
+            TaskEventKind::Resolved {
+                choice: "a".into(),
+                note: None,
+            },
+        );
+        let m = log.reduce().unwrap();
+        let r = m.tasks[&task].decision.as_ref().unwrap().resolution.as_ref().unwrap();
+        assert!(r.accepted_default);
+        assert_eq!(r.choice, "a");
     }
 }

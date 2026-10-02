@@ -1,15 +1,103 @@
 //! `cv task` — the fleet task substrate: open/claim/propose/review/verify dispatch objects whose
 //! landing state is *observed* from git, never taken on an agent's word.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
+use cv_core::ir::truncate;
 use cv_core::sanitize::sanitize_line;
-use cv_core::task::{self, InboxRow, TaskEventKind, TaskRow, TaskStore};
+use cv_core::task::{self, TaskEventKind, TaskProjection, TaskReadModel, TaskRow, TaskStore};
 
-use crate::util::{fmt_local, short_id};
+use super::task_ops::{self, DecisionSpec, EventFilter, Since};
+use crate::util::fmt_local;
+
+/// A text argument that may come from a file: `--body-file`/`--file` (`-` reads stdin). Bodies
+/// were 500-char shell strings before this existed; a brief is a document.
+fn read_text_arg(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading the text from stdin")?;
+        return Ok(buf);
+    }
+    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// `a,b, c` → `["a", "b", "c"]`: trimmed, empties dropped, duplicates collapsed in order.
+fn parse_tags(csv: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in csv.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if !out.iter().any(|have| have == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// The id-prefix length that keeps every task in `model` distinguishable (never below 8). Task
+/// ids are UUID v7: a batch opened in one second shares its first eight hex digits, so the usual
+/// 8-char prefix was ambiguous for every task opened that way — `cv task show <prefix>` refused
+/// what `cv task list` had just printed.
+pub(crate) fn prefix_len(model: &TaskReadModel) -> usize {
+    task::unique_prefix_len(model.tasks.keys().map(String::as_str), 8)
+}
+
+pub(crate) fn prefix(id: &str, len: usize) -> &str {
+    id.get(..len).unwrap_or(id)
+}
+
+/// A text argument where `-` means stdin (`--body -`, `--note -`, a bare `-` note).
+fn text_or_stdin(text: String) -> Result<String> {
+    if text == "-" {
+        read_text_arg(Path::new("-"))
+    } else {
+        Ok(text)
+    }
+}
+
+/// `--issue` absolutized at open time, because the record outlives the shell it was typed in —
+/// a relative `--issue` made `sweep` report "issue path no longer exists" the next day. A
+/// relative path is taken against the current directory; when it is not there but is under the
+/// task's `--repo`, the repo wins (that is where it was meant). Nothing found: joined to the cwd
+/// lexically. Handles (`#42`) and URLs pass through untouched.
+fn absolutize_issue(issue: Option<String>, repo: Option<&Path>) -> Option<String> {
+    let issue = issue?;
+    let Some(p) = issue_path(&issue) else {
+        return Some(issue);
+    };
+    let p = Path::new(p);
+    if p.is_absolute() {
+        return Some(issue);
+    }
+    let cwd = std::env::current_dir().ok();
+    let in_cwd = cwd.as_ref().map(|d| d.join(p));
+    let in_repo = repo.map(|r| r.join(p));
+    let chosen = match (&in_cwd, &in_repo) {
+        (Some(c), _) if c.exists() => c.clone(),
+        (_, Some(r)) if r.exists() => r.clone(),
+        (Some(c), _) => c.clone(),
+        (None, Some(r)) => r.clone(),
+        (None, None) => p.to_path_buf(),
+    };
+    let abs = chosen.canonicalize().unwrap_or(chosen);
+    Some(abs.display().to_string())
+}
+
+/// The caller's own endpoint for scoping (`$CV_ENDPOINT`), and the default 14-day window.
+fn scope_window(all: bool, since: Option<&str>, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+    if all {
+        return Ok(None);
+    }
+    match since {
+        Some(s) => Ok(Some(task::parse_since(s, now).map_err(|e| anyhow::anyhow!(e))?)),
+        None => Ok(Some(now - chrono::Duration::days(14))),
+    }
+}
 
 /// Identity resolution (G4) for chat-grade verbs: explicit `--from`, else `CV_ENDPOINT`, else
 /// the literal `"cv"` (a human opening a task from a shell owes no ceremony). Shared logic lives
@@ -29,12 +117,18 @@ pub(crate) enum TaskCmd {
     /// Open a new task. Prints its id.
     Open {
         title: String,
-        #[arg(long, default_value = "")]
+        /// The body; `-` reads it from stdin (the natural form for a heredoc — backticks inside a
+        /// double-quoted shell string are command-substituted by zsh).
+        #[arg(long, default_value = "", conflicts_with = "body_file")]
         body: String,
+        /// Read the body from a file (`-` for stdin) — a brief is a document, not a shell string.
+        #[arg(long = "body-file", value_name = "PATH")]
+        body_file: Option<PathBuf>,
         /// Repository this task's code work happens in (enables propose/verify/debt).
         #[arg(long)]
         repo: Option<PathBuf>,
-        /// External issue/work handle, free-form.
+        /// External issue/work handle, free-form. A relative path is made absolute at open time
+        /// (the record outlives the shell it was typed in).
         #[arg(long)]
         issue: Option<String>,
         /// Board channel task notifications post to.
@@ -42,24 +136,54 @@ pub(crate) enum TaskCmd {
         channel: String,
         #[arg(long)]
         assignee: Option<String>,
+        /// Comma-separated tags (`decision,deploy`); `list --tag` filters on them and a `decision`
+        /// tag on an assigned task puts it in the assignee's inbox under "decisions owed".
+        #[arg(long, value_name = "A,B")]
+        tags: Option<String>,
+        /// This task waits on another (id or unique prefix). Repeatable. Blocked-ness is computed
+        /// from the blocker's live state — it clears by itself when the blocker finishes.
+        #[arg(long = "blocked-by", value_name = "ID")]
+        blocked_by: Vec<String>,
+        /// Another task waits on this one (writes a `blocked_by` on THAT task). Repeatable.
+        #[arg(long = "blocks", value_name = "ID")]
+        blocks: Vec<String>,
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
     },
-    /// List tasks (non-terminal by default).
+    /// List tasks: non-terminal, touched in the last 14 days or involving you ($CV_ENDPOINT).
+    /// The hidden count is the last line; `--all` lifts both the window and the terminal filter.
     List {
-        /// Filter by effective state (open|claimed|awaiting_review|ready|merged_local|landed|done|...).
+        /// Filter by effective state (open|claimed|resolved|awaiting_review|ready|landed|done|...).
         #[arg(long)]
         state: Option<String>,
         #[arg(long)]
         assignee: Option<String>,
         #[arg(long)]
         repo: Option<PathBuf>,
-        /// Include terminal tasks.
+        /// Only tasks carrying this tag.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Only decisions (posed questions) / only actions (work).
+        #[arg(long, group = "kind")]
+        decisions: bool,
+        #[arg(long, group = "kind")]
+        actions: bool,
+        /// Everything: every project, every age, terminal tasks included.
         #[arg(long)]
         all: bool,
+        /// Widen or narrow the window: tasks touched since (`30d`, `2h`, `2026-09-01`, an event id).
+        #[arg(long, value_name = "WHEN", conflicts_with = "all")]
+        since: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Tab-separated rows for scripts: full id, state, assignee, repo basename, age, title,
+        /// blocked_by — no alignment, no truncation.
+        #[arg(long, conflicts_with = "json")]
+        tsv: bool,
+        /// Two lines per task: the row, then tags · repo · blockers · the body's first line.
+        #[arg(long, conflicts_with_all = ["json", "tsv"])]
+        wide: bool,
     },
     /// Show one task (id may be a unique prefix).
     Show {
@@ -69,6 +193,16 @@ pub(crate) enum TaskCmd {
         /// Also print the raw event history.
         #[arg(long)]
         events: bool,
+        /// One line per note (author, time, first 150 chars) and the body's first line — a
+        /// 26-note task on one screen.
+        #[arg(long)]
+        brief: bool,
+        /// Only the last N notes.
+        #[arg(long = "notes-last", value_name = "N")]
+        notes_last: Option<usize>,
+        /// Only notes matching this regex (case-insensitive).
+        #[arg(long = "notes-grep", value_name = "PATTERN")]
+        notes_grep: Option<String>,
     },
     /// Claim an open task (first writer wins).
     Claim {
@@ -91,10 +225,15 @@ pub(crate) enum TaskCmd {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Record a progress note.
+    /// Record a progress note. `cv task note <id> -` reads the note from stdin.
     Note {
         id: String,
-        text: String,
+        /// The note (`-` = stdin). Omit it and pass `--file` to read the note from a file.
+        #[arg(required_unless_present = "file", conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the note from a file (`-` for stdin).
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
         #[arg(long = "session-ref")]
         session_ref: Option<String>,
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
@@ -142,6 +281,159 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
+    },
+    /// Add tags to a task (comma-separated; additive, never removes).
+    Tag {
+        id: String,
+        #[arg(value_name = "A,B")]
+        tags: String,
+        /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Record that a task waits on another: `cv task block <id> --by <blocker>`.
+    Block {
+        id: String,
+        /// The task that must finish first (id or unique prefix).
+        #[arg(long = "by", value_name = "ID")]
+        by_task: String,
+        /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Pose a decision for someone: a task of kind `decision` with a default that stands if they
+    /// stay silent, the alternatives, and an optional deadline. Prints its id.
+    Decide {
+        title: String,
+        /// Who owes the decision (their `cv task inbox` lists it first).
+        #[arg(long = "for", value_name = "WHO")]
+        for_who: String,
+        /// The option that stands if nobody speaks (always one of the options).
+        #[arg(long, value_name = "OPTION")]
+        default: String,
+        /// Another admissible option. Repeatable.
+        #[arg(long = "option", value_name = "OPTION")]
+        options: Vec<String>,
+        /// When the default stands: a duration (`3d`, `48h`), a date (`2026-10-03`) or a datetime.
+        #[arg(long = "by", value_name = "WHEN")]
+        by: Option<String>,
+        /// The question in full (`-` = stdin).
+        #[arg(long, default_value = "", conflicts_with = "body_file")]
+        body: String,
+        #[arg(long = "body-file", value_name = "PATH")]
+        body_file: Option<PathBuf>,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        issue: Option<String>,
+        #[arg(long, default_value = "tasks")]
+        channel: String,
+        /// Extra tags (`decision` is always added).
+        #[arg(long, value_name = "A,B")]
+        tags: Option<String>,
+        /// This decision blocks another task (writes a `blocked_by` on THAT task). Repeatable.
+        #[arg(long = "blocks", value_name = "ID")]
+        blocks: Vec<String>,
+        /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Answer a decision: `--accept-default`, or `--choice "<option>"` (one of the posed options).
+    /// Records WHO resolved it: pass `--from <you>` or set `CV_ENDPOINT` once.
+    Resolve {
+        id: String,
+        #[arg(long, value_name = "OPTION", group = "answer", required = true)]
+        choice: Option<String>,
+        #[arg(long = "accept-default", group = "answer")]
+        accept_default: bool,
+        /// Why (`-` = stdin).
+        #[arg(long)]
+        note: Option<String>,
+        /// The resolver, recorded in `by`. Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+        /// TOFU per-endpoint token authenticating the `--from` claim. Default: $CV_TOKEN.
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Turn every leading-`DECIDE` note on a task into its own decision task (title = the label
+    /// and the question's first clause; default = the text after `Default =`/`Default if
+    /// silent:`/`Recommend:`; options = the `alternative =` clauses), assigned to the task's
+    /// assignee and blocking the task. The notes stay; `show` points each at its decision.
+    Split {
+        id: String,
+        /// Print what would be created without writing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// New task events since a point in time, one JSON line each (the poll surface: hand the
+    /// last event id back as the next `--since`). `--text` renders one human line per event.
+    Events {
+        /// A duration (`2h`), a date, a datetime, an RFC 3339 timestamp, or an event id (exclusive).
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
+        /// Only these kinds (comma-separated: `resolved,done,noted`; `note`/`resolve` spellings ok).
+        #[arg(long, value_name = "K,K")]
+        kind: Option<String>,
+        /// Only events by this endpoint.
+        #[arg(long)]
+        by: Option<String>,
+        /// Hide events by this endpoint (`web:<x>` counts as `<x>`).
+        #[arg(long = "not-by", value_name = "WHO")]
+        not_by: Option<String>,
+        /// Only events on tasks assigned to this endpoint.
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Only events on this task (id or prefix).
+        #[arg(long)]
+        task: Option<String>,
+        /// One human line per event instead of JSON lines.
+        #[arg(long)]
+        text: bool,
+    },
+    /// What `<assignee>` did on their tasks since `--since`: `events --assignee <who>` minus the
+    /// caller's own events (so an orchestrator polling at each check-in sees only the news).
+    Watch {
+        #[arg(long)]
+        assignee: String,
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
+        /// Whose events to hide. Default: $CV_ENDPOINT.
+        #[arg(long = "not-by", value_name = "WHO")]
+        not_by: Option<String>,
+        #[arg(long)]
+        text: bool,
+    },
+    /// A local web inbox served by cv itself: decisions with their options as buttons, actions,
+    /// claimed work, notes — every button records the same event the CLI would. Loopback only
+    /// unless `--bind 0.0.0.0:<port>` is passed explicitly (then any device on the LAN can act as
+    /// `web:<assignee>`).
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        bind: String,
+        /// Whose inbox the page opens on (`?who=` overrides per request). Default: $CV_ENDPOINT.
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Open the page in the default browser once the server is up.
+        #[arg(long)]
+        open: bool,
+    },
+    /// Candidates for closing, from what git and the filesystem say — never closes anything.
+    /// Lists non-terminal tasks whose `--issue` path no longer exists, or whose title/body names a
+    /// branch now merged into the repo's main (`git branch --merged`).
+    Sweep {
+        /// The repository to observe (branches are read from it; a task's own `--repo` must
+        /// match, or be unset).
+        #[arg(long)]
+        repo: PathBuf,
+        /// The branch merged work lands on (default: `main`, else `master` if that is what exists).
+        #[arg(long)]
+        main: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Propose a reviewed revision: cv resolves the branch tip and computes the range patch-id
     /// from git itself (identity is observed, never typed).
@@ -217,12 +509,25 @@ pub(crate) enum TaskCmd {
         #[arg(long = "skip-landed")]
         skip_landed: bool,
     },
-    /// What needs `<who>`: assigned/claimed tasks, reviews awaiting them, their unlanded work.
+    /// What needs `<who>`: decisions owed (default + options on one line each), then assigned
+    /// actions, claimed work, reviews, unlanded work. Same 14-day window as `list`.
     Inbox {
         /// Endpoint to compute the inbox for. Default: $CV_ENDPOINT, else "cv".
         who: Option<String>,
         #[arg(long)]
         json: bool,
+        /// The whole inbox as a Markdown page: each item's body and the first line of each note.
+        #[arg(long, conflicts_with = "json")]
+        md: bool,
+        /// Only items whose last event is NOT by `<who>` (news for them).
+        #[arg(long)]
+        unread: bool,
+        /// Every age (no 14-day window).
+        #[arg(long)]
+        all: bool,
+        /// Items touched since (`30d`, `2026-09-01`, …).
+        #[arg(long, value_name = "WHEN", conflicts_with = "all")]
+        since: Option<String>,
     },
     /// Reviewed-but-unlanded work, grouped by repo, oldest first. The honest debt view.
     Debt {
@@ -254,6 +559,12 @@ fn replay_loud() -> Result<cv_core::task::ReplayOutcome> {
 /// the TOFU credential presented on identity-bearing appends (`--token`, else `$CV_TOKEN`); it is
 /// inert for bookkeeping verbs and for endpoints that have never bound a token.
 fn append_and_report(task_id: Option<&str>, from: &str, kind: TaskEventKind, token: Option<String>) -> Result<()> {
+    append_event(task_id, from, kind, token).map(|_| ())
+}
+
+/// [`append_and_report`], returning the event's task id (what `open` needs to attach its tags
+/// and relations to the task it just created).
+fn append_event(task_id: Option<&str>, from: &str, kind: TaskEventKind, token: Option<String>) -> Result<String> {
     let store = TaskStore::default_store().with_token(task::token(token));
     let report = task::append_and_notify(&store, task_id, from, kind, Vec::new())?;
     for w in report.replay_warnings.iter().chain(&report.warnings) {
@@ -263,13 +574,13 @@ fn append_and_report(task_id: Option<&str>, from: &str, kind: TaskEventKind, tok
     println!(
         "✦ {} {} → {}",
         report.event.kind.tag(),
-        short_id(&report.event.task_id),
+        prefix(&report.event.task_id, 13),
         state
     );
     if matches!(report.event.kind, TaskEventKind::Opened { .. }) {
         println!("{}", report.event.task_id);
     }
-    Ok(())
+    Ok(report.event.task_id)
 }
 
 fn resolve<'m>(model: &'m cv_core::task::TaskReadModel, prefix: &str) -> Result<&'m str> {
@@ -279,30 +590,75 @@ fn resolve<'m>(model: &'m cv_core::task::TaskReadModel, prefix: &str) -> Result<
 /// One `cv task list` row: id, age since last event (G8), state, assignee, title — rendered from
 /// the shared [`TaskRow`] shape (built via [`TaskRow::full`], whose `last_ts` anchors the age).
 /// All free-text fields are terminal-sanitized (G5) — the log is forever, so every reader strips.
-fn task_row(r: &TaskRow, now: DateTime<Utc>) -> String {
+fn task_row(r: &TaskRow, now: DateTime<Utc>, plen: usize, blocked: bool) -> String {
     let assignee = r.assignee.as_deref().unwrap_or("-");
     format!(
-        "{}  {:>4}  {:16} {:20} {}",
-        short_id(&r.id),
+        "{:<plen$}  {:>4}  {:16} {:20} {}{}",
+        prefix(&r.id, plen),
         task::age_short(r.last_ts.unwrap_or(now), now),
         r.effective_state,
         sanitize_line(assignee),
+        if blocked { "⊘ " } else { "" },
         sanitize_line(&r.title)
     )
 }
 
-/// One `cv task inbox` row, stalest first upstream: a `⏰` leads anything waiting > 24h. A
-/// projection of age, not an escalation — the marker is the whole mechanism.
-fn inbox_row(r: &InboxRow, now: DateTime<Utc>) -> String {
-    let stale = now.signed_duration_since(r.since) > chrono::Duration::hours(24);
-    format!(
-        "{} {}  {:>4}  {:24} {}",
-        if stale { "⏰" } else { "  " },
-        short_id(&r.id),
-        task::age_short(r.since, now),
-        format!("{:?}", r.reason),
-        sanitize_line(&r.title)
-    )
+/// `--tsv`: full id, state, assignee, repo basename, age, title, blocked_by — one tab between
+/// fields, tabs/newlines inside a field replaced, nothing aligned or cut. For `cut`/`awk`/`sort`.
+fn task_row_tsv(r: &TaskRow, now: DateTime<Utc>) -> String {
+    let cell = |s: &str| sanitize_line(s).replace(['\t', '\n'], " ");
+    let repo = r
+        .repo
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    [
+        r.id.clone(),
+        r.effective_state.clone(),
+        cell(r.assignee.as_deref().unwrap_or("")),
+        cell(&repo),
+        task::age_short(r.last_ts.unwrap_or(now), now),
+        cell(&r.title),
+        r.blocked_by.join(","),
+    ]
+    .join("\t")
+}
+
+/// `--wide`: the row, then a second line with tags · repo · blockers · the body's first line.
+fn task_row_wide(t: &TaskProjection, model: &TaskReadModel, now: DateTime<Utc>, plen: usize) -> String {
+    let mut out = task_row(&TaskRow::full(t), now, plen, task::is_blocked(model, t));
+    let mut facts: Vec<String> = Vec::new();
+    if !t.tags.is_empty() {
+        facts.push(format!("#{}", t.tags.join(" #")));
+    }
+    if let Some(repo) = &t.repo {
+        facts.push(
+            repo.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+    }
+    if !t.blocked_by.is_empty() {
+        let names: Vec<String> = t
+            .blocked_by
+            .iter()
+            .map(|b| match model.tasks.get(b) {
+                Some(bt) => format!("{} [{}]", prefix(b, plen), task::effective_display(bt)),
+                None => format!("{} [unknown]", prefix(b, plen)),
+            })
+            .collect();
+        facts.push(format!("blocked by {}", names.join(", ")));
+    }
+    let body = t.body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if !body.is_empty() {
+        facts.push(truncate(&sanitize_line(body), 160));
+    }
+    if !facts.is_empty() {
+        out.push_str("\n    ");
+        out.push_str(&sanitize_line(&facts.join(" · ")));
+    }
+    out
 }
 
 pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
@@ -310,10 +666,14 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         TaskCmd::Open {
             title,
             body,
+            body_file,
             repo,
             issue,
             channel,
             assignee,
+            tags,
+            blocked_by,
+            blocks,
             from,
         } => {
             let repo = match repo {
@@ -323,9 +683,27 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 ),
                 None => None,
             };
-            append_and_report(
+            let issue = absolutize_issue(issue, repo.as_deref());
+            let body = match &body_file {
+                Some(p) => read_text_arg(p)?,
+                None => text_or_stdin(body)?,
+            };
+            let tags = tags.as_deref().map(parse_tags).unwrap_or_default();
+            // Relations name other tasks: resolve every prefix BEFORE the open, so a typo refuses
+            // the whole command instead of leaving a task opened with half its relations.
+            let (blocked_by, blocks) = {
+                let outcome = replay_loud()?;
+                let res = |ids: Vec<String>| -> Result<Vec<String>> {
+                    ids.iter()
+                        .map(|p| resolve(&outcome.model, p).map(str::to_string))
+                        .collect()
+                };
+                (res(blocked_by)?, res(blocks)?)
+            };
+            let from = from_or_cv(from);
+            let id = append_event(
                 None,
-                &from_or_cv(from),
+                &from,
                 TaskEventKind::Opened {
                     title,
                     body,
@@ -335,47 +713,119 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     assignee,
                 },
                 None,
-            )
+            )?;
+            if !tags.is_empty() {
+                append_and_report(Some(&id), &from, TaskEventKind::Tagged { tags }, None)?;
+            }
+            for b in blocked_by {
+                append_and_report(Some(&id), &from, TaskEventKind::BlockedBy { task: b }, None)?;
+            }
+            for other in blocks {
+                append_and_report(Some(&other), &from, TaskEventKind::BlockedBy { task: id.clone() }, None)?;
+            }
+            Ok(())
         }
         TaskCmd::List {
             state,
             assignee,
             repo,
+            tag,
+            decisions,
+            actions,
             all,
+            since,
             json,
+            tsv,
+            wide,
         } => {
             let outcome = replay_loud()?;
+            let now = Utc::now();
+            let touched_since = scope_window(all, since.as_deref(), now)?;
+            let caller = task::default_endpoint();
             let filter = task::TaskFilter {
                 state,
                 assignee,
                 repo,
                 include_terminal: all,
+                tag,
+                touched_since,
+                or_involving: caller,
+                decisions: if decisions {
+                    Some(true)
+                } else if actions {
+                    Some(false)
+                } else {
+                    None
+                },
             };
             let tasks = task::list(&outcome.model, &filter).map_err(|e| anyhow::anyhow!(e))?;
+            // What the window hid: the same filter with no window, minus what it kept.
+            let hidden = if touched_since.is_some() {
+                let unscoped = task::TaskFilter {
+                    touched_since: None,
+                    or_involving: None,
+                    ..filter.clone()
+                };
+                task::list(&outcome.model, &unscoped)
+                    .map(|v| v.len().saturating_sub(tasks.len()))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             if json {
                 // The full projections, unchanged wire shape (`show --json` sibling).
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
-            } else {
-                let now = Utc::now();
+                return Ok(());
+            }
+            let now = Utc::now();
+            if tsv {
                 for t in &tasks {
-                    println!("{}", task_row(&TaskRow::full(t), now));
+                    println!("{}", task_row_tsv(&TaskRow::full(t), now));
                 }
-                if tasks.is_empty() {
-                    println!("(no matching tasks)");
+                return Ok(());
+            }
+            let plen = prefix_len(&outcome.model);
+            for t in &tasks {
+                if wide {
+                    println!("{}", task_row_wide(t, &outcome.model, now, plen));
+                } else {
+                    println!(
+                        "{}",
+                        task_row(&TaskRow::full(t), now, plen, task::is_blocked(&outcome.model, t))
+                    );
                 }
+            }
+            if tasks.is_empty() {
+                println!("(no matching tasks)");
+            } else if tasks.iter().any(|t| task::is_blocked(&outcome.model, t)) {
+                println!("⊘ = blocked by a task that has not finished");
+            }
+            if hidden > 0 {
+                println!("({hidden} older task(s) hidden — `--all`, or `--since 90d`)");
             }
             Ok(())
         }
-        TaskCmd::Show { id, json, events } => {
+        TaskCmd::Show {
+            id,
+            json,
+            events,
+            brief,
+            notes_last,
+            notes_grep,
+        } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             let t = &outcome.model.tasks[&id];
+            let grep = match &notes_grep {
+                Some(p) => Some(regex::RegexBuilder::new(p).case_insensitive(true).build()?),
+                None => None,
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(t)?);
             } else {
                 // Every free-text field below came from the durable log — sanitize at render
                 // (G5): titles, notes, endpoints, and branch names are all untrusted.
-                println!("task {}  [{}]", t.task_id, task::effective_display(t));
+                println!("task {}  [{}]  {}", t.task_id, task::effective_display(t), t.kind());
                 // Provenance for the terminal facts: a self-reported completion is labeled as
                 // such (never silently equal to a verified land), and landing carries the
                 // verifier's freshness read.
@@ -403,7 +853,11 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 }
                 println!("  title:    {}", sanitize_line(&t.title));
                 if !t.body.is_empty() {
-                    println!("  body:     {}", sanitize_line(&t.body));
+                    if brief {
+                        println!("  body:     {}", task_ops::first_line(&t.body, 160));
+                    } else {
+                        println!("  body:     {}", sanitize_line(&t.body));
+                    }
                 }
                 if let Some(repo) = &t.repo {
                     println!("  repo:     {}", repo.display());
@@ -413,11 +867,71 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 }
                 println!("  channel:  #{}", sanitize_line(&t.channel));
                 println!("  assignee: {}", sanitize_line(t.assignee.as_deref().unwrap_or("-")));
+                if !t.tags.is_empty() {
+                    println!("  tags:     {}", sanitize_line(&t.tags.join(", ")));
+                }
+                let plen = prefix_len(&outcome.model);
+                for b in &t.blocked_by {
+                    match outcome.model.tasks.get(b) {
+                        Some(bt) => println!(
+                            "  blocked by: {} [{}] {}",
+                            prefix(b, plen),
+                            task::effective_display(bt),
+                            sanitize_line(&bt.title)
+                        ),
+                        None => println!("  blocked by: {} [unknown task]", prefix(b, plen)),
+                    }
+                }
+                if task::is_blocked(&outcome.model, t) {
+                    println!("  ⊘ BLOCKED — a blocker above has not finished");
+                }
+                for other in task::blocks(&outcome.model, &t.task_id) {
+                    println!(
+                        "  blocks:   {} [{}] {}",
+                        prefix(&other.task_id, plen),
+                        task::effective_display(other),
+                        sanitize_line(&other.title)
+                    );
+                }
                 println!(
                     "  opened:   {} by {}",
                     fmt_local(t.opened_at, "%Y-%m-%d %H:%M"),
                     sanitize_line(&t.opened_by)
                 );
+                if let Some(d) = &t.decision {
+                    let deadline = d
+                        .deadline
+                        .map(|dl| format!(" · {}", task_ops::deadline_phrase(dl, show_now)))
+                        .unwrap_or_default();
+                    println!(
+                        "  decision: posed {} by {}{deadline}",
+                        fmt_local(d.posed_at, "%Y-%m-%d %H:%M"),
+                        sanitize_line(&d.posed_by)
+                    );
+                    println!("    default:  {}", sanitize_line(&d.default_choice));
+                    for a in d.alternatives() {
+                        println!("    option:   {}", sanitize_line(a));
+                    }
+                    match &d.resolution {
+                        Some(r) => println!(
+                            "    resolved: {} — by {}, {}{}{}",
+                            sanitize_line(&r.choice),
+                            sanitize_line(&r.by),
+                            fmt_local(r.ts, "%Y-%m-%d %H:%M"),
+                            if r.accepted_default { " (the default)" } else { "" },
+                            r.note
+                                .as_deref()
+                                .map(|n| format!(" · {}", sanitize_line(n)))
+                                .unwrap_or_default()
+                        ),
+                        None if !t.state.is_terminal() => println!(
+                            "    resolve:  cv task resolve {} --accept-default --from {}",
+                            prefix(&t.task_id, plen),
+                            sanitize_line(t.assignee.as_deref().unwrap_or("<you>"))
+                        ),
+                        None => {}
+                    }
+                }
                 for rev in &t.revisions {
                     println!(
                         "  rev {}: {} [{}] {} → {}",
@@ -464,13 +978,42 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                         println!("         ⚠ {}", sanitize_line(&issue.describe()));
                     }
                 }
-                for note in &t.notes {
+                let children = task_ops::split_children(&outcome.model);
+                let selected: Vec<&cv_core::task::Note> = t
+                    .notes
+                    .iter()
+                    .filter(|n| grep.as_ref().is_none_or(|re| re.is_match(&n.text)))
+                    .collect();
+                let skip = notes_last.map_or(0, |k| selected.len().saturating_sub(k));
+                let shown = &selected[skip..];
+                if !t.notes.is_empty() && (brief || shown.len() != t.notes.len()) {
                     println!(
-                        "  note ({}, {}): {}",
-                        sanitize_line(&note.by),
-                        fmt_local(note.ts, "%Y-%m-%d %H:%M"),
-                        sanitize_line(&note.text)
+                        "  notes:    {} of {} (newest last){}",
+                        shown.len(),
+                        t.notes.len(),
+                        if brief { " — one line each; drop --brief for the full text" } else { "" }
                     );
+                }
+                for note in shown {
+                    let split = children
+                        .get(&note.event_id)
+                        .map(|c| format!("  → split into {}", prefix(c, plen)))
+                        .unwrap_or_default();
+                    if brief {
+                        println!(
+                            "    {} {:<24} {}{split}",
+                            fmt_local(note.ts, "%m-%d %H:%M"),
+                            truncate(&sanitize_line(&note.by), 24),
+                            task_ops::first_line(&note.text, 150)
+                        );
+                    } else {
+                        println!(
+                            "  note ({}, {}): {}{split}",
+                            sanitize_line(&note.by),
+                            fmt_local(note.ts, "%Y-%m-%d %H:%M"),
+                            sanitize_line(&note.text)
+                        );
+                    }
                 }
             }
             if events {
@@ -499,11 +1042,17 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         TaskCmd::Note {
             id,
             text,
+            file,
             session_ref,
             from,
         } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
+            let text = match (text, file) {
+                (Some(t), _) => text_or_stdin(t)?,
+                (None, Some(f)) => read_text_arg(&f)?,
+                (None, None) => unreachable!("clap requires text or --file"),
+            };
             append_and_report(
                 Some(&id),
                 &from_or_cv(from),
@@ -562,6 +1111,27 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 None,
             )
         }
+        TaskCmd::Tag { id, tags, from } => {
+            let outcome = replay_loud()?;
+            let id = resolve(&outcome.model, &id)?.to_string();
+            let tags = parse_tags(&tags);
+            if tags.is_empty() {
+                bail!("no tags given (comma-separated, e.g. `decision,deploy`)");
+            }
+            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Tagged { tags }, None)
+        }
+        TaskCmd::Block { id, by_task, from } => {
+            let outcome = replay_loud()?;
+            let id = resolve(&outcome.model, &id)?.to_string();
+            let by_task = resolve(&outcome.model, &by_task)?.to_string();
+            append_and_report(
+                Some(&id),
+                &from_or_cv(from),
+                TaskEventKind::BlockedBy { task: by_task },
+                None,
+            )
+        }
+        TaskCmd::Sweep { repo, main, json } => cmd_sweep(&repo, main, json),
         TaskCmd::Propose {
             id,
             branch,
@@ -679,25 +1249,271 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             fetch,
             skip_landed,
         } => cmd_verify(id, all, fetch, skip_landed),
-        TaskCmd::Inbox { who, json } => {
+        TaskCmd::Inbox {
+            who,
+            json,
+            md,
+            unread,
+            all,
+            since,
+        } => {
             // Bare `cv task inbox` means "my inbox": the spawner-set CV_ENDPOINT, else "cv".
             let who = from_or_cv(who);
             let outcome = replay_loud()?;
+            let now = Utc::now();
+            let window = scope_window(all, since.as_deref(), now)?;
+            let caller = task::default_endpoint();
+            let page = task_ops::inbox_page(&outcome, &who, caller.as_deref(), window, unread, now);
             if json {
-                // The full entries, unchanged wire shape.
-                let entries = task::inbox(&outcome.model, &who);
+                // The full entries, unchanged wire shape (`task` embeds the whole projection,
+                // decision facet included); `--unread`/the window narrow which entries appear.
+                let keep: std::collections::HashSet<&str> = page.items.iter().map(|i| i.id.as_str()).collect();
+                let entries: Vec<_> = task::inbox(&outcome.model, &who)
+                    .into_iter()
+                    .filter(|e| keep.contains(e.task.task_id.as_str()))
+                    .collect();
                 println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if md {
+                print!("{}", task_ops::render_inbox_md(&page));
             } else {
-                let rows = InboxRow::compute(&outcome.model, &who);
-                let now = Utc::now();
-                for r in &rows {
-                    println!("{}", inbox_row(r, now));
-                }
-                if rows.is_empty() {
-                    println!("(inbox empty for {})", sanitize_line(&who));
-                }
+                print!("{}", task_ops::render_inbox_text(&page));
             }
             Ok(())
+        }
+        TaskCmd::Decide {
+            title,
+            for_who,
+            default,
+            options,
+            by,
+            body,
+            body_file,
+            repo,
+            issue,
+            channel,
+            tags,
+            blocks,
+            from,
+        } => {
+            let repo = match repo {
+                Some(r) => Some(
+                    r.canonicalize()
+                        .with_context(|| format!("repo {} not found", r.display()))?,
+                ),
+                None => None,
+            };
+            let body = match &body_file {
+                Some(p) => read_text_arg(p)?,
+                None => text_or_stdin(body)?,
+            };
+            let now = Utc::now();
+            let deadline = match by {
+                Some(b) => Some(task::parse_deadline(&b, now).map_err(|e| anyhow::anyhow!(e))?),
+                None => None,
+            };
+            let blocks = {
+                let outcome = replay_loud()?;
+                blocks
+                    .iter()
+                    .map(|p| resolve(&outcome.model, p).map(str::to_string))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let issue = absolutize_issue(issue, repo.as_deref());
+            let spec = DecisionSpec {
+                title,
+                body,
+                for_who,
+                default_choice: default,
+                options,
+                deadline,
+                repo,
+                issue,
+                channel,
+                tags: tags.as_deref().map(parse_tags).unwrap_or_default(),
+                source: None,
+                blocks,
+            };
+            let store = TaskStore::default_store();
+            let (events, warnings) = task_ops::pose(&store, &from_or_cv(from), spec)?;
+            for w in &warnings {
+                eprintln!("⚠ {}", sanitize_line(w));
+            }
+            let id = events[0].task_id.clone();
+            let for_who = match &events[0].kind {
+                TaskEventKind::Opened { assignee, .. } => assignee.clone().unwrap_or_default(),
+                _ => String::new(),
+            };
+            println!("✦ decision {} posed for {}", prefix(&id, 13), sanitize_line(&for_who));
+            println!("{id}");
+            Ok(())
+        }
+        TaskCmd::Resolve {
+            id,
+            choice,
+            accept_default,
+            note,
+            from,
+            token,
+        } => {
+            let outcome = replay_loud()?;
+            let id = resolve(&outcome.model, &id)?.to_string();
+            let t = &outcome.model.tasks[&id];
+            // The resolver is the fact that matters; never guessed. The error names the cure
+            // with the decision's own assignee filled in.
+            let from = match from.or_else(task::default_endpoint) {
+                Some(f) => f,
+                None => bail!(
+                    "a resolution records WHO decided: this decision is for {owner} — if that is you,\n  \
+                     cv task resolve {short} {answer} --from {owner}\n  (or `export CV_ENDPOINT={owner}` once)",
+                    owner = t.assignee.as_deref().unwrap_or("<you>"),
+                    short = prefix(&id, 13),
+                    answer = match &choice {
+                        Some(c) => format!("--choice {c:?}"),
+                        None => "--accept-default".into(),
+                    }
+                ),
+            };
+            let note = match note {
+                Some(n) => Some(text_or_stdin(n)?),
+                None => None,
+            };
+            let store = TaskStore::default_store();
+            let answer = task_ops::Answer::from_flags(choice, accept_default)?;
+            let report = task_ops::resolve(&store, &outcome.model, &from, token, &id, answer, note)?;
+            for w in report.replay_warnings.iter().chain(&report.warnings) {
+                eprintln!("⚠ {}", sanitize_line(w));
+            }
+            if let TaskEventKind::Resolved { choice, .. } = &report.event.kind {
+                println!(
+                    "✦ resolved {} → {} (by {})",
+                    prefix(&id, 13),
+                    sanitize_line(choice),
+                    sanitize_line(&from)
+                );
+            }
+            Ok(())
+        }
+        TaskCmd::Split { id, dry_run, from } => {
+            let outcome = replay_loud()?;
+            let id = resolve(&outcome.model, &id)?.to_string();
+            let plan = task_ops::plan_split(&outcome.model, &id)?;
+            let plen = prefix_len(&outcome.model);
+            let t = &outcome.model.tasks[&id];
+            if plan.items.is_empty() {
+                println!(
+                    "no leading-DECIDE notes on {} ({} note(s){})",
+                    prefix(&id, plen),
+                    t.notes.len(),
+                    if plan.mid_text > 0 {
+                        format!("; {} mention DECIDE mid-text — split takes notes that START with DECIDE", plan.mid_text)
+                    } else {
+                        String::new()
+                    }
+                );
+                return Ok(());
+            }
+            println!(
+                "# {} DECIDE note(s) on {} — {}{}",
+                plan.items.len(),
+                prefix(&id, plen),
+                sanitize_line(&t.title),
+                if dry_run { " (dry run: nothing written)" } else { "" }
+            );
+            for (i, item) in plan.items.iter().enumerate() {
+                println!(
+                    "{:>2}. {}{}",
+                    i + 1,
+                    sanitize_line(&item.title),
+                    match &item.existing {
+                        Some(c) => format!("  (already split → {})", prefix(c, plen)),
+                        None => String::new(),
+                    }
+                );
+                println!("    default: {}", sanitize_line(&item.default_choice));
+                for o in item.options.iter().skip(1) {
+                    println!("    option:  {}", sanitize_line(o));
+                }
+                println!(
+                    "    from note by {} at {}",
+                    sanitize_line(&item.note_by),
+                    fmt_local(item.note_ts, "%m-%d %H:%M")
+                );
+            }
+            if plan.mid_text > 0 {
+                println!(
+                    "({} other note(s) mention DECIDE mid-text; not split — move the DECIDE to the front of a note to split it)",
+                    plan.mid_text
+                );
+            }
+            if dry_run {
+                return Ok(());
+            }
+            let store = TaskStore::default_store();
+            let (created, warnings) = task_ops::run_split(&store, &outcome.model, &from_or_cv(from), &plan)?;
+            for w in &warnings {
+                eprintln!("⚠ {}", sanitize_line(w));
+            }
+            println!();
+            for (_, child) in &created {
+                println!("✦ decision {} posed for {}", prefix(child, 13), sanitize_line(t.assignee.as_deref().unwrap_or("-")));
+            }
+            println!(
+                "{} decision(s) created, each blocking {} · `cv task inbox {}` lists them first",
+                created.len(),
+                prefix(&id, plen),
+                sanitize_line(t.assignee.as_deref().unwrap_or("<assignee>"))
+            );
+            Ok(())
+        }
+        TaskCmd::Events {
+            since,
+            kind,
+            by,
+            not_by,
+            assignee,
+            task: task_id,
+            text,
+        } => {
+            let outcome = replay_loud()?;
+            let now = Utc::now();
+            let task_id = match task_id {
+                Some(p) => Some(resolve(&outcome.model, &p)?.to_string()),
+                None => None,
+            };
+            let f = EventFilter {
+                since: Since::parse(since.as_deref(), now)?,
+                kinds: kind
+                    .as_deref()
+                    .map(|k| k.split(',').map(task_ops::kind_tag).collect())
+                    .unwrap_or_default(),
+                by,
+                not_by,
+                assignee,
+                task: task_id,
+            };
+            print_events(&outcome, &f, text)
+        }
+        TaskCmd::Watch {
+            assignee,
+            since,
+            not_by,
+            text,
+        } => {
+            let outcome = replay_loud()?;
+            let now = Utc::now();
+            let f = EventFilter {
+                since: Since::parse(since.as_deref(), now)?,
+                kinds: Vec::new(),
+                by: None,
+                not_by: not_by.or_else(task::default_endpoint),
+                assignee: Some(assignee),
+                task: None,
+            };
+            print_events(&outcome, &f, text)
+        }
+        TaskCmd::Serve { bind, assignee, open } => {
+            let who = assignee.or_else(task::default_endpoint);
+            super::task_serve::run(&bind, who, open)
         }
         TaskCmd::Debt { repo, json } => {
             let outcome = replay_loud()?;
@@ -751,6 +1567,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 return Ok(());
             }
             let report = task::DebtReport::compute(&outcome.model, hb.as_ref(), repo.as_deref());
+            let plen = prefix_len(&outcome.model);
             // Rows arrive repo-ascending (no-repo first), oldest first within a repo: render a
             // group header at each repo transition.
             let mut current: Option<&Option<std::path::PathBuf>> = None;
@@ -768,7 +1585,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 let age = now.signed_duration_since(row.since);
                 println!(
                     "  {}  rev{} {} [{}] unlanded for {}h · {} — {}",
-                    short_id(&row.id),
+                    prefix(&row.id, plen),
                     row.revision,
                     sanitize_line(&row.branch),
                     row.state.as_str(),
@@ -788,7 +1605,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 for row in &report.awaiting_review {
                     println!(
                         "  {}  rev{} {} → {} waiting {} — {}",
-                        short_id(&row.id),
+                        prefix(&row.id, plen),
                         row.revision,
                         sanitize_line(&row.branch),
                         sanitize_line(row.reviewer.as_deref().unwrap_or("(reviewer unbound)")),
@@ -809,7 +1626,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     .unwrap_or_default();
                 println!(
                     "⚠ SUSPECT {}  rev{} {}{} — {}",
-                    short_id(&s.task_id),
+                    prefix(&s.task_id, plen),
                     s.revision,
                     sanitize_line(&s.detail),
                     fresh,
@@ -840,6 +1657,25 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `cv task events` / `cv task watch`: one line per event, JSON by default (the poll surface),
+/// `--text` for people. The next cursor (the last event id) goes to stderr so stdout stays pure.
+fn print_events(outcome: &cv_core::task::ReplayOutcome, f: &EventFilter, text: bool) -> Result<()> {
+    let events = task_ops::select_events(outcome, f);
+    let plen = prefix_len(&outcome.model);
+    for ev in &events {
+        if text {
+            println!("{}", task_ops::event_text(ev, &outcome.model, plen));
+        } else {
+            println!("{}", serde_json::to_string(&task_ops::event_json(ev, &outcome.model))?);
+        }
+    }
+    match events.last() {
+        Some(last) => eprintln!("# {} event(s) · next: --since {}", events.len(), last.id),
+        None => eprintln!("# no events"),
+    }
+    Ok(())
 }
 
 /// A compact human phrase for a fact's freshness — how it was learned and when. Reused across the
@@ -1004,7 +1840,7 @@ fn cmd_verify(id: Option<String>, all: bool, fetch: bool, skip_landed: bool) -> 
         eprintln!("⚠ {}", sanitize_line(w));
     }
     for ev in &appended {
-        println!("✦ observed {} on {}", ev.kind.tag(), short_id(&ev.task_id));
+        println!("✦ observed {} on {}", ev.kind.tag(), prefix(&ev.task_id, 13));
     }
     if appended.is_empty() {
         println!("(nothing new observed)");
@@ -1015,7 +1851,7 @@ fn cmd_verify(id: Option<String>, all: bool, fetch: bool, skip_landed: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cv_core::task::{InboxEntry, InboxReason, TaskProjection, TaskState};
+    use cv_core::task::{TaskProjection, TaskState};
 
     fn proj(title: &str, last_ts: &str) -> TaskProjection {
         TaskProjection {
@@ -1037,6 +1873,9 @@ mod tests {
             abandoned_reason: None,
             done_observed: None,
             done_check: None,
+            tags: Vec::new(),
+            blocked_by: Vec::new(),
+            decision: None,
         }
     }
 
@@ -1044,33 +1883,56 @@ mod tests {
     fn task_row_shows_age_and_strips_ansi() {
         let t = proj("evil\u{1b}]0;pwn\u{7}title\u{1b}[31m!", "2026-07-13T00:00:00Z");
         let now: DateTime<Utc> = "2026-07-16T00:00:00Z".parse().unwrap();
-        let row = task_row(&TaskRow::full(&t), now);
+        let row = task_row(&TaskRow::full(&t), now, 8, false);
         assert!(row.contains("  3d  "), "age column from last_ts: {row}");
         assert!(row.contains("eviltitle!"), "payload stripped: {row}");
         assert!(!row.contains('\u{1b}'), "no ESC survives: {row}");
     }
 
     #[test]
-    fn inbox_row_marks_older_than_24h_and_strips_ansi() {
-        let t = proj("t\u{1b}[31mred", "2026-07-13T00:00:00Z");
+    fn blocked_rows_carry_the_marker_and_tsv_is_one_line_per_task() {
+        let mut t = proj("tab\tin\ntitle", "2026-07-13T00:00:00Z");
+        t.blocked_by = vec!["00000000-0000-7000-8000-000000000009".into()];
         let now: DateTime<Utc> = "2026-07-16T00:00:00Z".parse().unwrap();
-        let stale = InboxRow::from_entry(&InboxEntry {
-            task: &t,
-            reason: InboxReason::ClaimedByYou,
-            since: "2026-07-13T00:00:00Z".parse().unwrap(),
-        });
-        let row = inbox_row(&stale, now);
-        assert!(row.starts_with("⏰"), "24h+ rows lead with the marker: {row}");
-        assert!(row.contains("tred") && !row.contains('\u{1b}'), "{row}");
+        let row = task_row(&TaskRow::full(&t), now, 13, true);
+        assert!(row.contains("⊘ tab"), "{row}");
+        assert!(
+            row.starts_with("00000000-0000  "),
+            "prefix is sized by the caller: {row}"
+        );
+        let tsv = task_row_tsv(&TaskRow::full(&t), now);
+        assert_eq!(tsv.lines().count(), 1, "{tsv:?}");
+        let cells: Vec<&str> = tsv.split('\t').collect();
+        assert_eq!(cells.len(), 7, "{cells:?}");
+        assert_eq!(cells[0], t.task_id);
+        assert_eq!(cells[5], "tab in title");
+        assert_eq!(cells[6], "00000000-0000-7000-8000-000000000009");
+    }
 
-        let fresh = InboxRow::from_entry(&InboxEntry {
-            task: &t,
-            reason: InboxReason::ClaimedByYou,
-            since: "2026-07-15T12:00:00Z".parse().unwrap(),
-        });
-        let row = inbox_row(&fresh, now);
-        assert!(!row.contains('⏰'), "young rows carry no marker: {row}");
-        assert!(row.contains("12h"), "{row}");
+    #[test]
+    fn tags_parse_trimmed_and_deduplicated() {
+        assert_eq!(parse_tags(" a, b ,,a,c "), vec!["a", "b", "c"]);
+        assert!(parse_tags(", ,").is_empty());
+    }
+
+    #[test]
+    fn sweep_helpers_tell_branches_from_words_and_paths_from_handles() {
+        assert!(branch_like("sdk-ts-repair"));
+        assert!(branch_like("k-ran"));
+        assert!(branch_like("feature/x"));
+        assert!(branch_like("p3b1"));
+        assert!(!branch_like("fix"));
+        assert!(!branch_like("final"));
+        let toks = branch_tokens("one commit on branch `sdk-ts-repair` (see docs/plan.md).");
+        assert!(toks.contains("sdk-ts-repair"), "{toks:?}");
+        assert!(toks.contains("docs/plan.md"), "{toks:?}");
+        assert_eq!(
+            issue_path("claudesplosion/planning/SESSION-STATE.md"),
+            Some("claudesplosion/planning/SESSION-STATE.md")
+        );
+        assert_eq!(issue_path("#42"), None);
+        assert_eq!(issue_path("https://github.com/x/y/issues/4"), None);
+        assert_eq!(issue_path("memory/x.md"), Some("memory/x.md"));
     }
 
     #[test]
@@ -1080,4 +1942,193 @@ mod tests {
         // The unset-env cases are exercised end-to-end in tests/cli.rs (spawned process with a
         // controlled environment — no process-global set_var races here).
     }
+}
+
+// ===================== cv task sweep =====================
+
+/// What `git` in `repo` says has landed: every local branch merged into `main`, plus every
+/// remote-tracking branch merged into it with its remote prefix stripped — the names a task's
+/// body would mention. `main` itself is excluded.
+fn merged_branches(repo: &Path, main: &str) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for extra in [&[][..], &["-r"][..]] {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
+            .arg(repo)
+            .arg("branch")
+            .args(extra)
+            .arg("--format=%(refname:short)")
+            .arg("--merged")
+            .arg(main);
+        let o = cmd
+            .output()
+            .with_context(|| format!("running git branch --merged in {}", repo.display()))?;
+        if !o.status.success() {
+            bail!(
+                "git branch --merged {main} failed in {}: {}",
+                repo.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let name = line.trim();
+            if name.is_empty() || name.ends_with("/HEAD") {
+                continue;
+            }
+            let short = name.split_once('/').map(|(_, rest)| rest).unwrap_or(name);
+            for n in [name, short] {
+                if n != main {
+                    out.insert(n.to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Does `repo` have a ref named `name`?
+fn has_ref(repo: &Path, name: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", name])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// A branch name worth matching against prose: it must look like a branch, not a word — a
+/// separator or a digit, or eight characters — so a branch called `fix` does not sweep every task
+/// whose body says "fix".
+fn branch_like(name: &str) -> bool {
+    name.contains(['-', '/', '_', '.']) || name.chars().any(|c| c.is_ascii_digit()) || name.len() >= 8
+}
+
+/// The branch-shaped tokens of a text (letters, digits and `-_./`), deduplicated.
+fn branch_tokens(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.')))
+        .map(|t| t.trim_matches(|c| matches!(c, '.' | '/')))
+        .filter(|t| t.len() >= 3)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Does `issue` read as a path (as opposed to `#42` or a URL)? A slash or a file extension and no
+/// whitespace.
+fn issue_path(issue: &str) -> Option<&str> {
+    let i = issue.trim();
+    let looks = !i.contains(char::is_whitespace)
+        && !i.contains("://")
+        && (i.contains('/') || Path::new(i).extension().is_some());
+    looks.then_some(i)
+}
+
+#[derive(serde::Serialize)]
+struct SweepRow<'a> {
+    task_id: &'a str,
+    title: &'a str,
+    state: String,
+    reasons: Vec<String>,
+}
+
+/// `cv task sweep --repo <path>`: the tasks the world says are probably done. Observed from git
+/// and the filesystem; prints candidates and never closes one (a human or the agent that owns
+/// the task does that, with `done`/`abandon`, having read why).
+fn cmd_sweep(repo: &Path, main: Option<String>, json: bool) -> Result<()> {
+    let repo = repo
+        .canonicalize()
+        .with_context(|| format!("repo {} not found", repo.display()))?;
+    let main = match main {
+        Some(m) => m,
+        None if has_ref(&repo, "main") => "main".into(),
+        None if has_ref(&repo, "master") => "master".into(),
+        None => bail!(
+            "{} has neither `main` nor `master`; pass --main <branch>",
+            repo.display()
+        ),
+    };
+    let merged = merged_branches(&repo, &main)?;
+    let outcome = replay_loud()?;
+    let mut rows: Vec<SweepRow<'_>> = Vec::new();
+    for t in outcome.model.tasks.values() {
+        if t.state.is_terminal() || t.repo.as_deref().is_some_and(|r| r != repo) {
+            continue;
+        }
+        let mut reasons = Vec::new();
+        if let Some(p) = t.issue.as_deref().and_then(issue_path) {
+            // A relative issue path was typed from *somewhere*: the task's repo, the swept repo,
+            // the directory above it (`~/dev/<other-repo>/…` is the common spelling), or the
+            // current directory. It is missing only when none of them has it.
+            let p = Path::new(p);
+            let bases: Vec<PathBuf> = if p.is_absolute() {
+                vec![PathBuf::new()]
+            } else {
+                let mut b: Vec<PathBuf> = Vec::new();
+                b.extend(t.repo.clone());
+                b.push(repo.clone());
+                b.extend(repo.parent().map(Path::to_path_buf));
+                b.extend(std::env::current_dir().ok());
+                b.dedup();
+                b
+            };
+            if !bases.iter().any(|b| b.join(p).exists()) {
+                let tried: Vec<String> = bases.iter().map(|b| b.join(p).display().to_string()).collect();
+                reasons.push(format!("issue path no longer exists ({})", tried.join(", ")));
+            }
+        }
+        let mentioned = branch_tokens(&format!("{}\n{}", t.title, t.body));
+        for b in mentioned
+            .iter()
+            .filter(|b| branch_like(b) && merged.contains(b.as_str()))
+        {
+            reasons.push(format!("names branch `{b}`, merged into {main}"));
+        }
+        if let Some(rev) = t.current_revision() {
+            if !rev.state.is_terminal() && merged.contains(&rev.revision.branch) {
+                reasons.push(format!(
+                    "rev{} branch `{}` is merged into {main} (run `cv task verify`)",
+                    rev.revision.n, rev.revision.branch
+                ));
+            }
+        }
+        if !reasons.is_empty() {
+            rows.push(SweepRow {
+                task_id: &t.task_id,
+                title: &t.title,
+                state: task::effective_display(t),
+                reasons,
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.task_id.cmp(b.task_id));
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!(
+            "nothing to sweep: no open task names a branch merged into {main} or a missing issue path ({} merged branch(es) observed)",
+            merged.len()
+        );
+        return Ok(());
+    }
+    let plen = prefix_len(&outcome.model);
+    println!(
+        "# probably done — {} candidate(s) in {} (observed: {} branch(es) merged into {main}); nothing was closed\n",
+        rows.len(),
+        repo.display(),
+        merged.len()
+    );
+    for r in &rows {
+        println!(
+            "{:<plen$}  {:16} {}",
+            prefix(r.task_id, plen),
+            r.state,
+            sanitize_line(r.title)
+        );
+        for reason in &r.reasons {
+            println!("{:plen$}  ↳ {}", "", sanitize_line(reason));
+        }
+    }
+    println!("\nclose what is really done: `cv task done <id> --observed <evidence>` · drop the rest: `cv task abandon <id> --reason …`");
+    Ok(())
 }

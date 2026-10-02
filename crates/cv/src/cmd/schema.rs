@@ -111,9 +111,46 @@ pub(crate) fn data_schema_json() -> Value {
                 "file": ["mime", "path", "source"],
             },
         },
+        "prompt_row": {
+            "description": "one row of `prompts --json`: what the person typed, or an AskUserQuestion answer",
+            "keys": ["index", "timestamp", "kind", "text"],
+            "kind": ["prompt", "answer"],
+        },
+        "lane": {
+            "description": "one sub-agent in `lanes --json`, launch order",
+            "keys": ["agent_id", "session_id", "path", "agent_type", "description", "tool_use_id", "workflow", "model",
+                     "started_at", "last_turn_at", "duration_ms", "messages", "tool_calls", "tokens", "status",
+                     "status_source", "last_text", "last_tool", "stranded"],
+            "tokens": ["calls", "input", "cache_read", "cache_write", "output", "total"],
+            "status": "running · completed · stopped · failed · killed · or a journaled workflow status (done / partial / …)",
+            "status_source": ["journal", "task_notification", "subagent_stop", "transcript"],
+            "stranded": "status completed/stopped AND the last text's final sentences say it is waiting",
+        },
+        "deferral": {
+            "description": "one row of `deferrals --json`: a place the assistant put something off",
+            "keys": ["index", "timestamp", "phrase", "context", "matched"],
+            "phrase": DEFERRAL_PHRASES,
+            "matched": "with --open-tasks: {task_id, title, state, shared[]} or absent when no task shares ≥3 significant words",
+        },
         "query": query::schema_json(),
     })
 }
+
+/// The deferral phrase labels, in the order `cv deferrals` tries them.
+const DEFERRAL_PHRASES: &[&str] = &[
+    "later lane",
+    "follow-up",
+    "not tonight",
+    "queued",
+    "ember's call",
+    "decision for",
+    "integrator item",
+    "when X lands",
+    "after FINAL",
+    "deferred",
+    "later pass",
+    "out of scope",
+];
 
 /// The command tree in the §6 shape: one entry per visible command and subcommand
 /// (`"task open"`), each `{ name, group, about, args: [{ name, kind, value_type, possible_values?,

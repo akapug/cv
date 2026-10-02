@@ -168,14 +168,63 @@
       "assignee": null,
       "opened_by": "agent:owner",
       "opened_at": "2026-07-16T12:19:00Z",
-      "last_event_id": "00000000-0000-7000-8000-000000000021",
-      "last_ts": "2026-07-16T12:20:00Z",
+      "last_event_id": "00000000-0000-7000-8000-000000000023",
+      "last_ts": "2026-07-16T12:22:00Z",
       "revisions": [],
       "notes": [],
       "superseded_by": "00000000-0000-7000-8000-000000000001",
       "abandoned_reason": null,
       "done_observed": null,
-      "done_check": null
+      "done_check": null,
+      "tags": [
+        "decision",
+        "gate"
+      ],
+      "blocked_by": [
+        "00000000-0000-7000-8000-000000000001"
+      ]
+    },
+    "00000000-0000-7000-8000-000000000024": {
+      "task_id": "00000000-0000-7000-8000-000000000024",
+      "title": "K-PORTAL: who births a traveller's GUEST cell",
+      "body": "default = the concierge births it; alternative = the receiver allocates it",
+      "repo": null,
+      "issue": null,
+      "channel": "tasks",
+      "state": "resolved",
+      "assignee": "ember",
+      "opened_by": "orchestrator:demo",
+      "opened_at": "2026-07-16T12:23:00Z",
+      "last_event_id": "00000000-0000-7000-8000-000000000027",
+      "last_ts": "2026-07-16T12:26:00Z",
+      "revisions": [],
+      "notes": [],
+      "superseded_by": null,
+      "abandoned_reason": null,
+      "done_observed": null,
+      "done_check": null,
+      "tags": [
+        "decision"
+      ],
+      "decision": {
+        "options": [
+          "the concierge births it",
+          "the receiver allocates it"
+        ],
+        "default": "the concierge births it",
+        "deadline": "2026-07-20T00:00:00Z",
+        "source": "00000000-0000-7000-8000-000000000004",
+        "posed_at": "2026-07-16T12:25:00Z",
+        "posed_by": "orchestrator:demo",
+        "resolution": {
+          "choice": "the receiver allocates it",
+          "by": "ember",
+          "ts": "2026-07-16T12:26:00Z",
+          "event_id": "00000000-0000-7000-8000-000000000027",
+          "note": "F can afford the arrivals",
+          "accepted_default": false
+        }
+      }
     }
   }
 }

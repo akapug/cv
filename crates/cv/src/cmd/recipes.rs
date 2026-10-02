@@ -80,6 +80,23 @@ One selector at a time. Piped `cv show` with no selector over 200 KB prints the 
     cv touched <path> --json                     # every session that read/edited a file
     → [{harness, session_id, title, edits, reads, last_ts, agent_id, parent_id, workflow}]
 
+11. Re-read what the person actually said (and answered)
+    cv prompts <id>                              # every human prompt + AskUserQuestion answer, with msg indices
+    cv prompts <id> --pre-compaction --json      # only the span a compaction discarded
+    → [{index, timestamp, kind: prompt|answer, text}]
+
+12. Where is every lane right now?
+    cv lanes <id>                                # one row per sub-agent: status, model, duration, tokens, last line
+    cv lanes <id> --stranded                     # lanes that stopped saying \"waiting on …\" — each with its resume hint
+    cv lanes <id> --running --json
+    → [{agent_id, description, model, started_at, duration_ms, tokens: {total, …}, tool_calls, status,
+        status_source, last_text, last_tool, stranded}]
+
+13. What did I promise to do later, and does a task hold it?
+    cv deferrals <id> --open-tasks               # exit 1 while any deferral is UNMATCHED — gate a closeout on it
+    cv deferrals <id> --since <msg> --json
+    → [{index, timestamp, phrase, context, matched?: {task_id, title, state, shared}}]
+
 More: `cv schema` (the -q query calculus), `cv schema --commands --json` (every command + flag),
 `cv <command> --help`.
 ";
@@ -94,7 +111,7 @@ mod tests {
     #[test]
     fn ten_recipes_and_no_old_names() {
         let r = super::RECIPES;
-        for n in 1..=10 {
+        for n in 1..=13 {
             assert!(r.contains(&format!("{n:>2}. ")), "recipe {n} missing");
         }
         for old in [

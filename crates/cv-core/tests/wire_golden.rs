@@ -31,6 +31,10 @@ const ALL_EVENT_TAGS: &[&str] = &[
     "done",
     "abandoned",
     "superseded",
+    "tagged",
+    "blocked_by",
+    "posed",
+    "resolved",
     "revision_proposed",
     "review_rerouted",
     "review_passed",
@@ -407,7 +411,72 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
         &c,
         "agent:owner",
         20,
+        TaskEventKind::Tagged {
+            tags: vec!["decision".into(), "gate".into()],
+        },
+    );
+    push(
+        &mut events,
+        &c,
+        "agent:owner",
+        21,
+        TaskEventKind::BlockedBy { task: a.clone() },
+    );
+    push(
+        &mut events,
+        &c,
+        "agent:owner",
+        22,
         TaskEventKind::Superseded { by_task: a.clone() },
+    );
+
+    // Task D: a decision — opened for a human, posed with a default, a deadline and a source
+    // note, then resolved with a non-default choice (pins the decision facet's wire shape and
+    // the `resolved` terminal state).
+    let d = push(
+        &mut events,
+        "",
+        "orchestrator:demo",
+        23,
+        TaskEventKind::Opened {
+            title: "K-PORTAL: who births a traveller's GUEST cell".into(),
+            body: "default = the concierge births it; alternative = the receiver allocates it".into(),
+            repo: None,
+            issue: None,
+            channel: "tasks".into(),
+            assignee: Some("ember".into()),
+        },
+    );
+    push(
+        &mut events,
+        &d,
+        "orchestrator:demo",
+        24,
+        TaskEventKind::Tagged {
+            tags: vec!["decision".into()],
+        },
+    );
+    push(
+        &mut events,
+        &d,
+        "orchestrator:demo",
+        25,
+        TaskEventKind::Posed {
+            options: vec!["the concierge births it".into(), "the receiver allocates it".into()],
+            default_choice: "the concierge births it".into(),
+            deadline: Some("2026-07-20T00:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+            source: Some("00000000-0000-7000-8000-000000000004".into()),
+        },
+    );
+    push(
+        &mut events,
+        &d,
+        "ember",
+        26,
+        TaskEventKind::Resolved {
+            choice: "the receiver allocates it".into(),
+            note: Some("F can afford the arrivals".into()),
+        },
     );
 
     let mut log = String::from(HEADER_LINE);

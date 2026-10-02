@@ -15,6 +15,7 @@
 - [MCP — agents reading each other's minds](mcp.md)
 - [The coordination board](board.md)
 - [The task substrate](tasks.md)
+- [Running a swarm: the orchestrator's instruments](swarm.md)
 
 # Viewing & porting
 

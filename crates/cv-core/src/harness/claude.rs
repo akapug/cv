@@ -278,6 +278,27 @@ pub fn stream_reader<R: BufRead>(
     stream_reader_from(id, reader, source_path, 0, opts, sink)
 }
 
+/// How many messages a full parse of the transcript's first `len` bytes yields — the count a
+/// parse would have returned when the file was `len` bytes long, since a Claude transcript only
+/// grows by appending. Streams the prefix, so peak memory is O(largest line).
+pub(crate) fn count_prefix(r: &SessionRef, len: u64) -> Result<usize> {
+    use std::io::Read as _;
+    let file = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
+    let mut n = 0usize;
+    let mut count = |_: Message| {
+        n += 1;
+        Flow::Continue
+    };
+    stream_reader(
+        &r.id,
+        BufReader::new(file.take(len)),
+        Some(r.path.clone()),
+        &ParseOptions::full(),
+        &mut count,
+    );
+    Ok(n)
+}
+
 /// [`stream_reader`] generalized to a reader positioned at byte `start_off` (a **record start**)
 /// of the source — the seek-cooperation entry [`crate::offsets::stream_range`] drives after
 /// seeking to a recorded message offset. Every claude record parses independently of the skipped
@@ -651,6 +672,21 @@ fn user_origin(v: &Value) -> Origin {
     }
 }
 
+/// A `user` record whose whole content is a slash-command record: the invocation
+/// (`<command-name>/foo</command-name>` + `<command-message>`/`<command-args>`) or the captured
+/// output (`<local-command-stdout>…</local-command-stdout>`). Only a bare-string content that
+/// *starts* with the tag qualifies — a person pasting one of these tags mid-prompt is still a
+/// person.
+fn is_slash_command_record(msg: &Value) -> bool {
+    match msg.get("content") {
+        Some(Value::String(s)) => {
+            let s = s.trim_start();
+            s.starts_with("<command-name>") || s.starts_with("<local-command-stdout>")
+        }
+        _ => false,
+    }
+}
+
 /// Is this `assistant` record one of Claude Code's synthetic notices (an `isApiErrorMessage`, or any
 /// `model: "<synthetic>"` row such as "No response requested.")? Claude Code itself filters these out
 /// of the API messages; they are not turns.
@@ -988,6 +1024,106 @@ pub fn subagent_return(path: &std::path::Path) -> Option<String> {
     last
 }
 
+/// Where a sub-agent transcript ends: the timestamp of its last conversational record (`user` or
+/// `assistant`) and of its last `SubagentStop` hook attachment. Claude Code appends a
+/// `SubagentStop` attachment each time the agent stops; a `SendMessage` resume appends new turns
+/// after it. So `stopped_at > last_turn_at` means the agent is parked — finished or waiting —
+/// and `last_turn_at > stopped_at` (or no stop at all) means it is running, or died without the
+/// hook firing (a harness restart). Pure record scan; content is never materialized.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SubagentEnd {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_at: Option<DateTime<Utc>>,
+}
+
+impl SubagentEnd {
+    /// Parked (a `SubagentStop` fired after the last turn)? `None` when the transcript has no
+    /// stop record at all — which is *also* what a killed harness leaves behind, so the caller
+    /// pairs this with the parent's `<task-notification>` status before saying "running".
+    pub fn stopped(&self) -> Option<bool> {
+        let stop = self.stopped_at?;
+        Some(self.last_turn_at.is_none_or(|t| stop >= t))
+    }
+}
+
+pub fn subagent_end(path: &std::path::Path) -> SubagentEnd {
+    let mut end = SubagentEnd::default();
+    let Ok(file) = fs::File::open(path) else {
+        return end;
+    };
+    super::for_each_json_line(BufReader::new(file), |v| {
+        let ts = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
+        match v.get("type").and_then(Value::as_str) {
+            Some("user") | Some("assistant") => {
+                if let Some(ts) = ts {
+                    end.last_turn_at = Some(end.last_turn_at.map_or(ts, |t: DateTime<Utc>| t.max(ts)));
+                }
+            }
+            Some("attachment")
+                if v.pointer("/attachment/hookEvent").and_then(Value::as_str) == Some("SubagentStop") =>
+            {
+                if let Some(ts) = ts {
+                    end.stopped_at = Some(end.stopped_at.map_or(ts, |t: DateTime<Utc>| t.max(ts)));
+                }
+            }
+            _ => {}
+        }
+        Flow::Continue
+    });
+    end
+}
+
+/// The harness-side status of one sub-agent, as the parent transcript's `<task-notification>`
+/// records report it (`completed` / `failed` / `killed` / `stopped`), with the notification's
+/// timestamp. A notification fires each time the agent stops, so this is the LAST one per
+/// agent id.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskNotice {
+    pub status: String,
+    pub ts: Option<DateTime<Utc>>,
+}
+
+/// Scan a parent transcript for `<task-notification>` records and reduce them to the last notice
+/// per `<task-id>` (the bare agent id for `Agent`-tool children; background shell tasks notify
+/// under their own ids and ride along harmlessly). Two record shapes carry one: the
+/// `queue-operation`/`enqueue` record Claude Code writes the moment a child stops (top-level
+/// `content`), and the `user` turn it becomes when the queue drains into the conversation
+/// (`message.content`). Most notifications exist only as the former — on one real session 1,229
+/// against 105 — so reading only user turns misses the status of most lanes. Content is read only
+/// for records that start with the tag.
+pub fn task_notices(parent_path: &std::path::Path) -> std::collections::HashMap<String, TaskNotice> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(file) = fs::File::open(parent_path) else {
+        return map;
+    };
+    super::for_each_json_line(BufReader::new(file), |v| {
+        let content = match v.get("type").and_then(Value::as_str) {
+            Some("user") => v.pointer("/message/content"),
+            Some("queue-operation") => v.get("content"),
+            _ => None,
+        };
+        let Some(Value::String(content)) = content else {
+            return Flow::Continue;
+        };
+        if !content.trim_start().starts_with("<task-notification>") {
+            return Flow::Continue;
+        }
+        if let (Some(id), Some(status)) = (tag_inner(content, "task-id"), tag_inner(content, "status")) {
+            map.insert(
+                id.trim().to_string(),
+                TaskNotice {
+                    status: status.trim().to_string(),
+                    ts: v.get("timestamp").and_then(Value::as_str).and_then(parse_ts),
+                },
+            );
+        }
+        Flow::Continue
+    });
+    map
+}
+
 /// Cheap metadata-only scan for `discover`.
 fn scan(path: &std::path::Path) -> Result<SessionRef> {
     let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
@@ -1143,6 +1279,12 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx
         match role {
             Role::Tool => (MessageKind::ToolResult, Origin::Harness),
             Role::Assistant => (MessageKind::Reply, Origin::Model),
+            // Claude Code ≥ 2.1 records a slash command's invocation (`<command-name>…`) and its
+            // output (`<local-command-stdout>…`) as `user` rows — the same two records older
+            // versions wrote as `system`/`local_command`. They are the harness's bookkeeping of
+            // the command, not what the person typed (that is the plain `/compact` row just
+            // before them), so they classify as the system rows do: a notice from the harness.
+            Role::User if is_slash_command_record(msg) => (MessageKind::Notice, Origin::Harness),
             Role::User => (MessageKind::Prompt, user_origin(v)),
             Role::System => (MessageKind::Notice, Origin::Harness),
         }
@@ -2414,6 +2556,90 @@ mod tests {
             !bodies.iter().any(|b| b.contains("<command-name>")),
             "raw tag leaked: {bodies:?}"
         );
+    }
+
+    /// Claude Code ≥ 2.1 writes the slash-command invocation/output records as `user` rows. They
+    /// are harness bookkeeping (kind `notice`, origin `harness`); the person's own `/compact` line
+    /// just before them stays a human prompt — `cv prompts` keys on exactly this split.
+    #[test]
+    fn slash_command_user_rows_are_harness_notices_not_prompts() {
+        let text = [
+            r#"{"type":"user","uuid":"p1","timestamp":"2026-09-30T18:20:00.612Z","message":{"role":"user","content":"/compact"}}"#,
+            r#"{"type":"user","uuid":"c1","parentUuid":"p1","timestamp":"2026-09-30T18:20:00.618Z","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"}}"#,
+            r#"{"type":"user","uuid":"c2","parentUuid":"c1","timestamp":"2026-09-30T18:22:27.150Z","message":{"role":"user","content":"<local-command-stdout>Compacted</local-command-stdout>"}}"#,
+            r#"{"type":"user","uuid":"p2","parentUuid":"c2","timestamp":"2026-09-30T18:38:45.941Z","message":{"role":"user","content":"hi :) we /compacted. <command-name> is a thing I typed"}}"#,
+        ]
+        .join("\n");
+        let s = parse_str("slash-user", &text, None);
+        let kinds: Vec<(MessageKind, Origin)> = s.messages.iter().map(|m| (m.kind, m.origin)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (MessageKind::Prompt, Origin::Human),
+                (MessageKind::Notice, Origin::Harness),
+                (MessageKind::Notice, Origin::Harness),
+                (MessageKind::Prompt, Origin::Human),
+            ],
+            "{kinds:?}"
+        );
+        // The text itself is untouched (round-trips stay byte-honest); only the classification moves.
+        assert!(s.messages[1].text().unwrap().starts_with("<command-name>"));
+    }
+
+    #[test]
+    fn subagent_end_reads_the_stop_hook_and_task_notices_keep_the_last_status() {
+        let dir = std::env::temp_dir().join(format!("cv-subend-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = dir.join("agent-a1.jsonl");
+        std::fs::write(
+            &agent,
+            [
+                r#"{"type":"user","uuid":"u","timestamp":"2026-10-01T00:00:00Z","message":{"role":"user","content":"go"}}"#,
+                r#"{"type":"assistant","uuid":"a","timestamp":"2026-10-01T00:01:00Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"Waiting on notifications."}]}}"#,
+                r#"{"type":"attachment","uuid":"h","timestamp":"2026-10-01T00:01:05Z","attachment":{"type":"hook_success","hookEvent":"SubagentStop"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let end = subagent_end(&agent);
+        assert_eq!(end.stopped(), Some(true), "{end:?}");
+        // A resume appends turns after the stop: no longer stopped.
+        let mut resumed = std::fs::read_to_string(&agent).unwrap();
+        resumed.push('\n');
+        resumed.push_str(r#"{"type":"user","uuid":"u2","timestamp":"2026-10-01T00:05:00Z","message":{"role":"user","content":"poll it in the foreground"}}"#);
+        std::fs::write(&agent, resumed).unwrap();
+        assert_eq!(subagent_end(&agent).stopped(), Some(false));
+        // No stop record at all: unknown (a killed harness looks like this too).
+        let fresh = dir.join("agent-a2.jsonl");
+        std::fs::write(
+            &fresh,
+            r#"{"type":"user","uuid":"u","timestamp":"2026-10-01T00:00:00Z","message":{"role":"user","content":"go"}}"#,
+        )
+        .unwrap();
+        assert_eq!(subagent_end(&fresh).stopped(), None);
+
+        let parent = dir.join("parent.jsonl");
+        std::fs::write(
+            &parent,
+            [
+                r#"{"type":"user","uuid":"n1","timestamp":"2026-10-01T00:02:00Z","message":{"role":"user","content":"<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n</task-notification>"}}"#,
+                r#"{"type":"user","uuid":"n2","timestamp":"2026-10-01T00:06:00Z","message":{"role":"user","content":"<task-notification>\n<task-id>a1</task-id>\n<status>killed</status>\n</task-notification>"}}"#,
+                r#"{"type":"user","uuid":"n3","timestamp":"2026-10-01T00:06:00Z","message":{"role":"user","content":"<task-notification>\n<task-id>bash-7</task-id>\n<status>completed</status>\n</task-notification>"}}"#,
+                r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-01T00:08:00Z","content":"<task-notification>\n<task-id>a2</task-id>\n<status>completed</status>\n</task-notification>"}"#,
+                r#"{"type":"user","uuid":"p","timestamp":"2026-10-01T00:07:00Z","message":{"role":"user","content":"a human mentioning <task-notification> in passing"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let notices = task_notices(&parent);
+        assert_eq!(notices.len(), 3, "{notices:?}");
+        assert_eq!(notices["a1"].status, "killed");
+        assert_eq!(notices["a2"].status, "completed", "queue-operation records count");
+        assert_eq!(
+            notices["a1"].ts.map(|t| t.to_rfc3339()).as_deref(),
+            Some("2026-10-01T00:06:00+00:00")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

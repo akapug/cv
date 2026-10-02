@@ -21,8 +21,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use cmd::live::BoardCmd;
 use cmd::task::TaskCmd;
 use cmd::{
-    browse, cat, compose, config, doctor, formats, live, pack, port, provenance, recipes, schema, search, share, task,
-    view, workflow,
+    browse, cat, compose, config, doctor, formats, live, orchestrate, pack, port, provenance, recipes, schema, search,
+    share, task, view, workflow,
 };
 use std::path::PathBuf;
 use util::{usage, UsageError, WindowArgs};
@@ -76,6 +76,9 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
             "tree",
             "workflow",
             "compaction",
+            "prompts",
+            "lanes",
+            "deferrals",
             "timeline",
             "stats",
             "diff",
@@ -341,6 +344,64 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Only what the person said: every human-typed prompt and every `AskUserQuestion` answer, in
+    /// order, with message indices and timestamps. The orchestrator's re-read of its brief.
+    Prompts {
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Emit the rows as one JSON array (`index, timestamp, kind: prompt|answer, text`).
+        #[arg(long)]
+        json: bool,
+        /// Only the prompts in the span a compaction discarded — the Nth boundary's pre-span
+        /// (1-based; bare flag = the first), exactly the window `cv show --pre-compaction` reads.
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "1")]
+        pre_compaction: Option<usize>,
+    },
+    /// The sub-agent forest as a status table: one row per lane with its model, start, duration,
+    /// tokens, tool calls, status and last line — and the strand class (`--stranded`): lanes that
+    /// stopped saying they are waiting for something that will never wake them.
+    Lanes {
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Only lanes still running (no stop recorded).
+        #[arg(long, group = "lane_filter")]
+        running: bool,
+        /// Only lanes that completed (harness `completed`, or a journaled `done`).
+        #[arg(long, group = "lane_filter")]
+        done: bool,
+        /// Only stranded lanes: stopped, with a final text that says it is waiting (`Waiting on
+        /// notifications`, `I'll continue when the monitor fires`, …). Each row carries the
+        /// resume hint.
+        #[arg(long, group = "lane_filter")]
+        stranded: bool,
+        /// Only lanes active in this window: started or last turned within `2h`, `30m`, `1d`, …
+        #[arg(long, value_name = "DUR")]
+        since: Option<String>,
+        /// Emit the lanes as one JSON array (snake_case; `cv schema` has the shape).
+        #[arg(long)]
+        json: bool,
+    },
+    /// A linter for promises: every place the assistant deferred something ("later lane",
+    /// "follow-up", "not tonight", "queued", "ember's call", "when X lands", "after FINAL", …) with
+    /// its message index and context. `--open-tasks` cross-references the task store and marks
+    /// each MATCHED or UNMATCHED; any UNMATCHED exits 1, so a closeout can gate on it.
+    Deferrals {
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Only messages from this index on (e.g. the post-compaction region).
+        #[arg(long, value_name = "MSG")]
+        since: Option<usize>,
+        /// Cross-reference every task in the store (terminal ones included): a deferral MATCHES a
+        /// task when they share three or more significant words.
+        #[arg(long)]
+        open_tasks: bool,
+        /// Emit the deferrals as one JSON array (`index, timestamp, phrase, context, matched?`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Unified chronological feed across all harnesses (oldest → newest).
     Timeline {
         #[arg(long)]
@@ -365,6 +426,10 @@ enum Cmd {
         /// Emit the analytics as one JSON object (snake_case keys) instead of the report.
         #[arg(long)]
         json: bool,
+        /// Also total token usage per harness and model. Parses every matched transcript and its
+        /// sub-agents (slower than the catalog-only default); `--json` adds a `tokens` object.
+        #[arg(long)]
+        tokens: bool,
     },
     /// Compare two sessions message-by-message (great for loom branches).
     Diff {
@@ -970,7 +1035,7 @@ fn run() -> Result<()> {
             }
             pack::cmd_pack(&task, &format, harness, limit, out, util::parse_thinking(&thinking)?)
         }
-        Cmd::Stats { query, json } => browse::cmd_stats(query, json),
+        Cmd::Stats { query, json, tokens } => browse::cmd_stats(query, json, tokens),
         Cmd::Prune {
             id,
             harness,
@@ -1068,6 +1133,45 @@ fn run() -> Result<()> {
             summaries,
             json,
         } => workflow::cmd_compaction(&id, harness, summaries, json),
+        Cmd::Prompts {
+            id,
+            harness,
+            json,
+            pre_compaction,
+        } => orchestrate::cmd_prompts(&id, harness, json, pre_compaction),
+        Cmd::Lanes {
+            id,
+            harness,
+            running,
+            done,
+            stranded,
+            since,
+            json,
+        } => {
+            let filter = if running {
+                orchestrate::LaneFilter::Running
+            } else if done {
+                orchestrate::LaneFilter::Done
+            } else if stranded {
+                orchestrate::LaneFilter::Stranded
+            } else {
+                orchestrate::LaneFilter::All
+            };
+            orchestrate::cmd_lanes(&id, harness, filter, since, json)
+        }
+        Cmd::Deferrals {
+            id,
+            harness,
+            since,
+            open_tasks,
+            json,
+        } => {
+            // An unmatched deferral is a finding, not a failure: plain exit 1, no error text.
+            if !orchestrate::cmd_deferrals(&id, harness, since, open_tasks, json)? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Cmd::Doctor {
             id,
             harness,
@@ -1173,15 +1277,32 @@ mod tests {
     }
 
     /// The clap tree is well-formed (debug asserts: conflicting ids, bad defaults, …).
+    /// Building the clap tree is deep: `Cli::command()` for ~40 commands with their args is a
+    /// large stack frame in a debug build, and the default 2 MB test-thread stack overflows on
+    /// it (the binary's main thread has 8 MB and is fine). Run the tree-building tests on a
+    /// thread sized like main.
+    fn on_main_sized_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("test thread panicked");
+    }
+
     #[test]
     fn clap_tree_is_valid() {
-        build_cli().debug_assert();
+        on_main_sized_stack(|| build_cli().debug_assert());
     }
 
     /// Every visible command sits in exactly one group, and every grouped name is a real
     /// command — the table and the enum cannot drift apart.
     #[test]
     fn groups_cover_every_visible_command() {
+        on_main_sized_stack(groups_cover_every_visible_command_body);
+    }
+
+    fn groups_cover_every_visible_command_body() {
         let cmd = Cli::command();
         let visible: Vec<&str> = cmd
             .get_subcommands()
@@ -1216,6 +1337,10 @@ mod tests {
     /// `cv --help` lists the groups and ends with the recipes pointer.
     #[test]
     fn help_is_grouped_and_ends_with_recipes() {
+        on_main_sized_stack(help_is_grouped_and_ends_with_recipes_body);
+    }
+
+    fn help_is_grouped_and_ends_with_recipes_body() {
         let help = build_cli().render_long_help().to_string();
         for (group, _) in GROUPS {
             assert!(

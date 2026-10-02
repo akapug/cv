@@ -88,6 +88,40 @@ pub enum TaskEventKind {
     Superseded {
         by_task: String,
     },
+    /// Add tags (deduplicated, lowercase labels such as `decision`, `deploy`, `lean`). Tags are
+    /// additive: a task's tag set is the union of every `tagged` event on it.
+    Tagged {
+        tags: Vec<String>,
+    },
+    /// Record that this task cannot proceed until `task` reaches a terminal state. The relation
+    /// is stored on the BLOCKED task; "X blocks Y" is written as a `blocked_by` on Y. Whether a
+    /// task is blocked *now* is computed at read time from the blocker's current state, never
+    /// stored — so a blocker finishing or being abandoned unblocks without another event.
+    BlockedBy {
+        task: String,
+    },
+    /// Pose a decision on this task: from here on the task is of kind `decision` — something an
+    /// assignee *answers* (with `resolved`) rather than does. `options` always contains `default`;
+    /// `deadline` is when the default stands if nobody speaks; `source` is the event id of the
+    /// note this decision was split out of (`cv task split`), when it was. One `posed` per task:
+    /// amending the options is a new decision, never a silent rewrite under a resolver.
+    Posed {
+        options: Vec<String>,
+        #[serde(rename = "default")]
+        default_choice: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// Answer a posed decision. `choice` must be one of the posed options (the default included).
+    /// Terminal (`TaskState::Resolved`). Identity-bearing: WHO resolved is the fact that matters,
+    /// so the resolver is recorded from an explicit identity, never a shared sink.
+    Resolved {
+        choice: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 
     // ── land facet (revision-scoped) ────────────────────────────────────────
     /// Attach a reviewed code revision. Proposing again supersedes the prior revision — that is
@@ -155,16 +189,18 @@ impl TaskEventKind {
     }
 
     /// Kinds whose `by` endpoint carries semantics (keys inbox, reviewer, and land bookkeeping),
-    /// matching the identity-BEARING verbs claim/release/propose/pass/refute (see
+    /// matching the identity-BEARING verbs claim/release/resolve/propose/pass/refute (see
     /// [`crate::task::require_actor`]). The store's TOFU token gate ([`crate::task::identity`])
     /// applies only to these: a bound endpoint must present its token to stamp one of them, and a
     /// first-use token binds on one of them. Bookkeeping kinds (open/note/done/abandon/supersede/
-    /// reroute) stay token-optional by design — impersonating them changes no lifecycle authority.
+    /// reroute/tag/block) stay token-optional by design — impersonating them changes no lifecycle
+    /// authority.
     pub fn is_identity_bearing(&self) -> bool {
         matches!(
             self,
             TaskEventKind::Claimed { .. }
                 | TaskEventKind::Released {}
+                | TaskEventKind::Resolved { .. }
                 | TaskEventKind::RevisionProposed { .. }
                 | TaskEventKind::ReviewPassed { .. }
                 | TaskEventKind::ReviewRefuted { .. }
@@ -181,6 +217,10 @@ impl TaskEventKind {
             TaskEventKind::Done { .. } => "done",
             TaskEventKind::Abandoned { .. } => "abandoned",
             TaskEventKind::Superseded { .. } => "superseded",
+            TaskEventKind::Tagged { .. } => "tagged",
+            TaskEventKind::BlockedBy { .. } => "blocked_by",
+            TaskEventKind::Posed { .. } => "posed",
+            TaskEventKind::Resolved { .. } => "resolved",
             TaskEventKind::RevisionProposed { .. } => "revision_proposed",
             TaskEventKind::ReviewRerouted { .. } => "review_rerouted",
             TaskEventKind::ReviewPassed { .. } => "review_passed",
@@ -326,11 +366,16 @@ pub enum TaskState {
     Done,
     Abandoned,
     Superseded,
+    /// A posed decision that was answered (`resolved`). Terminal, like `Done` is for work.
+    Resolved,
 }
 
 impl TaskState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, TaskState::Done | TaskState::Abandoned | TaskState::Superseded)
+        matches!(
+            self,
+            TaskState::Done | TaskState::Abandoned | TaskState::Superseded | TaskState::Resolved
+        )
     }
 
     pub fn as_str(self) -> &'static str {
@@ -340,6 +385,7 @@ impl TaskState {
             TaskState::Done => "done",
             TaskState::Abandoned => "abandoned",
             TaskState::Superseded => "superseded",
+            TaskState::Resolved => "resolved",
         }
     }
 }
@@ -498,6 +544,26 @@ mod tests {
             },
             TaskEventKind::Abandoned { reason: "r".into() },
             TaskEventKind::Superseded { by_task: "t2".into() },
+            TaskEventKind::Tagged {
+                tags: vec!["decision".into()],
+            },
+            TaskEventKind::BlockedBy { task: "t3".into() },
+            TaskEventKind::Posed {
+                options: vec!["keep".into(), "delete".into()],
+                default_choice: "keep".into(),
+                deadline: Some("2026-10-03T00:00:00Z".parse().unwrap()),
+                source: Some("0198c0de-0000-7000-8000-0000000000aa".into()),
+            },
+            TaskEventKind::Posed {
+                options: vec!["keep".into()],
+                default_choice: "keep".into(),
+                deadline: None,
+                source: None,
+            },
+            TaskEventKind::Resolved {
+                choice: "delete".into(),
+                note: Some("why".into()),
+            },
             TaskEventKind::RevisionProposed { revision: revision() },
             TaskEventKind::ReviewRerouted {
                 from: "a".into(),
@@ -577,9 +643,29 @@ mod tests {
         assert_eq!(v["revision"]["review_sha"], "a".repeat(40));
         assert_eq!(v["revision"]["upstream"], "origin/main");
 
+        // The decision facet: `default` is the wire name (the Rust field is `default_choice`).
+        let ev = event(TaskEventKind::Posed {
+            options: vec!["a".into(), "b".into()],
+            default_choice: "a".into(),
+            deadline: None,
+            source: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        assert_eq!(v["event"], "posed");
+        assert_eq!(v["default"], "a");
+        assert_eq!(v["options"], serde_json::json!(["a", "b"]));
+        assert!(v.get("deadline").is_none() && v.get("source").is_none(), "{v}");
+
         // Tag helper stays in sync with serde.
         for (kind, tag) in [
             (TaskEventKind::Released {}, "released"),
+            (
+                TaskEventKind::Resolved {
+                    choice: "a".into(),
+                    note: None,
+                },
+                "resolved",
+            ),
             (
                 TaskEventKind::Landed {
                     upstream_head: "d".repeat(40),
@@ -635,6 +721,16 @@ mod tests {
             },
             TaskEventKind::Abandoned { reason: String::new() },
             TaskEventKind::Superseded { by_task: String::new() },
+            TaskEventKind::Posed {
+                options: Vec::new(),
+                default_choice: String::new(),
+                deadline: None,
+                source: None,
+            },
+            TaskEventKind::Resolved {
+                choice: String::new(),
+                note: None,
+            },
             TaskEventKind::RevisionProposed { revision: revision() },
             TaskEventKind::ReviewRerouted {
                 from: String::new(),
@@ -660,8 +756,9 @@ mod tests {
         }
     }
 
-    /// The identity-bearing partition (the TOFU token gate's scope) is exactly the five verbs whose
-    /// endpoint keys inbox/reviewer/land semantics — claim/release/propose/pass/refute.
+    /// The identity-bearing partition (the TOFU token gate's scope) is exactly the six verbs whose
+    /// endpoint keys inbox/reviewer/land/decision semantics — claim/release/resolve/propose/pass/
+    /// refute.
     #[test]
     fn identity_bearing_partition_is_exact() {
         let identity_bearing = [
@@ -669,6 +766,10 @@ mod tests {
                 assignee: String::new(),
             },
             TaskEventKind::Released {},
+            TaskEventKind::Resolved {
+                choice: String::new(),
+                note: None,
+            },
             TaskEventKind::RevisionProposed { revision: revision() },
             TaskEventKind::ReviewPassed {
                 reviewer: String::new(),
@@ -701,6 +802,12 @@ mod tests {
             },
             TaskEventKind::Abandoned { reason: String::new() },
             TaskEventKind::Superseded { by_task: String::new() },
+            TaskEventKind::Posed {
+                options: Vec::new(),
+                default_choice: String::new(),
+                deadline: None,
+                source: None,
+            },
             TaskEventKind::ReviewRerouted {
                 from: String::new(),
                 to: String::new(),

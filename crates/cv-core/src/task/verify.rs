@@ -482,7 +482,7 @@ pub fn run_verify(
             match store.append_verifier_event(super::store::new_event(Some(&tid), VERIFIER_BY, kind)) {
                 Ok(ev) => {
                     if !opts.quiet {
-                        if let Err(e) = super::notify_board(&ev, &task.channel) {
+                        if let Err(e) = super::notify_board(&ev, &task.channel, Some(&task.title)) {
                             warnings.push(format!("board notification failed: {e}"));
                         }
                     }

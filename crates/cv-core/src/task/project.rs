@@ -20,16 +20,27 @@ pub struct TaskFilter {
     /// When false (default), terminal tasks (done/abandoned/superseded, landed included) are
     /// hidden unless `state` explicitly asks for them.
     pub include_terminal: bool,
+    /// Only tasks carrying this tag (exact, case-sensitive — tags are stored as given).
+    pub tag: Option<String>,
+    /// Scope: keep a task only if its last event is at or after this instant, OR it involves
+    /// `or_involving`'s endpoint (see [`involves`]). `None` = no time scope (every surface that
+    /// predates scoping — MCP, HTTP — passes `None` and sees the whole store).
+    pub touched_since: Option<DateTime<Utc>>,
+    /// The endpoint whose own tasks escape the `touched_since` window.
+    pub or_involving: Option<String>,
+    /// Only decisions (`Some(true)`), only actions (`Some(false)`), or both (`None`).
+    pub decisions: Option<bool>,
 }
 
 /// The effective-state vocabulary [`TaskFilter::state`] accepts: every base [`TaskState`] plus
 /// every revision-layer [`super::model::RevisionState`] string, as [`list`] matches them.
-pub const STATE_VOCABULARY: [&str; 10] = [
+pub const STATE_VOCABULARY: [&str; 11] = [
     "open",
     "claimed",
     "done",
     "abandoned",
     "superseded",
+    "resolved",
     "awaiting_review",
     "ready",
     "merged_local",
@@ -72,15 +83,182 @@ pub fn list<'m>(model: &'m TaskReadModel, filter: &TaskFilter) -> Result<Vec<&'m
                     return false;
                 }
             }
-            true
+            if let Some(tag) = &filter.tag {
+                if !t.tags.iter().any(|have| have == tag) {
+                    return false;
+                }
+            }
+            if let Some(want_decision) = filter.decisions {
+                if t.is_decision() != want_decision {
+                    return false;
+                }
+            }
+            in_scope(t, filter.touched_since, filter.or_involving.as_deref())
         })
         .collect())
+}
+
+/// The scope rule every default listing applies: a task is in scope when its last event is at or
+/// after `since`, or when `endpoint` is involved in it. `since = None` keeps everything.
+pub fn in_scope(t: &TaskProjection, since: Option<DateTime<Utc>>, endpoint: Option<&str>) -> bool {
+    match since {
+        None => true,
+        Some(since) => t.last_ts >= since || endpoint.is_some_and(|e| involves(t, e)),
+    }
+}
+
+/// Is `endpoint` a party to this task: its opener, assignee, a note's author, a revision's
+/// author or reviewer, or the decision's poser/resolver? `web:<name>` is `<name>` acting through
+/// `cv task serve`, so it matches `<name>` too.
+pub fn involves(t: &TaskProjection, endpoint: &str) -> bool {
+    let is = |by: &str| same_actor(by, endpoint);
+    is(&t.opened_by)
+        || t.assignee.as_deref().is_some_and(is)
+        || t.notes.iter().any(|n| is(&n.by))
+        || t.revisions.iter().any(|r| {
+            is(&r.proposed_by)
+                || r.active_reviewer.as_deref().is_some_and(is)
+                || r.pass.as_ref().is_some_and(|p| is(&p.reviewer))
+                || r.refute.as_ref().is_some_and(|p| is(&p.reviewer))
+        })
+        || t.decision
+            .as_ref()
+            .is_some_and(|d| is(&d.posed_by) || d.resolution.as_ref().is_some_and(|r| is(&r.by)))
+}
+
+/// Two actor strings name the same party when they are equal, or when one is the other acting
+/// through the web inbox (`web:ember` ≡ `ember`). Everything else is distinct — `lane:x` is not
+/// `orchestrator:x`.
+pub fn same_actor(a: &str, b: &str) -> bool {
+    a == b || a.strip_prefix("web:") == Some(b) || b.strip_prefix("web:") == Some(a)
+}
+
+/// Parse a `--since` argument into an instant: a duration back from `now` (`30m`, `2h`, `3d`,
+/// `1w`), a date (`2026-10-01`, local midnight), a local datetime (`2026-10-01T14:30` or with a
+/// space), an RFC 3339 timestamp, or a UUID v7 event/task id (its embedded millisecond
+/// timestamp — `cv task events` prints the last id it saw so a poller can hand it back as the
+/// cursor; the instant is *exclusive* of that event when the caller compares `>`).
+pub fn parse_since(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty --since".into());
+    }
+    if let Some(d) = parse_duration(s) {
+        return Ok(now - d);
+    }
+    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        return Ok(t.with_timezone(&Utc));
+    }
+    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"] {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            if let Some(t) = Local.from_local_datetime(&ndt).single() {
+                return Ok(t.with_timezone(&Utc));
+            }
+        }
+    }
+    if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let ndt = nd.and_hms_opt(0, 0, 0).expect("midnight exists");
+        if let Some(t) = Local.from_local_datetime(&ndt).single() {
+            return Ok(t.with_timezone(&Utc));
+        }
+    }
+    if let Some(t) = uuid_v7_timestamp(s) {
+        return Ok(t);
+    }
+    Err(format!(
+        "cannot read {s:?} as a duration (30m, 2h, 3d, 1w), a date (2026-10-01), a datetime \
+         (2026-10-01T14:30), an RFC 3339 timestamp, or an event id"
+    ))
+}
+
+/// `30m` / `2h` / `3d` / `1w` / `45s` → a duration. Whole numbers only.
+pub fn parse_duration(s: &str) -> Option<chrono::Duration> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
+    let n: i64 = num.trim().parse().ok()?;
+    if n < 0 {
+        return None;
+    }
+    match unit {
+        "s" => Some(chrono::Duration::seconds(n)),
+        "m" => Some(chrono::Duration::minutes(n)),
+        "h" => Some(chrono::Duration::hours(n)),
+        "d" => Some(chrono::Duration::days(n)),
+        "w" => Some(chrono::Duration::weeks(n)),
+        _ => None,
+    }
+}
+
+/// The millisecond timestamp a UUID v7 carries in its first 48 bits, if `s` is one (or a prefix
+/// long enough to hold them: the first 12 hex digits).
+pub fn uuid_v7_timestamp(s: &str) -> Option<DateTime<Utc>> {
+    let hex: String = s.chars().filter(|c| *c != '-').take(13).collect();
+    if hex.len() < 13 || !hex.chars().all(|c| c.is_ascii_hexdigit()) || &hex[12..13] != "7" {
+        return None;
+    }
+    let ms = i64::from_str_radix(&hex[..12], 16).ok()?;
+    DateTime::from_timestamp_millis(ms)
+}
+
+/// Is `task` blocked *right now*: does any task it recorded a `blocked_by` on still sit in a
+/// non-terminal base state? A blocker the log does not know (opened in another store, or a typo
+/// that slipped past the front-end) counts as blocking — an unknown dependency is not a cleared
+/// one. A blocker that finished, was abandoned or superseded no longer blocks; nothing has to be
+/// appended to unblock.
+pub fn is_blocked(model: &TaskReadModel, task: &TaskProjection) -> bool {
+    task.blocked_by
+        .iter()
+        .any(|id| model.tasks.get(id).is_none_or(|b| !b.state.is_terminal()))
+}
+
+/// The tasks that recorded a `blocked_by` on `task_id` — the reverse relation (`blocks:` in
+/// `cv task show`). Oldest first (task ids are time-sortable).
+pub fn blocks<'m>(model: &'m TaskReadModel, task_id: &str) -> Vec<&'m TaskProjection> {
+    model
+        .tasks
+        .values()
+        .filter(|t| t.blocked_by.iter().any(|b| b == task_id))
+        .collect()
+}
+
+/// The tag that marks a task as a *decision owed* by its assignee rather than work to do — the
+/// inbox groups these first (`decisions owed`), because a decision nobody sees is the slowest
+/// blocker a fleet has.
+pub const DECISION_TAG: &str = "decision";
+/// A decision the decider parked for discussion (`cv task discuss` / the page's "needs discussion"):
+/// it stays open and resolvable, but it is no longer *owed* — the ball is with whoever posed it.
+pub const DISCUSS_TAG: &str = "discuss";
+
+/// The shortest id-prefix length (never below `min`, never above the full id) at which every id
+/// in `ids` is distinguishable from every other. UUID v7 task ids open within the same second
+/// share their first eight hex digits, so an 8-char prefix — fine for session ids — collides
+/// across any batch of tasks opened together; every row renderer sizes its prefix with this.
+pub fn unique_prefix_len<'a>(ids: impl IntoIterator<Item = &'a str>, min: usize) -> usize {
+    let ids: Vec<&str> = ids.into_iter().collect();
+    let longest = ids.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut len = min.min(longest.max(min));
+    while len < longest {
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        let distinct = ids.iter().all(|id| seen.insert(id.get(..len).unwrap_or(id)));
+        if distinct {
+            break;
+        }
+        len += 1;
+    }
+    len
 }
 
 /// Why a task appears in someone's inbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxReason {
+    /// A live decision (a posed one, or a task tagged [`DECISION_TAG`]) assigned to you: someone
+    /// is waiting on your call, not your work. Listed before everything else.
+    DecisionOwed,
+    /// A decision you parked with [`DISCUSS_TAG`]: open, still yours to resolve, but the next
+    /// move is the poser's answer to your note — it is not counted as owed.
+    Discussing,
     /// Open task assigned to you, not yet claimed.
     AssignedOpen,
     /// You claimed it; it is yours to finish.
@@ -133,6 +311,18 @@ pub fn inbox<'m>(model: &'m TaskReadModel, endpoint: &str) -> Vec<InboxEntry<'m>
 }
 
 fn base_inbox_reason(task: &TaskProjection, endpoint: &str) -> Option<(InboxReason, DateTime<Utc>)> {
+    if task.assignee.as_deref() == Some(endpoint)
+        && !task.state.is_terminal()
+        && (task.is_decision() || task.tags.iter().any(|t| t == DECISION_TAG))
+    {
+        if task.tags.iter().any(|t| t == DISCUSS_TAG) {
+            // Parked: ages from the discussion request (its last event), not from the pose.
+            return Some((InboxReason::Discussing, task.last_ts));
+        }
+        // A posed decision ages from when it was asked, not from the last note on it.
+        let since = task.decision.as_ref().map(|d| d.posed_at).unwrap_or(task.last_ts);
+        return Some((InboxReason::DecisionOwed, since));
+    }
     match task.state {
         TaskState::Open if task.assignee.as_deref() == Some(endpoint) => {
             Some((InboxReason::AssignedOpen, task.last_ts))

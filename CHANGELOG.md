@@ -22,6 +22,158 @@
     `CLUSTERVISION_CLAUDE_ROOTS`, so a test run inside an agent that has its own config dir stays
     hermetic.
 
+## 0.13.0 — decisions are a kind; a human can drain the inbox
+
+Written from the first day a human was on the other end of `cv task`: an orchestrator had filed
+~15 "DECIDE (…, default stands if silent): …" items as free-text notes on one assigned task, and
+the person asked "how do I access this inbox?" and "is there a web interface where I can see these
+and drain them?".
+
+- **Decisions.** Two new event kinds, `posed {options, default, deadline?, source?}` and
+  `resolved {choice, note?}`, and a terminal `TaskState::Resolved`. A task with a `posed` event is
+  of kind `decision`: `done` is refused on it ("answer it with resolve"), a second `posed` is
+  refused (amend by posing anew), the choice must be one of the posed options, and `resolved` is
+  identity-bearing — who decided is the fact, so it is never a shared sink. `cv task decide --for
+  <who> --default … [--option …]… [--by <when>]` poses one (`opened` + `tagged decision` +
+  `posed`); `cv task resolve <id> --accept-default | --choice "…" [--note …]` answers it; with no
+  identity the error prints the exact command with the decision's owner filled in.
+- **`cv task split <id>`** turns every leading-`DECIDE` note on a task into its own decision:
+  title = the parenthetical label + the question's first clause (parentheticals dropped), default
+  = the `Default =` / `Default if silent:` / `Recommend:` clause (several are joined; none means
+  "as proposed"), options = the `alternative =` clauses; each is assigned like the parent, carries
+  the note as its body and `source`, and blocks the parent. The notes stay; `show` points each at
+  its decision; a second run creates nothing; mid-text `DECIDE`s are counted, not split.
+- **`cv task inbox <who>`** now leads with decisions, each with `⇒ default: … · alt: … · by …` on
+  the next line, then assigned actions, claimed work, reviews, unlanded. `--md` renders the whole
+  inbox as a Markdown page (every body, the first line of every note, a resolve command per
+  decision). `--unread` keeps items whose last event is not `<who>`'s (`web:<who>` counts as
+  `<who>`). `--json` carries the decision facet.
+- **`cv task serve [--bind 127.0.0.1:7777] [--assignee <who>] [--open]`**: a web inbox served by
+  cv itself — one inline page, no external JS/CSS, theme-aware, phone-width — with the decisions'
+  options as buttons (Accept default / each alternative / Needs discussion), Done/Claim/Release on
+  actions, notes with a Save box, Open/Resolved/All filters and a counter line. Every button
+  records the same event the CLI would, as `web:<who>`, through `/api/task/<id>/{resolve,done,
+  note,discuss,claim,release,reopen}`; `/api/inbox?who=` and `/api/events?since=` are the CLI's
+  own queries. Loopback only unless `--bind 0.0.0.0:…` is passed; a DNS-named `Host` is refused
+  (rebinding), an IP literal is accepted (a phone on the LAN). Uses `tiny_http`, already in the
+  workspace through cvd. "Reopen" on a closed item opens a NEW task (terminal stays terminal).
+- **The feed.** `cv task events [--since <when|event-id>] [--kind resolved,done,noted] [--by]
+  [--not-by] [--assignee] [--task]` prints one JSON line per event (the event's fields plus
+  `title`, `task_state`, `assignee`) and the next cursor on stderr; `--text` for people. `cv task
+  watch --assignee <who> --since …` is that minus the caller's own events. No push channel: poll.
+- **Scope.** Bare `cv task list` / `inbox` show tasks touched in the last 14 days or involving
+  `$CV_ENDPOINT` (opener, assignee, note author, reviewer, resolver), and print the hidden count
+  on the last line; `--all` lifts it, `--since 90d` widens it. MCP and HTTP still see everything.
+- **`cv task show`**: `--brief` (one line per note, the body's first line), `--notes-last N`,
+  `--notes-grep PATTERN`; a decision block (default, options, resolution or the resolve command).
+- **stdin.** `cv task note <id> -`, `--body -`, `--note -` read stdin (zsh eats backticks inside
+  double quotes; a heredoc does not).
+- **Paths.** `--issue` is absolutized at open time (cwd, else the task's `--repo`, else cwd
+  lexically); handles and URLs pass through. `--repo` was already canonicalized.
+- **`cv lanes`**: `--since 2h` keeps lanes active in the window; a lane with no stop recorded
+  anywhere whose transcript ends in a text-only final turn and has been quiet ≥ 10 min reads
+  `returned` (status source `transcript`) — a lost notification — and counts as done; a running
+  lane quiet for an hour or more says so (`⚠ quiet 14h`).
+- Board notifications now carry the task's title, so `cv board read tasks` reads as a timeline.
+- Golden fixture: additive only (a decision specimen task; every prior task serializes
+  byte-identically).
+
+## 0.12.0 — the orchestrator's instruments
+
+Three commands for a session that is running a swarm, written from a day of running one with
+twenty lanes and doing each of these by hand (a thirty-line Python over `cv show --json`, three
+times). All three are in the Read group, take `harness:id` or a prefix, have `--json`, and reach
+MCP through the generated tool list like every other command.
+
+- **`cv prompts <session>`** prints only what the person said: every human-typed prompt and every
+  `AskUserQuestion` answer, in order, with message indices and timestamps. `--pre-compaction [N]`
+  narrows to the span the Nth compaction discarded, the same window `cv show --pre-compaction`
+  reads. Prompts are printed whole. On the session this was built against, 38 lines and 6 answers
+  out of 10,297 records.
+- **`cv lanes <session>`** is the sub-agent forest as a status table: one row per lane with its
+  model, start, duration, tokens (deduplicated by API `message.id`, as `cv stats --tokens`
+  counts), tool calls, status and either the last line of its return or — for a running lane —
+  its last tool call. `--running` / `--done` / `--stranded` filter. **Stranded** is the class that
+  parked four lanes in one day: the harness reports the lane *completed* and its final text says
+  it is waiting (`Waiting on notifications`, `I'll continue when the monitor fires`); nothing will
+  wake it. Each stranded row carries `→ resume: SendMessage to <agentId>`, and a stranded lane
+  never counts as done. Status comes from the most authoritative source and the JSON names it:
+  a `Workflow` journal, else the parent's last `<task-notification>` for the agent, else the
+  child's `SubagentStop` hook, else `running`.
+- **`cv deferrals <session>`** is a linter for promises: every place the assistant put something
+  off ("later lane", "follow-up", "not tonight", "queued for", "ember's call", "when X lands",
+  "after FINAL", …) with message index and context. `--open-tasks` cross-references every task in
+  the store (three or more shared significant words is a MATCH; the words are printed so the
+  match can be judged) and **exits 1 while any deferral is UNMATCHED**, so a closeout can gate on
+  it. `--since <msg>` restricts to the post-compaction region.
+
+### `cv task` ergonomics
+
+- `open --body-file <path>` and `note --file <path>` (`-` for stdin). Bodies were 500-character
+  shell strings.
+- `open --tags a,b`, `cv task tag <id> a,b`, `list --tag <t>`. The `decision` tag on an assigned
+  task is a decision owed, and `inbox` lists it first.
+- `open --blocked-by <id>` / `open --blocks <id>` and `cv task block <id> --by <id>`: relations
+  stored as `blocked_by` events on the blocked task. Blocked-ness is computed at read time from the
+  blocker's live state — a blocker finishing or being abandoned unblocks with no further event.
+  `list` marks blocked rows `⊘`; `show` prints `blocked by:` and `blocks:`. Relations are resolved
+  before the open is written, so a typo refuses the command instead of opening a half-related task.
+- `inbox <who>` groups: decisions owed · claimed · reviews · unlanded · assigned, unclaimed.
+- `list --tsv` (full id, state, assignee, repo basename, age, title, blocked_by) and `list --wide`
+  (a second line with tags, repo, blockers, the body's first line).
+- **`cv task sweep --repo <path>`** lists the tasks git and the filesystem say are probably done —
+  an `--issue` path that no longer exists, a title/body naming a branch now merged into main, a
+  proposed revision whose branch is merged — and never closes one.
+- **Task ids no longer collide in every list.** UUID v7 ids opened within one second share their
+  first eight hex digits; `list`/`inbox`/`debt` printed 8-char prefixes, so a batch of 23 tasks
+  rendered as 23 copies of `01a0f52e` and `show` refused every one. Every list now renders the
+  shortest prefix that keeps the ids distinct.
+
+### Wire
+
+- Two new task event kinds, `tagged { tags }` and `blocked_by { task }`, and two projection
+  fields, `tags` and `blocked_by`, on `TaskProjection` and `TaskRow` (every surface). Both are
+  omitted when empty, so a log that never used them serializes byte-for-byte as before; the golden
+  fixture gained specimens of both (`GOLDEN_REGEN=1`, snapshot diff reviewed: only the specimen
+  task changed). `TaskFilter` gained `tag`; `task_list` (MCP) and `GET /api/tasks` (cvd) accept it.
+  `InboxReason` gained `decision_owed`.
+- **Claude adapter:** Claude Code ≥ 2.1 writes a slash command's bookkeeping (`<command-name>…`,
+  `<local-command-stdout>…`) as `user` records; they now classify as `notice`/`harness`, as the
+  older `system`/`local_command` records always did. The typed `/compact` line stays a human
+  prompt. Text is untouched.
+- `cv schema --json` publishes the `prompt_row`, `lane` and `deferral` shapes. `cv recipes` has
+  three more entries.
+
+### Build
+
+- `make install` (= `cargo install --path crates/cv --force --target-dir target`, plus `cv-mcp`
+  and `cvd`) and `make version`, so the installed binary and the checkout can be compared in one
+  line. The installed `cv` on the machine this was written on was two releases behind the
+  checkout; `cv --version` had said so all along.
+- The clap-tree unit tests run on a 16 MB thread: `Cli::command()` for the grown enum overflows
+  the default 2 MB test-thread stack in a debug build (the binary's main thread is fine).
+
+## 0.11.2 — `cv stats --tokens`
+
+- **`cv stats --tokens`** totals token usage per harness and model over any query slice:
+  uncached input, cache writes, cache reads, output, reasoning, provider cost. It widens each Claude
+  session to its sub-agent and `Workflow`-agent forest, which the catalog does not list and which
+  on an orchestrating session holds most of the spend. It counts a Claude response once even though
+  Claude Code writes one line per content block and copies history into resumed sessions (deduped
+  by API `message.id`). `--json` adds a `tokens` object; without the flag the payload is unchanged.
+- **`Usage` has one meaning across harnesses.** `input_tokens` is now the *uncached* prompt
+  everywhere (Anthropic's convention), with `Usage::prompt_tokens()` / `total_tokens()` for the
+  sums. Codex and Gemini report cached tokens as a subset of input; their adapters now subtract on
+  parse and their emitters add back on emit. Before, a Codex → Claude port wrote cached tokens
+  twice into the Claude `usage` block, and `cv doctor` sized a Codex session's peak context at
+  roughly double. **Library consumers reading a Codex or Gemini `Usage.input_tokens` see a smaller
+  number now; add `cache_read_tokens` for the old one.**
+- **Codex: a re-emitted `token_count` no longer counts as a second call.** Codex repeats its last
+  snapshot (same running `total_token_usage`), for example after a user message. The adapter paired
+  only the first copy with its `token_usage_record`, so each repeat attached stale usage to the next
+  reply or to a synthetic carrier. On one 7,700-snapshot rollout that inflated usage from 834.5M to
+  1.06B; after the fix cv matches the rollout's own `thread_token_usage` to the token.
+
 ## 0.11.1 — packaging fix
 
 `clustervision-core` 0.11.0 could not be published to crates.io. `formats.rs` embeds the 22 format

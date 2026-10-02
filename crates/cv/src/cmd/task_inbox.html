@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>cv inbox</title>
+<style>
+  :root {
+    --bg: #f7f7f3; --fg: #1b1b1a; --muted: #6d6d66; --card: #ffffff; --line: #dedeD6;
+    --accent: #2457c5; --accent-fg: #ffffff; --ok: #1f7a3a; --warn: #b4540a; --soft: #eef1f8;
+    --danger: #a32d2d; --sel: #fff6d6; --sel-line: #e2b100; --kbd-bg: #ecece6;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121214; --fg: #ececea; --muted: #9a9a94; --card: #1c1c20; --line: #33333a;
+      --accent: #86a8ff; --accent-fg: #0b1430; --ok: #6fd48c; --warn: #f0a252; --soft: #23263a;
+      --danger: #ff8080; --sel: #2a2612; --sel-line: #e2b100; --kbd-bg: #2a2a30;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 13.5px/1.42 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  body { padding: 0 16px calc(24px + env(safe-area-inset-bottom)); max-width: 1180px; margin: 0 auto; }
+  code, .mono, kbd, table.lanes, table.events { font-family: var(--mono); }
+  header { position: sticky; top: 0; background: var(--bg); padding: 10px 0 6px; z-index: 3;
+    border-bottom: 1px solid var(--line); }
+  .bar { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .bar h1 { font-size: 17px; margin: 0; display: flex; gap: 6px; align-items: baseline; }
+  .bar h1 input { font: inherit; font-weight: 600; width: 9ch; background: transparent; color: var(--fg);
+    border: 0; border-bottom: 1px dashed var(--line); padding: 0 2px; }
+  .counter { color: var(--muted); font-size: 12.5px; }
+  .tabs { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; align-items: center; }
+  .tabs button { font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+  .tabs button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .tabs button .n { opacity: .75; font-size: 11.5px; margin-left: 4px; }
+  .tabs .spacer { flex: 1; }
+  .tabs input.filter { font: inherit; font-size: 13px; padding: 4px 8px; border-radius: 8px; width: 22ch;
+    border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+  kbd { font-size: 11px; background: var(--kbd-bg); border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 4px; padding: 0 5px; color: var(--muted); }
+  .btn { font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; text-align: left; }
+  .btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .btn.quiet { color: var(--muted); }
+  .btn.danger { color: var(--danger); }
+  .btn:disabled { opacity: .5; cursor: progress; }
+  .btn kbd { margin-right: 6px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 18px 0 6px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 0 0 8px; }
+  .card.unread { border-left: 3px solid var(--accent); }
+  .card.sel { outline: 2px solid var(--sel-line); background: var(--sel); }
+  .title { font-weight: 600; font-size: 14.5px; margin: 0; overflow-wrap: anywhere; }
+  .meta { color: var(--muted); font-size: 12px; margin: 3px 0 6px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .meta code { font-size: 11.5px; }
+  .stale { color: var(--warn); }
+  .overdue { color: var(--danger); font-weight: 600; }
+  .body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; margin: 0 0 6px; color: var(--fg); }
+  .body.clipped { max-height: 6.4em; overflow: hidden; -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
+  .more { color: var(--accent); background: none; border: 0; padding: 0; font: inherit; font-size: 12.5px; cursor: pointer; }
+  .decision { background: var(--soft); border-radius: 8px; padding: 8px 10px; margin: 6px 0; }
+  .decision .default { margin: 0 0 6px; }
+  .decision .default b { color: var(--ok); }
+  .choices { display: flex; flex-direction: column; gap: 5px; }
+  .choices .btn { white-space: normal; }
+  .actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+  .notes { margin: 6px 0 0; padding: 0; list-style: none; font-size: 12.5px; }
+  .notes li { padding: 5px 0; border-top: 1px dashed var(--line); overflow-wrap: anywhere; }
+  .notes .who { color: var(--muted); font-size: 11.5px; }
+  .notes .text { white-space: pre-wrap; }
+  .notebox { display: flex; gap: 6px; margin-top: 6px; }
+  .notebox textarea { flex: 1; font: inherit; font-size: 13px; min-height: 34px; padding: 6px 8px;
+    border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); resize: vertical; }
+  .resolved { color: var(--ok); }
+  .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+  .err { color: var(--danger); font-size: 12.5px; margin: 4px 0; white-space: pre-wrap; }
+  .tag { font-size: 11px; border: 1px solid var(--line); border-radius: 6px; padding: 0 5px; color: var(--muted); }
+  .tag.blocked { color: var(--danger); border-color: var(--danger); }
+  .tag.decision { color: var(--accent); border-color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em;
+    padding: 4px 6px; border-bottom: 1px solid var(--line); position: sticky; top: 92px; background: var(--bg); }
+  td { padding: 4px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr.sel td { background: var(--sel); }
+  tr.row { cursor: pointer; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.nowrap { white-space: nowrap; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; background: var(--muted); }
+  .dot.running { background: var(--ok); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 30%, transparent); }
+  .dot.stranded, .dot.failed, .dot.killed { background: var(--danger); }
+  .dot.quiet { background: var(--warn); }
+  .dot.done { background: var(--muted); }
+  .wrap { overflow-x: auto; }
+  .expand { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; padding: 6px 10px; background: var(--soft); border-radius: 8px; }
+  .chips { display: flex; gap: 4px; flex-wrap: wrap; margin: 6px 0; }
+  .chips button { font: inherit; font-size: 11.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; }
+  .chips button.on { color: var(--fg); border-color: var(--accent); }
+  .help { position: fixed; right: 16px; bottom: 16px; background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 14px; font-size: 12.5px; z-index: 9; box-shadow: 0 8px 30px rgba(0,0,0,.25); max-width: 360px; }
+  .help h3 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .help div { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; }
+  .toast { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); background: var(--fg); color: var(--bg);
+    padding: 6px 12px; border-radius: 8px; font-size: 12.5px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 9; }
+  .toast.on { opacity: .95; }
+  footer { color: var(--muted); font-size: 11.5px; margin-top: 24px; text-align: center; }
+  @media (max-width: 640px) { body { padding: 0 10px; } th { top: 110px; } .tabs input.filter { width: 100%; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <h1>cv · <input id="who" value="" placeholder="who?" aria-label="whose inbox"></h1>
+    <span class="counter" id="counter">loading…</span>
+  </div>
+  <div class="tabs" id="tabs">
+    <button data-pane="decisions">Decisions<span class="n" id="n-decisions"></span></button>
+    <button data-pane="actions">Actions<span class="n" id="n-actions"></span></button>
+    <button data-pane="lanes">Lanes<span class="n" id="n-lanes"></span></button>
+    <button data-pane="backlog">Backlog<span class="n" id="n-backlog"></span></button>
+    <button data-pane="events">Events</button>
+    <button data-pane="closed">Closed<span class="n" id="n-closed"></span></button>
+    <span class="spacer"></span>
+    <input class="filter" id="filter" placeholder="filter  /" aria-label="filter">
+    <button id="refresh" title="reload (r)">↻</button>
+    <button id="helpbtn" title="keys (?)">?</button>
+  </div>
+</header>
+<main id="main"></main>
+<footer>served by <code>cv task serve</code> · every button records the same event the CLI would, as <code>web:&lt;who&gt;</code> · <kbd>?</kbd> keys</footer>
+<div class="toast" id="toast"></div>
+<script>
+(function () {
+  'use strict';
+  const S = {
+    who: '', pane: 'decisions', page: null, lanes: null, backlog: null, events: null,
+    busy: false, expanded: {}, sel: 0, filter: '', lanesSession: '', help: false,
+    backlogRepo: '', backlogState: '', backlogAll: false, eventsMine: false, drafts: {}, discussOpen: {}, doneOpen: {}
+  };
+  const $ = (s) => document.querySelector(s);
+  const el = (tag, attrs, children) => {
+    const e = document.createElement(tag);
+    if (attrs) Object.keys(attrs).forEach((k) => {
+      if (k === 'class') e.className = attrs[k];
+      else if (k === 'text') e.textContent = attrs[k];
+      else if (k.slice(0, 2) === 'on') e.addEventListener(k.slice(2), attrs[k]);
+      else e.setAttribute(k, attrs[k]);
+    });
+    (children || []).forEach((c) => { if (c != null) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+    return e;
+  };
+  const pad = (n) => (n < 10 ? '0' : '') + n;
+  const fmtTs = (iso) => { const d = new Date(iso); return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+  const fmtHm = (iso) => { const d = new Date(iso); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+  const ago = (iso) => {
+    const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 90) return Math.round(s) + 's'; if (s < 5400) return Math.round(s / 60) + 'm';
+    if (s < 172800) return (s / 3600).toFixed(1).replace(/\.0$/, '') + 'h'; return Math.round(s / 86400) + 'd';
+  };
+  const dur = (ms) => { if (ms == null) return ''; const m = Math.round(ms / 60000); return m < 60 ? m + 'm' : Math.floor(m / 60) + 'h' + pad(m % 60); };
+  const mtok = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n);
+  const base = (p) => (p || '').split('/').filter(Boolean).slice(-1)[0] || '';
+  const matches = (text) => !S.filter || (text || '').toLowerCase().indexOf(S.filter.toLowerCase()) >= 0;
+  let toastT = null;
+  const toast = (msg) => { const t = $('#toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('on'), 1600); };
+  const copy = (text, what) => {
+    if (!text) return;
+    const done = () => toast('copied ' + (what || ''));
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, () => fallback());
+    else fallback();
+    function fallback() { const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); done(); } catch (e) {} ta.remove(); }
+  };
+
+  // ---------- params / persistence ----------
+  function params() {
+    const p = new URLSearchParams(location.search);
+    S.who = p.get('who') || localStorage.getItem('cv.who') || '';
+    S.pane = p.get('pane') || localStorage.getItem('cv.pane') || 'decisions';
+    S.lanesSession = p.get('lanes') || localStorage.getItem('cv.lanes') || '';
+    $('#who').value = S.who;
+  }
+  function persist() {
+    try { localStorage.setItem('cv.who', S.who); localStorage.setItem('cv.pane', S.pane); localStorage.setItem('cv.lanes', S.lanesSession); } catch (e) {}
+    const p = new URLSearchParams(location.search);
+    if (S.who) p.set('who', S.who); p.set('pane', S.pane); if (S.lanesSession) p.set('lanes', S.lanesSession);
+    history.replaceState(null, '', '?' + p.toString());
+  }
+
+  // ---------- loading ----------
+  function jget(url) { return fetch(url, { cache: 'no-store' }).then((r) => r.json()); }
+  function loadInbox() {
+    return jget('/api/inbox' + (S.who ? '?who=' + encodeURIComponent(S.who) : '')).then((page) => {
+      if (page.error) { $('#counter').textContent = page.error; return; }
+      S.page = page;
+      if (!S.who) { S.who = page.who; $('#who').value = page.who; persist(); }
+      counters();
+    }).catch((e) => { $('#counter').textContent = 'cannot reach cv task serve: ' + e; });
+  }
+  function loadLanes() {
+    if (!S.lanesSession) { S.lanes = null; return Promise.resolve(); }
+    return jget('/api/lanes?session=' + encodeURIComponent(S.lanesSession)).then((r) => { S.lanes = r; counters(); }).catch(() => {});
+  }
+  function loadBacklog() {
+    const q = new URLSearchParams();
+    if (S.backlogRepo) q.set('repo', S.backlogRepo); if (S.backlogState) q.set('state', S.backlogState); if (S.backlogAll) q.set('all', '1');
+    return jget('/api/backlog?' + q.toString()).then((r) => { S.backlog = r; counters(); }).catch(() => {});
+  }
+  function loadEvents() {
+    const q = new URLSearchParams(); q.set('since', '48h'); if (S.eventsMine && S.who) q.set('by', S.who);
+    return fetch('/api/events?' + q.toString(), { cache: 'no-store' }).then((r) => r.text()).then((t) => {
+      S.events = t.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch (e) { return null; } }).filter(Boolean).reverse();
+    }).catch(() => {});
+  }
+  function load() {
+    const jobs = [loadInbox()];
+    if (S.pane === 'lanes') jobs.push(loadLanes());
+    if (S.pane === 'backlog') jobs.push(loadBacklog());
+    if (S.pane === 'events') jobs.push(loadEvents());
+    return Promise.all(jobs).then(render);
+  }
+
+  // ---------- counters / tabs ----------
+  function counters() {
+    const p = S.page; if (!p) return;
+    const c = p.counts;
+    $('#counter').textContent = c.decisions + ' owed' + (c.discussing ? ' · ' + c.discussing + ' in discussion' : '') + ' · ' + c.assigned + ' assigned · ' + c.claimed + ' claimed · ' + c.reviews + ' reviews · ' + c.unread + ' unread' +
+      (p.hidden ? ' · ' + p.hidden + ' older hidden' : '') + ' · ' + fmtHm(new Date().toISOString());
+    $('#n-decisions').textContent = (c.decisions || c.discussing) ? ' ' + c.decisions + (c.discussing ? '+' + c.discussing : '') : '';
+    $('#n-actions').textContent = (c.assigned + c.claimed + c.reviews + c.unlanded) ? ' ' + (c.assigned + c.claimed + c.reviews + c.unlanded) : '';
+    $('#n-closed').textContent = c.closed ? ' ' + c.closed : '';
+    if (S.lanes) $('#n-lanes').textContent = ' ' + S.lanes.counts.running + '/' + S.lanes.counts.total;
+    if (S.backlog) $('#n-backlog').textContent = ' ' + S.backlog.count;
+    document.querySelectorAll('#tabs button[data-pane]').forEach((b) => b.classList.toggle('on', b.getAttribute('data-pane') === S.pane));
+  }
+
+  // ---------- items for keyboard ----------
+  function visibleItems() {
+    const p = S.page; if (!p) return [];
+    if (S.pane === 'decisions') return p.items.filter((i) => (i.reason === 'decision_owed' || i.reason === 'discussing') && matches(i.title + ' ' + i.body + ' ' + (i.tags || []).join(' ')));
+    if (S.pane === 'actions') return p.items.filter((i) => i.reason !== 'decision_owed' && i.reason !== 'discussing' && matches(i.title + ' ' + i.body));
+    if (S.pane === 'closed') return p.closed.filter((i) => matches(i.title + ' ' + i.body));
+    if (S.pane === 'backlog') return (S.backlog ? S.backlog.tasks : []).filter((t) => matches(t.title + ' ' + t.body + ' ' + (t.tags || []).join(' ') + ' ' + (t.assignee || '')));
+    if (S.pane === 'lanes') return (S.lanes ? S.lanes.lanes : []).filter((l) => matches((l.description || '') + ' ' + l.agent_id + ' ' + (l.last_tool || '')));
+    return [];
+  }
+
+  // ---------- render ----------
+  function render() {
+    counters();
+    const main = $('#main'); main.textContent = '';
+    const items = visibleItems();
+    if (S.sel >= items.length) S.sel = Math.max(0, items.length - 1);
+    if (S.pane === 'decisions' || S.pane === 'actions' || S.pane === 'closed') {
+      const closed = S.pane === 'closed';
+      if (S.pane === 'actions') {
+        const GROUPS = [['assigned_open', 'Assigned'], ['claimed_by_you', 'Claimed'], ['awaiting_your_review', 'Reviews'], ['your_unlanded_work', 'Unlanded']];
+        let k = 0;
+        GROUPS.forEach((g) => {
+          const its = items.filter((i) => i.reason === g[0]); if (!its.length) return;
+          main.appendChild(el('h2', { text: g[1] + ' (' + its.length + ')' }));
+          its.forEach((i) => { main.appendChild(card(i, false, items.indexOf(i))); k++; });
+        });
+      } else if (S.pane === 'decisions') {
+        const owed = items.filter((i) => i.reason === 'decision_owed'), parked = items.filter((i) => i.reason === 'discussing');
+        if (owed.length) main.appendChild(el('h2', { text: 'owed (' + owed.length + ')' }));
+        owed.forEach((i) => main.appendChild(card(i, false, items.indexOf(i))));
+        if (parked.length) main.appendChild(el('h2', { text: 'in discussion (' + parked.length + ') — parked, the ball is with whoever posed it; resolve when ready' }));
+        parked.forEach((i) => main.appendChild(card(i, false, items.indexOf(i))));
+      } else {
+        items.forEach((i, k) => main.appendChild(card(i, closed, k)));
+      }
+      if (!items.length) main.appendChild(el('div', { class: 'empty', text: closed ? 'nothing closed in the window' : S.filter ? 'nothing matches' : 'nothing waits on you ( ◕‿◕ )' }));
+    } else if (S.pane === 'lanes') renderLanes(main, items);
+    else if (S.pane === 'backlog') renderBacklog(main, items);
+    else if (S.pane === 'events') renderEvents(main);
+    renderHelp();
+    const s = document.querySelector('.sel'); if (s && S.keyboard) s.scrollIntoView({ block: 'nearest' });
+  }
+
+  function card(i, closed, k) {
+    const meta = [el('code', { text: i.short, title: 'copy id', onclick: () => copy(i.id, 'id') }), el('span', { text: i.state })];
+    if (i.decision) meta.push(el('span', { class: i.stale && !closed ? 'stale' : '', text: 'asked ' + i.age + ' ago by ' + i.opened_by }));
+    else meta.push(el('span', { class: i.stale && !closed ? 'stale' : '', text: (closed ? 'closed ' : 'waiting ') + i.age + ' ago' }));
+    if (i.decision && i.decision.deadline_phrase) meta.push(el('span', { class: /OVERDUE/.test(i.decision.deadline_phrase) ? 'overdue' : '', text: i.decision.deadline_phrase }));
+    if (i.unread && !closed) meta.push(el('span', { text: 'last: ' + i.last_by }));
+    if (i.repo) meta.push(el('span', { class: 'tag', text: base(i.repo), title: i.repo }));
+    if (i.issue) meta.push(el('span', { class: 'tag', text: '📄 ' + base(i.issue), title: i.issue + ' (click: copy path)', onclick: () => copy(i.issue, 'path') }));
+    if (i.blocked) meta.push(el('span', { class: 'tag blocked', text: 'blocked' }));
+    (i.tags || []).forEach((t) => { if (t !== 'decision') meta.push(el('span', { class: 'tag', text: '#' + t })); });
+    const kids = [el('p', { class: 'title', text: i.title }), el('div', { class: 'meta' }, meta)];
+    if (i.body && i.body.trim()) {
+      const long = i.body.length > 360 && !S.expanded[i.id];
+      kids.push(el('div', { class: 'body' + (long ? ' clipped' : ''), text: i.body }));
+      if (i.body.length > 360) kids.push(el('button', { class: 'more', text: long ? 'show all (x)' : 'less (x)', onclick: () => { S.expanded[i.id] = !S.expanded[i.id]; render(); } }));
+    }
+    if (i.decision) kids.push(decisionBlock(i, closed));
+    else if (!closed && (i.reason === 'decision_owed' || i.reason === 'discussing')) kids.push(taggedDecisionBlock(i));
+    else if (!closed) kids.push(actionBlock(i));
+    if (!closed && S.discussOpen[i.id]) kids.push(inlineBox(i, 'discuss', 'what needs discussing? (⌘⏎ sends)', 'Park for discussion'));
+    if (!closed && S.doneOpen[i.id]) kids.push(inlineBox(i, 'done', 'observed where? a path, url, or a word (⌘⏎ sends)', 'Mark done'));
+    if (closed) kids.push(el('div', { class: 'actions' }, [el('button', { class: 'btn quiet', text: 'Reopen as a new task', onclick: () => act(i, 'reopen', {}) })]));
+    kids.push(el('div', { class: 'err', id: 'err-' + i.id }));
+    if (i.notes.length) {
+      const open = S.expanded['n:' + i.id];
+      kids.push(el('button', { class: 'more', text: (open ? '▾ ' : '▸ ') + i.notes.length + ' note' + (i.notes.length === 1 ? '' : 's'), onclick: () => { S.expanded['n:' + i.id] = !open; render(); } }));
+      if (open) kids.push(el('ul', { class: 'notes' }, i.notes.map((n) => el('li', {}, [
+        el('div', { class: 'who', text: n.by + ' · ' + fmtTs(n.ts) + (n.split_into ? ' · split into ' + n.split_into.slice(0, 13) : '') }),
+        el('div', { class: 'text', text: n.text })]))));
+    }
+    if (!closed) {
+      const ta = draftArea('note-' + i.id, 'note… (n)', (text) => act(i, 'note', { text }));
+      kids.push(el('div', { class: 'notebox' }, [ta, el('button', { class: 'btn', text: 'Save', title: '⌘⏎', onclick: () => { if (ta.value.trim()) act(i, 'note', { text: ta.value }); } })]));
+    }
+    return el('div', { class: 'card' + (i.unread && !closed ? ' unread' : '') + (k === S.sel ? ' sel' : ''), onclick: () => { S.sel = k; S.keyboard = false; document.querySelectorAll('.card.sel').forEach((c) => c.classList.remove('sel')); }, 'data-k': k }, kids);
+  }
+
+  function decisionBlock(i, closed) {
+    const d = i.decision;
+    if (d.resolution) {
+      const r = d.resolution;
+      return el('div', { class: 'decision' }, [el('p', { class: 'default resolved', text: '✓ ' + r.choice + (r.accepted_default ? ' (the default)' : '') + ' — ' + r.by + ', ' + fmtTs(r.ts) + (r.note ? ' · ' + r.note : '') })]);
+    }
+    const buttons = [el('button', { class: 'btn primary', onclick: () => act(i, 'resolve', { accept_default: true }) }, [el('kbd', { text: 'a' }), 'accept the default'])];
+    d.alternatives.forEach((o, n) => buttons.push(el('button', { class: 'btn', title: o, onclick: () => act(i, 'resolve', { choice: o }) }, [el('kbd', { text: String(n + 1) }), o])));
+    if (i.reason !== 'discussing') buttons.push(el('button', { class: 'btn quiet', onclick: () => discuss(i) }, [el('kbd', { text: 'd' }), 'needs discussion']));
+    const parked = i.reason === 'discussing' ? latestDiscussNote(i) : null;
+    return el('div', { class: 'decision' }, [
+      parked ? el('p', { class: 'default' }, [el('b', { text: 'you asked: ' }), parked]) : null,
+      el('p', { class: 'default' }, [el('b', { text: 'default: ' }), d.default_choice ? d.default_choice : d['default']]),
+      closed ? null : el('div', { class: 'choices' }, buttons)]);
+  }
+
+  function actionBlock(i) {
+    const b = [];
+    if (i.reason === 'assigned_open') b.push(el('button', { class: 'btn', text: 'Claim', onclick: () => act(i, 'claim', {}) }));
+    if (i.reason === 'claimed_by_you') b.push(el('button', { class: 'btn quiet', text: 'Release', onclick: () => act(i, 'release', {}) }));
+    if (i.reason === 'assigned_open' || i.reason === 'claimed_by_you') b.push(el('button', { class: 'btn primary', text: 'Done', onclick: () => doneTask(i) }));
+    return el('div', { class: 'actions' }, b);
+  }
+
+  function discuss(i) { S.discussOpen[i.id] = !S.discussOpen[i.id]; render(); setTimeout(() => { const t = document.getElementById('discuss-' + i.id); if (t) t.focus(); }, 0); }
+  function doneTask(i) { S.doneOpen[i.id] = !S.doneOpen[i.id]; render(); setTimeout(() => { const t = document.getElementById('done-' + i.id); if (t) t.focus(); }, 0); }
+  function latestDiscussNote(i) { const n = (i.notes || []).slice().reverse().find((x) => /^NEEDS DISCUSSION:/.test(x.text)); return n ? n.text.replace(/^(NEEDS DISCUSSION:\s*)+/, '') : null; }
+  // A textarea whose draft survives re-renders (the page refreshes every 30 s).
+  function draftArea(id, placeholder, send) {
+    const ta = el('textarea', { placeholder, rows: '1', id, oninput: (ev) => { S.drafts[id] = ev.target.value; },
+      onkeydown: (ev) => { if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') { ev.preventDefault(); if (ta.value.trim()) { send(ta.value); } } } });
+    if (S.drafts[id]) ta.value = S.drafts[id];
+    return ta;
+  }
+  function inlineBox(i, verb, placeholder, label) {
+    const id = verb + '-' + i.id;
+    const send = (text) => { if (verb === 'discuss') act(i, 'discuss', { text }); else act(i, 'done', { observed: text }); };
+    const ta = draftArea(id, placeholder, send);
+    return el('div', { class: 'notebox' }, [ta,
+      el('button', { class: 'btn primary', text: label, onclick: () => send(ta.value) }),
+      el('button', { class: 'btn quiet', text: 'cancel', onclick: () => { if (verb === 'discuss') S.discussOpen[i.id] = false; else S.doneOpen[i.id] = false; render(); } })]);
+  }
+  // A decision that was TAGGED, not posed: no options to click. It is answered by a note and closed,
+  // or parked for discussion.
+  function taggedDecisionBlock(i) {
+    const parked = i.reason === 'discussing' ? latestDiscussNote(i) : null;
+    const last = (i.notes || []).slice().reverse().find((x) => !/^NEEDS DISCUSSION:/.test(x.text));
+    return el('div', { class: 'decision' }, [
+      parked ? el('p', { class: 'default' }, [el('b', { text: 'you asked: ' }), parked]) : null,
+      el('p', { class: 'default' }, [el('b', { text: 'no options were posed: ' }), 'answer in a note, then close it; or park it for discussion']),
+      el('div', { class: 'choices' }, [
+        el('button', { class: 'btn primary', title: last ? 'closes with your last note as the answer: ' + last.text : 'write a note first', onclick: () => { if (last) act(i, 'done', { observed: 'answered: ' + last.text }); else toast('write the answer as a note first'); } }, [el('kbd', { text: 'a' }), last ? 'my last note is the answer — close it' : 'answer in a note first']),
+        i.reason !== 'discussing' ? el('button', { class: 'btn quiet', onclick: () => discuss(i) }, [el('kbd', { text: 'd' }), 'needs discussion']) : null])]);
+  }
+
+  function act(i, verb, body) {
+    if (S.busy) return;
+    S.busy = true; body.who = S.who;
+    document.querySelectorAll('.btn').forEach((b) => { b.disabled = true; });
+    fetch('/api/task/' + encodeURIComponent(i.id) + '/' + verb, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then((r) => r.json()).then((res) => {
+        S.busy = false;
+        if (!res.error) { delete S.drafts[(verb === 'note' ? 'note-' : verb + '-') + i.id]; S.discussOpen[i.id] = false; S.doneOpen[i.id] = false; }
+        if (res.error) { const e = document.getElementById('err-' + i.id); if (e) e.textContent = res.error; document.querySelectorAll('.btn').forEach((b) => { b.disabled = false; }); return; }
+        toast(verb + ' ✓ ' + (res.task_state || ''));
+        load();
+      }).catch((e) => { S.busy = false; alert('request failed: ' + e); load(); });
+  }
+
+  // ---------- lanes ----------
+  function renderLanes(main, lanes) {
+    const top = el('div', { class: 'chips' }, [
+      el('span', { class: 'counter', text: 'session ' }),
+      el('input', { class: 'filter mono', id: 'lanes-session', value: S.lanesSession, placeholder: 'session id prefix', onchange: (ev) => { S.lanesSession = ev.target.value.trim(); persist(); load(); } }),
+      S.lanes ? el('span', { class: 'counter', text: ' ' + S.lanes.counts.running + ' running · ' + S.lanes.counts.done + ' done · ' + S.lanes.counts.stranded + ' stranded · ' + S.lanes.counts.total + ' total' }) : null
+    ]);
+    main.appendChild(top);
+    if (!S.lanesSession) { main.appendChild(el('div', { class: 'empty', text: 'name the orchestrator session (its id prefix) to see its lanes' })); return; }
+    if (!S.lanes) { main.appendChild(el('div', { class: 'empty', text: 'loading lanes…' })); return; }
+    if (S.lanes.error) { main.appendChild(el('div', { class: 'err', text: S.lanes.error })); return; }
+    const tbl = el('table', { class: 'lanes' }, [el('thead', {}, [el('tr', {}, ['', 'lane', 'description', 'model', 'start', 'dur', 'last', 'tokens', 'calls', 'where'].map((h) => el('th', { text: h })))])]);
+    const tb = el('tbody');
+    const now = Date.now();
+    lanes.forEach((l, k) => {
+      const running = l.status === 'running';
+      const quietMin = l.last_turn_at ? (now - new Date(l.last_turn_at).getTime()) / 60000 : 0;
+      const quiet = running && quietMin > 60;
+      const cls = l.stranded ? 'stranded' : quiet ? 'quiet' : running ? 'running' : (l.status === 'failed' || l.status === 'killed') ? 'failed' : 'done';
+      const where = l.last_tool || l.last_text || '';
+      const tr = el('tr', { class: 'row' + (k === S.sel ? ' sel' : ''), onclick: () => { S.expanded['l:' + l.agent_id] = !S.expanded['l:' + l.agent_id]; S.sel = k; render(); } }, [
+        el('td', { class: 'nowrap', title: l.status + (l.stranded ? ' · STRANDED' : '') + (quiet ? ' · quiet ' + Math.round(quietMin) + 'm' : '') }, [el('span', { class: 'dot ' + cls }), quiet ? 'quiet ' + Math.round(quietMin / 60 * 10) / 10 + 'h' : l.stranded ? 'stranded' : l.status]),
+        el('td', { class: 'nowrap' }, [el('code', { text: l.agent_id.slice(0, 8), title: 'copy ' + l.agent_id, onclick: (ev) => { ev.stopPropagation(); copy(l.agent_id, 'agent id'); } })]),
+        el('td', { text: l.description || l.agent_type || '' }),
+        el('td', { class: 'nowrap', text: (l.model || '').replace('claude-', '').replace(/-\d{8}$/, '') }),
+        el('td', { class: 'nowrap', text: l.started_at ? fmtTs(l.started_at) : '' }),
+        el('td', { class: 'num', text: dur(l.duration_ms) }),
+        el('td', { class: 'num', text: l.last_turn_at ? ago(l.last_turn_at) : '' }),
+        el('td', { class: 'num', text: mtok(l.tokens.total) }),
+        el('td', { class: 'num', text: String(l.tool_calls) }),
+        el('td', { text: where.length > 90 ? where.slice(0, 88) + '…' : where, title: where })
+      ]);
+      tb.appendChild(tr);
+      if (S.expanded['l:' + l.agent_id]) {
+        tb.appendChild(el('tr', {}, [el('td', { colspan: '10' }, [el('div', { class: 'expand', text: (l.last_text || '(no text yet)') + (l.last_tool ? '\n\n↪ ' + l.last_tool : '') })])]));
+      }
+    });
+    tbl.appendChild(tb);
+    main.appendChild(el('div', { class: 'wrap' }, [tbl]));
+    if (!lanes.length) main.appendChild(el('div', { class: 'empty', text: 'no lanes match' }));
+  }
+
+  // ---------- backlog ----------
+  function renderBacklog(main, tasks) {
+    if (!S.backlog) { main.appendChild(el('div', { class: 'empty', text: 'loading…' })); return; }
+    const chips = el('div', { class: 'chips' }, [el('button', { class: S.backlogRepo ? '' : 'on', text: 'all repos', onclick: () => { S.backlogRepo = ''; load(); } })]);
+    (S.backlog.repos || []).forEach((r) => chips.appendChild(el('button', { class: S.backlogRepo === r ? 'on' : '', text: base(r), title: r, onclick: () => { S.backlogRepo = S.backlogRepo === r ? '' : r; load(); } })));
+    chips.appendChild(el('span', { text: ' · ' }));
+    ['open', 'claimed', 'ready', 'landed'].forEach((st) => chips.appendChild(el('button', { class: S.backlogState === st ? 'on' : '', text: st, onclick: () => { S.backlogState = S.backlogState === st ? '' : st; load(); } })));
+    chips.appendChild(el('button', { class: S.backlogAll ? 'on' : '', text: 'incl. closed', onclick: () => { S.backlogAll = !S.backlogAll; load(); } }));
+    chips.appendChild(el('span', { class: 'counter', text: ' ' + tasks.length + ' of ' + S.backlog.count }));
+    main.appendChild(chips);
+    const tbl = el('table', { class: 'lanes' }, [el('thead', {}, [el('tr', {}, ['id', 'state', 'title', 'assignee', 'by', 'last', 'notes'].map((h) => el('th', { text: h })))])]);
+    const tb = el('tbody');
+    tasks.forEach((t, k) => {
+      const tags = (t.tags || []).filter((x) => x !== 'decision');
+      const tr = el('tr', { class: 'row' + (k === S.sel ? ' sel' : ''), onclick: () => { S.expanded['b:' + t.id] = !S.expanded['b:' + t.id]; S.sel = k; render(); } }, [
+        el('td', { class: 'nowrap' }, [el('code', { text: t.short, title: 'copy id', onclick: (ev) => { ev.stopPropagation(); copy(t.id, 'id'); } })]),
+        el('td', { class: 'nowrap' }, [t.decision ? el('span', { class: 'tag decision', text: 'decision' }) : null, t.blocked ? el('span', { class: 'tag blocked', text: 'blocked' }) : null, ' ' + t.state]),
+        el('td', {}, [t.title, ' ', ...tags.map((x) => el('span', { class: 'tag', text: '#' + x })), t.repo ? el('span', { class: 'tag', text: base(t.repo), title: t.repo }) : null]),
+        el('td', { class: 'nowrap', text: t.assignee || '' }),
+        el('td', { class: 'nowrap', text: (t.opened_by || '').replace(/^(lane|orchestrator|web):/, '') }),
+        el('td', { class: 'num', text: t.age }),
+        el('td', { class: 'num', text: String(t.notes) })
+      ]);
+      tb.appendChild(tr);
+      if (S.expanded['b:' + t.id]) {
+        const ta = el('textarea', { placeholder: 'note… (⌘⏎)', rows: '1', onkeydown: (ev) => { if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') { ev.preventDefault(); if (ta.value.trim()) act({ id: t.id }, 'note', { text: ta.value }); } } });
+        tb.appendChild(el('tr', {}, [el('td', { colspan: '7' }, [
+          el('div', { class: 'expand', text: (t.body || '(no body)') + (t.issue ? '\n\n📄 ' + t.issue : '') }),
+          el('div', { class: 'notebox' }, [ta, el('button', { class: 'btn', text: 'Note', onclick: () => { if (ta.value.trim()) act({ id: t.id }, 'note', { text: ta.value }); } }),
+            t.issue ? el('button', { class: 'btn quiet', text: 'copy path', onclick: () => copy(t.issue, 'path') }) : null,
+            el('button', { class: 'btn quiet', text: 'copy `cv task show`', onclick: () => copy('cv task show ' + t.short, 'command') })]),
+          el('div', { class: 'err', id: 'err-' + t.id })])]));
+      }
+    });
+    tbl.appendChild(tb);
+    main.appendChild(el('div', { class: 'wrap' }, [tbl]));
+    if (!tasks.length) main.appendChild(el('div', { class: 'empty', text: 'no tasks match' }));
+  }
+
+  // ---------- events ----------
+  function renderEvents(main) {
+    const chips = el('div', { class: 'chips' }, [
+      el('button', { class: S.eventsMine ? '' : 'on', text: 'everyone', onclick: () => { S.eventsMine = false; load(); } }),
+      el('button', { class: S.eventsMine ? 'on' : '', text: 'by ' + (S.who || 'me'), onclick: () => { S.eventsMine = true; load(); } }),
+      el('span', { class: 'counter', text: ' last 48h, newest first' })]);
+    main.appendChild(chips);
+    if (!S.events) { main.appendChild(el('div', { class: 'empty', text: 'loading…' })); return; }
+    const evs = S.events.filter((e) => matches(JSON.stringify(e)));
+    const tbl = el('table', { class: 'events' }, [el('thead', {}, [el('tr', {}, [el('th', { text: 'when' }), el('th', { text: 'by' }), el('th', { text: 'kind' }), el('th', { text: 'task' }), el('th', { text: 'what' })])])]);
+    const tb = el('tbody');
+    evs.slice(0, 300).forEach((e) => {
+      const task = e.task_id || ''; const title = e.title || '';
+      const what = e.detail || e.text || '';
+      tb.appendChild(el('tr', {}, [
+        el('td', { class: 'nowrap', text: e.ts ? fmtTs(e.ts) : '' }),
+        el('td', { class: 'nowrap', text: String(e.by || '').replace(/^(lane|orchestrator|web):/, '') }),
+        el('td', { class: 'nowrap', text: e.event || '' }),
+        el('td', {}, [el('code', { text: String(task).slice(0, 13), onclick: () => copy(String(task), 'id') }), title ? ' ' + title : '']),
+        el('td', { text: typeof what === 'string' ? (what.length > 160 ? what.slice(0, 158) + '…' : what) : '' })]));
+    });
+    tbl.appendChild(tb);
+    main.appendChild(el('div', { class: 'wrap' }, [tbl]));
+    if (!evs.length) main.appendChild(el('div', { class: 'empty', text: 'no events' }));
+  }
+
+  // ---------- help ----------
+  function renderHelp() {
+    const old = document.querySelector('.help'); if (old) old.remove();
+    if (!S.help) return;
+    const rows = [['j / k', 'next / previous'], ['a', 'accept the default'], ['1-9', 'choose option n'], ['d', 'park for discussion'], ['n', 'note (⌘⏎ saves)'],
+      ['x', 'expand / collapse'], ['i', 'copy the task id'], ['p', 'copy the issue path'], ['/', 'filter'], ['g then d/a/l/b/e/c', 'go to a pane'], ['r', 'reload'], ['?', 'this']];
+    const grid = el('div'); rows.forEach((r) => { grid.appendChild(el('kbd', { text: r[0] })); grid.appendChild(el('span', { text: r[1] })); });
+    document.body.appendChild(el('div', { class: 'help' }, [el('h3', { text: 'keys' }), grid]));
+  }
+
+  // ---------- keys ----------
+  let gPending = false;
+  document.addEventListener('keydown', (ev) => {
+    const tag = (ev.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') { if (ev.key === 'Escape') ev.target.blur(); return; }
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const items = visibleItems(); const cur = items[S.sel];
+    const inboxPane = S.pane === 'decisions' || S.pane === 'actions' || S.pane === 'closed';
+    if (gPending) { gPending = false; const m = { d: 'decisions', a: 'actions', l: 'lanes', b: 'backlog', e: 'events', c: 'closed' }; if (m[ev.key]) { setPane(m[ev.key]); ev.preventDefault(); } return; }
+    switch (ev.key) {
+      case 'j': case 'ArrowDown': S.sel = Math.min(items.length - 1, S.sel + 1); S.keyboard = true; render(); ev.preventDefault(); break;
+      case 'k': case 'ArrowUp': S.sel = Math.max(0, S.sel - 1); S.keyboard = true; render(); ev.preventDefault(); break;
+      case 'g': gPending = true; break;
+      case '/': $('#filter').focus(); ev.preventDefault(); break;
+      case '?': S.help = !S.help; renderHelp(); break;
+      case 'r': load(); toast('reloaded'); break;
+      case 'Escape': S.help = false; renderHelp(); break;
+      case 'x': if (cur) { const key = S.pane === 'lanes' ? 'l:' + cur.agent_id : S.pane === 'backlog' ? 'b:' + cur.id : cur.id; S.expanded[key] = !S.expanded[key]; render(); } break;
+      case 'i': if (cur) copy(cur.id || cur.agent_id, 'id'); break;
+      case 'p': if (cur && cur.issue) copy(cur.issue, 'path'); break;
+      case 'a':
+        if (!inboxPane || !cur) break;
+        if (cur.decision && !cur.decision.resolution) act(cur, 'resolve', { accept_default: true });
+        else if (!cur.decision && (cur.reason === 'decision_owed' || cur.reason === 'discussing')) { const b = document.querySelector('.card.sel .decision .btn.primary'); if (b) b.click(); }
+        break;
+      case 'd': if (inboxPane && cur && cur.reason !== 'discussing' && !(cur.decision && cur.decision.resolution)) discuss(cur); break;
+      case 'n': if (cur) { const ta = document.getElementById('note-' + cur.id); if (ta) { ta.focus(); ev.preventDefault(); } else if (S.pane === 'backlog') { S.expanded['b:' + cur.id] = true; render(); } } break;
+      default:
+        if (/^[1-9]$/.test(ev.key) && inboxPane && cur && cur.decision && !cur.decision.resolution) {
+          const o = cur.decision.alternatives[parseInt(ev.key, 10) - 1]; if (o) act(cur, 'resolve', { choice: o });
+        }
+    }
+  });
+
+  function setPane(p) { S.pane = p; S.sel = 0; persist(); load(); }
+  document.querySelectorAll('#tabs button[data-pane]').forEach((b) => b.addEventListener('click', () => setPane(b.getAttribute('data-pane'))));
+  $('#refresh').addEventListener('click', load);
+  $('#helpbtn').addEventListener('click', () => { S.help = !S.help; renderHelp(); });
+  $('#filter').addEventListener('input', (ev) => { S.filter = ev.target.value; S.sel = 0; render(); });
+  $('#who').addEventListener('change', () => { S.who = $('#who').value.trim(); persist(); load(); });
+  params(); persist(); load();
+  setInterval(() => { if (!S.busy && document.visibilityState === 'visible' && !document.activeElement.matches('textarea, input')) load(); }, 30000);
+})();
+</script>
+</body>
+</html>

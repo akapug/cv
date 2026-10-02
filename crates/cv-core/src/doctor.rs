@@ -92,9 +92,7 @@ impl Report {
         let mut session_startup: Option<u64> = None;
         for m in &session.messages {
             if let Some(u) = &m.usage {
-                let total = u.input_tokens.unwrap_or(0)
-                    + u.cache_read_tokens.unwrap_or(0)
-                    + u.cache_creation_tokens.unwrap_or(0);
+                let total = u.prompt_tokens();
                 if total > 0 {
                     self.peak_ctx = self.peak_ctx.max(total);
                     if session_startup.is_none() {

@@ -287,6 +287,10 @@ struct CodexCtx {
     /// Usage from the last `token_usage_record`, until its `token_count` twin (same numbers, a few
     /// records later) has been seen — so the twin never double-counts as a second carrier.
     pending_record_usage: Option<Usage>,
+    /// `info.total_token_usage` of the last `token_count`: the thread's running total. A snapshot
+    /// that repeats it reports no new model call (Codex re-emits the last one, e.g. after a user
+    /// message), so its `last_token_usage` must not be counted again.
+    last_total_usage: Option<Value>,
 }
 
 impl CodexCtx {
@@ -522,6 +526,33 @@ fn flush_all_but_held(scratch: &mut Vec<Message>, sink: &mut dyn MessageSink) ->
         }
     }
     Flow::Continue
+}
+
+/// How many messages a parse of a plain `.jsonl` rollout's first `len` bytes yields — the count a
+/// parse would have returned when the file was `len` bytes long, since a live rollout only grows by
+/// appending. Both passes read only the prefix, so `has_events` is decided exactly as it was then.
+/// Not for `.jsonl.zst` (a byte prefix of a zstd stream is not a prefix of the rollout).
+pub(crate) fn count_prefix(r: &SessionRef, len: u64) -> Result<usize> {
+    use std::io::Read as _;
+    let open = || -> Result<BufReader<std::io::Take<fs::File>>> {
+        let f = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
+        Ok(BufReader::new(f.take(len)))
+    };
+    let has_events = detect_has_events(open()?);
+    let mut n = 0usize;
+    let mut count = |_: Message| {
+        n += 1;
+        Flow::Continue
+    };
+    stream_jsonl(
+        &r.id,
+        open()?,
+        Some(r.path.clone()),
+        has_events,
+        &ParseOptions::full(),
+        &mut count,
+    );
+    Ok(n)
 }
 
 /// Streaming parse of a modern `.jsonl` rollout: emit each record's messages to `sink` and drop them
@@ -1347,6 +1378,14 @@ fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message
         ctx.pending_record_usage = None;
         usage = None;
     }
+    // A re-emitted snapshot: the running total has not moved since the last `token_count`.
+    let total = info.and_then(|i| i.get("total_token_usage")).filter(|v| !v.is_null());
+    if let Some(t) = total {
+        if ctx.last_total_usage.as_ref() == Some(t) {
+            usage = None;
+        }
+        ctx.last_total_usage = Some(t.clone());
+    }
     let rate_limits = p.get("rate_limits").filter(|v| !v.is_null()).cloned();
     let ctx_window = info
         .and_then(|i| i.get("model_context_window"))
@@ -1398,13 +1437,19 @@ fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message
 /// `cache_write_input_tokens` (added in 0.147, `#[serde(default)]`, protocol.rs:2235) to
 /// cache-creation — absent on older files; `reasoning_output_tokens` to `reasoning_tokens`. Codex
 /// stores no cost.
+///
+/// Codex's `input_tokens` *includes* both cache counts (its `total_tokens` is input + output), so
+/// the IR's disjoint `input_tokens` is the remainder; `emit::codex_token_usage` adds them back.
 fn parse_usage(v: &Value) -> Option<Usage> {
     let u64f = |k: &str| v.get(k).and_then(Value::as_u64);
+    let cache_read = u64f("cached_input_tokens");
+    let cache_write = u64f("cache_write_input_tokens");
     let u = Usage {
-        input_tokens: u64f("input_tokens"),
+        input_tokens: u64f("input_tokens")
+            .map(|i| i.saturating_sub(cache_read.unwrap_or(0) + cache_write.unwrap_or(0))),
         output_tokens: u64f("output_tokens"),
-        cache_read_tokens: u64f("cached_input_tokens"),
-        cache_creation_tokens: u64f("cache_write_input_tokens"),
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_write,
         reasoning_tokens: u64f("reasoning_output_tokens"),
         cost_usd: None,
     };
@@ -2479,11 +2524,54 @@ mod tests {
         ]);
         let m = s.messages.iter().find(|m| m.role == Role::Assistant).unwrap();
         let u = m.usage.as_ref().expect("usage attached");
-        assert_eq!(u.input_tokens, Some(100));
+        assert_eq!(
+            u.input_tokens,
+            Some(90),
+            "Codex's 100 includes the 10 cached; the IR's is disjoint"
+        );
         assert_eq!(u.output_tokens, Some(20));
         assert_eq!(u.cache_read_tokens, Some(10));
         assert!(m.extra["codex"].get("rate_limits").is_some());
         assert!(m.extra["codex"].get("model_context_window").is_some());
+    }
+
+    #[test]
+    fn a_reemitted_token_count_counts_no_second_call() {
+        // Codex re-emits its last snapshot (same `total_token_usage`) after the next user message;
+        // before, that stale `last_token_usage` landed on the following reply as a second call.
+        // The third snapshot's running total moved, so it is a real call and keeps its usage.
+        let tc = |total: u64, last: u64| {
+            format!(
+                r#"{{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{total},"output_tokens":0,"total_tokens":{total}}},"last_token_usage":{{"input_tokens":{last},"output_tokens":0,"total_tokens":{last}}}}}}}}}"#
+            )
+        };
+        let reply = |t: &str| {
+            format!(
+                r#"{{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{{"type":"agent_message","message":"{t}"}}}}"#
+            )
+        };
+        let user = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"again"}}"#;
+        let lines = [
+            reply("one"),
+            tc(100, 100),
+            user.to_string(),
+            reply("two"),
+            tc(100, 100),
+            tc(250, 150),
+        ];
+        let s = parse_str("s", &lines.join("\n"), true, None);
+        let usages: Vec<Option<u64>> = s
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .map(|m| m.usage.as_ref().and_then(|u| u.input_tokens))
+            .collect();
+        assert_eq!(
+            usages.iter().flatten().sum::<u64>(),
+            250,
+            "the thread's running total, counted once: {usages:?}"
+        );
+        assert_eq!(usages.iter().flatten().count(), 2, "{usages:?}");
     }
 
     #[test]
@@ -2530,7 +2618,7 @@ mod tests {
             let u = m.usage.as_ref().expect("usage attached");
             assert_eq!(
                 (u.input_tokens, u.output_tokens, u.cache_read_tokens),
-                (Some(100), Some(20), Some(10))
+                (Some(90), Some(20), Some(10))
             );
         }
         // function_call ToolUse msg attached nothing (it has its own pending usage slot untouched);
@@ -3025,7 +3113,8 @@ mod tests {
                 u.cache_creation_tokens,
                 u.output_tokens
             ),
-            (Some(35507), Some(34432), Some(512), Some(55))
+            // 35507 on disk includes both cache counts: 35507 - 34432 - 512 = 563 uncached.
+            (Some(563), Some(34432), Some(512), Some(55))
         );
         assert_eq!(
             u.reasoning_tokens,
@@ -3566,7 +3655,8 @@ mod tests {
                 u.output_tokens,
                 u.reasoning_tokens
             ),
-            (Some(100), Some(50), Some(5), Some(20), Some(7))
+            // 100 on disk includes both cache counts: 100 - 50 - 5 = 45 uncached.
+            (Some(45), Some(50), Some(5), Some(20), Some(7))
         );
         assert_eq!(reply.extra["codex"]["phase"], "final_answer");
         assert_eq!(reply.extra["codex"]["usage_source"], "token_usage_record");

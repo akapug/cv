@@ -17,7 +17,7 @@ Grouped help (`cv --help` shows every command under these headings; nothing is h
 
 | group | commands | what they have in common |
 |---|---|---|
-| **Read** | `ls` `show` `cat` `search` `events` `touched` `tools` `tree` `workflow` `compaction` `timeline` `stats` `diff` `blame` `doctor` | read-only over existing sessions |
+| **Read** | `ls` `show` `cat` `search` `events` `touched` `tools` `tree` `workflow` `compaction` `prompts` `lanes` `deferrals` `timeline` `stats` `diff` `blame` `doctor` | read-only over existing sessions |
 | **Reshape** | `prune` `splice` `loom` `port` `redact` `resume` | produce a NEW session id from existing ones (the source is never touched); `resume` launches one |
 | **Export** | `export` `dataset` `pack` | produce something that is not a session |
 | **Fleet & live** | `task` `board` `scry` `share` | multi-agent coordination and live views |
@@ -191,6 +191,11 @@ pub enum Origin {
     Unknown,
 }
 
+/// The four token counts are DISJOINT (Anthropic's convention): `input_tokens` is the uncached
+/// prompt only, and the prompt the model read is input + cache_read + cache_creation
+/// (`Usage::prompt_tokens`). Providers that report cached tokens as a subset of input (Codex,
+/// Gemini) are normalized on parse and re-inclusived on emit, so sums across harnesses mean one
+/// thing. `reasoning_tokens` is a subset of `output_tokens`.
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,

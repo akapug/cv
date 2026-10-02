@@ -30,6 +30,7 @@
 
 #[cfg(not(target_family = "wasm"))]
 pub mod check;
+pub mod decide;
 pub(crate) mod identity;
 pub mod model;
 pub mod project;
@@ -48,19 +49,22 @@ pub use model::{
     harness_family, model_family, DoneCheck, DoneCheckKind, IndependenceCheck, MergeFailure, ReviewReceipts, Revision,
     RevisionState, TaskEvent, TaskEventKind, TaskState, VERIFIER_BY,
 };
+pub use decide::{is_decide_note, options_of, parse_deadline, parse_decide_note, DecideNote, AS_PROPOSED};
 pub use project::{
-    age_short, awaiting_review, branch_carriers, debt, effective_display, inbox, list, propose_collision_warnings,
-    resolve_id, AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason, TaskFilter, STATE_VOCABULARY,
+    age_short, awaiting_review, blocks, branch_carriers, debt, effective_display, in_scope, inbox, involves,
+    is_blocked, list, parse_duration, parse_since, propose_collision_warnings, resolve_id, same_actor,
+    unique_prefix_len, uuid_v7_timestamp, AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason, TaskFilter,
+    DECISION_TAG, DISCUSS_TAG, STATE_VOCABULARY,
 };
 pub use provenance::{freshness_from_heartbeat, Freshness, Provenance};
 pub use reduce::{
-    EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence, RevisionProjection, TaskIssue,
-    TaskProjection, TaskReadModel, TaskReducer,
+    Decision, EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence, Resolution,
+    RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use stats::{EndpointRow, FamilyRow, FleetStats, ReviewerRow};
 pub use store::{new_event, replay, ReplayOutcome, TaskStore};
-pub use views::{AwaitingRow, DebtRow, InboxRow, TaskRow};
+pub use views::{AwaitingRow, DebtRow, InboxDecision, InboxRow, TaskRow};
 #[cfg(not(target_family = "wasm"))]
 pub use views::{DebtReport, SuspectRow};
 
@@ -455,10 +459,18 @@ pub fn receipts_warning(receipts: Option<&ReviewReceipts>) -> Option<String> {
 
 /// Best-effort board notification for an appended task event (never called while the store lock
 /// is held — the append has already returned). Failures are returned for the caller to warn
-/// about, never to fail the operation.
-pub fn notify_board(event: &TaskEvent, channel: &str) -> anyhow::Result<()> {
+/// about, never to fail the operation. The body names the task's title (truncated) so
+/// `cv board read tasks` reads as a timeline, not a list of ids.
+pub fn notify_board(event: &TaskEvent, channel: &str, title: Option<&str>) -> anyhow::Result<()> {
     let short = &event.task_id[..event.task_id.len().min(8)];
-    let body = format!("task {short}: {}", event.kind.tag());
+    let body = match title {
+        Some(t) => format!(
+            "task {short}: {} — {}",
+            event.kind.tag(),
+            crate::ir::truncate(&crate::sanitize::sanitize_line(t), 80)
+        ),
+        None => format!("task {short}: {}", event.kind.tag()),
+    };
     crate::board::post(
         channel,
         &event.by,
@@ -546,7 +558,7 @@ pub fn append_and_notify(
     let outcome = store.replay()?;
     let proj = outcome.model.tasks.get(&event.task_id);
     let channel = proj.map(|t| t.channel.clone()).unwrap_or_else(|| "tasks".into());
-    if let Err(e) = notify_board(&event, &channel) {
+    if let Err(e) = notify_board(&event, &channel, proj.map(|t| t.title.as_str())) {
         warnings.push(format!("board notification failed (task state is durable): {e}"));
     }
     Ok(AppendOutcome {

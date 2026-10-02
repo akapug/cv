@@ -220,7 +220,7 @@ pub(crate) fn cmd_timeline(
 
 // ---------- stats ----------
 
-pub(crate) fn cmd_stats(query: Option<String>, json: bool) -> Result<()> {
+pub(crate) fn cmd_stats(query: Option<String>, json: bool, tokens: bool) -> Result<()> {
     let query = crate::cmd::query::build(query)?;
     let mut refs = cv_core::sessions();
     apply_query(&mut refs, &query);
@@ -229,9 +229,14 @@ pub(crate) fn cmd_stats(query: Option<String>, json: bool) -> Result<()> {
     // accumulate its own from whichever sessions the user had happened to open.
     let s = cv_core::stats::CorpusStats::compute(&refs);
     let total = s.sessions;
+    let t = tokens.then(|| cv_core::stats::TokenStats::compute(&refs));
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&s.to_json())?);
+        let mut v = s.to_json();
+        if let Some(t) = &t {
+            v["tokens"] = t.to_json();
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
 
@@ -271,5 +276,71 @@ pub(crate) fn cmd_stats(query: Option<String>, json: bool) -> Result<()> {
             .map(|d| crate::util::fmt_local(d, "%Y-%m-%d %H:%M"))
             .unwrap_or_else(|| "?".into())
     );
+    if let Some(t) = &t {
+        print_token_stats(t);
+    }
     Ok(())
+}
+
+/// `1.23B` / `45.6M` / `7.8K` / `12`: token counts span nine orders of magnitude across a fleet.
+fn si(n: u64) -> String {
+    let f = n as f64;
+    match n {
+        1_000_000_000.. => format!("{:.2}B", f / 1e9),
+        1_000_000.. => format!("{:.1}M", f / 1e6),
+        1_000.. => format!("{:.1}K", f / 1e3),
+        _ => n.to_string(),
+    }
+}
+
+fn print_token_stats(t: &cv_core::stats::TokenStats) {
+    use cv_core::stats::TokenRow;
+    println!(
+        "
+tokens ({} session(s) + {} sub-agent transcript(s){}{}):",
+        t.sessions,
+        t.subagents,
+        if t.failed > 0 {
+            format!(", {} unparseable", t.failed)
+        } else {
+            String::new()
+        },
+        if t.duplicates > 0 {
+            format!(", {} repeated usage record(s) skipped", t.duplicates)
+        } else {
+            String::new()
+        },
+    );
+    println!(
+        "  {:8} {:30} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "harness", "model", "calls", "input", "c.write", "c.read", "output", "uncached", "total"
+    );
+    let line = |r: &TokenRow| {
+        let cost = r.cost_usd.map(|c| format!("  ${c:.2}")).unwrap_or_default();
+        println!(
+            "  {:8} {:30} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}{cost}",
+            r.harness,
+            truncate(&r.model, 30),
+            r.calls,
+            si(r.input),
+            si(r.cache_write),
+            si(r.cache_read),
+            si(r.output),
+            si(r.uncached()),
+            si(r.total()),
+        )
+    };
+    for r in &t.rows {
+        line(r);
+    }
+    let by_h = t.by_harness();
+    if by_h.len() > 1 {
+        println!();
+        for r in &by_h {
+            line(r);
+        }
+    }
+    println!();
+    line(&t.total());
+    println!("  (input excludes cache; uncached = input + cache writes + output)");
 }
