@@ -726,6 +726,36 @@ fn observe_stream_bounded_read_only_tail() {
     assert_eq!(v["count"], 1, "max_messages=1 bounds the batch: {text}");
     assert_eq!(v["more_pending"], true, "the rest must be flagged pending: {text}");
 
+    // ...and polling again with the returned cursor drains the rest, one per call, in order —
+    // with nothing new appended in between.
+    let mut cursor = v["cursor"].as_str().unwrap().to_string();
+    let mut drained = vec![v["messages"][0]["text"].as_str().unwrap().trim().to_string()];
+    for id in 100..110 {
+        let (text, is_err) = s.call_tool(
+            id,
+            "observe_stream",
+            json!({"cwd_contains": "/work/proj", "since_cursor": cursor, "max_messages": 1}),
+        );
+        assert!(!is_err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        cursor = v["cursor"].as_str().unwrap().to_string();
+        drained.extend(
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["text"].as_str().unwrap().trim().to_string()),
+        );
+        if v["more_pending"] == false {
+            break;
+        }
+    }
+    assert_eq!(
+        drained,
+        ["after message 0", "after message 1", "after message 2"],
+        "more_pending must be drainable by polling the cursor"
+    );
+
     // 6) READ-ONLY: observe_stream must NEVER write the board. Reading the channel observe_stream
     //    was scoped to ("/work/proj"/"fleet") returns nothing it could have posted. Assert the
     //    board has no observe_stream-authored traffic on a fresh channel.
