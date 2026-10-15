@@ -2572,6 +2572,15 @@ pub fn staleness(dir: &Path) -> Option<Staleness> {
     staleness_over(dir, &cv_core::sessions())
 }
 
+/// Whether an indexed stamp still matches the file on disk — THE TUPLE IS THE WHOLE QUESTION HERE.
+/// [`cv_core::offsets::sig_is_fresh_with_source`] also demands captured source authority, because
+/// it gates REUSE of captured bytes; a stat-only probe reuses nothing and cannot afford a
+/// per-session source snapshot (that is the cost this probe exists to avoid), so it passes the
+/// authority check vacuously and says so in its name. `(0, 0)` — unreadable — is never fresh.
+fn sig_current(stored: (i64, i64), cur: (i64, i64)) -> bool {
+    cv_core::offsets::sig_is_fresh_with_source(stored, cur, || true)
+}
+
 /// [`staleness`] over a caller-supplied inventory — the split that lets a unit test feed the
 /// fixture's refs rather than a real corpus discovery.
 fn staleness_over(dir: &Path, refs: &[cv_core::SessionRef]) -> Option<Staleness> {
@@ -2588,7 +2597,7 @@ fn staleness_over(dir: &Path, refs: &[cv_core::SessionRef]) -> Option<Staleness>
         newest_on_disk = newest_on_disk.max(cur.0);
         if !sigs
             .get(&r.id)
-            .is_some_and(|&stored| cv_core::offsets::sig_is_fresh(stored, cur))
+            .is_some_and(|&stored| sig_current(stored, cur))
         {
             stale_sessions += 1;
         }
@@ -2652,8 +2661,8 @@ pub fn pass_needed(dir: &Path, subagents: bool) -> Option<bool> {
     pass_needed_over(dir, &cv_core::sessions(), subagents)
 }
 
-/// A signature a pass could stamp: the file stats cleanly and is nonempty — the same bar
-/// [`cv_core::offsets::sig_is_fresh`] sets for "already indexed".
+/// A signature a pass could stamp: the file stats cleanly and is nonempty — the bar
+/// [`cv_core::offsets::sig_is_fresh_with_source`] sets for "already indexed".
 fn landable(sig: (i64, i64)) -> bool {
     sig.0 != 0 && sig.1 > 0
 }
