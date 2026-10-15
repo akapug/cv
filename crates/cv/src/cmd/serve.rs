@@ -674,10 +674,23 @@ fn search(query: &str, semantic_search: &cv_search::SemanticSearch) -> Reply {
 
     // The index is authoritative, so an empty result means "no match" — but the two reasons a real
     // conversation is unfindable are both about the index, not the query, and `cv search` says so
-    // on a miss. Same note here, and only on a miss (the staleness check costs a metadata-only
-    // discovery sweep, which is not something to pay on every hit).
-    if source == "index" && rows.is_empty() {
-        note = index_miss_note();
+    // on a miss. A hit list that may be missing rows says so too: the staleness probe is the
+    // catalog's own metadata (one stat per session), cheap enough to name on every indexed answer.
+    if source == "index" {
+        if let Some(stale) = cv_search::fts::staleness_note(&cv_search::default_tantivy_dir()) {
+            note = Some(match note {
+                Some(n) => format!("{n}; {stale}"),
+                None => stale,
+            });
+        }
+        if rows.is_empty() {
+            if let Some(sub) = subagent_miss_note() {
+                note = Some(match note {
+                    Some(n) => format!("{n}; {sub}"),
+                    None => sub,
+                });
+            }
+        }
     }
 
     let mut headers = vec![("X-Cv-Search-Source", source.to_string())];
@@ -687,24 +700,15 @@ fn search(query: &str, semantic_search: &cv_search::SemanticSearch) -> Reply {
     (200, json!(rows), headers)
 }
 
-/// Why an indexed search might have come back empty for something that really was said — the same
-/// two hints `cv search` prints on a miss: the index has fallen behind the newest session, and/or
-/// it holds no sub-agent transcripts (so nothing an Agent/Workflow lane discussed is searchable).
-fn index_miss_note() -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(days) = cv_search::fts::days_behind(&cv_search::default_tantivy_dir()) {
-        parts.push(format!(
-            "the index is ~{days} day(s) behind the newest session — run `cv index`"
-        ));
-    }
-    if !cv_search::fts::has_subagent_docs(&cv_search::default_tantivy_dir()) {
-        parts.push(
-            "sub-agent transcripts aren't searched yet — rebuild with `cv index --subagents` to \
-             include the Agent/Workflow lanes"
-                .into(),
-        );
-    }
-    (!parts.is_empty()).then(|| parts.join("; "))
+/// The other reason an indexed search might have come back empty for something that really was
+/// said — it holds no sub-agent transcripts (so nothing an Agent/Workflow lane discussed is
+/// searchable). The index-lag half is [`cv_search::fts::staleness_note`], which serves hits too.
+fn subagent_miss_note() -> Option<String> {
+    (!cv_search::fts::has_subagent_docs(&cv_search::default_tantivy_dir())).then(|| {
+        "sub-agent transcripts aren't searched yet — rebuild with `cv index --subagents` to \
+         include the Agent/Workflow lanes"
+            .to_string()
+    })
 }
 
 /// A header-safe rendering of a note: header values are a byte channel with no escaping, so keep

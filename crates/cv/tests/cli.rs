@@ -421,6 +421,54 @@ fn search_json_emits_machine_readable_hits() {
     assert!(rows.is_empty(), "{out}");
 }
 
+/// The staleness disclosure: once the corpus has outrun the index, a hit list must say so (a
+/// non-empty answer can still be missing rows), a miss must say so, and --json moves it to
+/// stderr so stdout stays a pure array — `cv mcp` relays stderr as its own content block.
+#[test]
+fn search_discloses_index_staleness() {
+    let w = World::new("searchstale");
+    standard_corpus(&w);
+    w.cv_ok(&["index"]);
+
+    // Fresh index: no disclosure on either surface.
+    let (_out, err) = w.cv_ok(&["search", "zebrafish", "--json"]);
+    assert!(!err.contains("behind"), "{err}");
+    let (out, _) = w.cv_ok(&["search", "zebrafish"]);
+    assert!(!out.contains("behind"), "{out}");
+
+    // Grow one session's transcript: the index now trails one file.
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(w.transcript("alphasess"))
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            user_line("u9", "2026-06-02T00:00:00Z", "more zebrafish tail work")
+        )
+        .unwrap();
+    }
+
+    // The human hit list carries the footer…
+    let (out, _) = w.cv_ok(&["search", "zebrafish"]);
+    assert!(out.contains("behind for 1 session"), "{out}");
+    // …--json keeps the array pure and puts the note on stderr…
+    let (out, err) = w.cv_ok(&["search", "zebrafish", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
+    assert_eq!(rows.len(), 1, "{out}");
+    assert!(err.contains("behind for 1 session"), "{err}");
+    // …and a miss names it too.
+    let (out, _) = w.cv_ok(&["search", "xyzzyplugh"]);
+    assert!(out.contains("behind for 1 session"), "{out}");
+
+    // A fresh pass quiets it again.
+    w.cv_ok(&["index"]);
+    let (_, err) = w.cv_ok(&["search", "zebrafish", "--json"]);
+    assert!(!err.contains("behind"), "{err}");
+}
+
 // ───────────────────────────── show windows ─────────────────────────────
 
 /// The 0.11 window grammar, on the one command every consumer reaches for: `--range A..B` is

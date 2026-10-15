@@ -94,7 +94,16 @@ fn render_search_hits(
     if source == "index" {
         cv_search::enrich_text_snippets(None, query, &mut hits)?;
     }
+    // How far the index trails the corpus right now — named on both hits and misses (a hit list
+    // can be missing rows, not only an empty one). Under --json it goes to stderr, keeping stdout
+    // a pure array; `cv mcp` relays stderr to the caller as its own content block.
+    let stale_note = (source == "index")
+        .then(|| cv_search::fts::staleness_note(&cv_search::default_tantivy_dir()))
+        .flatten();
     if json {
+        if let Some(note) = &stale_note {
+            eprintln!("(note: {note})");
+        }
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
         let rows = std::cell::LazyCell::new(cv_core::rows::SearchRowContext::new);
@@ -111,8 +120,8 @@ fn render_search_hits(
         println!("no matches for {query:?} {hint}");
         // The likely reason a recent conversation isn't findable: the index has fallen behind.
         if source == "index" {
-            if let Some(days) = cv_search::fts::days_behind(&cv_search::default_tantivy_dir()) {
-                println!("(note: the index is ~{days} day(s) behind the newest session — run `cv index`)");
+            if let Some(note) = &stale_note {
+                println!("(note: {note})");
             }
             // The other common miss: the wanted text lives in a *sub-agent* transcript, which the
             // default index doesn't fold in. Say so — a search that came back empty for something an
@@ -158,6 +167,11 @@ fn render_search_hits(
         if !h.snippet.trim().is_empty() {
             println!("          … {}", truncate(&sanitize_line(&h.snippet), 120));
         }
+    }
+    // The disclosure on the hit path: a stale index may be missing the rows the query would have
+    // caught, and a hit list that doesn't say so reads as complete.
+    if let Some(note) = &stale_note {
+        println!("(note: {note})");
     }
     Ok(())
 }
