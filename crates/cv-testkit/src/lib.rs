@@ -9,9 +9,10 @@
 //! - error-path honesty: [`World::cv_fails`] asserts a nonzero exit, a non-empty stderr and no
 //!   panic.
 //!
-//! The env is passed only to the child, so tests run in parallel. The two cv-core files that
-//! drive the library in-process take [`World::in_process`], which holds a mutex for the test's
-//! whole body and sets the same variables on the process.
+//! The env is passed only to the child, so tests run in parallel. A test that drives the library
+//! in-process takes [`World::in_process`], which hands the same environment to the library as a
+//! value scoped to the test's thread (`cv_core::env`), so those run in parallel too. (This crate
+//! cannot name cv-core: cv-core's own unit tests would then link a second copy of it.)
 //!
 //! A dev-dependency only: the dependency fence scans `[dependencies]`, and `cargo publish` strips
 //! a path-only dev-dependency.
@@ -22,9 +23,9 @@ use serde_json::Value;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
 
 /// Ambient variables no test may inherit: identity (`CV_ENDPOINT`), extra Claude roots
 /// (`CLAUDE_CONFIG_DIR`, `CLUSTERVISION_CLAUDE_ROOTS`), the catalog's staleness override and
@@ -91,7 +92,8 @@ pub fn jsonl(lines: &[Value]) -> String {
     lines.iter().map(|l| format!("{l}\n")).collect()
 }
 
-static PROCESS_ENV: Mutex<()> = Mutex::new(());
+/// An environment as `(name, value)` pairs.
+pub type Vars = Vec<(OsString, OsString)>;
 
 /// One temp world: a fake `$HOME` with a Claude project dir, and a `$CLUSTERVISION_HOME`.
 pub struct World {
@@ -100,8 +102,20 @@ pub struct World {
     pub cv_home: PathBuf,
     /// `home/.claude/projects/-work-proj`, where [`World::write_session`] writes.
     pub proj: PathBuf,
-    guard: Option<MutexGuard<'static, ()>>,
-    original_env: Vec<(&'static str, Option<OsString>)>,
+}
+
+/// A [`World`] whose environment the library reads in-process while `scope` lives.
+pub struct InProcess<S> {
+    /// The entered environment (declared first: it is left before the world's dirs go).
+    pub scope: S,
+    world: World,
+}
+
+impl<S> Deref for InProcess<S> {
+    type Target = World;
+    fn deref(&self) -> &World {
+        &self.world
+    }
 }
 
 impl World {
@@ -117,47 +131,24 @@ impl World {
             home,
             cv_home,
             proj,
-            guard: None,
-            original_env: Vec::new(),
         }
     }
 
-    /// A world for tests that call the library in-process: holds a process-wide lock until drop
-    /// and sets [`World::env`] on the process, with [`CLEARED_ENV`] removed.
-    pub fn in_process(tag: &str) -> World {
-        let guard = PROCESS_ENV.lock().unwrap_or_else(|e| e.into_inner());
-        let mut w = World::new(tag);
-        w.original_env = w
-            .env()
-            .iter()
-            .map(|(k, _)| *k)
-            .chain(CLEARED_ENV.iter().copied())
-            .map(|k| (k, std::env::var_os(k)))
-            .collect();
-        for (k, v) in w.env() {
-            std::env::set_var(k, v);
-        }
-        for k in CLEARED_ENV {
-            std::env::remove_var(k);
-        }
-        w.guard = Some(guard);
-        w
+    /// A world for tests that call the library in-process. `enter` (cv-core's
+    /// `Env::enter_isolated`) receives the environment [`World::command`] gives a child, and the
+    /// one a thread outside every world should read (a home that does not exist), and returns
+    /// the guard that keeps the first entered on this thread. The process is never mutated.
+    pub fn in_process<S>(tag: &str, enter: impl FnOnce(Vars, Vars) -> S) -> InProcess<S> {
+        let world = World::new(tag);
+        let nowhere = std::env::temp_dir().join(format!("cv-test-unscoped-{}", std::process::id()));
+        let outside = inherited_with(world_env(&nowhere.join("home"), &nowhere.join("cvhome")));
+        let scope = enter(inherited_with(world.env()), outside);
+        InProcess { scope, world }
     }
 
     /// The variables that make a process see this world.
     pub fn env(&self) -> [(&'static str, PathBuf); 9] {
-        [
-            ("HOME", self.home.clone()),
-            ("USERPROFILE", self.home.clone()),
-            ("APPDATA", self.home.join(".config")),
-            ("LOCALAPPDATA", self.home.join(".local/share")),
-            ("CLUSTERVISION_HOME", self.cv_home.clone()),
-            // Linux fallbacks for dirs::cache_dir / config_dir / data_dir; harmless on macOS.
-            ("XDG_CACHE_HOME", self.home.join(".cache")),
-            ("XDG_CONFIG_HOME", self.home.join(".config")),
-            ("XDG_DATA_HOME", self.home.join(".local/share")),
-            ("XDG_STATE_HOME", self.home.join(".local/state")),
-        ]
+        world_env(&self.home, &self.cv_home)
     }
 
     /// `program` in this world: cwd `base`, [`World::env`] set, [`CLEARED_ENV`] removed.
@@ -277,14 +268,34 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
-        for (key, value) in &self.original_env {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
         fs::remove_dir_all(&self.base).ok();
     }
+}
+
+fn world_env(home: &Path, cv_home: &Path) -> [(&'static str, PathBuf); 9] {
+    [
+        ("HOME", home.to_path_buf()),
+        ("USERPROFILE", home.to_path_buf()),
+        ("APPDATA", home.join(".config")),
+        ("LOCALAPPDATA", home.join(".local/share")),
+        ("CLUSTERVISION_HOME", cv_home.to_path_buf()),
+        // Linux fallbacks for dirs::cache_dir / config_dir / data_dir; harmless on macOS.
+        ("XDG_CACHE_HOME", home.join(".cache")),
+        ("XDG_CONFIG_HOME", home.join(".config")),
+        ("XDG_DATA_HOME", home.join(".local/share")),
+        ("XDG_STATE_HOME", home.join(".local/state")),
+    ]
+}
+
+/// The inherited environment less [`CLEARED_ENV`], with `env` set: what [`World::command`] gives.
+fn inherited_with(env: [(&'static str, PathBuf); 9]) -> Vars {
+    let mut vars: Vars = std::env::vars_os()
+        .filter(|(k, _)| {
+            !CLEARED_ENV.iter().any(|c| k == OsStr::new(c)) && !env.iter().any(|(e, _)| k == OsStr::new(e))
+        })
+        .collect();
+    vars.extend(env.into_iter().map(|(k, v)| (k.into(), v.into_os_string())));
+    vars
 }
 
 fn output_with_stdin(mut cmd: Command, text: &str) -> std::process::Output {
@@ -448,20 +459,5 @@ mod tests {
         let mut input = Vec::new();
         std::io::Read::read_to_end(&mut std::io::stdin(), &mut input).unwrap();
         assert_eq!(input, vec![b'i'; 2 * 1024 * 1024]);
-    }
-
-    #[test]
-    fn in_process_restores_ambient_environment_before_unlocking() {
-        let mut world = World::in_process("restore-env");
-        let original = world.original_env.clone();
-        let guard = world.guard.take();
-        let base = world.base.clone();
-        assert_eq!(std::env::var_os("HOME"), Some(world.home.clone().into_os_string()));
-        drop(world);
-        for (key, value) in original {
-            assert_eq!(std::env::var_os(key), value, "{key} was not restored");
-        }
-        assert!(!base.exists());
-        drop(guard);
     }
 }

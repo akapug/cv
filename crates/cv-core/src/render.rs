@@ -338,7 +338,7 @@ mod tests {
             session.messages.push(message);
         }
         assert!(to_markdown(&session)?.starts_with("# actual title\n"));
-        let world = cv_testkit::World::in_process("markdown-title-source");
+        let world = crate::test_world("markdown-title-source");
         let path = world.base.join("title.json");
         std::fs::write(&path, serde_json::to_vec(&"lazy title".repeat(2000))?)?;
         let source = crate::json::JsonSource::capture(&path)?;

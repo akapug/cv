@@ -406,7 +406,9 @@ pub(crate) fn cmd_mcp(tree: clap::Command) -> anyhow::Result<()> {
         let failure_id = id.clone();
         let tx = resp_tx.clone();
         let cancelled = cancelled.clone();
+        let env = cv_core::env::Env::scoped();
         let spawned = std::thread::Builder::new().stack_size(HANDLER_STACK).spawn(move || {
+            let _env = env.map(cv_core::env::Env::reenter);
             let _execution = permit.clone();
             let panic_id = id.clone();
             let token = Cancellation {
@@ -1096,7 +1098,7 @@ mod projection_tests {
     #[test]
     #[ignore = "isolated clean release CPU control; CV_OBSERVE_CONTROL=old|new"]
     fn observe_tiny_actual_consumer_cpu() {
-        let world = cv_testkit::World::in_process("observe-tiny-cpu");
+        let world = crate::test_world("observe-tiny-cpu");
         world.write_session("observe-tiny", &[json!({"type":"assistant", "sessionId":"observe-tiny", "uuid":"a", "message":{"role":"assistant","content":"tiny 月 text"}})]);
         let retained = std::env::var("CV_OBSERVE_CONTROL").unwrap() == "new";
         let start = std::time::Instant::now();
@@ -1122,7 +1124,7 @@ mod projection_tests {
 
     #[test]
     fn retained_observation_rejects_callback_mutation_before_acceptance() {
-        let world = cv_testkit::World::in_process("observe-prefix-mutation");
+        let world = crate::test_world("observe-prefix-mutation");
         let path = world.write_session("observe-mutation", &[json!({"type":"assistant", "sessionId":"observe-mutation", "uuid":"a", "message":{"role":"assistant","content":"hello"}})]);
         let mut watcher = Watcher::with_discovery(Filter::default(), true, discover);
         let before = watcher.to_cursor().encode();
@@ -1139,7 +1141,7 @@ mod projection_tests {
     #[test]
     #[ignore = "isolated allocation evidence; run one test thread with probe-heap"]
     fn observe_giant_actual_consumer_heap() {
-        let world = cv_testkit::World::in_process("observe-giant-heap");
+        let world = crate::test_world("observe-giant-heap");
         for kind in ["text", "arguments"] {
             for mib in [16, 64] {
                 let body = "x\n月".repeat(mib * 1024 * 1024 / 5);
@@ -1190,7 +1192,7 @@ mod projection_tests {
 
     #[test]
     fn observe_retained_prefix_matches_owned_oracle() {
-        let world = cv_testkit::World::in_process("observe-prefix-oracle");
+        let world = crate::test_world("observe-prefix-oracle");
         let body = "月🌙é\n\"\\".repeat(4000);
         world.write_session("observe-prefix", &[json!({"type":"assistant", "sessionId":"observe-prefix", "uuid":"a", "message":{"role":"assistant","content":[{"type":"text","text":body},{"type":"tool_use","id":"c","name":"tool","input":{"payload":body}}]}})]);
         for cap in [1usize, 2, 3, 4, 7, 19, 16000, 200000] {
@@ -1211,7 +1213,7 @@ mod projection_tests {
 
     #[test]
     fn observe_read_failure_returns_error_without_advancing_cursor() {
-        let _world = cv_testkit::World::in_process("mcp-unreadable-boundary");
+        let _world = crate::test_world("mcp-unreadable-boundary");
         fn unreadable() -> Vec<SessionRef> {
             vec![SessionRef::new(
                 "unreadable",
@@ -1231,7 +1233,7 @@ mod projection_tests {
 
     #[test]
     fn observe_projection_failure_returns_error_without_a_success_cursor() {
-        let world = cv_testkit::World::in_process("mcp-json-boundary");
+        let world = crate::test_world("mcp-json-boundary");
         world.write_session("observe-json", &[json!({"type":"user", "sessionId":"observe-json", "uuid":"u", "message":{"role":"user","content":"new activity"}})]);
         let path = world.base.join("arguments.json");
         let value = json!({"argument":"月🌙é\n\"\\".repeat(300)});
@@ -1525,7 +1527,7 @@ mod admission_tests {
 
     #[test]
     fn omen_matches_first_message_and_cursor_keeps_the_unseen_tail() {
-        let world = cv_testkit::World::in_process("omen-incremental");
+        let world = crate::test_world("omen-incremental");
         world.write_session("omen", &[
             json!({"type":"assistant", "uuid":"a", "message":{"role":"assistant", "content":[{"type":"text", "text":"λ BUILD PASSED"}]}}),
             json!({"type":"user", "uuid":"b", "message":{"role":"user", "content":"unseen second"}}),

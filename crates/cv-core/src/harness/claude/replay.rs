@@ -127,6 +127,29 @@ fn surviving<'a>(removed: &'a HashMap<String, Option<String>>, mut id: &'a str) 
 /// scales with IDs, removed records and each record's selected spans. Unknown fields and tool
 /// payloads copy unchanged with bounded positioned reads.
 pub(crate) fn normalize(bytes: ByteSource, mode: crate::emit::ThinkingMode) -> Result<(ByteStage, Changes)> {
+    rewrite(bytes, mode, false)
+}
+
+/// Remove records whose `message.content` is an empty array (a transform emptied them), relinking
+/// their children exactly as [`normalize`] does. Nothing else changes.
+pub(crate) fn drop_empty_records(bytes: ByteSource) -> Result<(ByteStage, Changes)> {
+    rewrite(bytes, crate::emit::ThinkingMode::Native, true)
+}
+
+fn empty_content(source: &RangeSource, row: Range) -> Result<bool> {
+    let Some(message) = source.get(row, "message")? else {
+        return Ok(false);
+    };
+    let Some(content) = source.get(message, "content")? else {
+        return Ok(false);
+    };
+    Ok(match source.array(content)? {
+        Some(mut array) => array.next().is_none(),
+        None => false,
+    })
+}
+
+fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) -> Result<(ByteStage, Changes)> {
     let bytes = Arc::new(bytes);
     let source = RangeSource::private(bytes.clone())?;
     let mut reserved = HashSet::new();
@@ -135,6 +158,7 @@ pub(crate) fn normalize(bytes: ByteSource, mode: crate::emit::ThinkingMode) -> R
     // Claude Code writes one content block per record, so a signature-only block usually empties
     // its record. Such a record is removed and its children point at its parent instead.
     let mut removed: HashMap<String, Option<String>> = HashMap::new();
+    let mut removed_rows = HashSet::new();
     rows(&bytes, |row| {
         // A portable output must not silently carry invalid JSON around its repaired fields.
         let mut cursor = source.cursor(row)?;
@@ -142,7 +166,11 @@ pub(crate) fn normalize(bytes: ByteSource, mode: crate::emit::ThinkingMode) -> R
         if cursor.position() == row.offset + row.len {
             return Ok(());
         }
-        anyhow::ensure!(source.validate(row)?, "portable Claude replay encountered invalid JSON");
+        if !source.validate(row)? {
+            // A transform's pass-through keeps malformed lines verbatim; replay refuses them.
+            anyhow::ensure!(empties, "portable Claude replay encountered invalid JSON");
+            return Ok(());
+        }
         let (mut total, mut drops) = (0usize, 0usize);
         blocks(&source, row, |block| {
             let ty = string(&source, source.get(block, "type")?)?;
@@ -151,6 +179,7 @@ pub(crate) fn normalize(bytes: ByteSource, mode: crate::emit::ThinkingMode) -> R
                 drops += 1;
             }
             let key = match ty.as_deref() {
+                _ if empties => return Ok(()),
                 Some("tool_use") => "id",
                 Some("tool_result") => "tool_use_id",
                 _ => return Ok(()),
@@ -164,7 +193,8 @@ pub(crate) fn normalize(bytes: ByteSource, mode: crate::emit::ThinkingMode) -> R
             }
             Ok(())
         })?;
-        if total > 0 && drops == total {
+        if (total > 0 && drops == total) || (empties && total == 0 && empty_content(&source, row)?) {
+            removed_rows.insert(row.offset);
             if let Some(uuid) = string(&source, source.get(row, "uuid")?)? {
                 removed.insert(uuid, string(&source, source.get(row, "parentUuid")?)?);
             }
@@ -189,6 +219,9 @@ pub(crate) fn normalize(bytes: ByteSource, mode: crate::emit::ThinkingMode) -> R
         ..Changes::default()
     };
     rows(&bytes, |row| {
+        if empties && !removed_rows.contains(&row.offset) && (removed.is_empty() || !source.validate(row)?) {
+            return copy(&source, row, &mut output);
+        }
         let mut patches = Vec::new();
         // (block, kept) for every content element, in order.
         let mut elements: Vec<(Range, bool)> = Vec::new();
@@ -215,7 +248,7 @@ pub(crate) fn normalize(bytes: ByteSource, mode: crate::emit::ThinkingMode) -> R
         })?;
         let drops = elements.iter().filter(|e| !e.1).count();
         changes.dropped += drops;
-        if drops > 0 && drops == elements.len() {
+        if removed_rows.contains(&row.offset) {
             changes.records += 1;
             return Ok(());
         }

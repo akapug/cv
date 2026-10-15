@@ -879,7 +879,14 @@ pub(super) fn reparse_features(
         crate::lazy::Resolver::new(Some(result.path.clone())),
     ));
     let metadata = reparse_with(target, result, &|adapter, reference| {
-        crate::stream::stream_counted(adapter, reference, &opts, &mut *sink.borrow_mut())
+        crate::stream::stream_counted(
+            adapter,
+            reference,
+            &opts,
+            &mut *sink.borrow_mut(),
+            crate::stream::Pass::RECORD,
+        )
+        .map(|read| read.session)
     })?;
     let features = sink.into_inner().finish(&metadata);
     Ok((metadata, features))

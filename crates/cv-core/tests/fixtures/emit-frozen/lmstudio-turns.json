@@ -1,0 +1,9 @@
+{
+"0": {"selected":null,"variants":[]},
+"1": {"selected":{"role":"user","kind":"prompt","origin":"human","content":[{"type":"text","text":"last"}]},"variants":[{"role":"user","kind":"branch","origin":"human","content":[{"type":"text","text":"old"}],"extra":{"lmstudio":{"variant":0}}}]},
+"2": {"selected":{"role":"assistant","kind":"reply","origin":"model","timestamp":"2025-08-05T20:18:14.719Z","content":[{"type":"thinking","text":"reason"},{"type":"image","data_ref":"image"},{"type":"text","text":"answer"}],"usage":{"input_tokens":12,"output_tokens":13}},"variants":[{"role":"system","kind":"branch","origin":"harness","content":[{"type":"text","text":"system"}],"extra":{"lmstudio":{"variant":0}}}]},
+"3": {"selected":{"role":"user","kind":"prompt","origin":"human","content":[{"type":"file","mime":"text/plain","path":"file","source":"masked"},{"type":"text","text":"final"}]},"variants":[]},
+"4": {"selected":{"role":"assistant","kind":"reply","origin":"model","content":[{"type":"text","text":"answer"}]},"variants":[]},
+"5": {"selected":null,"variants":[]},
+"6": {"selected":null,"variants":[]}
+}

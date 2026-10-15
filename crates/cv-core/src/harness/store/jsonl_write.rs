@@ -1,6 +1,7 @@
 //! Bounded JSONL staging: serialize successfully before opening the destination.
 use super::bytes::ByteStage;
-use anyhow::{Context, Result};
+use crate::publish::Claim;
+use anyhow::Result;
 use serde::Serialize;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
@@ -40,28 +41,19 @@ impl JsonlStage {
         anyhow::ensure!(!self.failed, "cannot consume a failed JSONL stage");
         Ok(self.output.into_inner().map_err(|e| e.into_error())?.finish()?)
     }
-    pub(crate) fn publish(self, path: &Path) -> Result<()> {
+    pub(crate) fn publish(self, path: &Path, claim: Claim) -> Result<()> {
         anyhow::ensure!(!self.failed, "cannot publish a failed JSONL stage");
         let stage = self.output.into_inner().map_err(|e| e.into_error())?;
-        publish_stage(stage, path)
+        publish_stage(stage, path, claim)
     }
 }
 
-/// Publish fully produced bytes with fs::write-compatible permissions/link/I/O behavior.
-/// Checked serialization must complete before calling; I/O errors may leave partial output.
-pub(crate) fn publish_stage(stage: ByteStage, path: &Path) -> Result<()> {
+/// Publish fully produced bytes through [`crate::publish`]: never written into an existing file.
+/// Checked serialization must complete before calling.
+pub(crate) fn publish_stage(stage: ByteStage, path: &Path, claim: Claim) -> Result<()> {
     let source = stage.finish()?;
-    let mut reader = BufReader::with_capacity(256 * 1024, source.reader()?);
-    // Like fs::write, preserve existing inode permissions, links and symlink following.
-    // Serialization errors occur before open; write errors retain fs::write's semantics.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .with_context(|| format!("writing {}", path.display()))?;
-    std::io::copy(&mut reader, &mut file).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    let reader = BufReader::with_capacity(256 * 1024, source.reader()?);
+    crate::publish::publish_reader(path, "stage", reader, claim)
 }
 
 #[cfg(test)]
@@ -75,7 +67,7 @@ mod tests {
         let mut stage = JsonlStage::new();
         stage.push(&value)?;
         stage.push(serde_json::Value::Null)?;
-        stage.publish(&path)?;
+        stage.publish(&path, Claim::New)?;
         assert_eq!(
             std::fs::read(&path)?,
             format!("{}\nnull\n", serde_json::to_string(&value)?).as_bytes()
@@ -90,7 +82,7 @@ mod tests {
         let mut stage = JsonlStage::new();
         stage.push(serde_json::json!({"valid": true}))?;
         assert!(stage.push(Failure).is_err());
-        assert!(stage.publish(&path).is_err());
+        assert!(stage.publish(&path, Claim::Replace).is_err());
         assert_eq!(std::fs::read(&path)?, before);
         let mut stage = JsonlStage::new();
         assert!(stage
@@ -99,13 +91,15 @@ mod tests {
                 anyhow::bail!("checked payload source failed")
             })
             .is_err());
-        assert!(stage.publish(&path).is_err());
+        assert!(stage.publish(&path, Claim::Replace).is_err());
         assert_eq!(std::fs::read(&path)?, before);
         Ok(())
     }
+    /// A replaced name gets a new file: the old inode, its other hard links and a symlink's
+    /// target keep their bytes; the replaced file's permissions carry over; New refuses.
     #[cfg(unix)]
     #[test]
-    fn preserves_destination_links_and_permissions() -> Result<()> {
+    fn replaces_the_name_never_the_linked_file() -> Result<()> {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let dir = cv_testkit::World::new("jsonl-stage-links");
         let path = dir.base.join("original");
@@ -115,12 +109,20 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
         std::fs::hard_link(&path, &hard)?;
         symlink(&path, &sym)?;
-        let mut stage = JsonlStage::new();
-        stage.push(42)?;
-        stage.publish(&sym)?;
-        assert_eq!(std::fs::read(&hard)?, b"42\n");
-        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o640);
-        assert!(std::fs::symlink_metadata(&sym)?.file_type().is_symlink());
+        let staged = || -> Result<JsonlStage> {
+            let mut stage = JsonlStage::new();
+            stage.push(42)?;
+            Ok(stage)
+        };
+        let error = staged()?.publish(&sym, Claim::New).unwrap_err();
+        assert!(error.downcast_ref::<crate::publish::Exists>().is_some(), "{error:#}");
+        staged()?.publish(&sym, Claim::Replace)?;
+        assert_eq!(std::fs::read(&sym)?, b"42\n");
+        assert!(!std::fs::symlink_metadata(&sym)?.file_type().is_symlink());
+        assert_eq!(std::fs::metadata(&sym)?.permissions().mode() & 0o777, 0o640);
+        staged()?.publish(&path, Claim::Replace)?;
+        assert_eq!(std::fs::read(&path)?, b"42\n");
+        assert_eq!(std::fs::read(&hard)?, b"before");
         Ok(())
     }
 }

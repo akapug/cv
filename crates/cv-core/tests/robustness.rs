@@ -9,14 +9,8 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use cv_core::ir::{Block, GitInfo, Harness, Message, Role, Session, SessionRef};
-
-// Some emit targets resolve their storage root from env (HOME / HERMES_HOME). Mutating process
-// env is not thread-safe, and these tests share the binary with one another, so serialize every
-// env-touching section behind one lock (mirrors how emit.rs's own tests guard HOME/HERMES_HOME).
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 // ------------------------------------------------------------------------------------------------
 // helpers
@@ -472,49 +466,28 @@ fn emit_and_reparse(target: Harness) -> Option<Session> {
         // OpenCode resolves message/part dirs from $HOME; redirect HOME at a temp home, emit into
         // its storage, then discover+parse the emitted session.
         Harness::OpenCode => {
-            let _guard = ENV_LOCK.lock().unwrap();
             let home = temp_dir();
             let storage = home.join(".local/share/opencode/storage");
             std::fs::create_dir_all(&storage).unwrap();
             let res = cv_core::emit::emit(&session, target, &storage, &Default::default()).expect("emit opencode");
-
-            let prev = std::env::var_os("HOME");
-            // SAFETY: guarded by ENV_LOCK; restored before releasing it.
-            unsafe { std::env::set_var("HOME", &home) }
+            let _env = cv_core::env::Env::from_vars([("HOME", &home)]).enter();
             let adapter = cv_core::harness::for_harness(target).unwrap();
-            let parsed = adapter
+            adapter
                 .discover()
                 .ok()
                 .and_then(|refs| refs.into_iter().find(|r| r.id == res.new_id))
-                .map(|r| adapter.parse(&r).expect("parse opencode"));
-            unsafe {
-                match prev {
-                    Some(h) => std::env::set_var("HOME", h),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-            parsed
+                .map(|r| adapter.parse(&r).expect("parse opencode"))
         }
         // Hermes resolves its state.db from HERMES_HOME; emit into a dir, then discover from it.
         Harness::Hermes => {
-            let _guard = ENV_LOCK.lock().unwrap();
             let res = cv_core::emit::emit(&session, target, &out, &Default::default()).expect("emit hermes");
-            let prev = std::env::var_os("HERMES_HOME");
-            // SAFETY: guarded by ENV_LOCK; restored before releasing it.
-            unsafe { std::env::set_var("HERMES_HOME", &out) }
+            let _env = cv_core::env::Env::from_vars([("HERMES_HOME", &out)]).enter();
             let adapter = cv_core::harness::for_harness(target).unwrap();
-            let parsed = adapter
+            adapter
                 .discover()
                 .ok()
                 .and_then(|refs| refs.into_iter().find(|r| r.id == res.new_id))
-                .map(|r| adapter.parse(&r).expect("parse hermes"));
-            unsafe {
-                match prev {
-                    Some(p) => std::env::set_var("HERMES_HOME", p),
-                    None => std::env::remove_var("HERMES_HOME"),
-                }
-            }
-            parsed
+                .map(|r| adapter.parse(&r).expect("parse hermes"))
         }
         // Everything else: the EmitResult path is directly parseable by the adapter.
         _ => {

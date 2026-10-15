@@ -71,8 +71,8 @@ label is the Bash `description` when there is one; consecutive repeats collapse 
 
 **Dropped**: every tool output outside the tail goes to a sidecar `<new>.flat.jsonl` in prune's
 format, so `cv cat <new> <tool_use_id>` returns it. Harness reminders, hook records and thinking are
-dropped. Token estimates use 2.4 characters per token (measured on resumed distilled sessions; the
-3.5 bytes/token prune uses undercounts this identifier-dense content).
+dropped. Token estimates use cv's shared estimator; the pack itself is priced at the tool-input rate
+(2.1 bytes per token), since resumed distilled packs measured 2.2–2.4.
 
 What a distilled lane cannot answer, by design: a detail that lived only in a file the lane *read*
 (the read is elided; a resumed lane has tools and `cv cat`, so it can re-read), and a "why" the

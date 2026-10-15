@@ -1,7 +1,19 @@
 //! SQLite plumbing for the database-backed stores (Cursor, Devin, Goose, Hermes, OpenClaw,
-//! OpenCode, Zed). One invariant lives here so no adapter can get it wrong: **cv opens a harness's
-//! database read-only** (`SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX`) and never takes a write
-//! lock on a live store — a WAL-mode database being written by its harness stays readable.
+//! OpenCode, Zed). One invariant lives here so no adapter can get it wrong: **cv never writes a
+//! harness's store**, not even its coordination files. Opening `SQLITE_OPEN_READ_ONLY` is not
+//! enough for that: a WAL reader records its read mark in the `-shm` wal-index (and creates
+//! `-wal`/`-shm` when they are missing), which rewrites a file in the harness home. So
+//! [`open_ro`] chooses from the database's sidecars:
+//! - no WAL frames (`-wal` absent or empty) and no `-journal`: the original with
+//!   `immutable=1`, so SQLite opens no `-wal`/`-shm` and takes no locks;
+//! - otherwise: a private snapshot of the database and its `-wal`/`-journal` (never `-shm`,
+//!   which SQLite rebuilds in the private directory), so committed WAL-only rows stay visible.
+//!
+//! This also protects a rollback-mode source that switches to WAL during an operation: an
+//! ordinary read-only connection could create coordination files before the after-read check.
+//!
+//! Every path's identity is captured before and checked after each read ([`ReadConnection::read`]),
+//! so a harness write during a read is an error, not a torn result.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -158,24 +170,45 @@ fn check_reads(reads: &crate::source::ReadSet) -> Result<()> {
     Ok(())
 }
 
+/// Discovery over one database, cached in the discovery cache under the read set [`open_ro`]
+/// captures (the file, its WAL and rollback journal; SHM is coordination state). An unchanged
+/// store is neither reopened nor rescanned. `discover` must depend only on that database; its
+/// errors are returned and never cached.
+pub(crate) fn cached_discover(
+    db: &Path,
+    discover: impl FnOnce() -> Result<Vec<crate::SessionRef>>,
+) -> Result<Vec<crate::SessionRef>> {
+    let path = std::path::absolute(db)?;
+    let mut reads = crate::source::ReadSet::default();
+    reads.record(&path);
+    reads.record(&sidecar(&path, "-wal"));
+    reads.record(&sidecar(&path, "-journal"));
+    let mut failure = None;
+    let refs = crate::discover_cache::cached_scan_many_with_reads(&path, reads, || {
+        discover().unwrap_or_else(|error| {
+            failure = Some(error);
+            Vec::new()
+        })
+    });
+    failure.map_or(Ok(refs), Err)
+}
+
 fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     name.into()
 }
 
-/// SQLite may create WAL/SHM even with READ_ONLY. Missing WAL auxiliaries therefore use a
-/// checked private copy; existing live auxiliaries keep ordinary SQLite locking/read semantics.
-/// Auxiliary existence is sampled: this cannot prevent a different process from deleting live
-/// SHM between that sample and SQLite opening it. cv does not remove harness sidecars.
-/// An operation-local LRU retains at most 256 MiB of copied DB/WAL/journal bytes, or one larger
-/// backing alone. Weak lookup reuses active readers without increasing idle disk retention.
+/// Open a harness database without writing anything in its directory (see the module docs).
+/// Snapshots of WAL-mode stores with frames live in a private directory; an operation-local LRU
+/// retains at most 256 MiB of copied DB/WAL/journal bytes, or one larger backing alone. Weak
+/// lookup reuses active readers without increasing idle disk retention. `std::fs::copy` clones
+/// on APFS (0.01 s for a 267 MB store) and copies elsewhere (0.26 s for the same file here).
 pub(crate) fn open_ro(path: &Path) -> Result<ReadConnection> {
     open_ro_with_copy_check(path, |_| Ok(()))
 }
 
 fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>) -> Result<ReadConnection> {
-    use std::io::Read;
     use std::sync::Arc;
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -186,17 +219,10 @@ fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>
     reads.record(&path);
     reads.record(&sidecar(&path, "-wal"));
     reads.record(&sidecar(&path, "-journal"));
-    let mut header = [0; 20];
-    match std::fs::File::open(&path)?.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => header.fill(0),
-        Err(error) => return Err(error.into()),
-    }
-    check_reads(&reads)?;
-    let cold = &header[..16] == b"SQLite format 3\0"
-        && (header[18] == 2 || header[19] == 2)
-        && (!sidecar(&path, "-wal").exists() || !sidecar(&path, "-shm").exists());
-    let scope = cold.then(reader_scope);
+    let has_frames = std::fs::metadata(sidecar(&path, "-wal")).is_ok_and(|m| m.len() > 0);
+    let has_journal = sidecar(&path, "-journal").exists();
+    let immutable = !has_frames && !has_journal;
+    let scope = (!immutable).then(reader_scope);
     let snapshot = if let Some(scope) = scope.as_ref() {
         let mut cache = scope
             .cache
@@ -264,10 +290,12 @@ fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>
         None
     };
     let backing = snapshot.as_ref().map_or(path.as_path(), |s| s.database.as_path());
-    let connection = Connection::open_with_flags(
-        backing,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let connection = if immutable {
+        Connection::open_with_flags(immutable_uri(backing), flags | OpenFlags::SQLITE_OPEN_URI)
+    } else {
+        Connection::open_with_flags(backing, flags)
+    }
     .with_context(|| format!("opening {}", path.display()))?;
     check_reads(&reads)?;
     Ok(ReadConnection {
@@ -276,6 +304,22 @@ fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>
         _snapshot: snapshot,
         _scope: scope,
     })
+}
+
+/// `file:<path>?immutable=1`, with the URI's reserved characters percent-encoded.
+fn immutable_uri(path: &Path) -> String {
+    const RESERVED: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b'%').add(b'?').add(b'#').add(b' ');
+    #[cfg(unix)]
+    let encoded = {
+        use std::os::unix::ffi::OsStrExt;
+        percent_encoding::percent_encode(path.as_os_str().as_bytes(), RESERVED).to_string()
+    };
+    #[cfg(not(unix))]
+    let encoded = {
+        let text = format!("/{}", path.to_string_lossy().replace('\\', "/"));
+        percent_encoding::utf8_percent_encode(&text, RESERVED).to_string()
+    };
+    format!("file:{encoded}?immutable=1")
 }
 
 /// Copy a snapshot's immutable TEXT/BLOB cell into an operation-owned arena using bounded
@@ -316,6 +360,192 @@ pub(crate) fn append_cell(
             }))
         },
     )?
+}
+
+/// A store's JSON cells as views: rows already are the byte source. Each cell a read selects is
+/// copied once into the source's operation-owned arena (an incremental read by rowid where the
+/// table allows one, else the row's own bytes), validated once, and handed to the format's one
+/// decoder as a [`JsonView`](crate::json::JsonView). The demand decides what the decoder
+/// resolves, never which code runs.
+pub(crate) struct Cells {
+    source: crate::json::JsonSource,
+    arena: std::sync::Arc<super::bytes::ByteSource>,
+    incremental: bool,
+}
+
+/// One cell's bytes in a [`Cells`] arena.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Cell(u64, u64);
+
+impl Cells {
+    /// Cells of `table` in the database at `path`, guarded by the reader's dependencies.
+    pub(crate) fn new(conn: &Connection, path: &Path, reads: &crate::source::ReadSet, table: &str) -> Result<Self> {
+        let source = crate::json::JsonSource::capture_with_reads(path, reads)?;
+        Ok(Self {
+            arena: source.decoded_backing()?,
+            source,
+            incremental: incremental_utf8_table(conn, table),
+        })
+    }
+
+    /// What a query selects for `column` so [`Cells::cell`] can read it from columns `i` and
+    /// `i + 1`: the rowid and the cell's type when reads are incremental, else the cell itself.
+    pub(crate) fn select(&self, column: &str) -> String {
+        if self.incremental {
+            format!("rowid, typeof({column})")
+        } else {
+            format!("{column}, NULL")
+        }
+    }
+
+    /// The cell `select(column)` put at column `i` of `row`. None for a cell that is not TEXT,
+    /// is empty or is not UTF-8 (UTF-8 is checked when it is read).
+    pub(crate) fn cell(
+        &self,
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        row: &rusqlite::Row<'_>,
+        i: usize,
+    ) -> Result<Option<Cell>> {
+        use rusqlite::types::ValueRef;
+        let (offset, len) = if self.incremental {
+            if row.get_ref(i + 1)?.as_str_or_null()? != Some("text") {
+                return Ok(None);
+            }
+            append_cell(conn, table, column, row.get(i)?, &self.arena)?
+        } else {
+            let ValueRef::Text(bytes) = row.get_ref(i)? else {
+                return Ok(None);
+            };
+            self.arena.append(|writer| Ok(writer.write_all(bytes)?))?
+        };
+        Ok((len != 0).then_some(Cell(offset, len)))
+    }
+
+    /// The BLOB `select(column)` put at column `i` of `row`, passed through `decode` (a
+    /// decompressor, say) into the arena: the decoded bytes are the cell. None for a cell that is
+    /// not a BLOB or is empty; a `decode` failure is an error.
+    pub(crate) fn blob(
+        &self,
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        row: &rusqlite::Row<'_>,
+        i: usize,
+        decode: impl FnOnce(&mut dyn std::io::BufRead, &mut dyn std::io::Write) -> Result<()>,
+    ) -> Result<Option<Cell>> {
+        use rusqlite::types::ValueRef;
+        let (offset, len) = if self.incremental {
+            if row.get_ref(i + 1)?.as_str_or_null()? != Some("blob") {
+                return Ok(None);
+            }
+            let blob = conn.blob_open(rusqlite::DatabaseName::Main, table, column, row.get(i)?, true)?;
+            if blob.is_empty() {
+                return Ok(None);
+            }
+            let mut blob = std::io::BufReader::with_capacity(64 * 1024, blob);
+            self.arena.append(|writer| decode(&mut blob, writer))?
+        } else {
+            let ValueRef::Blob(mut bytes) = row.get_ref(i)? else {
+                return Ok(None);
+            };
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            self.arena.append(|writer| decode(&mut bytes, writer))?
+        };
+        Ok((len != 0).then_some(Cell(offset, len)))
+    }
+
+    /// A TEXT cell holding a plain string (not JSON), copied into the arena as one JSON string so
+    /// the decoder views it like any other string. None for a cell that is not TEXT, is empty or
+    /// is not UTF-8.
+    pub(crate) fn text(
+        &self,
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        row: &rusqlite::Row<'_>,
+        i: usize,
+    ) -> Result<Option<Cell>> {
+        let mut valid = false;
+        let (offset, len) = self.arena.append(|writer| {
+            super::text::generate_string(writer, |builder| {
+                valid = self.chunks(conn, table, column, row, i, |chunk| builder.push(chunk))?;
+                Ok(())
+            })
+        })?;
+        Ok((valid && len > 2).then_some(Cell(offset, len)))
+    }
+
+    /// Visit the UTF-8 chunks of the TEXT cell `select(column)` put at column `i` of `row`
+    /// without copying it anywhere. False for a cell that is not TEXT or is not UTF-8.
+    pub(crate) fn chunks(
+        &self,
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        row: &rusqlite::Row<'_>,
+        i: usize,
+        mut visit: impl FnMut(&str) -> Result<()>,
+    ) -> Result<bool> {
+        use rusqlite::types::ValueRef;
+        if self.incremental {
+            if row.get_ref(i + 1)?.as_str_or_null()? != Some("text") {
+                return Ok(false);
+            }
+            return with_cell_reader(conn, table, column, row.get(i)?, |reader, _| {
+                for_each_utf8(reader, &mut visit)
+            });
+        }
+        let ValueRef::Text(bytes) = row.get_ref(i)? else {
+            return Ok(false);
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return Ok(false);
+        };
+        visit(text)?;
+        Ok(true)
+    }
+
+    /// The captured store and the arena its cells are copied into, where a decoder composes text
+    /// that is checked against the store like the cells themselves.
+    pub(crate) fn out(&self) -> (&crate::json::JsonSource, &std::sync::Arc<super::bytes::ByteSource>) {
+        (&self.source, &self.arena)
+    }
+
+    /// The cell at `rowid` of `table.column`, TEXT or BLOB bytes as stored, for a store that
+    /// locates its rows itself (by key). None when empty.
+    pub(crate) fn row(&self, conn: &Connection, table: &str, column: &str, rowid: i64) -> Result<Option<Cell>> {
+        let (offset, len) = append_cell(conn, table, column, rowid, &self.arena)?;
+        Ok((len != 0).then_some(Cell(offset, len)))
+    }
+
+    /// Bytes a format derives as a cell of their own: a BLOB in the store's own encoding rule, or
+    /// a JSON string holding a JSON document. None when empty.
+    pub(crate) fn append(&self, write: impl FnOnce(&mut dyn std::io::Write) -> Result<()>) -> Result<Option<Cell>> {
+        let (offset, len) = self.arena.append(write)?;
+        Ok((len != 0).then_some(Cell(offset, len)))
+    }
+
+    /// Recheck the store and the reader's dependencies (once, when a read ends).
+    pub(crate) fn check(&self) -> Result<()> {
+        self.source.check()
+    }
+
+    /// Decode `cell` with `f`. None when the cell is not exactly one JSON value; every other
+    /// error is a source failure.
+    pub(crate) fn read<T>(
+        &self,
+        cell: Cell,
+        f: impl for<'a> FnOnce(crate::json::JsonView<'a>) -> Result<T>,
+    ) -> Result<Option<T>> {
+        match self.source.read_backing_value(self.arena.clone(), cell.0, cell.1, f) {
+            Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => Ok(None),
+            result => result.map(Some),
+        }
+    }
 }
 
 /// Incremental TEXT bytes use the database's encoding. Ordinary UTF-8 rowid tables support
@@ -403,11 +633,79 @@ pub(crate) fn table_exists(conn: &Connection, name: &str) -> bool {
     .is_ok()
 }
 
+/// Every file in a store directory: name, inode, size, mtime and bytes (`-shm` included).
+#[cfg(test)]
+pub(crate) fn store_state(dir: &Path) -> Vec<(std::ffi::OsString, u64, u64, std::time::SystemTime, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            #[cfg(unix)]
+            let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+            #[cfg(not(unix))]
+            let inode = 0;
+            let bytes = if metadata.is_file() {
+                std::fs::read(entry.path()).unwrap()
+            } else {
+                Vec::new()
+            };
+            (
+                entry.file_name(),
+                inode,
+                metadata.len(),
+                metadata.modified().unwrap(),
+                bytes,
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// A running harness: WAL mode, `sql`'s frames not checkpointed, its connection kept open.
+#[cfg(test)]
+pub(crate) fn live_store(database: &Path, sql: &str) -> Connection {
+    let writer = Connection::open(database).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    writer.execute_batch(sql).unwrap();
+    writer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     static SNAPSHOT_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn rollback_reader_cannot_create_wal_sidecars_after_a_mode_change() {
+        let (directory, database) = fixture();
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1);")
+            .unwrap();
+        let reader = open_ro(&database).unwrap();
+        let result = reader.read(|connection| {
+            // The harness switches mode after the reader's before-operation guard. Closing
+            // its connection checkpoints the WAL and removes its coordination sidecars.
+            let writer = Connection::open(&database)?;
+            writer.execute_batch("PRAGMA journal_mode=WAL; INSERT INTO t VALUES(2);")?;
+            drop(writer);
+            let before = store_state(&directory);
+            let _: rusqlite::Result<i64> = connection.query_row("SELECT count(*) FROM t", [], |row| row.get(0));
+            assert!(
+                store_state(&directory) == before,
+                "read-only connection wrote harness sidecars"
+            );
+            Ok(())
+        });
+        assert!(result.is_err(), "changed source must also fail freshness");
+        drop(reader);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn fixture() -> (std::path::PathBuf, std::path::PathBuf) {
         let directory = std::env::temp_dir().join(format!("cv-cold-wal-test-{}", uuid::Uuid::new_v4()));
@@ -474,18 +772,15 @@ mod tests {
         Ok(())
     }
 
+    /// WAL frames are read through a private snapshot (reused within an operation, removed
+    /// after it) and nothing in the store directory changes, `-shm` bytes included.
     #[test]
-    fn cold_wal_is_private_and_reused() {
+    fn live_wal_snapshot_is_private_reused_and_writes_nothing_in_the_store() {
         let _serial = SNAPSHOT_TEST.lock().unwrap();
         let (directory, database) = fixture();
-        {
-            let writer = Connection::open(&database).unwrap();
-            writer
-                .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES(7);")
-                .unwrap();
-        }
-        assert!(!sidecar(&database, "-wal").exists());
-        assert!(!sidecar(&database, "-shm").exists());
+        let writer = live_store(&database, "CREATE TABLE t(x); INSERT INTO t VALUES(7);");
+        let before = super::store_state(&directory);
+        assert!(std::fs::metadata(sidecar(&database, "-wal")).unwrap().len() > 0);
         let first = open_ro(&database).unwrap();
         assert_eq!(
             first
@@ -498,8 +793,6 @@ mod tests {
             first._snapshot.as_ref().unwrap(),
             second._snapshot.as_ref().unwrap()
         ));
-        assert!(!sidecar(&database, "-wal").exists());
-        assert!(!sidecar(&database, "-shm").exists());
         assert!(second.execute("INSERT INTO t VALUES(8)", []).is_err());
         let private_directory = first._snapshot.as_ref().unwrap().directory.clone();
         let scope = read_scope();
@@ -515,6 +808,8 @@ mod tests {
         assert!(private_directory.exists());
         drop(scope);
         assert!(!private_directory.exists());
+        assert_eq!(super::store_state(&directory), before);
+        drop(writer);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -522,12 +817,7 @@ mod tests {
     fn retained_backing_keeps_lease_after_its_connection_and_cache_finish() {
         let _serial = SNAPSHOT_TEST.lock().unwrap();
         let (directory, database) = fixture();
-        {
-            let writer = Connection::open(&database).unwrap();
-            writer
-                .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x);")
-                .unwrap();
-        }
+        let _writer = live_store(&database, "CREATE TABLE t(x);");
         let reader = open_ro(&database).unwrap();
         let backing = std::sync::Arc::clone(reader._snapshot.as_ref().unwrap());
         let private = backing.directory.clone();
@@ -543,14 +833,9 @@ mod tests {
     fn interleaved_databases_reuse_active_snapshots_and_cleanup_operation() {
         let _serial = SNAPSHOT_TEST.lock().unwrap();
         let (directory, database) = fixture();
-        {
-            let writer = Connection::open(&database).unwrap();
-            writer
-                .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x);")
-                .unwrap();
-        }
+        let _writer = live_store(&database, "CREATE TABLE t(x);");
         let second_database = directory.join("other.db");
-        std::fs::copy(&database, &second_database).unwrap();
+        let _second_writer = live_store(&second_database, "CREATE TABLE t(x);");
         let scope = read_scope();
         let first = open_ro(&database).unwrap();
         let first_backing = first._snapshot.as_ref().unwrap().directory.clone();
@@ -613,21 +898,13 @@ mod tests {
     fn cached_snapshot_rebuilds_after_source_change() {
         let _serial = SNAPSHOT_TEST.lock().unwrap();
         let (directory, database) = fixture();
-        {
-            let writer = Connection::open(&database).unwrap();
-            writer
-                .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES(7);")
-                .unwrap();
-        }
+        let writer = live_store(&database, "CREATE TABLE t(x); INSERT INTO t VALUES(7);");
         let scope = read_scope();
         let first = open_ro(&database).unwrap();
         let old_backing = first._snapshot.as_ref().unwrap().directory.clone();
         let old_reads = first.reads().clone();
         drop(first);
-        {
-            let writer = Connection::open(&database).unwrap();
-            writer.execute("UPDATE t SET x=8", []).unwrap();
-        }
+        writer.execute("UPDATE t SET x=8", []).unwrap();
         let mut copied = false;
         let second = open_ro_with_copy_check(&database, |_| {
             copied = true;
@@ -652,16 +929,10 @@ mod tests {
     fn copy_race_rejects_source_change_and_removes_private_backing() {
         let _serial = SNAPSHOT_TEST.lock().unwrap();
         let (directory, database) = fixture();
-        {
-            let writer = Connection::open(&database).unwrap();
-            writer
-                .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x);")
-                .unwrap();
-        }
+        let writer = live_store(&database, "CREATE TABLE t(x);");
         let mut private = None;
         let result = open_ro_with_copy_check(&database, |copied| {
             private = copied.parent().map(Path::to_path_buf);
-            let writer = Connection::open(&database)?;
             writer.execute("INSERT INTO t VALUES(9)", [])?;
             Ok(())
         });
@@ -670,24 +941,34 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A WAL-mode store without frames (checkpointed while its harness runs, or closed) is read
+    /// in place with `immutable=1`: no copy, no `-wal`/`-shm` created, nothing changed.
     #[test]
-    fn live_wal_reads_original_without_copying() {
+    fn frameless_wal_reads_the_original_immutably_and_writes_nothing() {
         let (directory, database) = fixture();
-        let writer = Connection::open(&database).unwrap();
-        writer
-            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES(7);")
-            .unwrap();
-        let reader = open_ro_with_copy_check(&database, |_| panic!("live WAL was copied")).unwrap();
-        assert!(reader._snapshot.is_none());
-        assert_eq!(
-            reader
-                .read(|r| Ok(r.query_row("SELECT x FROM t", [], |row| row.get::<_, i64>(0))?))
-                .unwrap(),
-            7
+        let writer = live_store(
+            &database,
+            "CREATE TABLE t(x); INSERT INTO t VALUES(7); PRAGMA wal_checkpoint(TRUNCATE);",
         );
-        assert!(reader.reads().fresh(&mut crate::source::Probe::default()));
-        drop(reader);
+        assert!(sidecar(&database, "-shm").exists());
+        let read = || {
+            let before = super::store_state(&directory);
+            let reader = open_ro_with_copy_check(&database, |_| panic!("a frameless WAL was copied")).unwrap();
+            assert!(reader._snapshot.is_none());
+            assert_eq!(
+                reader
+                    .read(|r| Ok(r.query_row("SELECT x FROM t", [], |row| row.get::<_, i64>(0))?))
+                    .unwrap(),
+                7
+            );
+            assert!(reader.execute("INSERT INTO t VALUES(8)", []).is_err());
+            drop(reader);
+            assert_eq!(super::store_state(&directory), before);
+        };
+        read();
         drop(writer);
+        assert!(!sidecar(&database, "-wal").exists() && !sidecar(&database, "-shm").exists());
+        read();
         std::fs::remove_dir_all(directory).unwrap();
     }
 

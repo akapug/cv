@@ -27,6 +27,22 @@ pub(crate) fn usage<T>(msg: impl Into<String>) -> Result<T> {
     Err(UsageError(msg.into()).into())
 }
 
+/// How to publish a file the user named (`--out`, `--pack`): a taken name is refused (exit 2)
+/// unless `--force`, which replaces it by atomic rename. Never written in place.
+pub(crate) fn user_file_claim(path: &Path, force: bool) -> Result<cv_core::publish::Claim> {
+    if force {
+        return Ok(cv_core::publish::Claim::Replace);
+    }
+    cv_core::publish::refuse_existing(path, " (pass --force to replace it)")?;
+    Ok(cv_core::publish::Claim::New)
+}
+
+/// Publish `bytes` at a file the user named (see [`user_file_claim`]).
+pub(crate) fn write_user_file(path: &Path, bytes: &[u8], force: bool) -> Result<()> {
+    let claim = user_file_claim(path, force)?;
+    cv_core::publish::publish_reader(path, "out", bytes, claim)
+}
+
 // ---------- harness / id resolution ----------
 
 pub(crate) fn parse_harness(s: &Option<String>) -> Result<Option<Harness>> {
@@ -323,7 +339,7 @@ pub(crate) fn dim_cwd(p: Option<&Path>) -> String {
 }
 
 pub(crate) fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+    cv_core::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
 // ---------- compose-family reports ----------

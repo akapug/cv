@@ -322,7 +322,7 @@ mod text_publication_tests {
 
     #[test]
     fn canonical_source_text_matches_serde_and_skipped_fallback() -> Result<()> {
-        let world = cv_testkit::World::in_process("wire-single-source-string");
+        let world = crate::test_world("wire-single-source-string");
         let resolver = Session::new("source", Harness::Claude).resolver();
         for (i, value) in [
             "".to_owned(),
@@ -355,7 +355,7 @@ mod text_publication_tests {
 
     #[test]
     fn canonical_source_text_rejects_nonstring_and_invalid_unicode() -> Result<()> {
-        let world = cv_testkit::World::in_process("wire-invalid-source-string");
+        let world = crate::test_world("wire-invalid-source-string");
         let resolver = Session::new("source", Harness::Claude).resolver();
         for (i, raw) in [b"null".as_slice(), br#""\ud800""#, br#""\udc00""#]
             .into_iter()
@@ -369,7 +369,7 @@ mod text_publication_tests {
 
     #[test]
     fn canonical_source_text_checks_identity_even_when_writer_fails() -> Result<()> {
-        let world = cv_testkit::World::in_process("wire-source-writer-failure");
+        let world = crate::test_world("wire-source-writer-failure");
         let resolver = Session::new("source", Harness::Claude).resolver();
         let path = world.base.join("source.json");
         struct Fail<'a> {

@@ -61,7 +61,14 @@ fn set_meta_model(path: &std::path::Path, model: &str) -> Result<()> {
     if let Some(o) = meta.as_object_mut() {
         o.insert("model".into(), json!(model));
     }
-    std::fs::write(path, meta.to_string()).with_context(|| format!("writing {}", path.display()))
+    // The meta adopt itself just published (or none): replaced whole.
+    cv_core::publish::publish_reader(
+        path,
+        "meta",
+        meta.to_string().as_bytes(),
+        cv_core::publish::Claim::Replace,
+    )
+    .with_context(|| format!("writing {}", path.display()))
 }
 
 pub(crate) fn cmd_adopt(a: AdoptArgs) -> Result<()> {

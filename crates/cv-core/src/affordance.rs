@@ -1403,17 +1403,24 @@ pub fn read(adapter: &dyn crate::harness::Adapter, r: &crate::ir::SessionRef) ->
     let mut error = None;
     // Request classification facts and tool details while reducing complete content spans into
     // bounded summaries. Only the resulting rows survive each streamed message.
-    let s = crate::stream::stream_counted(adapter, r, &crate::stream::ParseOptions::facts(), &mut |m: Message| {
-        match message_rows(r.harness, &m, index, &resolver) {
-            Ok(rows) => messages.extend(rows),
-            Err(failure) => {
-                error = Some(failure);
-                return Flow::Stop;
+    let s = crate::stream::stream_counted(
+        adapter,
+        r,
+        &crate::stream::ParseOptions::facts(),
+        &mut |m: Message| {
+            match message_rows(r.harness, &m, index, &resolver) {
+                Ok(rows) => messages.extend(rows),
+                Err(failure) => {
+                    error = Some(failure);
+                    return Flow::Stop;
+                }
             }
-        }
-        index += 1;
-        Flow::Continue
-    })?;
+            index += 1;
+            Flow::Continue
+        },
+        crate::stream::Pass::RECORD,
+    )?
+    .session;
     if let Some(error) = error {
         return Err(error);
     }
@@ -1447,7 +1454,7 @@ mod tests {
     /// prefix, result details and side-store rows. Streaming must preserve all of those in order.
     #[test]
     fn streamed_read_matches_full_session_and_side_store() {
-        let _world = cv_testkit::World::in_process("affordance-stream");
+        let _world = crate::test_world("affordance-stream");
         struct Fixture {
             text_path: std::path::PathBuf,
         }
@@ -1567,7 +1574,7 @@ mod tests {
                 Ok(Session::new(&r.id, r.harness))
             }
         }
-        let world = cv_testkit::World::in_process("affordance-source-text-rows");
+        let world = crate::test_world("affordance-source-text-rows");
         let path = world.base.join("original");
         for case in 0..3 {
             std::fs::write(&path, "snapshot provenance").unwrap();

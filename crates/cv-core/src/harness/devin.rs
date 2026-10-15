@@ -142,9 +142,9 @@
 //! "" falls back to the last chain assistant's `generation_model` (observed on a real session). `hidden = 1` sessions are
 //! still discovered, flagged in `extra["devin"]["hidden"]`.
 
-mod selected;
+mod record;
 
-use super::store::sqlite::{columns, open_ro, table_exists};
+use super::store::sqlite::{columns, open_ro, table_exists, Cell, Cells};
 use super::store::xdg_data_dir;
 use super::{note_skipped_lines, ts_from_epoch, Adapter};
 use crate::ir::*;
@@ -199,10 +199,12 @@ impl Adapter for Devin {
         let Some(db) = self.db_path() else {
             return Ok(vec![]);
         };
-        let Ok(conn) = open_ro(&db) else {
-            return Ok(vec![]);
-        };
-        conn.read(|conn| discover_conn(conn, &db))
+        super::store::sqlite::cached_discover(&db, || {
+            let Ok(conn) = open_ro(&db) else {
+                return Ok(vec![]);
+            };
+            conn.read(|conn| discover_conn(conn, &db))
+        })
     }
 
     fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
@@ -212,16 +214,8 @@ impl Adapter for Devin {
             let sink: &mut dyn MessageSink = &mut spawns;
             let conn = open_ro(&r.path)?;
             conn.read(|conn| {
-                let selected = super::store::sqlite::incremental_utf8_table(conn, "message_nodes")
-                    .then(|| selected::Selected::new(&r.path, conn.reads()))
-                    .transpose()?;
-                stream_conn_selected(
-                    conn,
-                    r,
-                    sink,
-                    selected.as_ref(),
-                    selected.as_ref().filter(|_| opts.spans),
-                )
+                let cells = Cells::new(conn, &r.path, conn.reads(), "message_nodes")?;
+                stream_conn(conn, r, sink, &cells, opts.spans)
             })
         })
     }
@@ -231,21 +225,27 @@ impl Adapter for Devin {
 // Schema probing + the chain walk
 // ---------------------------------------------------------------------------
 
-/// A session's node topology and (where decodable) roles. Topology comes from the plain columns —
-/// never the JSON — so a corrupt `chat_message` can't truncate the chain walk; `roles` is filled by
-/// checked projection where corrupt rows are absent. Normal rowid stores keep native cells
-/// bounded through the same guarded backing as lazy bodies; older schemas retain their fallback.
+/// A session's node topology and (where decodable) navigation facts. Topology comes from the
+/// plain columns — never the JSON — so a corrupt `chat_message` can't truncate the chain walk;
+/// each node's cells are read once, through [`Cells`], and kept as arena ranges for the stream.
 #[derive(Default)]
 struct Forest {
     parents: HashMap<i64, Option<i64>>,
     roles: HashMap<i64, String>,
-    rows: HashMap<i64, i64>,
-    navigation: HashMap<i64, selected::Navigation>,
+    nodes: HashMap<i64, Node>,
+    navigation: HashMap<i64, record::Navigation>,
     node_meta: HashMap<i64, NodeFacts>,
     receipts: Vec<(String, i64, Option<i64>)>,
 }
 
-fn load_forest(conn: &Connection, session_id: &str, selected: Option<&selected::Selected>) -> Result<Forest> {
+/// One node row: its creation time and its `chat_message` and `metadata` cells.
+struct Node {
+    created: Option<i64>,
+    chat: Option<Cell>,
+    meta: Option<Cell>,
+}
+
+fn load_forest(conn: &Connection, session_id: &str, cells: &Cells) -> Result<Forest> {
     let mut f = Forest::default();
     if let Ok(mut stmt) = conn.prepare("SELECT node_id, parent_node_id FROM message_nodes WHERE session_id = ?1") {
         if let Ok(rows) = stmt.query_map([session_id], |row| {
@@ -256,72 +256,43 @@ fn load_forest(conn: &Connection, session_id: &str, selected: Option<&selected::
             }
         }
     }
-    let has_metadata = columns(conn, "message_nodes").contains("metadata");
-    if let Some(selected) = selected {
-        let mut navigation = HashMap::new();
-        let mut statement =
-            conn.prepare("SELECT node_id, rowid, created_at FROM message_nodes WHERE session_id=?1 ORDER BY node_id")?;
-        let mut rows = statement.query([session_id])?;
-        while let Some(row) = rows.next()? {
-            let node: i64 = row.get(0)?;
-            let rowid: i64 = row.get(1)?;
-            f.rows.insert(node, rowid);
-            if has_metadata {
-                if let Some(facts) = selected.facts(conn, rowid)? {
-                    f.node_meta.insert(node, facts);
-                }
-            }
-            match selected.read(conn, rowid, selected::navigation) {
-                Ok(facts) => {
-                    if let Some(role) = &facts.role {
-                        f.roles.insert(node, role.clone());
-                    }
-                    if let (Some(agent), Some(head)) = (&facts.agent_id, facts.chain_node_id) {
-                        f.receipts.push((agent.clone(), head, row.get(2).ok().flatten()));
-                    }
-                    navigation.insert(node, facts);
-                }
-                Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => {}
-                Err(error) => return Err(error),
-            }
-        }
-        f.navigation = navigation;
-        return Ok(f);
-    }
-    // Views/UTF16/WITHOUT ROWID cannot expose UTF8 incremental cells. Keep the typed owned
-    // fallback, but project through the same decoder instead of SQLite's JSON coercions.
-    let metadata = if has_metadata { "metadata" } else { "NULL" };
+    let metadata = if columns(conn, "message_nodes").contains("metadata") {
+        cells.select("metadata")
+    } else {
+        "NULL, NULL".into()
+    };
     let mut statement = conn.prepare(&format!(
-        "SELECT node_id,chat_message,created_at,{metadata} \
-        FROM message_nodes WHERE session_id=?1 ORDER BY node_id"
+        "SELECT node_id, created_at, {}, {metadata} FROM message_nodes WHERE session_id=?1 ORDER BY node_id",
+        cells.select("chat_message")
     ))?;
     let mut rows = statement.query([session_id])?;
     while let Some(row) = rows.next()? {
         let node: i64 = row.get(0)?;
-        if let Some(metadata) = row
-            .get_ref(3)
-            .ok()
-            .and_then(|value| value.as_str().ok())
-            .and_then(NodeFacts::parse)
+        let created = row.get::<_, Option<i64>>(1).ok().flatten();
+        let chat = cells.cell(conn, "message_nodes", "chat_message", row, 2)?;
+        let meta = cells.cell(conn, "message_nodes", "metadata", row, 4)?;
+        if let Some(facts) = meta
+            .map(|meta| cells.read(meta, record::facts))
+            .transpose()?
+            .flatten()
+            .flatten()
         {
-            f.node_meta.insert(node, metadata);
+            f.node_meta.insert(node, facts);
         }
-        let Some(chat) = row
-            .get_ref(1)
-            .ok()
-            .and_then(|value| value.as_str().ok())
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        else {
-            continue;
-        };
-        let facts = crate::Json::from(chat).with_view(selected::navigation)?;
-        if let Some(role) = &facts.role {
-            f.roles.insert(node, role.clone());
+        if let Some(facts) = chat
+            .map(|chat| cells.read(chat, record::navigation))
+            .transpose()?
+            .flatten()
+        {
+            if let Some(role) = &facts.role {
+                f.roles.insert(node, role.clone());
+            }
+            if let (Some(agent), Some(head)) = (&facts.agent_id, facts.chain_node_id) {
+                f.receipts.push((agent.clone(), head, created));
+            }
+            f.navigation.insert(node, facts);
         }
-        if let (Some(agent), Some(head)) = (&facts.agent_id, facts.chain_node_id) {
-            f.receipts.push((agent.clone(), head, row.get(2).ok().flatten()));
-        }
-        f.navigation.insert(node, facts);
+        f.nodes.insert(node, Node { created, chat, meta });
     }
     Ok(f)
 }
@@ -461,11 +432,11 @@ fn discover_conn(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
             row.get::<_, Option<i64>>(5).ok().flatten(),
         ))
     })?;
+    let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "message_nodes")?;
     let mut out = Vec::new();
     for (id, wd, title, created, last, main_chain_id) in rows.flatten() {
         // One forest load serves the parent's count AND its sub-agent children's.
-        let selected = checked_navigation(conn, db)?;
-        let forest = load_forest(conn, &id, selected.as_ref())?;
+        let forest = load_forest(conn, &id, &cells)?;
         let (head, _) = chain_head(&forest, main_chain_id);
         let parent = SessionRef {
             id: id.clone(),
@@ -487,15 +458,6 @@ fn discover_conn(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
         }
     }
     Ok(out)
-}
-
-fn checked_navigation(conn: &Connection, path: &Path) -> Result<Option<selected::Selected>> {
-    // In-memory test stores and historical non-incremental schemas keep the typed owned fallback.
-    if path.is_file() && super::store::sqlite::incremental_utf8_table(conn, "message_nodes") {
-        selected::Selected::new(path, &crate::source::ReadSet::default()).map(Some)
-    } else {
-        Ok(None)
-    }
 }
 
 /// A parent's completion receipt records the tool call that launched this child. The same
@@ -550,8 +512,8 @@ pub fn subagent_tree(db: &Path, session_id: &str) -> Vec<crate::harness::claude:
             updated_at: last.and_then(ts_from_epoch),
             ..SessionRef::new(session_id.to_string(), Harness::Devin, db.to_path_buf())
         };
-        let selected = checked_navigation(conn, db)?;
-        let forest = load_forest(conn, session_id, selected.as_ref())?;
+        let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "message_nodes")?;
+        let forest = load_forest(conn, session_id, &cells)?;
         let mut out = Vec::new();
         for (agent, head, updated) in subagent_head_rows(conn, session_id, &forest) {
             if let Some(session) = child_ref(db, session_id, &agent, head, updated, &forest, &parent) {
@@ -597,61 +559,20 @@ struct NodeFacts {
     num_tokens_preceding: Option<u64>,
     is_system_prefix: bool,
 }
-impl NodeFacts {
-    fn parse(text: &str) -> Option<Self> {
-        use serde::de::{MapAccess, Visitor};
-        struct Facts;
-        impl<'de> Visitor<'de> for Facts {
-            type Value = NodeFacts;
-            fn expecting(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                fmt.write_str("node metadata object")
-            }
-            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> std::result::Result<NodeFacts, M::Error> {
-                let mut facts = NodeFacts::default();
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "summarized_from" => {
-                            let value = map.next_value::<Value>()?;
-                            facts.is_summary = !value.is_null();
-                            facts.summarized_from = value.as_i64();
-                        }
-                        "num_tokens_preceding" => facts.num_tokens_preceding = map.next_value::<Value>()?.as_u64(),
-                        "is_system_prefix" => {
-                            facts.is_system_prefix = map.next_value::<Value>()?.as_bool().unwrap_or(false)
-                        }
-                        _ => {
-                            map.next_value::<crate::harness::store::DiscardValue>()?;
-                        }
-                    }
-                }
-                Ok(facts)
-            }
-        }
-        let mut de = serde_json::Deserializer::from_str(text);
-        let facts = serde::Deserializer::deserialize_map(&mut de, Facts).ok()?;
-        de.end().ok()?;
-        Some(facts)
-    }
-}
 
-#[cfg(test)]
-fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
-    stream_conn_selected(conn, r, sink, None, None)
-}
-
-fn stream_conn_selected(
+fn stream_conn(
     conn: &Connection,
     r: &SessionRef,
     sink: &mut dyn MessageSink,
-    navigation: Option<&selected::Selected>,
-    selected: Option<&selected::Selected>,
+    cells: &Cells,
+    spans: bool,
 ) -> Result<Session> {
     // Child ids split on the FIRST '/': `<session_id>/<agent_id>` — slugs never contain one.
     let (session_id, agent_id) = match r.id.split_once('/') {
         Some((s, a)) => (s, Some(a)),
         None => (r.id.as_str(), None),
     };
-    stream_session(conn, session_id, agent_id, r, sink, navigation, selected)
+    stream_session(conn, session_id, agent_id, r, sink, cells, spans)
 }
 
 /// The one chain walk / node map / meta path behind [`Adapter::stream`] for both a session and
@@ -664,8 +585,8 @@ fn stream_session(
     agent: Option<&str>,
     r: &SessionRef,
     sink: &mut dyn MessageSink,
-    navigation: Option<&selected::Selected>,
-    selected: Option<&selected::Selected>,
+    cells: &Cells,
+    spans: bool,
 ) -> Result<Session> {
     let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
     let cols = columns(conn, "sessions");
@@ -703,7 +624,7 @@ fn stream_session(
     // The chosen chain (see the module doc): head → root, reversed. For a child the head comes
     // from `subagent_heads.chain_node_id` — a head naming no live node leaves the chain empty
     // (counted as dangling rather than falling back, which would pick some other chain's tail).
-    let forest = load_forest(conn, session_id, navigation)?;
+    let forest = load_forest(conn, session_id, cells)?;
     let heads = subagent_head_rows(conn, session_id, &forest);
     let (head, fell_back, dangling_head) = match agent {
         None => {
@@ -723,7 +644,6 @@ fn stream_session(
     let spawned_by = agent.and_then(|a| spawning_call(a, &forest));
 
     // The forest's bounded metadata projection serves compaction, prefix and turn counts.
-    let has_node_metadata = columns(conn, "message_nodes").contains("metadata");
     let node_meta = &forest.node_meta;
     // Gather each compaction pair's facts before its first summary is emitted.
     let mut compaction_facts: HashMap<i64, serde_json::Map<String, Value>> = HashMap::new();
@@ -742,55 +662,9 @@ fn stream_session(
             let cur = entry.get("pre_tokens").and_then(Value::as_u64).unwrap_or(0);
             entry.insert("pre_tokens".into(), json!(cur.max(ntp)));
         }
-        if let Some(selected) = navigation {
-            let rowid: i64 = conn.query_row(
-                "SELECT rowid FROM message_nodes WHERE session_id=?1 AND node_id=?2",
-                rusqlite::params![session_id, nid],
-                |row| row.get(0),
-            )?;
-            match selected.read(conn, rowid, selected::compaction) {
-                Ok(facts) => entry.extend(facts),
-                Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => {}
-                Err(error) => return Err(error),
-            }
-            continue;
-        }
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT chat_message FROM message_nodes WHERE session_id = ?1 AND node_id = ?2",
-                rusqlite::params![session_id, nid],
-                |row| row.get(0),
-            )
-            .ok();
-        let Some(raw) = raw else { continue };
-        let Ok(chat) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        let ext = chat.get("metadata").and_then(|m| m.get("extensions"));
-        let get = |k: &str| ext.and_then(|e| e.get(k));
-        if let Some(src) = get("devin-rs/summary")
-            .and_then(|v| v.get("source"))
-            .filter(|v| !v.is_null())
-        {
-            entry.insert("source".into(), src.clone());
-        }
-        if let Some(paths) = get("compact/edited_files").and_then(|v| v.get("paths")) {
-            entry.insert("edited_files".into(), paths.clone());
-        }
-        if let Some(todos) = get("compact/todo_list").filter(|v| !v.is_null()) {
-            entry.insert("todo_list".into(), todos.clone());
-        }
-        if let Some(content) = chat.get("content").and_then(Value::as_str) {
-            // `Full conversation history saved at <path>.` — the sentence's trailing period is
-            // not part of the path.
-            if let Some(p) = content
-                .split("Full conversation history saved at ")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .map(|s| s.trim_end_matches('.'))
-                .filter(|s| !s.is_empty())
-            {
-                entry.insert("history_path".into(), json!(p));
+        if let Some(chat) = forest.nodes.get(&nid).and_then(|n| n.chat) {
+            if let Some(facts) = cells.read(chat, record::compaction)? {
+                entry.extend(facts);
             }
         }
     }
@@ -801,21 +675,9 @@ fn stream_session(
     for &nid in &chain {
         let is_prefix = node_meta.get(&nid).map(|m| m.is_system_prefix).unwrap_or(false);
         if is_prefix && forest.roles.get(&nid).is_some_and(|r| r == "system") {
-            let content: Option<String> = if let Some(navigation) = navigation {
-                match navigation.content(conn, forest.rows[&nid]) {
-                    Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => None,
-                    result => result?,
-                }
-            } else {
-                let chat = conn
-                    .query_row(
-                        "SELECT chat_message FROM message_nodes WHERE session_id=?1 AND node_id=?2",
-                        rusqlite::params![session_id, nid],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .ok()
-                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-                chat.and_then(|chat| chat.get("content").and_then(Value::as_str).map(str::to_string))
+            let content = match forest.nodes.get(&nid).and_then(|n| n.chat) {
+                Some(chat) => cells.read(chat, |v| record::string(v.get("content")?))?.flatten(),
+                None => None,
             };
             if let Some(content) = content.filter(|c| !c.is_empty()) {
                 prefix.push(content);
@@ -973,53 +835,35 @@ fn stream_session(
     let mut last_msg_id: Option<String> = None;
     let mut last_sf: Option<i64> = None;
     let mut skipped = 0u64;
-    let metadata_column = if has_node_metadata && selected.is_none() {
-        "metadata"
-    } else {
-        "NULL"
-    };
-    let payload = if selected.is_some() { "NULL" } else { "chat_message" };
-    let rowid_column = if selected.is_some() { "rowid" } else { "0" };
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {payload}, created_at, {metadata_column}, {rowid_column} FROM message_nodes WHERE session_id = ?1 AND node_id = ?2"
-    ))?;
     for &nid in &chain {
-        let row: Option<(Option<String>, i64, Option<String>, i64)> = stmt
-            .query_row(rusqlite::params![session_id, nid], |row| {
-                Ok((
-                    if selected.is_none() { Some(row.get(0)?) } else { None },
-                    row.get(1)?,
-                    row.get(2).ok().flatten(),
-                    row.get(3)?,
-                ))
-            })
-            .ok();
-        let Some((raw, node_created, metadata, rowid)) = row else {
+        let Some(Node {
+            created: Some(created),
+            chat: Some(chat),
+            meta,
+        }) = forest.nodes.get(&nid)
+        else {
             skipped += 1;
             continue;
         };
-        let metadata = if let Some(selected) = selected.filter(|_| has_node_metadata) {
-            selected.metadata(conn, rowid)?
-        } else {
-            metadata
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .filter(Value::is_object)
+        let carried = match meta {
+            Some(meta) => cells
+                .read(*meta, |v| {
+                    if v.is_object()? {
+                        record::carried(v)
+                    } else {
+                        Ok(Vec::new())
+                    }
+                })?
+                .unwrap_or_default(),
+            None => Vec::new(),
         };
-        let mut m = if let Some(selected) = selected {
-            match selected.node(conn, rowid, nid, node_created, metadata.as_ref(), &mut tool_names) {
-                Ok(message) => message,
-                Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => {
-                    skipped += 1;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            let Ok(chat) = serde_json::from_str::<Value>(raw.as_deref().unwrap()) else {
-                skipped += 1;
-                continue;
-            };
-            node_to_message(nid, node_created, &chat, metadata.as_ref(), &mut tool_names)
+        let facts = node_meta.get(&nid);
+        let decoded = cells.read(*chat, |v| {
+            record::node(v, nid, *created, facts, carried, &mut tool_names, spans)
+        })?;
+        let Some(mut m) = decoded else {
+            skipped += 1;
+            continue;
         };
 
         // The first node of a compaction pair: emit a synthetic boundary right before it and
@@ -1078,282 +922,6 @@ fn stream_session(
 }
 
 // ---------------------------------------------------------------------------
-// One chain node → one Message
-// ---------------------------------------------------------------------------
-
-fn node_to_message(
-    node_id: i64,
-    node_created: i64,
-    chat: &Value,
-    node_meta: Option<&Value>,
-    tool_names: &mut HashMap<String, String>,
-) -> Message {
-    let role = chat.get("role").and_then(Value::as_str).unwrap_or("");
-    // The message's own metadata object (inside `chat_message`, distinct from the node column).
-    let mmeta = chat.get("metadata").unwrap_or(&Value::Null);
-    let ext = mmeta.get("extensions").unwrap_or(&Value::Null);
-    let is_prefix = node_meta
-        .and_then(|m| m.get("is_system_prefix"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let is_user_input = mmeta.get("is_user_input").and_then(Value::as_bool).unwrap_or(false);
-    // The lead's brief to a sub-agent is a `user` prompt typed by another agent.
-    let is_handoff = ext.get("subagent/handoff").and_then(Value::as_bool).unwrap_or(false);
-
-    let mut m = match (role, is_prefix, is_user_input) {
-        ("system", true, _) => Message::of_kind(Role::System, MessageKind::SystemPrompt, Origin::Harness),
-        ("system", false, _) => Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Harness),
-        ("user", _, true) if is_handoff => Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent),
-        ("user", _, true) => Message::of_kind(Role::User, MessageKind::Prompt, Origin::Human),
-        // A `user` row the human didn't type is harness-injected context (same modeling Goose
-        // uses for `userVisible: false` rows).
-        ("user", _, false) => Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Harness),
-        ("assistant", _, _) => Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model),
-        ("tool", _, _) => Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness),
-        _ => Message::of_kind(Role::System, MessageKind::Notice, Origin::Harness),
-    };
-    // Compaction marks the node, whatever the role it copied into (observed live: system nodes
-    // carrying `subagent/handoff_history`/`compact/*`/`devin-rs/summary` extension sidecars).
-    if node_meta
-        .and_then(|n| n.get("summarized_from"))
-        .is_some_and(|v| !v.is_null())
-    {
-        m.kind = MessageKind::CompactionSummary;
-    }
-
-    m.id = chat.get("message_id").and_then(Value::as_str).map(str::to_string);
-    m.timestamp = mmeta
-        .get("created_at")
-        .and_then(Value::as_str)
-        .and_then(super::parse_ts)
-        .or_else(|| ts_from_epoch(node_created));
-
-    let content = chat.get("content").and_then(Value::as_str).unwrap_or("");
-    match role {
-        "assistant" => {
-            if let Some(th) = chat.get("thinking") {
-                let text = th.get("thinking").and_then(Value::as_str).unwrap_or("");
-                let signature = th.get("signature").and_then(Value::as_str).map(str::to_string);
-                if !text.is_empty() || signature.is_some() {
-                    m.content.push(Block::Thinking {
-                        text: text.to_string().into(),
-                        signature,
-                        encrypted: None,
-                        redacted: false,
-                    });
-                }
-            }
-            if !content.is_empty() {
-                m.content.push(Block::Text {
-                    text: content.to_string().into(),
-                });
-            }
-            if let Some(calls) = chat.get("tool_calls").and_then(Value::as_array) {
-                for c in calls {
-                    let id = c.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                    let name = c.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                    let input = c.get("arguments").cloned().unwrap_or(Value::Null);
-                    if !id.is_empty() && !name.is_empty() {
-                        tool_names.insert(id.clone(), name.clone());
-                    }
-                    m.content.push(Block::ToolUse {
-                        id,
-                        name,
-                        input: input.into(),
-                        namespace: None,
-                    });
-                }
-            }
-            m.model = mmeta
-                .get("generation_model")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            if let Some(metrics) = mmeta.get("metrics") {
-                let get = |k: &str| metrics.get(k).and_then(Value::as_u64);
-                let u = Usage {
-                    input_tokens: get("input_tokens"),
-                    output_tokens: get("output_tokens"),
-                    cache_read_tokens: get("cache_read_tokens"),
-                    cache_creation_tokens: get("cache_creation_tokens"),
-                    ..Default::default()
-                };
-                if u.input_tokens.is_some()
-                    || u.output_tokens.is_some()
-                    || u.cache_read_tokens.is_some()
-                    || u.cache_creation_tokens.is_some()
-                {
-                    m.usage = Some(u);
-                }
-            }
-        }
-        "tool" => {
-            let tool_use_id = chat
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let success = ext
-                .get("chisel/tool_result_meta")
-                .and_then(|v| v.get("success"))
-                .and_then(Value::as_bool);
-            // `chisel/tool_failure` is a failure even without a tool_result_meta verdict.
-            let failure_reason = ext
-                .get("chisel/tool_failure")
-                .and_then(|v| v.get("reason"))
-                .and_then(Value::as_str);
-            let mut details = serde_json::Map::new();
-            if let Some(r) = failure_reason {
-                details.insert("failure_reason".into(), json!(r));
-            }
-            if let Some(term) = ext.get("chisel/terminal_output") {
-                if let Some(cwd) = term.get("cwd") {
-                    details.insert("cwd".into(), cwd.clone());
-                }
-                for (src, dst) in [("exit_code", "exit_code"), ("terminal_id", "terminal_id")] {
-                    if let Some(v) = term.get("exit").and_then(|e| e.get(src)) {
-                        details.insert(dst.into(), v.clone());
-                    }
-                }
-            }
-            if let Some(d) = ext.get("chisel/tool_call_timing").and_then(|t| t.get("duration_ms")) {
-                details.insert("duration_ms".into(), d.clone());
-            }
-            if let Some(k) = ext.get("chisel/tool_result_meta").and_then(|v| v.get("kind")) {
-                details.insert("kind".into(), k.clone());
-            }
-            // `chisel/undo` names what `/revert` can put back: a `restore_file` entry is a file
-            // checkpoint (its `original_content` stays in the store); `irreversible` is none.
-            let restorable: Vec<Value> = ext
-                .get("chisel/undo")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|u| u.get("kind").and_then(Value::as_str) == Some("restore_file"))
-                .filter_map(|u| u.get("path").cloned())
-                .collect();
-            if !restorable.is_empty() {
-                details.insert("restorable".into(), Value::Array(restorable));
-            }
-            m.content.push(Block::ToolResult {
-                tool_name: tool_names.get(&tool_use_id).cloned(),
-                tool_use_id,
-                content: content.to_string().into(),
-                is_error: success == Some(false) || failure_reason.is_some(),
-                status: if failure_reason.is_some() {
-                    Some("error".to_string())
-                } else {
-                    success.map(|ok| if ok { "completed" } else { "error" }.to_string())
-                },
-                details: (!details.is_empty()).then(|| Value::Object(details)),
-            });
-        }
-        _ => {
-            if !content.is_empty() {
-                m.content.push(Block::Text {
-                    text: content.to_string().into(),
-                });
-            }
-        }
-    }
-
-    // Harness facts that have no first-class IR home: the node's position in the forest and the
-    // metadata both layers record. Only present keys are written.
-    {
-        let bag = m.harness_extra_mut(Harness::Devin);
-        bag.insert("node_id".into(), json!(node_id));
-        for k in ["finish_reason", "request_id", "telemetry", "num_tokens"] {
-            if let Some(v) = mmeta.get(k).filter(|v| !v.is_null()) {
-                bag.insert(k.into(), v.clone());
-            }
-        }
-        if let Some(nm) = node_meta {
-            if let Some(v) = nm.get("num_tokens_preceding").filter(|v| !v.is_null()) {
-                bag.insert("num_tokens_preceding".into(), v.clone());
-            }
-            if let Some(v) = nm.get("summarized_from").filter(|v| !v.is_null()) {
-                bag.insert("summarized_from".into(), v.clone());
-            }
-            if let Some(v) = nm
-                .get("extensions")
-                .and_then(|e| e.get("compact/prior_node_ids"))
-                .filter(|v| !v.is_null())
-            {
-                bag.insert("prior_node_ids".into(), v.clone());
-            }
-        }
-        if let Some(v) = ext.get("affogato/cog-context").filter(|v| !v.is_null()) {
-            bag.insert("cog_context".into(), v.clone());
-        }
-        // The tool row that answers an in-band question dialog (and `cv show --kind answer` reads).
-        if let Some(v) = ext.get("chisel/user_question_answers").filter(|v| !v.is_null()) {
-            bag.insert("user_question_answers".into(), v.clone());
-        }
-        // Which sub-agent a completion row is about: the parent's `sidekick` tool result and the
-        // `<subagent_completion_notification>` system row both carry these.
-        {
-            let mut sub = serde_json::Map::new();
-            for (k, dst) in [
-                ("subagent/profile_name", "profile_name"),
-                ("subagent/model", "model"),
-                ("subagent/agent_id", "agent_id"),
-                ("subagent/chain_node_id", "chain_node_id"),
-            ] {
-                if let Some(v) = ext.get(k).filter(|v| !v.is_null()) {
-                    sub.insert(dst.into(), v.clone());
-                }
-            }
-            if !sub.is_empty() {
-                bag.insert("subagent".into(), Value::Object(sub));
-            }
-        }
-        // Sub-agent wiring: the lead's model uid on a handoff prompt, and the rules/skills the
-        // child's system prefix says it loaded (agent-ext/*).
-        if let Some(v) = ext.get("chisel/fusion_lead_model_uid").filter(|v| !v.is_null()) {
-            bag.insert("lead_model".into(), v.clone());
-        }
-        if let Some(v) = ext.get("agent-ext/rules-loaded").filter(|v| !v.is_null()) {
-            bag.insert("rules_loaded".into(), v.clone());
-        }
-        if let Some(skills) = ext
-            .get("agent-ext/skills-loaded")
-            .and_then(|v| v.get("skills"))
-            .and_then(Value::as_array)
-        {
-            let reduced: Vec<Value> = skills
-                .iter()
-                .map(|s| {
-                    let mut o = serde_json::Map::new();
-                    for k in ["name", "path"] {
-                        if let Some(v) = s.get(k) {
-                            o.insert(k.into(), v.clone());
-                        }
-                    }
-                    Value::Object(o)
-                })
-                .collect();
-            bag.insert("skills_loaded".into(), Value::Array(reduced));
-        }
-        // The ACP view of the calls, reduced to title/kind/status — `content`/`rawInput`/`_meta`
-        // duplicate the ToolUse block and the result row.
-        if let Some(tcc) = ext.get("chisel/tool_call_content").and_then(Value::as_object) {
-            let mut reduced = serde_json::Map::new();
-            for (id, v) in tcc {
-                let mut o = serde_json::Map::new();
-                for k in ["title", "kind", "status"] {
-                    if let Some(val) = v.get(k) {
-                        o.insert(k.into(), val.clone());
-                    }
-                }
-                reduced.insert(id.clone(), Value::Object(o));
-            }
-            bag.insert("tool_call_content".into(), Value::Object(reduced));
-        }
-    }
-    m
-}
-
-// ---------------------------------------------------------------------------
 // Tests — `tests/fixtures/devin/sessions-v17-3000.11.3.db` (tools/harness-fixtures/devin/)
 // ---------------------------------------------------------------------------
 
@@ -1361,7 +929,8 @@ fn node_to_message(
 #[cfg(test)]
 fn parse_db(conn: &Connection, r: &SessionRef) -> Result<Session> {
     let mut sink = crate::stream::CollectSink::default();
-    let mut s = stream_conn(conn, r, &mut sink)?;
+    let cells = Cells::new(conn, &r.path, &crate::source::ReadSet::default(), "message_nodes")?;
+    let mut s = stream_conn(conn, r, &mut sink, &cells, false)?;
     s.messages = sink.messages;
     Ok(s)
 }
@@ -1403,65 +972,51 @@ mod tests {
     }
 
     #[test]
-    fn selected_rows_preserve_corpus_chains_metadata_and_wal_guards() -> Result<()> {
-        let world = cv_testkit::World::in_process("devin-selected-corpus");
+    fn long_text_stays_in_the_cell_and_the_store_guards_it() -> Result<()> {
+        let world = crate::test_world("devin-cell-guard");
         let path = world.base.join("sessions.db");
         std::fs::copy(fixture(), &path)?;
         let adapter = Devin::with_root(&world.base);
-        for reference in adapter.discover()? {
-            let owned = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
-            for options in [
-                ParseOptions::lazy_extra(),
-                ParseOptions {
-                    spans: true,
-                    ..ParseOptions::complete()
-                },
-            ] {
-                let mut selected = crate::stream::collect_with(&adapter, &reference, &options)?;
-                selected.materialize()?;
-                assert_eq!(
-                    serde_json::to_value(&selected)?,
-                    serde_json::to_value(&owned)?,
-                    "{}",
-                    reference.id
-                );
-            }
-        }
         let writer = Connection::open(&path)?;
         writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE);")?;
         let reference = adapter.discover()?.remove(0);
-        let selected = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy_extra())?;
         let before = std::fs::read(&path)?;
         writer.execute(
             "UPDATE message_nodes SET chat_message=json_set(chat_message,'$.content',?1) WHERE session_id=?2",
             rusqlite::params!["changed", reference.id],
         )?;
         assert_eq!(std::fs::read(&path)?, before);
-        // Tiny corpus values are inline; add a large demanded body to establish retained-source guard.
         writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         writer.execute(
             "UPDATE message_nodes SET chat_message=json_set(chat_message,'$.content',?1) WHERE session_id=?2",
             rusqlite::params!["large body ".repeat(10000), reference.id],
         )?;
+        let inline = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
         let mut large = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy_extra())?;
-        assert!(large.messages.iter().any(|m| m.content.iter().any(|b| matches!(
-            b,
-            Block::Text {
-                text: crate::Text::Source(_)
-            }
-        ))));
+        let source = |s: &Session| {
+            s.messages.iter().any(|m| {
+                m.content.iter().any(|b| {
+                    matches!(
+                        b,
+                        Block::Text {
+                            text: crate::Text::Source(_)
+                        }
+                    )
+                })
+            })
+        };
+        assert!(source(&large) && !source(&inline));
         writer.execute(
             "UPDATE message_nodes SET created_at=created_at+1 WHERE session_id=?1",
             [&reference.id],
         )?;
         assert!(large.materialize().is_err());
-        let _ = selected;
         Ok(())
     }
 
     #[test]
-    fn checked_navigation_matches_owned_prefix_model_heads_and_ignored_giant_cells() -> Result<()> {
-        let world = cv_testkit::World::in_process("devin-native-navigation");
+    fn prefix_and_model_fallback_skip_giant_ignored_cells() -> Result<()> {
+        let world = crate::test_world("devin-native-navigation");
         let path = world.base.join("sessions.db");
         std::fs::copy(fixture(), &path)?;
         let writer = Connection::open(&path)?;
@@ -1486,73 +1041,80 @@ mod tests {
                 json!({"is_system_prefix":true,"ignored":payload}).to_string()
             ],
         )?;
+        writer.execute("UPDATE sessions SET model='' WHERE id='fixture-beta'", [])?;
         let adapter = Devin::with_root(&world.base);
         let refs = adapter.discover()?;
         let reference = refs.iter().find(|r| r.id == "fixture-beta").unwrap();
-        let legacy = parse_db(&writer, reference)?;
-        assert_eq!(legacy.model.as_deref(), Some("fallback-model"));
-        assert_eq!(legacy.system_prompt.as_deref(), Some("You are a checked prefix."));
         for options in [ParseOptions::full(), ParseOptions::lazy_extra(), ParseOptions::facts()] {
-            let mut checked = crate::stream::collect_with(&adapter, reference, &options)?;
-            checked.materialize()?;
-            assert_eq!(serde_json::to_value(&checked)?, serde_json::to_value(&legacy)?);
+            let s = crate::stream::collect_with(&adapter, reference, &options)?;
+            assert_eq!(s.model.as_deref(), Some("fallback-model"));
+            assert_eq!(s.system_prompt.as_deref(), Some("You are a checked prefix."));
         }
         Ok(())
     }
 
     #[test]
-    fn lazy_reads_fall_back_for_views_without_incremental_cells() -> Result<()> {
-        let world = cv_testkit::World::in_process("devin-view-fallback");
+    fn a_view_without_incremental_cells_reads_its_rows() -> Result<()> {
+        let world = crate::test_world("devin-view-fallback");
         let path = world.base.join("sessions.db");
         std::fs::copy(fixture(), &path)?;
+        let adapter = Devin::with_root(&world.base);
+        let table = adapter.discover()?;
+        let parsed = |r: &SessionRef| crate::stream::collect_with(&adapter, r, &ParseOptions::full()).unwrap();
+        let expected: Vec<Value> = table.iter().map(|r| serde_json::to_value(parsed(r)).unwrap()).collect();
         let writer = Connection::open(&path)?;
         writer.execute_batch(
             "ALTER TABLE message_nodes RENAME TO stored_nodes; \
             CREATE VIEW message_nodes AS SELECT * FROM stored_nodes;",
         )?;
-        let adapter = Devin::with_root(&world.base);
-        for reference in adapter.discover()? {
-            let full = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
-            let lazy = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy_extra())?;
-            assert_eq!(
-                serde_json::to_value(lazy)?,
-                serde_json::to_value(full)?,
-                "{}",
-                reference.id
-            );
+        let view = adapter.discover()?;
+        assert_eq!(serde_json::to_value(&view)?, serde_json::to_value(&table)?);
+        for (r, expected) in view.iter().zip(expected) {
+            assert_eq!(serde_json::to_value(parsed(r))?, expected, "{}", r.id);
         }
         Ok(())
     }
 
     #[test]
-    fn selected_cells_preserve_owned_text_type_and_invalid_utf8_acceptance() -> Result<()> {
-        let world = cv_testkit::World::in_process("devin-selected-cell-types");
+    fn cells_that_are_not_json_text_are_skipped_rows() -> Result<()> {
+        let world = crate::test_world("devin-cell-types");
         let path = world.base.join("sessions.db");
         std::fs::copy(fixture(), &path)?;
         let writer = Connection::open(&path)?;
         let adapter = Devin::with_root(&world.base);
         let reference = SessionRef::new("fixture-beta", Harness::Devin, &path);
-        for cell in [
-            "CAST('{\"role\":\"assistant\",\"content\":\"blob body\"}' AS BLOB)",
-            "CAST(X'FF' AS TEXT)",
-            "'{invalid json'",
-            "'null'",
+        let base = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
+        for (cell, skipped) in [
+            (
+                "CAST('{\"role\":\"assistant\",\"content\":\"blob body\"}' AS BLOB)",
+                true,
+            ),
+            ("CAST(X'FF' AS TEXT)", true),
+            ("'{invalid json'", true),
+            ("''", true),
+            ("'null'", false),
         ] {
             writer.execute_batch(&format!(
                 "UPDATE message_nodes SET chat_message={cell} \
                 WHERE session_id='fixture-beta' AND node_id=3;"
             ))?;
-            let owned = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
-            let mut selected = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy_extra())?;
-            selected.materialize()?;
-            assert_eq!(serde_json::to_value(selected)?, serde_json::to_value(owned)?, "{cell}");
+            for options in [ParseOptions::full(), ParseOptions::lazy_extra()] {
+                let s = crate::stream::collect_with(&adapter, &reference, &options)?;
+                let noted = |s: &Session| {
+                    s.cv_extra()
+                        .and_then(|cv| cv.get("skipped_lines")?.as_u64())
+                        .unwrap_or(0)
+                };
+                assert_eq!(base.messages.len() - s.messages.len(), usize::from(skipped), "{cell}");
+                assert_eq!(noted(&s) - noted(&base), u64::from(skipped), "{cell}");
+            }
         }
         Ok(())
     }
 
     #[test]
     fn corrupt_abandoned_rows_do_not_hide_tool_only_subagent_heads() -> Result<()> {
-        let world = cv_testkit::World::in_process("devin-corrupt-tool-head");
+        let world = crate::test_world("devin-corrupt-tool-head");
         let path = world.base.join("sessions.db");
         std::fs::copy(fixture(), &path)?;
         let conn = Connection::open(&path)?;
@@ -1586,44 +1148,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn node_facts_match_value_navigation_without_retaining_payloads() {
-        for text in [
-            r#"{"summarized_from":1,"num_tokens_preceding":9,"is_system_prefix":true,"ignored":"body"}"#,
-            r#"{"summarized_from":1,"summarized_from":null,"num_tokens_preceding":-1,"is_system_prefix":1}"#,
-            r#"{"summarized_from":{},"num_tokens_preceding":[],"is_system_prefix":false}"#,
-            r#"{"ignored":"\ud800"}"#,
-            r#"{"ignored":1e400}"#,
-            "null",
-            "[]",
-            "{} trailing",
-        ] {
-            let old = serde_json::from_str::<Value>(text).ok().filter(Value::is_object);
-            let facts = NodeFacts::parse(text);
-            assert_eq!(facts.is_some(), old.is_some(), "{text}");
-            if let (Some(old), Some(facts)) = (old, facts) {
-                assert_eq!(
-                    facts.is_summary,
-                    old.get("summarized_from").is_some_and(|value| !value.is_null())
-                );
-                assert_eq!(
-                    facts.summarized_from,
-                    old.get("summarized_from").and_then(Value::as_i64)
-                );
-                assert_eq!(
-                    facts.num_tokens_preceding,
-                    old.get("num_tokens_preceding").and_then(Value::as_u64)
-                );
-                assert_eq!(
-                    facts.is_system_prefix,
-                    old.get("is_system_prefix").and_then(Value::as_bool).unwrap_or(false)
-                );
-            }
-        }
-        let text = format!("{{\"ignored\":\"{}\",\"summarized_from\":7}}", "x".repeat(1024 * 1024));
-        assert_eq!(NodeFacts::parse(&text).unwrap().summarized_from, Some(7));
-    }
-
     fn dbag(s: &Session) -> &serde_json::Map<String, Value> {
         s.harness_extra(Harness::Devin).expect("extra[\"devin\"]")
     }
@@ -1634,7 +1158,7 @@ mod tests {
 
     #[test]
     fn discovery_counts_only_canonical_prompts_and_replies_on_each_chain() -> Result<()> {
-        let world = cv_testkit::World::in_process("devin-canonical-discovery-count");
+        let world = crate::test_world("devin-canonical-discovery-count");
         let path = world.base.join("sessions.db");
         std::fs::copy(fixture(), &path)?;
         let writer = Connection::open(&path)?;

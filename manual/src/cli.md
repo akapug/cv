@@ -96,7 +96,7 @@ against `claude-opus-4-8`: `claude -p --resume <id> --fork-session` answered fro
 a Claude session, a portable rewind of the same session, and a portable rewind of a proxied
 `grok-4.7-build` session, each cut on a tool result.
 
-Note that `cv prune --drop-thinking` is a different thing: it flattens old reasoning to shrink a
+Note that `cv prune --drop-thinking` is a different thing: it omits old reasoning to shrink a
 session you intend to resume. It was spelled `--thinking` before 0.11.0, and was renamed precisely
 so that one word does not mean two things.
 
@@ -240,7 +240,13 @@ A piped `cv show` with no window selector will not spray a whole giant transcrip
 
 #### Views
 
-`--subagents`, `--agent`, `--tree` and `--kind` replace the transcript with one view of the same session. `--kind` takes the kinds that have a view — `prompt`/`answer` and `compaction_boundary`/`compaction_summary` — and exits 2 on anything else or on two views at once.
+`--subagents`, `--agent`, `--tree` and `--kind` select views of the same session.
+`--kind` accepts three families: `prompt,answer`; `compaction_boundary,compaction_summary`;
+and affordances such as `plan`, `goal`, `schedule`, `background_job`, `skill`, `hook`,
+`question`, `approval`, `checkpoint`, `branch`, `fork`, `model_change`, `subagent_spawn`,
+and `subagent_return` (`affordances` selects all of them). Unknown kinds or a mix of
+families exit 2. Prompt and affordance rows accept message windows; compaction rows
+cover the whole session. These row views print whole rows and reject `--max-bytes`.
 
 #### The threading: `--tree`
 
@@ -577,8 +583,8 @@ First prompt: 261.2k recorded (includes conversation; heuristic proxy for fixed 
 Peak prompt:  284.9k recorded in transcript
 
 Transcript content by source (278.5k estimated token equivalents):
-(text/JSON bytes ÷ 3.5; images use a fixed estimate; totals include history across compactions)
-(thinking includes opaque signature/encrypted bytes; not measured reasoning tokens)
+(an estimate: bytes at calibrated per-kind rates, ~2.2–2.5 bytes/token, images ~3k; totals include history across compactions)
+(thinking is mostly signature bytes; requests carry them, and most models count them)
   thinking payload   42%  ██████████               117.9k
   tool-call args    26%  ██████                   71.6k
   tool results      20%  █████                    55.6k
@@ -589,12 +595,15 @@ Transcript content by source (278.5k estimated token equivalents):
 
 It then ranks the largest tool-result payloads, breaks the system reminders down by kind, and names the sources worth cutting. The "system reminders" bucket is [`MessageKind::InjectedContext`](architecture.md#the-unified-ir) — context the *harness* put into the model's input — so the number means the same thing on every harness, and the per-kind names come from the harness's own bag (`extra["claude"]["attachment_type"]` and friends).
 
-Sources are sized at 3.5 bytes per token (images at a fixed estimate) over the whole transcript,
-compacted history included, so the percentages say where the session's bytes went, not what the
-current window holds. Code-heavy sessions tokenize denser: on one 980k-token `claude-opus-5`
-session the API counted 2.8 bytes per token, so the estimates read about 20% low there. The
-thinking bucket counts signature and encrypted bytes as well as plaintext; on Claude it is mostly
-signatures. The first prompt is the first recorded prompt size: the system prompt and tools plus
+Sources are sized with cv's one token estimator over the whole transcript, compacted history
+included, so the percentages say where the session's bytes went, not what the current window
+holds. Each content kind has its own rate, calibrated against the API's `count_tokens` on 42
+requests Claude Code built to resume 14 sessions: prose 2.5 bytes per token, tool input 2.1, tool
+results 2.2, thinking signatures 3.6, prune markers 1.5, plus 12 tokens per content block and 3k
+per image. On those requests the estimate read between 7% under and 46% over the count, the middle
+within 10%; it reads high on claude-opus-4-6 (a sparser tokenizer) and on sessions whose
+signatures the API no longer counts. The thinking bucket counts signature and encrypted bytes as
+well as plaintext; on Claude it is mostly signatures. The first prompt is the first recorded prompt size: the system prompt and tools plus
 whatever conversation that turn carried (a resumed session starts with its history); with
 `--recent`, doctor shows the largest. The peak prompt is the largest recorded. Both are the
 provider's numbers unless `cv prune` rewrote them.
@@ -632,10 +641,13 @@ cv cat <new-id> toolu_abc123                       # fetch a stashed original ba
 ```
 
 The defaults snip payloads over 2 KB and keep the last 25 turns verbatim. `--drop-thinking`
-flattens older thinking text and discards signatures and encrypted payloads. On one 977k-token
-`claude-opus-5` session (Claude Code 2.1.299) it took the resumed request from 980k to 849k tokens,
-98% to 85% of the 1M window, as the API counted Claude Code's own request; prune's byte estimate
-had predicted 641k. `--window` and `--keep` drop whole turns (lossy in the new session; the source keeps everything):
+omits older thinking blocks outright, with no marker in their place (a marker would give the
+model nothing); each goes to the sidecar under `<record uuid>#think<index>`, where `cv cat` finds
+it, and a record left empty is removed with its children relinked to its parent. On one
+977k-token `claude-opus-5` session (Claude Code 2.1.299) it took the resumed request from 981k to
+817k tokens, 98% to 82% of the 1M window, as the API counted Claude Code's own request. How much
+it frees depends on the model: on claude-fable-5-1, claude-opus-5-5 and claude-sonnet-5 sessions
+the API no longer counts old signatures, so dropping them freed nothing. `--window` and `--keep` drop whole turns (lossy in the new session; the source keeps everything):
 `--window` uses recorded prompt-usage deltas when available and byte estimates otherwise;
 `--keep A..B` selects by index. The flag spelled `--range` before 0.11.0 was renamed because
 it selects what to **keep**.
@@ -643,10 +655,13 @@ it selects what to **keep**.
 By default prune also **revives** an already-maxed session: Claude Code's resume gate reads the
 last turn's recorded `usage` as the session's size *before* re-sending anything, so a session at
 the wall refuses to resume even after pruning made it fit. Revive rewrites recorded usage above
-the estimated post-prune window (everything after the last compaction boundary, sized from
-recorded-usage deltas and byte estimates) down to that estimate. The estimate can read low (641k
-for the 849k request above), so a session pruned to just under the window can pass the gate and
-then be refused by the API. `--no-revive` keeps the original records byte for byte. `--declassify` snips conversational
+the estimated post-prune prompt down to that estimate. The estimate starts from the last recorded
+prompt, subtracts most of what pruning removed on the branch Claude Code resumes (removed
+signatures only for models measured to count them), adds what follows, and is floored by an
+outright estimate plus the fixed overhead the recorded prompts imply, then 5% on top. On 28
+calibration prunes it read between 1% under and 52% over the request Claude Code then built,
+so a session near the window is held back rather than refused; the session above was estimated
+at 966k and resumes. `--no-revive` keeps the original records byte for byte. `--declassify` snips conversational
 *prose* dense in terms you supply (`--declassify-tokens`, `--declassify-tokens-file`); cv ships no
 term list. `--json` puts the report on stdout as one object (the human report stays on stderr),
 and under `--dry-run` the paths it would write are `null`, with a `note` saying so.

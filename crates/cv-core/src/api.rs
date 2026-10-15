@@ -276,12 +276,16 @@ fn lookup(harness: &str, id: &str) -> Result<(SessionRef, Box<dyn crate::Adapter
 // but retain its operation receipt until JSON projection finishes and is safe to publish.
 fn complete_session_json(adapter: &dyn crate::Adapter, reference: &SessionRef) -> anyhow::Result<Value> {
     let mut sink = crate::stream::CollectSink::default();
-    let (mut session, guard) =
-        crate::stream::stream_counted_guarded(adapter, reference, &crate::ParseOptions::full(), &mut sink)?;
+    let pass = crate::stream::Pass {
+        guard: true,
+        ..crate::stream::Pass::RECORD
+    };
+    let read = crate::stream::stream_counted(adapter, reference, &crate::ParseOptions::full(), &mut sink, pass)?;
+    let mut session = read.session;
     session.messages = sink.messages;
     session.materialize()?;
     let output = serde_json::to_value(&session)?;
-    guard.verify(reference)?;
+    read.guard.expect("guarded pass").verify(reference)?;
     Ok(output)
 }
 
@@ -517,7 +521,7 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
         Ok(x) => x,
         Err(e) => return e,
     };
-    if events::needs_ingest(&r, events::file_mtime_ns(&r.path)) {
+    if events::needs_ingest(&r) {
         if let Err(e) = events::ingest_ref(&r) {
             return err(500, &format!("event ingest failed: {e:#}"));
         }
@@ -750,7 +754,7 @@ mod tests {
 
     #[test]
     fn complete_session_json_retains_full_owned_parity_and_rejects_source_changes() {
-        let world = cv_testkit::World::in_process("owned-api-source-guard");
+        let world = crate::test_world("owned-api-source-guard");
         let path = world.write_session(
             "full",
             &[json!({"type":"user", "uuid":"u", "message":{"role":"user", "content":"owned text"}})],
@@ -798,7 +802,7 @@ mod tests {
 
     #[test]
     fn staged_message_windows_match_value_response_bytes() {
-        let world = cv_testkit::World::in_process("api-staged-windows");
+        let world = crate::test_world("api-staged-windows");
         let body = "月🌙é\n\"\\".repeat(4000);
         world.write_session("staged",&[
             json!({"type":"assistant","sessionId":"staged","uuid":"a","message":{"role":"assistant","content":[{"type":"text","text":body},{"type":"tool_use","id":"c","name":"tool","input":{"z":body,"a":2}}]}}),
@@ -829,7 +833,7 @@ mod tests {
 
     #[test]
     fn selected_json_window_reports_read_errors_and_skipped_values_stay_lazy() {
-        let world = cv_testkit::World::in_process("api_json_failure");
+        let world = crate::test_world("api_json_failure");
         let path = world.home.join("input.json");
         let body = r#"{"command":"git status"}"#;
         std::fs::write(&path, body).unwrap();
@@ -863,7 +867,7 @@ mod tests {
     fn pagination_prefix_replay_read_work() {
         use crate::Adapter as _;
         use std::io::Write as _;
-        let world = cv_testkit::World::in_process("api_page_read_work");
+        let world = crate::test_world("api_page_read_work");
         let path = world.transcript("pages");
         let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
         let records = 20_000usize;

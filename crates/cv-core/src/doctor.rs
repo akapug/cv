@@ -1,10 +1,10 @@
 //! Compaction doctor: attribute a session's context-window pressure to its sources.
 //!
-//! Powers both `cv doctor` (CLI rendering) and the `doctor` MCP tool. Attributes stored transcript
-//! content using decoded text/JSON bytes divided by 3.5 and a fixed image estimate. Thinking includes
-//! plaintext, signatures and encrypted blobs as payload-size proxies; opaque bytes do not establish
-//! provider reasoning tokens or their cost on resume. Totals span transcript history, including
-//! compactions, rather than describing the currently loaded model context.
+//! Powers both `cv doctor` (CLI rendering) and the `doctor` MCP tool. Sizes stored transcript
+//! content with the shared estimator ([`crate::ir::est_tokens`]: per-kind bytes/token calibrated
+//! against the API's token counts). Thinking counts plaintext plus signature and encrypted bytes,
+//! which Claude requests do carry. Totals span transcript history, including compactions, rather
+//! than describing the currently loaded model context.
 //!
 //! Recorded prompt usage supplies peak sizing and the first-prompt heuristic for fixed overhead.
 //! The first prompt also contains conversation; fixed system/tool overhead is not separately
@@ -16,9 +16,6 @@ use crate::stream::{Flow, MessageSink};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
-
-/// Heuristic conversion for stored text/JSON payloads, not a provider tokenizer.
-const BYTES_PER_TOKEN: f64 = 3.5;
 
 /// The bucket name for an injected-context turn: the harness's own attachment kind when it recorded
 /// one (`extra[h]["attachment_type"]`, e.g. Claude's `hook_success`), else the IR kind name.
@@ -213,7 +210,7 @@ impl SessionPass<'_> {
         for b in &m.content {
             // What this block costs, by the one shared rule; the arms below only decide which
             // bucket the number lands in.
-            let tokens = || est_tokens_resolved(b, BYTES_PER_TOKEN, &self.resolver);
+            let tokens = || est_tokens_resolved(b, &self.resolver);
             match b {
                 Block::Text { .. } => {
                     match (m.role, m.kind) {
@@ -310,7 +307,7 @@ mod tests {
 
     #[test]
     fn unreadable_text_cannot_be_published_as_zero_tokens() {
-        let world = cv_testkit::World::in_process("doctor-checked-text");
+        let world = crate::test_world("doctor-checked-text");
         let path = world.base.join("payload.json");
         let wire = serde_json::to_vec(&"🌙\n".repeat(8192)).unwrap();
         std::fs::write(&path, &wire).unwrap();
@@ -351,9 +348,9 @@ mod tests {
         }
         pass.finish().unwrap();
         let mcp = &rep.by_tool["mcp__s__q"];
-        assert_eq!((mcp.calls, mcp.result_tokens, mcp.is_mcp), (1, 20, true));
-        assert_eq!(rep.by_tool["(unknown tool)"].result_tokens, 1);
-        assert_eq!(rep.mcp_tool_results(), 20);
+        assert_eq!((mcp.calls, mcp.result_tokens, mcp.is_mcp), (1, 44, true));
+        assert_eq!(rep.by_tool["(unknown tool)"].result_tokens, 13);
+        assert_eq!(rep.mcp_tool_results(), 44);
         assert_eq!((rep.sessions, rep.messages), (1, 3));
     }
     #[test]

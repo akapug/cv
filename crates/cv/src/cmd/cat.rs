@@ -24,7 +24,14 @@ pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>,
         input,
         hit: None,
     };
-    let mut parsed = cv_core::stream::stream_counted(adapter.as_ref(), &r, &ParseOptions::lazy(), &mut found)?;
+    let mut parsed = cv_core::stream::stream_counted(
+        adapter.as_ref(),
+        &r,
+        &ParseOptions::lazy(),
+        &mut found,
+        cv_core::stream::Pass::RECORD,
+    )?
+    .session;
     parsed.messages = found.hit.into_iter().collect();
     let sidecar = sidecar_path(&r.path);
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -184,7 +191,7 @@ mod tests {
     #[test]
     fn retained_result_prints_exact_text_and_rejects_source_failure_without_output() {
         use cv_core::{Block, Flow, Harness, Message, MessageSink, Role, Session};
-        let world = cv_testkit::World::in_process("cat-retained-result");
+        let world = crate::test_world("cat-retained-result");
         let path = world.base.join("result.json");
         let body = "actual🌙\n\"\\".repeat(1024);
         let wire = serde_json::to_vec(&body).unwrap();

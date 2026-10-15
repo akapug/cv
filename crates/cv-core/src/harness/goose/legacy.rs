@@ -118,7 +118,7 @@ fn read_message(
         .and_then(|n| n.as_i64())
         .and_then(ts_from_epoch);
     let decoded = match fields.get("content") {
-        Some(content) => decode_content_view(content, tools, opts, source, arena)?,
+        Some(content) => record::content(content, tools, opts, Some((source, arena)))?,
         None => Decoded::default(),
     };
     let Some(mut message) = build_message(&role, id, timestamp, None, decoded) else {
@@ -218,7 +218,11 @@ fn note(view: JsonView<'_>, header: bool, session: &mut SessionRef) -> Result<()
         return Ok(());
     };
     let role = fields.string("role")?.unwrap_or_else(|| "user".into());
-    session.message_count += usize::from(super::count::view(&role, fields.get("content"))?);
+    let decoded = match fields.get("content") {
+        Some(content) => record::content(content, &mut HashMap::new(), &ParseOptions::lazy(), None)?,
+        None => Decoded::default(),
+    };
+    session.message_count += usize::from(is_turn(role, None, decoded));
     Ok(())
 }
 
@@ -227,7 +231,7 @@ mod tests {
     use super::*;
     #[test]
     fn projected_discovery_preserves_header_count_and_whole_utf8_policy() {
-        let world = cv_testkit::World::in_process("goose-legacy-discovery");
+        let world = crate::test_world("goose-legacy-discovery");
         let path = world.base.join("legacy.jsonl");
         let observe = |r: Option<SessionRef>| serde_json::to_value(r).unwrap();
         let cases: Vec<Vec<u8>> = vec![
@@ -300,9 +304,12 @@ mod tests {
         session
     }
 
-    /// Oracle is the original line/Value reader; it tests acceptance and ordering independently
-    /// of source selection, including malformed ignored fields and duplicate keys.
-    fn owned_messages(text: &[u8]) -> Vec<Message> {
+    /// Oracle is a line/Value reader feeding owned values to the codec; it tests framing,
+    /// acceptance and ordering, including malformed ignored fields and duplicate keys.
+    fn owned_messages(path: &Path) -> Vec<Message> {
+        let text = std::fs::read(path).unwrap();
+        let source = JsonSource::capture(path).unwrap();
+        let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
         let mut tools = HashMap::new();
         text.split(|b| *b == b'\n')
             .skip(1)
@@ -313,7 +320,9 @@ mod tests {
                 let timestamp = value.get("created").and_then(Value::as_i64).and_then(ts_from_epoch);
                 let decoded = value
                     .get("content")
-                    .map(|c| decode_content(c, &mut tools))
+                    .map(|c| {
+                        record::content(c.into(), &mut tools, &ParseOptions::full(), Some((&source, &arena))).unwrap()
+                    })
                     .unwrap_or_default();
                 build_message(role, id, timestamp, None, decoded)
             })
@@ -322,7 +331,7 @@ mod tests {
 
     #[test]
     fn selected_stream_preserves_legacy_acceptance_order_and_rich_demand() {
-        let world = cv_testkit::World::in_process("goose-legacy-stream");
+        let world = crate::test_world("goose-legacy-stream");
         let path = world.base.join("legacy.jsonl");
         let giant = "雪\n\"".repeat(30_000);
         let header =
@@ -349,7 +358,7 @@ mod tests {
         bytes.extend_from_slice(b"\xff\n");
         bytes.extend_from_slice(br#"{"role":null,"id":false,"created":1.5,"content":"final"}"#);
         std::fs::write(&path, &bytes).unwrap();
-        let expected = owned_messages(&bytes);
+        let expected = owned_messages(&path);
         let observe = |messages: Vec<Message>| serde_json::to_value(messages).unwrap();
         for opts in [
             ParseOptions::full(),
@@ -386,7 +395,7 @@ mod tests {
 
     #[test]
     fn selected_stream_retains_checked_bodies_and_stops_before_later_records() {
-        let world = cv_testkit::World::in_process("goose-legacy-stop");
+        let world = crate::test_world("goose-legacy-stop");
         let path = world.base.join("legacy.jsonl");
         let giant = "\n雪".repeat(30_000);
         let first = serde_json::json!({"role":"assistant","content":[{"type":"text","text":giant},{"type":"toolRequest","id":"tool","toolCall":{"value":{"name":"shell","arguments":{"command":giant}}}}]});
@@ -455,7 +464,7 @@ mod tests {
             .next()
             .and_then(|l| serde_json::from_str(l).ok())
             .unwrap_or(Value::Null);
-        let count = owned_messages(text.as_bytes()).iter().filter(|m| m.is_turn()).count();
+        let count = owned_messages(path).iter().filter(|m| m.is_turn()).count();
         let title = header
             .get("description")
             .and_then(Value::as_str)

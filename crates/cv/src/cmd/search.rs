@@ -71,7 +71,7 @@ pub(crate) fn cmd_search(
 /// Where the retired sqlite FTS index used to live: `$CLUSTERVISION_HOME/index.sqlite` or
 /// `~/.clustervision/index.sqlite`. Only used to nudge cleanup of a stale file.
 fn legacy_sqlite_index_path() -> Option<PathBuf> {
-    std::env::var_os("CLUSTERVISION_HOME")
+    cv_core::env::var_os("CLUSTERVISION_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs_home().map(|h| h.join(".clustervision")))
         .map(|d| d.join("index.sqlite"))
@@ -279,8 +279,7 @@ pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool, if_chang
         if rebuild { "rebuilding" } else { "updating" },
         if subagents { " (+ sub-agent forest)" } else { "" }
     );
-    let refs = cv_core::discover_all();
-    let n = cv_search::index_sessions(None, &refs, rebuild, subagents)?;
+    let (n, refs) = cv_search::index_all(None, rebuild, subagents)?;
     println!(
         "indexed {n} top-level session(s) → {}{}",
         cv_search::default_tantivy_dir().display(),

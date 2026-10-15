@@ -157,7 +157,9 @@ fn write_sidecar(transcript: &Path, elided: &[cv_core::distill::Elided]) -> Resu
     }
     let stem = transcript.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
     let p = transcript.with_file_name(format!("{stem}.flat.jsonl"));
-    cv_core::distill::write_sidecar(&p, elided).with_context(|| format!("writing sidecar {}", p.display()))?;
+    // The sidecar of a transcript this command just created: a taken name is another artifact.
+    cv_core::distill::write_sidecar(&p, elided, cv_core::publish::Claim::New)
+        .with_context(|| format!("writing sidecar {}", p.display()))?;
     Ok(Some(p))
 }
 
@@ -228,7 +230,13 @@ pub(crate) fn emit_to(
             // The meta sidecar is optional for resume, but carries the model and the label a
             // harness shows; inherit the source's when it has one.
             let meta = agent_meta(source_path, description, model.as_deref());
-            std::fs::write(sub.join(format!("agent-{agent}.meta.json")), meta.to_string())?;
+            let meta_path = sub.join(format!("agent-{agent}.meta.json"));
+            cv_core::publish::publish_reader(
+                &meta_path,
+                "meta",
+                meta.to_string().as_bytes(),
+                cv_core::publish::Claim::New,
+            )?;
             let sidecar = write_sidecar(&res.path, elided)?;
             Ok(Emitted {
                 session_id: Some(root.id),
@@ -334,10 +342,14 @@ pub(crate) fn cmd_distill(
     upto: Option<usize>,
     with: &[String],
     pack: Option<PathBuf>,
+    force: bool,
     target: Target,
     json_out: bool,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
+    if let Some(path) = &pack {
+        crate::util::user_file_claim(path, force)?;
+    }
     let (s, src_path) = match upto {
         Some(n) => load_upto(spec, want, n)?,
         None => load_distill(spec, want)?,
@@ -370,7 +382,7 @@ pub(crate) fn cmd_distill(
     };
     let mut h = report_text(&d, &emitted);
     if let Some(p) = &pack {
-        std::fs::write(p, d.pack()).with_context(|| format!("writing {}", p.display()))?;
+        crate::util::write_user_file(p, d.pack().as_bytes(), force)?;
         let _ = writeln!(h, "  ↳ pack {}", p.display());
     }
     report(
@@ -423,7 +435,7 @@ mod tests {
         let json_out = std::env::var("CV_DISTILL_PROBE_REPORT").as_deref() != Ok("human");
         let pack = (mode != "stdout").then(|| destination.join("pack.md"));
         let baseline = cv_testkit::heap::begin();
-        let result = cmd_distill(&source, None, opts, upto, &with, pack, target, json_out);
+        let result = cmd_distill(&source, None, opts, upto, &with, pack, false, target, json_out);
         let heap = cv_testkit::heap::end(baseline);
         eprintln!("CV_DISTILL_HEAP {}", serde_json::to_string(&heap)?);
         result

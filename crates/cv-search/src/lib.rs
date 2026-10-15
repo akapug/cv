@@ -68,10 +68,10 @@ pub struct Hit {
 /// existing `~/.claurdvoyant` (kept only if the new dir hasn't been created) — so a previously-built
 /// index/embedding store isn't orphaned by the rename.
 pub fn home_dir() -> PathBuf {
-    if let Some(v) = std::env::var_os("CLUSTERVISION_HOME").or_else(|| std::env::var_os("CLAURDVOYANT_HOME")) {
+    if let Some(v) = cv_core::env::var_os("CLUSTERVISION_HOME").or_else(|| cv_core::env::var_os("CLAURDVOYANT_HOME")) {
         return PathBuf::from(v);
     }
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = cv_core::env::home_dir() else {
         return PathBuf::from(".");
     };
     let new = home.join(".clustervision");
@@ -98,8 +98,13 @@ pub fn default_embeddings_path() -> PathBuf {
 
 /// Discover, parse, and update the full-text index at its default location. Incremental by default
 /// (only changed/new sessions are rewritten; vanished ones are reaped); `rebuild = true` clears and
-/// rebuilds from scratch. Returns the number of sessions discovered.
-pub fn index_all(dir: impl Into<Option<PathBuf>>, rebuild: bool, subagents: bool) -> Result<usize> {
+/// rebuilds from scratch. Returns the number of sessions discovered, and their refs. Each compressed
+/// rollout is decoded once: discovery hands its decoded bytes to the sweep running beside it.
+pub fn index_all(
+    dir: impl Into<Option<PathBuf>>,
+    rebuild: bool,
+    subagents: bool,
+) -> Result<(usize, Vec<cv_core::SessionRef>)> {
     let dir = dir.into().unwrap_or_else(default_tantivy_dir);
     fts::index_all(&dir, rebuild, subagents)
 }
@@ -212,8 +217,15 @@ pub fn semantic_search_filtered(
 pub(crate) fn read_corpus_doc(r: &cv_core::SessionRef) -> Result<(Doc, cv_core::source::ReadSet)> {
     let adapter = cv_core::harness::for_harness(r.harness).with_context(|| format!("no adapter for {}", r.harness))?;
     let mut sink = semantic_corpus::DocSink::new(cv_core::Resolver::new(Some(r.path.clone())));
-    let meta = cv_core::stream::stream_counted(&*adapter, r, &cv_core::ParseOptions::lazy(), &mut sink)
-        .with_context(|| format!("reading semantic corpus session {} ({})", r.id, r.harness))?;
+    let meta = cv_core::stream::stream_counted(
+        &*adapter,
+        r,
+        &cv_core::ParseOptions::lazy(),
+        &mut sink,
+        cv_core::stream::Pass::RECORD,
+    )
+    .with_context(|| format!("reading semantic corpus session {} ({})", r.id, r.harness))?
+    .session;
     let title = cv_core::label_from(meta.title.as_deref(), sink.first_user_text.as_deref());
     Ok((
         Doc {

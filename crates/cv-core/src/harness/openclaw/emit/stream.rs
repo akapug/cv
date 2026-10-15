@@ -289,7 +289,7 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
     }
     // All source demands complete before opening the transcript or changing its index.
     fs::create_dir_all(&sessions_dir).with_context(|| format!("creating {}", sessions_dir.display()))?;
-    lines.publish(&file_path)?;
+    lines.publish(&file_path, opts.claim())?;
     let index_path = sessions_dir.join("sessions.json");
     let mut index: Map<String, Value> = fs::read_to_string(&index_path)
         .ok()
@@ -310,7 +310,8 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
     index.insert(new_id.clone(), Value::Object(entry));
     let mut index_stage = crate::harness::store::bytes::ByteStage::new();
     serde_json::to_writer_pretty(&mut index_stage, &index)?;
-    crate::harness::store::publish_stage(index_stage, &index_path)?;
+    // OpenClaw's own index: cv's update replaces it whole.
+    crate::harness::store::publish_stage(index_stage, &index_path, crate::publish::Claim::Replace)?;
     Ok(EmitResult {
         path: file_path,
         new_id: new_id.clone(),

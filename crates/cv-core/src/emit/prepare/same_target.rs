@@ -105,7 +105,7 @@ fn check(adapter: &dyn Adapter, reference: &SessionRef, target: Harness, output:
 
 #[test]
 fn same_target_complete_task_dirs_preserve_owned_ir_wire_and_source_errors() -> Result<()> {
-    let world = cv_testkit::World::in_process("same-target-task-dirs");
+    let world = crate::test_world("same-target-task-dirs");
     let body = "ordinary \\ λ\n".repeat(12000);
     for target in [Harness::Cline, Harness::Roo] {
         let root = world.base.join(target.as_str());
@@ -144,7 +144,7 @@ fn same_target_complete_task_dirs_preserve_owned_ir_wire_and_source_errors() -> 
 
 #[test]
 fn same_target_complete_sdk_preserves_owned_ir_wire_and_source_errors() -> Result<()> {
-    let world = cv_testkit::World::in_process("same-target-sdk");
+    let world = crate::test_world("same-target-sdk");
     let source = world.base.join("synthetic-source.messages.json");
     let body = "sdk text λ\n".repeat(12000);
     fs::write(
@@ -174,7 +174,7 @@ fn same_target_complete_sdk_preserves_owned_ir_wire_and_source_errors() -> Resul
 
 #[test]
 fn same_target_complete_continue_preserves_owned_ir_wire_and_source_errors() -> Result<()> {
-    let world = cv_testkit::World::in_process("same-target-continue");
+    let world = crate::test_world("same-target-continue");
     let body = "continue λ\n".repeat(12000);
     let source = world.base.join("session.json");
     fs::write(
@@ -200,7 +200,7 @@ fn same_target_complete_continue_preserves_owned_ir_wire_and_source_errors() -> 
 
 #[test]
 fn same_target_complete_lm_variants_preserve_owned_ir_wire_and_source_errors() -> Result<()> {
-    let world = cv_testkit::World::in_process("same-target-lm");
+    let world = crate::test_world("same-target-lm");
     let body = "lmstudio λ\n".repeat(12000);
     let source = world.base.join("session.conversation.json");
     fs::write(

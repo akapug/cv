@@ -30,7 +30,6 @@ thiserror.workspace = true
 walkdir.workspace = true
 percent-encoding.workspace = true
 rusqlite = { workspace = true, optional = true, features = ["blob"] }
-ruzstd = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 dirs.workspace = true
 uuid.workspace = true
@@ -47,6 +46,9 @@ memmap2 = { version = ">=0.9.11, <0.10", optional = true }
 # concurrency, so the store falls back to a plain open there.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
+# libzstd decodes compressed sources natively (`store::zst`): already linked into the shipped
+# binary through tantivy, and about 4x ruzstd's decode rate on Codex's compressed rollouts.
+zstd = { version = "0.13", optional = true, default-features = false }
 
 # uuid v4 generation needs a randomness source; on wasm32-unknown-unknown that means the JS
 # crypto API via getrandom's `js` backend. Feature-gating it here (features unify per-target)
@@ -58,6 +60,8 @@ libc = "0.2"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 uuid = { workspace = true, features = ["js"] }
+# Pure-Rust zstd for wasm builds (`store::zst`); native builds use libzstd below.
+ruzstd = { workspace = true, optional = true }
 
 [features]
 zip-ingest = ["dep:zip"]
@@ -66,14 +70,19 @@ default = ["sqlite", "parallel", "mmap"]
 # Off for wasm32 (no mmap); the resolver falls back to a positioned ranged read, behavior identical.
 mmap = ["dep:memmap2"]
 # `sqlite` pulls in rusqlite (native C SQLite) for the SQLite-backed adapters (Hermes, Cursor,
-# Goose, Zed, Devin) and the FTS index, plus ruzstd (pure Rust) for Zed's zstd-compressed thread blobs.
+# Goose, Zed, Devin) and the FTS index, plus a zstd decoder for compressed rollouts and blobs.
 # Disable it (e.g. `--no-default-features`) to compile cv-core for wasm32.
-sqlite = ["dep:rusqlite", "dep:ruzstd"]
+sqlite = ["dep:rusqlite", "dep:ruzstd", "dep:zstd"]
 # `parallel` fans discovery across adapters/files with rayon. Off for wasm32 (no threads); the code
 # has a sequential fallback so behavior is identical, just slower.
 parallel = ["dep:rayon"]
 # Diagnostic example only: count requested Rust allocations separately from clean timing runs.
 probe-heap = []
+
+# The golden corpus reads every harness's store, SQLite and zstd ones included.
+[[test]]
+name = "corpus"
+required-features = ["sqlite"]
 
 [dev-dependencies]
 syn = { version = "2", features = ["full"] }

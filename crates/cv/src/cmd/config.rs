@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn requested_update_rejects_malformed_config_without_overwriting_it() {
-        let _world = cv_testkit::World::in_process("config-cli-malformed");
+        let _world = crate::test_world("config-cli-malformed");
         let path = cv_core::config::save(&cv_core::config::Config::default()).unwrap();
         let original = "exports = [broken";
         std::fs::write(&path, original).unwrap();

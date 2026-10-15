@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn decoded_lengths_preserve_prefix_boundaries_and_source_guards() {
-        let world = cv_testkit::World::in_process("source-text-length");
+        let world = crate::test_world("source-text-length");
         let path = world.base.join("text.json");
         let body = "a🌙\n\"\\".repeat(8192);
         let bytes = serde_json::to_vec(&body).unwrap();
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn giant_prefix_demands_preserve_utf8_and_original_identity() {
-        let world = cv_testkit::World::in_process("source-text-prefix-window");
+        let world = crate::test_world("source-text-prefix-window");
         let path = world.base.join("original.json");
         let body = format!("🌙\n{}", "x".repeat(1024 * 1024));
         std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn backed_text_retains_arena_and_checked_decoded_demands() {
-        let world = cv_testkit::World::in_process("source-text-demands");
+        let world = crate::test_world("source-text-demands");
         let path = world.base.join("original");
         std::fs::write(&path, "original compressed provenance").unwrap();
         let source = JsonSource::capture(&path).unwrap();

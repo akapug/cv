@@ -166,38 +166,9 @@ impl Native {
     // A full owned read has no retained payload witness: rebuild just this record using
     // the native codec, then apply the session-level normalization used by the reader.
     fn owned_group(&self, value: &Value, envelopes: &[Message], messages: &[Message]) -> Option<usize> {
-        let opts = ParseOptions::complete();
-        let mut original = match value.get("type").and_then(Value::as_str).unwrap_or("") {
-            "message" => super::super::parse_entry(value),
-            "compaction" | "reset" | "branch_summary" | "custom_message" | "model_change" | "thinking_level_change" => {
-                super::super::parse_control_entry(value)
-            }
-            "session_info" => super::super::notice_if_complete(
-                value,
-                &opts,
-                format!(
-                    "[session named: {}]",
-                    value
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or("")
-                ),
-            ),
-            "label" => super::super::notice_if_complete(
-                value,
-                &opts,
-                format!(
-                    "[label {}: {}]",
-                    value.get("targetId").and_then(Value::as_str).unwrap_or(""),
-                    value.get("label").and_then(Value::as_str).unwrap_or("")
-                ),
-            ),
-            _ => super::super::carrier_if_complete(value, &opts),
-        };
-        if original.is_empty() {
-            original = super::super::carrier_if_complete(value, &opts);
-        }
+        let mut original = super::super::record::record(JsonView::from(value), &ParseOptions::complete())
+            .ok()?
+            .messages;
         if original.len() != envelopes.len() || messages.len() < original.len() {
             return None;
         }
@@ -270,7 +241,7 @@ fn message_with_thinking(
                     .as_deref()
                     == Some("thinking");
                 let block = if thinking {
-                    super::super::selected::projected_block(part)?
+                    super::super::record::block_with(part, true, &mut |v| v.source_text())?
                 } else {
                     None
                 };

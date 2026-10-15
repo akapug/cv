@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "grok"
-source_files = ["harness/grok.rs", "harness/wire/openai.rs", "harness/wire/mod.rs"]
+source_files = ["harness/grok.rs", "harness/grok/record.rs", "harness/wire/openai.rs", "harness/wire/mod.rs"]
 ignore_literals = []
 store = [
   "~/.grok/sessions/<percent-encoded-cwd>/<sessionId>/{chat_history.jsonl,updates.jsonl,summary.json,system_prompt.txt}",

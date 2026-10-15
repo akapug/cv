@@ -106,7 +106,7 @@ mod tests {
     use super::*;
     #[test]
     fn dependency_guards_do_not_collapse_different_wal_states_or_get_recaptured() {
-        let world = cv_testkit::World::in_process("json-source-read-guard");
+        let world = crate::test_world("json-source-read-guard");
         let path = world.base.join("source.json");
         let wal = world.base.join("source.json-wal");
         std::fs::write(&path, r#"{"value":"old"}"#).unwrap();
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn decoded_documents_register_one_arena_and_original_identity() {
-        let world = cv_testkit::World::in_process("decoded-source-transport");
+        let world = crate::test_world("decoded-source-transport");
         let path = world.base.join("source.json");
         let argument = format!("{{\"p\":\"{}\"}}", "x".repeat(8192));
         std::fs::write(&path, serde_json::to_vec(&vec![&argument; 32]).unwrap()).unwrap();
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn repeated_sources_share_original_identity_and_never_recapture() {
-        let world = cv_testkit::World::in_process("json-source-transport");
+        let world = crate::test_world("json-source-transport");
         let path = world.base.join("source.json");
         std::fs::write(&path, r#"{"value":"old"}"#).unwrap();
         let mut first = Json::source(&path, 0, 15).unwrap();

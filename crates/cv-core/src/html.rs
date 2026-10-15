@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn lazy_html_text_matches_owned_and_rejects_changed_sources() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("html-lazy-card");
+        let world = crate::test_world("html-lazy-card");
         let path = world.base.join("body.json");
         let body = format!(
             "{}<script>bad</script> `λ`\n\n```rust\n<unsafe>\n```",

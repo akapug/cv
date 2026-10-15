@@ -428,7 +428,7 @@ fn update_message_count(conn: &rusqlite::Connection, id: &str) -> Result<()> {
 /// must instead be JSON-quoted, or its next parse could change type (e.g. "null" → Null).
 fn extra_column<'a>(bag: Option<&'a serde_json::Map<String, Value>>, key: &str) -> Option<std::borrow::Cow<'a, str>> {
     bag.and_then(|bag| bag.get(key)).map(|value| match value {
-        Value::String(raw) if !super::accepted_json(raw) => std::borrow::Cow::Borrowed(raw.as_str()),
+        Value::String(raw) if serde_json::from_str::<Value>(raw).is_err() => std::borrow::Cow::Borrowed(raw.as_str()),
         value => std::borrow::Cow::Owned(value.to_string()),
     })
 }
@@ -556,31 +556,12 @@ fn tool_calls(blocks: &[Block]) -> Result<Option<String>> {
 }
 
 #[cfg(test)]
-mod legacy;
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    // Keep the old content codec as the byte oracle, applying only intentional schema/policy
-    // changes here. The native replay controls below check those changed semantics independently.
-    fn historical_wire_oracle(session: &Session, directory: &Path, options: &EmitOptions) -> Result<EmitResult> {
-        let result = legacy::emit(session, directory, options)?;
-        let connection = rusqlite::Connection::open(&result.path)?;
-        reconcile_columns(&connection)?;
-        if options.thinking == ThinkingMode::Drop {
-            connection.execute_batch(
-                "UPDATE messages SET reasoning=NULL, reasoning_content=NULL, \
-                reasoning_details=NULL, codex_reasoning_items=NULL;",
-            )?;
-        }
-        update_message_count(&connection, &result.new_id)?;
-        Ok(result)
-    }
-
     fn parsed(connection: &rusqlite::Connection, options: &crate::stream::ParseOptions) -> Result<Session> {
         super::super::parse_conn_with(
             connection,
-            &crate::SessionRef::new("fixed", Harness::Hermes, ":memory:"),
+            &crate::SessionRef::new("fixed", Harness::Hermes, connection.path().expect("file store")),
             options,
         )
     }
@@ -602,7 +583,9 @@ mod tests {
 
     #[test]
     fn modern_native_exports_preserve_display_compaction_identity_and_sparse_metadata() -> Result<()> {
-        let source = rusqlite::Connection::open_in_memory()?;
+        let store = std::env::temp_dir().join(format!("cv-hermes-export-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&store)?;
+        let source = rusqlite::Connection::open(store.join("state.db"))?;
         source.execute_batch(include_str!("../../../tests/fixtures/hermes/schema-v30.sql"))?;
         reconcile_columns(&source)?;
         source.execute_batch(
@@ -640,7 +623,7 @@ mod tests {
             8,
             "one synthetic boundary accompanies the seven native rows"
         );
-        let world = cv_testkit::World::in_process("hermes-modern-export");
+        let world = crate::test_world("hermes-modern-export");
         for (name, old_schema) in [("fresh", false), ("historical", true)] {
             let directory = world.base.join(name);
             std::fs::create_dir_all(&directory)?;
@@ -721,7 +704,8 @@ mod tests {
             }))?;
             session.messages.push(message);
         }
-        let mut output = rusqlite::Connection::open_in_memory()?;
+        let store = crate::test_world("hermes-thinking-drop");
+        let mut output = rusqlite::Connection::open(store.base.join("state.db"))?;
         write_database(
             &session,
             &EmitOptions {
@@ -754,10 +738,10 @@ mod tests {
     }
 
     #[test]
-    fn checked_transactional_rows_match_legacy_and_roll_back() -> Result<()> {
-        crate::harness::store::sqlite::export_tests::exercise(
+    fn checked_transactional_rows_match_frozen_and_roll_back() -> Result<()> {
+        crate::harness::store::sqlite::export_tests::exercise_frozen(
             Harness::Hermes,
-            historical_wire_oracle,
+            "hermes-export",
             emit,
             |session, options, connection| write_database(session, options, "fixed", connection),
         )

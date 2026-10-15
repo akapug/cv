@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn source_text_frames_and_labels_match_owned_and_reject_changed_guards() {
-        let world = cv_testkit::World::in_process("archive-source-text");
+        let world = crate::test_world("archive-source-text");
         let path = world.home.join("source.json");
         let sidecar = world.home.join("optional-meta.json");
         let body = "  λ moon\n\"text\" ".repeat(10_000);

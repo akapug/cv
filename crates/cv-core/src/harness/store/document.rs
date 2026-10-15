@@ -11,8 +11,6 @@ use crate::lazy::INLINE_MAX;
 use anyhow::Context;
 use anyhow::Result;
 use serde_json::Value;
-#[cfg(any(feature = "mmap", test))]
-use std::collections::HashSet;
 use std::collections::{BTreeMap, VecDeque};
 
 /// Read-only mapped source bytes used by native scoped views and JSONL readers.
@@ -97,22 +95,22 @@ impl<'a> Fields<'a> {
         Ok(Some(Self { fields }))
     }
     fn parse_with(view: crate::json::JsonView<'a>, keys: &[&'static str], unique: bool) -> Result<Option<Self>> {
-        let fields = if unique {
-            view.select_unique_fields(keys)?
-        } else {
-            view.select_fields(keys)?
-        };
-        let Some(fields) = fields else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            fields: keys
-                .iter()
-                .copied()
-                .zip(fields)
-                .filter_map(|(key, value)| value.map(|value| (key, value)))
-                .collect(),
-        }))
+        let mut fields: Vec<(&'static str, crate::json::JsonView<'a>)> = Vec::new();
+        let mut seen = if unique { vec![false; keys.len()] } else { Vec::new() };
+        let complete = view.select_each(keys, unique, &mut |i, value| {
+            if unique {
+                if seen[i] {
+                    return Err(InvalidStruct("duplicate known field").into());
+                }
+                seen[i] = true;
+            }
+            match fields.iter_mut().find(|(name, _)| *name == keys[i]) {
+                Some(field) => field.1 = value,
+                None => fields.push((keys[i], value)),
+            }
+            Ok(())
+        })?;
+        Ok(complete.then_some(Self { fields }))
     }
     pub fn get(&self, key: &str) -> Option<crate::json::JsonView<'a>> {
         self.fields
@@ -145,6 +143,10 @@ impl<'a> Fields<'a> {
 /// shallow object must not repeatedly validate its potentially enormous string descendants.
 #[derive(Clone, Copy)]
 pub(crate) struct Raw<'a>(&'a str, &'a Index);
+
+/// Containers longer than this (and strings over INLINE_MAX) are remembered while validating,
+/// so each later structural selection (record, message, content, block) skips them in O(1).
+const SKIP_MIN: usize = 128;
 
 /// Memoize at most 1024 recent long string endpoints. Nested record wrappers reuse body bounds
 /// without retaining offsets for the entire history. Eviction affects only scan cost, not data.
@@ -184,6 +186,16 @@ impl<'a> Raw<'a> {
     }
 }
 
+/// Whether an unvalidated slice is exactly a serde `Value`, in one pass that also indexes it.
+pub(crate) fn validate(raw: Raw<'_>) -> bool {
+    let b = raw.get().as_bytes();
+    super::json::validate_value(raw.get(), |start, end| {
+        if end - start > if b[start] == b'"' { INLINE_MAX } else { SKIP_MIN } {
+            raw.1.remember(b.as_ptr() as usize + start, b.as_ptr() as usize + end);
+        }
+    })
+}
+
 pub(crate) fn accepts_value(raw: Raw<'_>) -> bool {
     accepts_value_at_depth(raw, 0)
 }
@@ -191,7 +203,8 @@ pub(crate) fn accepts_value(raw: Raw<'_>) -> bool {
 pub(crate) fn accepts_value_at_depth(raw: Raw<'_>, depth: usize) -> bool {
     let b = raw.get().as_bytes();
     super::json::value_compatible_str_at_depth_with(raw.get(), depth, |start, end| {
-        if end - start > INLINE_MAX {
+        // memchr already skips a string quickly; only a long one is worth an index entry.
+        if end - start > if b[start] == b'"' { INLINE_MAX } else { SKIP_MIN } {
             raw.1.remember(b.as_ptr() as usize + start, b.as_ptr() as usize + end);
         }
     })
@@ -199,20 +212,35 @@ pub(crate) fn accepts_value_at_depth(raw: Raw<'_>, depth: usize) -> bool {
 
 /// Select a bounded schema roster without allocating ignored keys or descendant payloads.
 /// Keys obey Value's final-duplicate rule; complete acceptance remains the caller's boundary.
-#[cfg(any(feature = "mmap", feature = "sqlite"))]
 pub(crate) fn select_fields<'a>(raw: Raw<'a>, keys: &[&str]) -> Option<Vec<Option<Raw<'a>>>> {
     select_fields_with(raw, keys, false).ok().flatten()
 }
-#[cfg(feature = "mmap")]
+fn select_fields_with<'a>(raw: Raw<'a>, keys: &[&str], unique: bool) -> Result<Option<Vec<Option<Raw<'a>>>>> {
+    let mut fields = vec![None; keys.len()];
+    let complete = select_each(raw, keys, unique, &mut |i, value| {
+        if unique && fields[i].is_some() {
+            return Err(InvalidStruct("duplicate known field").into());
+        }
+        fields[i] = Some(value);
+        Ok(())
+    })?;
+    Ok(complete.then_some(fields))
+}
 pub(crate) fn select_unique_fields<'a>(raw: Raw<'a>, keys: &[&str]) -> Result<Option<Vec<Option<Raw<'a>>>>> {
     select_fields_with(raw, keys, true)
 }
-#[cfg(any(feature = "mmap", feature = "sqlite"))]
-fn select_fields_with<'a>(raw: Raw<'a>, keys: &[&str], unique: bool) -> Result<Option<Vec<Option<Raw<'a>>>>> {
+/// Visit each requested field of an object in wire order (a later duplicate visits again, so
+/// the last visit wins). False for a nonobject or malformed object, whose visits must be dropped.
+pub(crate) fn select_each<'a>(
+    raw: Raw<'a>,
+    keys: &[&str],
+    unique: bool,
+    visit: &mut dyn FnMut(usize, Raw<'a>) -> Result<()>,
+) -> Result<bool> {
     use anyhow::Context;
     let b = raw.get().as_bytes();
     if b.first() != Some(&b'{') {
-        return Ok(None);
+        return Ok(false);
     }
     let key_limit = keys
         .iter()
@@ -221,26 +249,28 @@ fn select_fields_with<'a>(raw: Raw<'a>, keys: &[&str], unique: bool) -> Result<O
         .unwrap_or(0)
         .saturating_mul(6)
         .saturating_add(2);
-    let mut fields = vec![None; keys.len()];
     let mut cursor = 1;
     loop {
         whitespace(b, &mut cursor);
         if b.get(cursor) == Some(&b'}') {
-            return Ok(Some(fields));
+            return Ok(true);
         }
         let start = cursor;
         cursor = string_end(b, start, raw.1).context("invalid JSON key")?;
         if unique && !super::json::value_compatible(&b[start..cursor]) {
             return Err(InvalidStruct("invalid object key").into());
         }
-        let key = if cursor - start <= key_limit {
-            serde_json::from_str::<String>(&raw.get()[start..cursor]).ok()
-        } else {
+        let quoted = &raw.get()[start..cursor];
+        let key = if cursor - start > key_limit {
             None
+        } else if !quoted.as_bytes().contains(&b'\\') {
+            Some(std::borrow::Cow::Borrowed(&quoted[1..quoted.len() - 1]))
+        } else {
+            serde_json::from_str::<String>(quoted).ok().map(std::borrow::Cow::Owned)
         };
         whitespace(b, &mut cursor);
         if b.get(cursor) != Some(&b':') {
-            return Ok(None);
+            return Ok(false);
         }
         cursor += 1;
         whitespace(b, &mut cursor);
@@ -248,19 +278,16 @@ fn select_fields_with<'a>(raw: Raw<'a>, keys: &[&str], unique: bool) -> Result<O
         cursor = value_end(b, start, raw.1).context("invalid JSON field")?;
         if let Some(key) = key {
             for (i, requested) in keys.iter().enumerate() {
-                if key == *requested {
-                    if unique && fields[i].is_some() {
-                        return Err(InvalidStruct("duplicate known field").into());
-                    }
-                    fields[i] = Some(Raw(&raw.get()[start..cursor], raw.1));
+                if key == **requested {
+                    visit(i, Raw(&raw.get()[start..cursor], raw.1))?;
                 }
             }
         }
         whitespace(b, &mut cursor);
         match b.get(cursor) {
             Some(b',') => cursor += 1,
-            Some(b'}') => return Ok(Some(fields)),
-            _ => return Ok(None),
+            Some(b'}') => return Ok(true),
+            _ => return Ok(false),
         }
     }
 }
@@ -272,7 +299,7 @@ struct ObjectIter<'a> {
     done: bool,
 }
 impl<'a> Iterator for ObjectIter<'a> {
-    type Item = (String, Raw<'a>);
+    type Item = (std::borrow::Cow<'a, str>, Raw<'a>);
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
@@ -285,7 +312,12 @@ impl<'a> Iterator for ObjectIter<'a> {
         }
         let start = self.cursor;
         self.cursor = string_end(b, start, self.raw.1)?;
-        let key = serde_json::from_str(&self.raw.get()[start..self.cursor]).ok()?;
+        let quoted = &self.raw.get()[start..self.cursor];
+        let key = if quoted.as_bytes().contains(&b'\\') {
+            std::borrow::Cow::Owned(serde_json::from_str(quoted).ok()?)
+        } else {
+            std::borrow::Cow::Borrowed(&quoted[1..quoted.len() - 1])
+        };
         whitespace(b, &mut self.cursor);
         if b.get(self.cursor) != Some(&b':') {
             return None;
@@ -305,18 +337,12 @@ impl<'a> Iterator for ObjectIter<'a> {
     }
 }
 pub(crate) struct Record<'a> {
-    #[cfg(any(feature = "mmap", test))]
-    raw: Raw<'a>,
     pub fields: BTreeMap<String, Raw<'a>>,
 }
 impl<'a> Record<'a> {
     /// Missing/nonobject nested fields behave as an empty object without allocating a Value.
-    pub fn empty(raw: Raw<'a>) -> Self {
-        #[cfg(not(any(feature = "mmap", test)))]
-        let _ = raw;
+    pub fn empty(_: Raw<'a>) -> Self {
         Self {
-            #[cfg(any(feature = "mmap", test))]
-            raw,
             fields: BTreeMap::new(),
         }
     }
@@ -329,32 +355,8 @@ impl<'a> Record<'a> {
             cursor: 1,
             done: false,
         };
-        let fields = entries.by_ref().collect();
-        entries.done.then_some(Self {
-            #[cfg(any(feature = "mmap", test))]
-            raw,
-            fields,
-        })
-    }
-    /// serde_json's preserve_order keeps a key's first position and its final value. Only
-    /// callers that require navigation order retain the set; ordinary records retain no roster.
-    #[cfg(any(feature = "mmap", test))]
-    pub fn entries_in_order(&self) -> impl Iterator<Item = (String, Raw<'a>)> + '_ {
-        let mut seen = HashSet::new();
-        ObjectIter {
-            raw: self.raw,
-            cursor: 1,
-            done: self.fields.is_empty(),
-        }
-        .filter_map(move |(key, _)| {
-            seen.insert(key.clone())
-                .then(|| self.get(&key).map(|value| (key, value)))
-                .flatten()
-        })
-    }
-    #[cfg(test)]
-    pub fn values_in_order(&self) -> impl Iterator<Item = Raw<'a>> + '_ {
-        self.entries_in_order().map(|(_, value)| value)
+        let fields = entries.by_ref().map(|(key, value)| (key.into_owned(), value)).collect();
+        entries.done.then_some(Self { fields })
     }
     pub fn get(&self, key: &str) -> Option<Raw<'a>> {
         self.fields.get(key).copied()
@@ -366,6 +368,47 @@ impl<'a> Record<'a> {
     pub fn string(&self, key: &str) -> Option<String> {
         serde_json::from_str(self.fields.get(key)?.get()).ok()
     }
+}
+
+/// An object's entries as Value keeps them: each key at its first position, with its final
+/// value. None for a nonobject or malformed object. Narrow objects dedupe by scanning; wide
+/// ones by a position map.
+pub(crate) fn object_entries(raw: Raw<'_>) -> Option<Vec<(std::borrow::Cow<'_, str>, Raw<'_>)>> {
+    if !raw.get().starts_with('{') {
+        return None;
+    }
+    let mut iter = ObjectIter {
+        raw,
+        cursor: 1,
+        done: false,
+    };
+    let mut entries: Vec<(std::borrow::Cow<'_, str>, Raw<'_>)> = Vec::new();
+    let mut positions: Option<std::collections::HashMap<String, usize>> = None;
+    for (key, value) in iter.by_ref() {
+        if entries.len() == 16 && positions.is_none() {
+            positions = Some(
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (k, _))| (k.to_string(), i))
+                    .collect(),
+            );
+        }
+        let existing = match &positions {
+            Some(positions) => positions.get(key.as_ref()).copied(),
+            None => entries.iter().position(|(k, _)| *k == key),
+        };
+        match existing {
+            Some(i) => entries[i].1 = value,
+            None => {
+                if let Some(positions) = &mut positions {
+                    positions.insert(key.to_string(), entries.len());
+                }
+                entries.push((key, value));
+            }
+        }
+    }
+    iter.done.then_some(entries)
 }
 
 /// Chronological traversal keeps one descriptor regardless of record count. Input must already
@@ -410,10 +453,6 @@ impl<'a> Iterator for ArrayIter<'a> {
         Some(Raw(&self.raw.get()[start..end], self.raw.1))
     }
 }
-/// Retained descriptors are reserved for replay/navigation that genuinely needs random access.
-pub(crate) fn array(raw: Raw<'_>) -> Option<Vec<Raw<'_>>> {
-    Some(array_iter(raw)?.collect())
-}
 
 fn whitespace(b: &[u8], i: &mut usize) {
     while b.get(*i).is_some_and(u8::is_ascii_whitespace) {
@@ -435,6 +474,9 @@ fn value_end(b: &[u8], mut i: usize, index: &Index) -> Option<usize> {
     match b.get(i)? {
         b'"' => string_end(b, i, index),
         b'{' | b'[' => {
+            if let Some(end) = index.get(b.as_ptr() as usize + i) {
+                return Some(end - b.as_ptr() as usize);
+            }
             let mut depth = 1usize;
             i += 1;
             while depth != 0 {
@@ -530,21 +572,14 @@ pub(crate) fn text_summary<T: std::borrow::Borrow<crate::lazy::Text>>(
         };
         match text {
             crate::lazy::Text::Inline(s) => feed(s),
-            crate::lazy::Text::Source(source) => {
-                let prefix = source.try_prefix(1024).unwrap_or_default();
+            crate::lazy::Text::Source(_) | crate::lazy::Text::Span(_) => {
+                let prefix = text.try_resolve_prefix(resolver, 1024).unwrap_or_default();
                 feed(&prefix);
-                if require_nonwhite && !nonwhite && source.raw_len() > 1024 {
-                    let _ = source.try_for_each_chunk(4096, |chunk| {
+                if require_nonwhite && !nonwhite && text.len() > 1024 {
+                    let _ = text.try_for_each_chunk(resolver, 4096, |chunk| {
                         nonwhite |= chunk.chars().any(|c| !c.is_whitespace());
                         Ok(())
                     });
-                }
-            }
-            crate::lazy::Text::Span(sp) => {
-                let prefix = resolver.resolve_prefix(sp, 1024);
-                feed(&prefix);
-                if require_nonwhite && !nonwhite && sp.len > 1024 {
-                    resolver.for_each_chunk(sp, 4096, |chunk| nonwhite |= chunk.chars().any(|c| !c.is_whitespace()));
                 }
             }
         }
@@ -559,7 +594,7 @@ pub(crate) fn text_summary<T: std::borrow::Borrow<crate::lazy::Text>>(
 mod tests {
     #[test]
     fn checked_text_heads_preserve_classification_boundaries_and_source_errors() -> Result<()> {
-        let world = cv_testkit::World::in_process("checked-text-heads");
+        let world = crate::test_world("checked-text-heads");
         let path = world.base.join("text.json");
         let resolver = crate::lazy::Resolver::new(None);
         for body in [
@@ -615,7 +650,7 @@ mod tests {
             for (key, raw) in actual.fields {
                 let value: Value = serde_json::from_str(raw.get()).unwrap();
                 assert_eq!(value, expected[&key]);
-                if let Some(items) = array(raw) {
+                if let Some(items) = array_iter(raw).map(Iterator::collect::<Vec<_>>) {
                     assert_eq!(items.len(), value.as_array().unwrap().len());
                     for (raw, expected) in items.into_iter().zip(value.as_array().unwrap()) {
                         assert_eq!(serde_json::from_str::<Value>(raw.get()).unwrap(), *expected);
@@ -629,7 +664,6 @@ mod tests {
             assert!(Record::parse(raw).is_none());
             let empty = Record::empty(raw);
             assert!(empty.fields.is_empty());
-            assert_eq!(empty.values_in_order().count(), 0);
         }
     }
     #[test]

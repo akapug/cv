@@ -34,22 +34,37 @@ partly controls runner speed. Passing it is a regression check, not evidence of 
 
 ## Measured
 
-Fleet: ember's machine, 12 cores, 96 GB, ~6,750 sessions; claude + codex are 5,195 files, 95 GB.
-Release builds, `/usr/bin/time -l`, scratch catalog; 0.16.1 -> perf-2 (2026-10-12).
+2026-10-14, 0eea676f -> v17-perf. Release builds, `/usr/bin/time -l`, instructions retired
+(repeat to ~1%; the host's load was 25-200, so wall times are wide). Frozen: APFS clone under a
+fake HOME, 5,421 sessions (claude 38 GB; codex 40 GB, 3,923 of 4,483 rollouts `.jsonl.zst`,
+~89 GB decoded). Live: the real HOME read-only, ~7,000 sessions, scratch `CLUSTERVISION_HOME`.
 
-| command | 0.16.1 | after perf-2 |
-|---|---|---|
-| counts recount, frozen fleet | 335-379 s | 41-44 s, 140 MB |
-| counts recount, live fleet | 329 s, 1.6 GB | 61-68 s, 2.1-2.4 GB (budget missed) |
-| append ~1 MB to 3 sessions (1.6 GB) | 23-36 s, 2.3 GB | 0.69-0.72 s, 50-70 MB |
-| `cv index`, nothing changed | 0.66 s | 0.03-0.05 s scratch; ~0.9 s live |
-| `cv show <codex 708 MB> --last 20` | 2.0 s | 1.0 s |
-| `cv ls`, first run | 5.7 s | 7.5-7.8 s under load (not worked on) |
+| budget | 0eea676f | v17-perf | met? |
+|---|---|---|---|
+| index, nothing changed, frozen (≤ 1 s) | 7.5-9.0 G insn, 0.74-3.10 s | 4.3-4.5 G, 0.41-0.80 s | yes |
+| index, nothing changed, live (≤ 1 s) | 27-36 G, 2.6-5.2 s | 6.7-12.3 G, 0.99-1.61 s | no |
+| index after ~1 MB appended to each of 3 sessions (≤ 0.53 s) | 9.3 G, 0.95-0.98 s | 5.9-6.1 G, 0.70-0.74 s | no |
+| full recount, catalog deleted, frozen (≤ 60 s, RSS ≤ 2 GB) | 21.6 T, 849 s, RSS 2.9 GB | 12.8 T, 834 s, RSS 2.9 GB, footprint 689 MB | no |
+| ls, first run, frozen (≤ 300 ms) | 9,546 G, 257 s | 5,178-5,188 G, 158-186 s | no |
+| ls, warm, frozen / live (≤ 100 ms) | 0.50 G, 0.06-0.09 s | 0.50 G, 0.06-0.09 s | yes, when no live session changed |
+| `ls -q has:plan`, frozen (≤ 100 ms) | 4.9 G, 0.47-1.43 s | 1.7 G, 0.24-0.30 s | no |
+| `show --last 20` (≤ the session's counting pass) | | claude 3.7 G vs 3.6 G; codex 708 MB 12.6 G vs 12.7 G; codex zst 412 MB 28.0 G vs 27.8 G | yes, within startup |
+| counting pass (≥ 1 GB/s per core) | | best of 3: claude 190 MB at 641 MB/s, codex 708 MB at 719 MB/s, codex zst at 174 MB/s decoded | no |
 
-Counting pass on the largest sessions: codex 0.76-1.08 GB/s, claude 400-620 MB/s (budget missed).
-A 2026-10-13 live baseline indexed 6,826 sessions in 421.5 s wall / 592.8 s CPU, peak RSS 3.39 GB.
+A live "nothing changed" index also re-reads whatever ember's running sessions appended, so its
+range is the live write rate. The compressed path's floor is ruzstd's decode: 18.1-18.6 G for
+the 412 MB rollout with ruzstd 0.8.3 or 0.9.1 (C `zstd -dc`: 4.7 G). A cold index decodes each
+rollout once since 0.17: discovery hands its decoded bytes to the sweep running beside it.
+A full build from an empty home, frozen: 21.6 T, 737 s -> 12.9 T, 866 s, footprint 565 -> 715 MB.
+Live: 13.5 T, 966 s, RSS 3.4 GB, footprint 759 MB. `has:` now pays for the Claude tool-results
+inventory (a stat per file), which 0.16.1 did not check.
 
-Peak requested Rust heap, before -> after the datapaths pass (2026-10-12..14):
+Not reproducible on today's fleet, so removed: perf-2's recount 41-44 s / 140 MB, unchanged
+index 0.03-0.05 s, first listing 7.5-7.8 s, and the 421.5 s live index of 2026-10-13. All
+were measured before most codex rollouts were compressed.
+
+Peak requested Rust heap, before -> after the datapaths pass (2026-10-12..14; not re-measured
+here, the CI heap gates that bound them pass; compressed Codex now also gated, 6.4 MB flat):
 
 | operation | before | after |
 |---|---:|---:|

@@ -12,7 +12,7 @@
 
 *search by meaning · read behind every compaction · port across harnesses · resurrect a maxed-out session · pack a new task from your whole history*
 
-No database, no import, no telemetry: clustervision reads your **real local session storage** and turns the scattered pile of `.jsonl` into one searchable, lossless corpus. Full-text **and** semantic search across everything you've ever run; the verbatim detail **behind every compaction boundary**; one-command porting between harnesses; and a custom compaction that pulls a maxed-out session back from the context wall.
+No database server, no import step, no telemetry: clustervision reads your **real local session storage**. Run `cv index` for full-text search and `cv index --semantic` for meaning-based search. Read the verbatim detail **behind compaction boundaries** when the harness retains it, port sessions between harnesses with a fidelity report, and prune bulky history to revive a maxed-out session.
 
 <br>
 

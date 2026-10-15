@@ -554,10 +554,14 @@ pub(crate) fn cmd_dataset(
     redact: bool,
     redact_only: Option<String>,
     out: Option<PathBuf>,
+    force: bool,
 ) -> Result<()> {
     use std::io::Write;
     if !matches!(format, "chatml" | "sharegpt") {
         bail!("unknown format {format:?} (use chatml or sharegpt)");
+    }
+    if let Some(path) = &out {
+        crate::util::user_file_claim(path, force)?;
     }
     let want = parse_harness(&harness)?;
     let query = match query {
@@ -639,6 +643,7 @@ pub(crate) fn cmd_dataset(
         publish_dataset(
             stage,
             path,
+            force,
             sources
                 .iter()
                 .map(|r| r.path.as_path())
@@ -651,48 +656,37 @@ pub(crate) fn cmd_dataset(
     Ok(())
 }
 
-/// Preserve ordinary output-file permissions and links while rejecting transcript inode aliases
-/// before truncation. Input/transform failures have already completed against private staging.
+/// Publish the dataset whole at `--out` (refused if taken unless `--force`). Naming one of its
+/// own source transcripts is refused even with `--force`: the rename would replace it.
 fn publish_dataset<'a>(
     stage: cv_core::bytes::ByteStage,
     path: &std::path::Path,
+    force: bool,
     inputs: impl Iterator<Item = &'a std::path::Path>,
 ) -> Result<()> {
-    use std::io::Write;
-    let bytes = stage.finish()?;
-    let mut destination = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let target = destination.metadata()?;
+    if let Ok(target) = fs::metadata(path) {
         for input in inputs {
-            if let Ok(source) = fs::metadata(input) {
-                anyhow::ensure!(
-                    source.dev() != target.dev() || source.ino() != target.ino(),
-                    "dataset output aliases source transcript: {}",
-                    input.display()
-                );
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let target = fs::canonicalize(path)?;
-        for input in inputs {
+            let Ok(source) = fs::metadata(input) else { continue };
+            #[cfg(unix)]
+            let aliases = {
+                use std::os::unix::fs::MetadataExt;
+                source.dev() == target.dev() && source.ino() == target.ino()
+            };
+            #[cfg(not(unix))]
+            let aliases = {
+                let _ = (&source, &target);
+                fs::canonicalize(input).ok() == fs::canonicalize(path).ok()
+            };
             anyhow::ensure!(
-                fs::canonicalize(input).ok().as_ref() != Some(&target),
+                !aliases,
                 "dataset output aliases source transcript: {}",
                 input.display()
             );
         }
     }
-    destination.set_len(0)?;
-    bytes.copy_to(&mut destination)?;
-    destination.flush()?;
+    let claim = crate::util::user_file_claim(path, force)?;
+    let bytes = stage.finish()?;
+    cv_core::publish::publish_reader(path, "out", bytes.reader()?, claim)?;
     Ok(())
 }
 

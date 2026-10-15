@@ -55,6 +55,23 @@ fn normalized(path: &Path) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// One emitted session, frozen: the normalized transcript's and the index's length and SHA-256
+/// (the test's base directory normalized), the new id and the resume hint.
+fn frozen_entry(base: &Path, result: &EmitResult) -> Result<Value> {
+    let digest = |bytes: Vec<u8>| {
+        let bytes = String::from_utf8(bytes)
+            .unwrap()
+            .replace(&*base.to_string_lossy(), "$BASE");
+        json!([bytes.len(), crate::digest::sha256_hex(bytes.as_bytes())])
+    };
+    Ok(json!({
+        "transcript": digest(normalized(&result.path)?),
+        "index": digest(fs::read(result.path.parent().unwrap().join("sessions.json"))?),
+        "new_id": result.new_id,
+        "resume_hint": result.resume_hint,
+    }))
+}
+
 fn source_text(path: &Path, body: &str) -> Result<crate::Text> {
     let bytes = serde_json::to_vec(body)?;
     fs::write(path, &bytes)?;
@@ -196,42 +213,30 @@ fn fixture(base: &Path) -> Result<Session> {
 
 #[test]
 fn checked_openclaw_matches_frozen_records_index_and_all_modes() -> Result<()> {
-    let world = cv_testkit::World::in_process("openclaw-checked-wire");
+    let world = crate::test_world("openclaw-checked-wire");
     let session = fixture(&world.base)?;
+    let mut frozen = crate::emit::grok_qwen_tests::Frozen::new("openclaw-fixture");
     for mode in ThinkingMode::ALL {
         let options = EmitOptions {
             new_id: Some("fixed".into()),
             thinking: mode,
             ..Default::default()
         };
-        let before_root = world.base.join(format!("old-{mode}/agents"));
-        let after_root = world.base.join(format!("new-{mode}/agents"));
-        for root in [&before_root, &after_root] {
-            fs::create_dir_all(root.join("main/sessions"))?;
-            fs::write(
-                root.join("main/sessions/sessions.json"),
-                serde_json::to_vec(&json!({"untouched":{"label":"keep"},"fixed":{"old":"replace"}}))?,
-            )?;
-        }
-        let mut owned = session.clone();
-        owned.materialize()?;
-        crate::emit::project_owned_thinking_for_test(&mut owned, Harness::OpenClaw, mode);
-        let before = legacy::emit(&owned, &before_root, &options)?;
-        let after = crate::emit::emit(&session, Harness::OpenClaw, &after_root, &options)?;
-        assert_eq!(normalized(&before.path)?, normalized(&after.path)?, "mode={mode}");
-        assert_eq!(
-            fs::read(before.path.parent().unwrap().join("sessions.json"))?,
-            fs::read(after.path.parent().unwrap().join("sessions.json"))?
-        );
-        assert_eq!(before.new_id, after.new_id);
-        assert_eq!(before.resume_hint, after.resume_hint);
+        let root = world.base.join(format!("new-{mode}/agents"));
+        fs::create_dir_all(root.join("main/sessions"))?;
+        fs::write(
+            root.join("main/sessions/sessions.json"),
+            serde_json::to_vec(&json!({"untouched":{"label":"keep"},"fixed":{"old":"replace"}}))?,
+        )?;
+        let after = crate::emit::emit(&session, Harness::OpenClaw, &root, &options)?;
+        frozen.insert(mode.to_string(), frozen_entry(&world.base, &after)?);
     }
-    Ok(())
+    frozen.check()
 }
 
 #[test]
 fn checked_openclaw_borrowed_wrapper_matches_replay_definition_and_none() -> Result<()> {
-    let world = cv_testkit::World::in_process("openclaw-checked-deferred");
+    let world = crate::test_world("openclaw-checked-deferred");
     let session = fixture(&world.base)?;
     let Block::ToolUse { input, .. } = &session.messages[1].content[4] else {
         unreachable!()
@@ -254,8 +259,9 @@ fn checked_openclaw_borrowed_wrapper_matches_replay_definition_and_none() -> Res
 }
 
 #[test]
-fn checked_openclaw_title_policy_matches_explicit_and_first_user_legacy() -> Result<()> {
-    let world = cv_testkit::World::in_process("openclaw-title-policy");
+fn checked_openclaw_title_policy_matches_frozen_explicit_and_first_user() -> Result<()> {
+    let world = crate::test_world("openclaw-title-policy");
+    let mut frozen = crate::emit::grok_qwen_tests::Frozen::new("openclaw-title-policy");
     for title in [None, Some(""), Some("   "), Some("explicit λ")] {
         for meaningful in [false, true] {
             let mut session = Session::new("source", Harness::Claude);
@@ -292,23 +298,17 @@ fn checked_openclaw_title_policy_matches_explicit_and_first_user_legacy() -> Res
                     ..Default::default()
                 };
                 let suffix = format!("{}-{meaningful}-{mode}", title.unwrap_or("none"));
-                let mut owned = session.clone();
-                crate::emit::project_owned_thinking_for_test(&mut owned, Harness::OpenClaw, mode);
-                let before = legacy::emit(&owned, &world.base.join(format!("old-{suffix}")), &options)?;
                 let after = emit(&session, &world.base.join(format!("new-{suffix}")), &options)?;
-                assert_eq!(
-                    fs::read(before.path.parent().unwrap().join("sessions.json"))?,
-                    fs::read(after.path.parent().unwrap().join("sessions.json"))?
-                );
+                frozen.insert(suffix, frozen_entry(&world.base, &after)?["index"].clone());
             }
         }
     }
-    Ok(())
+    frozen.check()
 }
 
 #[test]
 fn checked_openclaw_source_failure_preserves_transcript_and_index_even_for_ignored_fields() -> Result<()> {
-    let world = cv_testkit::World::in_process("openclaw-source-guard");
+    let world = crate::test_world("openclaw-source-guard");
     for ignored in [false, true] {
         let mut session = fixture(&world.base)?;
         if ignored {
@@ -339,7 +339,7 @@ fn checked_openclaw_source_failure_preserves_transcript_and_index_even_for_ignor
 #[test]
 fn checked_openclaw_late_source_failure_cannot_publish_staged_records() -> Result<()> {
     use std::io::Write;
-    let world = cv_testkit::World::in_process("openclaw-source-race");
+    let world = crate::test_world("openclaw-source-race");
     let session = fixture(&world.base)?;
     let source = world.base.join("input.json");
     let replacement = world.base.join("replacement.json");
@@ -381,7 +381,7 @@ fn checked_openclaw_late_source_failure_cannot_publish_staged_records() -> Resul
         })
         .unwrap_err();
     assert!(error.to_string().contains("source changed"), "{error}");
-    assert!(stage.publish(&destination).is_err());
+    assert!(stage.publish(&destination, crate::publish::Claim::Replace).is_err());
     assert_eq!(fs::read_to_string(&destination)?, "original transcript");
     Ok(())
 }
@@ -389,7 +389,7 @@ fn checked_openclaw_late_source_failure_cannot_publish_staged_records() -> Resul
 #[test]
 fn checked_openclaw_complete_preparation_preserves_ir_wire_report_and_late_failure() -> Result<()> {
     use crate::stream::ParseOptions;
-    let world = cv_testkit::World::in_process("openclaw-complete-preparation");
+    let world = crate::test_world("openclaw-complete-preparation");
     let source = world.base.join("source.jsonl");
     let rows = [
         json!({"type":"session","version":4,"cwd":"/synthetic","timestamp":"2026-10-12T12:00:00Z","parentSession":"parent"}),
@@ -460,7 +460,7 @@ fn checked_openclaw_complete_preparation_preserves_ir_wire_report_and_late_failu
 
 #[test]
 fn tool_export_preserves_every_result_structured_details_and_images() -> Result<()> {
-    let world = cv_testkit::World::in_process("openclaw-tool-export");
+    let world = crate::test_world("openclaw-tool-export");
     let mut source = Session::new("tools", Harness::Claude);
     source.created_at = Some("2026-10-14T12:00:00Z".parse()?);
     let mut tool = Message::new(Role::Tool);
@@ -512,7 +512,7 @@ fn tool_export_preserves_every_result_structured_details_and_images() -> Result<
 #[test]
 fn native_complete_export_preserves_records_branch_links_and_one_compaction_pair() -> Result<()> {
     use crate::stream::ParseOptions;
-    let world = cv_testkit::World::in_process("openclaw-native-complete-export");
+    let world = crate::test_world("openclaw-native-complete-export");
     let original =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/openclaw/branchy-v4.jsonl"))?;
     let mut rows = original

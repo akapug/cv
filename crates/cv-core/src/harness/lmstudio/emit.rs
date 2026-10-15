@@ -317,7 +317,7 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOp
     }
     let stage = stage.into_inner().map_err(|e| e.into_error())?;
     fs::create_dir_all(file_path.parent().unwrap())?;
-    publish_stage(stage, &file_path)?;
+    publish_stage(stage, &file_path, opts.claim())?;
     Ok(EmitResult {
         path: file_path,
         new_id,
@@ -325,63 +325,17 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOp
     })
 }
 #[cfg(test)]
-fn legacy_emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<EmitResult> {
-    let session = crate::emit::materialized_session(session)?;
-    let session = session.as_ref();
-    let created = session.created_at.or(session.updated_at).unwrap_or_else(Utc::now);
-    let created_ms = created.timestamp_millis();
-
-    // The id (filename stem) is the ms-epoch createdAt unless explicitly overridden.
-    let new_id = opts.new_id.clone().unwrap_or_else(|| created_ms.to_string());
-
-    let conv_dir = out_dir.join("conversations");
-    fs::create_dir_all(&conv_dir).with_context(|| format!("creating {}", conv_dir.display()))?;
-    let file_path = conv_dir.join(format!("{new_id}.conversation.json"));
-
-    let mut messages: Vec<Value> = Vec::new();
-    for msg in &session.messages {
-        if let Some(version) = emit_version(session, msg, created)? {
-            messages.push(json!({
-                "versions": [version],
-                "currentlySelected": 0,
-            }));
-        }
-    }
-
-    let mut root = Map::new();
-    let title = session
-        .title
-        .clone()
-        .or_else(|| session.first_user_text())
-        .map(|t| crate::ir::truncate(&t, 80))
-        .unwrap_or_else(|| "Untitled".to_string());
-    root.insert("name".into(), json!(title));
-    root.insert("createdAt".into(), json!(created_ms));
-    root.insert("messages".into(), Value::Array(messages));
-    root.insert("tokenCount".into(), json!(0));
-    root.insert("pinned".into(), json!(false));
-
-    // Preserve any system prompt the source carried (parse puts it on `Session::system_prompt`).
-    if let Some(sp) = &session.system_prompt {
-        root.insert("systemPrompt".into(), json!(sp));
-    }
-
-    fs::write(&file_path, serde_json::to_string_pretty(&Value::Object(root))?)
-        .with_context(|| format!("writing {}", file_path.display()))?;
-
-    Ok(EmitResult {
-        path: file_path,
-        new_id,
-        resume_hint: Some("open the chat in LM Studio".to_string()),
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emit::grok_qwen_tests::Frozen;
+
+    /// One emitted conversation, frozen: its length and SHA-256.
+    fn digest(bytes: &[u8]) -> Value {
+        json!([bytes.len(), crate::digest::sha256_hex(bytes)])
+    }
     #[test]
     fn primary_adapter_root_and_explicit_conversations_emit_into_discoverable_store() -> Result<()> {
-        let world = cv_testkit::World::in_process("lmstudio_root_composition");
+        let world = crate::test_world("lmstudio_root_composition");
         let home = world.home.join(".lmstudio");
         let conversations = home.join("conversations");
         fs::create_dir_all(&conversations)?;
@@ -417,7 +371,7 @@ mod tests {
 
     #[test]
     fn usage_only_selected_and_alternate_completions_roundtrip_without_text() -> Result<()> {
-        let world = cv_testkit::World::in_process("lmstudio_empty_completions");
+        let world = crate::test_world("lmstudio_empty_completions");
         let path = world.home.join("source.conversation.json");
         let completion = |model: &str, stats: Value, timestamp: &str| {
             json!({"type":"multiStep","role":"assistant","steps":[{
@@ -492,7 +446,7 @@ mod tests {
 
     #[test]
     fn complete_native_versions_roundtrip_selected_indices_roles_and_models() -> Result<()> {
-        let world = cv_testkit::World::in_process("lmstudio_versions_roundtrip");
+        let world = crate::test_world("lmstudio_versions_roundtrip");
         let path = world.home.join("source.conversation.json");
         let payload = "edited 雪\n\"\\".repeat(10_000);
         let assistant = |text: &str, model: &str| {
@@ -576,7 +530,7 @@ mod tests {
 
     #[test]
     fn an_unparsed_selected_turn_cannot_attach_its_alternates_to_the_previous_turn() -> Result<()> {
-        let world = cv_testkit::World::in_process("lmstudio_orphan_group");
+        let world = crate::test_world("lmstudio_orphan_group");
         let path = world.home.join("source.conversation.json");
         fs::write(
             &path,
@@ -610,7 +564,7 @@ mod tests {
 
     #[test]
     fn malformed_or_orphaned_variant_metadata_falls_back_to_independent_turns() -> Result<()> {
-        let world = cv_testkit::World::in_process("lmstudio_variant_fallback");
+        let world = crate::test_world("lmstudio_variant_fallback");
         let mut session = Session::new("source", Harness::LmStudio);
         let mut primary = Message::new(Role::User);
         primary.content.push(Block::Text { text: "primary".into() });
@@ -639,8 +593,8 @@ mod tests {
     }
 
     #[test]
-    fn checked_native_writer_matches_owned_oracle_and_preserves_changed_source() -> Result<()> {
-        let world = cv_testkit::World::in_process("checked-lmstudio");
+    fn checked_native_writer_matches_frozen_output_and_preserves_changed_source() -> Result<()> {
+        let world = crate::test_world("checked-lmstudio");
         let path = world.base.join("source.jsonl");
         let mut rows = [
             json!({"type":"user","message":{"role":"user","content":[{"type":"thinking","thinking":"user thought","signature":"user-sig"},{"type":"text","text":" \n"},{"type":"text","text":"λ prompt".repeat(3000)}]}}),
@@ -684,8 +638,7 @@ mod tests {
                 redacted: false,
             });
         }
-        let mut owned = lazy.clone();
-        owned.materialize()?;
+        let mut frozen = Frozen::new("lmstudio-emit");
         for mode in [
             crate::emit::ThinkingMode::Native,
             crate::emit::ThinkingMode::Text,
@@ -696,18 +649,11 @@ mod tests {
                 thinking: mode,
                 ..Default::default()
             };
-            let mut oracle = owned.clone();
-            crate::emit::project_owned_thinking_for_test(&mut oracle, Harness::LmStudio, mode);
-            let old = legacy_emit(&oracle, &world.base.join(format!("old-{mode:?}")), &opts)?;
             let new = super::super::emit(&lazy, &world.base.join(format!("new-{mode:?}")), &opts)?;
-            let old = fs::read(old.path)?;
             let new = fs::read(new.path)?;
-            assert!(
-                old == new,
-                "wire mismatch {mode:?} at {:?}",
-                old.iter().zip(&new).position(|(a, b)| a != b)
-            );
+            frozen.insert(format!("{mode:?}"), digest(&new));
         }
+        frozen.check()?;
         let dest = world.base.join("mutation");
         fs::create_dir_all(&dest)?;
         let opts = crate::emit::EmitOptions {
@@ -723,7 +669,7 @@ mod tests {
     }
     #[test]
     fn late_argument_source_failure_preserves_published_files() -> Result<()> {
-        let world = cv_testkit::World::in_process("late-argument-LmStudio");
+        let world = crate::test_world("late-argument-LmStudio");
         let source = world.base.join("arguments.json");
         fs::write(&source, br#"{"path":"old"}"#)?;
         let input = crate::Json::source(&source, 0, fs::metadata(&source)?.len())?;
@@ -760,8 +706,8 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn dropped_source_failure_matches_direct_owned_error_contract() -> Result<()> {
-        let world = cv_testkit::World::in_process("dropped-source-LmStudio");
+    fn dropped_source_failure_preserves_published_files_and_drop_never_reads_thinking() -> Result<()> {
+        let world = crate::test_world("dropped-source-LmStudio");
         let path = world.base.join("thinking.json");
         fs::write(&path, serde_json::to_vec(&"private thought".repeat(3000))?)?;
         let text = crate::Json::source(&path, 0, fs::metadata(&path)?.len())?
@@ -782,6 +728,7 @@ mod tests {
         let opts = crate::emit::EmitOptions {
             new_id: Some("fixed".into()),
             thinking: crate::emit::ThinkingMode::Drop,
+            force: true, // this test emits the same pinned id again
             ..Default::default()
         };
         let dest = world.base.join("new");
@@ -790,12 +737,10 @@ mod tests {
         let index = dest.join("sessions.json");
         let index_before = fs::read(&index).ok();
         fs::remove_file(&path)?;
-        assert!(legacy_emit(&session, &world.base.join("old"), &opts).is_err());
         assert!(super::super::emit(&session, &dest, &opts).is_err());
         assert_eq!(fs::read(&emitted.path)?, before);
         assert_eq!(fs::read(&index).ok(), index_before);
-        // Drop does not demand legacy raw spans. Project the owned oracle before
-        // checked materialization, which correctly rejects an unprojected invalid span.
+        // Drop never demands the thinking text, so an unreadable span is never read.
         fs::write(&path, b"short")?;
         if let Block::Thinking { text, .. } = &mut session.messages[0].content[0] {
             *text = crate::Text::Span(crate::lazy::Span {
@@ -805,17 +750,11 @@ mod tests {
                 escaped: true,
             });
         }
-        let mut owned = session.clone();
-        assert!(owned.materialize().is_err());
-        // The general owned projection helper expects materialized text. This
-        // oracle deliberately has an unreadable span, which Drop never demands.
-        for message in &mut owned.messages {
-            message.content.retain(|block| !matches!(block, Block::Thinking { .. }));
-        }
-        owned.materialize()?;
-        let oracle = legacy_emit(&owned, &world.base.join("span-oracle"), &opts)?;
+        assert!(session.clone().materialize().is_err());
         let new = super::super::emit(&session, &dest, &opts)?;
-        assert_eq!(fs::read(oracle.path)?, fs::read(new.path)?);
+        let mut frozen = Frozen::new("lmstudio-emit-drop");
+        frozen.insert("unreadable span", digest(&fs::read(new.path)?));
+        frozen.check()?;
         assert_eq!(fs::read(&emitted.path)?, before);
         assert_eq!(fs::read(index).ok(), index_before);
         Ok(())

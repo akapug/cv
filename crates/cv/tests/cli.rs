@@ -703,6 +703,57 @@ fn export_formats() {
 
 // ───────────────────────────── prune --json ─────────────────────────────
 
+/// `--drop-thinking` omits old reasoning outright: a thinking-only record goes, its child is
+/// relinked, the transcript only shrinks, and `cv cat` still returns the dropped block.
+#[test]
+fn prune_drop_thinking_omits_blocks_and_keeps_them_retrievable() {
+    let w = World::new("prunedropthinking");
+    let record = |uuid: &str, parent: Option<&str>, role: &str, content: serde_json::Value| {
+        serde_json::json!({"type": role, "uuid": uuid, "parentUuid": parent, "sessionId": "thinksrc",
+            "timestamp": "2026-01-01T10:00:00Z", "cwd": "/work/proj",
+            "message": {"role": role, "model": "claude-opus-5", "content": content}})
+    };
+    let reasoning = "weighing the options ".repeat(40);
+    let source = w.write_session(
+        "thinksrc",
+        &[
+            record("u1", None, "user", serde_json::json!("plan it")),
+            record(
+                "a1",
+                Some("u1"),
+                "assistant",
+                serde_json::json!([
+                {"type": "thinking", "thinking": reasoning, "signature": "s".repeat(600)}]),
+            ),
+            record(
+                "a2",
+                Some("a1"),
+                "assistant",
+                serde_json::json!([{"type": "text", "text": "planned"}]),
+            ),
+            record("u2", Some("a2"), "user", serde_json::json!("go on")),
+            record(
+                "a3",
+                Some("u2"),
+                "assistant",
+                serde_json::json!([{"type": "text", "text": "going"}]),
+            ),
+        ],
+    );
+    let (out, _) = w.cv_ok(&["prune", "thinksrc", "--drop-thinking", "--keep-last", "1", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let new_id = report["new_id"].as_str().unwrap();
+    let path = source.with_file_name(format!("{new_id}.jsonl"));
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.len() < fs::read_to_string(&source).unwrap().len());
+    assert!(!text.contains("\"thinking\"") && !text.contains("[PRUNED"), "{text}");
+    assert!(!text.contains("\"uuid\":\"a1\""), "the emptied record is removed");
+    let (reached, threaded, _) = chain_walk(&path);
+    assert_eq!(reached, threaded, "a dangling parent truncates the resumed context");
+    let (cat, _) = w.cv_ok(&["cat", new_id, "a1#think0"]);
+    assert!(cat.contains("weighing the options"), "{cat}");
+}
+
 #[test]
 fn prune_json_emits_machine_readable_report() {
     let w = World::new("prunejson");
@@ -1177,14 +1228,18 @@ fn dataset_file_publication_matches_stdout_and_preserves_transcript_aliases() {
     let (expected, _) = w.cv_ok(&["dataset"]);
     let output = w.base.join("training.jsonl");
     fs::write(&output, b"previous artifact").unwrap();
-    let (stdout, _) = w.cv_ok(&["dataset", "--out", output.to_str().unwrap()]);
+    let (_, code, _, error) = w.cv(&["dataset", "--out", output.to_str().unwrap()]);
+    assert_eq!(code, 2, "{error}");
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(fs::read(&output).unwrap(), b"previous artifact");
+    let (stdout, _) = w.cv_ok(&["dataset", "--out", output.to_str().unwrap(), "--force"]);
     assert!(stdout.is_empty());
     assert_eq!(fs::read(&output).unwrap(), expected.as_bytes());
 
+    // Even --force never replaces one of the dataset's own source transcripts.
     let source = w.transcript("alphasess");
     let original = fs::read(&source).unwrap();
-    // A limit cannot make an unselected source safe to overwrite.
-    let (_, error) = w.cv_fails(&["dataset", "--limit", "1", "--out", source.to_str().unwrap()]);
+    let (_, error) = w.cv_fails(&["dataset", "--limit", "1", "--out", source.to_str().unwrap(), "--force"]);
     assert!(error.contains("aliases source transcript"), "{error}");
     assert_eq!(fs::read(&source).unwrap(), original);
     assert_eq!(w.cv_ok(&["dataset"]).0, expected);
@@ -1196,7 +1251,7 @@ fn dataset_file_publication_matches_stdout_and_preserves_transcript_aliases() {
         let symlink = w.base.join("source-symlink.jsonl");
         std::os::unix::fs::symlink(&source, &symlink).unwrap();
         for alias in [&hardlink, &symlink] {
-            let (_, error) = w.cv_fails(&["dataset", "--out", alias.to_str().unwrap()]);
+            let (_, error) = w.cv_fails(&["dataset", "--out", alias.to_str().unwrap(), "--force"]);
             assert!(error.contains("aliases source transcript"), "{error}");
             assert_eq!(fs::read(alias).unwrap(), original);
         }
@@ -1204,10 +1259,12 @@ fn dataset_file_publication_matches_stdout_and_preserves_transcript_aliases() {
     }
 }
 
+/// `--force` replaces the name: a symlink there becomes the new file (its target untouched), the
+/// old inode's other hard links keep the old bytes, and the replaced file's permissions carry over.
 #[cfg(unix)]
 #[test]
-fn dataset_file_publication_preserves_existing_output_links_and_permissions() {
-    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+fn dataset_file_publication_replaces_the_name_not_the_linked_file() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
     let w = World::new("dataset-file-links");
     standard_corpus(&w);
     let (expected, _) = w.cv_ok(&["dataset"]);
@@ -1218,12 +1275,43 @@ fn dataset_file_publication_preserves_existing_output_links_and_permissions() {
     fs::hard_link(&target, &hardlink).unwrap();
     let output = w.base.join("output-symlink.jsonl");
     symlink(&target, &output).unwrap();
-    let inode = fs::metadata(&target).unwrap().ino();
-    w.cv_ok(&["dataset", "--out", output.to_str().unwrap()]);
-    assert!(output.is_symlink());
-    assert_eq!(fs::metadata(&target).unwrap().ino(), inode);
-    assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
-    assert_eq!(fs::read(&hardlink).unwrap(), expected.as_bytes());
+    w.cv_ok(&["dataset", "--out", output.to_str().unwrap(), "--force"]);
+    assert!(!output.is_symlink());
+    assert_eq!(fs::read(&output).unwrap(), expected.as_bytes());
+    assert_eq!(fs::metadata(&output).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::read(&target).unwrap(), b"previous artifact");
+    w.cv_ok(&["dataset", "--out", target.to_str().unwrap(), "--force"]);
+    assert_eq!(fs::read(&target).unwrap(), expected.as_bytes());
+    assert_eq!(fs::read(&hardlink).unwrap(), b"previous artifact");
+}
+
+/// Files the user names (`distill --pack`, `share --out`) are refused when taken (exit 2,
+/// untouched) and replaced whole with `--force`.
+#[test]
+fn named_output_files_are_refused_unless_forced() {
+    let w = World::new("named-outputs");
+    standard_corpus(&w);
+    let pack = w.base.join("pack.md");
+    let html = w.base.join("shared.html");
+    for (path, args) in [
+        (&pack, vec!["distill", "alphasess", "--pack"]),
+        (&html, vec!["share", "alphasess", "--out"]),
+    ] {
+        fs::write(path, b"keep me").unwrap();
+        let mut argv = args.clone();
+        argv.push(path.to_str().unwrap());
+        let (_, code, _, error) = w.cv(&argv);
+        assert_eq!(code, 2, "{argv:?}: {error}");
+        assert!(error.contains("--force"), "{error}");
+        assert_eq!(fs::read(path).unwrap(), b"keep me", "{argv:?}");
+        argv.push("--force");
+        let (ok, _, _, error) = w.cv(&argv);
+        assert!(ok, "{argv:?}: {error}");
+        assert_ne!(fs::read(path).unwrap(), b"keep me", "{argv:?}");
+    }
+    assert!(!fs::read_dir(&w.base)
+        .unwrap()
+        .any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".cv-")));
 }
 
 // ───────────────────────────── events / touched ─────────────────────────────
@@ -3256,12 +3344,12 @@ fn doctor_labels_payload_estimates_and_recorded_usage_without_changing_accountin
     );
     let (human, _) = w.cv_ok(&["doctor", "accounting"]);
     assert!(
-        human.contains("Transcript content by source (104 estimated token equivalents)"),
+        human.contains("Transcript content by source (138 estimated token equivalents)"),
         "{human}"
     );
     assert!(human.contains("totals include history across compactions"), "{human}");
     assert!(
-        human.contains("thinking includes opaque signature/encrypted bytes; not measured reasoning tokens"),
+        human.contains("thinking is mostly signature bytes; requests carry them, and most models count them"),
         "{human}"
     );
     assert!(
@@ -3275,8 +3363,8 @@ fn doctor_labels_payload_estimates_and_recorded_usage_without_changing_accountin
     let report: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(report["fixed_overhead_est"], 60000);
     assert_eq!(report["peak_context"], 60000);
-    assert_eq!(report["conversational"]["thinking"], 100);
-    assert_eq!(report["conversational"]["total"], 104);
+    assert_eq!(report["conversational"]["thinking"], 110);
+    assert_eq!(report["conversational"]["total"], 138);
 }
 
 #[test]

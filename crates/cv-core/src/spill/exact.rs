@@ -653,7 +653,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn small_checked_sources_keep_memory_fast_path() {
-        let world = cv_testkit::World::in_process("exact-small-source");
+        let world = crate::test_world("exact-small-source");
         let mut set = ExactStrings::default();
         let resolver = crate::lazy::Resolver::new(None);
         for (index, body) in ["short λ\n".to_string(), "escaped \"🌙\"".repeat(1000)]
@@ -709,7 +709,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn checked_source_insertion_matches_inline_keys_and_rejects_stale_sources() {
-        let world = cv_testkit::World::in_process("exact-checked-source");
+        let world = crate::test_world("exact-checked-source");
         let path = world.home.join("key.json");
         let body = "key\0λ🌙\n".repeat(200_000);
         std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"key":body})).unwrap()).unwrap();

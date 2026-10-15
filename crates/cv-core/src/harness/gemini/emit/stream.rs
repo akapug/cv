@@ -307,7 +307,7 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
     };
     fs::create_dir_all(&chats).with_context(|| format!("creating {}", chats.display()))?;
     let path = chats.join(format!("session-{new_id}.json"));
-    publish_stage(stage, &path)?;
+    publish_stage(stage, &path, opts.claim())?;
     Ok(EmitResult {
         path,
         new_id: new_id.clone(),

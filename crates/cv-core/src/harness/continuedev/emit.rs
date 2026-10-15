@@ -17,6 +17,7 @@ pub(super) fn transcript(
     cwd: Option<&str>,
     path: &Path,
     mode: crate::emit::ThinkingMode,
+    claim: crate::publish::Claim,
 ) -> Result<()> {
     let resolver = Resolver::new(session.source_path.clone());
     let mut stage = BufWriter::with_capacity(64 * 1024, ByteStage::new());
@@ -62,7 +63,7 @@ pub(super) fn transcript(
         root.finish()?;
     }
     let stage = stage.into_inner().map_err(|e| e.into_error())?;
-    publish_stage(stage, path)
+    publish_stage(stage, path, claim)
 }
 /// Continue's OpenAI usage counts include cache reads in the prompt total.
 pub(super) fn native_usage(usage: &Usage, model: Option<&str>) -> Result<Map<String, Value>> {
@@ -319,7 +320,7 @@ mod tests {
     use super::*;
     #[test]
     fn cn_usage_cost_and_partial_fields_roundtrip_without_invented_counts() -> Result<()> {
-        let world = cv_testkit::World::in_process("continue_usage_cost");
+        let world = crate::test_world("continue_usage_cost");
         let store = world.home.join(".continue");
         fs::create_dir_all(store.join("sessions"))?;
         let path = store.join("sessions/source.json");
@@ -338,6 +339,7 @@ mod tests {
         )?;
         let opts = crate::emit::EmitOptions {
             new_id: Some("copy".into()),
+            force: true, // this test emits the same pinned id again
             ..Default::default()
         };
         let (emitted, report) = crate::emit::emit_report(&session, Harness::Continue, &store.join("sessions"), &opts)?;
@@ -394,7 +396,7 @@ mod tests {
 
     #[test]
     fn cn_grouped_tool_results_emit_every_call_and_body() -> Result<()> {
-        let world = cv_testkit::World::in_process("continue_grouped_results");
+        let world = crate::test_world("continue_grouped_results");
         let store = world.home.join(".continue");
         fs::create_dir_all(store.join("sessions"))?;
         let path = store.join("sessions/source.json");
@@ -418,6 +420,7 @@ mod tests {
         assert_eq!(grouped.content.len(), 2);
         let opts = crate::emit::EmitOptions {
             new_id: Some("copy".into()),
+            force: true, // this test emits the same pinned id again
             ..Default::default()
         };
         let emitted = super::super::emit(&session, &store.join("sessions"), &opts)?;
@@ -449,7 +452,7 @@ mod tests {
 
     #[test]
     fn checked_native_writer_matches_owned_oracle_and_preserves_changed_source() -> Result<()> {
-        let world = cv_testkit::World::in_process("checked-continuedev");
+        let world = crate::test_world("checked-continuedev");
         let path = world.base.join("source.jsonl");
         let mut rows = [
             json!({"type":"user","message":{"role":"user","content":[{"type":"thinking","thinking":"user thought","signature":"user-sig"},{"type":"text","text":" \n"},{"type":"text","text":"λ prompt".repeat(3000)}]}}),
@@ -524,7 +527,7 @@ mod tests {
     }
     #[test]
     fn late_argument_source_failure_preserves_published_files() -> Result<()> {
-        let world = cv_testkit::World::in_process("late-argument-Continue");
+        let world = crate::test_world("late-argument-Continue");
         let source = world.base.join("arguments.json");
         fs::write(&source, br#"{"path":"old"}"#)?;
         let input = crate::Json::source(&source, 0, fs::metadata(&source)?.len())?;
@@ -562,7 +565,7 @@ mod tests {
     }
     #[test]
     fn dropped_source_failure_matches_direct_owned_error_contract() -> Result<()> {
-        let world = cv_testkit::World::in_process("dropped-source-Continue");
+        let world = crate::test_world("dropped-source-Continue");
         let path = world.base.join("thinking.json");
         fs::write(&path, serde_json::to_vec(&"private thought".repeat(3000))?)?;
         let text = crate::Json::source(&path, 0, fs::metadata(&path)?.len())?
@@ -583,6 +586,7 @@ mod tests {
         let opts = crate::emit::EmitOptions {
             new_id: Some("fixed".into()),
             thinking: crate::emit::ThinkingMode::Drop,
+            force: true, // this test emits the same pinned id again
             ..Default::default()
         };
         let dest = world.base.join("new");
@@ -623,7 +627,7 @@ mod tests {
     }
     #[test]
     fn ignored_user_argument_source_failure_preserves_transcript_and_index() -> Result<()> {
-        let world = cv_testkit::World::in_process("ignored-continue-arguments");
+        let world = crate::test_world("ignored-continue-arguments");
         let path = world.base.join("arguments.json");
         fs::write(&path, b"{}")?;
         let mut session = Session::new("synthetic", Harness::Claude);
@@ -655,7 +659,7 @@ mod tests {
 }
 #[test]
 fn wide_grouped_tool_results_preserve_each_item_and_empty_context() -> Result<()> {
-    let world = cv_testkit::World::in_process("continue-wide-grouped-results");
+    let world = crate::test_world("continue-wide-grouped-results");
     for count in [1, 128, 8192] {
         let mut session = Session::new("source", Harness::Continue);
         let mut tool = Message::new(Role::Tool);
@@ -685,7 +689,15 @@ fn wide_grouped_tool_results_preserve_each_item_and_empty_context() -> Result<()
         });
         session.messages.push(tool);
         let path = world.base.join(format!("wide-{count}.json"));
-        transcript(&session, "copy", None, None, &path, crate::emit::ThinkingMode::Native)?;
+        transcript(
+            &session,
+            "copy",
+            None,
+            None,
+            &path,
+            crate::emit::ThinkingMode::Native,
+            crate::publish::Claim::New,
+        )?;
         let actual: Value = serde_json::from_slice(&fs::read(path)?)?;
         assert_eq!(actual, json!({"sessionId":"copy","history":expected}));
     }

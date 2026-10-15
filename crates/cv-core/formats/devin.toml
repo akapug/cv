@@ -6,7 +6,7 @@
 # Devin CLI is closed source — this vocabulary was reverse-engineered from a live sessions.db.
 
 harness = "devin"
-source_files = ["harness/devin.rs"]
+source_files = ["harness/devin.rs", "harness/devin/record.rs"]
 ignore_literals = []
 store = [
   "~/.local/share/devin/cli/sessions.db (all platforms observed; $XDG_DATA_HOME/devin/cli honoured)",

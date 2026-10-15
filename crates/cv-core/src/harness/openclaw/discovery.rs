@@ -1,13 +1,17 @@
 //! One compact index inventory per discovery operation, with checked transcript projections.
 use super::*;
-use crate::harness::store::{document::Fields, jsonl::ranges};
+use crate::harness::store::{
+    document::Fields,
+    jsonl::{self, ranges},
+};
 use crate::harness::wire::text_title;
 use crate::json::{JsonSource, JsonView};
 
+/// A `sessions.json` entry / `session_nodes.entry_json` (same shape).
 #[derive(Default, Debug, PartialEq)]
 pub(super) struct Entry {
-    title: Option<String>,
-    cwd: Option<PathBuf>,
+    pub title: Option<String>,
+    pub cwd: Option<PathBuf>,
     updated_at: Option<DateTime<Utc>>,
 }
 type Index = HashMap<String, Entry>;
@@ -45,45 +49,49 @@ fn index(view: JsonView<'_>) -> Result<Index> {
     // for_each_entry preserves Value's last-duplicate values and first insertion order,
     // including the winner when several registry keys name the same sessionId.
     view.for_each_entry(|_, entry| {
-        let Some(fields) = Fields::parse(
-            entry,
-            &[
-                "sessionId",
-                "label",
-                "subject",
-                "cwd",
-                "spawnedCwd",
-                "spawnedWorkspaceDir",
-                "updatedAt",
-            ],
-        )?
-        else {
+        let Some(fields) = Fields::parse(entry, ENTRY)? else {
             return Ok(());
         };
-        let Some(id) = fields.string("sessionId")? else {
-            return Ok(());
-        };
-        // A present invalid/blank label suppresses subject, as entry_title does.
-        let title = fields.get("label").or_else(|| fields.get("subject"));
-        let title = string_title(title)?;
-        let mut cwd = None;
-        for key in ["cwd", "spawnedCwd", "spawnedWorkspaceDir"] {
-            if let Some(path) = fields.string(key)? {
-                cwd = Some(PathBuf::from(path));
-                break;
-            }
+        if let Some(id) = fields.string("sessionId")? {
+            out.insert(id, entry_of(&fields)?);
         }
-        out.insert(
-            id,
-            Entry {
-                title,
-                cwd,
-                updated_at: timestamp(fields.get("updatedAt"))?,
-            },
-        );
         Ok(())
     })?;
     Ok(out)
+}
+const ENTRY: &[&str] = &[
+    "sessionId",
+    "label",
+    "subject",
+    "cwd",
+    "spawnedCwd",
+    "spawnedWorkspaceDir",
+    "updatedAt",
+];
+/// One index entry; a nonobject is an empty one.
+#[cfg(any(feature = "sqlite", test))]
+pub(super) fn entry(view: JsonView<'_>) -> Result<Entry> {
+    Fields::parse(view, ENTRY)?
+        .map(|fields| entry_of(&fields))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+fn entry_of(fields: &Fields<'_>) -> Result<Entry> {
+    // A present invalid/blank label suppresses subject.
+    let title = fields.get("label").or_else(|| fields.get("subject"));
+    let title = string_title(title)?;
+    let mut cwd = None;
+    for key in ["cwd", "spawnedCwd", "spawnedWorkspaceDir"] {
+        if let Some(path) = fields.string(key)? {
+            cwd = Some(PathBuf::from(path));
+            break;
+        }
+    }
+    Ok(Entry {
+        title,
+        cwd,
+        updated_at: timestamp(fields.get("updatedAt"))?,
+    })
 }
 fn string_title(value: Option<JsonView<'_>>) -> Result<Option<String>> {
     match value {
@@ -116,8 +124,10 @@ pub(super) fn scan(path: &Path, index: &Index) -> Result<SessionRef> {
         "OpenClaw discovery transcript did not contain valid UTF-8"
     );
     let mut acc = ScanAcc::default();
-    super::super::store::checked_lines::for_each(&file, 0, &source, |view, _, _, _| {
-        feed(view, &mut acc)?;
+    jsonl::for_each_line(&source, &file, 0, source.len(), |line| {
+        if let Some(view) = line.view {
+            feed(view, &mut acc)?;
+        }
         Ok(Flow::Continue)
     })?;
     source.check_metadata(file.metadata()?)?;
@@ -143,7 +153,8 @@ pub(super) fn scan(path: &Path, index: &Index) -> Result<SessionRef> {
     })
 }
 
-fn feed(view: JsonView<'_>, acc: &mut ScanAcc) -> Result<()> {
+/// One transcript entry's discovery facts.
+pub(super) fn feed(view: JsonView<'_>, acc: &mut ScanAcc) -> Result<()> {
     let Some(fields) = Fields::parse(view, &["type", "id", "cwd", "timestamp", "name", "message"])? else {
         return Ok(());
     };
@@ -193,19 +204,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The index as serde reads the document, each entry through the decoder over an owned view.
     fn owned_index(bytes: &[u8]) -> Index {
         let mut out = HashMap::new();
         if let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(bytes) {
             for (_, entry) in entries {
                 if let Some(id) = entry.get("sessionId").and_then(Value::as_str) {
-                    out.insert(
-                        id.into(),
-                        Entry {
-                            title: entry_title(Some(&entry)),
-                            cwd: entry_cwd(Some(&entry)),
-                            updated_at: entry.get("updatedAt").and_then(ts_from_value),
-                        },
-                    );
+                    out.insert(id.into(), super::entry(JsonView::from(&entry)).unwrap());
                 }
             }
         }
@@ -213,8 +218,8 @@ mod tests {
     }
 
     #[test]
-    fn selected_indexes_preserve_value_precedence_and_tolerant_fallback() -> Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-discovery-index");
+    fn indexes_preserve_value_precedence_and_tolerant_fallback() -> Result<()> {
+        let world = crate::test_world("openclaw-discovery-index");
         let dir = world.base.join("sessions");
         fs::create_dir_all(&dir)?;
         let path = dir.join("sessions.json");
@@ -249,7 +254,7 @@ mod tests {
 
     #[test]
     fn discovery_reuses_one_index_snapshot_and_rejects_changed_or_created_indexes() -> Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-discovery-index-reuse");
+        let world = crate::test_world("openclaw-discovery-index-reuse");
         let dir = world.base.join("sessions");
         fs::create_dir_all(&dir)?;
         let path = dir.join("sessions.json");
@@ -278,11 +283,12 @@ mod tests {
         Ok(())
     }
 
+    /// Discovery over serde-parsed lines, each fed to the decoder as an owned view.
     fn owned_scan(path: &Path, index: &Index) -> Result<SessionRef> {
         let text = fs::read_to_string(path)?;
         let mut acc = ScanAcc::default();
         super::super::super::for_each_json_line_str(&text, |value| {
-            acc.feed(&value);
+            feed(JsonView::from(&value), &mut acc).unwrap();
             Flow::Continue
         });
         let id = if acc.id.is_empty() {
@@ -307,8 +313,8 @@ mod tests {
     }
 
     #[test]
-    fn projected_transcript_discovery_preserves_owned_scan_and_inventory_metadata() -> Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-discovery-transcript");
+    fn transcript_discovery_reads_every_line_and_inventory_metadata() -> Result<()> {
+        let world = crate::test_world("openclaw-discovery-transcript");
         let sessions = world.base.join("agents/main/sessions");
         fs::create_dir_all(&sessions)?;
         let index_bytes = serde_json::to_vec(&json!({
@@ -326,9 +332,7 @@ mod tests {
             json!({"type":"message","timestamp":"2024-01-01T03:00:00Z","message":{"role":"assistant","timestamp":1704070800000_i64,"content":[{"type":"thinking","thinking":body}]}}),
             json!({"type":"message","message":{"role":"toolResult","timestamp":1704070800000_i64,"content":body}}),
         );
-        text.push_str(
-            "\u{2003}{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"accepted\"}}\u{2003}\n",
-        );
+        text.push_str(" \t{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"accepted\"}}\r\n");
         text.push_str("{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"rejected\"},\"ignored\":1e999}\n{bad}\n");
         for index in [&index, &Index::default()] {
             fs::write(&path, &text)?;

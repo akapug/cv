@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn scoped_capability_restores_nested_and_early_drop_and_closes_connection() {
-        let world = cv_testkit::World::in_process("scan-scopes");
+        let world = crate::test_world("scan-scopes");
         let source = world.base.join("source");
         std::fs::write(&source, "metadata").unwrap();
         let (a, weak_a) = owner(&world.base.join("a.db"), &source, "a");
@@ -223,13 +223,14 @@ mod tests {
 
     #[test]
     fn concurrent_operations_route_each_home_and_parallel_worker_explicitly() {
-        let world = cv_testkit::World::in_process("scan-overlap");
+        let world = crate::test_world("scan-overlap");
         let source = world.base.join("source");
         std::fs::write(&source, "metadata").unwrap();
         let (a, _) = owner(&world.base.join("a.db"), &source, "a");
         let (b, _) = owner(&world.base.join("b.db"), &source, "b");
         // A later ambient home cannot redirect an already captured operation capability.
-        std::env::set_var("CLUSTERVISION_HOME", world.base.join("another-home"));
+        world.scope.set("CLUSTERVISION_HOME", world.base.join("another-home"));
+
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|threads| {
             for (context, id) in [(&a, "a"), (&b, "b")] {
@@ -253,7 +254,7 @@ mod tests {
     #[cfg(feature = "parallel")]
     #[test]
     fn rayon_callback_panic_restores_previous_capability() {
-        let world = cv_testkit::World::in_process("scan-panic");
+        let world = crate::test_world("scan-panic");
         let source = world.base.join("source");
         std::fs::write(&source, "metadata").unwrap();
         let (a, _) = owner(&world.base.join("a.db"), &source, "a");
@@ -275,7 +276,7 @@ mod tests {
 
     #[test]
     fn standalone_batch_opens_once_and_only_demands_matching_rows() {
-        let world = cv_testkit::World::in_process("scan-batch");
+        let world = crate::test_world("scan-batch");
         let conn = crate::catalog::open_db().unwrap();
         let paths: Vec<_> = (0..64)
             .map(|i| {

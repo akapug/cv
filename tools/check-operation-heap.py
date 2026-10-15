@@ -119,12 +119,12 @@ def prune_gate(binary, root, env, cases=("thinking", "ascii-declass", "unicode-d
         assert result["tokens_freed"] > PAYLOAD // 8
         assert result["before_bytes"] > PAYLOAD and result["after_bytes"] < 2048
         if case == "thinking":
-            assert report["revive_tokens"] == 168 and report["revive_old_tokens"] == 2000
+            assert report["revive_tokens"] == 267 and report["revive_old_tokens"] == 2000
             assert report["usage_rewritten"] == 2
         output_path = Path(result["new_path"])
         if case == "thinking":
-            assert output_path.stat().st_size == 1521
-            assert file_digest(output_path) == "a22fa06f173a2222433de567d4548e1d62fc8c09133759e8070a8ea3c9d943b5"
+            assert output_path.stat().st_size == 1329
+            assert file_digest(output_path) == "bee44f7082b29ac844d352f6d2cf55a52f0f52bce7c80fad30ade403a7cd4ad5"
         if case == "unicode-declass":
             assert output_path.stat().st_size == 823
             assert file_digest(output_path) == "02277ad8d3b8e96ae49402adf892f2d905d5de5678013df342fa230beec32305"
@@ -136,7 +136,10 @@ def prune_gate(binary, root, env, cases=("thinking", "ascii-declass", "unicode-d
         assert output[-2]["message"]["content"] == "recent"
         assert output[-1]["message"]["content"] == [dict(type="text", text="recent answer")]
         changed = output[1]["message"]["content"]
-        assert len(changed) == (3 if case == "thinking" else 2)
+        # --drop-thinking omits the block outright; declassify leaves its marker in place.
+        if case == "thinking":
+            changed = [None, *changed]
+        assert len(changed) == 3 if case == "thinking" else len(changed) == 2
         assert changed[1] == dict(type="text", text="conclusion")
         if case == "thinking":
             assert changed[2] == dict(type="tool_use", id="linked", name="Bash",
@@ -145,7 +148,8 @@ def prune_gate(binary, root, env, cases=("thinking", "ascii-declass", "unicode-d
             assert len(result_block) == 1 and result_block[0]["type"] == "tool_result"
             assert result_block[0]["tool_use_id"] == "linked"
             assert "id=linked tool=Bash command=printf useful, description=linked control |" in result_block[0]["content"]
-        assert f"id={stash_id} " in changed[0]["text"] and "[PRUNED " in changed[0]["text"]
+        if case != "thinking":
+            assert f"id={stash_id} " in changed[0]["text"] and "[PRUNED " in changed[0]["text"]
         sidecar = Path(result["sidecar_path"])
         assert sidecar.stat().st_size == sidecar_size and file_digest(sidecar) == sidecar_hash
         assert file_digest(source) == original, "prune modified its source"
@@ -183,12 +187,14 @@ def usage_gate(binary, root, env):
     peak = checked_peak(report.get("heap"))
     result = report["result"]
     assert result["snipped_payloads"] == 0 and result["sidecar_path"] is None
-    assert report["usage_rewritten"] == 1 and report["revive_tokens"] == 12
+    # The only recorded prompt follows the boundary, so it is not evidence: content plus the
+    # unknown fixed overhead (20k), with revive's 5% margin.
+    assert report["usage_rewritten"] == 1 and report["revive_tokens"] == 21069
     assert report["revive_old_tokens"] == 1000000032
     output = Path(result["new_path"])
-    assert output.stat().st_size == 67110008
+    assert output.stat().st_size == 67110014
     # Frozen owned operation: checks complete giant body preservation and exact usage rewrite.
-    assert file_digest(output) == "835a2a22a52b94ca4e33db8a2b6c4d5ad0af9488abe176ec775d42b46a3c6e0e"
+    assert file_digest(output) == "82895801012a033034b36107784d30835b2890522939f28a85467928a0ce93b7"
     assert file_digest(source) == original
     print(json.dumps(dict(case="unchanged-giant-usage-rewrite", peak_live_rust_bytes=peak,
                           usage_rewritten=1, output_bytes=output.stat().st_size)), flush=True)

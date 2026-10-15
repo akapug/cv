@@ -26,7 +26,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     // and resume fails with "failed to parse thread ID from rollout file". A session with no known
     // cwd (some harnesses never record one) lands in the home dir rather than nowhere.
     let cwd = effective_cwd(session, opts)
-        .or_else(dirs::home_dir)
+        .or_else(crate::env::home_dir)
         .unwrap_or_else(|| PathBuf::from("/"));
     let cwd_str = cwd.to_string_lossy().into_owned();
 
@@ -315,7 +315,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         }
     }
 
-    lines.publish(&file_path)?;
+    lines.publish(&file_path, opts.claim())?;
 
     Ok(EmitResult {
         path: file_path,
@@ -440,7 +440,7 @@ mod staged_tests {
     fn native_namespaced_tool_calls_and_named_results_round_trip() -> Result<()> {
         use crate::harness::{Adapter, Parse};
         use crate::ir::{Message, SessionRef};
-        let world = cv_testkit::World::in_process("codex-tool-identity-wire");
+        let world = crate::test_world("codex-tool-identity-wire");
         let mut session = Session::new("source", Harness::Codex);
         let mut call = Message::new(Role::Assistant);
         call.content.push(Block::ToolUse {
@@ -516,7 +516,7 @@ mod staged_tests {
             let mut stage = JsonlStage::new();
             push_text(&mut stage, "fixed", role, content_type, event_type, text)?;
             let path = world.base.join(role);
-            stage.publish(&path)?;
+            stage.publish(&path, crate::publish::Claim::New)?;
             let expected = format!(
                 "{}\n{}\n",
                 serde_json::to_string(&codex_response_item(

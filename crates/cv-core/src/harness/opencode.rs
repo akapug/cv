@@ -13,8 +13,8 @@
 //! by *messageID*) — was only ever the input to a one-shot importer that was deleted on 2026-06-02:
 //! a machine that ran the import still carries a frozen copy, a fresh install has none. We read the
 //! database when it exists (behind the `sqlite` cargo feature) and fall back to the JSON tree,
-//! de-duplicating by session id (db wins). The payload JSON is identical in both, so one mapping
-//! ([`build_messages`]) serves both sources; db-backed [`SessionRef`]s point at the `.db` file.
+//! de-duplicating by session id (db wins). The payload JSON is identical in both, so one codec
+//! (`record.rs`, over a file's or a cell's view) serves both; db-backed [`SessionRef`]s point at the `.db` file.
 //!
 //! ## Two storage generations (JSON tree)
 //!
@@ -56,6 +56,7 @@
 //! remaining `session` columns land in `Session::extra["opencode"]`.
 
 mod emit;
+mod record;
 #[cfg(any(feature = "sqlite", test))]
 mod v2;
 pub use emit::emit;
@@ -158,7 +159,7 @@ fn data_dir() -> Option<PathBuf> {
 /// `opencode.db` (release channels), else the newest `opencode-<channel>.db`.
 #[cfg(feature = "sqlite")]
 fn resolve_db(data: &Path) -> Option<PathBuf> {
-    if let Some(v) = std::env::var_os("OPENCODE_DB") {
+    if let Some(v) = crate::env::var_os("OPENCODE_DB") {
         if v == ":memory:" {
             return None;
         }
@@ -249,7 +250,7 @@ impl Adapter for OpenCode {
         Ok(out)
     }
 
-    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             // Spawn turns, sub-agent returns and deferred tool calls, typed (`crate::affordance`).
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::OpenCode, sink);
@@ -257,17 +258,14 @@ impl Adapter for OpenCode {
             // A db-backed ref points at the `.db` file itself (like the other SQLite adapters).
             #[cfg(feature = "sqlite")]
             if self.db.as_ref() == Some(&r.path) || db::is_db_ref(r) {
-                return db::stream(r, _opts, sink);
+                return db::stream(r, opts, sink);
             }
             // OpenCode stores a session as a *directory* of per-message JSON files (plus per-message
-            // part files). The old `parse` slurped every message body into a `Vec` to sort it — for a
-            // large session that resident-spikes the whole transcript. Here we instead:
+            // part files), each one document viewed by the record codec:
             //   1. read the small session meta file,
-            //   2. cheaply order the message files (read each only to pull its `time/created` key, then
-            //      drop the body — peak is O(one message file), not the whole session),
-            //   3. re-read each file in order, build its IR message(s), emit to `sink`, and drop it
-            //      before touching the next.
-            // `load_parts` already loads one message's parts at a time, so peak stays O(one message).
+            //   2. order the message files by their `time/created` key alone,
+            //   3. view each message file in order, then its part files one at a time, emit its IR
+            //      message(s) to `sink`, and drop it before touching the next.
             let text = fs::read_to_string(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
             let meta: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
 
@@ -303,29 +301,13 @@ impl Adapter for OpenCode {
                 if let Ok(rd) = fs::read_dir(&mdir) {
                     for e in rd.filter_map(|e| e.ok()) {
                         let path = e.path();
-                        let Ok(source) = crate::json::JsonSource::capture(&path) else {
-                            continue;
-                        };
-                        match source.read_syntax(|view| {
-                            if !view.accepts_value()? {
-                                return Ok(None);
-                            }
-                            let when = view
-                                .get("time")?
-                                .map(|time| time.get("created"))
-                                .transpose()?
-                                .flatten()
-                                .map(|created| created.as_number())
-                                .transpose()?
-                                .flatten()
-                                .and_then(|number| number.as_i64())
-                                .unwrap_or(0);
-                            Ok(Some(when))
-                        }) {
-                            Ok(Some(when)) => order.push((when, path)),
-                            Ok(None) => {}
-                            Err(error) if error.is::<crate::json::InvalidJson>() => {}
-                            Err(error) => return Err(error),
+                        let when = document(&path, |view, _| {
+                            Ok(record::owned(record::get(view.get("time")?, "created")?)?
+                                .and_then(|created| created.as_i64())
+                                .unwrap_or(0))
+                        })?;
+                        if let Some(when) = when {
+                            order.push((when, path));
                         }
                     }
                 }
@@ -339,33 +321,27 @@ impl Adapter for OpenCode {
 
             // Re-read one message file at a time, emit, then drop before the next.
             for (_, path) in &order {
-                let built = if _opts.spans {
-                    let Ok(source) = crate::json::JsonSource::capture(path) else {
-                        continue;
-                    };
-                    let header = match source.read_syntax(|view| {
-                        if !view.accepts_value()? {
-                            return Ok(None);
-                        }
-                        ProjectedHeader::read(view).map(Some)
-                    }) {
-                        Ok(Some(header)) => header,
-                        Ok(None) => continue,
-                        Err(error) if error.is::<crate::json::InvalidJson>() => continue,
-                        Err(error) => return Err(error),
-                    };
-                    let msg_id = header.value.get("id").and_then(Value::as_str).unwrap_or("");
-                    let parts = self.load_projected_parts(msg_id, &arena)?;
-                    build_header_projected(&header, &parts)
-                } else {
-                    let Ok(t) = fs::read_to_string(path) else { continue };
-                    let Ok(mv) = serde_json::from_str::<Value>(&t) else {
-                        continue;
-                    };
-                    let msg_id = mv.get("id").and_then(Value::as_str).unwrap_or("");
-                    build_messages(&mv, &self.load_parts(msg_id))
+                let Some(mut record) = document(path, |view, source| {
+                    record::Record::header(view, None, record::Ctx::new(opts.spans, source, &arena))
+                })?
+                .flatten() else {
+                    continue;
                 };
-                for mut built in built {
+                if let Some(dir) = self.part_dir(record.id().unwrap_or("")) {
+                    // Parts in file-name order, one file at a time.
+                    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e.ok().map(|e| e.path()))
+                        .collect();
+                    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                    for path in paths {
+                        document(&path, |view, source| {
+                            record.part(view, None, record::Ctx::new(opts.spans, source, &arena))
+                        })?;
+                    }
+                }
+                for mut built in record.finish() {
                     fold_into_session(&mut s, &mut built)?;
                     if sink.message(built) == Flow::Stop {
                         return Ok(s);
@@ -383,6 +359,8 @@ impl Adapter for OpenCode {
         if self.db.as_ref() == Some(&r.path) || db::is_db_ref(r) {
             return db::todos(r).into_iter().collect();
         }
+        #[cfg(not(feature = "sqlite"))]
+        let _ = r;
         Vec::new()
     }
 }
@@ -408,84 +386,46 @@ fn fold_into_session(s: &mut Session, m: &mut Message) -> Result<()> {
 /// Count a session's conversational turns: message records whose `role` is `user`/`assistant`.
 /// The [`SessionRef::message_count`] contract is user+assistant turns only — counting directory
 /// entries (the old behavior) also picked up system/summary records and any stray files, so the
-/// number disagreed with every other adapter. Project only the role while validating each header;
-/// older headers can contain large inline summaries. This never touches part files.
+/// number disagreed with every other adapter. Only the role is selected; older headers can
+/// contain large inline summaries. This never touches part files.
 fn count_turns(dir: &std::path::Path) -> usize {
     let Ok(rd) = fs::read_dir(dir) else { return 0 };
     rd.filter_map(|e| e.ok())
         .filter(|entry| {
-            let Ok(source) = crate::json::JsonSource::capture(&entry.path()) else {
-                return false;
-            };
-            source
-                .read_syntax(|view| {
-                    if !view.accepts_value()? {
-                        return Ok(false);
-                    }
-                    Ok(view
-                        .get("role")?
-                        .map(|role| role.resolve())
-                        .transpose()?
-                        .is_some_and(|role| matches!(role.as_str(), Some("user") | Some("assistant"))))
-                })
+            document(&entry.path(), |view, _| is_turn(view))
+                .ok()
+                .flatten()
                 .unwrap_or(false)
         })
         .count()
 }
 
-impl OpenCode {
-    fn load_projected_parts(
-        &self,
-        mid: &str,
-        arena: &std::sync::Arc<crate::harness::store::bytes::ByteSource>,
-    ) -> Result<Vec<ProjectedPart>> {
-        let Some(dir) = self.part_dir(mid) else {
-            return Ok(Vec::new());
-        };
-        let mut paths = Vec::new();
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                paths.push((entry.file_name().to_string_lossy().into_owned(), entry.path()));
-            }
-        }
-        paths.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut parts = Vec::new();
-        for (_, path) in paths {
-            let Ok(source) = crate::json::JsonSource::capture(&path) else {
-                continue;
-            };
-            match source.read_syntax(|view| {
-                if !view.accepts_value()? || !view.is_object()? {
-                    return Ok(None);
-                }
-                Ok(Some(ProjectedPart::read(view, &source, arena)?))
-            }) {
-                Ok(Some(part)) => parts.push(part),
-                Ok(None) => {}
-                Err(error) if error.is::<crate::json::InvalidJson>() => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(parts)
-    }
+/// A message record whose `role` is `user` or `assistant`.
+fn is_turn(view: crate::json::JsonView<'_>) -> Result<bool> {
+    Ok(matches!(
+        record::string(view.get("role")?)?.as_deref(),
+        Some("user" | "assistant")
+    ))
+}
 
-    fn load_parts(&self, mid: &str) -> Vec<Value> {
-        let Some(pdir) = self.part_dir(mid) else {
-            return vec![];
-        };
-        let mut parts: Vec<(String, Value)> = Vec::new();
-        if let Ok(rd) = fs::read_dir(&pdir) {
-            for e in rd.filter_map(|e| e.ok()) {
-                let fname = e.file_name().to_string_lossy().to_string();
-                if let Ok(t) = fs::read_to_string(e.path()) {
-                    if let Ok(v) = serde_json::from_str::<Value>(&t) {
-                        parts.push((fname, v));
-                    }
-                }
-            }
+/// One JSON document of the tree, validated and viewed once; None for a file that cannot be
+/// captured or is not exactly one JSON value.
+fn document<T>(
+    path: &Path,
+    f: impl for<'a> FnOnce(crate::json::JsonView<'a>, &crate::json::JsonSource) -> Result<T>,
+) -> Result<Option<T>> {
+    let Ok(source) = crate::json::JsonSource::capture(path) else {
+        return Ok(None);
+    };
+    match source.read_syntax(|view| {
+        if view.accepts_value()? {
+            f(view, &source).map(Some)
+        } else {
+            Ok(None)
         }
-        parts.sort_by(|a, b| a.0.cmp(&b.0));
-        parts.into_iter().map(|(_, v)| v).collect()
+    }) {
+        Err(error) if error.is::<crate::json::InvalidJson>() => Ok(None),
+        result => result,
     }
 }
 
@@ -493,10 +433,10 @@ impl OpenCode {
 
 #[cfg(feature = "sqlite")]
 mod db {
-    //! `opencode.db` — `session`, `message`, `part` (`packages/core/src/session/sql.ts`). Rows are
-    //! hydrated back into the exact JSON the tree stored (`{...data, id, sessionID, messageID}`,
-    //! as `message-v2.ts` does) and handed to the shared mapping, so the two sources can't drift.
-    use super::super::store::sqlite::open_ro;
+    //! `opencode.db` — `session`, `message`, `part` (`packages/core/src/session/sql.ts`). `data`
+    //! cells are viewed through [`Cells`] and decoded by the same record codec as the tree, with
+    //! the row ids standing in for the ones the tree stored (as `message-v2.ts` hydrates them).
+    use super::super::store::sqlite::{open_ro, Cells};
     use super::super::ts_from_epoch;
     use super::*;
     use rusqlite::types::ValueRef;
@@ -569,18 +509,15 @@ mod db {
     /// 2.x writes only the new tables, so they win). Either table set may be absent: a 1.x database
     /// has no `session_v2`, a database 2.x created has no `session`.
     pub(super) fn discover(db: &Path) -> Result<Vec<SessionRef>> {
-        let conn = open_ro(db)?;
-        conn.read(|reader| {
-            let source = crate::json::JsonSource::capture_with_reads(db, reader.reads())?;
-            let result = discover_snapshot(db, &source, reader);
-            source.check()?;
-            result
+        crate::harness::store::sqlite::cached_discover(db, || {
+            let conn = open_ro(db)?;
+            conn.read(|reader| discover_snapshot(db, reader.reads(), reader))
         })
     }
 
     fn discover_snapshot(
         db: &Path,
-        source: &crate::json::JsonSource,
+        reads: &crate::source::ReadSet,
         conn: &rusqlite::Connection,
     ) -> Result<Vec<SessionRef>> {
         let _transaction = conn.unchecked_transaction()?;
@@ -591,7 +528,7 @@ mod db {
         };
         if has_table(conn, "session") && has_table(conn, "message") {
             let seen: HashSet<String> = refs.iter().map(|r| r.id.clone()).collect();
-            refs.extend(discover_v1(conn, db, source, &seen)?);
+            refs.extend(discover_v1(conn, db, reads, &seen)?);
         }
         Ok(refs)
     }
@@ -640,12 +577,11 @@ mod db {
         })
     }
 
-    /// Count the roles the actual Value-based reader accepts, including final duplicate keys.
-    /// Incremental cells keep old inline summary bodies out of SQLite's native value buffers.
+    /// Count the turns the stream reads: `message` cells whose final `role` is user or assistant.
     fn discover_v1(
         conn: &rusqlite::Connection,
         db: &Path,
-        source: &crate::json::JsonSource,
+        reads: &crate::source::ReadSet,
         seen: &HashSet<String>,
     ) -> Result<Vec<SessionRef>> {
         // Migrated stores retain old message bodies. Select only surviving legacy sessions
@@ -661,45 +597,19 @@ mod db {
         }
         let wanted: HashSet<&str> = refs.iter().map(|reference| reference.id.as_str()).collect();
         let mut counts: HashMap<String, usize> = HashMap::new();
-        let (mut stmt, rowid) = match conn.prepare("SELECT session_id, rowid, typeof(data) FROM message") {
-            Ok(statement) => (statement, true),
-            Err(_) => (conn.prepare("SELECT session_id, data FROM message")?, false),
-        };
+        let cells = Cells::new(conn, db, reads, "message")?;
+        let mut stmt = conn.prepare(&format!("SELECT session_id, {} FROM message", cells.select("data")))?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let Ok(sid) = row.get::<_, String>(0) else { continue };
             if !wanted.contains(sid.as_str()) {
                 continue;
             }
-            let backing = if rowid {
-                if row.get::<_, String>(2)? != "text" {
-                    continue;
-                }
-                let blob = conn.blob_open(rusqlite::DatabaseName::Main, "message", "data", row.get(1)?, true)?;
-                crate::harness::store::bytes::ByteSource::read(blob)?
-            } else {
-                let Ok(data) = row.get_ref(1)?.as_str() else { continue };
-                crate::harness::store::bytes::ByteSource::read(data.as_bytes())?
-            };
-            let len = backing.len()?;
-            if len == 0 {
+            let Some(cell) = cells.cell(conn, "message", "data", row, 1)? else {
                 continue;
-            }
-            let accepted = source.read_backing_syntax(std::sync::Arc::new(backing), 0, len, |view| {
-                if !view.accepts_value()? || !view.is_object()? {
-                    return Ok(false);
-                }
-                Ok(view
-                    .get("role")?
-                    .map(|role| role.resolve())
-                    .transpose()?
-                    .is_some_and(|role| matches!(role.as_str(), Some("user") | Some("assistant"))))
-            });
-            match accepted {
-                Ok(true) => *counts.entry(sid).or_default() += 1,
-                Ok(false) => {}
-                Err(error) if error.is::<crate::json::InvalidJson>() => {}
-                Err(error) => return Err(error),
+            };
+            if cells.read(cell, |view| Ok(view.is_object()? && is_turn(view)?))? == Some(true) {
+                *counts.entry(sid).or_default() += 1;
             }
         }
         for reference in &mut refs {
@@ -735,23 +645,17 @@ mod db {
     /// `message` row with its `part` rows hydrated and mapped one message at a time.
     pub(super) fn stream(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         let conn = open_ro(&r.path)?;
-        conn.read(|reader| {
-            let source = crate::json::JsonSource::capture_with_reads(&r.path, reader.reads())?;
-            let result = stream_snapshot(r, opts, sink, &source, reader);
-            source.check()?;
-            result
-        })
+        conn.read(|reader| stream_snapshot(r, opts, sink, reader.reads(), reader))
     }
 
     fn stream_snapshot(
         r: &SessionRef,
         opts: &ParseOptions,
         sink: &mut dyn MessageSink,
-        source: &crate::json::JsonSource,
+        reads: &crate::source::ReadSet,
         conn: &rusqlite::Connection,
     ) -> Result<Session> {
         let _transaction = conn.unchecked_transaction()?;
-        let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena()?);
         // The 2.x tables win for a session in both (a migrated database; module doc of `v2`).
         let v2 = has_table(conn, "session_v2")
             && conn
@@ -832,144 +736,53 @@ mod db {
         }
         sink.meta(&s);
         if v2 {
-            return stream_v2(conn, s, opts, sink, source, &arena);
+            return stream_v2(
+                conn,
+                s,
+                opts,
+                sink,
+                &Cells::new(conn, &r.path, reads, "session_message")?,
+            );
         }
-
-        let (mut msgs, message_rowid) = if opts.spans {
-            match conn
-                .prepare("SELECT id, rowid, typeof(data) FROM message WHERE session_id = ?1 ORDER BY time_created, id")
-            {
-                Ok(statement) => (statement, true),
-                Err(_) => (
-                    conn.prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")?,
-                    false,
-                ),
-            }
-        } else {
-            (
-                conn.prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")?,
-                false,
-            )
-        };
-        let (mut parts, part_rowid) = if opts.spans {
-            match conn.prepare("SELECT rowid, id, typeof(data) FROM part WHERE message_id = ?1 ORDER BY id") {
-                Ok(statement) => (statement, true),
-                Err(_) => (
-                    conn.prepare("SELECT id, data FROM part WHERE message_id = ?1 ORDER BY id")?,
-                    false,
-                ),
-            }
-        } else {
-            (
-                conn.prepare("SELECT id, data FROM part WHERE message_id = ?1 ORDER BY id")?,
-                false,
-            )
-        };
-        let mut rows = msgs.query(rusqlite::params![r.id])?;
+        // Each `message` cell with its `part` cells (ordered by id), one record at a time.
+        let messages = Cells::new(conn, &r.path, reads, "message")?;
+        let parts = Cells::new(conn, &r.path, reads, "part")?;
+        fn ctx<'a>(spans: bool, cells: &'a Cells) -> record::Ctx<'a> {
+            let (source, arena) = cells.out();
+            record::Ctx::new(spans, source, arena)
+        }
+        let mut message_rows = conn.prepare(&format!(
+            "SELECT id, {} FROM message WHERE session_id = ?1 ORDER BY time_created, id",
+            messages.select("data")
+        ))?;
+        let mut part_rows = conn.prepare(&format!(
+            "SELECT id, {} FROM part WHERE message_id = ?1 ORDER BY id",
+            parts.select("data")
+        ))?;
+        let mut rows = message_rows.query(rusqlite::params![r.id])?;
         while let Some(row) = rows.next()? {
             let mid: String = row.get(0)?;
-            let mut header = if opts.spans {
-                let (offset, len) = if message_rowid {
-                    if row.get::<_, String>(2)? != "text" {
-                        anyhow::bail!("OpenCode SQLite message data is not TEXT");
-                    }
-                    crate::harness::store::sqlite::append_cell(conn, "message", "data", row.get(1)?, &arena)?
-                } else {
-                    let data = row.get_ref(1)?.as_str()?;
-                    arena.append(|writer| {
-                        writer.write_all(data.as_bytes())?;
-                        Ok(())
-                    })?
-                };
-                if len == 0 {
-                    continue;
-                }
-                match source.read_backing_syntax(arena.clone(), offset, len, |view| {
-                    if !view.accepts_value()? || !view.is_object()? {
-                        return Ok(None);
-                    }
-                    ProjectedHeader::read(view).map(Some)
-                }) {
-                    Ok(Some(header)) => header,
-                    Ok(None) => continue,
-                    Err(error) if error.is::<crate::json::InvalidJson>() => {
-                        if !backing_utf8(&arena, offset, len)? {
-                            anyhow::bail!("OpenCode SQLite message data is not UTF-8");
-                        }
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                let data: String = row.get(1)?;
-                let Ok(Value::Object(mv)) = serde_json::from_str::<Value>(&data) else {
-                    continue;
-                };
-                ProjectedHeader {
-                    value: Value::Object(mv),
-                    summary: None,
-                }
+            let Some(cell) = messages.cell(conn, "message", "data", row, 1)? else {
+                continue;
             };
-            let mv = header.value.as_object_mut().unwrap();
-            mv.insert("id".into(), json!(mid));
-            mv.insert("sessionID".into(), json!(r.id));
-            let mut part_rows = parts.query(rusqlite::params![mid])?;
-            let mut pv = Vec::new();
-            let mut projected = Vec::new();
-            while let Some(pr) = part_rows.next()? {
-                let Ok(pid) = pr.get::<_, String>(if part_rowid { 1 } else { 0 }) else {
+            let Some(Some(mut record)) = messages.read(cell, |view| {
+                record::Record::header(view, Some(&mid), ctx(opts.spans, &messages))
+            })?
+            else {
+                continue;
+            };
+            let mut part_rows = part_rows.query(rusqlite::params![mid])?;
+            while let Some(row) = part_rows.next()? {
+                let Ok(pid) = row.get::<_, String>(0) else {
                     continue;
                 };
-                if part_rowid && pr.get::<_, String>(2)? != "text" {
-                    continue;
-                }
-                if !part_rowid && pr.get_ref(1)?.as_str().is_err() {
-                    continue;
-                }
-                if opts.spans {
-                    let (offset, len) = if part_rowid {
-                        crate::harness::store::sqlite::append_cell(conn, "part", "data", pr.get(0)?, &arena)?
-                    } else {
-                        let pdata = pr.get_ref(1)?.as_str()?;
-                        arena.append(|writer| {
-                            writer.write_all(pdata.as_bytes())?;
-                            Ok(())
-                        })?
-                    };
-                    if len == 0 {
-                        continue;
-                    }
-                    let part = source.read_backing_syntax(arena.clone(), offset, len, |view| {
-                        if !view.accepts_value()? || !view.is_object()? {
-                            return Ok(None);
-                        }
-                        Ok(Some(ProjectedPart::read(view, source, &arena)?))
-                    });
-                    match part {
-                        Ok(Some(mut part)) => {
-                            let po = part.value.as_object_mut().unwrap();
-                            po.insert("id".into(), json!(pid));
-                            po.insert("messageID".into(), json!(mid));
-                            po.insert("sessionID".into(), json!(r.id));
-                            projected.push(part);
-                        }
-                        Ok(None) => {}
-                        Err(error) if error.is::<crate::json::InvalidJson>() => {}
-                        Err(error) => return Err(error),
-                    }
-                } else if let Ok(Value::Object(mut po)) = serde_json::from_str::<Value>(pr.get_ref(1)?.as_str()?) {
-                    po.insert("id".into(), json!(pid));
-                    po.insert("messageID".into(), json!(mid));
-                    po.insert("sessionID".into(), json!(r.id));
-                    pv.push(Value::Object(po));
+                if let Some(cell) = parts.cell(conn, "part", "data", row, 1)? {
+                    parts.read(cell, |view| {
+                        record.part(view, Some([&pid, &mid, &r.id]), ctx(opts.spans, &parts))
+                    })?;
                 }
             }
-            let built = if opts.spans {
-                build_header_projected(&header, &projected)
-            } else {
-                build_messages(&header.value, &pv)
-            };
-            for mut built in built {
+            for mut built in record.finish() {
                 fold_into_session(&mut s, &mut built)?;
                 if sink.message(built) == Flow::Stop {
                     return Ok(s);
@@ -979,62 +792,21 @@ mod db {
         Ok(s)
     }
 
-    // Owned SQLite String reads reject invalid UTF-8 before JSON parsing. Preserve that failure
-    // policy on malformed rows without adding a second traversal to valid payloads.
-    fn backing_utf8(arena: &crate::harness::store::bytes::ByteSource, offset: u64, len: u64) -> Result<bool> {
-        if let Some(valid) =
-            arena.with_bytes(|bytes| std::str::from_utf8(&bytes[offset as usize..(offset + len) as usize]).is_ok())?
-        {
-            return Ok(valid);
-        }
-        use std::io::{Read, Seek};
-        let mut file = arena.file()?;
-        file.seek(std::io::SeekFrom::Start(offset))?;
-        let mut input = file.take(len);
-        let mut bytes = [0u8; 64 * 1024 + 3];
-        let mut pending = 0;
-        loop {
-            let read = input.read(&mut bytes[pending..])?;
-            if read == 0 {
-                return Ok(pending == 0);
-            }
-            let end = pending + read;
-            match std::str::from_utf8(&bytes[..end]) {
-                Ok(_) => pending = 0,
-                Err(error) if error.error_len().is_none() => {
-                    pending = end - error.valid_up_to();
-                    bytes.copy_within(error.valid_up_to()..end, 0);
-                }
-                Err(_) => return Ok(false),
-            }
-        }
-    }
-
-    /// The 2.x `session_message` rows of one session, in `seq` order (module doc of `v2`).
+    /// The 2.x `session_message` rows of one session, in `seq` order (module doc of `v2`). A cell
+    /// that is not one JSON value is a skipped line.
     fn stream_v2(
         conn: &rusqlite::Connection,
         mut s: Session,
         opts: &ParseOptions,
         sink: &mut dyn MessageSink,
-        source: &crate::json::JsonSource,
-        arena: &std::sync::Arc<crate::harness::store::bytes::ByteSource>,
+        cells: &Cells,
     ) -> Result<Session> {
-        let (mut stmt, rowid) = if opts.spans {
-            match conn
-                .prepare("SELECT id, type, rowid, typeof(data) FROM session_message WHERE session_id = ?1 ORDER BY seq")
-            {
-                Ok(statement) => (statement, true),
-                Err(_) => (
-                    conn.prepare("SELECT id, type, data FROM session_message WHERE session_id = ?1 ORDER BY seq")?,
-                    false,
-                ),
-            }
-        } else {
-            (
-                conn.prepare("SELECT id, type, data FROM session_message WHERE session_id = ?1 ORDER BY seq")?,
-                false,
-            )
-        };
+        let (source, arena) = cells.out();
+        let ctx = record::Ctx::new(opts.spans, source, arena);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, type, {} FROM session_message WHERE session_id = ?1 ORDER BY seq",
+            cells.select("data")
+        ))?;
         let mut rows = stmt.query(rusqlite::params![s.id])?;
         let mut unknown: std::collections::BTreeMap<String, u64> = Default::default();
         let mut unreadable = 0u64;
@@ -1044,141 +816,27 @@ mod db {
             if opts.complete && !v2::known_type(&ty) {
                 *unknown.entry(ty.clone()).or_default() += 1;
             }
-            if rowid && row.get::<_, String>(3)? != "text" {
-                anyhow::bail!("OpenCode SQLite message data is not TEXT");
-            }
-            let mut built = if opts.spans
-                && matches!(
-                    ty.as_str(),
-                    "user" | "synthetic" | "system" | "skill" | "shell" | "assistant" | "compaction"
-                ) {
-                let (offset, len) = if rowid {
-                    crate::harness::store::sqlite::append_cell(conn, "session_message", "data", row.get(2)?, arena)?
-                } else {
-                    let bytes = row.get_ref(2)?.as_str()?;
-                    arena.append(|writer| {
-                        writer.write_all(bytes.as_bytes())?;
-                        Ok(())
-                    })?
-                };
-                if len == 0 {
-                    unreadable += 1;
-                    continue;
-                }
-                let result = source.read_backing_syntax(arena.clone(), offset, len, |view| {
-                    if !view.accepts_value()? {
+            let decoded = match cells.cell(conn, "session_message", "data", row, 2)? {
+                Some(cell) => cells.read(cell, |view| {
+                    let Some(mut built) = v2::build(&id, &ty, view, opts, ctx)? else {
                         return Ok(None);
-                    }
-                    let mut data = Map::new();
-                    let mut parts = Vec::new();
-                    let mut text = None;
-                    let shell = (ty == "shell")
-                        .then(|| project_shell(view, source, arena))
-                        .transpose()?;
-                    view.for_each_entry(|key, value| {
-                        if ty == "shell" && matches!(key, "command" | "output") {
-                            // Payloads are retained separately; only the command-presence gate
-                            // is needed by the unchanged shell codec.
-                            data.insert(
-                                key.to_owned(),
-                                if key == "command" && value.is_string()? {
-                                    json!(if nonempty_string(value)? { "x" } else { "" })
-                                } else {
-                                    Value::Null
-                                },
-                            );
-                        } else if ((key == "text" && ty != "assistant") || (key == "summary" && ty == "compaction"))
-                            && value.is_string()?
-                        {
-                            text = value.source_text()?;
-                            data.insert(key.to_owned(), json!(if nonempty_string(value)? { "x" } else { "" }));
-                        } else if key == "files" && ty == "user" && value.is_array()? {
-                            let mut files = Vec::new();
-                            for file in value.array()?.unwrap() {
-                                let file = file?;
-                                let mut selected = Map::new();
-                                for key in ["mime", "source", "name"] {
-                                    if let Some(value) = file.get(key)? {
-                                        selected.insert(key.into(), value.resolve()?.into_owned());
-                                    }
-                                }
-                                files.push(Value::Object(selected));
-                            }
-                            data.insert(key.into(), Value::Array(files));
-                        } else if key == "content" && ty == "assistant" && value.is_array()? {
-                            for item in value.array()?.unwrap() {
-                                parts.push(ProjectedPart::read_inner(item?, source, arena, true)?);
-                            }
-                            data.insert(
-                                key.to_owned(),
-                                Value::Array(parts.iter().map(|p| p.value.clone()).collect()),
-                            );
-                        } else {
-                            data.insert(key.to_owned(), value.resolve()?.into_owned());
-                        }
-                        Ok(())
-                    })?;
-                    let mut built = v2::build_projected(
-                        &id,
-                        &ty,
-                        &Value::Object(data),
-                        opts,
-                        text.as_ref(),
-                        Some(&parts),
-                        shell.as_ref(),
-                    );
+                    };
                     if opts.complete {
-                        if let Ok(messages) = &mut built {
-                            v2::attach_complete(messages, &id, &ty, view.to_json()?);
-                        }
+                        v2::attach_complete(&mut built, &id, &ty, view.argument(opts.spans)?);
                     }
                     Ok(Some(built))
-                });
-                match result {
-                    Ok(Some(Ok(built))) => built,
-                    Ok(Some(Err(()))) => {
-                        *unknown.entry(ty).or_default() += 1;
-                        Vec::new()
-                    }
-                    Ok(None) => {
-                        unreadable += 1;
-                        continue;
-                    }
-                    Err(error) if error.is::<crate::json::InvalidJson>() => {
-                        anyhow::ensure!(
-                            backing_utf8(arena, offset, len)?,
-                            "OpenCode SQLite message data is not UTF-8"
-                        );
-                        unreadable += 1;
-                        continue;
-                    }
-                    Err(error) => return Err(error),
+                })?,
+                None => None,
+            };
+            let mut built = match decoded {
+                Some(Some(built)) => built,
+                Some(None) => {
+                    *unknown.entry(ty).or_default() += 1;
+                    Vec::new()
                 }
-            } else {
-                let data = if rowid {
-                    conn.query_row(
-                        "SELECT data FROM session_message WHERE rowid = ?1",
-                        rusqlite::params![row.get::<_, i64>(2)?],
-                        |row| row.get::<_, String>(0),
-                    )?
-                } else {
-                    row.get::<_, String>(2)?
-                };
-                let Ok(data) = serde_json::from_str::<Value>(&data) else {
+                None => {
                     unreadable += 1;
                     continue;
-                };
-                match v2::build(&id, &ty, &data, opts) {
-                    Ok(mut built) => {
-                        if opts.complete {
-                            v2::attach_complete(&mut built, &id, &ty, data.into());
-                        }
-                        built
-                    }
-                    Err(()) => {
-                        *unknown.entry(ty).or_default() += 1;
-                        Vec::new()
-                    }
                 }
             };
             if let Some(record) = built.first_mut().and_then(|message| message.complete_record.as_mut()) {
@@ -1234,7 +892,6 @@ mod db {
             let world = cv_testkit::World::new("opencode-shadowed-discovery");
             let path = world.base.join("provenance");
             fs::write(&path, b"unchanged")?;
-            let source = crate::json::JsonSource::capture(&path)?;
             for count in [1, 16, 256] {
                 let conn = rusqlite::Connection::open_in_memory()?;
                 conn.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,data TEXT); CREATE TABLE session_v2(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT); INSERT INTO session VALUES('ses_m','/old','old title',1,1); INSERT INTO session_v2 VALUES('ses_m','/new','current title',2,2);")?;
@@ -1255,7 +912,7 @@ mod db {
                         std::ptr::null_mut(),
                     );
                 }
-                let refs = discover_snapshot(&path, &source, &conn)?;
+                let refs = discover_snapshot(&path, &Default::default(), &conn)?;
                 assert_eq!(refs.len(), 1);
                 assert_eq!(refs[0].title.as_deref(), Some("current title"));
                 assert_eq!(refs[0].message_count, 0);
@@ -1268,10 +925,9 @@ mod db {
             let world = cv_testkit::World::new("opencode-mixed-discovery");
             let path = world.base.join("provenance");
             fs::write(&path, b"unchanged")?;
-            let source = crate::json::JsonSource::capture(&path)?;
             let conn = rusqlite::Connection::open_in_memory()?;
             conn.execute_batch(r#"CREATE TABLE session(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,data TEXT); CREATE TABLE session_v2(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT); INSERT INTO session VALUES('covered','/old','old',1,3),('older','/old','older',1,1),('newer','/old','newer',1,2); INSERT INTO session_v2 VALUES('covered','/new','current',2,2); INSERT INTO message VALUES('hidden','covered','{broken'),('orphan','missing','{broken'),('old','older','{"role":"user"}'),('new','newer','{"role":"system","role":"assistant"}');"#)?;
-            let refs = discover_snapshot(&path, &source, &conn)?;
+            let refs = discover_snapshot(&path, &Default::default(), &conn)?;
             assert_eq!(
                 refs.iter()
                     .map(|r| (r.id.as_str(), r.message_count))
@@ -1283,722 +939,6 @@ mod db {
     }
 }
 
-// ── pure mapping (filesystem-free, so it's unit-testable for both generations) ──────────────
-
-/// Map one OpenCode message record + its parts into IR messages. Tool results are split into a
-/// trailing `Role::Tool` message (mirroring the Claude adapter) so conversions re-encode them
-/// correctly. Returns 0–2 messages.
-fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
-    build_parts(mv, parts.iter().map(|v| (v, None)), None)
-}
-
-fn json_text(
-    view: crate::json::JsonView<'_>,
-    source: &crate::json::JsonSource,
-    arena: &std::sync::Arc<crate::harness::store::bytes::ByteSource>,
-) -> Result<crate::lazy::Text> {
-    crate::harness::store::text::append(source, arena, |writer| writer.push_json(view))
-}
-
-fn decoded_input(
-    view: crate::json::JsonView<'_>,
-    source: &crate::json::JsonSource,
-    arena: &std::sync::Arc<crate::harness::store::bytes::ByteSource>,
-) -> Result<crate::json::Json> {
-    if !view
-        .source_range()?
-        .is_some_and(|(_, len)| len > crate::lazy::INLINE_MAX as u64)
-    {
-        let value = view.resolve()?.into_owned();
-        return Ok(match serde_json::from_str::<Value>(value.as_str().unwrap()) {
-            Ok(decoded) => decoded.into(),
-            Err(_) => value.into(),
-        });
-    }
-    let (offset, len) = arena.append(|writer| {
-        view.for_each_str_chunk(|chunk| {
-            writer.write_all(chunk.as_bytes())?;
-            Ok(())
-        })?;
-        Ok(())
-    })?;
-    if len != 0 {
-        match source.read_backing_syntax(arena.clone(), offset, len, |decoded| {
-            if decoded.accepts_value()? {
-                Ok(Some(decoded.argument(true)?))
-            } else {
-                Ok(None)
-            }
-        }) {
-            Ok(Some(decoded)) => return Ok(decoded),
-            Ok(None) => {}
-            Err(error) if error.is::<crate::json::InvalidJson>() => {}
-            Err(error) => return Err(error),
-        }
-    }
-    view.argument(true)
-}
-
-#[cfg(any(feature = "sqlite", test))]
-fn project_shell(
-    view: crate::json::JsonView<'_>,
-    source: &crate::json::JsonSource,
-    arena: &std::sync::Arc<crate::harness::store::bytes::ByteSource>,
-) -> Result<v2::ProjectedShell> {
-    let command = match view.get("command")? {
-        Some(command) if command.is_string()? && nonempty_string(command)? => {
-            Some(crate::harness::store::text::append(source, arena, |writer| {
-                writer.push("$ ")?;
-                anyhow::ensure!(writer.push_string(command)?, "expected shell command string");
-                Ok(())
-            })?)
-        }
-        _ => None,
-    };
-    let output = match view.get("output")? {
-        Some(output) if !output.is_null()? => {
-            let string = if output.is_string()? {
-                Some(output)
-            } else {
-                // Presence wins before type: a non-string output field must NOT fall through
-                // to text. The historical codec canonicalizes the entire object instead.
-                match output.get("output")?.or(output.get("text")?) {
-                    Some(value) if value.is_string()? => Some(value),
-                    _ => None,
-                }
-            };
-            match string {
-                Some(string) if nonempty_string(string)? => string.source_text()?,
-                Some(_) => None,
-                None => Some(crate::harness::store::text::append(source, arena, |writer| {
-                    writer.push_json(output)
-                })?),
-            }
-        }
-        _ => None,
-    };
-    Ok(v2::ProjectedShell { command, output })
-}
-
-fn nonempty_string(view: crate::json::JsonView<'_>) -> Result<bool> {
-    match view.source_range()? {
-        Some((_, len)) => Ok(len > 2),
-        None => Ok(view.resolve()?.as_str().is_some_and(|text| !text.is_empty())),
-    }
-}
-
-struct ProjectedHeader {
-    value: Value,
-    summary: Option<crate::lazy::Text>,
-}
-
-impl ProjectedHeader {
-    fn read(view: crate::json::JsonView<'_>) -> Result<Self> {
-        let keys = [
-            "id",
-            "role",
-            "parentID",
-            "time",
-            "modelID",
-            "model",
-            "tokens",
-            "cost",
-            "agent",
-            "mode",
-            "providerID",
-            "finish",
-            "error",
-            "variant",
-            "structured",
-            "format",
-            "system",
-            "tools",
-            "path",
-            "summary",
-        ];
-        let Some(fields) = view.select_fields(&keys)? else {
-            return Ok(Self {
-                value: Value::Null,
-                summary: None,
-            });
-        };
-        let mut object = Map::new();
-        let mut summary = None;
-        for (key, value) in keys.into_iter().zip(fields) {
-            let Some(value) = value else { continue };
-            if key == "summary" {
-                if let Some(fields) = value.select_fields(&["body", "title", "diffs"])? {
-                    let mut selected = Map::new();
-                    let has_body = fields[0].is_some();
-                    for (index, (key, value)) in ["body", "title", "diffs"].into_iter().zip(fields).enumerate() {
-                        let Some(value) = value else { continue };
-                        if index < 2 {
-                            let text = value.source_text()?;
-                            if index == 0 || !has_body {
-                                summary = text;
-                            }
-                            selected.insert(
-                                key.to_owned(),
-                                if value.is_string()? {
-                                    json!(if nonempty_string(value)? { "x" } else { "" })
-                                } else {
-                                    Value::Null
-                                },
-                            );
-                        } else {
-                            selected.insert(key.to_owned(), value.resolve()?.into_owned());
-                        }
-                    }
-                    object.insert(key.to_owned(), Value::Object(selected));
-                } else {
-                    object.insert(key.to_owned(), value.as_bool()?.map(Value::Bool).unwrap_or(Value::Null));
-                }
-            } else {
-                object.insert(key.to_owned(), value.resolve()?.into_owned());
-            }
-        }
-        Ok(Self {
-            value: Value::Object(object),
-            summary,
-        })
-    }
-}
-
-struct ProjectedPart {
-    value: Value,
-    text: Option<crate::lazy::Text>,
-    input: Option<crate::json::Json>,
-    output: Option<crate::lazy::Text>,
-    error: Option<crate::lazy::Text>,
-}
-
-impl ProjectedPart {
-    fn read(
-        view: crate::json::JsonView<'_>,
-        source: &crate::json::JsonSource,
-        arena: &std::sync::Arc<crate::harness::store::bytes::ByteSource>,
-    ) -> Result<Self> {
-        Self::read_inner(view, source, arena, false)
-    }
-    fn read_inner(
-        view: crate::json::JsonView<'_>,
-        source: &crate::json::JsonSource,
-        arena: &std::sync::Arc<crate::harness::store::bytes::ByteSource>,
-        v2: bool,
-    ) -> Result<Self> {
-        let mut part = Self {
-            value: Value::Null,
-            text: None,
-            input: None,
-            output: None,
-            error: None,
-        };
-        if !view.is_object()? {
-            part.value = view.resolve()?.into_owned();
-            return Ok(part);
-        }
-        let ty = view
-            .get("type")?
-            .map(|v| v.resolve().map(|v| v.as_str().unwrap_or("").to_owned()))
-            .transpose()?
-            .unwrap_or_default();
-        let mut object = Map::new();
-        view.for_each_entry(|key, value| {
-            if key == "text" && matches!(ty.as_str(), "text" | "reasoning") && value.is_string()? {
-                part.text = value.source_text()?;
-                object.insert(key.to_owned(), json!(if nonempty_string(value)? { "x" } else { "" }));
-            } else if key == "state" && ty == "tool" && value.is_object()? {
-                let mut state = Map::new();
-                value.for_each_entry(|key, value| {
-                    if key == "input" {
-                        part.input = Some(if v2 && value.is_string()? {
-                            // 2.x accepts encoded scalars and preserves empty/partial strings.
-                            // Its established scalar policy differs from OpenAI's helper.
-                            decoded_input(value, source, arena)?
-                        } else {
-                            value.argument(true)?
-                        });
-                        state.insert(key.to_owned(), Value::Null);
-                    } else if key == "content" && v2 && value.is_array()? {
-                        // A single text result already has the exact joined representation.
-                        // Retain its source range instead of copying it through another arena extent.
-                        let mut content = value.array()?.unwrap();
-                        if let Some(item) = content.next().transpose()? {
-                            if content.next().transpose()?.is_none()
-                                && item
-                                    .get("type")?
-                                    .map(|ty| ty.resolve().map(|ty| ty.as_str() == Some("text")))
-                                    .transpose()?
-                                    .unwrap_or(false)
-                            {
-                                part.output = Some(
-                                    item.get("text")?
-                                        .map(|text| text.source_text())
-                                        .transpose()?
-                                        .flatten()
-                                        .unwrap_or_default(),
-                                );
-                                state.insert(key.to_owned(), json!([{"type":"text","text":""}]));
-                                return Ok(());
-                            }
-                        }
-                        let mut items = Vec::new();
-                        let mut text_count = 0usize;
-                        let output = crate::harness::store::text::append(source, arena, |writer| {
-                            for item in value.array()?.unwrap() {
-                                let item = item?;
-                                let is_text = item
-                                    .get("type")?
-                                    .is_some_and(|v| v.resolve().is_ok_and(|v| v.as_str() == Some("text")));
-                                if is_text {
-                                    if text_count > 0 {
-                                        writer.push("\n")?;
-                                    }
-                                    text_count += 1;
-                                    if let Some(text) = item.get("text")? {
-                                        writer.push_string(text)?;
-                                    }
-                                    items.push(json!({"type":"text", "text":""}));
-                                } else {
-                                    let is_file = item
-                                        .get("type")?
-                                        .map(|v| v.resolve().map(|v| v.as_str() == Some("file")))
-                                        .transpose()?
-                                        .unwrap_or(false);
-                                    if !is_file {
-                                        if text_count > 0 {
-                                            writer.push("\n")?;
-                                        }
-                                        text_count += 1;
-                                        writer.push_json(item)?;
-                                        items.push(Value::Null);
-                                    } else {
-                                        items.push(item.resolve()?.into_owned());
-                                    }
-                                }
-                            }
-                            Ok(())
-                        })?;
-                        if text_count > 0 {
-                            part.output = Some(output);
-                        }
-                        state.insert(key.to_owned(), Value::Array(items));
-                    } else if !v2 && matches!(key, "output" | "error") {
-                        let text = if value.is_string()? {
-                            value.source_text()?
-                        } else {
-                            Some(json_text(value, source, arena)?)
-                        };
-                        if key == "output" {
-                            part.output = text;
-                        } else {
-                            part.error = text;
-                        }
-                        state.insert(key.to_owned(), json!(""));
-                    } else {
-                        state.insert(key.to_owned(), value.resolve()?.into_owned());
-                    }
-                    Ok(())
-                })?;
-                object.insert(key.to_owned(), Value::Object(state));
-            } else {
-                object.insert(key.to_owned(), value.resolve()?.into_owned());
-            }
-            Ok(())
-        })?;
-        part.value = Value::Object(object);
-        Ok(part)
-    }
-}
-
-#[cfg(test)]
-fn build_projected(mv: &Value, parts: &[ProjectedPart]) -> Vec<Message> {
-    build_parts(mv, parts.iter().map(|p| (&p.value, Some(p))), None)
-}
-
-fn build_header_projected(header: &ProjectedHeader, parts: &[ProjectedPart]) -> Vec<Message> {
-    build_parts(
-        &header.value,
-        parts.iter().map(|p| (&p.value, Some(p))),
-        header.summary.as_ref(),
-    )
-}
-
-fn build_parts<'a>(
-    mv: &Value,
-    parts: impl IntoIterator<Item = (&'a Value, Option<&'a ProjectedPart>)>,
-    summary_text: Option<&crate::lazy::Text>,
-) -> Vec<Message> {
-    let role = match mv.get("role").and_then(Value::as_str) {
-        Some("assistant") => Role::Assistant,
-        Some("system") => Role::System,
-        _ => Role::User,
-    };
-
-    let msg_id = mv.get("id").and_then(Value::as_str).unwrap_or("");
-    let mut m = match role {
-        Role::System => Message::of_kind(Role::System, MessageKind::SystemPrompt, Origin::Harness),
-        role => Message::new(role),
-    };
-    m.id = (!msg_id.is_empty()).then(|| msg_id.to_string());
-    m.parent_id = mv.get("parentID").and_then(Value::as_str).map(str::to_string);
-    m.timestamp = mv.pointer("/time/created").and_then(super::ts_from_value);
-    // Newer records carry `modelID`; user records nest it under `model.modelID`.
-    m.model = mv
-        .get("modelID")
-        .and_then(Value::as_str)
-        .or_else(|| mv.pointer("/model/modelID").and_then(Value::as_str))
-        .map(str::to_string);
-    m.usage = parse_usage(mv);
-    // Harness facts, gathered here and nested under `extra["opencode"]` at the end (module doc).
-    let mut bag = Map::new();
-    collect_message_extra(mv, &mut bag);
-    // Kind evidence from the parts: a `compaction` part, an `agent` mention / `subtask` spawn.
-    let mut compaction = false;
-    let mut spawn = false;
-
-    let mut tool_results: Vec<Block> = Vec::new();
-    for (part, projected) in parts {
-        match part.get("type").and_then(Value::as_str).unwrap_or("") {
-            "text" => {
-                if let Some(t) = part.get("text").and_then(Value::as_str) {
-                    if !t.is_empty() {
-                        m.content.push(Block::Text {
-                            text: projected
-                                .and_then(|p| p.text.clone())
-                                .unwrap_or_else(|| t.to_string().into()),
-                        });
-                    }
-                }
-            }
-            "reasoning" => {
-                if let Some(t) = part.get("text").and_then(Value::as_str) {
-                    // Providers stash an opaque signature under `metadata.<provider>.signature`
-                    // (e.g. anthropic). Preserve it so a thinking block can round-trip.
-                    let signature = part
-                        .pointer("/metadata/anthropic/signature")
-                        .and_then(Value::as_str)
-                        .or_else(|| find_signature(part.get("metadata")))
-                        .map(str::to_string);
-                    // A signature-only part (empty text, opaque blob) is still the whole of a
-                    // redacted thinking turn: dropping it deleted the turn's only content, and with
-                    // it the message — which cost a ported session 134 assistant turns and their
-                    // usage, timestamps and ids.
-                    if !t.is_empty() || signature.is_some() {
-                        m.content.push(Block::Thinking {
-                            text: projected
-                                .and_then(|p| p.text.clone())
-                                .unwrap_or_else(|| t.to_string().into()),
-                            signature,
-                            encrypted: None,
-                            redacted: false,
-                        });
-                    }
-                }
-            }
-            "tool" => {
-                let (use_block, results) = tool_blocks_projected(part, projected);
-                m.content.push(use_block);
-                tool_results.extend(results);
-            }
-            "file" => {
-                m.content.push(file_block(part));
-            }
-            "agent" => {
-                // An `@agent` mention / sub-agent reference embedded in a user prompt — opencode
-                // routes the prompt to that agent in a child session. No IR block fits; surface
-                // its name as text and keep the structured form in the bag.
-                if let Some(name) = part.get("name").and_then(Value::as_str) {
-                    m.content.push(Block::Text {
-                        text: format!("@{name}").into(),
-                    });
-                }
-                push_extra_array(&mut bag, "agent_refs", part.clone());
-                spawn = true;
-            }
-            "subtask" => {
-                // A spawned sub-session (Task tool style). Render its prompt + which agent ran
-                // it; keep the full record (agent/model/command/description) in the bag.
-                let agent = part.get("agent").and_then(Value::as_str).unwrap_or("agent");
-                let prompt = part.get("prompt").and_then(Value::as_str).unwrap_or("");
-                m.content.push(Block::Text {
-                    text: format!("[subtask → {agent}] {prompt}").into(),
-                });
-                push_extra_array(&mut bag, "subtasks", part.clone());
-                spawn = true;
-            }
-            "patch" => push_extra_array(&mut bag, "patches", part.clone()),
-            "snapshot" => push_extra_array(&mut bag, "snapshots", part.clone()),
-            "step-start" | "step-finish" => push_extra_array(&mut bag, "steps", part.clone()),
-            "retry" => push_extra_array(&mut bag, "retries", part.clone()),
-            "compaction" => {
-                push_extra_array(&mut bag, "compactions", part.clone());
-                compaction = true;
-            }
-            other if !other.is_empty() => {
-                // Unknown / future part type: never drop it silently — stash verbatim.
-                push_extra_array(&mut bag, "unknown_parts", part.clone());
-            }
-            _ => {}
-        }
-    }
-
-    // Older inline-summary generation stored no parts — fall back to the AI summary so the turn
-    // isn't blank. (`summary` must be an *object* here; a boolean `summary: true` is a newer
-    // compaction marker: the `CompactionSummary` kind below.)
-    if m.content.is_empty() {
-        let summary = mv
-            .pointer("/summary/body")
-            .or_else(|| mv.pointer("/summary/title"))
-            .and_then(Value::as_str);
-        if let Some(text) = summary {
-            if !text.is_empty() {
-                m.content.push(Block::Text {
-                    text: summary_text.cloned().unwrap_or_else(|| text.to_string().into()),
-                });
-            }
-        }
-    }
-
-    // What the record IS, most specific first (module doc "Kinds").
-    if compaction {
-        m.kind = MessageKind::CompactionBoundary;
-        m.origin = Origin::Harness;
-    } else if mv.get("summary").and_then(Value::as_bool) == Some(true) {
-        m.kind = MessageKind::CompactionSummary;
-        m.origin = Origin::Harness;
-    } else if mv.get("error").is_some_and(|e| !e.is_null()) {
-        m.kind = MessageKind::Error;
-        m.origin = Origin::Harness;
-    } else if spawn {
-        m.kind = MessageKind::SubagentSpawn;
-    }
-    if !bag.is_empty() {
-        m.harness_extra_mut(Harness::OpenCode).extend(bag);
-    }
-
-    let mut out = Vec::new();
-    if !m.content.is_empty() || !m.extra.is_empty() || m.kind != MessageKind::for_role(role) {
-        out.push(m);
-    }
-    if !tool_results.is_empty() {
-        let mut tm = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
-        tm.content = tool_results;
-        out.push(tm);
-    }
-    out
-}
-
-/// Build the `ToolUse` block for a `tool` part, plus the blocks that belong in the Tool message:
-/// the `ToolResult` (if the state carries one) followed by any `state.attachments[]` (files/images a
-/// completed tool handed back — a `read` of an image, a screenshot — same shape as a `file` part).
-/// The state's `title`/`metadata`/`time` ride in the result's `details`. Tolerant of the
-/// `completed`/`error`/`running`/`pending` state shapes.
-fn tool_blocks_projected(part: &Value, projected: Option<&ProjectedPart>) -> (Block, Vec<Block>) {
-    let call_id = part
-        .get("callID")
-        .or_else(|| part.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let name = part.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
-    let status = part.pointer("/state/status").and_then(Value::as_str).unwrap_or("");
-
-    let tool_name = (!name.is_empty()).then(|| name.clone());
-    let status_field = (!status.is_empty()).then(|| status.to_string());
-    let details = tool_details(part);
-    let use_block = Block::ToolUse {
-        id: call_id.clone(),
-        name,
-        input: projected
-            .and_then(|p| p.input.clone())
-            .unwrap_or_else(|| part.pointer("/state/input").cloned().unwrap_or(Value::Null).into()),
-        namespace: None,
-    };
-
-    // A completed tool carries `output`; an error tool carries `error`.
-    let result = match status {
-        "completed" | "running" | "pending" => part.pointer("/state/output").map(|out| Block::ToolResult {
-            tool_use_id: call_id.clone(),
-            content: projected
-                .and_then(|p| p.output.clone())
-                .unwrap_or_else(|| coerce_text(out).into()),
-            is_error: false,
-            tool_name: tool_name.clone(),
-            status: status_field.clone(),
-            details: details.clone(),
-        }),
-        "error" => {
-            let content = part
-                .pointer("/state/error")
-                .or_else(|| part.pointer("/state/output"))
-                .map(coerce_text)
-                .unwrap_or_default();
-            Some(Block::ToolResult {
-                tool_use_id: call_id.clone(),
-                content: projected
-                    .and_then(|p| {
-                        if part.pointer("/state/error").is_some() {
-                            p.error.clone()
-                        } else {
-                            p.output.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| content.into()),
-                is_error: true,
-                tool_name: tool_name.clone(),
-                status: status_field.clone(),
-                details: details.clone(),
-            })
-        }
-        // Unknown status but an output is present — still surface it.
-        _ => part.pointer("/state/output").map(|out| Block::ToolResult {
-            tool_use_id: call_id.clone(),
-            content: projected
-                .and_then(|p| p.output.clone())
-                .unwrap_or_else(|| coerce_text(out).into()),
-            is_error: false,
-            tool_name: tool_name.clone(),
-            status: status_field.clone(),
-            details: details.clone(),
-        }),
-    };
-
-    let mut out: Vec<Block> = result.into_iter().collect();
-    if let Some(atts) = part.pointer("/state/attachments").and_then(Value::as_array) {
-        out.extend(atts.iter().map(file_block));
-    }
-    (use_block, out)
-}
-
-/// `state.{title, metadata, time}` of a tool part — the tool's own label (e.g. the file read),
-/// structured metadata (exit code, diff stats, …) and start/end times — as the result's `details`.
-fn tool_details(part: &Value) -> Option<Value> {
-    let mut d = Map::new();
-    for key in ["title", "metadata", "time"] {
-        if let Some(v) = part.pointer(&format!("/state/{key}")) {
-            let blank = v.is_null() || v.as_object().is_some_and(|o| o.is_empty()) || v.as_str() == Some("");
-            if !blank {
-                d.insert(key.to_string(), v.clone());
-            }
-        }
-    }
-    (!d.is_empty()).then_some(Value::Object(d))
-}
-
-/// Map a `file` part to a block. Genuine images become `Block::Image`; everything else
-/// (text files, directories via `@path`, symbol/resource refs) becomes a first-class
-/// `Block::File` reference.
-fn file_block(part: &Value) -> Block {
-    let mime = part.get("mime").and_then(Value::as_str).unwrap_or("");
-    if mime.starts_with("image/") {
-        Block::Image {
-            media_type: (!mime.is_empty()).then(|| mime.to_string()),
-            data_ref: part.get("url").and_then(Value::as_str).map(str::to_string),
-        }
-    } else {
-        // `source.path` is the workspace-relative path when present; `filename`/`url` are fallbacks.
-        let path = part
-            .pointer("/source/path")
-            .or_else(|| part.get("filename"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        Block::File {
-            mime: (!mime.is_empty()).then(|| mime.to_string()),
-            path,
-            source: part.get("url").and_then(Value::as_str).map(str::to_string),
-        }
-    }
-}
-
-/// Preserve message-level fields the IR has no home for, verbatim, in the record's
-/// `extra["opencode"]` bag. (`cost`/`tokens` are [`Usage`]; `summary: true` is the
-/// `CompactionSummary` kind; `error` also sets the `Error` kind.)
-fn collect_message_extra(mv: &Value, bag: &mut Map<String, Value>) {
-    for key in [
-        "agent",      // which agent ran this turn (Sisyphus, build, compaction, …)
-        "mode",       // deprecated alias of agent; kept for old records
-        "providerID", // amazon-bedrock, anthropic, …
-        "finish",     // finish reason: stop | tool-calls | length | …
-        "error",      // assistant error object (aborted / overflow / api error)
-        "variant",    // model variant
-        "structured", // structured-output result
-        "format",     // requested output format
-        "system",     // per-message system prompt (user records)
-        "tools",      // enabled-tools map (user records)
-    ] {
-        if let Some(v) = mv.get(key) {
-            if !v.is_null() {
-                bag.insert(key.to_string(), v.clone());
-            }
-        }
-    }
-    // `path: {cwd, root}` — per-turn working dir.
-    if let Some(cwd) = mv.pointer("/path/cwd").and_then(Value::as_str) {
-        bag.insert("cwd".to_string(), json!(cwd));
-    }
-    // The assistant `error` union is tagged by `name` — ProviderAuthError, UnknownError,
-    // MessageOutputLengthError, MessageAbortedError, StructuredOutputError, ContextOverflowError,
-    // ContentFilterError (2026-06), APIError — with the detail under `data`. Lift the tag so
-    // consumers can filter on it without unpicking the object.
-    if let Some(name) = mv.pointer("/error/name").and_then(Value::as_str) {
-        bag.insert("error_name".to_string(), json!(name));
-    }
-    // The older inline summary's `diffs[]` are worth keeping even though we render body as text.
-    if let Some(diffs) = mv.pointer("/summary/diffs") {
-        if diffs.is_array() && !diffs.as_array().map(|a| a.is_empty()).unwrap_or(true) {
-            bag.insert("summary_diffs".to_string(), diffs.clone());
-        }
-    }
-}
-
-fn push_extra_array(extra: &mut Map<String, Value>, key: &str, v: Value) {
-    match extra.get_mut(key) {
-        Some(Value::Array(a)) => a.push(v),
-        _ => {
-            extra.insert(key.to_string(), Value::Array(vec![v]));
-        }
-    }
-}
-
-/// Look for a `signature` string anywhere one provider-level deep inside `metadata`
-/// (`metadata.<provider>.signature`), without hard-coding the provider name.
-fn find_signature(metadata: Option<&Value>) -> Option<&str> {
-    let obj = metadata?.as_object()?;
-    for v in obj.values() {
-        if let Some(sig) = v.pointer("/signature").and_then(Value::as_str) {
-            return Some(sig);
-        }
-    }
-    None
-}
-
-fn coerce_text(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// `tokens{input, output, reasoning, cache{read, write}}` + `cost` (USD) of an assistant record.
-/// `reasoning` is always written by opencode; it is reported only when non-zero.
-fn parse_usage(mv: &Value) -> Option<Usage> {
-    let t = mv.get("tokens").filter(|t| t.is_object());
-    let cost = mv.get("cost").and_then(Value::as_f64);
-    if t.is_none() && cost.is_none() {
-        return None;
-    }
-    let get = |k: &str| t.and_then(|t| t.pointer(k)).and_then(Value::as_u64);
-    Some(Usage {
-        input_tokens: get("/input"),
-        output_tokens: get("/output"),
-        cache_read_tokens: get("/cache/read"),
-        cache_creation_tokens: get("/cache/write"),
-        reasoning_tokens: get("/reasoning").filter(|&r| r > 0),
-        cost_usd: cost,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2006,6 +946,36 @@ mod tests {
 
     fn parts(json_strs: &[&str]) -> Vec<Value> {
         json_strs.iter().map(|s| serde_json::from_str(s).unwrap()).collect()
+    }
+
+    /// The record codec over owned views, everything inline.
+    fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
+        let ctx = record::Ctx::Owned;
+        let mut record = record::Record::header(crate::json::JsonView::owned(mv), None, ctx)
+            .unwrap()
+            .unwrap();
+        for part in parts {
+            record.part(crate::json::JsonView::owned(part), None, ctx).unwrap();
+        }
+        record.finish()
+    }
+
+    /// Decode the `data` document at `path` both ways, everything inline and by the span rule,
+    /// and return them with the spans one materialized: the demand never changes content.
+    fn both_demands(
+        path: &Path,
+        decode: impl Fn(crate::json::JsonView<'_>, record::Ctx<'_>) -> Result<Vec<Message>>,
+    ) -> (Vec<Message>, Vec<Message>) {
+        let source = crate::json::JsonSource::capture(path).unwrap();
+        let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
+        let owned = source.read_document(|view| decode(view, record::Ctx::Owned)).unwrap();
+        let mut spans = source
+            .read_document(|view| decode(view, record::Ctx::new(true, &source, &arena)))
+            .unwrap();
+        for message in &mut spans {
+            message.materialize(&crate::lazy::Resolver::new(None)).unwrap();
+        }
+        (owned, spans)
     }
 
     #[test]
@@ -2211,59 +1181,68 @@ mod tests {
     }
 
     #[test]
-    fn projected_headers_preserve_summary_precedence_and_part_fallback() {
-        let dir = std::env::temp_dir().join(format!("cv-opencode-header-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("message.json");
+    fn inline_summary_body_wins_then_title_and_parts_win_over_both() {
+        let world = crate::test_world("opencode-summary");
+        let path = world.base.join("message.json");
         let body = "summary\n\"text\" 🌟".repeat(9000);
-        for summary in [
-            json!({"body":body,"title":body,"diffs":[{"file":"a.rs"}]}),
-            json!({"title":body}),
-            json!({"body":"","title":body}),
-            json!({"body":null,"title":body}),
-            Value::Bool(true),
+        let title = "title".repeat(9000);
+        for (summary, expected) in [
+            (
+                json!({"body":body,"title":title,"diffs":[{"file":"a.rs"}]}),
+                Some(&body),
+            ),
+            (json!({"title":title}), Some(&title)),
+            (json!({"body":"","title":title}), None),
+            (json!({"body":null,"title":title}), None),
+            (Value::Bool(true), None),
         ] {
             let value = json!({"id":"m","role":"assistant","time":{"created":2},"summary":summary,"ignored":body});
             std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-            let source = crate::json::JsonSource::capture(&path).unwrap();
-            let header = source.read_syntax(ProjectedHeader::read).unwrap();
-            for with_parts in [false, true] {
-                let parts = if with_parts {
-                    vec![json!({"type":"text","text":"part wins"})]
-                } else {
-                    vec![]
-                };
-                let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
-                let projected = parts
-                    .iter()
-                    .map(|part| ProjectedPart::read(part.into(), &source, &arena).unwrap())
-                    .collect::<Vec<_>>();
-                let mut actual = build_header_projected(&header, &projected);
-                for message in &mut actual {
-                    message.materialize(&crate::lazy::Resolver::new(None)).unwrap();
-                }
-                assert!(
-                    serde_json::to_value(actual).unwrap()
-                        == serde_json::to_value(build_messages(&value, &parts)).unwrap(),
-                    "summary precedence differs with_parts={with_parts}"
+            for parts in [vec![], vec![json!({"type":"text","text":"part wins"})]] {
+                let (owned, spans) = both_demands(&path, |view, ctx| {
+                    let mut record = record::Record::header(view, None, ctx)?.unwrap();
+                    for part in &parts {
+                        record.part(crate::json::JsonView::owned(part), None, ctx)?;
+                    }
+                    Ok(record.finish())
+                });
+                assert_eq!(
+                    serde_json::to_value(&owned).unwrap(),
+                    serde_json::to_value(&spans).unwrap()
                 );
+                let text = owned.first().and_then(Message::text);
+                match (parts.is_empty(), expected) {
+                    (true, Some(expected)) => assert_eq!(text.as_ref(), Some(expected)),
+                    (true, None) => assert_eq!(text, None),
+                    (false, _) => assert_eq!(text.as_deref(), Some("part wins")),
+                }
             }
         }
-        let value = json!({"id":"m","role":"user","summary":{"body":body}});
-        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        // Long summary text stays in its file, guarded.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"id":"m","role":"user","summary":{"body":body}})).unwrap(),
+        )
+        .unwrap();
         let source = crate::json::JsonSource::capture(&path).unwrap();
-        let header = source.read_syntax(ProjectedHeader::read).unwrap();
-        let mut messages = build_header_projected(&header, &[]);
+        let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
+        let mut messages = source
+            .read_document(|view| {
+                Ok(
+                    record::Record::header(view, None, record::Ctx::new(true, &source, &arena))?
+                        .unwrap()
+                        .finish(),
+                )
+            })
+            .unwrap();
         std::fs::write(&path, b"{}").unwrap();
         assert!(messages[0].materialize(&crate::lazy::Resolver::new(None)).is_err());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn projected_parts_preserve_resolved_payloads_and_errors() {
-        let dir = std::env::temp_dir().join(format!("cv-opencode-projection-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("parts.json");
+    fn long_part_payloads_resolve_the_same_in_every_demand() {
+        let world = crate::test_world("opencode-parts");
+        let path = world.base.join("parts.json");
         let payload = "line\n\"quoted\"\t\\tail".repeat(9000);
         let parts = json!([
             {"type":"text", "text":payload},
@@ -2276,117 +1255,124 @@ mod tests {
             {"type":"future", "payload":"preserved"}
         ]);
         std::fs::write(&path, serde_json::to_vec(&parts).unwrap()).unwrap();
-        let source = crate::json::JsonSource::capture(&path).unwrap();
-        let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
-        let projected = source
-            .read_syntax(|view| {
-                view.array()?
-                    .unwrap()
-                    .map(|part| ProjectedPart::read(part?, &source, &arena))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .unwrap();
         let mv = json!({"id":"message", "role":"assistant", "modelID":"model", "tokens":{"input":1}});
-        let expected = build_messages(&mv, parts.as_array().unwrap());
-        let mut actual = build_projected(&mv, &projected);
-        let resolver = crate::lazy::Resolver::new(Some(dir.join("wrong-primary")));
-        for message in &mut actual {
-            message.materialize(&resolver).unwrap();
-        }
+        let (owned, spans) = both_demands(&path, |view, ctx| {
+            let mut record = record::Record::header(crate::json::JsonView::owned(&mv), None, ctx)?.unwrap();
+            for part in view.array()?.unwrap() {
+                record.part(part?, None, ctx)?;
+            }
+            Ok(record.finish())
+        });
         assert_eq!(
-            serde_json::to_value(actual).unwrap(),
-            serde_json::to_value(expected).unwrap()
+            serde_json::to_value(&owned).unwrap(),
+            serde_json::to_value(&spans).unwrap()
         );
-        std::fs::remove_dir_all(dir).unwrap();
+        let Block::ToolResult { content, .. } = &owned[1].content[1] else {
+            panic!("structured error result")
+        };
+        assert_eq!(content, r#"{"message":"structured"}"#);
+        let Block::ToolResult { content, .. } = &owned[1].content[3] else {
+            panic!("object output")
+        };
+        assert_eq!(
+            content.inline_str(),
+            Some(serde_json::to_string(&json!({"payload":payload})).unwrap().as_str())
+        );
+        assert_eq!(owned[0].extra["opencode"]["unknown_parts"][0]["payload"], "preserved");
     }
 
     #[test]
-    fn projected_v2_shell_matches_owned_command_output_priority_and_canonical_fallback() {
-        let world = cv_testkit::World::in_process("opencode-shell-projection");
+    fn v2_shell_command_output_priority_and_canonical_fallback() {
+        let world = crate::test_world("opencode-shell");
         let path = world.base.join("shell.json");
         let body = "escaped\n\" λ🌙".repeat(6000);
-        let command = serde_json::to_string(&body).unwrap();
-        let output = serde_json::to_string(&body).unwrap();
+        let quoted = serde_json::to_string(&body).unwrap();
+        let canonical = |output: &str| serde_json::to_string(&serde_json::from_str::<Value>(output).unwrap()).unwrap();
         let cases = [
-            format!(r#"{{"command":{command},"output":{{"output":{output},"cursor":1,"size":3,"truncated":false}}}}"#),
-            format!(r#"{{"command":"echo hi","output":{output}}}"#),
-            format!(r#"{{"command":"echo hi","output":{{"text":{output}}}}}"#),
-            format!(r#"{{"output":{{"output":null,"text":{output},"z":2,"a":1}}}}"#),
-            format!(r#"{{"output":{{"output":false,"text":{output}}}}}"#),
-            format!(r#"{{"output":{{"output":"","text":{output}}}}}"#),
-            format!(
-                r#"{{"command":"first","command":{command},"output":{{"output":"first","outpu\u0074":{output}}}}}"#
+            (
+                format!(
+                    r#"{{"command":{quoted},"output":{{"output":{quoted},"cursor":1,"size":3,"truncated":false}}}}"#
+                ),
+                Some(format!("$ {body}\n{body}")),
             ),
-            format!(r#"{{"output":{{"z":{output},"a":1,"z":"duplicate winner"}}}}"#),
-            r#"{"command":"","output":null}"#.into(),
-            r#"{"command":null,"output":false}"#.into(),
-            r#"{"output":1.00}"#.into(),
-            r#"{"output":[1,"text",null]}"#.into(),
-            r#"{"output":{}}"#.into(),
+            (
+                format!(r#"{{"command":"echo hi","output":{quoted}}}"#),
+                Some(format!("$ echo hi\n{body}")),
+            ),
+            (
+                format!(r#"{{"command":"echo hi","output":{{"text":{quoted}}}}}"#),
+                Some(format!("$ echo hi\n{body}")),
+            ),
+            // Presence wins before type: a non-string inner output renders the whole object.
+            (
+                format!(r#"{{"output":{{"output":null,"text":{quoted},"z":2,"a":1}}}}"#),
+                Some(canonical(&format!(r#"{{"output":null,"text":{quoted},"z":2,"a":1}}"#))),
+            ),
+            (
+                format!(r#"{{"output":{{"output":false,"text":{quoted}}}}}"#),
+                Some(canonical(&format!(r#"{{"output":false,"text":{quoted}}}"#))),
+            ),
+            (format!(r#"{{"output":{{"output":"","text":{quoted}}}}}"#), None),
+            (
+                format!(
+                    r#"{{"command":"first","command":{quoted},"output":{{"output":"first","outpu\u0074":{quoted}}}}}"#
+                ),
+                Some(format!("$ {body}\n{body}")),
+            ),
+            (
+                format!(r#"{{"output":{{"z":{quoted},"a":1,"z":"duplicate winner"}}}}"#),
+                Some(r#"{"z":"duplicate winner","a":1}"#.into()),
+            ),
+            (r#"{"command":"","output":null}"#.into(), None),
+            (r#"{"command":null,"output":false}"#.into(), Some("false".into())),
+            (r#"{"output":1.00}"#.into(), Some("1.0".into())),
+            (
+                r#"{"output":[1,"text",null]}"#.into(),
+                Some(r#"[1,"text",null]"#.into()),
+            ),
+            (r#"{"output":{}}"#.into(), Some("{}".into())),
         ];
-        for raw in cases {
-            let mut owned: Value = serde_json::from_str(&raw).unwrap();
-            owned
-                .as_object_mut()
-                .unwrap()
-                .insert("time".into(), json!({"created":1}));
-            owned
-                .as_object_mut()
-                .unwrap()
-                .insert("metadata".into(), json!({"source":"shell","background":true}));
-            // Preserve duplicate-key cases in the checked input instead of serializing the Value.
+        for (raw, expected) in cases {
             let wire = format!(
                 "{{\"time\":{{\"created\":1}},\"metadata\":{{\"source\":\"shell\",\"background\":true}},{}",
                 &raw[1..]
             );
             fs::write(&path, &wire).unwrap();
-            let source = crate::json::JsonSource::capture(&path).unwrap();
-            let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
-            let shell = source
-                .read_range_value(0, source.len(), |view| project_shell(view, &source, &arena))
-                .unwrap();
-            if owned
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value.len() > crate::lazy::INLINE_MAX)
-            {
-                assert!(
-                    matches!(shell.command, Some(crate::Text::Source(_))),
-                    "large prefixed command stays checked"
-                );
-            }
-            let mut skeleton = owned.clone();
-            skeleton["command"] = match owned.get("command").and_then(Value::as_str) {
-                Some(value) => json!(if value.is_empty() { "" } else { "x" }),
-                None => Value::Null,
-            };
-            skeleton["output"] = Value::Null;
-            let mut actual = v2::build_projected(
-                "message",
-                "shell",
-                &skeleton,
-                &ParseOptions::complete(),
-                None,
-                None,
-                Some(&shell),
-            )
-            .unwrap();
-            let expected = v2::build("message", "shell", &owned, &ParseOptions::complete()).unwrap();
-            for message in &mut actual {
-                message.materialize(&crate::lazy::Resolver::new(None)).unwrap();
-            }
-            assert!(
-                serde_json::to_vec(&actual).unwrap() == serde_json::to_vec(&expected).unwrap(),
-                "shell output differs for {}",
-                &wire[..wire.len().min(200)]
-            );
+            let (owned, spans) = both_demands(&path, |view, ctx| {
+                Ok(v2::build("message", "shell", view, &ParseOptions::complete(), ctx)?.unwrap())
+            });
+            assert_eq!(serde_json::to_vec(&owned).unwrap(), serde_json::to_vec(&spans).unwrap());
+            assert_eq!(owned[0].text(), expected, "{}", &wire[..wire.len().min(200)]);
+            assert_eq!(owned[0].extra["opencode"]["metadata"]["background"], true);
         }
+        // A long prefixed command is generated text held in the arena, guarded by the source.
+        fs::write(&path, format!(r#"{{"command":{quoted}}}"#)).unwrap();
+        let source = crate::json::JsonSource::capture(&path).unwrap();
+        let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
+        let messages = source
+            .read_document(|view| {
+                Ok(v2::build(
+                    "message",
+                    "shell",
+                    view,
+                    &ParseOptions::lazy(),
+                    record::Ctx::new(true, &source, &arena),
+                )?
+                .unwrap())
+            })
+            .unwrap();
+        assert!(matches!(
+            &messages[0].content[0],
+            Block::Text {
+                text: crate::Text::Source(_)
+            }
+        ));
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_v2_shell_projection_preserves_modes_corpus_and_source_errors() {
-        let world = cv_testkit::World::in_process("opencode-shell-db");
+        let world = crate::test_world("opencode-shell-db");
         let db = world.base.join("opencode.db");
         let connection = rusqlite::Connection::open(&db).unwrap();
         connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE session_v2(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,data TEXT); INSERT INTO session_v2 VALUES('session','/synthetic','shell',1,1);").unwrap();
@@ -2483,10 +1469,9 @@ mod tests {
     }
 
     #[test]
-    fn projected_v2_tools_keep_join_order_and_scalar_arguments() {
-        let dir = std::env::temp_dir().join(format!("cv-opencode-projection-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("content.json");
+    fn v2_tools_keep_join_order_and_scalar_arguments() {
+        let world = crate::test_world("opencode-v2-tools");
+        let path = world.base.join("content.json");
         let payload = "escaped\n\"text\"".repeat(9000);
         let content = json!([
             {"type":"text", "text":payload},
@@ -2502,40 +1487,60 @@ mod tests {
             {"type":"tool", "id":"nine", "name":"read", "state":{"status":"error", "content":[{"type":"text","text":42}],"error":{"message":"unused"}}},
             {"type":"tool", "id":"ten", "name":"read", "state":{"status":"completed", "content":[{"type":"text"}]}}
         ]);
-        std::fs::write(&path, serde_json::to_vec(&content).unwrap()).unwrap();
+        let data = json!({"content":content,"model":{"id":"model"},"tokens":{"input":1},"metadata":{"preserve":true}});
+        std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+        let (owned, spans) = both_demands(&path, |view, ctx| {
+            Ok(v2::build("message", "assistant", view, &ParseOptions::lazy(), ctx)?.unwrap())
+        });
+        assert_eq!(
+            serde_json::to_value(&owned).unwrap(),
+            serde_json::to_value(&spans).unwrap()
+        );
+        let results = &owned[1].content;
+        let text = |index: usize| match &results[index] {
+            Block::ToolResult { content, .. } => content.inline_str().unwrap().to_string(),
+            block => panic!("result {index}: {block:?}"),
+        };
+        assert_eq!(text(0), format!("{payload}\n\n{}", json!({"future":payload})));
+        assert!(
+            matches!(&results[1], Block::File { .. }),
+            "file items follow their result"
+        );
+        assert_eq!((text(2), text(3)), (String::new(), "failure".into()));
+        assert_eq!(
+            (text(4), text(5), text(6)),
+            (payload.clone(), String::new(), String::new())
+        );
+        let input = |index: usize| match &owned[0].content[index] {
+            Block::ToolUse { input, .. } => input.resolve().unwrap().into_owned(),
+            block => panic!("use {index}: {block:?}"),
+        };
+        assert_eq!((input(3), input(4), input(6)), (json!(42), json!(""), json!(true)));
+        assert_eq!(input(7), json!(payload));
+        assert_eq!(input(8), json!(format!("{{partial {payload}")));
+        // A single long text result stays in the source, guarded.
         let source = crate::json::JsonSource::capture(&path).unwrap();
         let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
-        let projected = source
-            .read_syntax(|view| {
-                view.array()?
-                    .unwrap()
-                    .map(|part| ProjectedPart::read_inner(part?, &source, &arena, true))
-                    .collect::<Result<Vec<_>>>()
+        let messages = source
+            .read_document(|view| {
+                Ok(v2::build(
+                    "message",
+                    "assistant",
+                    view,
+                    &ParseOptions::lazy(),
+                    record::Ctx::new(true, &source, &arena),
+                )?
+                .unwrap())
             })
             .unwrap();
-        let original =
-            json!({"content":content,"model":{"id":"model"},"tokens":{"input":1},"metadata":{"preserve":true}});
-        let skeleton = json!({"content":projected.iter().map(|p|p.value.clone()).collect::<Vec<_>>(),"model":{"id":"model"},"tokens":{"input":1},"metadata":{"preserve":true}});
-        let opts = ParseOptions::lazy();
-        let expected = v2::build("message", "assistant", &original, &opts).unwrap();
-        let mut actual =
-            v2::build_projected("message", "assistant", &skeleton, &opts, None, Some(&projected), None).unwrap();
-        for message in &mut actual {
-            message.materialize(&crate::lazy::Resolver::new(None)).unwrap();
-        }
-        assert_eq!(
-            serde_json::to_value(actual).unwrap(),
-            serde_json::to_value(expected).unwrap()
-        );
-        assert!(matches!(projected[9].output, Some(crate::lazy::Text::Source(_))));
+        let Block::ToolResult { content, .. } = &messages[1].content[4] else {
+            panic!("single text result")
+        };
+        assert!(matches!(content, crate::lazy::Text::Source(_)));
         std::fs::write(&path, b"[]").unwrap();
-        assert!(projected[9]
-            .output
-            .as_ref()
-            .unwrap()
+        assert!(content
             .try_resolve_prefix(&crate::lazy::Resolver::new(None), 8)
             .is_err());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(feature = "sqlite")]
@@ -2848,12 +1853,49 @@ mod tests {
         );
     }
 
+    /// Reading a running OpenCode's store writes nothing there: discovery plus a full stream of
+    /// every session leave each file's inode, size, mtime and bytes (`-shm` included) unchanged,
+    /// both with WAL frames pending and after a checkpoint, and the WAL-only rows are read.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn v2_projection_preserves_malformed_cell_failure_policy() {
-        let dir = std::env::temp_dir().join(format!("cv-opencode-cell-{}", uuid::Uuid::new_v4()));
+    fn reading_a_live_wal_store_writes_nothing_in_it() {
+        use crate::harness::store::sqlite::{live_store, store_state};
+        let dir = std::env::temp_dir().join(format!("cv-opencode-live-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
         let db = dir.join("opencode.db");
+        drop(make_db(&db, true));
+        let writer = live_store(&db, "SELECT 1");
+        seed_session(&writer, "ses_live", true);
+        assert!(fs::metadata(dir.join("opencode.db-wal")).unwrap().len() > 0);
+        for checkpointed in [false, true] {
+            if checkpointed {
+                writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            let before = store_state(&dir);
+            let adapter = OpenCode::with_db(db.clone());
+            let refs = adapter.discover().unwrap();
+            assert_eq!(refs.len(), 1);
+            for reference in &refs {
+                let mut session = crate::stream::collect_with(&adapter, reference, &ParseOptions::lazy()).unwrap();
+                session.materialize().unwrap();
+                assert!(session
+                    .messages
+                    .iter()
+                    .any(|m| m.text().as_deref() == Some("Reverted.")));
+            }
+            assert_eq!(store_state(&dir), before, "checkpointed: {checkpointed}");
+        }
+        drop(writer);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A `session_message` cell that is not TEXT, empty, not UTF-8 or not exactly one JSON value
+    /// is a skipped line in every demand, never an error and never a message.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn malformed_v2_cells_are_skipped_lines() {
+        let world = cv_testkit::World::new("opencode-cell");
+        let db = world.base.join("opencode.db");
         let connection = rusqlite::Connection::open(&db).unwrap();
         connection.execute_batch("CREATE TABLE session_v2(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,data); INSERT INTO session_v2 VALUES('session','/tmp','test',1,1); INSERT INTO session_message VALUES('message','session','assistant',1,'{broken');").unwrap();
         let adapter = OpenCode::with_db(db);
@@ -2862,6 +1904,7 @@ mod tests {
             connection.execute("UPDATE session_message SET type=?1", [ty]).unwrap();
             for expression in [
                 "'{broken'",
+                "''",
                 "CAST(X'FF' AS TEXT)",
                 "X'7B7D'",
                 "NULL",
@@ -2872,19 +1915,13 @@ mod tests {
                 connection
                     .execute_batch(&format!("UPDATE session_message SET data = {expression}"))
                     .unwrap();
-                let expected = adapter.stream(&reference, &ParseOptions::bulk(), &mut |_| Flow::Continue);
-                let actual = adapter.stream(&reference, &ParseOptions::lazy(), &mut |_| Flow::Continue);
-                assert_eq!(expected.is_err(), actual.is_err(), "{expression}");
-                if let (Ok(expected), Ok(actual)) = (expected, actual) {
-                    assert_eq!(
-                        serde_json::to_value(expected).unwrap(),
-                        serde_json::to_value(actual).unwrap()
-                    );
+                for opts in [ParseOptions::bulk(), ParseOptions::lazy()] {
+                    let session = crate::stream::collect_with(&adapter, &reference, &opts).unwrap();
+                    assert!(session.messages.is_empty(), "{expression}");
+                    assert_eq!(session.extra["cv"]["skipped_lines"], 1, "{expression}");
                 }
             }
         }
-        drop(connection);
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(feature = "sqlite")]

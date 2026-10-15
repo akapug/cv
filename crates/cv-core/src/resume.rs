@@ -1,6 +1,6 @@
 //! Byte marks: where a pass over a grown append-only transcript picks back up.
 //!
-//! A pass that streams through [`stream::stream_resumable`](crate::stream::stream_resumable)
+//! A pass that streams through [`stream::stream_counted`](crate::stream::stream_counted) with checkpoints
 //! takes [`Checkpoint`]s as it goes; its last one, stored here as a **mark** per transcript file,
 //! lets the next pass over the same file (grown by an append) read only what came after it. A
 //! mark passes its guards when the file's device/inode identity matches, it is at least `offset`
@@ -95,9 +95,8 @@ fn prefix_guard(path: &Path, offset: u64) -> Option<(Option<(u64, u64)>, u64)> {
 }
 
 fn prefix_guard_file(file: &std::fs::File, offset: u64) -> Option<(Option<(u64, u64)>, u64)> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut f = file;
-    let metadata = f.metadata().ok()?;
+    use crate::harness::store::jsonl::ranges::read_exact_at;
+    let metadata = file.metadata().ok()?;
     #[cfg(unix)]
     let identity = {
         use std::os::unix::fs::MetadataExt;
@@ -109,12 +108,10 @@ fn prefix_guard_file(file: &std::fs::File, offset: u64) -> Option<(Option<(u64, 
         return None;
     }
     let mut head = vec![0u8; offset.min(HASH_SPAN) as usize];
-    f.seek(SeekFrom::Start(0)).ok()?;
-    f.read_exact(&mut head).ok()?;
+    read_exact_at(file, &mut head, 0).ok()?;
     let from = offset.saturating_sub(HASH_SPAN);
     let mut tail = vec![0u8; (offset - from) as usize];
-    f.seek(SeekFrom::Start(from)).ok()?;
-    f.read_exact(&mut tail).ok()?;
+    read_exact_at(file, &mut tail, from).ok()?;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in head.iter().chain(&tail).chain(&offset.to_le_bytes()) {
         h ^= u64::from(*b);
@@ -296,6 +293,39 @@ pub fn update(_marks: &[MarkUpdate]) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sampling an open transcript must not move its reader or any cloned handle.
+    #[test]
+    #[cfg(unix)]
+    fn sampling_preserves_the_open_readers_position_and_hash() {
+        use std::io::{Read, Seek, SeekFrom};
+        let world = cv_testkit::World::new("mark-position");
+        let path = world.base.join("transcript");
+        let body: Vec<u8> = (0..20_000).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &body).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut reader = file.try_clone().unwrap();
+        for offset in [0u64, 100, 4096, 10_000, body.len() as u64] {
+            file.seek(SeekFrom::Start(123)).unwrap();
+            let mark = MarkHead::of_file(&file, &Checkpoint::new(offset), "v1").unwrap();
+            let end = offset as usize;
+            let expected = body[..end.min(HASH_SPAN as usize)]
+                .iter()
+                .chain(&body[end.saturating_sub(HASH_SPAN as usize)..end])
+                .chain(&offset.to_le_bytes())
+                .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                    (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+                });
+            assert_eq!(mark.hash, expected);
+            assert_eq!(file.stream_position().unwrap(), 123);
+            let mut next = [0; 8];
+            reader.read_exact(&mut next).unwrap();
+            assert_eq!(next, body[123..131]);
+        }
+        file.seek(SeekFrom::Start(123)).unwrap();
+        assert!(MarkHead::of_file(&file, &Checkpoint::new(body.len() as u64 + 1), "v1").is_none());
+        assert_eq!(file.stream_position().unwrap(), 123);
+    }
 
     /// A mark permits growth; sampled-byte edits, truncation and another version break it.
     #[test]

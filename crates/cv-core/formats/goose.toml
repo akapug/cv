@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "goose"
-source_files = ["harness/goose.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
+source_files = ["harness/goose.rs", "harness/goose/record.rs", "harness/goose/legacy.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
 ignore_literals = []
 store = [
   "~/.local/share/goose/sessions/sessions.db (Linux)",

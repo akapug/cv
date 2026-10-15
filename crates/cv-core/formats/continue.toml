@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "continue"
-source_files = ["harness/continuedev.rs", "harness/wire/openai.rs", "harness/wire/mod.rs"]
+source_files = ["harness/continuedev.rs", "harness/continuedev/record.rs", "harness/wire/openai.rs", "harness/wire/mod.rs"]
 ignore_literals = ["sessions.json"]
 store = [
   "$CONTINUE_GLOBAL_DIR or ~/.continue/sessions/{sessions.json,<id>.json}",

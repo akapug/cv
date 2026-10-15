@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn search_rows_carry_the_session_row_plus_the_search_fields() {
-        let _world = cv_testkit::World::in_process("rows-search-contract");
+        let _world = crate::test_world("rows-search-contract");
         // An uncataloged id (a sub-agent lane): the session-row half is all null, the search half
         // is fully populated — the shape never varies, only the values.
         let row = SearchRow {

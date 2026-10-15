@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn inventory_nested_parallel_mutation_and_lifetime_are_operation_owned() {
-        let world = cv_testkit::World::in_process("source-inventory-operation");
+        let world = crate::test_world("source-inventory-operation");
         let path = world.base.join("registry");
         std::fs::write(&path, "old").unwrap();
         let calls = AtomicUsize::new(0);
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn inventory_absence_races_and_oversized_admission_keep_guards() {
-        let world = cv_testkit::World::in_process("source-inventory-admission");
+        let world = crate::test_world("source-inventory-admission");
         let path = world.base.join("conditional");
         let _scope = super::super::read_scope();
         let absent = baseline(&path);
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn public_scope_run_shares_first_load_and_restores_worker_context() {
-        let world = cv_testkit::World::in_process("source-inventory-explicit-workers");
+        let world = crate::test_world("source-inventory-explicit-workers");
         let path = world.base.join("source");
         std::fs::write(&path, "source").unwrap();
         let reads = baseline(&path);
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn parallel_first_demand_singleflights_and_separate_operations_stay_isolated() {
-        let world = cv_testkit::World::in_process("source-inventory-singleflight");
+        let world = crate::test_world("source-inventory-singleflight");
         let path = world.base.join("source");
         std::fs::write(&path, "source").unwrap();
         let reads = baseline(&path);

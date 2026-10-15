@@ -228,7 +228,7 @@ mod tests {
         use crate::harness::store::bytes::ByteSource;
         use crate::json::JsonSource;
         use std::sync::Arc;
-        let world = cv_testkit::World::in_process("deferred-source-text");
+        let world = crate::test_world("deferred-source-text");
         let path = world.base.join("original");
         std::fs::write(&path, "snapshot provenance").unwrap();
         let source = JsonSource::capture(&path).unwrap();
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn spilled_sources_restore_exact_training_bytes_without_serializing_payloads() {
-        let world = cv_testkit::World::in_process("deferred-dataset-source-spill");
+        let world = crate::test_world("deferred-dataset-source-spill");
         let path = world.base.join("source.json");
         let body = serde_json::json!({"rich":"escaped\n\"🌙\"".repeat(8192)}).to_string();
         std::fs::write(&path, &body).unwrap();
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn corrupted_descriptors_cannot_escape_as_unresolved_messages() {
-        let world = cv_testkit::World::in_process("deferred-dataset-descriptor-corruption");
+        let world = crate::test_world("deferred-dataset-descriptor-corruption");
         let path = world.base.join("source.json");
         std::fs::write(&path, "null").unwrap();
         let mut message = Message::new(Role::Assistant);

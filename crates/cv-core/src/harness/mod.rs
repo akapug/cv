@@ -138,26 +138,6 @@ pub(crate) fn for_each_json_line_at_with<R: BufRead>(
     scan_json_lines(reader, offset, parse, f).0
 }
 
-/// Fallible record transport for production readers: malformed JSON/UTF-8 remains a per-record
-/// skip, while terminal input failures cannot masquerade as EOF and certify partial output.
-pub(crate) fn try_for_each_json_line_at<R: BufRead>(
-    reader: R,
-    offset: u64,
-    f: impl FnMut(Value, u64, bool, u64) -> Flow,
-) -> std::io::Result<u64> {
-    try_for_each_json_line_at_with(reader, offset, |line| serde_json::from_str(line).ok(), f)
-}
-
-pub(crate) fn try_for_each_json_line_at_with<R: BufRead>(
-    reader: R,
-    offset: u64,
-    parse: impl FnMut(&str) -> Option<Value>,
-    f: impl FnMut(Value, u64, bool, u64) -> Flow,
-) -> std::io::Result<u64> {
-    let (skipped, result) = scan_json_lines(reader, offset, parse, f);
-    result.map(|()| skipped)
-}
-
 fn scan_json_lines<R: BufRead>(
     mut reader: R,
     mut offset: u64,
@@ -388,40 +368,69 @@ impl dyn Adapter + '_ {
 // (A previous `Adapter::emit`/`can_emit` pair had zero call sites and drifted out of sync with the
 // real dispatcher, with `can_emit` returning `false` for supported targets.)
 
+/// Registration order: [`all`]'s order, which listings and discovery observe.
+const ORDER: [Harness; Harness::COUNT] = [
+    Harness::Claude,
+    Harness::Codex,
+    Harness::Grok,
+    Harness::OpenCode,
+    Harness::Gemini,
+    Harness::OpenClaw,
+    Harness::Kimi,
+    Harness::KimiCode,
+    Harness::Qwen,
+    Harness::LmStudio,
+    Harness::Cline,
+    Harness::Roo,
+    Harness::Continue,
+    Harness::ChatGptExport,
+    Harness::ClaudeExport,
+    Harness::OpenSession,
+    Harness::Hermes,
+    Harness::Cursor,
+    Harness::Goose,
+    Harness::Zed,
+    Harness::Devin,
+];
+
 /// All registered adapters.
 pub fn all() -> Vec<Box<dyn Adapter>> {
-    let mut adapters: Vec<Box<dyn Adapter>> = vec![
-        Box::new(claude::Claude::detect()),
-        Box::new(codex::Codex::detect()),
-        Box::new(grok::Grok::detect()),
-        Box::new(opencode::OpenCode::detect()),
-        Box::new(gemini::Gemini::detect()),
-        Box::new(openclaw::OpenClaw::detect()),
-        Box::new(kimi::Kimi::detect()),
-        Box::new(kimi_code::KimiCode::detect()),
-        Box::new(qwen::Qwen::detect()),
-        Box::new(lmstudio::LmStudio::detect()),
-        Box::new(cline::Cline::detect()),
-        Box::new(roo::Roo::detect()),
-        Box::new(continuedev::Continue::detect()),
-        Box::new(export::ChatGptExport),
-        Box::new(export::ClaudeExport),
-        Box::new(opensession::OpenSession),
-    ];
-    #[cfg(feature = "sqlite")]
-    {
-        adapters.push(Box::new(hermes::Hermes::detect()));
-        adapters.push(Box::new(cursor::Cursor::detect()));
-        adapters.push(Box::new(goose::Goose::detect()));
-        adapters.push(Box::new(zed::Zed::detect()));
-        adapters.push(Box::new(devin::Devin::detect()));
-    }
-    adapters
+    ORDER.into_iter().filter_map(for_harness).collect()
 }
 
-/// The adapter for a specific harness, if registered.
+/// The adapter for a specific harness, if registered. Detects only that adapter: detection stats
+/// roots and reads config, so a per-session lookup must not detect the other twenty.
 pub fn for_harness(h: Harness) -> Option<Box<dyn Adapter>> {
-    all().into_iter().find(|a| a.harness() == h)
+    Some(match h {
+        Harness::Claude => Box::new(claude::Claude::detect()),
+        Harness::Codex => Box::new(codex::Codex::detect()),
+        Harness::Grok => Box::new(grok::Grok::detect()),
+        Harness::OpenCode => Box::new(opencode::OpenCode::detect()),
+        Harness::Gemini => Box::new(gemini::Gemini::detect()),
+        Harness::OpenClaw => Box::new(openclaw::OpenClaw::detect()),
+        Harness::Kimi => Box::new(kimi::Kimi::detect()),
+        Harness::KimiCode => Box::new(kimi_code::KimiCode::detect()),
+        Harness::Qwen => Box::new(qwen::Qwen::detect()),
+        Harness::LmStudio => Box::new(lmstudio::LmStudio::detect()),
+        Harness::Cline => Box::new(cline::Cline::detect()),
+        Harness::Roo => Box::new(roo::Roo::detect()),
+        Harness::Continue => Box::new(continuedev::Continue::detect()),
+        Harness::ChatGptExport => Box::new(export::ChatGptExport),
+        Harness::ClaudeExport => Box::new(export::ClaudeExport),
+        Harness::OpenSession => Box::new(opensession::OpenSession),
+        #[cfg(feature = "sqlite")]
+        Harness::Hermes => Box::new(hermes::Hermes::detect()),
+        #[cfg(feature = "sqlite")]
+        Harness::Cursor => Box::new(cursor::Cursor::detect()),
+        #[cfg(feature = "sqlite")]
+        Harness::Goose => Box::new(goose::Goose::detect()),
+        #[cfg(feature = "sqlite")]
+        Harness::Zed => Box::new(zed::Zed::detect()),
+        #[cfg(feature = "sqlite")]
+        Harness::Devin => Box::new(devin::Devin::detect()),
+        #[cfg(not(feature = "sqlite"))]
+        Harness::Hermes | Harness::Cursor | Harness::Goose | Harness::Zed | Harness::Devin => return None,
+    })
 }
 
 /// Assert the IR-v2 nesting invariant on a parsed session (`docs/INTERFACE-V2.md` §4), so every
@@ -459,6 +468,17 @@ pub(crate) fn assert_no_flat_keys(s: &Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_order_names_every_harness_once_and_each_adapter_is_its_own() {
+        let mut seen = std::collections::HashSet::new();
+        assert!(ORDER.iter().all(|h| seen.insert(*h)), "ORDER repeats a harness");
+        for h in ORDER {
+            if let Some(adapter) = for_harness(h) {
+                assert_eq!(adapter.harness(), h);
+            }
+        }
+    }
 
     #[test]
     fn ts_from_value_handles_all_shapes() {
@@ -509,17 +529,16 @@ mod tests {
     }
 
     #[test]
-    fn fallible_json_lines_retry_interrupted_and_preserve_corrupt_record_offsets() {
+    fn json_lines_retry_interrupted_and_preserve_corrupt_record_offsets() {
         let input = InterruptedOnce {
             input: std::io::Cursor::new(b"\xff\n{\"n\":1}\n{\"n\":2}".to_vec()),
             interrupted: false,
         };
         let mut seen = Vec::new();
-        let skipped = try_for_each_json_line_at(input, 5, |value, offset, complete, skipped| {
+        let skipped = for_each_json_line_at(input, 5, |value, offset, complete, skipped| {
             seen.push((value["n"].as_u64().unwrap(), offset, complete, skipped));
             Flow::Continue
-        })
-        .unwrap();
+        });
         assert_eq!(skipped, 1);
         assert_eq!(seen, vec![(1, 15, true, 1), (2, 22, false, 1)]);
     }
@@ -538,20 +557,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_json_line_io_returns_error_and_legacy_helpers_stop_with_one_skip() {
-        let error = try_for_each_json_line_at(TerminalIo, 0, |_, _, _, _| unreachable!()).unwrap_err();
-        assert_eq!(error.to_string(), "terminal source failure");
+    fn terminal_json_line_io_stops_legacy_helpers_with_one_skip() {
         assert_eq!(for_each_json_line(TerminalIo, |_| unreachable!()), 1);
         assert_eq!(for_each_json_line_at(TerminalIo, 0, |_, _, _, _| unreachable!()), 1);
-        let error = crate::stream::with_read_check(TerminalIo, &mut || Ok(()), |reader| {
-            for_each_json_line(reader, |_| unreachable!())
-        })
-        .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "terminal source failure",
-            "checked legacy reader cannot certify partial success"
-        );
     }
 
     #[test]

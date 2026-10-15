@@ -1,0 +1,10 @@
+{
+"ChatGpt complete": [271296,"1716281b2e9e0251c5d2f90855060da60ce528c8b668996488c0a87eabc29c34"],
+"ChatGpt full": [271296,"1716281b2e9e0251c5d2f90855060da60ce528c8b668996488c0a87eabc29c34"],
+"ChatGpt lazy": [271296,"1716281b2e9e0251c5d2f90855060da60ce528c8b668996488c0a87eabc29c34"],
+"ChatGpt ref": {"id":"chatgpt","harness":"chatgpt-export","message_count":3},
+"Claude complete": [361348,"582107eedd38e653ade407a7bde10b1486fd950604bd98cd10493b167fc1c543"],
+"Claude full": [361348,"582107eedd38e653ade407a7bde10b1486fd950604bd98cd10493b167fc1c543"],
+"Claude lazy": [361348,"582107eedd38e653ade407a7bde10b1486fd950604bd98cd10493b167fc1c543"],
+"Claude ref": {"id":"claude","harness":"claude-export","message_count":3}
+}

@@ -1,61 +1,51 @@
 //! SQLite TEXT/BLOB cells are read incrementally under the caller's read snapshot.
 use super::*;
-use crate::harness::store::bytes::ByteSource;
+use crate::harness::store::sqlite::{Cell, Cells};
+use rusqlite::OptionalExtension;
 use std::io::{self, Read};
 
-/// Append one immutable snapshot cell into the session's shared arena. BLOB values retain
-/// Cursor's historical lossy UTF-8 conversion; TEXT uses the shared incremental SQL copier.
-pub(super) fn append_cell(conn: &Connection, table: &str, key: &str, arena: &ByteSource) -> Result<(u64, u64)> {
+/// The value cell of the key-value row `key` in `table`, copied once into `cells`' arena. TEXT is
+/// read as stored; a BLOB keeps Cursor's historical lossy UTF-8 conversion. None for a missing,
+/// NULL or empty value.
+pub(super) fn cell(conn: &Connection, cells: &Cells, table: &str, key: &str) -> Result<Option<Cell>> {
     let row = conn.query_row(
         &format!("SELECT _rowid_, typeof(value) FROM {table} WHERE key = ?1"),
         [key],
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
     );
-    if let Ok((rowid, kind)) = row {
-        if kind != "blob" {
-            return crate::harness::store::sqlite::append_cell(conn, table, "value", rowid, arena);
+    match row {
+        Ok((_, kind)) if kind == "null" => return Ok(None),
+        Ok((rowid, kind)) if kind != "blob" => return cells.row(conn, table, "value", rowid),
+        Ok((rowid, _)) => {
+            if let Ok(blob) = conn.blob_open(rusqlite::DatabaseName::Main, table, "value", rowid, true) {
+                let mut input = LossyUtf8::new(blob);
+                return cells.append(|out| {
+                    io::copy(&mut input, out)?;
+                    Ok(())
+                });
+            }
         }
-        if let Ok(blob) = conn.blob_open(rusqlite::DatabaseName::Main, table, "value", rowid, true) {
-            let mut input = LossyUtf8::new(blob);
-            return arena.append(|out| {
-                io::copy(&mut input, out)?;
-                Ok(())
-            });
-        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(_) => {}
     }
-    let source = cell(conn, table, key)?;
-    arena.append(|out| {
-        io::copy(&mut source.reader()?, out)?;
-        Ok(())
-    })
-}
-
-pub(super) fn cell(conn: &Connection, table: &str, key: &str) -> Result<ByteSource> {
-    let row = conn.query_row(
-        &format!("SELECT _rowid_, typeof(value) FROM {table} WHERE key = ?1"),
-        [key],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-    );
-    if let Ok((rowid, kind)) = row {
-        if let Ok(blob) = conn.blob_open(rusqlite::DatabaseName::Main, table, "value", rowid, true) {
-            return if kind == "blob" {
-                Ok(ByteSource::read(LossyUtf8::new(blob))?)
-            } else {
-                Ok(ByteSource::read(blob)?)
-            };
-        }
-    }
-    // WITHOUT ROWID/indexed value schemas cannot expose incremental cells. Preserve the old
-    // TEXT/BLOB tolerance while bounding the JSON tree; this still retains one native cell.
+    // WITHOUT ROWID/indexed value schemas cannot expose incremental cells; this retains one
+    // native cell with the same TEXT/BLOB tolerance.
     let raw = conn
         .query_row(&format!("SELECT value FROM {table} WHERE key = ?1"), [key], |row| {
-            row.get::<_, String>(0).or_else(|_| {
+            if row.get_ref(0)? == rusqlite::types::ValueRef::Null {
+                return Ok(None);
+            }
+            row.get::<_, String>(0).map(Some).or_else(|_| {
                 row.get::<_, Vec<u8>>(0)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .map(|b| Some(String::from_utf8_lossy(&b).into_owned()))
             })
         })
-        .with_context(|| format!("{table} cell {key} not found"))?;
-    Ok(ByteSource::read(raw.as_bytes())?)
+        .optional()?
+        .flatten();
+    match raw {
+        Some(raw) => cells.append(|out| Ok(out.write_all(raw.as_bytes())?)),
+        None => Ok(None),
+    }
 }
 
 /// Cursor historically replaces invalid UTF-8 in BLOB values before JSON parsing. Chunked
@@ -151,8 +141,10 @@ mod tests {
     }
     #[test]
     fn native_text_and_lossy_blob_cells_and_without_rowid_fallback() {
+        let world = crate::test_world("cursor-cells");
         for rowid in [true, false] {
-            let conn = Connection::open_in_memory().unwrap();
+            let path = world.base.join(format!("state-{rowid}.vscdb"));
+            let conn = Connection::open(&path).unwrap();
             conn.execute_batch(&format!(
                 "CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY,value){}",
                 if rowid { "" } else { " WITHOUT ROWID" }
@@ -163,19 +155,26 @@ mod tests {
                 .unwrap();
             conn.execute("INSERT INTO cursorDiskKV VALUES('text',?1)", ["{\"conversation\":[]}"])
                 .unwrap();
+            conn.execute("INSERT INTO cursorDiskKV VALUES('null',NULL)", [])
+                .unwrap();
             if rowid {
                 assert!(conn
                     .blob_open(rusqlite::DatabaseName::Main, "cursorDiskKV", "value", 2, true)
                     .is_ok());
             }
+            let cells = Cells::new(&conn, &path, &Default::default(), "cursorDiskKV").unwrap();
             for key in ["blob", "text"] {
-                let source = cell(&conn, "cursorDiskKV", key).unwrap();
-                assert!(super::super::composer::header(&source).is_some());
-                let mut actual = String::new();
-                source.reader().unwrap().read_to_string(&mut actual).unwrap();
+                let cell = cell(&conn, &cells, "cursorDiskKV", key).unwrap().unwrap();
+                let value = cells.read(cell, |v| Ok(v.resolve()?.into_owned())).unwrap().unwrap();
                 if key == "blob" {
-                    assert_eq!(actual, String::from_utf8_lossy(invalid));
+                    let expected: Value = serde_json::from_str(&String::from_utf8_lossy(invalid)).unwrap();
+                    assert_eq!(value, expected);
+                } else {
+                    assert_eq!(value, serde_json::json!({"conversation":[]}));
                 }
+            }
+            for key in ["null", "missing"] {
+                assert!(cell(&conn, &cells, "cursorDiskKV", key).unwrap().is_none());
             }
         }
     }

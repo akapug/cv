@@ -43,13 +43,16 @@ def inline(text, table=False):
 
 
 def arg_line(a):
+    long = a.get("long", a["name"].replace("_", "-"))
     if a["kind"] == "positional":
         name = f"`<{a['name']}>`"
     elif a["kind"] == "flag":
-        name = f"`--{a['name'].replace('_', '-')}`"
+        name = f"`--{long}`"
     else:
-        name = f"`--{a['name'].replace('_', '-')} <{a['value_type']}>`"
+        name = f"`--{long} <{a['value_type']}>`"
     facts = []
+    if a.get("multiple"):
+        facts.append("repeatable")
     if a.get("required"):
         facts.append("required")
     if a.get("possible_values"):

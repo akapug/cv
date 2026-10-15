@@ -113,7 +113,7 @@
 //!   can pair it to a prior request by id (we do this within a session).
 //! * `model` is reconstructed from `provider_name` + `model_config_json.model_name` when present.
 
-use super::store::sqlite::{columns, open_ro};
+use super::store::sqlite::{columns, open_ro, Cells};
 use super::wire::anthropic;
 use super::{ts_from_epoch, Adapter};
 use crate::ir::*;
@@ -125,10 +125,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-mod count;
 mod legacy;
-mod project;
-use project::{decode_content_view, project_metadata};
+mod record;
 
 pub struct Goose {
     /// The `sessions/` dir, if it exists on disk.
@@ -157,15 +155,15 @@ impl Goose {
 /// exists (so discovery degrades to empty rather than erroring on machines without Goose).
 fn sessions_dir() -> Option<PathBuf> {
     // 1. Explicit test/CI override used by Goose itself: `$GOOSE_PATH_ROOT/data`.
-    if let Some(root) = std::env::var_os("GOOSE_PATH_ROOT") {
+    if let Some(root) = crate::env::var_os("GOOSE_PATH_ROOT") {
         let p = PathBuf::from(root).join("data").join("sessions");
         if p.exists() {
             return Some(p);
         }
     }
-    let home = dirs::home_dir();
+    let home = crate::env::home_dir();
     // 2. XDG (honour an explicit $XDG_DATA_HOME even on macOS for portability).
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+    if let Some(xdg) = crate::env::var_os("XDG_DATA_HOME") {
         let p = PathBuf::from(xdg).join("goose").join("sessions");
         if p.exists() {
             return Some(p);
@@ -180,7 +178,7 @@ fn sessions_dir() -> Option<PathBuf> {
     }
     // Windows: `%APPDATA%\Block\goose\data\sessions` (etcetera 0.11's Windows strategy yields one
     // vendor segment); older etcetera doubled it (`Block\Block\goose`). Probe both.
-    if let Some(appdata) = std::env::var_os("APPDATA") {
+    if let Some(appdata) = crate::env::var_os("APPDATA") {
         let appdata = PathBuf::from(appdata);
         candidates.push(appdata.join("Block").join("goose").join("data").join("sessions"));
         candidates.push(
@@ -213,12 +211,16 @@ impl Adapter for Goose {
 
         // Modern SQLite store.
         if let Some(db) = self.db_path() {
-            if let Ok(conn) = open_ro(&db) {
-                if let Ok(refs) = conn.read(|reader| discover_db(reader, &db)) {
-                    for r in refs {
-                        seen_ids.insert(r.id.clone());
-                        out.push(r);
-                    }
+            let refs = super::store::sqlite::cached_discover(&db, || {
+                let Ok(conn) = open_ro(&db) else {
+                    return Ok(Vec::new());
+                };
+                conn.read(|reader| discover_db(reader, &db))
+            });
+            if let Ok(refs) = refs {
+                for r in refs {
+                    seen_ids.insert(r.id.clone());
+                    out.push(r);
                 }
             }
         }
@@ -327,54 +329,39 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
         .iter()
         .all(|column| message_columns.contains(*column))
     {
-        // One cursor pass counts actual codec turns across all sessions. Eligible native stores
-        // read large cells incrementally; tiny/in-memory/UTF-16/virtual stores keep the typed cursor.
+        // One cursor pass over every row: the stream's own decoder classifies each, building no
+        // text (no `Out`), so a count is the number of turns a read of the session yields.
         let metadata = if message_columns.contains("metadata_json") {
             "metadata_json"
         } else {
             "NULL"
         };
-        let source = if db.is_file() && super::store::sqlite::incremental_utf8_table(conn, "messages") {
-            Some(crate::json::JsonSource::capture(db)?)
-        } else {
-            None
-        };
-        let content_select = if source.is_some() {
-            "typeof(content_json)"
-        } else {
-            "content_json"
-        };
-        let metadata_select = if source.is_some() {
-            format!("typeof({metadata})")
-        } else {
-            metadata.to_owned()
-        };
-        let rowid_select = if source.is_some() { "_rowid_" } else { "NULL" };
+        let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "messages")?;
         let mut count_stmt = conn.prepare(&format!(
-            "SELECT session_id, role, {content_select}, {metadata_select}, {rowid_select} FROM messages"
+            "SELECT session_id, role, {}, {} FROM messages",
+            cells.select("content_json"),
+            cells.select(metadata)
         ))?;
         let mut messages = count_stmt.query([])?;
+        let opts = ParseOptions::lazy();
         while let Some(row) = messages.next()? {
-            let role = row.get_ref(1).ok().and_then(|v| v.as_str().ok()).unwrap_or("user");
-            let turn = if let Some(source) = &source {
-                if row.get_ref(2)?.as_str()? != "text" {
-                    false
-                } else {
-                    count::incremental(conn, source, row.get(4)?, role, row.get_ref(3)?.as_str()? == "text")?
-                }
-            } else {
-                let content = row.get_ref(2).ok().and_then(|v| v.as_str().ok());
-                let metadata = row.get_ref(3).ok().and_then(|v| v.as_str().ok());
-                content.is_some_and(|content| count::cell(role, content, metadata))
+            let role: String = row.get(1).unwrap_or_default();
+            let metadata = match cells.cell(conn, "messages", metadata, row, 4)? {
+                Some(cell) => cells.read(cell, |v| record::metadata(v, false))?,
+                None => None,
             };
-            if turn {
+            let decoded = match cells.cell(conn, "messages", "content_json", row, 2)? {
+                Some(cell) => cells
+                    .read(cell, |v| record::content(v, &mut HashMap::new(), &opts, None))?
+                    .unwrap_or_default(),
+                None => Decoded::default(),
+            };
+            if is_turn(role, metadata, decoded) {
                 let id: String = row.get(0)?;
                 *counts.entry(id).or_default() += 1;
             }
         }
-        if let Some(source) = source {
-            source.check()?;
-        }
+        cells.out().0.check()?;
     }
     let mut out = Vec::new();
     for row in rows.flatten() {
@@ -558,11 +545,7 @@ fn stream_db_opts_with_reads(
     let mut wal = r.path.as_os_str().to_os_string();
     wal.push("-wal");
     reads.record(Path::new(&wal));
-    let source = opts
-        .spans
-        .then(|| crate::json::JsonSource::capture_with_reads(&r.path, &reads))
-        .transpose()?;
-    let arena = std::sync::Arc::new(super::store::bytes::ByteSource::arena()?);
+    let cells = Cells::new(conn, &r.path, &reads, "messages")?;
     let cols = columns(conn, "sessions");
     let has = |c: &str| cols.contains(c);
     let title_expr = title_expr(has);
@@ -663,84 +646,38 @@ fn stream_db_opts_with_reads(
     } else {
         "NULL"
     };
-    let payload = if opts.spans { "rowid" } else { "content_json" };
-    let metadata = if opts.spans {
-        format!("{metadata} IS NOT NULL")
-    } else {
-        metadata.to_owned()
-    };
     let sql = format!(
-        "SELECT role, {payload}, created_timestamp, {msg_id}, {tokens}, {metadata} \
-         FROM messages WHERE session_id = ?1 ORDER BY created_timestamp, id"
+        "SELECT role, {}, created_timestamp, {msg_id}, {tokens}, {} \
+         FROM messages WHERE session_id = ?1 ORDER BY created_timestamp, id",
+        cells.select("content_json"),
+        cells.select(metadata),
     );
     let mut stmt = conn.prepare(&sql)?;
-    // Partial readers select row IDs rather than giant TEXT cells. SQLite copies demanded cells
-    // into one private arena; selected text/arguments retain checked DB/WAL provenance. Full
-    // readers keep their demanded rich output and the established tolerant native decoder.
-    let rows = stmt.query_map([&r.id], |row| {
-        Ok((
-            if opts.spans { Some(row.get::<_, i64>(1)?) } else { None },
-            if opts.spans {
-                None
-            } else {
-                row.get::<_, Option<String>>(1).ok().flatten()
-            },
-            DbMsg {
-                role: row.get::<_, String>(0).unwrap_or_default(),
-                created: row.get::<_, Option<i64>>(2).ok().flatten(),
-                id: row.get::<_, Option<String>>(3).ok().flatten(),
-                tokens: row.get::<_, Option<i64>>(4).ok().flatten(),
-                metadata: if opts.spans {
-                    None
-                } else {
-                    row.get::<_, Option<String>>(5)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                },
-                has_metadata: row.get::<_, bool>(5).unwrap_or(false),
-            },
-        ))
-    })?;
+    let mut rows = stmt.query([&r.id])?;
+    let rich = opts.wants_full_extra();
 
     // Track tool-request names so we can label later tool responses (forward-only state).
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut history = AgentHistory::default();
-    for (idx, row) in rows.enumerate() {
-        let Ok((rowid, owned, mut row)) = row else { continue };
-        let decoded = if let (Some(rowid), Some(source)) = (rowid, source.as_ref()) {
-            if row.has_metadata {
-                let (offset, len) =
-                    super::store::sqlite::append_cell(conn, "messages", "metadata_json", rowid, &arena)?;
-                let metadata = source.read_backing_value(arena.clone(), offset, len, |v| {
-                    if !opts.wants_full_extra() {
-                        project_metadata(v)
-                    } else {
-                        Ok(v.resolve()?.into_owned())
-                    }
-                });
-                source.check()?;
-                row.metadata = match metadata {
-                    Ok(value) => Some(value),
-                    Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => None,
-                    Err(error) => return Err(error),
-                };
-            }
-            let (offset, len) = super::store::sqlite::append_cell(conn, "messages", "content_json", rowid, &arena)?;
-            let decoded = source.read_backing_value(arena.clone(), offset, len, |view| {
-                decode_content_view(view, &mut tool_names, opts, source, &arena)
-            });
-            source.check()?;
-            match decoded {
-                Ok(decoded) => decoded,
-                Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => Decoded::default(),
-                Err(error) => return Err(error),
-            }
-        } else {
-            decode_content(
-                &owned.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null),
-                &mut tool_names,
-            )
+    let mut idx = 0;
+    while let Some(row) = rows.next()? {
+        idx += 1;
+        let metadata = match cells.cell(conn, "messages", metadata, row, 6)? {
+            Some(cell) => cells.read(cell, |v| record::metadata(v, rich))?,
+            None => None,
+        };
+        let decoded = match cells.cell(conn, "messages", "content_json", row, 1)? {
+            Some(cell) => cells
+                .read(cell, |v| record::content(v, &mut tool_names, opts, Some(cells.out())))?
+                .unwrap_or_default(),
+            None => Decoded::default(),
+        };
+        let row = DbMsg {
+            role: row.get::<_, String>(0).unwrap_or_default(),
+            created: row.get::<_, Option<i64>>(3).ok().flatten(),
+            id: row.get::<_, Option<String>>(4).ok().flatten(),
+            tokens: row.get::<_, Option<i64>>(5).ok().flatten(),
+            metadata,
         };
         let Some(mut m) = row.into_message_decoded(decoded, s.model.as_deref(), &mut history, opts.wants_full_extra())
         else {
@@ -753,7 +690,7 @@ fn stream_db_opts_with_reads(
         // `parent_id` — the `CompactionBoundary` + `CompactionSummary` pair `crate::compaction`
         // detects for every harness.
         if m.kind == MessageKind::CompactionSummary {
-            let boundary_id = format!("compact-{}", m.id.as_deref().unwrap_or(&idx.to_string()));
+            let boundary_id = format!("compact-{}", m.id.as_deref().unwrap_or(&(idx - 1).to_string()));
             let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
             boundary.id = Some(boundary_id.clone());
             boundary.timestamp = m.timestamp;
@@ -769,8 +706,8 @@ fn stream_db_opts_with_reads(
             break;
         }
     }
-    if let Some(source) = source {
-        source.check()?;
+    if opts.spans {
+        cells.out().0.check()?;
     }
     Ok(s)
 }
@@ -795,7 +732,20 @@ struct DbMsg {
     tokens: Option<i64>,
     /// `messages.metadata_json` — the only place Goose records per-message usage and model.
     metadata: Option<Value>,
-    has_metadata: bool,
+}
+
+/// Whether a row is a conversational turn, by the same assembly the stream uses. Compaction
+/// history only refines rows that are never turns, so discovery needs none.
+fn is_turn(role: String, metadata: Option<Value>, decoded: Decoded) -> bool {
+    let row = DbMsg {
+        role,
+        created: None,
+        id: None,
+        tokens: None,
+        metadata,
+    };
+    row.into_message_decoded(decoded, None, &mut AgentHistory::default(), false)
+        .is_some_and(|m| m.is_turn())
 }
 
 /// What the rows before this one left in the model's context, in store order: how many there were
@@ -976,200 +926,6 @@ struct Decoded {
     /// Whether any block is conversational content (text, tools, thinking, media) rather than the
     /// rendering of a control block or an error.
     substantive: bool,
-}
-
-/// Decode a `Vec<MessageContent>` JSON value, recording tool-request names.
-fn decode_content(content: &Value, tool_names: &mut HashMap<String, String>) -> Decoded {
-    let mut d = Decoded::default();
-    let Some(items) = content.as_array() else {
-        // A bare string content (defensive; Goose stores arrays) → one Text block.
-        if let Some(t) = content.as_str().filter(|t| !t.is_empty()) {
-            d.blocks.push(Block::Text {
-                text: t.to_string().into(),
-            });
-            d.substantive = true;
-        }
-        return d;
-    };
-    for item in items {
-        match item.get("type").and_then(Value::as_str) {
-            // `ErrorContent {kind, message}` (message.rs:284-287; written by `Message::with_error`
-            // when a provider call gives up — context overflow, auth, credits). Shown to the user in
-            // Goose; kept visible here as text, self-describing with its kind, and the message is an
-            // Error.
-            Some("error") => {
-                let kind = item.get("kind").and_then(Value::as_str).unwrap_or("other");
-                let message = item.get("message").and_then(Value::as_str).unwrap_or("");
-                d.blocks.push(Block::Text {
-                    text: format!("[error: {kind}] {message}").into(),
-                });
-                if d.error.is_none() {
-                    d.error = Some(serde_json::json!({ "kind": kind, "message": message }));
-                }
-            }
-            Some("systemNotification" | "actionRequired" | "toolConfirmationRequest") => {
-                d.blocks.push(Block::Text {
-                    text: control_block_text(item).into(),
-                });
-                d.control.push(item.clone());
-            }
-            _ => {
-                if let Some(b) = item_to_block(item, tool_names) {
-                    d.blocks.push(b);
-                    d.substantive = true;
-                }
-            }
-        }
-    }
-    d
-}
-
-/// A control block as Goose's own `Display` prints it (message.rs:352-373), so a notice reads the
-/// same in cv as in a Goose log.
-fn control_block_text(item: &Value) -> String {
-    let s = |k: &str| item.get(k).and_then(Value::as_str).unwrap_or("");
-    match item.get("type").and_then(Value::as_str) {
-        Some("systemNotification") => format!("[SystemNotification: {}]", s("msg")),
-        Some("toolConfirmationRequest") => format!("[ToolConfirmationRequest: {}]", s("toolName")),
-        _ => {
-            let data = item.get("data").unwrap_or(item);
-            let d = |k: &str| data.get(k).and_then(Value::as_str).unwrap_or("");
-            match data.get("actionType").and_then(Value::as_str) {
-                Some("toolConfirmation") => format!("[ActionRequired: ToolConfirmation for {}]", d("toolName")),
-                Some("elicitation") => format!("[ActionRequired: Elicitation - {}]", d("message")),
-                Some("elicitationResponse") => format!("[ActionRequired: ElicitationResponse for {}]", d("id")),
-                Some("toolConfirmationResponse") => {
-                    format!("[ActionRequired: ToolConfirmationResponse for {}]", d("id"))
-                }
-                other => format!("[ActionRequired: {}]", other.unwrap_or("?")),
-            }
-        }
-    }
-}
-
-/// One content item → IR. The tool request/response pair is Goose's own (rmcp) shape; everything
-/// else — text, thinking, `redactedThinking`, image, `DocumentContent {data, mimeType, name?}`
-/// (message.rs:291-296, goose 1.4x) — is the Anthropic shape under Goose's keys.
-fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Option<Block> {
-    match item.get("type").and_then(Value::as_str)? {
-        "toolRequest" | "frontendToolRequest" => {
-            let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            let call = item.get("toolCall")?;
-            // Error wrapper: {"status":"error","error":"…"} → surface as a degenerate ToolUse.
-            let (name, input) = match call.get("status").and_then(Value::as_str) {
-                Some("error") => (
-                    String::new(),
-                    serde_json::json!({
-                        "error": call.get("error").and_then(Value::as_str).unwrap_or("")
-                    }),
-                ),
-                _ => {
-                    let value = call.get("value")?;
-                    let name = value.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                    let input = value.get("arguments").cloned().unwrap_or(Value::Null);
-                    (name, input)
-                }
-            };
-            if !id.is_empty() && !name.is_empty() {
-                tool_names.insert(id.clone(), name.clone());
-            }
-            Some(Block::ToolUse {
-                id,
-                name,
-                input: input.into(),
-                namespace: None,
-            })
-        }
-        "toolResponse" => {
-            let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            let result = item.get("toolResult")?;
-            let tool_name = tool_names.get(&id).cloned();
-            // rmcp's `structuredContent` (the developer shell's `{stdout, stderr, exit_code}`) and
-            // `_meta` (summon's `delegate` puts the child's `subagent_session_id` there) ride in
-            // `details`, verbatim, so a consumer can join a delegate call to its child session.
-            let details = result.get("value").and_then(Value::as_object).and_then(|v| {
-                let d: serde_json::Map<String, Value> = ["structuredContent", "_meta"]
-                    .into_iter()
-                    .filter_map(|k| v.get(k).map(|x| (k.to_string(), x.clone())))
-                    .collect();
-                (!d.is_empty()).then_some(Value::Object(d))
-            });
-            let (content, is_error) = match result.get("status").and_then(Value::as_str) {
-                Some("error") => (
-                    result.get("error").and_then(Value::as_str).unwrap_or("").to_string(),
-                    true,
-                ),
-                _ => {
-                    let value = result.get("value");
-                    let is_error = value
-                        .and_then(|v| v.get("isError"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    // `value` is an rmcp `CallToolResult {content, isError}` — or, in the legacy
-                    // shape Goose still accepts (`SuccessWithContentVec`, tool_result_serde.rs:
-                    // 132-146), the bare content array itself.
-                    let text = value
-                        .and_then(|v| if v.is_array() { Some(v) } else { v.get("content") })
-                        .map(flatten_result_content)
-                        .unwrap_or_default();
-                    (text, is_error)
-                }
-            };
-            Some(Block::ToolResult {
-                tool_use_id: id,
-                content: content.into(),
-                is_error,
-                tool_name,
-                status: None,
-                details,
-            })
-        }
-        // `error` and the control blocks are handled by `decode_content`; anything unknown is skipped.
-        _ => anthropic::block_from(item, &anthropic::GOOSE),
-    }
-}
-
-/// Flatten an rmcp `CallToolResult.content` array to text. rmcp 3.x content blocks are
-/// `text | image | audio | resource | resource_link` (snake_case): embedded resources contribute
-/// their text (or a `[blob: <mime>]` marker), links their uri.
-fn flatten_result_content(content: &Value) -> String {
-    let Some(items) = content.as_array() else {
-        return content.as_str().unwrap_or_default().to_string();
-    };
-    let mut parts = Vec::new();
-    for it in items {
-        match it.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(t) = it.get("text").and_then(Value::as_str) {
-                    parts.push(t.to_string());
-                }
-            }
-            Some("image") => {
-                let mime = it.get("mimeType").and_then(Value::as_str).unwrap_or("image");
-                parts.push(format!("[image: {mime}]"));
-            }
-            Some("audio") => {
-                let mime = it.get("mimeType").and_then(Value::as_str).unwrap_or("audio");
-                parts.push(format!("[audio: {mime}]"));
-            }
-            Some("resource") => {
-                let res = it.get("resource").unwrap_or(it);
-                match res.get("text").and_then(Value::as_str) {
-                    Some(t) => parts.push(t.to_string()),
-                    None => {
-                        let mime = res.get("mimeType").and_then(Value::as_str).unwrap_or("binary");
-                        parts.push(format!("[blob: {mime}]"));
-                    }
-                }
-            }
-            Some("resource_link") => {
-                let uri = it.get("uri").and_then(Value::as_str).unwrap_or("?");
-                parts.push(format!("[resource: {uri}]"));
-            }
-            _ => {}
-        }
-    }
-    parts.join("\n")
 }
 
 /// Build a [`Message`] from decoded content: a pure-tool-response `user` message is a
@@ -1369,8 +1125,9 @@ mod tests {
         );
     ";
 
+    /// A store file holding `schema`; Goose reads cells against the file they live in.
     fn mk(schema: &str) -> Connection {
-        let c = Connection::open_in_memory().unwrap();
+        let c = Connection::open(tempdir().join("sessions.db")).unwrap();
         c.execute_batch(schema).unwrap();
         c
     }
@@ -1396,8 +1153,12 @@ mod tests {
         s.messages.iter().map(|m| (m.role, m.kind, m.origin)).collect()
     }
 
-    fn sref(id: &str) -> SessionRef {
-        SessionRef::new(id, Harness::Goose, PathBuf::from("sessions.db"))
+    fn at(c: &Connection) -> PathBuf {
+        PathBuf::from(c.path().expect("file store"))
+    }
+
+    fn sref(c: &Connection, id: &str) -> SessionRef {
+        SessionRef::new(id, Harness::Goose, at(c))
     }
 
     #[test]
@@ -1428,7 +1189,7 @@ mod tests {
             [toolresp],
         ).unwrap();
 
-        let s = parse_db(&c, &sref("s1")).unwrap();
+        let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         assert_eq!(s.title.as_deref(), Some("Build a thing"));
         assert_eq!(s.cwd.as_deref().map(|p| p.to_str().unwrap()), Some("/home/u/proj"));
         assert_eq!(s.model.as_deref(), Some("anthropic/claude-sonnet-4"));
@@ -1493,7 +1254,7 @@ mod tests {
         // A stub-provider turn: prompt, the injected `<turn-context>` row (hidden from the user →
         // System / injected context), the reply with real usage; the session model is
         // provider/model and the reply's `openai/stub-model` is the same, so it is not repeated.
-        let s = parse_db(&c, &sref("20260919_3")).unwrap();
+        let s = parse_db(&c, &sref(&c, "20260919_3")).unwrap();
         assert_eq!(s.model.as_deref(), Some("openai/stub-model"));
         assert_eq!(
             kinds(&s),
@@ -1527,7 +1288,7 @@ mod tests {
         // `goose session import`): tool calls and results keep their names, thinking survives. The
         // store records no provenance (`session_type` is forced to `user`), so its prompts read as
         // a person's — `Origin::Import` is not derivable from a goose 1.51 store.
-        let s = parse_db(&c, &sref("20260919_6")).unwrap();
+        let s = parse_db(&c, &sref(&c, "20260919_6")).unwrap();
         assert_eq!(s.messages[0].origin, Origin::Human);
         assert!(s.harness_extra(Harness::Goose).unwrap()["session_type"] == "user");
         let tool_names: Vec<&str> = s
@@ -1557,7 +1318,7 @@ mod tests {
 
         // Retry exhaustion: goose 1.51.0 persists the message as a plain text block — a reply, not
         // an `error` block, so it is not a `MessageKind::Error`.
-        let s = parse_db(&c, &sref("20260919_5")).unwrap();
+        let s = parse_db(&c, &sref(&c, "20260919_5")).unwrap();
         let last = s.messages.last().unwrap();
         assert_eq!(last.role, Role::Assistant);
         assert_eq!(last.kind, MessageKind::Reply);
@@ -1566,7 +1327,7 @@ mod tests {
         );
         assert_nested_extra(&s);
         // The dead-endpoint session recorded no assistant row at all.
-        let s = parse_db(&c, &sref("20260919_4")).unwrap();
+        let s = parse_db(&c, &sref(&c, "20260919_4")).unwrap();
         assert!(s.messages.iter().all(|m| m.role != Role::Assistant));
     }
 
@@ -1608,7 +1369,7 @@ mod tests {
             )
             .unwrap();
         }
-        let s = parse_db(&c, &sref("c")).unwrap();
+        let s = parse_db(&c, &sref(&c, "c")).unwrap();
         let k: Vec<MessageKind> = s.messages.iter().map(|m| m.kind).collect();
         assert_eq!(
             k,
@@ -1655,7 +1416,7 @@ mod tests {
 
     #[test]
     fn fork_scoped_custom_nocase_ids_preserve_sql_current_holder_exclusion() -> Result<()> {
-        let world = cv_testkit::World::in_process("goose-nocase-fork-scope");
+        let world = crate::test_world("goose-nocase-fork-scope");
         let path = world.base.join("sessions.db");
         let conn = Connection::open(&path)?;
         conn.execute_batch(&SCHEMA.replace(
@@ -1691,7 +1452,7 @@ mod tests {
 
     #[test]
     fn fork_family_holder_rows_are_scanned_once_per_read_scope_and_fresh_between_scopes() -> Result<()> {
-        let world = cv_testkit::World::in_process("goose-fork-family-scope");
+        let world = crate::test_world("goose-fork-family-scope");
         let path = world.base.join("sessions.db");
         let conn = Connection::open(&path)?;
         conn.execute_batch(SCHEMA)?;
@@ -1745,7 +1506,7 @@ mod tests {
         rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()?
-            .install(stats_control)?;
+            .install(crate::env::carry(stats_control))?;
         #[cfg(not(feature = "parallel"))]
         stats_control()?;
         // A later operation observes changed holder metadata rather than keeping the old minimum.
@@ -1773,7 +1534,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let refs = discover_db(&c, Path::new("sessions.db")).unwrap();
+        let refs = discover_db(&c, &at(&c)).unwrap();
         let by_id = |id: &str| refs.iter().find(|r| r.id == id).unwrap().title.clone();
         assert_eq!(by_id("n").as_deref(), Some("Fix flaky test"));
         assert_eq!(
@@ -1783,7 +1544,7 @@ mod tests {
         );
         assert_eq!(by_id("e"), None, "empty strings are not titles");
         assert_eq!(
-            parse_db(&c, &sref("n")).unwrap().title.as_deref(),
+            parse_db(&c, &sref(&c, "n")).unwrap().title.as_deref(),
             Some("Fix flaky test")
         );
     }
@@ -1815,7 +1576,7 @@ mod tests {
             [hidden],
         )
         .unwrap();
-        let s = parse_db(&c, &sref("s1")).unwrap();
+        let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         assert_eq!(s.harness_extra(Harness::Goose).unwrap()["session_type"], "sub_agent");
         assert_eq!(
             s.lineage,
@@ -1874,7 +1635,7 @@ mod tests {
             )
             .unwrap();
         }
-        let origin = |id: &str| parse_db(&c, &sref(id)).unwrap().messages[0].origin;
+        let origin = |id: &str| parse_db(&c, &sref(&c, id)).unwrap().messages[0].origin;
         assert_eq!(origin("u"), Origin::Human);
         assert_eq!(origin("s"), Origin::Scheduler);
         assert_eq!(origin("h"), Origin::Harness);
@@ -1892,7 +1653,7 @@ mod tests {
             [content],
         )
         .unwrap();
-        let s = parse_db(&c, &sref("s1")).unwrap();
+        let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         let m = &s.messages[0];
         assert_eq!(m.role, Role::Assistant);
         assert_eq!((m.kind, m.origin), (MessageKind::Error, Origin::Harness));
@@ -1941,7 +1702,7 @@ mod tests {
             )
             .unwrap();
         }
-        let s = parse_db(&c, &sref("s1")).unwrap();
+        let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         assert_eq!(
             kinds(&s),
             vec![
@@ -1981,7 +1742,7 @@ mod tests {
             [resp],
         )
         .unwrap();
-        let s = parse_db(&c, &sref("s1")).unwrap();
+        let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         let m = &s.messages[0];
         assert!(matches!(&m.content[0], Block::ToolResult { content, is_error, .. }
                 if content == "ok\nhello\n[resource: file:///tmp/b.bin]\n[audio: audio/wav]" && !is_error));
@@ -2004,7 +1765,7 @@ mod tests {
             [resp],
         )
         .unwrap();
-        let s = parse_db(&c, &sref("s1")).unwrap();
+        let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         assert!(
             matches!(&s.messages[0].content[0], Block::ToolResult { is_error, content, .. } if *is_error && content == "boom")
         );
@@ -2022,7 +1783,7 @@ mod tests {
             [resp],
         )
         .unwrap();
-        let s = parse_db(&c, &sref("s1")).unwrap();
+        let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         let Block::ToolResult { details, content, .. } = &s.messages[0].content[0] else {
             panic!("a tool result")
         };
@@ -2141,8 +1902,8 @@ mod tests {
             conn.execute("INSERT INTO messages(session_id,role,content_json,created_timestamp,metadata_json) VALUES (?1,?2,?3,1,?4)",
                 rusqlite::params![id,role,body,metadata]).unwrap();
         }
-        for reference in discover_db(&conn, Path::new("sessions.db")).unwrap() {
-            let parsed = parse_db(&conn, &sref(&reference.id)).unwrap();
+        for reference in discover_db(&conn, &at(&conn)).unwrap() {
+            let parsed = parse_db(&conn, &sref(&conn, &reference.id)).unwrap();
             assert_eq!(
                 reference.message_count,
                 parsed.messages.iter().filter(|m| m.is_turn()).count(),
@@ -2150,56 +1911,6 @@ mod tests {
                 reference.id
             );
         }
-    }
-
-    #[test]
-    fn native_discovery_spooled_large_cells_match_parse_and_small_cell_counts() -> Result<()> {
-        let world = cv_testkit::World::in_process("goose-native-discovery-cells");
-        let path = world.base.join("sessions.db");
-        let conn = Connection::open(&path)?;
-        conn.execute_batch(SCHEMA)?;
-        conn.execute("INSERT INTO sessions(id,working_dir) VALUES ('large','/synthetic')", [])?;
-        let giant = "雪\n".repeat(super::super::store::bytes::MEMORY_LIMIT);
-        for (i, (body, meta)) in [
-            (
-                serde_json::json!([{"type":"text","text":giant}]).to_string(),
-                "{}".to_owned(),
-            ),
-            (
-                serde_json::json!([{"type":"text","text":"visible"}]).to_string(),
-                serde_json::json!({"userVisible":0,"ignored":giant}).to_string(),
-            ),
-            (
-                serde_json::json!([{"type":"text","text":giant}]).to_string(),
-                serde_json::json!({"userVisible":false,"ignored":giant}).to_string(),
-            ),
-            (
-                format!(
-                    "[{{\"type\":\"text\",\"text\":{},\"ignored\":1e999}}]",
-                    serde_json::to_string(&giant)?
-                ),
-                "{}".to_owned(),
-            ),
-            (
-                serde_json::json!([{"type":"text","text":giant}]).to_string(),
-                String::new(),
-            ),
-            (String::new(), serde_json::json!({"ignored":giant}).to_string()),
-            (r#"[{"type":"text","text":"small"}]"#.to_owned(), "{}".to_owned()),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            conn.execute("INSERT INTO messages(session_id,role,content_json,created_timestamp,metadata_json) VALUES ('large','user',?1,?2,?3)",rusqlite::params![body,i as i64,meta])?;
-        }
-        let refs = discover_db(&conn, &path)?;
-        assert_eq!(refs[0].message_count, 4);
-        let parsed = parse_db(&conn, &sref("large"))?;
-        assert_eq!(
-            refs[0].message_count,
-            parsed.messages.iter().filter(|m| m.is_turn()).count()
-        );
-        Ok(())
     }
 
     #[test]
@@ -2211,7 +1922,7 @@ mod tests {
             if let Some(schema) = incomplete {
                 conn.execute_batch(schema)?;
             }
-            let refs = discover_db(&conn, Path::new("sessions.db"))?;
+            let refs = discover_db(&conn, &at(&conn))?;
             assert_eq!(refs.len(), 1);
             assert_eq!(refs[0].id, "known");
             assert_eq!(refs[0].message_count, 0);
@@ -2234,7 +1945,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let refs = discover_db(&c, Path::new("sessions.db")).unwrap();
+        let refs = discover_db(&c, &at(&c)).unwrap();
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].id, "b"); // updated_at DESC
         assert_eq!(refs[1].id, "a");
@@ -2254,10 +1965,10 @@ mod tests {
         )
         .unwrap();
         c.execute("INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES ('s1','user','[{\"type\":\"text\",\"text\":\"old\"}]',1704110400)", []).unwrap();
-        let refs = discover_db(&c, Path::new("sessions.db")).unwrap();
+        let refs = discover_db(&c, &at(&c)).unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].title.as_deref(), Some("My Session")); // falls back to `name`
-        let s = parse_db(&c, &sref("s1")).unwrap();
+        let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         assert_eq!(s.messages.len(), 1);
         assert_eq!(s.messages[0].text().as_deref(), Some("old"));
         assert_eq!(s.title.as_deref(), Some("My Session"));
@@ -2330,7 +2041,7 @@ mod tests {
             "INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES ('s1','assistant','[{\"type\":\"redactedThinking\",\"data\":\"BLOB\"}]',1)",
             [],
         ).unwrap();
-        let s = parse_db(&c, &sref("s1")).unwrap();
+        let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         assert!(
             matches!(&s.messages[0].content[0], Block::Thinking { redacted, encrypted, .. } if *redacted && encrypted.as_deref() == Some("BLOB"))
         );
@@ -2351,37 +2062,6 @@ mod tests {
         session
     }
 
-    #[test]
-    fn checked_projection_matches_native_store_in_all_modes() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/goose/sessions-v16-1.51.0.db");
-        let conn = open_ro(&path).unwrap();
-        for r in discover_db(&conn, &path).unwrap() {
-            let expected = serde_json::to_value(projected_session(&conn, &r, &ParseOptions::full())).unwrap();
-            for opts in [ParseOptions::lazy_extra(), ParseOptions::complete()] {
-                assert_eq!(
-                    serde_json::to_value(projected_session(&conn, &r, &opts)).unwrap(),
-                    expected,
-                    "{} {opts:?}",
-                    r.id
-                );
-            }
-            let lean = without_rich_message_fields(projected_session(&conn, &r, &ParseOptions::full()));
-            for opts in [
-                ParseOptions::lazy(),
-                ParseOptions::bulk(),
-                ParseOptions::facts(),
-                ParseOptions::usage(),
-            ] {
-                assert_eq!(
-                    serde_json::to_value(projected_session(&conn, &r, &opts)).unwrap(),
-                    lean,
-                    "{} {opts:?}",
-                    r.id
-                );
-            }
-        }
-    }
-
     // ParseOptions explicitly reserves native sidecars and structured result details for full
     // extra demand. Lean output must retain every first-class field and ordinary content block.
     fn without_rich_message_fields(mut session: Session) -> Value {
@@ -2397,58 +2077,65 @@ mod tests {
     }
 
     #[test]
-    fn checked_projection_large_selected_and_ignored_payloads() {
-        let dir = tempdir();
-        let path = dir.join("sessions.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute(
-            "INSERT INTO sessions (id, description, working_dir) VALUES ('large','large','/scratch')",
-            [],
-        )
-        .unwrap();
-        let giant = "é\n\"\\".repeat(400_000);
+    fn long_text_stays_in_the_cell_and_lean_demands_drop_only_rich_fields() {
+        let c = mk(SCHEMA);
+        c.execute("INSERT INTO sessions (id, working_dir) VALUES ('large','/scratch')", [])
+            .unwrap();
+        let giant = "é\n\"\\".repeat(20_000);
         let content = serde_json::json!([
             {"type":"text","text": giant},
-            {"type":"thinking","thinking": giant,"signature":"sig"},
             {"type":"toolRequest","id":"call","toolCall":{"status":"success","value":{"name":"shell","arguments":{"command":giant}}}},
-            {"type":"toolResponse","id":"call","toolResult":{"status":"success","value":{"content":[{"type":"text","text":giant},{"type":"resource","resource":{"text":giant}},{"type":"audio","mimeType":"audio/wav"}],"structuredContent":{"stdout":giant},"_meta":{"subagent_session_id":"child"}}}},
-            {"type":"image","data":giant,"mimeType":"image/png"},
-            {"type":"document","data":giant,"mimeType":"application/pdf","name":"file"},
-            {"type":"error"},
+            {"type":"toolResponse","id":"call","toolResult":{"status":"success","value":{"content":[{"type":"text","text":giant},{"type":"audio","mimeType":"audio/wav"}],"structuredContent":{"stdout":"out"}}}},
             {"type":"systemNotification","msg":giant},
-            {"type":"actionRequired","data":{"actionType":"elicitation","message":giant}},
             {"type":"unknown","discarded":giant}
         ]);
-        let metadata = serde_json::json!({"userVisible":false,"turnContext":true,"usage":{"inputTokens":9,"cacheReadTokens":3,"cost":0.25,"discarded":giant},"inference":{"provider":"p","resolvedModel":"m","discarded":giant},"operations":[giant]});
-        conn.execute("INSERT INTO messages (session_id,role,content_json,created_timestamp,metadata_json) VALUES ('large','user',?1,1,?2)", rusqlite::params![content.to_string(),metadata.to_string()]).unwrap();
-        let r = SessionRef::new("large", Harness::Goose, path.clone());
-        let full = projected_session(&conn, &r, &ParseOptions::full());
-        for opts in [ParseOptions::lazy_extra(), ParseOptions::complete()] {
-            assert_eq!(
-                serde_json::to_value(projected_session(&conn, &r, &opts)).unwrap(),
-                serde_json::to_value(&full).unwrap()
-            );
-        }
-        let lean = without_rich_message_fields(projected_session(&conn, &r, &ParseOptions::full()));
-        for opts in [ParseOptions::lazy(), ParseOptions::bulk(), ParseOptions::usage()] {
-            assert_eq!(serde_json::to_value(projected_session(&conn, &r, &opts)).unwrap(), lean);
-        }
-        let facts = projected_session(&conn, &r, &ParseOptions::facts());
-        assert_eq!(facts.messages[0].role, full.messages[0].role);
-        assert_eq!(facts.messages[0].kind, full.messages[0].kind);
-        assert_eq!(
-            serde_json::to_value(&facts.messages[0].usage).unwrap(),
-            serde_json::to_value(&full.messages[0].usage).unwrap()
-        );
-        assert_eq!(facts.messages[0].model, full.messages[0].model);
-        assert!(facts.messages[0].extra.is_empty());
+        let metadata = serde_json::json!({"userVisible":false,"turnContext":true,"usage":{"inputTokens":9,"cost":0.25,"discarded":giant},"inference":{"provider":"p","resolvedModel":"m"},"operations":[giant]});
+        c.execute("INSERT INTO messages (session_id,role,content_json,created_timestamp,metadata_json) VALUES ('large','user',?1,1,?2)", rusqlite::params![content.to_string(),metadata.to_string()]).unwrap();
+        let r = sref(&c, "large");
+        let mut sink = crate::stream::CollectSink::default();
+        stream_db_opts(&c, &r, &ParseOptions::lazy(), &mut sink).unwrap();
+        let m = &sink.messages[0];
         assert!(matches!(
-            &facts.messages[0].content[3],
-            Block::ToolResult { details: None, .. }
+            &m.content[0],
+            Block::Text {
+                text: crate::lazy::Text::Source(_)
+            }
         ));
-        drop(conn);
-        std::fs::remove_dir_all(dir).unwrap();
+        assert!(matches!(
+            &m.content[1],
+            Block::ToolUse {
+                input: crate::json::Json::Source(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &m.content[2],
+            Block::ToolResult {
+                content: crate::lazy::Text::Source(_),
+                details: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            (m.kind, m.model.as_deref()),
+            (MessageKind::InjectedContext, Some("p/m"))
+        );
+        assert_eq!(
+            m.usage.as_ref().map(|u| (u.input_tokens, u.cost_usd)),
+            Some((Some(9), Some(0.25)))
+        );
+        assert!(m.extra.is_empty());
+        let lazy = projected_session(&c, &r, &ParseOptions::lazy());
+        let full = projected_session(&c, &r, &ParseOptions::full());
+        assert_eq!(
+            serde_json::to_value(lazy).unwrap(),
+            without_rich_message_fields(full.clone())
+        );
+        let tool = &full.messages[0].content[2];
+        assert!(
+            matches!(tool, Block::ToolResult { content, details: Some(_), .. } if *content == format!("{giant}\n[audio: audio/wav]").as_str())
+        );
+        assert_eq!(bag(&full.messages[0])["metadata"]["operations"][0], giant.as_str());
     }
 
     #[test]

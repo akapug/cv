@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn empty_live_window_skips_sources_and_snippets_saturate_extreme_positions() {
-        let world = cv_testkit::World::in_process("live-empty-window");
+        let world = crate::test_world("live-empty-window");
         world.write_session(
             "match",
             &[serde_json::json!({"type":"user", "message":{"role":"user", "content":"match"}})],

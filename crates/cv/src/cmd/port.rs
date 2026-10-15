@@ -112,19 +112,23 @@ fn carry_context(src: &Path, dst: &Path) {
     }
 }
 
-/// Exclusive creation enforces the context-copy contract even for symlinks or concurrent writers.
+/// Stage the complete context before claiming its name, including permissions from the source.
 fn copy_context_if_absent(from: &Path, to: &Path) -> std::io::Result<Option<u64>> {
-    use std::io::Write;
-    let mut source = fs::File::open(from)?;
-    let mut destination = match fs::OpenOptions::new().write(true).create_new(true).open(to) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
-        Err(error) => return Err(error),
+    use cv_core::publish::{refuse_existing, Claim, Exists, Staged};
+    let copy = || -> Result<u64> {
+        refuse_existing(to, "")?;
+        let mut source = fs::File::open(from)?;
+        let mut staged = Staged::beside(to, "context", cv_core::publish::mode_of(&source))?;
+        let copied = std::io::copy(&mut source, &mut staged)?;
+        staged.file().set_permissions(source.metadata()?.permissions())?;
+        staged.publish(to, Claim::New)?;
+        Ok(copied)
     };
-    let copied = std::io::copy(&mut source, &mut destination)?;
-    destination.flush()?;
-    destination.set_permissions(source.metadata()?.permissions())?;
-    Ok(Some(copied))
+    match copy() {
+        Ok(copied) => Ok(Some(copied)),
+        Err(error) if error.downcast_ref::<Exists>().is_some() => Ok(None),
+        Err(error) => Err(std::io::Error::other(error)),
+    }
 }
 
 pub(crate) fn emit_session(session: &Session, to_h: Harness, out: Option<PathBuf>, opts: EmitOptions) -> Result<()> {
@@ -247,6 +251,19 @@ pub(crate) fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod context_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn context_copy_read_failure_does_not_publish_an_empty_file() {
+        let world = cv_testkit::World::new("port-context-read-failure");
+        let destination = world.base.join("target.md");
+        let before = fs::read_dir(&world.base).unwrap().count();
+        // A source replaced by a directory between discovery and copying opens on Unix,
+        // but reading it fails, just as an I/O failure after opening a regular file does.
+        assert!(copy_context_if_absent(&world.base, &destination).is_err());
+        assert!(!destination.exists(), "failed copy claimed the destination");
+        assert_eq!(fs::read_dir(&world.base).unwrap().count(), before);
+    }
 
     #[test]
     fn context_copy_never_overwrites_existing_destinations() {

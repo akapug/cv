@@ -21,7 +21,7 @@ fn compare(reader: &Reader, r: &SessionRef, expected: Option<u32>) {
 
 #[test]
 fn demand_counts_match_batch_baselines_and_reject_stale_pairs() {
-    let w = cv_testkit::World::in_process("counts-demand-baselines");
+    let w = crate::test_world("counts-demand-baselines");
     let path = w.base.join("sessions.db");
     std::fs::write(&path, "database").unwrap();
     let r = SessionRef::new("selected", crate::Harness::Hermes, path.clone());
@@ -83,7 +83,7 @@ fn demand_counts_match_batch_baselines_and_reject_stale_pairs() {
 
 #[test]
 fn demand_counts_decode_only_selected_rows_as_inventory_grows() {
-    let w = cv_testkit::World::in_process("counts-demand-work");
+    let w = crate::test_world("counts-demand-work");
     let path = w.base.join("selected.jsonl");
     std::fs::write(&path, "selected").unwrap();
     let r = SessionRef::new("selected", crate::Harness::Codex, path);

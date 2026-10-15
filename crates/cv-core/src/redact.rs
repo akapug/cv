@@ -1367,7 +1367,7 @@ mod tests {
 
     #[test]
     fn redaction_resolves_lazy_text_and_scrubs_system_prompt_and_complete_record() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("redact-checked-record");
+        let world = crate::test_world("redact-checked-record");
         let path = world.base.join("record.json");
         let secret = fixture("sk-", "testabcdefghijklmnopqrstuvwxyz");
         let body = format!("{} {secret}", "ordinary ".repeat(2000));
@@ -1417,7 +1417,7 @@ mod tests {
 
     #[test]
     fn redaction_uses_session_resolver_for_implicit_spans() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("redact-implicit-span");
+        let world = crate::test_world("redact-implicit-span");
         let path = world.base.join("body.txt");
         let secret = fixture("sk-", "testabcdefghijklmnopqrstuvwxyz");
         std::fs::write(&path, &secret)?;

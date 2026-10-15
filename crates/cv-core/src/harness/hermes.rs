@@ -64,7 +64,7 @@
 mod emit;
 pub use emit::emit;
 
-use super::store::sqlite::{columns, open_ro, table_exists};
+use super::store::sqlite::{columns, open_ro, table_exists, Cells};
 use super::wire::openai;
 use super::{ts_from_epoch, Adapter};
 use crate::ir::*;
@@ -180,9 +180,9 @@ pub struct Hermes {
 impl Hermes {
     pub fn detect() -> Self {
         // HERMES_HOME overrides ~/.hermes.
-        let home = std::env::var_os("HERMES_HOME")
+        let home = crate::env::var_os("HERMES_HOME")
             .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".hermes")));
+            .or_else(|| crate::env::home_dir().map(|h| h.join(".hermes")));
         match home {
             Some(home) => Self::with_home(&home),
             None => Hermes { dbs: Vec::new() },
@@ -241,11 +241,13 @@ impl Adapter for Hermes {
         // unreadable DB (e.g. permission-denied) is skipped rather than failing the whole scan.
         let mut out = Vec::new();
         for db in &self.dbs {
-            let conn = match open_ro(db) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            if let Ok(refs) = conn.read(|conn| discover_conn(conn, db)) {
+            let refs = super::store::sqlite::cached_discover(db, || {
+                let Ok(conn) = open_ro(db) else {
+                    return Ok(Vec::new());
+                };
+                conn.read(|conn| discover_conn(conn, db))
+            });
+            if let Ok(refs) = refs {
                 out.extend(refs);
             }
         }
@@ -516,11 +518,12 @@ struct SessionFacts {
 /// SELECT; the rest are probed here.
 fn read_session_facts(
     conn: &Connection,
+    (path, reads): (&Path, &crate::source::ReadSet),
     id: &str,
     source: Option<&str>,
     end_reason: Option<&str>,
     opts: &ParseOptions,
-) -> SessionFacts {
+) -> Result<SessionFacts> {
     let mut meta = serde_json::Map::new();
     let scols = columns(conn, "sessions");
     if opts.wants_full_extra() {
@@ -585,37 +588,45 @@ fn read_session_facts(
     let mut bag = serde_json::Map::new();
     // A foreign import (`hermes sessions import --from claude|codex`, `hermes_cli/foreign_sessions.py`)
     // records its provenance in `origin_json.imported_from{tool, path, foreign_session_id}` — the
-    // very transcript cv also parses natively. Surface it in the bag so consumers can dedupe; the
-    // messages themselves carry `Origin::Import`.
-    let imported_from = meta
-        .get("origin_json")
-        .and_then(Value::as_str)
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|origin| origin.get("imported_from").cloned())
-        .filter(Value::is_object);
-    let imported = if opts.wants_full_extra() {
-        imported_from.is_some()
-    } else if scols.contains("origin_json") {
-        // Import origin is first-class even on lean reads. Inspect the borrowed native cell,
-        // validating Value acceptance without building unrelated import metadata.
-        conn.query_row("SELECT origin_json FROM sessions WHERE id = ?1", [id], |row| {
-            Ok(borrowed_text(row, Some(0)).is_some_and(imported_origin))
-        })
-        .unwrap_or(false)
-    } else {
-        false
-    };
+    // very transcript cv also parses natively. Surface it in the bag (full demand) so consumers can
+    // dedupe; the messages themselves carry `Origin::Import` on every demand.
+    let mut imported_from = None;
+    if scols.contains("origin_json") {
+        let cells = Cells::new(conn, path, reads, "sessions")?;
+        let sql = format!("SELECT {} FROM sessions WHERE id = ?1", cells.select("origin_json"));
+        let mut statement = conn.prepare(&sql)?;
+        let mut rows = statement.query([id])?;
+        if let Some(cell) = rows
+            .next()?
+            .map(|row| cells.cell(conn, "sessions", "origin_json", row, 0))
+            .transpose()?
+            .flatten()
+        {
+            imported_from = cells
+                .read(cell, |view| match view.get("imported_from")? {
+                    Some(from) if from.is_object()? => Ok(Some(if opts.wants_full_extra() {
+                        from.resolve()?.into_owned()
+                    } else {
+                        Value::Null
+                    })),
+                    _ => Ok(None),
+                })?
+                .flatten();
+        }
+    }
+    let imported = imported_from.is_some();
+    let imported_from = imported_from.filter(|_| opts.wants_full_extra());
     if let Some(imported_from) = imported_from {
         bag.insert("imported_from".into(), imported_from);
     }
     if !meta.is_empty() {
         bag.insert(SESSION_META_KEY.into(), Value::Object(meta));
     }
-    SessionFacts {
+    Ok(SessionFacts {
         bag,
         system_prompt,
         imported,
-    }
+    })
 }
 
 /// The compression continuation of `id`, if any: the child whose `parent_session_id` is `id` and
@@ -673,14 +684,6 @@ fn stream_conn_with_demand(
     reads: &crate::source::ReadSet,
     count_only: bool,
 ) -> Result<Session> {
-    let checked_source = opts
-        .spans
-        .then(|| crate::json::JsonSource::capture_with_reads(&r.path, reads))
-        .transpose()?;
-    let arena = checked_source
-        .as_ref()
-        .map(|_| super::store::bytes::ByteSource::arena().map(std::sync::Arc::new))
-        .transpose()?;
     // session-level metadata (guard optional columns for historical schemas).
     let scols = columns(conn, "sessions");
     let expr = |col: &str| {
@@ -738,7 +741,14 @@ fn stream_conn_with_demand(
             imported: false,
         }
     } else {
-        read_session_facts(conn, &r.id, source.as_deref(), end_reason.as_deref(), opts)
+        read_session_facts(
+            conn,
+            (&r.path, reads),
+            &r.id,
+            source.as_deref(),
+            end_reason.as_deref(),
+            opts,
+        )?
     };
     // A foreign import: every message of the session came through the importer.
     let session_origin = imported.then_some(Origin::Import);
@@ -815,33 +825,34 @@ fn stream_conn_with_demand(
     let has = |c: &str| cols.contains(c);
 
     // Build the SELECT defensively: required cols always present; optional cols gated by probe.
-    let mut select_cols: Vec<&str> = vec![
-        "id",
-        "role",
-        "content",
-        "tool_call_id",
-        "tool_calls",
-        "tool_name",
-        "timestamp",
-    ];
-    for c in OPTIONAL_MSG_COLS {
-        if has(c) {
-            select_cols.push(c);
-        }
+    // Plain columns are selected by name; every JSON column (and `content`) as a cell, which the
+    // row decoder reads through `cells`. Generation identity reads `content` and
+    // `_content_rowid` from the content cell's columns (the cell's type and rowid when reads are
+    // incremental, the cell itself otherwise).
+    let cells = Cells::new(conn, &r.path, reads, "messages")?;
+    let incremental = super::store::sqlite::incremental_utf8_table(conn, "messages");
+    let mut names: Vec<String> = ["id", "role", "tool_call_id", "tool_calls", "tool_name", "timestamp"]
+        .map(String::from)
+        .to_vec();
+    names.extend(
+        OPTIONAL_MSG_COLS
+            .iter()
+            .filter(|c| has(c) && !CELL_COLS.contains(c))
+            .map(|c| c.to_string()),
+    );
+    let mut select_list = names.clone();
+    select_list.push(cells.select("content"));
+    names.extend(if incremental {
+        ["_content_rowid".to_string(), "content".to_string()]
+    } else {
+        ["content".to_string(), "content#type".to_string()]
+    });
+    for column in CELL_COLS {
+        select_list.push(cells.select(if has(column) { column } else { "NULL" }));
+        names.extend([format!("{column}#"), format!("{column}#type")]);
     }
-    let incremental_content = super::store::sqlite::incremental_utf8_table(conn, "messages");
-    if incremental_content {
-        select_cols.push("_content_rowid");
-    }
-    let select_list = select_cols
-        .iter()
-        .map(|column| match *column {
-            "content" if incremental_content => "typeof(content) AS content",
-            "_content_rowid" => "rowid AS _content_rowid",
-            column => column,
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let select_list = select_list.join(", ");
+    let idx = |name: &str| names.iter().position(|c| c == name);
 
     // Row visibility (schema v12+): Hermes's display projection is `(active = 1 OR compacted = 1)`
     // — live rows plus the history a compaction summarized away — which drops rewound rows and the
@@ -865,241 +876,24 @@ fn stream_conn_with_demand(
     // look-back (the trailing run of user single-texts since the last substantive assistant turn),
     // not the whole transcript, so peak stays O(one message).
     let mut dedup = ReplayDedup::default();
+    let demand = Demand {
+        opts,
+        count_only,
+        incremental,
+    };
     'lineage: for sid in &chain {
         // `ORDER BY id`, as Hermes itself reads (`_ACTIVE_IDS_SQL`, `_fetch_conversation_rows`):
         // timestamps are not monotonic and would split a tool call from its result.
         let sql = format!("SELECT {select_list} FROM messages WHERE session_id = ?1{visibility} ORDER BY id ASC");
         let mut stmt = conn.prepare(&sql)?;
-        // Map column name -> index so we can read by name regardless of which optionals exist.
-        let idx = |name: &str| select_cols.iter().position(|c| *c == name);
-        // Stream rows lazily: one `MsgRow` -> one `Message` at a time, emitted and dropped before
-        // the next row (a single Hermes session can be large; never materialize the whole Vec).
-        let mut rows = stmt.query_map([sid], |row| {
-            if dedup_generations {
-                let admitted = generations
-                    .admit(row, &idx, conn, incremental_content)
-                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
-                if !admitted {
-                    return Ok(None);
-                }
+        // Stream rows lazily: one row -> one `Message` at a time, emitted and dropped before the
+        // next row (a single Hermes session can be large; never materialize the whole Vec).
+        let mut rows = stmt.query([sid])?;
+        while let Some(row) = rows.next()? {
+            if dedup_generations && !generations.admit(row, &idx, conn, incremental)? {
+                continue;
             }
-            let get_str = |name: &str| -> Option<String> {
-                idx(name).and_then(|i| row.get::<_, Option<String>>(i).ok().flatten())
-            };
-            let get_i64 =
-                |name: &str| -> Option<i64> { idx(name).and_then(|i| row.get::<_, Option<i64>>(i).ok().flatten()) };
-            let get_extra = |name| opts.wants_full_extra().then(|| get_str(name)).flatten();
-            // Native rowid tables select only the content type/rowid, then stream the cell into
-            // the same checked arena. Typed rejection and older/view/UTF-16 fallbacks are retained.
-            let mut content_source = None;
-            let mut decoded_content = None;
-            let mut untyped_failed_turn = false;
-            // Counts still use into_message's classification/acceptance. Nonturn bodies cannot
-            // affect replay suppression; plain assistant bodies need only typed presence and the
-            // failed-turn classifier, not an escaped arena copy. User text and multimodal content
-            // retain their established exact decoder because their block shape affects dedup.
-            let nonturn = matches!(borrowed_text(row, idx("role")), Some("tool" | "system"))
-                || get_i64("_compressed_summary").is_some_and(|n| n != 0)
-                || borrowed_text(row, idx("display_kind"))
-                    .and_then(harness_display_kind)
-                    .is_some();
-            let content = if count_only && nonturn {
-                None
-            } else if incremental_content {
-                if borrowed_text(row, idx("content")).is_some_and(|kind| kind == "text") {
-                    let rowid = row.get::<_, i64>(idx("_content_rowid").unwrap())?;
-                    let mut prepare = || -> Result<Option<String>> {
-                        if count_only && borrowed_text(row, idx("role")) == Some("assistant") {
-                            let projected = super::store::sqlite::with_cell_reader(
-                                conn,
-                                "messages",
-                                "content",
-                                rowid,
-                                |reader, _| count_content(reader),
-                            );
-                            match projected {
-                                Ok((present, failed)) => {
-                                    untyped_failed_turn = get_str("display_kind").is_none() && failed;
-                                    return Ok(present.then(|| "[content present]".to_string()));
-                                }
-                                Err(error) if error.is::<CountNeedsBody>() => {}
-                                Err(error) => return Err(error),
-                            }
-                        }
-                        if let Some(source) = &checked_source {
-                            let mut valid = false;
-                            let text = super::store::sqlite::with_cell_reader(
-                                conn,
-                                "messages",
-                                "content",
-                                rowid,
-                                |reader, _| {
-                                    super::store::text::append(source, arena.as_ref().unwrap(), |builder| {
-                                        valid =
-                                            super::store::sqlite::for_each_utf8(reader, |chunk| builder.push(chunk))?;
-                                        Ok(())
-                                    })
-                                },
-                            )?;
-                            if valid && !text.is_empty() {
-                                if borrowed_text(row, idx("role")) != Some("tool") {
-                                    decoded_content =
-                                        source_multimodal_content(&text, source, arena.as_ref().unwrap())?;
-                                }
-                                if decoded_content.is_none() {
-                                    if borrowed_text(row, idx("role")) == Some("assistant")
-                                        && get_str("display_kind").is_none()
-                                    {
-                                        untyped_failed_turn = source_failed_turn(&text)?;
-                                    }
-                                    content_source = Some(text);
-                                }
-                            }
-                            Ok(None)
-                        } else {
-                            super::store::sqlite::with_cell_reader(conn, "messages", "content", rowid, |reader, len| {
-                                let mut text = String::with_capacity(len);
-                                let valid = super::store::sqlite::for_each_utf8(reader, |chunk| {
-                                    text.push_str(chunk);
-                                    Ok(())
-                                })?;
-                                Ok(valid.then_some(text))
-                            })
-                        }
-                    };
-                    prepare().map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?
-                } else {
-                    None
-                }
-            } else {
-                let owned = get_str("content");
-                if let (Some(source), Some(raw)) = (
-                    &checked_source,
-                    owned.as_deref().filter(|raw| {
-                        raw.len() > crate::lazy::INLINE_MAX && !FAILED_TURN_NOTICES.contains(&raw.trim())
-                    }),
-                ) {
-                    let mut prepare = || -> Result<()> {
-                        if get_str("role").as_deref() != Some("tool") {
-                            decoded_content = checked_multimodal_content(raw, source, arena.as_ref().unwrap())?;
-                        }
-                        if decoded_content.is_none() {
-                            content_source = Some(super::store::text::append(
-                                source,
-                                arena.as_ref().unwrap(),
-                                |builder| builder.push(raw),
-                            )?);
-                        }
-                        Ok(())
-                    };
-                    prepare().map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
-                }
-                if content_source.is_some() || decoded_content.is_some() {
-                    None
-                } else {
-                    owned
-                }
-            };
-            let mut decoded_calls = None;
-            if let Some(source) = &checked_source {
-                if let Some(raw) =
-                    borrowed_text(row, idx("tool_calls")).filter(|raw| raw.len() > crate::lazy::INLINE_MAX)
-                {
-                    decoded_calls = Some(
-                        checked_json(raw, source, arena.as_ref().unwrap(), |view| {
-                            let mut calls = Vec::new();
-                            if let Some(array) = view.array()? {
-                                for call in array {
-                                    calls.push(openai::tool_call_view(call?)?);
-                                }
-                            }
-                            Ok(calls)
-                        })
-                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?
-                        .unwrap_or_default(),
-                    );
-                }
-            }
-            let mut has_reasoning_extra = false;
-            let thinking = if opts.wants_full_extra()
-                || (count_only && (nonturn || borrowed_text(row, idx("role")) == Some("assistant")))
-            {
-                None
-            } else {
-                let (text, encrypted, present) = lean_reasoning(row, &idx);
-                has_reasoning_extra = present;
-                if text.is_empty() && encrypted.is_none() {
-                    None
-                } else {
-                    let text = if let Some(source) =
-                        checked_source.as_ref().filter(|_| text.len() > crate::lazy::INLINE_MAX)
-                    {
-                        super::store::text::append(source, arena.as_ref().unwrap(), |builder| builder.push(&text))
-                            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?
-                    } else {
-                        text.into()
-                    };
-                    Some(Block::Thinking {
-                        text,
-                        signature: None,
-                        encrypted,
-                        redacted: false,
-                    })
-                }
-            };
-            let has_body = content_source.is_some()
-                || decoded_content.as_ref().is_some_and(|blocks| !blocks.is_empty())
-                || decoded_calls.as_ref().is_some_and(|blocks| !blocks.is_empty())
-                || thinking.is_some()
-                || borrowed_text(row, idx("role")) == Some("tool")
-                || content
-                    .as_deref()
-                    .is_some_and(|raw| !raw.is_empty() && !raw.starts_with(MULTIMODAL_SENTINEL));
-            let has_extra = !opts.wants_full_extra() && !has_body && (has_reasoning_extra || row_has_extra(row, &idx));
-            Ok(Some(MsgRow {
-                id: get_i64("id").unwrap_or(0),
-                role: get_str("role").unwrap_or_default(),
-                content,
-                untyped_failed_turn,
-                content_source,
-                decoded_content,
-                tool_call_id: get_str("tool_call_id"),
-                tool_calls: decoded_calls.is_none().then(|| get_str("tool_calls")).flatten(),
-                decoded_calls,
-                thinking,
-                has_extra,
-                tool_name: get_str("tool_name"),
-                timestamp: idx("timestamp").and_then(|i| row.get::<_, Option<f64>>(i).ok().flatten()),
-                token_count: get_i64("token_count"),
-                finish_reason: get_extra("finish_reason"),
-                reasoning: get_extra("reasoning"),
-                reasoning_content: get_extra("reasoning_content"),
-                reasoning_details: get_extra("reasoning_details"),
-                codex_reasoning_items: get_extra("codex_reasoning_items"),
-                codex_message_items: get_extra("codex_message_items"),
-                platform_message_id: get_extra("platform_message_id"),
-                observed: get_i64("observed"),
-                effect_disposition: get_extra("effect_disposition"),
-                active: get_i64("active"),
-                compacted: get_i64("compacted"),
-                compressed_summary: matches!(get_i64("_compressed_summary"), Some(n) if n != 0),
-                api_content: get_extra("api_content"),
-                display_kind: get_str("display_kind"),
-                display_metadata: get_extra("display_metadata"),
-                message_uid: get_extra("message_uid"),
-                absorbed_message_uids: get_extra("absorbed_message_uids"),
-                tool_call_uids: get_extra("tool_call_uids"),
-                tool_call_uid: get_extra("tool_call_uid"),
-            }))
-        })?;
-
-        for row in rows.by_ref() {
-            let row = match row {
-                Ok(row) => row,
-                Err(error) if checked_source.is_some() => return Err(error.into()),
-                Err(_) => continue,
-            };
-            let Some(row) = row else { continue };
+            let row = read_row(conn, &cells, row, &idx, &demand)?;
             let row_id = row.id;
             let Some(mut m) = row.into_message(session_origin, opts) else {
                 continue;
@@ -1136,7 +930,7 @@ fn stream_conn_with_demand(
     #[cfg(test)]
     ARENA_WRITE_OBSERVER.with(|observer| -> Result<()> {
         if let Some(bytes) = observer.borrow_mut().as_mut() {
-            bytes.push(arena.as_ref().map(|arena| arena.len()).transpose()?.unwrap_or(0));
+            bytes.push(cells.out().1.len()?);
         }
         Ok(())
     })?;
@@ -1523,8 +1317,340 @@ fn generation_rows_equal(
     )
 }
 
-/// Preserve acceptance of metadata-only rows even when their extras are not demanded.
-/// String sidecars need only a presence check; JSON sidecars retain strict Value acceptance.
+/// The JSON `messages` columns the row decoder reads as cells.
+const CELL_COLS: &[&str] = &[
+    "tool_calls",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+];
+
+/// What a read of the rows resolves: the parse demand, plus `count_only` (discovery's turn
+/// count: only whether a non-turn or an assistant reply has a body, never the body itself).
+struct Demand<'a> {
+    opts: &'a ParseOptions,
+    count_only: bool,
+    incremental: bool,
+}
+
+/// A row's `content`: text by the codec's rule, or the parts of a `\x00json:` multimodal document.
+enum Body {
+    Text(crate::Text),
+    Blocks(Vec<Block>),
+}
+
+/// One `messages` row through the one decoder: plain columns from the row, `content` and the JSON
+/// columns from their cells. The demand decides what is resolved, never which code runs.
+fn read_row(
+    conn: &Connection,
+    cells: &Cells,
+    row: &rusqlite::Row<'_>,
+    idx: &impl Fn(&str) -> Option<usize>,
+    demand: &Demand<'_>,
+) -> Result<MsgRow> {
+    let opts = demand.opts;
+    let (spans, full) = (opts.spans, opts.wants_full_extra());
+    let get_str =
+        |name: &str| -> Option<String> { idx(name).and_then(|i| row.get::<_, Option<String>>(i).ok().flatten()) };
+    let get_i64 = |name: &str| -> Option<i64> { idx(name).and_then(|i| row.get::<_, Option<i64>>(i).ok().flatten()) };
+    let get_extra = |name| full.then(|| get_str(name)).flatten();
+    let cell = |column: &str| cells.cell(conn, "messages", column, row, idx(&format!("{column}#")).unwrap());
+    let role = borrowed_text(row, idx("role"));
+    let display_kind = get_str("display_kind");
+    let compressed_summary = get_i64("_compressed_summary").is_some_and(|n| n != 0);
+    // Non-turn rows cannot affect a turn count or replay suppression.
+    let nonturn = matches!(role, Some("tool" | "system"))
+        || compressed_summary
+        || display_kind.as_deref().and_then(harness_display_kind).is_some();
+    let skip = demand.count_only && nonturn;
+    let check_failed = role == Some("assistant") && display_kind.is_none();
+
+    let content_at = idx(if demand.incremental {
+        "_content_rowid"
+    } else {
+        "content"
+    })
+    .unwrap();
+    let mut body = None;
+    let mut untyped_failed_turn = false;
+    let mut projected = false;
+    if !skip && demand.count_only && role == Some("assistant") {
+        // A reply counts by presence and the failed-turn notice; its body is not copied.
+        let mut prefix = [0; MULTIMODAL_SENTINEL.len()];
+        let mut prefix_len = 0;
+        let mut present = false;
+        let mut notice = FailedNotice::new();
+        match cells.chunks(conn, "messages", "content", row, content_at, |chunk| {
+            present |= !chunk.is_empty();
+            let take = chunk.len().min(prefix.len() - prefix_len);
+            prefix[prefix_len..prefix_len + take].copy_from_slice(&chunk.as_bytes()[..take]);
+            prefix_len += take;
+            if prefix_len == prefix.len() && prefix.as_slice() == MULTIMODAL_SENTINEL.as_bytes() {
+                return Err(CountNeedsBody.into());
+            }
+            notice.push(chunk);
+            Ok(())
+        }) {
+            Ok(valid) => {
+                projected = true;
+                untyped_failed_turn = check_failed && valid && notice.finished();
+                if valid && present {
+                    body = Some(Body::Text("[content present]".into()));
+                }
+            }
+            Err(error) if error.is::<CountNeedsBody>() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if !skip && !projected {
+        if let Some(text) = cells.text(conn, "messages", "content", row, content_at)? {
+            let multimodal = role != Some("tool");
+            (body, untyped_failed_turn) = cells
+                .read(text, |view| content(view, multimodal, check_failed, spans, cells))?
+                .unwrap_or_default();
+        }
+    }
+
+    let calls = match cell("tool_calls")?.filter(|_| !skip) {
+        Some(calls) => cells
+            .read(calls, |view| {
+                let mut calls = Vec::new();
+                if let Some(array) = view.array()? {
+                    for call in array {
+                        calls.push(openai::tool_call_from_view(call?, spans)?);
+                    }
+                }
+                Ok(calls)
+            })?
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    // Reasoning: summary text from `reasoning`, `reasoning_content` (unless identical, Hermes' own
+    // dedup) and the text entries of `reasoning_details`; the first encrypted handle of
+    // `reasoning_details` or else `codex_reasoning_items`. Full demand keeps the JSON sidecars.
+    let mut reasoning = Reasoning::default();
+    if !(demand.count_only && (nonturn || role == Some("assistant"))) {
+        let summary = borrowed_text(row, idx("reasoning"));
+        if let Some(summary) = summary {
+            reasoning.push(summary);
+        }
+        if let Some(content) = borrowed_text(row, idx("reasoning_content")).filter(|c| Some(*c) != summary) {
+            reasoning.push(content);
+        }
+        if let Some(details) = cell("reasoning_details")? {
+            reasoning.details = cells.read(details, |view| reasoning.read(view, true, full))?.flatten();
+            reasoning.present = true;
+        }
+        if full || reasoning.encrypted.is_none() {
+            if let Some(items) = cell("codex_reasoning_items")? {
+                reasoning.codex = cells.read(items, |view| reasoning.read(view, false, full))?.flatten();
+                reasoning.present = true;
+            }
+        }
+    }
+    let thinking = if reasoning.text.is_empty() && reasoning.encrypted.is_none() {
+        None
+    } else {
+        let text = if spans && reasoning.text.len() > crate::lazy::INLINE_MAX {
+            let (source, arena) = cells.out();
+            super::store::text::append(source, arena, |builder| builder.push(&reasoning.text))?
+        } else {
+            std::mem::take(&mut reasoning.text).into()
+        };
+        Some(Block::Thinking {
+            text,
+            signature: None,
+            encrypted: reasoning.encrypted.take(),
+            redacted: false,
+        })
+    };
+    let codex_message_items = if full {
+        cell("codex_message_items")?
+            .map(|items| cells.read(items, |view| Ok(view.resolve()?.into_owned())))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let has_body = match &body {
+        Some(Body::Blocks(blocks)) => !blocks.is_empty(),
+        Some(Body::Text(_)) => true,
+        None => false,
+    } || !calls.is_empty()
+        || thinking.is_some()
+        || role == Some("tool");
+    // A metadata-only row is still a message on lean reads, whose extras are not demanded.
+    let has_extra = !full
+        && !has_body
+        && (reasoning.present
+            || row_has_extra(row, idx)
+            || cell("codex_message_items")?
+                .map(|items| cells.read(items, |_| Ok(())))
+                .transpose()?
+                .flatten()
+                .is_some());
+    Ok(MsgRow {
+        id: get_i64("id").unwrap_or(0),
+        role: get_str("role").unwrap_or_default(),
+        body,
+        untyped_failed_turn,
+        tool_call_id: get_str("tool_call_id"),
+        calls,
+        thinking,
+        has_extra,
+        tool_name: get_str("tool_name"),
+        timestamp: idx("timestamp").and_then(|i| row.get::<_, Option<f64>>(i).ok().flatten()),
+        token_count: get_i64("token_count"),
+        finish_reason: get_extra("finish_reason"),
+        reasoning: get_extra("reasoning"),
+        reasoning_content: get_extra("reasoning_content"),
+        reasoning_details: reasoning.details,
+        codex_reasoning_items: reasoning.codex,
+        codex_message_items,
+        platform_message_id: get_extra("platform_message_id"),
+        observed: get_i64("observed"),
+        effect_disposition: get_extra("effect_disposition"),
+        active: get_i64("active"),
+        compacted: get_i64("compacted"),
+        compressed_summary,
+        api_content: get_extra("api_content"),
+        display_kind,
+        display_metadata: get_extra("display_metadata"),
+        message_uid: get_extra("message_uid"),
+        absorbed_message_uids: get_extra("absorbed_message_uids"),
+        tool_call_uids: get_extra("tool_call_uids"),
+        tool_call_uid: get_extra("tool_call_uid"),
+    })
+}
+
+/// A row's folded reasoning.
+#[derive(Default)]
+struct Reasoning {
+    text: String,
+    encrypted: Option<String>,
+    /// A `reasoning_details` or `codex_reasoning_items` document was read.
+    present: bool,
+    details: Option<Value>,
+    codex: Option<Value>,
+}
+
+impl Reasoning {
+    fn push(&mut self, summary: &str) {
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return;
+        }
+        if !self.text.is_empty() {
+            self.text.push_str("\n\n");
+        }
+        self.text.push_str(summary);
+    }
+
+    /// Fold one reasoning document's items (`summaries` for `reasoning_details`, whose text entries
+    /// count too); the owned document on full demand.
+    fn read(&mut self, view: crate::json::JsonView<'_>, summaries: bool, full: bool) -> Result<Option<Value>> {
+        let string = |v: Option<crate::json::JsonView<'_>>| -> Result<Option<String>> {
+            match v {
+                Some(v) if v.is_string()? => Ok(v.resolve()?.as_str().map(str::to_owned)),
+                _ => Ok(None),
+            }
+        };
+        if let Some(items) = view.array()? {
+            for item in items {
+                let item = item?;
+                if self.encrypted.is_none() {
+                    self.encrypted = string(item.get("encrypted_content")?)?;
+                    if !summaries && self.encrypted.is_some() {
+                        break;
+                    }
+                }
+                if summaries {
+                    // The first present key wins, even when it is not a string.
+                    let mut summary = None;
+                    for key in ["summary", "thinking", "content", "text"] {
+                        if let Some(v) = item.get(key)? {
+                            summary = Some(v);
+                            break;
+                        }
+                    }
+                    if let Some(summary) = string(summary)? {
+                        self.push(&summary);
+                    }
+                }
+            }
+        }
+        Ok(if full { Some(view.resolve()?.into_owned()) } else { None })
+    }
+}
+
+/// A content string: the parts of a `\x00json:` multimodal document (never for a tool result,
+/// whose sentinel is literal output), else the text by the codec's rule. A document that is not
+/// valid JSON, or a dict without parts, stays literal text. Also whether the text is the
+/// failed-turn notice (when `check_failed`).
+fn content(
+    view: crate::json::JsonView<'_>,
+    multimodal: bool,
+    check_failed: bool,
+    spans: bool,
+    cells: &Cells,
+) -> Result<(Option<Body>, bool)> {
+    let mut head = String::new();
+    view.for_each_char(|c| {
+        head.push(c);
+        head.len() < MULTIMODAL_SENTINEL.len()
+    })?;
+    if multimodal && head == MULTIMODAL_SENTINEL {
+        let (source, arena) = cells.out();
+        let (offset, len) = arena.append(|writer| {
+            let mut skip = MULTIMODAL_SENTINEL.len();
+            view.for_each_str_chunk(|chunk| {
+                let skipped = skip.min(chunk.len());
+                skip -= skipped;
+                writer.write_all(&chunk.as_bytes()[skipped..])?;
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        match source.read_backing_value(arena.clone(), offset, len, |v| multimodal_blocks(v, spans)) {
+            Ok(Some(blocks)) => return Ok((Some(Body::Blocks(blocks)), false)),
+            Ok(None) => {}
+            Err(error) if error.is::<crate::json::InvalidJson>() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let mut failed = false;
+    if check_failed {
+        let mut notice = FailedNotice::new();
+        let mut matching = true;
+        view.for_each_char(|c| {
+            matching = notice.push(c.encode_utf8(&mut [0; 4]));
+            matching
+        })?;
+        failed = matching && notice.finished();
+    }
+    Ok((view.lazy_text(spans)?.map(Body::Text), failed))
+}
+
+/// A multimodal document's parts: an array, or a dict's `parts` (provider wrappers). None for a
+/// dict whose parts are missing or yield nothing (the content stays literal text).
+fn multimodal_blocks(view: crate::json::JsonView<'_>, spans: bool) -> Result<Option<Vec<Block>>> {
+    let array = view.is_array()?;
+    let parts = if array { Some(view) } else { view.get("parts")? };
+    let Some(parts) = parts.map(|parts| parts.array()).transpose()?.flatten() else {
+        return Ok(None);
+    };
+    let mut blocks = Vec::new();
+    for part in parts {
+        blocks.extend(openai::part_from_view(part?, &openai::HERMES, &mut |v| {
+            v.lazy_text(spans)
+        })?);
+    }
+    Ok((array || !blocks.is_empty()).then_some(blocks))
+}
+
+/// Preserve acceptance of metadata-only rows even when their extras are not demanded: string
+/// sidecars need only a presence check.
 fn row_has_extra(row: &rusqlite::Row<'_>, index: &impl Fn(&str) -> Option<usize>) -> bool {
     [
         "display_kind",
@@ -1548,88 +1674,15 @@ fn row_has_extra(row: &rusqlite::Row<'_>, index: &impl Fn(&str) -> Option<usize>
                 .is_some_and(|value| value != 0)
         })
         || index("active").and_then(|i| row.get::<_, Option<i64>>(i).ok().flatten()) == Some(0)
-        || borrowed_text(row, index("codex_message_items")).is_some_and(accepted_json)
-}
-
-fn imported_origin(raw: &str) -> bool {
-    use super::store::document::{Index, Raw, Record};
-    let Some(validated) = accepted_raw(raw) else {
-        return false;
-    };
-    let index = Index::default();
-    Record::parse(Raw::new(validated.get(), &index))
-        .and_then(|record| record.get("imported_from"))
-        .is_some_and(|imported| imported.get().starts_with('{'))
-}
-
-/// First-class thinking on lean reads selects summaries/encrypted handles from borrowed rows,
-/// never constructing the unrelated native reasoning sidecars. Full demand keeps the existing
-/// parsed values because their entire structure is requested output.
-fn lean_reasoning(row: &rusqlite::Row<'_>, index: &impl Fn(&str) -> Option<usize>) -> (String, Option<String>, bool) {
-    use super::store::document::{array_iter, Index, Raw, Record};
-    let mut text = String::new();
-    let mut push = |summary: &str| {
-        let summary = summary.trim();
-        if !summary.is_empty() {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str(summary);
-        }
-    };
-    let reasoning = borrowed_text(row, index("reasoning"));
-    if let Some(reasoning) = reasoning {
-        push(reasoning);
-    }
-    if let Some(content) = borrowed_text(row, index("reasoning_content")).filter(|content| Some(*content) != reasoning)
-    {
-        push(content);
-    }
-    let mut encrypted = None;
-    let strings = Index::default();
-    let mut has_extra = false;
-    if let Some(details) = borrowed_text(row, index("reasoning_details")).and_then(accepted_raw) {
-        has_extra = true;
-        if let Some(items) = array_iter(Raw::new(details.get(), &strings)) {
-            for item in items {
-                let Some(item) = Record::parse(item) else { continue };
-                if encrypted.is_none() {
-                    encrypted = item.string("encrypted_content");
-                }
-                let summary = item
-                    .get("summary")
-                    .or_else(|| item.get("thinking"))
-                    .or_else(|| item.get("content"))
-                    .or_else(|| item.get("text"));
-                if let Some(summary) = summary.and_then(|raw| serde_json::from_str::<String>(raw.get()).ok()) {
-                    push(&summary);
-                }
-            }
-        }
-    }
-    if encrypted.is_none() {
-        if let Some(items) = borrowed_text(row, index("codex_reasoning_items")).and_then(accepted_raw) {
-            has_extra = true;
-            encrypted = array_iter(Raw::new(items.get(), &strings)).and_then(|items| {
-                items
-                    .filter_map(Record::parse)
-                    .find_map(|item| item.string("encrypted_content"))
-            });
-        }
-    }
-    (text, encrypted, has_extra)
 }
 
 struct MsgRow {
     id: i64,
     role: String,
-    content: Option<String>,
+    body: Option<Body>,
     untyped_failed_turn: bool,
-    content_source: Option<crate::Text>,
-    decoded_content: Option<Vec<Block>>,
     tool_call_id: Option<String>,
-    tool_calls: Option<String>,
-    decoded_calls: Option<Vec<Block>>,
+    calls: Vec<Block>,
     thinking: Option<Block>,
     has_extra: bool,
     tool_name: Option<String>,
@@ -1638,9 +1691,9 @@ struct MsgRow {
     finish_reason: Option<String>,
     reasoning: Option<String>,
     reasoning_content: Option<String>,
-    reasoning_details: Option<String>,
-    codex_reasoning_items: Option<String>,
-    codex_message_items: Option<String>,
+    reasoning_details: Option<Value>,
+    codex_reasoning_items: Option<Value>,
+    codex_message_items: Option<Value>,
     platform_message_id: Option<String>,
     observed: Option<i64>,
     // v11+ columns (NULL / default on older schemas).
@@ -1671,17 +1724,10 @@ impl MsgRow {
         };
         // Harness-injected rows (a hidden compaction handoff, auto-continue nudges, model-switch /
         // delegation / process notices) are System turns typed by what they are, never prompts.
-        let untyped_failed_turn = self.untyped_failed_turn
-            || (self.display_kind.is_none()
-                && self.role == "assistant"
-                && self
-                    .content
-                    .as_deref()
-                    .is_some_and(|c| FAILED_TURN_NOTICES.contains(&c.trim())));
         let display_kind = self
             .display_kind
             .as_deref()
-            .or(untyped_failed_turn.then_some("failed_turn"));
+            .or(self.untyped_failed_turn.then_some("failed_turn"));
         if let Some((k, o)) = display_kind.and_then(harness_display_kind) {
             role = Role::System;
             kind = k;
@@ -1770,106 +1816,26 @@ impl MsgRow {
         if opts.wants_full_extra() && matches!(self.observed, Some(o) if o != 0) {
             bag.insert("observed".into(), Value::Bool(true));
         }
-
-        // Format-complete capture: keep the raw reasoning source columns verbatim so a parse→emit
-        // round-trip reproduces them byte-for-byte. The summary text we fold into `Thinking.text`
-        // below is a *projection* (it merges `reasoning` + `reasoning_content` + the text entries of
-        // `reasoning_details` and dedups them); reconstructing the original columns from that
-        // projection is impossible, so we move the originals into the owned fact bag after folding
-        // the text. Structured reasoning/codex sidecars are parsed once and moved into the bag too.
-
-        // Reasoning: combine summary text from `reasoning`, `reasoning_content`, and the text
-        // entries of `reasoning_details`; collect any encrypted blob (reasoning_details or codex).
-        let mut reasoning_text = String::new();
-        let mut push_reasoning = |s: &str| {
-            let s = s.trim();
-            if s.is_empty() {
-                return;
-            }
-            if !reasoning_text.is_empty() {
-                reasoning_text.push_str("\n\n");
-            }
-            reasoning_text.push_str(s);
-        };
-        if let Some(r) = self.reasoning.as_deref() {
-            push_reasoning(r);
-        }
-        if let Some(r) = self.reasoning_content.as_deref() {
-            // Avoid duplicating when identical to `reasoning` (Hermes' own dedup behaviour).
-            if Some(r) != self.reasoning.as_deref() {
-                push_reasoning(r);
+        // Format-complete capture: the reasoning sidecars and the raw reasoning columns verbatim,
+        // since the folded `Thinking.text` (merged and deduped across columns) cannot reproduce
+        // them for a parse→emit round-trip.
+        for (key, value) in [
+            ("reasoning_details", self.reasoning_details),
+            ("codex_reasoning_items", self.codex_reasoning_items),
+            ("codex_message_items", self.codex_message_items),
+        ] {
+            if let Some(value) = value {
+                bag.insert(key.into(), value);
             }
         }
-        let mut encrypted: Option<String> = None;
-        if let Some(v) = self
-            .reasoning_details
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        {
-            if let Value::Array(items) = &v {
-                for item in items {
-                    if encrypted.is_none() {
-                        encrypted = item
-                            .get("encrypted_content")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                    }
-                    let text = item
-                        .get("summary")
-                        .or_else(|| item.get("thinking"))
-                        .or_else(|| item.get("content"))
-                        .or_else(|| item.get("text"))
-                        .and_then(Value::as_str);
-                    if let Some(text) = text {
-                        push_reasoning(text);
-                    }
-                }
-            }
-            // The projection borrows the already parsed sidecar before moving it into extras.
-            if opts.wants_full_extra() {
-                bag.insert("reasoning_details".into(), v);
-            }
-        }
-        if let Some(v) = self
-            .codex_reasoning_items
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        {
-            if encrypted.is_none() {
-                encrypted = v.as_array().and_then(|items| {
-                    items.iter().find_map(|item| {
-                        item.get("encrypted_content")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                });
-            }
-            if opts.wants_full_extra() {
-                bag.insert("codex_reasoning_items".into(), v);
-            }
-        }
-        if let Some(raw) = self.codex_message_items {
-            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                bag.insert("codex_message_items".into(), v);
-            }
-        }
-        if let Some(r) = self.reasoning.filter(|s| !s.is_empty() && opts.wants_full_extra()) {
+        if let Some(r) = self.reasoning.filter(|s| !s.is_empty()) {
             bag.insert(RAW_REASONING_KEY.into(), Value::String(r));
         }
-        if let Some(r) = self
-            .reasoning_content
-            .filter(|s| !s.is_empty() && opts.wants_full_extra())
-        {
+        if let Some(r) = self.reasoning_content.filter(|s| !s.is_empty()) {
             bag.insert(RAW_REASONING_CONTENT_KEY.into(), Value::String(r));
         }
         if let Some(thinking) = self.thinking {
             m.content.push(thinking);
-        }
-        if !reasoning_text.is_empty() || encrypted.is_some() {
-            m.content.push(Block::Thinking {
-                text: reasoning_text.into(),
-                signature: None,
-                encrypted,
-                redacted: false,
-            });
         }
         if !bag.is_empty() {
             *m.harness_extra_mut(Harness::Hermes) = bag;
@@ -1879,9 +1845,10 @@ impl MsgRow {
         if role == Role::Tool {
             m.content.push(Block::ToolResult {
                 tool_use_id: self.tool_call_id.unwrap_or_default(),
-                content: self
-                    .content_source
-                    .unwrap_or_else(|| self.content.unwrap_or_default().into()),
+                content: match self.body {
+                    Some(Body::Text(text)) => text,
+                    _ => crate::Text::default(),
+                },
                 is_error: false,
                 tool_name: self.tool_name,
                 status: None,
@@ -1889,79 +1856,14 @@ impl MsgRow {
             });
             return Some(m);
         }
-
-        // text / multimodal content
-        if let Some(text) = self.content_source {
-            m.content.push(Block::Text { text });
-        } else if let Some(blocks) = self.decoded_content {
-            m.content.extend(blocks);
-        } else if let Some(raw) = self.content {
-            m.content.extend(decode_content(raw));
+        match self.body {
+            Some(Body::Text(text)) => m.content.push(Block::Text { text }),
+            Some(Body::Blocks(blocks)) => m.content.extend(blocks),
+            None => {}
         }
-
-        // assistant tool calls
-        if let Some(calls) = self.decoded_calls {
-            m.content.extend(calls);
-        } else if let Some(tc) = &self.tool_calls {
-            for b in parse_tool_calls(tc) {
-                m.content.push(b);
-            }
-        }
+        m.content.extend(self.calls);
 
         (!m.content.is_empty() || !m.extra.is_empty() || self.has_extra).then_some(m)
-    }
-}
-
-/// Source-backed counterpart of decode_content. Validate the entire sentinel document before
-/// selecting parts, preserving serde Value's rejection of invalid ignored fields. Non-array or
-/// empty provider wrappers fall back to the original literal text, as the owned decoder does.
-fn checked_multimodal_content(
-    raw: &str,
-    source: &crate::json::JsonSource,
-    arena: &std::sync::Arc<super::store::bytes::ByteSource>,
-) -> Result<Option<Vec<Block>>> {
-    let Some(rest) = raw.strip_prefix(MULTIMODAL_SENTINEL) else {
-        return Ok(None);
-    };
-    Ok(checked_json(rest, source, arena, multimodal_blocks)?.flatten())
-}
-
-fn multimodal_blocks(view: crate::json::JsonView<'_>) -> Result<Option<Vec<Block>>> {
-    let array = view.is_array()?;
-    let parts = if array { Some(view) } else { view.get("parts")? };
-    let Some(parts) = parts.map(|parts| parts.array()).transpose()?.flatten() else {
-        return Ok(None);
-    };
-    let mut blocks = Vec::new();
-    for part in parts {
-        blocks.extend(openai::part_view(part?, &openai::HERMES)?);
-    }
-    Ok((array || !blocks.is_empty()).then_some(blocks))
-}
-
-fn source_multimodal_content(
-    text: &crate::Text,
-    source: &crate::json::JsonSource,
-    arena: &std::sync::Arc<super::store::bytes::ByteSource>,
-) -> Result<Option<Vec<Block>>> {
-    let resolver = crate::lazy::Resolver::new(None);
-    let (head, _) = super::store::document::text_head(text, &resolver, MULTIMODAL_SENTINEL.len(), false)?;
-    if head != MULTIMODAL_SENTINEL {
-        return Ok(None);
-    }
-    let (offset, len) = arena.append(|writer| {
-        let mut skip = MULTIMODAL_SENTINEL.len();
-        text.try_for_each_chunk(&resolver, 64 * 1024, |chunk| {
-            let skipped = skip.min(chunk.len());
-            skip -= skipped;
-            writer.write_all(&chunk.as_bytes()[skipped..])?;
-            Ok(())
-        })
-    })?;
-    match source.read_backing_value(arena.clone(), offset, len, multimodal_blocks) {
-        Ok(blocks) => Ok(blocks),
-        Err(error) if error.is::<crate::json::InvalidJson>() => Ok(None),
-        Err(error) => Err(error),
     }
 }
 
@@ -2009,117 +1911,9 @@ impl FailedNotice {
     }
 }
 
-fn source_failed_turn(text: &crate::Text) -> Result<bool> {
-    #[derive(Debug, thiserror::Error)]
-    #[error("not a failed-turn notice")]
-    struct NotNotice;
-    let mut notice = FailedNotice::new();
-    let result = text.try_for_each_chunk(&crate::lazy::Resolver::new(None), 64 * 1024, |chunk| {
-        if notice.push(chunk) {
-            Ok(())
-        } else {
-            Err(NotNotice.into())
-        }
-    });
-    match result {
-        Err(error) if error.is::<NotNotice>() => Ok(false),
-        Err(error) => Err(error),
-        Ok(()) => Ok(notice.finished()),
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 #[error("count needs multimodal body projection")]
 struct CountNeedsBody;
-fn count_content(reader: &mut dyn std::io::Read) -> Result<(bool, bool)> {
-    let mut prefix = [0; MULTIMODAL_SENTINEL.len()];
-    let mut prefix_len = 0;
-    let mut present = false;
-    let mut notice = FailedNotice::new();
-    let valid = super::store::sqlite::for_each_utf8(reader, |chunk| {
-        present |= !chunk.is_empty();
-        let take = chunk.len().min(prefix.len() - prefix_len);
-        prefix[prefix_len..prefix_len + take].copy_from_slice(&chunk.as_bytes()[..take]);
-        prefix_len += take;
-        if prefix_len == prefix.len() && prefix.as_slice() == MULTIMODAL_SENTINEL.as_bytes() {
-            return Err(CountNeedsBody.into());
-        }
-        notice.push(chunk);
-        Ok(())
-    })?;
-    Ok((valid && present, valid && notice.finished()))
-}
-
-fn checked_json<T>(
-    raw: &str,
-    source: &crate::json::JsonSource,
-    arena: &std::sync::Arc<super::store::bytes::ByteSource>,
-    select: impl for<'a> FnOnce(crate::json::JsonView<'a>) -> Result<T>,
-) -> Result<Option<T>> {
-    if !accepted_json(raw) {
-        return Ok(None);
-    }
-    let (offset, len) = arena.append(|writer| {
-        writer.write_all(raw.as_bytes())?;
-        Ok(())
-    })?;
-    source.read_backing_syntax(arena.clone(), offset, len, select).map(Some)
-}
-
-fn accepted_json(raw: &str) -> bool {
-    accepted_raw(raw).is_some()
-}
-
-fn accepted_raw(raw: &str) -> Option<&crate::lazy::RawValue> {
-    let value = serde_json::from_str::<&crate::lazy::RawValue>(raw).ok()?;
-    super::store::json::value_compatible(raw.as_bytes()).then_some(value)
-}
-
-fn decode_content(raw: String) -> Vec<Block> {
-    if let Some(rest) = raw.strip_prefix(MULTIMODAL_SENTINEL) {
-        match serde_json::from_str::<Value>(rest) {
-            Ok(Value::Array(items)) => {
-                return items
-                    .iter()
-                    .filter_map(|p| openai::part_to_block(p, &openai::HERMES))
-                    .collect();
-            }
-            // Dict-shaped content (provider wrappers, e.g. {"parts":[…]}). Best-effort: pull any
-            // string fields out; otherwise stash nothing and fall through to the empty case.
-            Ok(Value::Object(map)) => {
-                if let Some(blocks) = object_content_to_blocks(&map) {
-                    return blocks;
-                }
-            }
-            _ => {}
-        }
-    }
-    if raw.is_empty() {
-        vec![]
-    } else {
-        vec![Block::Text { text: raw.into() }]
-    }
-}
-
-/// Best-effort extraction from a dict-shaped (non-array) decoded content payload.
-fn object_content_to_blocks(map: &serde_json::Map<String, Value>) -> Option<Vec<Block>> {
-    // Common shape: {"parts": [ {"text": "…"} | {"type":…} ]}
-    if let Some(Value::Array(parts)) = map.get("parts") {
-        let blocks: Vec<Block> = parts
-            .iter()
-            .filter_map(|p| openai::part_to_block(p, &openai::HERMES))
-            .collect();
-        if !blocks.is_empty() {
-            return Some(blocks);
-        }
-    }
-    None
-}
-
-/// Hermes `tool_calls` is an OpenAI-shaped array: `[{id,type,function:{name,arguments}}]`.
-fn parse_tool_calls(raw: &str) -> Vec<Block> {
-    openai::tool_calls(serde_json::from_str::<Value>(raw).ok().as_ref())
-}
 
 /// Whole-`Session` convenience over [`stream_conn`] for tests: stream into a [`CollectSink`] and
 /// reattach the messages. The production path goes through `Adapter::parse` → `stream::collect`.
@@ -2202,11 +1996,13 @@ mod tests {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"))
     }
 
-    /// An in-memory database with a fixture schema: `schema-v14.sql` (hermes_state.py
+    /// A store file with a fixture schema: `schema-v14.sql` (hermes_state.py
     /// SCHEMA_VERSION 14), `schema-old.sql` (pre-v14 columns only, for the column-probing
     /// degradation path) or `schema-v30.sql` (a subset of schema 30; see its header).
     fn mk_conn(schema: &str) -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!("cv-hermes-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("state.db")).unwrap();
         conn.execute_batch(&fixture(schema)).unwrap();
         conn
     }
@@ -2239,7 +2035,7 @@ mod tests {
 
     #[test]
     fn incremental_content_matches_typed_view_for_cells_notices_and_generations() -> Result<()> {
-        let world = cv_testkit::World::in_process("hermes-incremental-content");
+        let world = crate::test_world("hermes-incremental-content");
         let path = world.base.join("native.db");
         let writer = Connection::open(&path)?;
         writer.execute_batch(&fixture("schema-v30.sql"))?;
@@ -2337,7 +2133,7 @@ mod tests {
 
     #[test]
     fn complete_checked_preparation_preserves_owned_rows_and_fidelity() -> Result<()> {
-        let world = cv_testkit::World::in_process("hermes-complete-preparation");
+        let world = crate::test_world("hermes-complete-preparation");
         let path = world.base.join("state.db");
         let writer = Connection::open(&path)?;
         writer.execute_batch(&fixture("schema-v14.sql"))?;
@@ -2425,7 +2221,7 @@ mod tests {
 
     #[test]
     fn complete_checked_multimodal_matches_owned_acceptance_and_guards_sources() -> Result<()> {
-        let world = cv_testkit::World::in_process("hermes-checked-multimodal");
+        let world = crate::test_world("hermes-checked-multimodal");
         let path = world.base.join("state.db");
         let writer = Connection::open(&path)?;
         writer.execute_batch(&fixture("schema-v14.sql"))?;
@@ -2486,7 +2282,7 @@ mod tests {
 
     #[test]
     fn lean_checked_reads_preserve_facts_dedup_and_actual_consumers() -> Result<()> {
-        let world = cv_testkit::World::in_process("hermes-lean-checked");
+        let world = crate::test_world("hermes-lean-checked");
         let path = world.base.join("state.db");
         let writer = Connection::open(&path)?;
         writer.execute_batch(&fixture("schema-v30.sql"))?;
@@ -2641,43 +2437,6 @@ mod tests {
     }
 
     #[test]
-    fn lean_reasoning_and_import_projection_preserve_owned_json_acceptance() -> Result<()> {
-        let conn = mk_conn("schema-v30.sql");
-        insert_session(&conn, "s", None, None, 1000.0, None);
-        let large = "ignored λ".repeat(4096);
-        for details in [
-            serde_json::json!([{"summary":" first ","encrypted_content":"first handle","ignored":large},{"summary":null,"thinking":"ignored by null precedence"},{"text":" second ","encrypted_content":"second handle"}]).to_string(),
-            r#"[{"text":"discarded","text":"final"}]"#.into(),
-            format!(r#"[{{"text":"rejected","ignored":"\ud800","opaque":{}}}]"#,serde_json::to_string(&large)?),
-            r#"[{"text":"rejected","ignored":1e400}]"#.into(),
-            "null".into(),
-            "[".repeat(128)+"0"+&"]".repeat(128),
-        ] {
-            conn.execute("DELETE FROM messages",[])?;
-            conn.execute(r#"INSERT INTO messages(session_id,role,reasoning,reasoning_content,reasoning_details,codex_reasoning_items,codex_message_items,timestamp) VALUES('s','assistant',' same ',' same ',?1,'[{"encrypted_content":"codex handle"}]',?1,1001)"#, [&details])?;
-            let full = parse_conn_with(&conn,&sref("s"),&ParseOptions::full())?;
-            let mut lean = parse_conn_with(&conn,&sref("s"),&ParseOptions::bulk())?;
-            let mut expected = full;
-            expected.extra.clear();
-            for message in &mut expected.messages { message.extra.clear(); }
-            lean.extra.clear();
-            assert_eq!(serde_json::to_value(lean)?,serde_json::to_value(expected)?,"{details}");
-        }
-        for origin in [
-            serde_json::json!({"imported_from":{"tool":"codex"},"ignored":large}).to_string(),
-            r#"{"imported_from":{},"imported_from":null}"#.into(),
-            r#"{"imported_from":{},"ignored":"\ud800"}"#.into(),
-            r#"{"imported_from":{},"ignored":1e400}"#.into(),
-        ] {
-            conn.execute("UPDATE sessions SET origin_json=?1 WHERE id='s'", [&origin])?;
-            let full = parse_conn_with(&conn, &sref("s"), &ParseOptions::full())?;
-            let lean = parse_conn_with(&conn, &sref("s"), &ParseOptions::bulk())?;
-            assert_eq!(full.messages[0].origin, lean.messages[0].origin, "{origin}");
-        }
-        Ok(())
-    }
-
-    #[test]
     fn replay_text_memory_budget_includes_tiny_entry_slots() {
         let mut texts = crate::spill::ExactStrings::default();
         for i in 0..40000 {
@@ -2743,8 +2502,13 @@ mod tests {
         }
     }
 
-    fn sref(id: &str) -> SessionRef {
-        SessionRef::new(id, Harness::Hermes, PathBuf::from(":memory:"))
+    /// The store file a test connection reads; Hermes reads cells against the file they live in.
+    fn at(conn: &Connection) -> PathBuf {
+        PathBuf::from(conn.path().expect("file store"))
+    }
+
+    fn sref(conn: &Connection, id: &str) -> SessionRef {
+        SessionRef::new(id, Harness::Hermes, at(conn))
     }
 
     fn insert_session(
@@ -2770,7 +2534,7 @@ mod tests {
         conn.execute_batch(&fixture("parses_basic_text_conversation.sql"))
             .unwrap();
 
-        let s = parse_conn(&conn, &sref("s1")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         assert_eq!(s.messages.len(), 2);
         assert_eq!(s.messages[0].role, Role::User);
         assert_eq!(
@@ -2799,7 +2563,7 @@ mod tests {
         let conn = mk_conn("schema-v14.sql");
         conn.execute_batch(&fixture("system_row_is_the_system_prompt.sql"))
             .unwrap();
-        let s = parse_conn(&conn, &sref("s")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s")).unwrap();
         assert_eq!(s.system_prompt.as_deref(), Some("You are Hermes"));
         assert_eq!(s.messages[0].role, Role::System);
         assert_eq!(
@@ -2819,7 +2583,7 @@ mod tests {
             [content],
         )
         .unwrap();
-        let s = parse_conn(&conn, &sref("s1")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         assert_eq!(s.messages.len(), 1);
         let blocks = &s.messages[0].content;
         assert!(matches!(&blocks[0], Block::Text { text } if text == "see this"));
@@ -2837,7 +2601,7 @@ mod tests {
             [content],
         )
         .unwrap();
-        let s = parse_conn(&conn, &sref("s1")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         let blocks = &s.messages[0].content;
         assert!(matches!(&blocks[0], Block::Text { text } if text == "hi"));
         assert!(matches!(&blocks[1], Block::Image { data_ref: Some(u), .. } if u.starts_with("data:image/jpeg")));
@@ -2853,7 +2617,7 @@ mod tests {
             [content],
         )
         .unwrap();
-        let s = parse_conn(&conn, &sref("s1")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         assert_eq!(s.messages[0].text().as_deref(), Some("hi"));
     }
 
@@ -2862,7 +2626,7 @@ mod tests {
         let conn = mk_conn("schema-v14.sql");
         insert_session(&conn, "s1", None, None, 1000.0, None);
         conn.execute_batch(&fixture("parses_tool_call_and_result.sql")).unwrap();
-        let s = parse_conn(&conn, &sref("s1")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         assert_eq!(s.messages.len(), 2);
         let tu = &s.messages[0].content[0];
         assert!(matches!(tu, Block::ToolUse { name, id, .. } if name == "web_search" && id == "c1"));
@@ -2887,7 +2651,7 @@ mod tests {
         let conn = mk_conn("schema-v14.sql");
         insert_session(&conn, "s1", None, None, 1000.0, None);
         conn.execute_batch(&fixture("maps_all_reasoning_variants.sql")).unwrap();
-        let s = parse_conn(&conn, &sref("s1")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         let think = s.messages[0]
             .content
             .iter()
@@ -2914,7 +2678,7 @@ mod tests {
         insert_session(&conn, "s1", None, None, 1000.0, None);
         conn.execute_batch(&fixture("reasoning_content_not_duplicated_when_equal.sql"))
             .unwrap();
-        let s = parse_conn(&conn, &sref("s1")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         let text = s.messages[0]
             .content
             .iter()
@@ -2931,7 +2695,7 @@ mod tests {
         let conn = mk_conn("schema-v14.sql");
         insert_session(&conn, "s1", None, None, 1000.0, None);
         conn.execute_batch(&fixture("maps_codex_items.sql")).unwrap();
-        let s = parse_conn(&conn, &sref("s1")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         let enc = s.messages[0].content.iter().find_map(|b| match b {
             Block::Thinking { encrypted, .. } => encrypted.clone(),
             _ => None,
@@ -2947,7 +2711,7 @@ mod tests {
         insert_session(&conn, "s1", None, None, 1000.0, None);
         conn.execute_batch(&fixture("platform_message_id_and_observed.sql"))
             .unwrap();
-        let s = parse_conn(&conn, &sref("s1")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         assert_eq!(bag(&s.messages[0])["platform_message_id"], "abc-123");
         assert_eq!(bag(&s.messages[0])["observed"], Value::Bool(true));
     }
@@ -2962,7 +2726,7 @@ mod tests {
             .unwrap();
 
         // Parsing the CHILD should walk up to the root and merge, deduping the replayed user msg.
-        let s = parse_conn(&conn, &sref("child")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "child")).unwrap();
         let texts: Vec<String> = s.messages.iter().filter_map(|m| m.text()).collect();
         assert_eq!(
             texts,
@@ -2976,12 +2740,12 @@ mod tests {
         conn.execute_batch(&fixture("old_schema_missing_columns_still_parses.sql"))
             .unwrap();
         // Must not error despite missing reasoning/token/codex/parent columns.
-        let s = parse_conn(&conn, &sref("s1")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         assert_eq!(s.messages.len(), 2);
         assert_eq!(s.messages[0].text().as_deref(), Some("hello old"));
         assert!(matches!(&s.messages[1].content[0], Block::ToolUse { name, .. } if name == "f"));
         // discover also works on the old schema.
-        let refs = discover_conn(&conn, &PathBuf::from(":memory:")).unwrap();
+        let refs = discover_conn(&conn, &at(&conn)).unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].id, "s1");
     }
@@ -2992,11 +2756,6 @@ mod tests {
     /// invisible. Synthesizes a minimal `~/.hermes`-shaped tree under a temp `HERMES_HOME`.
     #[test]
     fn discovers_top_level_and_profile_dbs() {
-        // Mutating process env (HERMES_HOME) is not thread-safe; serialize against the other
-        // env-touching tests in this binary.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
-
         let home = std::env::temp_dir().join(format!("cv-hermes-profiles-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("profiles/hermes-x")).unwrap();
@@ -3025,12 +2784,12 @@ mod tests {
         mk_db(&home.join("profiles/state-snapshots/old/state.db"), "snapshot-session");
 
         // Point the adapter at our synthetic home and discover.
-        std::env::set_var("HERMES_HOME", &home);
+        let env = crate::env::Env::from_vars([("HERMES_HOME", &home)]).enter();
         let hermes = Hermes::detect();
         // Two readable DBs: top-level + the one profile (snapshot is depth-2, skipped).
         assert_eq!(hermes.dbs.len(), 2, "should bind top-level + profile DB only");
         let refs = hermes.discover().unwrap();
-        std::env::remove_var("HERMES_HOME");
+        drop(env);
 
         let ids: HashSet<&str> = refs.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.contains("top-session"), "top-level session must be discovered");
@@ -3073,7 +2832,7 @@ mod tests {
         insert_session(&conn, "s", None, None, 1000.0, None);
         insert_v30(&conn, "s", "user", "later stamp, first row", 2000.0, 1, 0);
         insert_v30(&conn, "s", "assistant", "earlier stamp, second row", 1500.0, 1, 0);
-        let s = parse_conn(&conn, &sref("s")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s")).unwrap();
         assert_eq!(texts(&s), vec!["later stamp, first row", "earlier stamp, second row"]);
     }
 
@@ -3094,7 +2853,7 @@ mod tests {
         insert_v30(&conn, "s", "assistant", "a2", 1005.0, 1, 0); // id 7
 
         // Lean: the display projection, generation-deduped, summary as boundary + summary.
-        let s = parse_conn(&conn, &sref("s")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s")).unwrap();
         assert_eq!(
             texts(&s),
             vec![
@@ -3136,7 +2895,7 @@ mod tests {
         assert_nested_extra(&s);
 
         // Complete: every row, flags tagged, no dedup.
-        let c = parse_conn_with(&conn, &sref("s"), &ParseOptions::complete()).unwrap();
+        let c = parse_conn_with(&conn, &sref(&conn, "s"), &ParseOptions::complete()).unwrap();
         assert_eq!(c.messages.len(), 8, "7 rows + 1 boundary marker");
         let typo = c.messages.iter().find(|m| m.text().as_deref() == Some("typo")).unwrap();
         assert_eq!(bag(typo)["active"], Value::Bool(false));
@@ -3154,7 +2913,7 @@ mod tests {
         conn.execute_batch(&fixture("system_prompt_resolves_via_system_prompts_table.sql"))
             .unwrap();
         insert_v30(&conn, "s", "user", "hi", 1001.0, 1, 0);
-        let s = parse_conn(&conn, &sref("s")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s")).unwrap();
         assert_eq!(s.system_prompt.as_deref(), Some("You are Hermes"));
         assert!(
             !smeta(&s).as_object().unwrap().contains_key("system_prompt"),
@@ -3164,7 +2923,7 @@ mod tests {
         let old = mk_conn("schema-v14.sql");
         old.execute_batch(&fixture("system_prompt_resolves_via_system_prompts_table-2.sql"))
             .unwrap();
-        let s = parse_conn(&old, &sref("s")).unwrap();
+        let s = parse_conn(&old, &sref(&old, "s")).unwrap();
         assert_eq!(s.system_prompt.as_deref(), Some("legacy prompt"));
     }
 
@@ -3225,7 +2984,7 @@ mod tests {
         .unwrap();
         insert_v30(&conn, "b", "user", "shared prompt", 1001.0, 1, 0); // the copied row
         insert_v30(&conn, "b", "assistant", "branch answer", 1601.0, 1, 0);
-        let b = parse_conn(&conn, &sref("b")).unwrap();
+        let b = parse_conn(&conn, &sref(&conn, "b")).unwrap();
         assert_eq!(
             texts(&b),
             vec!["shared prompt", "branch answer"],
@@ -3252,7 +3011,7 @@ mod tests {
         ))
         .unwrap();
         insert_v30(&conn, "d", "user", "delegate task", 1701.0, 1, 0);
-        let d = parse_conn(&conn, &sref("d")).unwrap();
+        let d = parse_conn(&conn, &sref(&conn, "d")).unwrap();
         assert_eq!(texts(&d), vec!["delegate task"]);
         assert_eq!(
             d.lineage,
@@ -3268,7 +3027,7 @@ mod tests {
         ))
         .unwrap();
         insert_v30(&conn, "r", "user", "fresh", 1801.0, 1, 0);
-        let r = parse_conn(&conn, &sref("r")).unwrap();
+        let r = parse_conn(&conn, &sref(&conn, "r")).unwrap();
         assert!(r.lineage.is_empty(), "{:?}", r.lineage);
         assert_eq!(r.harness_extra(Harness::Hermes).unwrap()["_reset_from"], "p");
 
@@ -3278,11 +3037,11 @@ mod tests {
         insert_v30(&conn, "c0", "user", "long ago", 2001.0, 1, 0);
         insert_session(&conn, "c1", Some("c0"), None, 2600.0, None);
         insert_v30(&conn, "c1", "assistant", "continued", 2601.0, 1, 0);
-        let c1 = parse_conn(&conn, &sref("c1")).unwrap();
+        let c1 = parse_conn(&conn, &sref(&conn, "c1")).unwrap();
         assert_eq!(texts(&c1), vec!["long ago", "continued"]);
         assert_eq!(c1.lineage.continues.as_deref(), Some("c0"));
         assert_eq!(c1.lineage.continued_in, None);
-        let c0 = parse_conn(&conn, &sref("c0")).unwrap();
+        let c0 = parse_conn(&conn, &sref(&conn, "c0")).unwrap();
         assert_eq!(c0.lineage.continued_in.as_deref(), Some("c1"));
         assert_eq!(c0.lineage.continues, None);
         assert!(
@@ -3300,7 +3059,7 @@ mod tests {
         insert_session(&conn, "tip", Some("root"), None, 1600.0, None);
         conn.execute_batch(&fixture("discovery_mirrors_hermes_listing.sql"))
             .unwrap();
-        let refs = discover_conn(&conn, &PathBuf::from(":memory:")).unwrap();
+        let refs = discover_conn(&conn, &at(&conn)).unwrap();
         let ids: Vec<&str> = refs.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -3323,7 +3082,7 @@ mod tests {
         // a v14 DB is listed exactly as before (no listing columns → no filters)
         let old = mk_conn("schema-v14.sql");
         insert_session(&old, "a", None, None, 1000.0, None);
-        assert_eq!(discover_conn(&old, &PathBuf::from(":memory:")).unwrap().len(), 1);
+        assert_eq!(discover_conn(&old, &at(&old)).unwrap().len(), 1);
     }
 
     #[test]
@@ -3332,7 +3091,7 @@ mod tests {
         conn.execute_batch(&fixture("session_cwd_git_and_activity_are_first_class.sql"))
             .unwrap();
         insert_v30(&conn, "s", "user", "hi", 1001.0, 1, 0);
-        let s = parse_conn(&conn, &sref("s")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s")).unwrap();
         assert_eq!(s.cwd.as_deref(), Some(Path::new("/work/proj")));
         assert_eq!(s.git.as_ref().and_then(|g| g.branch.as_deref()), Some("main"));
         assert_eq!(s.updated_at, ts_from_epoch(3000.0));
@@ -3365,7 +3124,7 @@ mod tests {
                VALUES ('s', 'tool', 'ok', 'call_1', 'terminal', 1003.0, 'u3', 't1');",
         )
         .unwrap();
-        let s = parse_conn(&conn, &sref("s")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s")).unwrap();
         assert_eq!(bag(&s.messages[0])["message_uid"], "u1");
         assert_eq!(bag(&s.messages[0])["absorbed_message_uids"], serde_json::json!(["u0"]));
         assert_eq!(bag(&s.messages[1])["tool_call_uids"]["call_1"], "t1");
@@ -3392,7 +3151,7 @@ mod tests {
             )
             .unwrap();
         }
-        let s = parse_conn(&conn, &sref("s")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s")).unwrap();
         let kinds: Vec<(Role, MessageKind, Origin)> = s.messages.iter().map(|m| (m.role, m.kind, m.origin)).collect();
         assert_eq!(
             kinds,
@@ -3432,7 +3191,7 @@ mod tests {
             )
             .unwrap();
         }
-        let s = parse_conn(&conn, &sref("s")).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, "s")).unwrap();
         let m = &s.messages[0];
         assert_eq!(m.role, Role::System, "harness-injected notice");
         assert_eq!((m.kind, m.origin), (MessageKind::ModelChange, Origin::Harness));
@@ -3484,7 +3243,7 @@ mod tests {
             .unwrap();
         insert_v30(&conn, "f", "user", "hello", 1001.0, 1, 0);
         insert_v30(&conn, "f", "assistant", "hi", 1002.0, 1, 0);
-        let f = parse_conn(&conn, &sref("f")).unwrap();
+        let f = parse_conn(&conn, &sref(&conn, "f")).unwrap();
         assert_eq!(f.messages.len(), 2);
         assert!(
             f.messages.iter().all(|m| m.origin == Origin::Import),
@@ -3513,7 +3272,7 @@ mod tests {
             ('b','system','system',4),('b','assistant','another reply',5);",
         )
         .unwrap();
-        let refs = discover_conn(&conn, &PathBuf::from(":memory:")).unwrap();
+        let refs = discover_conn(&conn, &at(&conn)).unwrap();
         assert_eq!(refs.len(), 2);
         // ordered by started_at DESC
         assert_eq!(refs[0].id, "b");
@@ -3591,7 +3350,7 @@ mod tests {
             let bytes = ARENA_WRITE_OBSERVER.with(|observer| observer.borrow_mut().take().unwrap());
             Ok((result, bytes))
         }
-        let world = cv_testkit::World::in_process("hermes-discovery-body-demand");
+        let world = crate::test_world("hermes-discovery-body-demand");
         let path = world.base.join("state.db");
         let writer = Connection::open(&path)?;
         writer.execute_batch(&fixture("schema-v30.sql"))?;
@@ -3621,7 +3380,7 @@ mod tests {
 
     #[test]
     fn count_demand_preserves_parser_acceptance_without_copying_plain_assistant_bodies() -> Result<()> {
-        let world = cv_testkit::World::in_process("hermes-count-demand");
+        let world = crate::test_world("hermes-count-demand");
         let path = world.base.join("state.db");
         let writer = Connection::open(&path)?;
         writer.execute_batch(&fixture("schema-v30.sql"))?;
@@ -3695,7 +3454,7 @@ mod tests {
 
     #[test]
     fn checked_giant_prompts_dedup_exactly_and_reset_after_a_reply() -> Result<()> {
-        let world = cv_testkit::World::in_process("hermes-checked-prompt-dedup");
+        let world = crate::test_world("hermes-checked-prompt-dedup");
         let path = world.base.join("state.db");
         let writer = Connection::open(&path)?;
         writer.execute_batch(&fixture("schema-v30.sql"))?;
@@ -3743,7 +3502,7 @@ mod tests {
             .unwrap();
         }
         assert_eq!(session_lineage_root_to_tip(&conn, "s149").len(), 150);
-        let reference = SessionRef::new("s149", Harness::Hermes, ":memory:");
+        let reference = SessionRef::new("s149", Harness::Hermes, at(&conn));
         assert_eq!(parse_conn(&conn, &reference).unwrap().messages.len(), 150);
         conn.execute("UPDATE sessions SET parent_session_id='s149' WHERE id='s0'", [])
             .unwrap();
@@ -3752,7 +3511,7 @@ mod tests {
 
     #[test]
     fn discovery_turn_counts_match_native_display_and_compression_replay() -> Result<()> {
-        let world = cv_testkit::World::in_process("hermes-discovery-turn-counts");
+        let world = crate::test_world("hermes-discovery-turn-counts");
         let path = world.base.join("state.db");
         std::fs::copy(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hermes/state-v30.db"),
@@ -3855,7 +3614,7 @@ mod tests {
         );
 
         // A: the display view — each carried message once, in id order, the summary as a system turn.
-        let a = parse_conn(&conn, &sref(A)).unwrap();
+        let a = parse_conn(&conn, &sref(&conn, A)).unwrap();
         let t = texts(&a);
         assert_eq!(a.messages.len(), 13, "{t:?}");
         // Index by message (the tool-result turn has no text, so `t` is one shorter).
@@ -3921,7 +3680,7 @@ mod tests {
         assert!(a.lineage.is_empty(), "{:?}", a.lineage);
         assert_nested_extra(&a);
         // complete: the superseded originals of the carried tail are present, tagged as rewind rows.
-        let ac = parse_conn_with(&conn, &sref(A), &ParseOptions::complete()).unwrap();
+        let ac = parse_conn_with(&conn, &sref(&conn, A), &ParseOptions::complete()).unwrap();
         assert!(ac.messages.len() > a.messages.len());
         // (Flags are recorded as non-default values only: a superseded original carries
         // `active: false` and no `compacted` key — the same shape as a rewound row.)
@@ -3933,7 +3692,7 @@ mod tests {
 
         // C2: the rotation chain reads root→tip, titled by the root, the carried tail once; the
         // store's pointers survive both ways.
-        let c2 = parse_conn(&conn, &sref(C2)).unwrap();
+        let c2 = parse_conn(&conn, &sref(&conn, C2)).unwrap();
         assert_eq!(c2.title.as_deref(), Some("Long migration"));
         let t = texts(&c2);
         assert_eq!(t[0], "step 0: migrate table t0");
@@ -3948,7 +3707,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_conn(&conn, &sref(C1)).unwrap().lineage,
+            parse_conn(&conn, &sref(&conn, C1)).unwrap().lineage,
             Lineage {
                 continued_in: Some(C2.into()),
                 ..Default::default()
@@ -3961,7 +3720,7 @@ mod tests {
         assert_nested_extra(&c2);
 
         // Lineage: branch / reset / delegate children stand alone with their markers.
-        let b = parse_conn(&conn, &sref(B)).unwrap();
+        let b = parse_conn(&conn, &sref(&conn, B)).unwrap();
         assert_eq!(
             b.messages.len(),
             4,
@@ -3969,18 +3728,18 @@ mod tests {
         );
         assert_eq!(b.lineage.forked_from.as_deref(), Some(R));
         assert_eq!(b.lineage.parent, None);
-        let s = parse_conn(&conn, &sref(S)).unwrap();
+        let s = parse_conn(&conn, &sref(&conn, S)).unwrap();
         assert!(s.lineage.is_empty(), "a reset has no IR lineage field: {:?}", s.lineage);
         assert_eq!(s.harness_extra(Harness::Hermes).unwrap()["_reset_from"], R);
         assert_eq!(s.messages.len(), 2);
-        let d = parse_conn(&conn, &sref(D)).unwrap();
+        let d = parse_conn(&conn, &sref(&conn, D)).unwrap();
         assert_eq!(d.lineage.parent.as_deref(), Some(R));
         assert_eq!(d.lineage.forked_from, None);
 
         // Flags and provenance.
-        assert_eq!(smeta(&parse_conn(&conn, &sref(X)).unwrap())["archived"], 1);
-        assert_eq!(smeta(&parse_conn(&conn, &sref(Y)).unwrap())["hidden"], 1);
-        let f = parse_conn(&conn, &sref(F)).unwrap();
+        assert_eq!(smeta(&parse_conn(&conn, &sref(&conn, X)).unwrap())["archived"], 1);
+        assert_eq!(smeta(&parse_conn(&conn, &sref(&conn, Y)).unwrap())["hidden"], 1);
+        let f = parse_conn(&conn, &sref(&conn, F)).unwrap();
         let fb = f.harness_extra(Harness::Hermes).unwrap();
         assert_eq!(fb["imported_from"]["tool"], "claude-code");
         assert_eq!(smeta(&f)["source"], "claude-code");

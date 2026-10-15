@@ -89,25 +89,19 @@
 //! `…/agents/agent-N`); parsing one yields its own [`Session`] with `lineage.parent` = the session
 //! uuid and `lineage.agent_path` = `agent-N`.
 
-use super::store::{
-    document::{Fields, Record},
-    jsonl,
-};
-#[cfg(test)]
-use super::wire::text_parts;
-use super::wire::{coerce_text, openai};
+use super::store::{document::Fields, jsonl};
+use super::wire::openai;
 use super::Adapter;
 use crate::harness::claude::CARRIER_KEY;
 use crate::ir::*;
-use crate::json::JsonView;
+use crate::json::{JsonSource, JsonView};
 use crate::lazy::Text;
 use crate::stream::{Checkpoint, Flow, MessageSink, ParseOptions};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub struct KimiCode {
@@ -117,9 +111,9 @@ pub struct KimiCode {
 
 impl KimiCode {
     pub fn detect() -> Self {
-        let root = std::env::var_os("KIMI_CODE_HOME")
+        let root = crate::env::var_os("KIMI_CODE_HOME")
             .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".kimi-code")))
+            .or_else(|| crate::env::home_dir().map(|h| h.join(".kimi-code")))
             .filter(|p| p.exists());
         KimiCode { root }
     }
@@ -204,12 +198,10 @@ impl Adapter for KimiCode {
         crate::stream::checked(sink, |sink| {
             let (s, wire) = session_header(r);
             sink.meta(&s);
-            let Ok(file) = fs::File::open(&wire) else { return Ok(s) };
-            if opts.spans {
-                stream_projected(&file, &wire, 0, s, Ctx::new(opts), 0, sink)
-            } else {
-                stream_wire(BufReader::new(file), &wire, 0, s, Ctx::new(opts), 0, sink)
+            if !wire.is_file() {
+                return Ok(s);
             }
+            Ok(stream_wire(&wire, 0, s, Ctx::new(opts), 0, sink)?.expect("offset 0 is inside every file"))
         })
     }
 
@@ -237,37 +229,14 @@ impl Adapter for KimiCode {
             if state.wire != wire || state.flavor != Flavor::of(opts) {
                 return Ok(None);
             }
-            let mut file = fs::File::open(&wire)?;
-            if file.metadata()?.len() < from.offset {
+            if fs::metadata(&wire)?.len() < from.offset {
                 return Ok(None);
             }
-            file.seek(SeekFrom::Start(from.offset))?;
             // Catalog fallbacks and static sidecar metadata are refreshed rather than retained in
             // the checkpoint. The caller verifies those dependencies before accepting the suffix.
             let (s, _) = session_header(r);
             sink.meta(&s);
-            let session = if opts.spans {
-                stream_projected(
-                    &file,
-                    &wire,
-                    from.offset,
-                    s,
-                    state.ctx.restore(opts),
-                    state.skipped,
-                    sink,
-                )?
-            } else {
-                stream_wire(
-                    BufReader::new(file),
-                    &wire,
-                    from.offset,
-                    s,
-                    state.ctx.restore(opts),
-                    state.skipped,
-                    sink,
-                )?
-            };
-            Ok(Some(session))
+            stream_wire(&wire, from.offset, s, state.ctx.restore(opts), state.skipped, sink)
         })
     }
 }
@@ -396,7 +365,7 @@ struct ResumeState {
 #[derive(serde::Deserialize)]
 struct SavedCtx {
     model_bindings: ModelBindings,
-    call_names: HashMap<String, String>,
+    call_names: BTreeMap<String, String>,
     seen_prompts: std::collections::BTreeSet<u64>,
     protocol_version: Option<String>,
     facts: Map<String, Value>,
@@ -416,25 +385,40 @@ impl SavedCtx {
     }
 }
 
+/// The one Kimi Code read: records `at..` of an agent's wire log, each through the record
+/// codec. After a finished record with no step held (a pending step is amended by later parts,
+/// results and usage; its EOF flush is provisional) the sink may take a checkpoint with the
+/// rejected-line count so far. `Ok(None)`: `at` lies beyond the file.
 fn stream_wire(
-    reader: impl std::io::BufRead,
     wire: &Path,
     at: u64,
     mut s: Session,
     mut ctx: Ctx<'_>,
     prior_skipped: u64,
     sink: &mut dyn MessageSink,
-) -> Result<Session> {
+) -> Result<Option<Session>> {
     ctx.init_model(s.model.as_deref());
-    let skipped = super::try_for_each_json_line_at(reader, at, |v, offset, complete, skipped| {
-        let flow = ctx.record(&v, sink);
-        // Pending steps are amended by subsequent parts/results/usage; EOF flush is provisional.
-        // Only a complete record with no held step can preserve an immutable emitted prefix.
-        if flow != Flow::Stop && complete && ctx.step.is_none() && sink.wants_checkpoint(offset) {
-            checkpoint_wire(&ctx, wire, offset, prior_skipped + skipped, sink);
+    let source = JsonSource::capture(wire)?;
+    let file = fs::File::open(wire)?;
+    source.check_metadata(file.metadata()?)?;
+    if at > source.len() {
+        return Ok(None);
+    }
+    let spans = ctx.opts.spans.then_some(&source);
+    let mut skipped = prior_skipped;
+    jsonl::for_each_line(&source, &file, at, source.len(), |line| {
+        let Some(view) = line.view else {
+            skipped += u64::from(!line.blank);
+            return Ok(Flow::Continue);
+        };
+        let flow = ctx.record(view, spans, sink)?;
+        if flow != Flow::Stop && line.complete && ctx.step.is_none() && sink.wants_checkpoint(line.end) {
+            checkpoint_wire(&ctx, wire, line.end, skipped, sink);
         }
-        flow
+        Ok(flow)
     })?;
+    source.check_metadata(file.metadata()?)?;
+    source.check()?;
     if !ctx.stopped {
         ctx.flush_step(sink);
     }
@@ -444,66 +428,8 @@ fn stream_wire(
         s.harness_extra_mut(Harness::KimiCode)
             .insert("protocol_version".into(), Value::String(pv));
     }
-    super::note_skipped_lines(&mut s, prior_skipped + skipped);
-    Ok(s)
-}
-
-fn stream_projected(
-    file: &fs::File,
-    wire: &Path,
-    at: u64,
-    mut s: Session,
-    mut ctx: Ctx<'_>,
-    prior_skipped: u64,
-    sink: &mut dyn MessageSink,
-) -> Result<Session> {
-    use jsonl::ranges::{self, Range};
-    ctx.init_model(s.model.as_deref());
-    let source = crate::json::JsonSource::capture(wire)?;
-    source.check_metadata(file.metadata()?)?;
-    let end = source.len();
-    let mut records = ranges::records(
-        file,
-        Range {
-            offset: at,
-            len: end.saturating_sub(at),
-        },
-    )?;
-    let mut skipped = prior_skipped;
-    while let Some(record) = records.next() {
-        let (range, complete) = record?;
-        let range = ranges::trim(file, range)?;
-        if range.len == 0 {
-            continue;
-        }
-        let flow = match source.read_range_value(range.offset, range.len, |view| ctx.record_view(view, &source, sink)) {
-            Ok(flow) => flow,
-            Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => {
-                skipped += 1;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        if flow == Flow::Stop {
-            break;
-        }
-        let offset = records.offset();
-        if complete && ctx.step.is_none() && sink.wants_checkpoint(offset) {
-            checkpoint_wire(&ctx, wire, offset, skipped, sink);
-        }
-    }
-    source.check()?;
-    if !ctx.stopped {
-        ctx.flush_step(sink);
-    }
-    s.model = ctx.model_bindings.first.take().or(s.model);
-    s.harness_extra_mut(Harness::KimiCode).append(&mut ctx.facts);
-    if let Some(pv) = ctx.protocol_version.take() {
-        s.harness_extra_mut(Harness::KimiCode)
-            .insert("protocol_version".into(), pv.into());
-    }
     super::note_skipped_lines(&mut s, skipped);
-    Ok(s)
+    Ok(Some(s))
 }
 
 fn checkpoint_wire(ctx: &Ctx<'_>, wire: &Path, offset: u64, skipped: u64, sink: &mut dyn MessageSink) {
@@ -634,21 +560,25 @@ struct SessionIndex {
 /// entry after a tombstone — a re-created id — revives it).
 fn read_session_index(path: &Path) -> SessionIndex {
     let mut idx = SessionIndex::default();
-    let valid = jsonl::scan(path, |raw, _| {
-        let Some(record) = Record::parse(raw) else { return };
-        let Some(id) = record.string("sessionId") else { return };
-        if record.get("deleted").is_some_and(|raw| raw.get() == "true") {
+    let read = jsonl::for_each_record(path, |view| {
+        let Some(record) = Fields::parse(view, &["sessionId", "deleted", "workDir"])? else {
+            return Ok(());
+        };
+        let Some(id) = record.string("sessionId")? else {
+            return Ok(());
+        };
+        if record.get("deleted").map(|v| v.as_bool()).transpose()?.flatten() == Some(true) {
             idx.deleted.insert(id.clone());
             idx.cwd.remove(&id);
         } else {
             idx.deleted.remove(&id);
-            if let Some(wd) = record.string("workDir") {
+            if let Some(wd) = record.string("workDir")? {
                 idx.cwd.insert(id, PathBuf::from(wd));
             }
         }
+        Ok(())
     });
-    if valid.is_none() {
-        // The previous read_to_string rejected the complete file on UTF-8/read failure.
+    if read.is_err() {
         return SessionIndex::default();
     }
     idx
@@ -736,13 +666,10 @@ fn scan_wire(wire: &Path) -> Result<WireScan> {
 }
 fn scan_wire_with_title(wire: &Path, title_needed: bool) -> Result<WireScan> {
     let mut w = WireScan::default();
-    let file = match fs::File::open(wire) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(w),
-        Err(error) => return Err(error.into()),
-    };
-    let source = crate::json::JsonSource::capture(wire)?;
-    super::store::checked_lines::for_each(&file, 0, &source, |view, _, _, _| {
+    if !wire.exists() {
+        return Ok(w);
+    }
+    jsonl::for_each_record(wire, |view| {
         if let Some(ts) = view
             .get("time")?
             .map(|v| v.resolve())
@@ -755,7 +682,7 @@ fn scan_wire_with_title(wire: &Path, title_needed: bool) -> Result<WireScan> {
         }
         let fields = super::store::document::Fields::parse(view, &["type", "message", "event"])?;
         let Some(fields) = fields else {
-            return Ok(Flow::Continue);
+            return Ok(());
         };
         match fields.string("type")?.as_deref() {
             Some("context.append_message") => {
@@ -794,44 +721,9 @@ fn scan_wire_with_title(wire: &Path, title_needed: bool) -> Result<WireScan> {
             }
             _ => {}
         }
-        Ok(Flow::Continue)
+        Ok(())
     })?;
     Ok(w)
-}
-
-#[cfg(test)]
-fn old_scan_wire(wire: &Path) -> WireScan {
-    let mut w = WireScan::default();
-    let Ok(file) = fs::File::open(wire) else {
-        return w;
-    };
-    super::for_each_json_line(BufReader::new(file), |v| {
-        if let Some(ts) = v.get("time").and_then(super::ts_from_value) {
-            w.first_ts = Some(w.first_ts.map_or(ts, |f| f.min(ts)));
-            w.last_ts = Some(w.last_ts.map_or(ts, |l| l.max(ts)));
-        }
-        match v.get("type").and_then(Value::as_str) {
-            Some("context.append_message") => {
-                if v.pointer("/message/role").and_then(Value::as_str) == Some("user") {
-                    w.message_count += 1;
-                    if w.title.is_none() && origin_kind(v.get("message")) == "user" {
-                        let t = text_parts(v.pointer("/message/content"));
-                        if !t.trim().is_empty() {
-                            w.title = Some(crate::ir::truncate(&t, 80));
-                        }
-                    }
-                }
-            }
-            Some("context.append_loop_event")
-                if v.pointer("/event/type").and_then(Value::as_str) == Some("step.end") =>
-            {
-                w.message_count += 1;
-            }
-            _ => {}
-        }
-        Flow::Continue
-    });
-    w
 }
 
 fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
@@ -854,11 +746,15 @@ struct HeaderFields {
 /// requested field only on relevant record kinds; unrelated body/telemetry fields remain views.
 fn peek_header(wire: &Path) -> HeaderFields {
     let read = || -> Result<HeaderFields> {
+        let source = JsonSource::capture(wire)?;
         let file = fs::File::open(wire)?;
-        let source = crate::json::JsonSource::capture(wire)?;
+        source.check_metadata(file.metadata()?)?;
         let mut header = HeaderFields::default();
         let mut seen = 0;
-        super::store::checked_lines::for_each(&file, 0, &source, |view, _, _, _| {
+        jsonl::for_each_line(&source, &file, 0, source.len(), |line| {
+            let Some(view) = line.view else {
+                return Ok(Flow::Continue);
+            };
             seen += 1;
             if let Some(record) = Fields::parse(view, &["type", "modelAlias", "systemPrompt", "kind"])? {
                 let ty = record.string("type")?.unwrap_or_default();
@@ -885,15 +781,6 @@ fn peek_header(wire: &Path) -> HeaderFields {
     read().unwrap_or_default()
 }
 
-/// `message.origin.kind` (`user` / `injection` / `system_trigger` / `background_task` / `task`),
-/// "user" when absent (older records).
-fn origin_kind(message: Option<&Value>) -> &str {
-    message
-        .and_then(|m| m.pointer("/origin/kind"))
-        .and_then(Value::as_str)
-        .unwrap_or("user")
-}
-
 /// One buffered LLM step: the Assistant turn under construction plus the Tool turns that already
 /// answered its calls (results precede `step.end` on the wire).
 struct StepBuf {
@@ -916,7 +803,7 @@ struct Ctx<'a> {
     step: Option<StepBuf>,
     model_bindings: ModelBindings,
     /// `toolCallId` → tool name, so a result can name its tool (`Block::ToolResult::tool_name`).
-    call_names: HashMap<String, String>,
+    call_names: BTreeMap<String, String>,
     /// Hashes of system prompts already surfaced (a re-bind with the same prompt is bookkeeping).
     /// Ordered so later checkpoints remain identical after restoring this state.
     seen_prompts: std::collections::BTreeSet<u64>,
@@ -934,7 +821,7 @@ impl<'a> Ctx<'a> {
             opts,
             step: None,
             model_bindings: ModelBindings::default(),
-            call_names: HashMap::new(),
+            call_names: BTreeMap::new(),
             seen_prompts: std::collections::BTreeSet::new(),
             protocol_version: None,
             facts: Map::new(),
@@ -973,16 +860,15 @@ impl<'a> Ctx<'a> {
             .cloned()
     }
 
-    /// Selected payloads keep their source lifetime while the mutable step waits for usage/end.
-    fn record_view(
-        &mut self,
-        view: JsonView<'_>,
-        source: &crate::json::JsonSource,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Flow> {
+    /// The Kimi Code record codec: one wire record view in, its messages to `sink`. Every byte
+    /// source feeds this one function; `spans` (the captured source, when the demand keeps large
+    /// strings in it) chooses only where text, arguments and complete envelopes live. The step
+    /// under construction keeps its payloads' source lifetime while it waits for usage/end. Small
+    /// bookkeeping records are resolved and handled whole by [`Self::bookkeeping`].
+    fn record(&mut self, view: JsonView<'_>, spans: Option<&JsonSource>, sink: &mut dyn MessageSink) -> Result<Flow> {
         let Some(record) = Fields::parse(view, &["type", "time", "event", "message", "modelAlias", "kind"])? else {
             return Ok(if self.opts.complete {
-                self.record(view.resolve()?.as_ref(), sink)
+                self.bookkeeping(view.resolve()?.as_ref(), sink)
             } else {
                 Flow::Continue
             });
@@ -995,35 +881,47 @@ impl<'a> Ctx<'a> {
             }
             return Ok(Flow::Continue);
         }
+        let mut text = |v: JsonView<'_>| {
+            if spans.is_some() {
+                v.source_text()
+            } else {
+                v.text(false)
+            }
+        };
+        let ts = record.value("time")?.as_ref().and_then(super::ts_from_value);
         if ty == "context.append_message" {
             let message = record
                 .get("message")
                 .map(|view| Fields::parse(view, &["role", "origin", "content"]))
                 .transpose()?
                 .flatten();
-            let mut blocks = Vec::new();
-            if let Some(content) = message.as_ref().and_then(|message| message.get("content")) {
-                if let Some(text) = content.source_text()? {
-                    if !text.is_empty() {
-                        blocks.push(Block::Text { text });
-                    }
-                } else if let Some(parts) = content.array()? {
-                    for part in parts {
-                        if let Some(block) = part_view(part?)? {
-                            blocks.push(block);
-                        }
-                    }
-                }
-            }
-            let metadata = message
-                .map(|message| message.project(&["role", "origin"]))
-                .transpose()?
-                .map(Value::Object)
-                .unwrap_or(Value::Null);
-            let projected = serde_json::json!({"message":metadata});
-            let ts = record.value("time")?.as_ref().and_then(super::ts_from_value);
-            let raw = self.opts.complete.then(|| view.to_json()).transpose()?;
-            let flow = self.append_message(&projected, ts, sink, Some(blocks), raw);
+            let blocks = openai::blocks_from_view(
+                message.as_ref().and_then(|m| m.get("content")),
+                &openai::KIMI_CODE,
+                &mut text,
+            )?;
+            let role = message.as_ref().map(|m| m.string("role")).transpose()?.flatten();
+            let origin = match message.as_ref().and_then(|m| m.get("origin")) {
+                Some(origin) => origin
+                    .get("kind")?
+                    .filter(|v| v.is_string().unwrap_or(false))
+                    .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
+                    .transpose()?,
+                None => None,
+            };
+            let raw = match (self.opts.complete, spans) {
+                (false, _) => None,
+                (true, Some(_)) => Some(view.to_json()?),
+                (true, None) => Some(crate::Json::Owned(view.resolve()?.into_owned())),
+            };
+            let flow = self.append_message(
+                role.as_deref(),
+                origin.as_deref().unwrap_or("user"),
+                ts,
+                sink,
+                blocks,
+                raw,
+            );
             return Ok(if flow == Flow::Stop { self.stop() } else { flow });
         }
         if ty != "context.append_loop_event" {
@@ -1036,7 +934,6 @@ impl<'a> Ctx<'a> {
                         | "metadata"
                         | "profile.bind"
                         | "config.update"
-                        | "context.append_message"
                         | "context.apply_compaction"
                         | "task.terminated"
                         | "subagent.spawned"
@@ -1049,7 +946,7 @@ impl<'a> Ctx<'a> {
             {
                 return Ok(Flow::Continue);
             }
-            return Ok(self.record(view.resolve()?.as_ref(), sink));
+            return Ok(self.bookkeeping(view.resolve()?.as_ref(), sink));
         }
         let Some(event) = record.get("event") else {
             return Ok(Flow::Continue);
@@ -1071,12 +968,11 @@ impl<'a> Ctx<'a> {
         )?
         else {
             return Ok(if self.opts.complete {
-                self.record(view.resolve()?.as_ref(), sink)
+                self.carry(view.resolve()?.as_ref(), ts, sink)
             } else {
                 Flow::Continue
             });
         };
-        let ts = record.value("time")?.as_ref().and_then(super::ts_from_value);
         let event_type = fields.string("type")?.unwrap_or_default();
         let flow = match event_type.as_str() {
             "content.part" | "tool.call" => {
@@ -1087,7 +983,7 @@ impl<'a> Ctx<'a> {
                 }
                 if event_type == "content.part" {
                     if let Some(part) = fields.get("part") {
-                        if let Some(block) = part_view(part)? {
+                        if let Some(block) = openai::part_from_view(part, &openai::KIMI_CODE, &mut text)? {
                             self.step.as_mut().unwrap().msg.content.push(block);
                         }
                     }
@@ -1097,7 +993,7 @@ impl<'a> Ctx<'a> {
                     self.call_names.insert(id.clone(), name.clone());
                     let input = fields
                         .get("args")
-                        .map(|v| v.argument(true))
+                        .map(|v| v.argument(spans.is_some()))
                         .transpose()?
                         .unwrap_or_else(|| Value::Null.into());
                     self.step.as_mut().unwrap().msg.content.push(Block::ToolUse {
@@ -1110,103 +1006,7 @@ impl<'a> Ctx<'a> {
                 Flow::Continue
             }
             "tool.result" => {
-                let id = fields.string("toolCallId")?.unwrap_or_default();
-                let result = fields
-                    .get("result")
-                    .map(|v| Fields::parse(v, &["output", "isError", "note", "truncated"]))
-                    .transpose()?
-                    .flatten();
-                let output = result.as_ref().and_then(|r| r.get("output"));
-                let (content, path) = match output {
-                    Some(output) if output.is_string()? => (output.source_text()?.unwrap(), output_path_view(output)?),
-                    Some(output) if output.array()?.is_some() => {
-                        // Flattened parts share checked encoded backing. One arena per wire capture
-                        // keeps deferred descriptor registries bounded in file handles.
-                        let backing = source.decoded_backing()?;
-                        let content = super::store::text::append(source, &backing, |writer| {
-                            let mut first = true;
-                            for part in output.array()?.unwrap() {
-                                let part = part?;
-                                let Some(fields) = Fields::parse(part, &["type", "text"])? else {
-                                    continue;
-                                };
-                                let image = fields.string("type")?.is_some_and(|ty| super::wire::is_image_part(&ty));
-                                let text = match fields.get("text") {
-                                    Some(text) if text.is_string()? => Some(text),
-                                    _ => None,
-                                };
-                                if !image && text.is_none() {
-                                    continue;
-                                }
-                                if !first {
-                                    writer.push("\n")?;
-                                }
-                                first = false;
-                                if image {
-                                    writer.push("[image]")?;
-                                } else {
-                                    writer.push_string(text.unwrap())?;
-                                }
-                            }
-                            Ok(())
-                        })?;
-                        let path = match &content {
-                            Text::Inline(text) => output_path(text),
-                            Text::Source(text) => text.range.with_view(output_path_view)?,
-                            Text::Span(_) => unreachable!("generated text has no external span"),
-                        };
-                        (content, path)
-                    }
-                    _ => (Text::default(), None),
-                };
-                let mut details = Map::new();
-                if let Some(result) = &result {
-                    if let Some(note) = result.value("note")?.filter(|v| !v.is_null()) {
-                        details.insert("note".into(), note);
-                    }
-                    if result.value("truncated")? == Some(Value::Bool(true)) {
-                        details.insert("truncated".into(), Value::Bool(true));
-                    }
-                }
-                if let Some(path) = path {
-                    details.insert("persistedOutput".into(), serde_json::json!({"path":path}));
-                }
-                let mut message = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
-                message.timestamp = ts;
-                message.content.push(Block::ToolResult {
-                    tool_use_id: id.clone(),
-                    content,
-                    is_error: result
-                        .as_ref()
-                        .map(|r| r.value("isError"))
-                        .transpose()?
-                        .flatten()
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    tool_name: self.call_names.get(&id).cloned(),
-                    status: None,
-                    details: (!details.is_empty()).then(|| Value::Object(details)),
-                });
-                if self.opts.extra {
-                    if let Some(trace) = fields.value("traceId")? {
-                        message
-                            .harness_extra_mut(Harness::KimiCode)
-                            .insert("traceId".into(), trace);
-                    }
-                }
-                if self.opts.complete {
-                    let arena = source.decoded_backing()?;
-                    let (offset, len) = arena.append(|writer| {
-                        use crate::harness::wire::write::ObjectWriter;
-                        let mut out = ObjectWriter::new(writer)?;
-                        out.field("type", "context.append_loop_event")?;
-                        out.field_with("event", |mut writer| event.write_canonical(&mut writer))?;
-                        out.field("time", ts.map(|t| t.timestamp_millis()))?;
-                        out.finish()
-                    })?;
-                    let raw = source.read_backing_syntax(arena, offset, len, |view| view.to_json())?;
-                    CompleteRecord::attach(std::slice::from_mut(&mut message), Harness::KimiCode, raw, Map::new());
-                }
+                let message = self.tool_result(event, &fields, ts, spans)?;
                 if let Some(step) = &mut self.step {
                     step.results.push(message);
                     Flow::Continue
@@ -1238,15 +1038,163 @@ impl<'a> Ctx<'a> {
                         .unwrap_or(Value::Null);
                     metadata.insert("usage".into(), usage);
                 }
-                let projected = serde_json::json!({"event":metadata});
-                self.loop_event(&projected, ts, sink)
+                self.step_event(&Value::Object(metadata), ts, sink)
             }
-            _ if self.opts.complete => self.record(view.resolve()?.as_ref(), sink),
+            _ if self.opts.complete => self.carry(view.resolve()?.as_ref(), ts, sink),
             _ => Flow::Continue,
         };
         Ok(if flow == Flow::Stop { self.stop() } else { flow })
     }
-    fn record(&mut self, v: &Value, sink: &mut dyn MessageSink) -> Flow {
+
+    /// A `tool.result` loop event as its Tool turn. The `<system>…</system>` note, the truncation
+    /// flag, and — when the full output went to a sidecar (`tool-results/…txt`,
+    /// `tasks/<id>/output.log`) — its path ride in `details`, under the same
+    /// `details.persistedOutput` key the Claude adapter uses so `cv show` points at it and the
+    /// indexer reads it. A part-list output is flattened (images as `[image]`); under spans into
+    /// the source's decoded backing, never owned.
+    fn tool_result(
+        &self,
+        event: JsonView<'_>,
+        fields: &Fields<'_>,
+        ts: Option<DateTime<Utc>>,
+        spans: Option<&JsonSource>,
+    ) -> Result<Message> {
+        let id = fields.string("toolCallId")?.unwrap_or_default();
+        let result = fields
+            .get("result")
+            .map(|v| Fields::parse(v, &["output", "isError", "note", "truncated"]))
+            .transpose()?
+            .flatten();
+        let output = result.as_ref().and_then(|r| r.get("output"));
+        let (content, path) = match output {
+            Some(output) if output.is_string()? => {
+                let text = match spans {
+                    Some(_) => output.source_text()?,
+                    None => output.text(false)?,
+                };
+                (text.unwrap(), output_path_view(output)?)
+            }
+            Some(output) if output.array()?.is_some() => {
+                let parts = || -> Result<Vec<Option<JsonView<'_>>>> {
+                    // `None` is an image part's `[image]` marker.
+                    let mut out = Vec::new();
+                    for part in output.array()?.unwrap() {
+                        let Some(fields) = Fields::parse(part?, &["type", "text"])? else {
+                            continue;
+                        };
+                        if fields.string("type")?.is_some_and(|ty| super::wire::is_image_part(&ty)) {
+                            out.push(None);
+                        } else if let Some(text) = fields.get("text").filter(|v| v.is_string().unwrap_or(false)) {
+                            out.push(Some(text));
+                        }
+                    }
+                    Ok(out)
+                };
+                match spans {
+                    None => {
+                        let mut joined = Vec::new();
+                        for part in parts()? {
+                            joined.push(match part {
+                                Some(text) => text.resolve()?.as_str().unwrap_or_default().to_owned(),
+                                None => "[image]".to_owned(),
+                            });
+                        }
+                        let joined = joined.join("\n");
+                        let path = output_path(&joined);
+                        (Text::Inline(joined), path)
+                    }
+                    // One arena per wire capture keeps deferred descriptor registries bounded.
+                    Some(source) => {
+                        let content = super::store::text::append(source, &source.decoded_backing()?, |writer| {
+                            for (i, part) in parts()?.into_iter().enumerate() {
+                                if i != 0 {
+                                    writer.push("\n")?;
+                                }
+                                match part {
+                                    Some(text) => {
+                                        writer.push_string(text)?;
+                                    }
+                                    None => writer.push("[image]")?,
+                                }
+                            }
+                            Ok(())
+                        })?;
+                        let path = match &content {
+                            Text::Inline(text) => output_path(text),
+                            Text::Source(text) => text.range.with_view(output_path_view)?,
+                            Text::Span(_) => unreachable!("generated text has no external span"),
+                        };
+                        (content, path)
+                    }
+                }
+            }
+            _ => (Text::default(), None),
+        };
+        let mut details = Map::new();
+        if let Some(result) = &result {
+            if let Some(note) = result.value("note")?.filter(|v| !v.is_null()) {
+                details.insert("note".into(), note);
+            }
+            if result.value("truncated")? == Some(Value::Bool(true)) {
+                details.insert("truncated".into(), Value::Bool(true));
+            }
+        }
+        if let Some(path) = path {
+            details.insert("persistedOutput".into(), serde_json::json!({"path":path}));
+        }
+        let mut message = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
+        message.timestamp = ts;
+        message.content.push(Block::ToolResult {
+            tool_use_id: id.clone(),
+            content,
+            is_error: result
+                .as_ref()
+                .map(|r| r.value("isError"))
+                .transpose()?
+                .flatten()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            tool_name: self.call_names.get(&id).cloned(),
+            status: None,
+            details: (!details.is_empty()).then(|| Value::Object(details)),
+        });
+        if self.opts.extra {
+            if let Some(trace) = fields.value("traceId")? {
+                message
+                    .harness_extra_mut(Harness::KimiCode)
+                    .insert("traceId".into(), trace);
+            }
+        }
+        if self.opts.complete {
+            let time = ts.map(|t| t.timestamp_millis());
+            match spans {
+                Some(source) => {
+                    let arena = source.decoded_backing()?;
+                    let (offset, len) = arena.append(|writer| {
+                        use crate::harness::wire::write::ObjectWriter;
+                        let mut out = ObjectWriter::new(writer)?;
+                        out.field("type", "context.append_loop_event")?;
+                        out.field_with("event", |mut writer| event.write_canonical(&mut writer))?;
+                        out.field("time", time)?;
+                        out.finish()
+                    })?;
+                    let raw = source.read_backing_syntax(arena, offset, len, |view| view.to_json())?;
+                    CompleteRecord::attach(std::slice::from_mut(&mut message), Harness::KimiCode, raw, Map::new());
+                }
+                None => {
+                    message.extra.insert(
+                        CARRIER_KEY.into(),
+                        serde_json::json!({"type": "context.append_loop_event", "event": event.resolve()?, "time": time}),
+                    );
+                }
+            }
+        }
+        Ok(message)
+    }
+
+    /// A small bookkeeping record, whole: model bindings, session facts, notices, compaction and
+    /// branch markers, sub-agent lives, and carriers for everything else.
+    fn bookkeeping(&mut self, v: &Value, sink: &mut dyn MessageSink) -> Flow {
         let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
         let ts = v.get("time").and_then(super::ts_from_value);
         let loop_request = loop_request(ty, v.get("kind").and_then(Value::as_str));
@@ -1278,8 +1226,6 @@ impl<'a> Ctx<'a> {
                 self.carry(v, ts, sink)
             }
             "profile.bind" | "config.update" => self.system_prompt(v, ty, ts, sink),
-            "context.append_message" => self.append_message(v, ts, sink, None, None),
-            "context.append_loop_event" => self.loop_event(v, ts, sink),
             "context.apply_compaction" => {
                 let f = self.flush_step(sink);
                 if f == Flow::Stop {
@@ -1490,28 +1436,28 @@ impl<'a> Ctx<'a> {
         sink.message(m)
     }
 
+    /// A conversation message: its role, `origin.kind` (who put the text there: `user` is a typed
+    /// prompt; `injection` / `system_trigger` are harness steers; `background_task` / `task` are
+    /// automation notices), blocks, and under `complete` its record.
     fn append_message(
         &mut self,
-        v: &Value,
+        role: Option<&str>,
+        origin_kind: &str,
         ts: Option<DateTime<Utc>>,
         sink: &mut dyn MessageSink,
-        blocks: Option<Vec<Block>>,
-        record: Option<crate::json::Json>,
+        blocks: Vec<Block>,
+        record: Option<crate::Json>,
     ) -> Flow {
         let f = self.flush_step(sink);
         if f == Flow::Stop {
             return Flow::Stop;
         }
-        let message = v.get("message");
-        let role = match message.and_then(|m| m.get("role")).and_then(Value::as_str) {
+        let role = match role {
             Some("assistant") => Role::Assistant,
             Some("tool") => Role::Tool,
             Some("system") => Role::System,
             _ => Role::User,
         };
-        // `origin.kind` says who put the text there: `user` is a typed prompt; `injection` /
-        // `system_trigger` are harness steers; `background_task` / `task` are automation notices.
-        let origin_kind = origin_kind(message);
         let (kind, origin) = match role {
             Role::User => match origin_kind {
                 "user" => (MessageKind::Prompt, Origin::Human),
@@ -1527,25 +1473,21 @@ impl<'a> Ctx<'a> {
             m.model = self.reply_model();
         }
         m.timestamp = ts;
-        if let Some(blocks) = blocks {
-            m.content = blocks;
-        } else {
-            push_parts(&mut m, message.and_then(|m| m.get("content")));
-        }
+        m.content = blocks;
         m.harness_extra_mut(Harness::KimiCode)
             .insert("origin_kind".into(), Value::String(origin_kind.to_string()));
-        if let Some(record) = record {
-            CompleteRecord::attach(std::slice::from_mut(&mut m), Harness::KimiCode, record, Map::new());
-        } else if self.opts.complete {
-            m.extra.insert(CARRIER_KEY.into(), v.clone());
+        match record {
+            Some(crate::Json::Owned(record)) => {
+                m.extra.insert(CARRIER_KEY.into(), record);
+            }
+            Some(record) => CompleteRecord::attach(std::slice::from_mut(&mut m), Harness::KimiCode, record, Map::new()),
+            None => {}
         }
         sink.message(m)
     }
 
-    fn loop_event(&mut self, v: &Value, ts: Option<DateTime<Utc>>, sink: &mut dyn MessageSink) -> Flow {
-        let Some(e) = v.get("event") else {
-            return Flow::Continue;
-        };
+    /// A `step.begin` / `step.end` loop event, its metadata projected (`e`).
+    fn step_event(&mut self, e: &Value, ts: Option<DateTime<Utc>>, sink: &mut dyn MessageSink) -> Flow {
         let ety = e.get("type").and_then(Value::as_str).unwrap_or("");
         match ety {
             "step.begin" => {
@@ -1556,48 +1498,6 @@ impl<'a> Ctx<'a> {
                 let uuid = e.get("uuid").and_then(Value::as_str).unwrap_or("").to_string();
                 self.open_step(uuid, e, ts);
                 Flow::Continue
-            }
-            "content.part" => {
-                let step_uuid = e.get("stepUuid").and_then(Value::as_str).unwrap_or("");
-                let f = self.ensure_step(step_uuid, e, ts, sink);
-                if f == Flow::Stop {
-                    return Flow::Stop;
-                }
-                if let (Some(step), Some(part)) = (self.step.as_mut(), e.get("part")) {
-                    if let Some(b) = openai::part_to_block(part, &openai::KIMI_CODE) {
-                        step.msg.content.push(b);
-                    }
-                }
-                Flow::Continue
-            }
-            "tool.call" => {
-                let step_uuid = e.get("stepUuid").and_then(Value::as_str).unwrap_or("");
-                let f = self.ensure_step(step_uuid, e, ts, sink);
-                if f == Flow::Stop {
-                    return Flow::Stop;
-                }
-                let id = e.get("toolCallId").and_then(Value::as_str).unwrap_or("").to_string();
-                let name = e.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                self.call_names.insert(id.clone(), name.clone());
-                if let Some(step) = self.step.as_mut() {
-                    step.msg.content.push(Block::ToolUse {
-                        id,
-                        name,
-                        input: e.get("args").cloned().unwrap_or(Value::Null).into(),
-                        namespace: None,
-                    });
-                }
-                Flow::Continue
-            }
-            "tool.result" => {
-                let m = self.tool_result(e, ts);
-                match self.step.as_mut() {
-                    Some(step) => {
-                        step.results.push(m);
-                        Flow::Continue
-                    }
-                    None => sink.message(m),
-                }
             }
             "step.end" => {
                 let uuid = e.get("uuid").and_then(Value::as_str).unwrap_or("");
@@ -1631,7 +1531,7 @@ impl<'a> Ctx<'a> {
                 }
                 self.flush_step(sink)
             }
-            _ => self.carry(v, ts, sink),
+            _ => Flow::Continue,
         }
     }
 
@@ -1685,56 +1585,6 @@ impl<'a> Ctx<'a> {
         }
         Flow::Continue
     }
-
-    fn tool_result(&self, e: &Value, ts: Option<DateTime<Utc>>) -> Message {
-        let id = e.get("toolCallId").and_then(Value::as_str).unwrap_or("").to_string();
-        let result = e.get("result");
-        let output = result.and_then(|r| r.get("output"));
-        let content = coerce_text(output);
-        let is_error = result
-            .and_then(|r| r.get("isError"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        // Structured extras: the `<system>…</system>` note, the truncation flag, and — when the
-        // full output went to a sidecar (`tool-results/…txt`, `tasks/<id>/output.log`) — its path,
-        // under the same `details.persistedOutput` key the Claude adapter uses so `cv show`
-        // points at it and the indexer reads it.
-        let mut details = Map::new();
-        if let Some(note) = result.and_then(|r| r.get("note")).filter(|n| !n.is_null()) {
-            details.insert("note".into(), note.clone());
-        }
-        if result.and_then(|r| r.get("truncated")).and_then(Value::as_bool) == Some(true) {
-            details.insert("truncated".into(), Value::Bool(true));
-        }
-        if let Some(path) = output_path(&content) {
-            details.insert("persistedOutput".into(), serde_json::json!({ "path": path }));
-        }
-        let mut m = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
-        m.timestamp = ts;
-        m.content.push(Block::ToolResult {
-            tool_use_id: id.clone(),
-            content: Text::from(content),
-            is_error,
-            tool_name: self.call_names.get(&id).cloned(),
-            status: None,
-            details: (!details.is_empty()).then(|| Value::Object(details)),
-        });
-        if self.opts.extra {
-            if let Some(t) = e.get("traceId") {
-                m.harness_extra_mut(Harness::KimiCode)
-                    .insert("traceId".into(), t.clone());
-            }
-        }
-        if self.opts.complete {
-            m.extra.insert(CARRIER_KEY.into(), serde_json::json!({ "type": "context.append_loop_event", "event": e, "time": ts.map(|t| t.timestamp_millis()) }));
-        }
-        m
-    }
-}
-
-/// Decode only bounded metadata; text/thinking payloads retain the validated wire source.
-fn part_view(part: JsonView<'_>) -> Result<Option<Block>> {
-    openai::part_view(part, &openai::KIMI_CODE)
 }
 
 /// Keep only candidate output-path lines while scanning decoded chunks. Last matching line wins,
@@ -1815,11 +1665,6 @@ fn usage_from(u: &Value) -> Usage {
     }
 }
 
-/// Append a message's parts (`[Part]`, or a bare string) as blocks.
-fn push_parts(m: &mut Message, content: Option<&Value>) {
-    m.content.extend(openai::blocks_from(content, &openai::KIMI_CODE));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1827,54 +1672,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn owned_wire_io_failure_cannot_flush_a_provisional_step_or_publish_metadata() -> Result<()> {
-        struct FailingReader(std::io::Cursor<Vec<u8>>);
-        impl std::io::Read for FailingReader {
-            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-                if self.0.position() == self.0.get_ref().len() as u64 {
-                    return Err(std::io::Error::other("synthetic terminal wire read failure"));
-                }
-                std::io::Read::read(&mut self.0, bytes)
-            }
-        }
-        impl std::io::BufRead for FailingReader {
-            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-                if self.0.position() == self.0.get_ref().len() as u64 {
-                    return Err(std::io::Error::other("synthetic terminal wire read failure"));
-                }
-                std::io::BufRead::fill_buf(&mut self.0)
-            }
-            fn consume(&mut self, n: usize) {
-                std::io::BufRead::consume(&mut self.0, n);
-            }
-        }
-        let body = concat!(
-            "{\"type\":\"context.append_message\",\"message\":{\"role\":\"user\",\"content\":\"stable prefix\"}}\n",
-            "{\"type\":\"context.append_loop_event\",\"event\":{\"type\":\"content.part\",\"stepUuid\":\"pending\",\"part\":{\"type\":\"text\",\"text\":\"provisional reply\"}}}\n"
-        );
-        let opts = ParseOptions::full();
-        let mut kept = Kept::default();
-        let result = stream_wire(
-            FailingReader(std::io::Cursor::new(body.as_bytes().to_vec())),
-            Path::new("synthetic/wire.jsonl"),
-            0,
-            Session::new("synthetic", Harness::KimiCode),
-            Ctx::new(&opts),
-            0,
-            &mut kept,
-        );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("synthetic terminal wire read failure"));
-        assert_eq!(kept.messages.len(), 1);
-        assert_eq!(kept.messages[0].text().as_deref(), Some("stable prefix"));
-        Ok(())
-    }
-
-    #[test]
     fn model_bindings_follow_native_request_order_and_survive_every_suffix() -> Result<()> {
-        let world = cv_testkit::World::in_process("kimi_code_model_bindings");
+        let world = crate::test_world("kimi_code_model_bindings");
         let home = world.home.join(".kimi-code");
         let dir = home.join("sessions/wd_test/session_models");
         let path = main_wire(&dir);
@@ -1958,7 +1757,7 @@ mod tests {
 
     #[test]
     fn one_header_pass_preserves_independent_first_fields_and_record_limit() -> Result<()> {
-        let world = cv_testkit::World::in_process("kimi_code_header_fields");
+        let world = crate::test_world("kimi_code_header_fields");
         let path = world.home.join("wire.jsonl");
         let ignored = "unused payload ".repeat(20_000);
         let cases = [
@@ -2012,7 +1811,7 @@ mod tests {
 
     #[test]
     fn discovery_refreshes_state_and_cwd_fallbacks_without_wire_append() -> Result<()> {
-        let world = cv_testkit::World::in_process("kimi_code_aux_discovery");
+        let world = crate::test_world("kimi_code_aux_discovery");
         let context = crate::discover_cache::read::Context::current();
         let _scope = context.enter();
         let home = world.home.join(".kimi-code");
@@ -2058,7 +1857,7 @@ mod tests {
 
     #[test]
     fn checked_discovery_kimi_code_matches_owned_steps_titles_and_state() -> Result<()> {
-        let world = cv_testkit::World::in_process("kimi-code-discovery-selected");
+        let world = crate::test_world("kimi-code-discovery-selected");
         let dir = world.base.join("session-id");
         fs::create_dir_all(&dir)?;
         let wire = main_wire(&dir);
@@ -2077,11 +1876,11 @@ mod tests {
             .collect::<String>()
             .into_bytes();
         bytes.extend_from_slice(b"invalid-json\n\xff\n{\"ignored\":1e999}\n");
-        bytes.extend_from_slice("\u{2003}{\"type\":\"context.append_message\",\"message\":{\"role\":\"user\",\"origin\":{\"kind\":null},\"content\":\"partial\"}}\u{2003}".as_bytes());
+        bytes.extend_from_slice(" {\"type\":\"context.append_message\",\"message\":{\"role\":\"user\",\"origin\":{\"kind\":null},\"content\":\"partial\"}} ".as_bytes());
         bytes.extend_from_slice(b"\n{\"type\":\"ignored\",\"type\":\"context.append_loop_event\",\"event\":{\"type\":\"step.begin\",\"type\":\"step.end\"}}\n");
         fs::write(&wire, bytes)?;
         let facts = |w: WireScan| (w.message_count, w.title, w.first_ts, w.last_ts);
-        assert_eq!(facts(scan_wire(&wire)?), facts(old_scan_wire(&wire)));
+        assert_eq!(facts(scan_wire(&wire)?), facts(reducer(&wire)));
         for title in [
             Value::Null,
             serde_json::json!("explicit title λ"),
@@ -2091,7 +1890,7 @@ mod tests {
             let state = serde_json::json!({"cwd":"/p","title":title,"createdAt":3,"updatedAt":11,"lastPrompt":body,"unknown":body});
             fs::write(dir.join("state.json"), serde_json::to_vec(&state)?)?;
             let actual = scan(&dir, "id", None).unwrap();
-            let old = old_scan_wire(&wire);
+            let old = reducer(&wire);
             assert_eq!(actual.message_count, old.message_count);
             assert_eq!(
                 actual.title,
@@ -2124,7 +1923,7 @@ mod tests {
             if entry.file_name() != "wire.jsonl" {
                 continue;
             }
-            assert_eq!(facts(scan_wire(entry.path())?), facts(old_scan_wire(entry.path())));
+            assert_eq!(facts(scan_wire(entry.path())?), facts(reducer(entry.path())));
         }
         Ok(())
     }
@@ -2147,33 +1946,52 @@ mod tests {
         }
     }
 
-    // Independent old scanner/collector: validates that offset tracking did not change tolerated
-    // records, step ordering, diagnostics, or metadata before checking suffix equivalence.
-    fn old_wire_oracle(r: &SessionRef, opts: &ParseOptions) -> Session {
-        let (mut shell, wire) = session_header(r);
-        let mut ctx = Ctx::new(opts);
-        let mut kept = Kept::default();
-        let skipped = super::super::for_each_json_line(BufReader::new(fs::File::open(wire).unwrap()), |v| {
-            ctx.record(&v, &mut kept)
+    /// The simple discovery reducer over owned values: turn count, title fallback, time bounds.
+    fn reducer(wire: &Path) -> WireScan {
+        let mut w = WireScan::default();
+        super::super::for_each_json_line(std::io::BufReader::new(fs::File::open(wire).unwrap()), |v| {
+            if let Some(ts) = v.get("time").and_then(super::super::ts_from_value) {
+                w.first_ts = Some(w.first_ts.map_or(ts, |f| f.min(ts)));
+                w.last_ts = Some(w.last_ts.map_or(ts, |l| l.max(ts)));
+            }
+            match v.get("type").and_then(Value::as_str) {
+                Some("context.append_message") => {
+                    if v.pointer("/message/role").and_then(Value::as_str) == Some("user") {
+                        w.message_count += 1;
+                        let kind = v.pointer("/message/origin/kind").and_then(Value::as_str);
+                        if w.title.is_none() && kind.unwrap_or("user") == "user" {
+                            let t = super::super::wire::text_parts(v.pointer("/message/content"));
+                            if !t.trim().is_empty() {
+                                w.title = Some(crate::ir::truncate(&t, 80));
+                            }
+                        }
+                    }
+                }
+                Some("context.append_loop_event")
+                    if v.pointer("/event/type").and_then(Value::as_str) == Some("step.end") =>
+                {
+                    w.message_count += 1;
+                }
+                _ => {}
+            }
+            Flow::Continue
         });
-        if !ctx.stopped {
-            ctx.flush_step(&mut kept);
-        }
-        shell.model = ctx.model_bindings.first.take().or(shell.model);
-        shell.harness_extra_mut(Harness::KimiCode).append(&mut ctx.facts);
-        if let Some(pv) = ctx.protocol_version {
-            shell
-                .harness_extra_mut(Harness::KimiCode)
-                .insert("protocol_version".into(), pv.into());
-        }
-        super::super::note_skipped_lines(&mut shell, skipped);
+        w
+    }
+
+    /// The whole session read with every string inline: what a spans read materializes to.
+    fn old_wire_oracle(r: &SessionRef, opts: &ParseOptions) -> Session {
+        let mut opts = opts.clone();
+        opts.spans = false;
+        let mut kept = Kept::default();
+        let mut shell = KimiCode { root: None }.try_stream(r, &opts, &mut kept).unwrap();
         shell.messages = kept.messages;
         shell
     }
 
     #[test]
     fn checked_complete_bodies_keep_raw_envelopes_and_guarded_replay() {
-        let world = cv_testkit::World::in_process("kimi_code_checked_complete");
+        let world = crate::test_world("kimi_code_checked_complete");
         let dir = world.home.join(".kimi-code/sessions/wd_test/session_checked");
         fs::create_dir_all(dir.join("agents/main")).unwrap();
         let path = main_wire(&dir);
@@ -2219,13 +2037,14 @@ mod tests {
             serde_json::to_value(&session).unwrap(),
             serde_json::to_value(&expected).unwrap()
         );
-        fs::write(&path, format!("{body}\n")).unwrap();
+        // Truncation, not growth: an append-only log may grow under a retained source.
+        fs::write(&path, "").unwrap();
         assert!(serde_json::to_value(retained).is_err());
     }
 
     #[test]
     fn growing_call_name_checkpoints_preserve_late_and_duplicate_result_suffixes() -> Result<()> {
-        let world = cv_testkit::World::in_process("kimi-code-growing-call-state");
+        let world = crate::test_world("kimi-code-growing-call-state");
         let dir = world.home.join("session_calls");
         fs::create_dir_all(dir.join("agents/main"))?;
         let names = (0..96)
@@ -2302,8 +2121,17 @@ mod tests {
                 );
             }
             let mut amortized = Kept::default();
-            crate::stream::stream_resumable_amortized(&adapter, &reference, &options, &mut amortized, 1024, None)?
-                .unwrap();
+            crate::stream::stream_counted(
+                &adapter,
+                &reference,
+                &options,
+                &mut amortized,
+                crate::stream::Pass {
+                    every: Some(1024),
+                    amortized: true,
+                    ..Default::default()
+                },
+            )?;
             assert_eq!(
                 serde_json::to_value(&amortized.messages)?,
                 serde_json::to_value(&full.messages)?
@@ -2317,15 +2145,19 @@ mod tests {
             assert!(snapshot_bytes as u64 <= fs::metadata(main_wire(&dir))?.len() * 4);
             for (count, checkpoint) in &amortized.checkpoints {
                 let mut suffix = Kept::default();
-                assert!(crate::stream::stream_resumable_amortized(
+                assert!(crate::stream::stream_counted(
                     &adapter,
                     &reference,
                     &options,
                     &mut suffix,
-                    1024,
-                    Some(checkpoint)
-                )?
-                .is_some());
+                    crate::stream::Pass {
+                        from: Some(checkpoint),
+                        every: Some(1024),
+                        amortized: true,
+                        ..Default::default()
+                    }
+                )
+                .is_ok());
                 assert_eq!(
                     serde_json::to_value(suffix.messages)?,
                     serde_json::to_value(&full.messages[*count..])?
@@ -2337,7 +2169,7 @@ mod tests {
 
     #[test]
     fn resume_checkpoints_match_old_corpus_and_every_selected_suffix() {
-        let world = cv_testkit::World::in_process("kimi_code_resume_corpus");
+        let world = crate::test_world("kimi_code_resume_corpus");
         let adapter = KimiCode::with_home(&world.home.join(".kimi-code"));
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/kimi-code");
         let mut files = 0;
@@ -2421,7 +2253,7 @@ mod tests {
 
     #[test]
     fn lazy_finalized_payloads_resolve_like_original_step_dispatch() {
-        let world = cv_testkit::World::in_process("kimi_code_source_payloads");
+        let world = crate::test_world("kimi_code_source_payloads");
         let body = "雪\n\"".repeat(6000);
         let output = format!("{body}\noutput_path: first\n{body}\noutput_path: /scratch/result.log\n");
         let records = [
@@ -2467,7 +2299,7 @@ mod tests {
 
     #[test]
     fn giant_two_part_results_match_owned_dispatch() {
-        let world = cv_testkit::World::in_process("kimi_code_giant_composite");
+        let world = crate::test_world("kimi_code_giant_composite");
         let adapter = KimiCode::with_home(&world.home.join(".kimi-code"));
         for bytes in [2 * 1024 * 1024, 8 * 1024 * 1024] {
             for escaped in [false, true] {
@@ -2501,7 +2333,7 @@ mod tests {
     #[test]
     fn resume_replays_partial_records_and_unfinished_steps_with_exact_diagnostics() {
         use std::io::Write as _;
-        let world = cv_testkit::World::in_process("kimi_code_partial_resume");
+        let world = crate::test_world("kimi_code_partial_resume");
         let prefix = concat!(
             "{\"type\":\"metadata\",\"protocol_version\":\"2\"}\n",
             "{\"type\":\"context.append_message\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\r\n",
@@ -2565,7 +2397,7 @@ mod tests {
     #[test]
     fn resume_append_reads_only_new_callbacks_and_keeps_catalog_fallbacks_current() {
         use std::io::Write as _;
-        let world = cv_testkit::World::in_process("kimi_code_append_read_work");
+        let world = crate::test_world("kimi_code_append_read_work");
         let line = "{\"type\":\"context.append_message\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
         let mut r = resume_fixture(&world, line.repeat(20_000).as_bytes());
         let adapter = KimiCode::with_home(&world.home.join(".kimi-code"));
@@ -2726,16 +2558,17 @@ mod tests {
         assert_eq!(actual.cwd, expected.cwd);
         assert_eq!(actual.cwd.get("a"), Some(&PathBuf::from("/last")));
         assert_eq!(actual.deleted, HashSet::from(["last".to_string()]));
+        // A non-UTF-8 line is one rejected record; the entries around it stand.
         let mut invalid_utf8 = text.into_bytes();
         invalid_utf8.extend_from_slice(b"\n\xff");
         fs::write(&path, invalid_utf8).unwrap();
         let actual = read_session_index(&path);
-        assert!(actual.deleted.is_empty() && actual.cwd.is_empty());
+        assert_eq!((actual.deleted, actual.cwd), (expected.deleted, expected.cwd));
     }
 
     #[test]
     fn subagent_discovery_reuses_histories_and_preserves_numeric_order_and_current_parent() -> Result<()> {
-        let world = cv_testkit::World::in_process("kimi-code-subagent-cache");
+        let world = crate::test_world("kimi-code-subagent-cache");
         let context = crate::discover_cache::read::Context::current();
         let _scope = context.enter();
         let parent = world.home.join("session_parent");

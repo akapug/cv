@@ -60,21 +60,8 @@ impl Head {
         self.text.push_str(&text[..end]);
         self.stopped |= end < text.len();
     }
-    pub fn push_text(&mut self, text: &Text, resolver: &Resolver) {
-        if matches!(text, Text::Source(_)) {
-            let _ = self.try_push_text(text, resolver);
-            return;
-        }
-        if self.full() {
-            return;
-        }
-        // Preserve the existing raw-prefix selection for spans. Decoded malformed UTF-8 may
-        // expand beyond this raw budget, so still apply the final decoded-byte bound.
-        let prefix = text.resolve_prefix(resolver, self.remaining() as u64);
-        self.push(&prefix);
-    }
-    /// Checked text demand with the same raw-prefix selection as push_text. Decoded UTF-8
-    /// shares the remaining byte budget; selected raw prefixes keep their existing behavior.
+    /// Checked text demand: a span's raw prefix of the remaining budget, then the decoded-byte
+    /// bound (decoded malformed UTF-8 may expand beyond the raw budget).
     pub fn try_push_text(&mut self, text: &Text, resolver: &Resolver) -> anyhow::Result<()> {
         if !self.full() {
             if let Text::Source(source) = text {
@@ -394,17 +381,11 @@ mod tests {
             source.try_prefix_with_truncation(decoded.len()).unwrap(),
             (decoded.clone(), false)
         );
-        for checked in [true, false] {
-            let mut head = Head::new(3);
-            if checked {
-                head.try_push_text(&text, &Resolver::new(None)).unwrap();
-            } else {
-                head.push_text(&text, &Resolver::new(None));
-            }
-            head.push("\n");
-            assert_eq!(head.as_str(), "ab");
-            assert!(head.full());
-        }
+        let mut head = Head::new(3);
+        head.try_push_text(&text, &Resolver::new(None)).unwrap();
+        head.push("\n");
+        assert_eq!(head.as_str(), "ab");
+        assert!(head.full());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

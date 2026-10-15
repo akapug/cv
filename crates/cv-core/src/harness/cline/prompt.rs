@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn source_prompt_cutoffs_match_owned_and_early_stop_keeps_identity_checks() -> Result<()> {
-        let world = cv_testkit::World::in_process("cline-prompt-cutoffs");
+        let world = crate::test_world("cline-prompt-cutoffs");
         let path = world.base.join("prompt.json");
         for chars in [79, 80, 81, 82] {
             for padding in [0, 65_530, 65_536] {

@@ -20,8 +20,6 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     stream::emit(session, out_dir, opts)
 }
 
-#[cfg(test)]
-mod legacy;
 mod stream;
 
 /// Bind `cwd` to a slug dir under gemini's `<globalTemp>` (=`out_dir`), replicating
@@ -71,7 +69,8 @@ fn gemini_register_project(global_tmp: &Path, cwd: &str) -> Result<Option<String
     let slug_dir = global_tmp.join(&slug);
     fs::create_dir_all(&slug_dir).with_context(|| format!("creating Gemini project {}", slug_dir.display()))?;
     let marker = slug_dir.join(MARKER);
-    fs::write(&marker, cwd).with_context(|| format!("writing Gemini project marker {}", marker.display()))?;
+    crate::publish::publish_reader(&marker, "stage", cwd.as_bytes(), crate::publish::Claim::Replace)
+        .with_context(|| format!("writing Gemini project marker {}", marker.display()))?;
     // Record the projects.json fast-path mapping too (best-effort).
     if let Some(parent) = global_tmp.parent() {
         let projects_json = parent.join("projects.json");
@@ -94,7 +93,8 @@ fn gemini_register_project(global_tmp: &Path, cwd: &str) -> Result<Option<String
             m.insert(cwd.to_string(), json!(slug));
         }
         if let Ok(s) = serde_json::to_string_pretty(&doc) {
-            let _ = fs::write(&projects_json, s);
+            let _ =
+                crate::publish::publish_reader(&projects_json, "stage", s.as_bytes(), crate::publish::Claim::Replace);
         }
     }
     Ok(Some(slug))
@@ -167,8 +167,9 @@ mod checked_tests {
         }
     }
     #[test]
-    fn checked_gemini_matches_legacy_pretty_all_modes_and_fields() -> Result<()> {
-        let world = cv_testkit::World::in_process("gemini-wire-oracle");
+    fn checked_gemini_matches_frozen_pretty_all_modes_and_fields() -> Result<()> {
+        let world = crate::test_world("gemini-wire-oracle");
+        let mut frozen = crate::emit::grok_qwen_tests::Frozen::new("gemini-fixture");
         let mut session = Session::new("source", Harness::Claude);
         let ts = "2026-10-12T12:00:00Z".parse()?;
         session.created_at = Some(ts);
@@ -264,16 +265,17 @@ mod checked_tests {
                 thinking: mode,
                 ..Default::default()
             };
-            let mut projected = session.clone();
-            crate::emit::project_owned_thinking_for_test(&mut projected, Harness::Gemini, mode);
-            let before = legacy::emit(&projected, &world.base.join(format!("legacy-{mode}")), &opts)?;
             let after = crate::emit::emit(
                 &session,
                 Harness::Gemini,
                 &world.base.join(format!("checked-{mode}")),
                 &opts,
             )?;
-            assert_eq!(normalized(&before.path)?, normalized(&after.path)?, "{mode}");
+            let bytes = normalized(&after.path)?;
+            frozen.insert(
+                mode.to_string(),
+                json!([bytes.len(), crate::digest::sha256_hex(&bytes)]),
+            );
             // Original serialized order/whitespace is already serde's pretty normalization.
             let raw = fs::read(&after.path)?;
             let parsed: Value = serde_json::from_slice(&raw)?;
@@ -284,11 +286,11 @@ mod checked_tests {
                 "retained source"
             );
         }
-        Ok(())
+        frozen.check()
     }
     #[test]
     fn checked_gemini_guarded_text_json_fail_before_transcript_publication() -> Result<()> {
-        let world = cv_testkit::World::in_process("gemini-guarded-publication");
+        let world = crate::test_world("gemini-guarded-publication");
         for text_leaf in [true, false] {
             let source = world.base.join(format!("leaf-{text_leaf}.json"));
             let wire = if text_leaf {
@@ -335,7 +337,7 @@ mod checked_tests {
     }
     #[test]
     fn checked_gemini_cross_harness_preparation_preserves_full_metadata_and_owned_defaults() -> Result<()> {
-        let world = cv_testkit::World::in_process("gemini-preparation");
+        let world = crate::test_world("gemini-preparation");
         let source = world.base.join("source.jsonl");
         let wire = json!({"type":"assistant","uuid":"a","sessionId":"source","timestamp":"2026-10-12T12:00:00Z","cwd":"/synthetic/gemini",
             "message":{"role":"assistant","model":"source-model","content":[{"type":"text","text":"metadata body λ".repeat(2000)}],"usage":{"input_tokens":7,"output_tokens":3}},

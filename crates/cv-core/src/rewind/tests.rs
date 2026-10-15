@@ -127,11 +127,7 @@ fn sref(path: &Path, id: &str) -> SessionRef {
 
 /// The stream index (the `cv show --range` counting) of the message with this uuid.
 fn idx_of(path: &Path, uuid: &str) -> usize {
-    let s = crate::harness::claude::parse_reader(
-        "x",
-        BufReader::new(std::fs::File::open(path).unwrap()),
-        Some(path.to_path_buf()),
-    );
+    let s = crate::harness::claude::parse_str("x", &std::fs::read_to_string(path).unwrap(), Some(path.to_path_buf()));
     s.messages
         .iter()
         .position(|m| m.id.as_deref() == Some(uuid))
@@ -420,8 +416,7 @@ fn subagent_transcript_becomes_a_standalone_resumable_session() {
     assert_eq!(res.cut_cwd.as_deref(), Some("/work/proj/wt"));
     assert!(res.warnings.is_empty(), "{:?}", res.warnings);
     // And it reads back as an ordinary (non-sub-agent) session.
-    let s =
-        crate::harness::claude::parse_reader("n", BufReader::new(std::fs::File::open(&res.new_path).unwrap()), None);
+    let s = crate::harness::claude::parse_str("n", &std::fs::read_to_string(&res.new_path).unwrap(), None);
     assert_eq!(s.messages.len(), 4);
     assert_eq!(std::fs::read(&agent).unwrap(), before);
 

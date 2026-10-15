@@ -7,7 +7,7 @@ use std::{
 };
 
 /// Read one captured extent without changing a shared descriptor's seek position.
-pub(crate) fn reader(file: &fs::File, range: Range) -> Result<BufReader<Reader<'_>>> {
+pub(crate) fn reader<S: At + ?Sized>(file: &S, range: Range) -> Result<BufReader<Reader<'_, S>>> {
     let end = range.offset.checked_add(range.len).context("JSONL range overflow")?;
     Ok(BufReader::with_capacity(
         64 * 1024,
@@ -20,7 +20,7 @@ pub(crate) fn reader(file: &fs::File, range: Range) -> Result<BufReader<Reader<'
 }
 /// Each completed range excludes LF; CR and Unicode whitespace remain until trim. A partial final
 /// row is emitted with complete=false. On read error the consumer may stop or retry from offset().
-pub(crate) fn records(file: &fs::File, range: Range) -> Result<Records<'_>> {
+pub(crate) fn records<S: At + ?Sized>(file: &S, range: Range) -> Result<Records<'_, S>> {
     Ok(Records {
         reader: reader(file, range)?,
         at: range.offset,
@@ -32,7 +32,7 @@ pub(crate) fn records(file: &fs::File, range: Range) -> Result<Records<'_>> {
 
 /// Match the buffered driver's Unicode trim. Only boundary windows are decoded, even when
 /// a record is a giant string or consists entirely of whitespace.
-pub(crate) fn trim(file: &fs::File, mut range: Range) -> Result<Range> {
+pub(crate) fn trim<S: At + ?Sized>(file: &S, mut range: Range) -> Result<Range> {
     range.offset.checked_add(range.len).context("JSONL range overflow")?;
     let mut window = [0; 64 * 1024];
     while range.len > 0 {
@@ -160,7 +160,7 @@ mod tests {
     #[cfg(not(feature = "mmap"))]
     #[test]
     fn optional_small_records_drop_giant_bytes_and_resume_after_window_boundaries() {
-        let world = cv_testkit::World::in_process("positioned-small-record-cache");
+        let world = crate::test_world("positioned-small-record-cache");
         let path = world.base.join("rows.jsonl");
         let bytes = format!("{}\n{}\nsmall\r\npartial", "a".repeat(65535), "b".repeat(65537));
         fs::write(&path, &bytes).unwrap();
@@ -192,16 +192,16 @@ pub(crate) struct Range {
     pub offset: u64,
     pub len: u64,
 }
-pub(crate) struct Reader<'a> {
-    file: &'a fs::File,
+pub(crate) struct Reader<'a, S: ?Sized = fs::File> {
+    file: &'a S,
     at: u64,
     end: u64,
 }
-impl Read for Reader<'_> {
+impl<S: At + ?Sized> Read for Reader<'_, S> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let n = ((self.end - self.at).min(bytes.len() as u64)) as usize;
         let n = loop {
-            match read_at(self.file, &mut bytes[..n], self.at) {
+            match self.file.read_at(&mut bytes[..n], self.at) {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 result => break result?,
             }
@@ -210,28 +210,33 @@ impl Read for Reader<'_> {
         Ok(n)
     }
 }
-fn read_at(file: &fs::File, bytes: &mut [u8], at: u64) -> io::Result<usize> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_at(bytes, at)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        file.seek_read(bytes, at)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let mut file = file.try_clone()?;
-        use std::io::Seek;
-        file.seek(std::io::SeekFrom::Start(at))?;
-        file.read(bytes)
+/// Positioned bytes: a file, or bytes already in memory (such as a mapped private decode), so one
+/// framing implementation serves both without per-record syscalls on the second.
+pub(crate) trait At {
+    fn read_at(&self, bytes: &mut [u8], at: u64) -> io::Result<usize>;
+}
+impl At for fs::File {
+    fn read_at(&self, bytes: &mut [u8], at: u64) -> io::Result<usize> {
+        crate::harness::store::bytes::read_at(self, bytes, at)
     }
 }
-pub(crate) fn read_exact_at(file: &fs::File, mut bytes: &mut [u8], mut at: u64) -> io::Result<()> {
+impl At for [u8] {
+    fn read_at(&self, bytes: &mut [u8], at: u64) -> io::Result<usize> {
+        let start = usize::try_from(at).map_or(self.len(), |at| at.min(self.len()));
+        let n = bytes.len().min(self.len() - start);
+        bytes[..n].copy_from_slice(&self[start..start + n]);
+        Ok(n)
+    }
+}
+#[cfg(feature = "mmap")]
+impl At for memmap2::Mmap {
+    fn read_at(&self, bytes: &mut [u8], at: u64) -> io::Result<usize> {
+        self[..].read_at(bytes, at)
+    }
+}
+pub(crate) fn read_exact_at<S: At + ?Sized>(file: &S, mut bytes: &mut [u8], mut at: u64) -> io::Result<()> {
     while !bytes.is_empty() {
-        match read_at(file, bytes, at) {
+        match file.read_at(bytes, at) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => {
                 at += n as u64;
@@ -279,18 +284,18 @@ pub(crate) fn valid_utf8(cursor: &mut impl BufRead) -> io::Result<bool> {
     }
 }
 
-pub(crate) struct Records<'a> {
-    reader: BufReader<Reader<'a>>,
+pub(crate) struct Records<'a, S: ?Sized = fs::File> {
+    reader: BufReader<Reader<'a, S>>,
     at: u64,
     small: Vec<u8>,
     small_limit: usize,
     small_complete: bool,
 }
-impl Records<'_> {
+impl<S: ?Sized> Records<'_, S> {
     /// Optionally retain small physical records during framing, avoiding a second positioned
     /// read. Above this fixed cap the scratch is cleared; giant records remain only ranges.
+    /// The scratch grows with the records it holds, never past the cap.
     pub(crate) fn keep_small_records(&mut self, limit: usize) {
-        self.small = Vec::with_capacity(limit);
         self.small_limit = limit;
     }
     pub(crate) fn small_record(&self) -> Option<&[u8]> {
@@ -300,7 +305,7 @@ impl Records<'_> {
         self.at
     }
 }
-impl Iterator for Records<'_> {
+impl<S: At + ?Sized> Iterator for Records<'_, S> {
     type Item = Result<(Range, bool)>;
     fn next(&mut self) -> Option<Self::Item> {
         let start = self.at;
@@ -325,6 +330,11 @@ impl Iterator for Records<'_> {
             if self.small_complete {
                 let payload = n - usize::from(newline.is_some());
                 if payload <= self.small_limit - self.small.len() {
+                    let needed = self.small.len() + payload;
+                    if needed > self.small.capacity() {
+                        let grown = needed.max(2 * self.small.capacity()).min(self.small_limit);
+                        self.small.reserve_exact(grown - self.small.len());
+                    }
                     self.small.extend_from_slice(&bytes[..payload]);
                 } else {
                     self.small.clear();

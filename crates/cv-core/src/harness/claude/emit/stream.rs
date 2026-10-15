@@ -759,9 +759,9 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     if opts.thinking != ThinkingMode::Native {
         let source = lines.into_source()?;
         let (stage, _) = crate::harness::claude::replay::normalize(source, opts.thinking)?;
-        crate::harness::store::publish_stage(stage, &file_path)?;
+        crate::harness::store::publish_stage(stage, &file_path, opts.claim())?;
     } else {
-        lines.publish(&file_path)?;
+        lines.publish(&file_path, opts.claim())?;
     }
     let resume = match (&c.agent, &cwd) {
         (Some(agent), _) => format!(
@@ -841,7 +841,7 @@ mod parent_tests {
 
     #[test]
     fn emitted_forward_parent_fanout_matches_owned_native_oracle() -> Result<()> {
-        let world = cv_testkit::World::in_process("claude-parent-fanout");
+        let world = crate::test_world("claude-parent-fanout");
         let mut session = crate::Session::new("original", Harness::Claude);
         session.created_at = chrono::DateTime::from_timestamp(1, 0);
         let mut root = Message::new(Role::User);

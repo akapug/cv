@@ -598,9 +598,12 @@ mod tests {
                 len: bytes.len() as u64,
                 escaped,
             };
-            let expected = resolver.resolve_prefix(&span, EMBED_HEAD_BYTES as u64);
+            let expected = resolver.try_resolve_prefix(&span, EMBED_HEAD_BYTES as u64).unwrap();
             let mut actual = DocSink::new(Resolver::new(Some(dir.join("source"))));
-            let expected_label = cv_core::label_from(None, Some(&resolver.resolve_prefix(&span, FIRST_USER_RAW_HEAD)));
+            let expected_label = cv_core::label_from(
+                None,
+                Some(&resolver.try_resolve_prefix(&span, FIRST_USER_RAW_HEAD).unwrap()),
+            );
             actual.message(message(Role::User, vec![Block::Text { text: Text::Span(span) }]));
             let mut projected = prefix(&expected, EMBED_HEAD_BYTES).to_owned();
             if projected.len() < EMBED_HEAD_BYTES && expected.len() <= EMBED_HEAD_BYTES {

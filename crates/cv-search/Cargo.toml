@@ -38,3 +38,4 @@ probe-heap = []
 [dev-dependencies]
 cv-testkit = { path = "../cv-testkit" }
 rusqlite.workspace = true
+zstd = { version = "0.13", default-features = false }

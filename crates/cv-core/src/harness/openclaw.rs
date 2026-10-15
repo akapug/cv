@@ -114,15 +114,15 @@
 
 mod discovery;
 mod emit;
+mod record;
 mod registry;
-mod selected;
 pub use emit::emit;
 
 #[cfg(feature = "sqlite")]
 use super::store::sqlite::open_ro;
 #[cfg(feature = "sqlite")]
 use super::ts_from_epoch;
-use super::wire::{anthropic, text_parts};
+use super::wire::anthropic;
 use super::{parse_ts, ts_from_value, Adapter};
 use crate::ir::*;
 use crate::stream::{Flow, MessageSink, ParseOptions};
@@ -131,7 +131,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -144,13 +144,13 @@ impl OpenClaw {
         let mut roots = Vec::new();
         // `OPENCLAW_STATE_DIR` overrides the state dir wholesale (`src/config/state-dir.ts`
         // `resolveStateDir`); otherwise `~/.openclaw` (and the elide-home variant).
-        let override_dir = std::env::var_os("OPENCLAW_STATE_DIR")
+        let override_dir = crate::env::var_os("OPENCLAW_STATE_DIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
         for base in [
             override_dir,
-            dirs::home_dir().map(|h| h.join(".openclaw")),
-            dirs::home_dir().map(|h| h.join("elide-home").join(".openclaw")),
+            crate::env::home_dir().map(|h| h.join(".openclaw")),
+            crate::env::home_dir().map(|h| h.join("elide-home").join(".openclaw")),
         ]
         .into_iter()
         .flatten()
@@ -235,38 +235,13 @@ impl Adapter for OpenClaw {
                 return stream_sqlite(r, opts, sink);
             }
             with_jsonl_source(&r.path, |source| {
-                // A transcript with `leaf` controls is a tree: the visible branch must be selected over the
-                // whole transcript (see [`select_navigation`]). Retain navigation fields and ranges,
-                // then replay payloads only for selected entries.
                 let mut reads = crate::source::ReadSet::default();
                 let facts = jsonl_key_facts_with_reads(&r.path, &r.id, &mut |path| sink.dependency(path), &mut reads)?;
                 source.check()?;
                 // Retained bodies depend on the inventory and sibling transcripts consulted
                 // for lineage, not only on their own unchanged bytes.
                 let guarded = crate::json::JsonSource::capture_with_reads(&r.path, &reads)?;
-                let source = &guarded;
-                let tree = file_has_leaf_controls(&r.path)?;
-                source.check()?;
-                if tree {
-                    return selected::tree(r, &facts, opts, sink, source);
-                }
-                if opts.spans || opts.complete {
-                    return selected::stream(r, &facts, opts, sink, source);
-                }
-                // `filter_map`, not `map_while`: a single undecodable line (stray non-UTF8 bytes) must be
-                // skipped like any other corrupt record — `map_while` would silently TRUNCATE the whole
-                // rest of the transcript at it. The lint's run-forever concern doesn't apply: on a regular
-                // file an invalid-UTF8 `Err` still consumes that line's bytes, so the iterator advances to
-                // EOF (same tolerance as `for_each_json_line`).
-                #[allow(clippy::lines_filter_map_ok)]
-                let lines = {
-                    let file = fs::File::open(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
-                    BufReader::new(file).lines().filter_map(Result::ok)
-                };
-                let rows = lines.filter_map(|l| parse_line(&l)).map(Row::active);
-                let session = stream_rows(rows, r, &facts, opts, sink);
-                source.check()?;
-                Ok(session)
+                stream_jsonl(r, &facts, opts, sink, &guarded)
             })
         })
     }
@@ -287,192 +262,161 @@ fn with_jsonl_source<T>(path: &Path, read: impl FnOnce(&crate::json::JsonSource)
     result
 }
 
-/// One parsed JSONL line / `transcript_events` row (whitespace-trimmed, non-JSON skipped).
-fn parse_line(line: &str) -> Option<Value> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-    serde_json::from_str::<Value>(line).ok()
+/// Is this entry an accepted `leaf` navigation control?
+fn is_leaf_entry(view: crate::json::JsonView<'_>) -> Result<bool> {
+    let ty = super::store::document::Fields::parse(view, &["type"])?
+        .map(|f| f.string("type"))
+        .transpose()?
+        .flatten();
+    Ok(ty.as_deref() == Some("leaf") && is_leaf_control(&record::navigation(view)?))
 }
 
-/// Does this JSONL transcript hold an accepted top-level `leaf` navigation control? Flat
-/// transcripts can stream immediately after this bounded projection pass.
-fn file_has_leaf_controls(path: &Path) -> Result<bool> {
-    selected::has_leaf_controls(path)
-}
-
-/// A transcript entry on its way to the sink, with the branch selection's verdict.
-struct Row {
-    v: Value,
-    projected: Option<Vec<Message>>,
-    native_record: Option<crate::Json>,
-    /// On the visible branch (always true when no `leaf` control exists).
-    active: bool,
-    /// Parent id after active-branch normalization (`Some(_)` when the tree rewrote it).
-    parent: Option<Option<String>>,
-}
-
-impl Row {
-    fn active(v: Value) -> Self {
-        Row {
-            v,
-            projected: None,
-            native_record: None,
-            active: true,
-            parent: None,
-        }
-    }
-}
-
-/// Rows for a fully-loaded transcript: the branch-selected view when a `leaf` control exists, else
-/// every entry in file order.
-#[cfg(any(feature = "sqlite", test))]
-fn rows_from_values(entries: Vec<Value>, complete: bool) -> Vec<Row> {
-    if entries.iter().any(is_leaf_control) {
-        select_rows(entries, complete)
-    } else {
-        entries.into_iter().map(Row::active).collect()
-    }
-}
-
-/// Core parse, split out so tests can drive it from a fixture string. Full fidelity (collects).
-/// Test-only: production reads go through [`Adapter::stream`]/[`Adapter::parse`] → [`stream_rows`].
-#[cfg(test)]
-fn parse_text(text: &str, r: &SessionRef) -> Session {
-    parse_text_with(text, r, &ParseOptions::full())
-}
-
-#[cfg(test)]
-fn parse_text_with(text: &str, r: &SessionRef, opts: &ParseOptions) -> Session {
-    let mut sink = crate::stream::CollectSink::default();
-    let entries: Vec<Value> = text.lines().filter_map(parse_line).collect();
-    let mut s = stream_rows(
-        rows_from_values(entries, opts.complete).into_iter(),
-        r,
-        &KeyFacts::default(),
-        opts,
-        &mut sink,
-    );
-    s.messages = sink.messages;
-    s
-}
-
-/// Streaming core shared by the on-disk [`Adapter::stream`] (JSONL and sqlite) and the string-driven
-/// `parse_text`: fold each record's metadata into the session and emit any message to `sink`.
-/// Returns the session with empty `messages`.
-fn stream_rows<I: Iterator<Item = Row>>(
-    rows: I,
+/// A JSONL transcript through the record codec. A transcript with an accepted `leaf` control is a
+/// tree: the visible branch is selected over every entry's navigation fields (see
+/// [`select_navigation`]) and only the selected records are decoded, by their source ranges.
+/// Otherwise every line streams in file order, a rejected line costing only itself.
+fn stream_jsonl(
     r: &SessionRef,
     facts: &KeyFacts,
     opts: &ParseOptions,
     sink: &mut dyn MessageSink,
-) -> Session {
-    let mut s = Session {
-        cwd: r.cwd.clone(),
-        title: r.title.clone(),
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        source_path: Some(r.path.clone()),
-        ..Session::new(r.id.clone(), Harness::OpenClaw)
-    };
-    s.lineage.parent = facts.parent.clone();
-    for (k, v) in [("session_key", &facts.session_key), ("spawned_by", &facts.spawned_by)] {
-        if let Some(v) = v {
-            s.harness_extra_mut(Harness::OpenClaw)
-                .insert(k.into(), Value::from(v.as_str()));
+    source: &crate::json::JsonSource,
+) -> Result<Session> {
+    use super::store::jsonl::{for_each_line, ranges};
+    let file = fs::File::open(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
+    source.check_metadata(file.metadata()?)?;
+    let len = source.len();
+    let mut tree = false;
+    for_each_line(source, &file, 0, len, |line| {
+        tree = line.view.map(is_leaf_entry).transpose()?.unwrap_or(false);
+        Ok(if tree { Flow::Stop } else { Flow::Continue })
+    })?;
+    let mut fold = Fold::new(r, facts, opts);
+    if tree {
+        // A tree is read whole: invalid UTF-8 anywhere, even off the branch, rejects it.
+        if !ranges::valid_utf8(&mut ranges::reader(&file, ranges::Range { offset: 0, len })?)? {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8").into(),
+            );
+        }
+        let mut descriptors = Vec::new();
+        let mut records = Vec::new();
+        for_each_line(source, &file, 0, len, |line| {
+            if let Some(view) = line.view {
+                descriptors.push(record::navigation(view)?);
+                records.push(view.source_range()?.context("a transcript line has a source range")?);
+            }
+            Ok(Flow::Continue)
+        })?;
+        let navigation = select_navigation(&descriptors, opts.complete);
+        drop(descriptors);
+        for row in navigation {
+            let (offset, len) = records[row.index];
+            let record = source.read_range_value(offset, len, |view| record::record(view, opts))?;
+            if fold.push(record, row.active, row.parent, sink)? == Flow::Stop {
+                break;
+            }
+        }
+    } else {
+        for_each_line(source, &file, 0, len, |line| match line.view {
+            Some(view) => fold.push(record::record(view, opts)?, true, None, sink),
+            None => Ok(Flow::Continue),
+        })?;
+    }
+    let session = fold.finish(sink);
+    source.check_metadata(file.metadata()?)?;
+    source.check()?;
+    Ok(session)
+}
+
+/// Folds decoded records into the session in emission order and hands their messages to the sink.
+/// The session's `messages` stay empty.
+struct Fold {
+    s: Session,
+    prompt_origin: Option<Origin>,
+    header_version: Option<i64>,
+    meta_sent: bool,
+    /// Without spans, a complete record keeps its owned value only (as a materialized read does).
+    owned: Option<crate::lazy::Resolver>,
+}
+
+impl Fold {
+    fn new(r: &SessionRef, facts: &KeyFacts, opts: &ParseOptions) -> Self {
+        let mut s = Session {
+            cwd: r.cwd.clone(),
+            title: r.title.clone(),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            source_path: Some(r.path.clone()),
+            ..Session::new(r.id.clone(), Harness::OpenClaw)
+        };
+        s.lineage.parent = facts.parent.clone();
+        for (k, v) in [("session_key", &facts.session_key), ("spawned_by", &facts.spawned_by)] {
+            if let Some(v) = v {
+                s.harness_extra_mut(Harness::OpenClaw)
+                    .insert(k.into(), Value::from(v.as_str()));
+            }
+        }
+        Fold {
+            s,
+            prompt_origin: facts.prompt_origin(),
+            header_version: None,
+            meta_sent: false,
+            owned: (opts.complete && !opts.spans).then(|| crate::lazy::Resolver::new(Some(r.path.clone()))),
         }
     }
-    let prompt_origin = facts.prompt_origin();
-    let mut header_version: Option<i64> = None;
-    let mut meta_sent = false;
 
-    for row in rows {
-        let v = row.v;
-        let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-        if ty == "session" {
-            header_version = v.get("version").and_then(Value::as_i64);
-            if opts.complete {
-                s.harness_extra_mut(Harness::OpenClaw)
-                    .insert("header_record".into(), v.clone());
+    /// One record, with the branch selection's verdict: `active` (always true without `leaf`
+    /// controls) and the normalized parent (`Some(_)` when the tree rewrote it).
+    fn push(
+        &mut self,
+        record: record::Record,
+        active: bool,
+        parent: Option<Option<String>>,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Flow> {
+        let s = &mut self.s;
+        if let Some(header) = record.header {
+            self.header_version = header.version;
+            if let Some(v) = header.record {
+                s.harness_extra_mut(Harness::OpenClaw).insert("header_record".into(), v);
             }
             if s.cwd.is_none() {
-                s.cwd = v.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+                s.cwd = header.cwd.map(PathBuf::from);
             }
             if s.created_at.is_none() {
-                s.created_at = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
+                s.created_at = header.created_at;
             }
             // v4 fork lineage: the transcript this one was branched from.
-            if let Some(parent) = v.get("parentSession").and_then(Value::as_str) {
-                s.lineage.forked_from = Some(parent.to_string());
+            if let Some(parent) = header.forked_from {
+                s.lineage.forked_from = Some(parent);
             }
-            continue;
+            return Ok(Flow::Continue);
         }
-        // Off the visible branch: gone for the lean passes, carried (tagged) under `complete`.
-        if !row.active && !opts.complete {
-            continue;
-        }
-        let native_record = opts
-            .complete
-            .then(|| row.native_record.unwrap_or_else(|| v.clone().into()));
-        let mut msgs = if let Some(messages) = row.projected {
-            messages
-        } else {
-            match ty {
-                "message" => parse_entry(&v),
-                "compaction"
-                | "reset"
-                | "branch_summary"
-                | "custom_message"
-                | "model_change"
-                | "thinking_level_change" => parse_control_entry(&v),
-                // Session-level facts with a first-class home; the record itself only rides under
-                // `complete`, as the notice the user saw.
-                "session_info" => {
-                    let name = v.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty());
-                    if let Some(name) = name {
-                        // Discovery already applied OpenClaw's own precedence (store label /
-                        // display_name first, then this name — what its session list shows), so a
-                        // titled ref keeps its title and `cv ls` and `cv show` agree; the name is
-                        // still first-class in the bag. A bare JSONL parse has no ref title.
-                        if s.title.is_none() {
-                            s.title = Some(crate::ir::truncate(name, 80));
-                        }
-                        s.harness_extra_mut(Harness::OpenClaw)
-                            .insert("session_name".into(), Value::from(name));
-                    }
-                    notice_if_complete(&v, opts, format!("[session named: {}]", name.unwrap_or("")))
-                }
-                "label" => {
-                    let target = v.get("targetId").and_then(Value::as_str);
-                    let label = v.get("label").and_then(Value::as_str);
-                    if let (Some(target), Some(label)) = (target, label) {
-                        let labels = s
-                            .harness_extra_mut(Harness::OpenClaw)
-                            .entry("labels")
-                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                        if let Some(map) = labels.as_object_mut() {
-                            map.insert(target.to_string(), Value::from(label));
-                        }
-                    }
-                    notice_if_complete(
-                        &v,
-                        opts,
-                        format!("[label {}: {}]", target.unwrap_or(""), label.unwrap_or("")),
-                    )
-                }
-                // `custom` (extension state, not in context), `leaf` navigation controls and anything
-                // newer: bookkeeping, carried only under `complete`.
-                _ => carrier_if_complete(&v, opts),
+        if let Some(name) = record.session_name {
+            // Discovery already applied OpenClaw's own precedence (store label / display_name
+            // first, then this name — what its session list shows), so a titled ref keeps its
+            // title and `cv ls` and `cv show` agree; the name is still first-class in the bag.
+            if s.title.is_none() {
+                s.title = Some(crate::ir::truncate(&name, 80));
             }
-        };
-        if opts.complete && msgs.is_empty() {
-            msgs = carrier_if_complete(&v, opts);
+            s.harness_extra_mut(Harness::OpenClaw)
+                .insert("session_name".into(), Value::from(name));
         }
+        if let Some((target, label)) = record.label {
+            let labels = s
+                .harness_extra_mut(Harness::OpenClaw)
+                .entry("labels")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(map) = labels.as_object_mut() {
+                map.insert(target, Value::from(label));
+            }
+        }
+        let mut msgs = record.messages;
         for (i, m) in msgs.iter_mut().enumerate() {
             // A cron run's or a sub-agent's prompts were written by the scheduler / the parent
             // agent, not typed: the session key says which.
-            if let Some(o) = prompt_origin {
+            if let Some(o) = self.prompt_origin {
                 if m.kind == MessageKind::Prompt && m.origin == Origin::Human {
                     m.origin = o;
                 }
@@ -480,11 +424,11 @@ fn stream_rows<I: Iterator<Item = Row>>(
             // The branch selection's normalized parent applies to the entry's own turn; a second
             // turn split off the same entry (a compaction summary) already points at the first.
             if i == 0 {
-                if let Some(parent) = &row.parent {
+                if let Some(parent) = &parent {
                     m.parent_id = parent.clone();
                 }
             }
-            if !row.active {
+            if !active {
                 m.harness_extra_mut(Harness::OpenClaw)
                     .insert("inactive_branch".into(), Value::Bool(true));
             }
@@ -507,29 +451,36 @@ fn stream_rows<I: Iterator<Item = Row>>(
             }
             // Stash the transcript schema version on the first message so a downstream consumer
             // can tell v1/v2 (linear) from v3/v4 (parent-linked) sessions.
-            if let Some(ver) = header_version.take() {
+            if let Some(ver) = self.header_version.take() {
                 m.harness_extra_mut(Harness::OpenClaw)
                     .insert("session_version".into(), Value::from(ver));
             }
         }
-        if let Some(record) = native_record.filter(|_| v.is_object()) {
-            CompleteRecord::attach_replay(&mut msgs, Harness::OpenClaw, record, serde_json::Map::new());
+        if let Some(native) = record.native {
+            CompleteRecord::attach_replay(&mut msgs, Harness::OpenClaw, native, serde_json::Map::new());
         }
-        for m in msgs {
+        for mut m in msgs {
+            if let Some(resolver) = &self.owned {
+                m.materialize(resolver)?;
+            }
             // Hand session metadata to the sink before the first message (header consumers).
-            if !meta_sent {
-                sink.meta(&s);
-                meta_sent = true;
+            if !self.meta_sent {
+                sink.meta(s);
+                self.meta_sent = true;
             }
             if sink.message(m) == Flow::Stop {
-                return s;
+                return Ok(Flow::Stop);
             }
         }
+        Ok(Flow::Continue)
     }
-    if !meta_sent {
-        sink.meta(&s);
+
+    fn finish(self, sink: &mut dyn MessageSink) -> Session {
+        if !self.meta_sent {
+            sink.meta(&self.s);
+        }
+        self.s
     }
-    s
 }
 
 /// What the store's index says about a session beyond its transcript: its session key (`sessions.json`
@@ -559,10 +510,8 @@ impl KeyFacts {
     }
 }
 
-/// Whether `text` records `key` as a spawned child: a `childSessionKey` field (plain, or JSON-escaped
-/// inside a tool result's text) right before an occurrence of the key. A bare mention, such as a
-/// `sessions_list` result, does not count.
-#[cfg(any(feature = "sqlite", test))]
+/// Whether `text` records `key` as a spawned child ([`ChildMarker`]'s policy over one string).
+#[cfg(test)]
 fn names_child(text: &str, key: &str) -> bool {
     text.match_indices(key).any(|(i, _)| {
         let start = text.floor_char_boundary(i.saturating_sub(24));
@@ -570,30 +519,60 @@ fn names_child(text: &str, key: &str) -> bool {
     })
 }
 
-/// Preserve the lexical child marker policy and whole-file UTF-8 rejection while
-/// scanning bounded chunks. A marker and its key may cross any chunk boundary.
+/// Whether bytes fed in any chunking record `key` as a spawned child: a `childSessionKey` field
+/// (plain, or JSON-escaped inside a tool result's text) within 24 bytes before an occurrence of
+/// the key. A bare mention, such as a `sessions_list` result, does not count. A marker and its key
+/// may cross any chunk boundary; only a key-sized window is retained.
+struct ChildMarker<'a> {
+    key: &'a str,
+    window: Vec<u8>,
+    found: bool,
+}
+impl<'a> ChildMarker<'a> {
+    fn new(key: &'a str) -> Self {
+        ChildMarker {
+            key,
+            window: Vec::new(),
+            found: false,
+        }
+    }
+    fn feed(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(64 * 1024) {
+            if self.found {
+                return;
+            }
+            self.window.extend_from_slice(chunk);
+            self.found = memchr::memmem::find_iter(&self.window, self.key.as_bytes())
+                .any(|at| memchr::memmem::find(&self.window[at.saturating_sub(24)..at], b"childSessionKey").is_some());
+            let keep = self.key.len().saturating_add(24);
+            let start = self.window.len().saturating_sub(keep);
+            self.window.copy_within(start.., 0);
+            self.window.truncate(self.window.len() - start);
+        }
+    }
+}
+impl std::io::Write for ChildMarker<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.feed(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// [`ChildMarker`] over a candidate transcript, with whole-file UTF-8 rejection.
 fn names_child_file(path: &Path, key: &str) -> Result<bool> {
     use super::store::jsonl::ranges;
     use std::io::Read;
     struct Scan<'a, R> {
         reader: R,
-        key: &'a str,
-        window: Vec<u8>,
-        found: bool,
+        marker: ChildMarker<'a>,
     }
     impl<R: Read> Read for Scan<'_, R> {
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
             let length = self.reader.read(bytes)?;
-            if !self.found {
-                self.window.extend_from_slice(&bytes[..length]);
-                self.found = memchr::memmem::find_iter(&self.window, self.key.as_bytes()).any(|at| {
-                    memchr::memmem::find(&self.window[at.saturating_sub(24)..at], b"childSessionKey").is_some()
-                });
-                let keep = self.key.len().saturating_add(24);
-                let start = self.window.len().saturating_sub(keep);
-                self.window.copy_within(start.., 0);
-                self.window.truncate(self.window.len() - start);
-            }
+            self.marker.feed(&bytes[..length]);
             Ok(length)
         }
     }
@@ -604,15 +583,13 @@ fn names_child_file(path: &Path, key: &str) -> Result<bool> {
     };
     let scanner = Scan {
         reader: ranges::reader(&file, range)?,
-        key,
-        window: Vec::new(),
-        found: false,
+        marker: ChildMarker::new(key),
     };
     let mut reader = BufReader::with_capacity(64 * 1024, scanner);
     // Keep consuming after a match: invalid UTF-8 anywhere made the original read_to_string
     // reject this candidate, including in a suffix after a perfectly valid spawn result.
     let valid = ranges::valid_utf8(&mut reader)?;
-    Ok(valid && reader.into_inner().found)
+    Ok(valid && reader.into_inner().marker.found)
 }
 
 /// [`KeyFacts`] from the `sessions.json` beside a JSONL transcript. A key names a *current* session
@@ -911,23 +888,13 @@ fn plain_parent_scan(conn: &rusqlite::Connection, key: &str, current: &str) -> R
 /// [`KeyFacts`] from `session_windows`. The spawner is the window under `spawned_by` — when that key
 /// has several windows (resets, rollovers), the one whose transcript records this session's key as `childSessionKey`.
 #[cfg(feature = "sqlite")]
-fn sqlite_key_facts_scoped(
+fn sqlite_key_facts(
     conn: &rusqlite::Connection,
     r: &SessionRef,
     reads: &crate::source::ReadSet,
+    events: &Events,
 ) -> Result<KeyFacts> {
-    sqlite_key_facts_inner(conn, &r.id, Some((&r.path, reads)))
-}
-#[cfg(all(feature = "sqlite", test))]
-fn sqlite_key_facts(conn: &rusqlite::Connection, id: &str) -> Result<KeyFacts> {
-    sqlite_key_facts_inner(conn, id, None)
-}
-#[cfg(feature = "sqlite")]
-fn sqlite_key_facts_inner(
-    conn: &rusqlite::Connection,
-    session_id: &str,
-    scoped: Option<(&Path, &crate::source::ReadSet)>,
-) -> Result<KeyFacts> {
+    let (session_id, path) = (r.id.as_str(), r.path.as_path());
     let cols = super::store::sqlite::columns(conn, "session_windows");
     if !cols.contains("session_key") {
         return Ok(KeyFacts::default());
@@ -965,9 +932,9 @@ fn sqlite_key_facts_inner(
             });
             Ok(candidates)
         };
-        let candidates = if let Some((path, reads)) = scoped {
-            // Query plans can vary by parameter with SQLite statistics. Check the actual key's
-            // plan rather than applying one plain scan's traversal order to an indexed key.
+        // Query plans can vary by parameter with SQLite statistics. Check the actual key's
+        // plan rather than applying one plain scan's traversal order to an indexed key.
+        let candidates = {
             let mut encoded_plan_key = String::with_capacity(by.len() * 2);
             use std::fmt::Write as _;
             for byte in by.as_bytes() {
@@ -1006,23 +973,29 @@ fn sqlite_key_facts_inner(
                 })?
                 .0
             }
-        } else {
-            std::sync::Arc::new(load()?)
         };
         parent = if candidates.len() == 1 {
             candidates.first().cloned()
         } else {
-            let mut events = EventReader::new(conn)?;
             let mut found = None;
             for c in candidates.iter() {
-                let mut entries = events.rows(c, parse_line)?;
                 // Keep reading after finding the child so a later SQL error still fails the
                 // lookup, as it did when this collected the candidate's complete transcript.
                 let mut names = false;
-                for (_, v) in entries.by_ref() {
-                    names |= names_child(&v.to_string(), &key);
-                }
-                entries.finish()?;
+                events.each(conn, c, |cell| {
+                    if let (false, Some(cell)) = (names, cell) {
+                        names = events
+                            .cells
+                            .read(cell, |view| {
+                                // The record's compact serialization, as a parsed event prints.
+                                let mut marker = ChildMarker::new(&key);
+                                view.write_canonical(&mut marker)?;
+                                Ok(marker.found)
+                            })?
+                            .unwrap_or(false);
+                    }
+                    Ok(Flow::Continue)
+                })?;
                 if names {
                     found = Some(c.clone());
                     break;
@@ -1036,119 +1009,6 @@ fn sqlite_key_facts_inner(
         spawned_by,
         parent,
     })
-}
-
-/// A System turn for a non-`message` entry: id / parent / timestamp from the entry, and — in the
-/// harness bag — `record_type` plus every field the entry carries besides the structural ones and
-/// the `summary`/`content` that become the turn's text, snake_cased.
-fn entry_message(v: &Value, ty: &str, kind: MessageKind, origin: Origin) -> Message {
-    let mut m = Message::of_kind(Role::System, kind, origin);
-    m.id = v.get("id").and_then(Value::as_str).map(str::to_string);
-    m.parent_id = v.get("parentId").and_then(Value::as_str).map(str::to_string);
-    m.timestamp = entry_timestamp(v);
-    let bag = m.harness_extra_mut(Harness::OpenClaw);
-    bag.insert("record_type".into(), Value::from(ty));
-    if let Some(obj) = v.as_object() {
-        for (key, val) in obj {
-            if matches!(
-                key.as_str(),
-                "type" | "id" | "parentId" | "timestamp" | "summary" | "content"
-            ) || val.is_null()
-            {
-                continue;
-            }
-            bag.insert(snake(key), val.clone());
-        }
-    }
-    m
-}
-
-/// A non-`message` canonical entry that carries context or a boundary the reader should see, as
-/// the kinds vocabulary has it: `compaction` → a `CompactionBoundary` (the entry's own fields:
-/// `first_kept_entry_id`, `tokens_before`, `from_hook`, `details`) followed by the
-/// `CompactionSummary` that replaced the compacted span; `reset` → `Branch`; `model_change` /
-/// `thinking_level_change` → `ModelChange`; `branch_summary` / `custom_message` (extension text
-/// that IS in model context) → `Notice`. All origin Harness.
-fn parse_control_entry(v: &Value) -> Vec<Message> {
-    let Some(ty) = v.get("type").and_then(Value::as_str) else {
-        return Vec::new();
-    };
-    let kind = match ty {
-        "compaction" => MessageKind::CompactionBoundary,
-        "reset" => MessageKind::Branch,
-        "model_change" | "thinking_level_change" => MessageKind::ModelChange,
-        "branch_summary" | "custom_message" => MessageKind::Notice,
-        _ => return Vec::new(),
-    };
-    let mut m = entry_message(v, ty, kind, Origin::Harness);
-    let str_of = |k: &str| v.get(k).and_then(Value::as_str);
-    let text = match ty {
-        "compaction" => "[conversation compacted]".to_string(),
-        "branch_summary" => str_of("summary").unwrap_or("").to_string(),
-        "reset" => format!("[session reset: {}]", str_of("reason").unwrap_or("reset")),
-        "model_change" => {
-            let model = str_of("modelId").unwrap_or("");
-            m.model = (!model.is_empty()).then(|| model.to_string());
-            match str_of("provider") {
-                Some(p) if !p.is_empty() => format!("[model: {p}/{model}]"),
-                _ => format!("[model: {model}]"),
-            }
-        }
-        "thinking_level_change" => match str_of("thinkingLevel") {
-            Some(level) => format!("[thinking level: {level}]"),
-            None => "[thinking level changed]".to_string(),
-        },
-        _ => text_parts(v.get("content")),
-    };
-    if !text.is_empty() {
-        m.content.push(Block::Text { text: text.into() });
-    }
-    let mut out = vec![m];
-    if ty == "compaction" {
-        let summary = str_of("summary").unwrap_or("");
-        if !summary.trim().is_empty() {
-            let mut sm = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
-            sm.parent_id = v.get("id").and_then(Value::as_str).map(str::to_string);
-            sm.timestamp = entry_timestamp(v);
-            sm.content.push(Block::Text {
-                text: summary.to_string().into(),
-            });
-            sm.harness_extra_mut(Harness::OpenClaw)
-                .insert("record_type".into(), Value::from(ty));
-            out.push(sm);
-        }
-    }
-    out
-}
-
-/// Under [`ParseOptions::complete`], a bookkeeping entry (`custom`, `leaf`, …) rides along verbatim
-/// as a `Carrier` turn: the raw record at the top-level `_record`, its type in
-/// `extra["openclaw"]["record_type"]`. The lean passes drop it.
-fn carrier_if_complete(v: &Value, opts: &ParseOptions) -> Vec<Message> {
-    if !opts.complete {
-        return Vec::new();
-    }
-    let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-    let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
-    m.id = v.get("id").and_then(Value::as_str).map(str::to_string);
-    m.parent_id = v.get("parentId").and_then(Value::as_str).map(str::to_string);
-    m.timestamp = entry_timestamp(v);
-    m.harness_extra_mut(Harness::OpenClaw)
-        .insert("record_type".into(), Value::from(ty));
-    m.extra.insert(crate::harness::claude::CARRIER_KEY.into(), v.clone());
-    vec![m]
-}
-
-/// Under [`ParseOptions::complete`], a session-fact entry the user saw as a notice (`session_info`,
-/// `label`) rides along as a `Notice` turn with `text`, the raw record at `_record` and its type in
-/// the bag. Lean passes keep only the fact's first-class home.
-fn notice_if_complete(v: &Value, opts: &ParseOptions, text: String) -> Vec<Message> {
-    let mut out = carrier_if_complete(v, opts);
-    if let Some(m) = out.first_mut() {
-        m.kind = MessageKind::Notice;
-        m.content.push(Block::Text { text: text.into() });
-    }
-    out
 }
 
 /// Models OpenClaw writes for transcript-only / bridged turns that should not be reported as the
@@ -1235,383 +1095,6 @@ struct ScanAcc {
     message_count: usize,
 }
 
-impl ScanAcc {
-    #[cfg(any(feature = "sqlite", test))]
-    fn feed(&mut self, v: &Value) {
-        match v.get("type").and_then(Value::as_str) {
-            Some("session") => {
-                if self.id.is_empty() {
-                    self.id = v.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                }
-                if self.cwd.is_none() {
-                    self.cwd = v.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-                }
-                if self.created_at.is_none() {
-                    self.created_at = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
-                }
-            }
-            Some("message") => {
-                // The contract count (`SessionRef::message_count`): user + assistant turns. A
-                // `toolResult` row and the custom roles (`bashExecution`, `compactionSummary`, …)
-                // are messages the store keeps, not turns of the conversation.
-                let role = v.pointer("/message/role").and_then(Value::as_str);
-                if matches!(role, Some("user") | Some("assistant")) {
-                    self.message_count += 1;
-                }
-                if let Some(ts) = entry_timestamp(v) {
-                    self.updated_at = Some(ts);
-                }
-                if self.first_user.is_none() && v.pointer("/message/role").and_then(Value::as_str) == Some("user") {
-                    let t = text_parts(v.pointer("/message/content"));
-                    if !t.trim().is_empty() {
-                        self.first_user = Some(crate::ir::truncate(&t, 80));
-                    }
-                }
-            }
-            // The user-visible session name (`/name`, UI rename): the natural title.
-            Some("session_info") => {
-                if let Some(name) = v.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()) {
-                    self.session_name = Some(crate::ir::truncate(name, 80));
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Title/cwd fields of a `sessions.json` entry / `session_nodes.entry_json` (same shape).
-#[cfg(any(feature = "sqlite", test))]
-fn entry_title(entry: Option<&Value>) -> Option<String> {
-    entry
-        .and_then(|e| e.get("label").or_else(|| e.get("subject")))
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| crate::ir::truncate(s, 80))
-}
-
-#[cfg(any(feature = "sqlite", test))]
-fn entry_cwd(entry: Option<&Value>) -> Option<PathBuf> {
-    entry.and_then(|e| {
-        ["cwd", "spawnedCwd", "spawnedWorkspaceDir"]
-            .iter()
-            .find_map(|k| e.get(*k).and_then(Value::as_str))
-            .map(PathBuf::from)
-    })
-}
-
-/// Prefer the entry-level ISO `timestamp`, fall back to the inner epoch-ms `message.timestamp`.
-fn entry_timestamp(v: &Value) -> Option<DateTime<Utc>> {
-    v.get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(parse_ts)
-        .or_else(|| v.pointer("/message/timestamp").and_then(ts_from_value))
-}
-
-/// A `message` entry → its turn(s). The `compactionSummary` custom role (the pre-`compaction`-entry
-/// form) yields two: the boundary (the entry's id and token counts) and the summary.
-fn parse_entry(v: &Value) -> Vec<Message> {
-    let Some(msg) = v.get("message") else {
-        return Vec::new();
-    };
-    let Some(role_str) = msg.get("role").and_then(Value::as_str) else {
-        return Vec::new();
-    };
-    let (role, kind, origin) = match role_str {
-        "user" => (Role::User, MessageKind::Prompt, Origin::Human),
-        "assistant" => (Role::Assistant, MessageKind::Reply, Origin::Model),
-        "toolResult" => (Role::Tool, MessageKind::ToolResult, Origin::Harness),
-        "system" => (Role::System, MessageKind::SystemPrompt, Origin::Harness),
-        // Custom (declaration-merged) message types, as System turns: a `!cmd` run and its output
-        // are flattened into the model's context; the summaries and extension markers are notices
-        // (the compaction summary gets its boundary below).
-        "bashExecution" => (Role::System, MessageKind::InjectedContext, Origin::Harness),
-        "branchSummary" | "custom" => (Role::System, MessageKind::Notice, Origin::Harness),
-        "compactionSummary" => (Role::System, MessageKind::CompactionSummary, Origin::Harness),
-        _ => return Vec::new(),
-    };
-    let provenance = msg.get("provenance").filter(|p| p.is_object());
-    let (kind, origin) = match (role_str, provenance) {
-        ("user", Some(p)) => user_provenance(p),
-        _ => (kind, origin),
-    };
-    let mut m = Message::of_kind(role, kind, origin);
-    m.id = v.get("id").and_then(Value::as_str).map(str::to_string);
-    m.parent_id = v.get("parentId").and_then(Value::as_str).map(str::to_string);
-    m.timestamp = entry_timestamp(v);
-    m.model = msg.get("model").and_then(Value::as_str).map(str::to_string);
-    if let Some(p) = provenance {
-        m.harness_extra_mut(Harness::OpenClaw)
-            .insert("provenance".into(), p.clone());
-    }
-
-    match role_str {
-        "toolResult" => parse_tool_result(&mut m, msg),
-        "assistant" => {
-            parse_content_array(&mut m, msg.get("content"));
-            capture_assistant_meta(&mut m, msg);
-        }
-        "user" | "system" => match msg.get("content") {
-            Some(Value::String(s)) => m.content.push(Block::Text { text: s.clone().into() }),
-            content => parse_content_array(&mut m, content),
-        },
-        "bashExecution" => parse_bash_execution(&mut m, msg),
-        "branchSummary" => parse_branch_summary(&mut m, msg),
-        "compactionSummary" => parse_compaction_summary(&mut m, msg),
-        "custom" => parse_custom(&mut m, msg),
-        _ => {}
-    }
-
-    if m.content.is_empty() && m.extra.is_empty() {
-        return Vec::new();
-    }
-    if role_str != "compactionSummary" {
-        return vec![m];
-    }
-    // The old single-record form: the record IS the compaction. The boundary keeps the entry's id
-    // (what a later `firstKeptEntryId` / label points at) and counts; the summary hangs off it.
-    let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
-    boundary.id = m.id.take();
-    boundary.parent_id = m.parent_id.take();
-    boundary.timestamp = m.timestamp;
-    boundary.extra = std::mem::take(&mut m.extra);
-    boundary.content.push(Block::Text {
-        text: "[conversation compacted]".into(),
-    });
-    m.parent_id = boundary.id.clone();
-    m.harness_extra_mut(Harness::OpenClaw)
-        .insert("message_role".into(), Value::from(role_str));
-    vec![boundary, m]
-}
-
-/// A user message OpenClaw wrote on someone else's behalf carries `provenance` (`InputProvenance`,
-/// `src/sessions/input-provenance.ts`; not yet in 2026.1.29, present by `0e9181234a`): `inter_session` is a
-/// message from another session (`sourceSessionKey`), and a sub-agent's announce to its requester is
-/// its return; `internal_system` with `sourceTool: "cron"` is a cron run's prompt.
-fn user_provenance(p: &Value) -> (MessageKind, Origin) {
-    let field = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("");
-    match field("kind") {
-        "inter_session"
-            if field("sourceRole") == "subagent" || field("sourceSessionKey").split(':').nth(2) == Some("subagent") =>
-        {
-            (MessageKind::SubagentReturn, Origin::Subagent)
-        }
-        "inter_session" => (MessageKind::Prompt, Origin::Subagent),
-        "internal_system" if field("sourceTool") == "cron" => (MessageKind::Prompt, Origin::Scheduler),
-        "internal_system" => (MessageKind::InjectedContext, Origin::Harness),
-        _ => (MessageKind::Prompt, Origin::Human),
-    }
-}
-
-fn parse_tool_result(m: &mut Message, msg: &Value) {
-    let tool_use_id = msg.get("toolCallId").and_then(Value::as_str).unwrap_or("").to_string();
-    // `toolName` and the arbitrary structured `details` payload (diffs, file lists) live on the
-    // block, where every harness puts them.
-    m.content.push(Block::ToolResult {
-        tool_use_id,
-        content: text_parts(msg.get("content")).into(),
-        is_error: msg.get("isError").and_then(Value::as_bool).unwrap_or(false),
-        tool_name: msg.get("toolName").and_then(Value::as_str).map(str::to_string),
-        status: None,
-        details: msg.get("details").filter(|d| !d.is_null()).cloned(),
-    });
-    // Image parts in a tool result aren't captured by the text coercion above; surface them.
-    if let Some(Value::Array(items)) = msg.get("content") {
-        for item in items {
-            if item.get("type").and_then(Value::as_str) == Some("image") {
-                if let Some(b) = content_block(item) {
-                    m.content.push(b);
-                }
-            }
-        }
-    }
-}
-
-/// Parse a `(TextContent|ThinkingContent|ToolCall|ImageContent)[]` content array.
-fn parse_content_array(m: &mut Message, content: Option<&Value>) {
-    if let Some(Value::Array(items)) = content {
-        for item in items {
-            if let Some(b) = content_block(item) {
-                m.content.push(b);
-            }
-        }
-    }
-}
-
-/// Capture assistant-level metadata (provider/api/model/usage/stop/diagnostics) into the harness
-/// bag, and an API failure into the `Error` kind (`extra["openclaw"]["error"]`).
-fn capture_assistant_meta(m: &mut Message, msg: &Value) {
-    let failed = msg
-        .get("errorMessage")
-        .and_then(Value::as_str)
-        .is_some_and(|e| !e.is_empty())
-        || msg.get("stopReason").and_then(Value::as_str) == Some("error");
-    if let Some(usage) = msg.get("usage") {
-        m.usage = parse_usage(usage);
-    }
-    let mut bag = serde_json::Map::new();
-    for key in [
-        "api",
-        "provider",
-        "responseModel",
-        "responseId",
-        "stopReason",
-        "diagnostics",
-    ] {
-        if let Some(val) = msg.get(key) {
-            if !val.is_null() {
-                bag.insert(snake(key), val.clone());
-            }
-        }
-    }
-    if let Some(usage) = msg.get("usage") {
-        // The full usage object also carries per-bucket cost and `contextUsage`; keep it verbatim.
-        bag.insert("usage_raw".into(), usage.clone());
-    }
-    if failed {
-        let mut err = serde_json::Map::new();
-        for key in ["errorMessage", "errorCode", "errorType"] {
-            if let Some(val) = msg.get(key).filter(|v| !v.is_null()) {
-                err.insert(snake(key), val.clone());
-            }
-        }
-        bag.insert("error".into(), Value::Object(err));
-        m.kind = MessageKind::Error;
-        m.origin = Origin::Harness;
-    }
-    if !bag.is_empty() {
-        m.harness_extra_mut(Harness::OpenClaw).extend(bag);
-    }
-}
-
-/// `usage{input, output, cacheRead, cacheWrite, totalTokens, cost{…, total}}` → [`Usage`].
-fn parse_usage(usage: &Value) -> Option<Usage> {
-    let get = |k: &str| usage.get(k).and_then(Value::as_u64);
-    let u = Usage {
-        input_tokens: get("input"),
-        output_tokens: get("output"),
-        cache_read_tokens: get("cacheRead"),
-        cache_creation_tokens: get("cacheWrite"),
-        cost_usd: usage.pointer("/cost/total").and_then(Value::as_f64),
-        ..Usage::default()
-    };
-    let any = u.input_tokens.is_some()
-        || u.output_tokens.is_some()
-        || u.cache_read_tokens.is_some()
-        || u.cache_creation_tokens.is_some()
-        || u.cost_usd.is_some();
-    any.then_some(u)
-}
-
-/// The custom message roles keep their role name and fields in the harness bag.
-fn custom_role_bag<'a>(
-    m: &'a mut Message,
-    role: &str,
-    msg: &Value,
-    keys: &[&str],
-) -> &'a mut serde_json::Map<String, Value> {
-    let bag = m.harness_extra_mut(Harness::OpenClaw);
-    bag.insert("message_role".into(), Value::from(role));
-    for key in keys {
-        if let Some(val) = msg.get(*key) {
-            if !val.is_null() {
-                bag.insert(snake(key), val.clone());
-            }
-        }
-    }
-    bag
-}
-
-fn parse_bash_execution(m: &mut Message, msg: &Value) {
-    let command = msg.get("command").and_then(Value::as_str).unwrap_or("");
-    let output = msg.get("output").and_then(Value::as_str).unwrap_or("");
-    let mut text = format!("$ {command}");
-    if !output.is_empty() {
-        text.push('\n');
-        text.push_str(output);
-    }
-    m.content.push(Block::Text { text: text.into() });
-    custom_role_bag(
-        m,
-        "bashExecution",
-        msg,
-        &[
-            "exitCode",
-            "cancelled",
-            "truncated",
-            "fullOutputPath",
-            "excludeFromContext",
-        ],
-    );
-}
-
-fn parse_branch_summary(m: &mut Message, msg: &Value) {
-    let summary = msg.get("summary").and_then(Value::as_str).unwrap_or("");
-    m.content.push(Block::Text {
-        text: summary.to_string().into(),
-    });
-    let bag = custom_role_bag(m, "branchSummary", msg, &[]);
-    if let Some(from_id) = msg.get("fromId").and_then(Value::as_str) {
-        bag.insert("branch_from_id".into(), Value::from(from_id));
-    }
-}
-
-fn parse_compaction_summary(m: &mut Message, msg: &Value) {
-    let summary = msg.get("summary").and_then(Value::as_str).unwrap_or("");
-    m.content.push(Block::Text {
-        text: summary.to_string().into(),
-    });
-    custom_role_bag(
-        m,
-        "compactionSummary",
-        msg,
-        &["tokensBefore", "tokensAfter", "firstKeptEntryId"],
-    );
-}
-
-fn parse_custom(m: &mut Message, msg: &Value) {
-    let text = text_parts(msg.get("content"));
-    if !text.is_empty() {
-        m.content.push(Block::Text { text: text.into() });
-    }
-    let bag = custom_role_bag(m, "custom", msg, &["display"]);
-    if let Some(ct) = msg.get("customType").and_then(Value::as_str) {
-        bag.insert("custom_type".into(), Value::from(ct));
-    }
-    if let Some(details) = msg.get("details").filter(|d| !d.is_null()) {
-        bag.insert("custom_details".into(), details.clone());
-    }
-}
-
-/// One `(TextContent|ThinkingContent|ToolCall|ImageContent)` item → IR: the Anthropic shape under
-/// OpenClaw's keys; `redacted` flags a server-redacted reasoning block.
-fn content_block(item: &Value) -> Option<Block> {
-    let mut b = anthropic::block_from(item, &anthropic::OPENCLAW)?;
-    if let Block::Thinking {
-        encrypted, redacted, ..
-    } = &mut b
-    {
-        if item.get("redacted").and_then(Value::as_bool).unwrap_or(false) {
-            *redacted = true;
-            *encrypted = Some("redacted".to_string());
-        }
-    }
-    Some(b)
-}
-
-/// camelCase → snake_case for `extra` keys (ASCII only; OpenClaw keys are all ASCII).
-fn snake(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
-    for c in s.chars() {
-        if c.is_ascii_uppercase() {
-            out.push('_');
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // SQLite store (OpenClaw ≥ 2026-07-11)
 // ---------------------------------------------------------------------------
@@ -1653,26 +1136,35 @@ fn discover_sqlite(db: &Path) -> Result<Vec<SessionRef>> {
                 row.get(7)?,
             ))
         })?;
-        let mut events = EventReader::new(conn)?;
+        let events = Events::new(conn, db, conn.reads())?;
         let mut out = Vec::new();
         for row in rows {
             let (session_id, created, updated, transcript_updated, w_display, n_label, n_display, entry_json) = row?;
             let mut acc = ScanAcc::default();
-            let mut entries = events.rows(&session_id, parse_line)?;
-            for (_, v) in entries.by_ref() {
-                acc.feed(&v);
-            }
-            entries.finish()?;
-            let entry: Option<Value> = entry_json.as_deref().and_then(|e| serde_json::from_str(e).ok());
+            events.each(conn, &session_id, |cell| {
+                if let Some(cell) = cell {
+                    events.cells.read(cell, |view| discovery::feed(view, &mut acc))?;
+                }
+                Ok(Flow::Continue)
+            })?;
+            // `entry_json` is the old `sessions.json` entry, read by the same entry decoder.
+            let entry = entry_json
+                .as_deref()
+                .and_then(|e| serde_json::from_str::<Value>(e).ok());
+            let entry = entry
+                .as_ref()
+                .map(|e| discovery::entry(crate::json::JsonView::from(e)))
+                .transpose()?
+                .unwrap_or_default();
             let title = n_label
                 .or(n_display)
                 .or(w_display)
                 .filter(|t| !t.trim().is_empty())
                 .map(|t| crate::ir::truncate(&t, 80))
-                .or_else(|| entry_title(entry.as_ref()))
+                .or(entry.title)
                 .or(acc.session_name)
                 .or(acc.first_user);
-            let cwd = acc.cwd.or_else(|| entry_cwd(entry.as_ref()));
+            let cwd = acc.cwd.or(entry.cwd);
             out.push(SessionRef {
                 id: session_id,
                 harness: Harness::OpenClaw,
@@ -1691,176 +1183,106 @@ fn discover_sqlite(db: &Path) -> Result<Vec<SessionRef>> {
     })
 }
 
-/// Reads one window's `transcript_events` in `seq` order. Since OpenClaw added payload compression
-/// (`transcript-payload.ts`, after `0e9181234a`), an event of at least 1 KiB is stored as a zstd frame
-/// of its UTF-8 JSON in `event_zstd` with `event_json` NULL (plus a `navigation_json` projection
-/// cv does not need); smaller ones stay in `event_json`. A row that decodes to nothing is counted
-/// (`extra["cv"]["skipped_lines"]`), never silently dropped.
+/// One window's `transcript_events` cells in `seq` order, each copied once into one [`Cells`]
+/// arena. Since OpenClaw added payload compression (`transcript-payload.ts`, after `0e9181234a`),
+/// an event of at least 1 KiB is stored as a zstd frame of its UTF-8 JSON in `event_zstd` with
+/// `event_json` NULL (plus a `navigation_json` projection cv does not need); smaller ones stay in
+/// `event_json`. A row that decodes to nothing is counted (`extra["cv"]["skipped_lines"]`), never
+/// silently dropped.
 #[cfg(feature = "sqlite")]
-struct EventReader<'c> {
-    stmt: rusqlite::Statement<'c>,
+struct Events {
+    cells: super::store::sqlite::Cells,
+    sql: String,
 }
 
 #[cfg(feature = "sqlite")]
-impl<'c> EventReader<'c> {
-    fn new(conn: &'c rusqlite::Connection) -> Result<Self> {
-        let zstd = super::store::sqlite::columns(conn, "transcript_events").contains("event_zstd");
-        let sql = if zstd {
-            "SELECT seq, event_json, event_zstd FROM transcript_events WHERE session_id = ?1 ORDER BY seq ASC"
+impl Events {
+    const TABLE: &'static str = "transcript_events";
+
+    fn new(conn: &rusqlite::Connection, path: &Path, reads: &crate::source::ReadSet) -> Result<Self> {
+        let cells = super::store::sqlite::Cells::new(conn, path, reads, Self::TABLE)?;
+        let compressed = if super::store::sqlite::columns(conn, Self::TABLE).contains("event_zstd") {
+            cells.select("event_zstd")
         } else {
-            "SELECT seq, event_json, NULL FROM transcript_events WHERE session_id = ?1 ORDER BY seq ASC"
+            "NULL, NULL".into()
         };
-        Ok(EventReader {
-            stmt: conn.prepare(sql)?,
-        })
+        let sql = format!(
+            "SELECT {}, {compressed} FROM transcript_events WHERE session_id = ?1 ORDER BY seq ASC",
+            cells.select("event_json")
+        );
+        Ok(Events { cells, sql })
     }
 
-    fn rows(&mut self, session_id: &str, parse: fn(&str) -> Option<Value>) -> Result<EventRows<'_>> {
-        Ok(EventRows {
-            rows: self.stmt.query([session_id])?,
-            parse,
-            skipped: 0,
-            error: None,
-        })
-    }
-
-    fn point(conn: &'c rusqlite::Connection) -> Result<Self> {
-        let zstd = super::store::sqlite::columns(conn, "transcript_events").contains("event_zstd");
-        let payload = if zstd {
-            "event_json, event_zstd"
-        } else {
-            "event_json, NULL"
-        };
-        Ok(Self {
-            stmt: conn.prepare(&format!(
-                "SELECT seq, {payload} FROM transcript_events WHERE session_id = ?1 AND seq = ?2"
-            ))?,
-        })
-    }
-
-    fn at(&mut self, session_id: &str, seq: i64) -> Result<Option<Value>> {
-        Ok(self.stmt.query_row(rusqlite::params![session_id, seq], |row| {
-            decode_event_row(row, parse_line).map(|(_, v)| v)
-        })?)
+    /// Visit each row's event cell: a TEXT `event_json`, else a valid `event_zstd` frame decoded,
+    /// else None.
+    fn each(
+        &self,
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        mut visit: impl FnMut(Option<super::store::sqlite::Cell>) -> Result<Flow>,
+    ) -> Result<()> {
+        let mut statement = conn.prepare_cached(&self.sql)?;
+        let mut rows = statement.query([session_id])?;
+        while let Some(row) = rows.next()? {
+            let cell = match self.cells.cell(conn, Self::TABLE, "event_json", row, 0)? {
+                Some(cell) => Some(cell),
+                None => {
+                    let mut invalid = false;
+                    let cell = self.cells.blob(conn, Self::TABLE, "event_zstd", row, 2, |input, out| {
+                        unzstd(input, out, &mut invalid)
+                    })?;
+                    cell.filter(|_| !invalid)
+                }
+            };
+            if visit(cell)? == Flow::Stop {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
+/// One zstd frame from `input` to `out`. A codec rejection sets `invalid` (the row is skipped); a
+/// failure to read the cell or write the arena is an error.
 #[cfg(feature = "sqlite")]
-fn decode_event_row(
-    row: &rusqlite::Row<'_>,
-    parse: fn(&str) -> Option<Value>,
-) -> rusqlite::Result<(i64, Option<Value>)> {
-    let seq = row.get(0)?;
-    // SQLite owns these bytes for the lifetime of the row. Parse them before advancing rather
-    // than copying every TEXT/BLOB cell into Rust, including on the navigation-only pass.
-    let json = row.get_ref(1)?;
-    let zstd = row.get_ref(2)?;
-    let text = json
-        .as_str_or_null()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, json.data_type(), Box::new(e)))?;
-    let compressed = zstd
-        .as_blob_or_null()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, zstd.data_type(), Box::new(e)))?;
-    let value = match (text, compressed) {
-        (Some(text), _) => parse(text),
-        (None, Some(z)) => decompress_zstd(z).and_then(|bytes| std::str::from_utf8(&bytes).ok().and_then(parse)),
-        (None, None) => None,
+fn unzstd(input: &mut dyn std::io::BufRead, out: &mut dyn std::io::Write, invalid: &mut bool) -> Result<()> {
+    use std::{cell::RefCell, io::Read};
+    struct Checked<'a, 'b> {
+        inner: &'a mut dyn std::io::BufRead,
+        failure: &'b RefCell<Option<std::io::Error>>,
+    }
+    impl Read for Checked<'_, '_> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(bytes).inspect_err(|error| {
+                *self.failure.borrow_mut() = Some(std::io::Error::new(error.kind(), error.to_string()));
+            })
+        }
+    }
+    let failure = RefCell::<Option<std::io::Error>>::new(None);
+    let source_failed = || -> Result<()> {
+        match failure.borrow_mut().take() {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     };
-    Ok((seq, value))
-}
-
-/// The tree selector needs only these fields. Validate everything else without owning its
-/// strings, arrays or objects. Unlike `IgnoredAny`, this retains Value's number-range and nesting
-/// checks, so an unreadable payload stays an unreadable row in the navigation pass too.
-#[cfg(feature = "sqlite")]
-fn navigation_line(text: &str) -> Option<Value> {
-    struct Navigation;
-    impl<'de> serde::de::Visitor<'de> for Navigation {
-        type Value = Value;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("an event object")
-        }
-
-        fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> std::result::Result<Value, M::Error> {
-            let mut out = serde_json::Map::new();
-            while let Some(key) = map.next_key::<String>()? {
-                if matches!(
-                    key.as_str(),
-                    "type" | "id" | "parentId" | "targetId" | "appendParentId" | "appendMode" | "firstKeptEntryId"
-                ) {
-                    out.insert(key, map.next_value()?);
-                } else {
-                    map.next_value::<DiscardValue>()?;
-                }
-            }
-            Ok(Value::Object(out))
-        }
-    }
-    use serde::de::Deserializer as _;
-    let mut de = serde_json::Deserializer::from_str(text);
-    match (&mut de).deserialize_map(Navigation) {
-        Ok(v) if de.end().is_ok() => Some(v),
-        // Complete mode also carries valid non-object JSON records. Their source value is read
-        // later; a null projection has the same (absent) navigation fields.
-        _ => serde_json::from_str::<DiscardValue>(text).ok().map(|_| Value::Null),
-    }
-}
-
-#[cfg(feature = "sqlite")]
-use super::store::DiscardValue;
-
-/// A SQLite cursor whose decoded payload is dropped before the next row. Keep SQL errors apart
-/// from unreadable payloads: the latter are tolerated, while callers must check `finish` even if
-/// their sink stopped early.
-#[cfg(feature = "sqlite")]
-struct EventRows<'s> {
-    rows: rusqlite::Rows<'s>,
-    parse: fn(&str) -> Option<Value>,
-    skipped: u64,
-    error: Option<rusqlite::Error>,
-}
-
-#[cfg(feature = "sqlite")]
-impl Iterator for EventRows<'_> {
-    type Item = (i64, Value);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let decoded = (|| -> rusqlite::Result<Option<(i64, Option<Value>)>> {
-                let Some(row) = self.rows.next()? else { return Ok(None) };
-                decode_event_row(row, self.parse).map(Some)
-            })();
-            match decoded {
-                Ok(Some((seq, Some(v)))) => return Some((seq, v)),
-                Ok(Some((_, None))) => self.skipped += 1,
-                Ok(None) => return None,
-                Err(e) => {
-                    self.error = Some(e);
-                    return None;
-                }
+    let Ok(mut decoder) = super::store::zst::decoder(Checked {
+        inner: input,
+        failure: &failure,
+    }) else {
+        *invalid = true;
+        return source_failed();
+    };
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        match decoder.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => out.write_all(&chunk[..n])?,
+            Err(_) => {
+                *invalid = true;
+                return source_failed();
             }
         }
     }
-}
-
-#[cfg(feature = "sqlite")]
-impl EventRows<'_> {
-    fn finish(self) -> Result<u64> {
-        match self.error {
-            Some(e) => Err(e.into()),
-            None => Ok(self.skipped),
-        }
-    }
-}
-
-#[cfg(feature = "sqlite")]
-fn decompress_zstd(data: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Read as _;
-    let mut decoder = ruzstd::decoding::StreamingDecoder::new(data).ok()?;
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).ok()?;
-    Some(out)
 }
 
 #[cfg(not(feature = "sqlite"))]
@@ -1868,8 +1290,9 @@ fn discover_sqlite(_db: &Path) -> Result<Vec<SessionRef>> {
     Ok(Vec::new())
 }
 
-/// Replay one window's `transcript_events` rows (`ORDER BY seq`) through the same entry parser the
-/// JSONL path uses — `event_json` IS the JSONL line.
+/// Replay one window's `transcript_events` rows (`ORDER BY seq`) through the record codec the
+/// JSONL path uses — `event_json` IS the JSONL line. Branch selection reads the navigation fields
+/// of every cell, then decodes only the selected ones.
 #[cfg(feature = "sqlite")]
 fn stream_sqlite(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
     let conn = open_ro(&r.path)?;
@@ -1877,68 +1300,53 @@ fn stream_sqlite(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink
         // Navigation and payload reads must see the same history: a concurrent leaf update cannot
         // change which rows the second pass emits. A deferred read transaction writes no store data.
         let snapshot = conn.unchecked_transaction()?;
-        let facts = sqlite_key_facts_scoped(&snapshot, r, conn.reads())?;
-        // Incremental cell access requires a rowid. Historical WITHOUT ROWID stores keep
-        // the explicit owned compatibility path rather than guessing a different SQL contract.
-        if opts.spans
-            && snapshot
-                .prepare("SELECT _rowid_ FROM transcript_events LIMIT 0")
-                .is_ok()
-        {
-            return selected::sqlite(&snapshot, conn.reads(), r, &facts, opts, sink);
-        }
-        let mut reader = EventReader::new(&snapshot)?;
-        let mut navigation = reader.rows(&r.id, navigation_line)?;
-        let mut has_leaf = false;
-        for (_, v) in navigation.by_ref() {
-            has_leaf |= is_leaf_control(&v);
-        }
-        // Match the original whole-transcript diagnostics even if the sink stops at its first turn.
-        let skipped = navigation.finish()?;
-        let mut s = if has_leaf {
-            // Retain navigation fields only, never the message/tool payloads on abandoned branches.
-            // The selector is shared with JSONL, including complete-mode carriers and normalized parents.
-            let mut navigation = reader.rows(&r.id, navigation_line)?;
-            let mut entries = Vec::new();
-            for (seq, mut v) in navigation.by_ref() {
-                if !v.is_object() {
-                    v = Value::Object(Default::default());
+        let events = Events::new(&snapshot, &r.path, conn.reads())?;
+        let facts = sqlite_key_facts(&snapshot, r, conn.reads(), &events)?;
+        // The whole transcript's diagnostics, even if the sink stops at its first turn.
+        let mut cells = Vec::new();
+        let mut skipped = 0;
+        let mut tree = false;
+        events.each(&snapshot, &r.id, |cell| {
+            match cell
+                .map(|cell| events.cells.read(cell, is_leaf_entry))
+                .transpose()?
+                .flatten()
+            {
+                Some(leaf) => {
+                    cells.push(cell.expect("read cell"));
+                    tree |= leaf;
                 }
-                v.as_object_mut().unwrap().insert("cv_sql_seq".into(), seq.into());
-                entries.push(v);
+                None => skipped += 1,
             }
-            navigation.finish()?;
-            let mut selected = rows_from_values(entries, opts.complete).into_iter();
-            let mut payloads = EventReader::point(&snapshot)?;
-            let mut error = None;
-            let rows = std::iter::from_fn(|| loop {
-                let mut row = selected.next()?;
-                let seq = row.v["cv_sql_seq"]
-                    .as_i64()
-                    .expect("navigation row has its source sequence");
-                match payloads.at(&r.id, seq) {
-                    Ok(Some(v)) => {
-                        row.v = v;
-                        return Some(row);
-                    }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        error = Some(e);
-                        return None;
-                    }
-                }
-            });
-            let s = stream_rows(rows, r, &facts, opts, sink);
-            if let Some(e) = error {
-                return Err(e);
-            }
-            s
-        } else {
-            let mut events = reader.rows(&r.id, parse_line)?;
-            let s = stream_rows(events.by_ref().map(|(_, v)| Row::active(v)), r, &facts, opts, sink);
-            events.finish()?;
-            s
+            Ok(Flow::Continue)
+        })?;
+        let mut fold = Fold::new(r, &facts, opts);
+        let mut emit = |index: usize, active: bool, parent: Option<Option<String>>| -> Result<Flow> {
+            Ok(
+                match events.cells.read(cells[index], |view| record::record(view, opts))? {
+                    Some(record) => fold.push(record, active, parent, sink)?,
+                    None => Flow::Continue,
+                },
+            )
         };
+        if tree {
+            let mut descriptors = Vec::with_capacity(cells.len());
+            for cell in &cells {
+                descriptors.push(events.cells.read(*cell, record::navigation)?.unwrap_or(Value::Null));
+            }
+            for row in select_navigation(&descriptors, opts.complete) {
+                if emit(row.index, row.active, row.parent)? == Flow::Stop {
+                    break;
+                }
+            }
+        } else {
+            for index in 0..cells.len() {
+                if emit(index, true, None)? == Flow::Stop {
+                    break;
+                }
+            }
+        }
+        let mut s = fold.finish(sink);
         super::note_skipped_lines(&mut s, skipped);
         Ok(s)
     })
@@ -2342,22 +1750,6 @@ struct NavigationRow {
     parent: Option<Option<String>>,
 }
 
-#[cfg(any(feature = "sqlite", test))]
-fn select_rows(entries: Vec<Value>, complete: bool) -> Vec<Row> {
-    let selected = select_navigation(&entries, complete);
-    let mut entries: Vec<Option<Value>> = entries.into_iter().map(Some).collect();
-    selected
-        .into_iter()
-        .map(|row| Row {
-            v: entries[row.index].take().expect("navigation selects each entry once"),
-            projected: None,
-            native_record: None,
-            active: row.active,
-            parent: row.parent,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2381,6 +1773,24 @@ mod tests {
         let r = fixture_ref(name);
         let text = fs::read_to_string(&r.path).unwrap_or_else(|e| panic!("reading {}: {e}", r.path.display()));
         parse_text(&text, &r)
+    }
+
+    /// `text` read as a transcript file through the adapter, as `r` (full fidelity, collected).
+    fn parse_text(text: &str, r: &SessionRef) -> Session {
+        parse_text_with(text, r, &ParseOptions::full())
+    }
+
+    fn parse_text_with(text: &str, r: &SessionRef, opts: &ParseOptions) -> Session {
+        let dir = std::env::temp_dir().join(format!("cv-openclaw-text-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut file_ref = r.clone();
+        file_ref.path = dir.join("transcript.jsonl");
+        fs::write(&file_ref.path, text).unwrap();
+        let mut s = collect(&file_ref, opts).unwrap();
+        s.materialize().unwrap();
+        s.source_path = Some(r.path.clone());
+        fs::remove_dir_all(&dir).unwrap();
+        s
     }
 
     /// A v4 transcript with a rewind: `a2` is a sibling answer, the `leaf` control selects `a1`,
@@ -2410,6 +1820,7 @@ mod tests {
         }
         None
     }
+    #[cfg(feature = "sqlite")]
     fn parent_node(id: &str, parent: Option<&str>, control: bool) -> TreeNode {
         TreeNode {
             entry: TreeEntry {
@@ -2423,6 +1834,7 @@ mod tests {
             index: 0,
         }
     }
+    #[cfg(feature = "sqlite")]
     #[test]
     fn canonical_parent_shared_chains_have_linear_visits_including_missing_targets_and_cycles() {
         for terminal in [Some("root"), Some("absent"), None, Some("leaf-0")] {
@@ -2454,6 +1866,7 @@ mod tests {
             );
         }
     }
+    #[cfg(feature = "sqlite")]
     #[test]
     fn canonical_parent_cache_preserves_forward_targets_duplicate_ids_and_cycle_entry_points() {
         let mut nodes = vec![
@@ -2485,6 +1898,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     fn write_store(agents: &Path, session_id: &str, events: &[String]) -> PathBuf {
         let agent_dir = agents.join("main").join("agent");
         fs::create_dir_all(&agent_dir).unwrap();
@@ -2526,83 +1940,32 @@ mod tests {
         d
     }
 
-    #[cfg(feature = "sqlite")]
-    #[test]
-    fn navigation_projection_preserves_tree_selection_and_payload_validation() {
-        for name in ["branchy-v4.jsonl", "reset-and-side-entries.jsonl", "v3-full.jsonl"] {
-            let text = fixture_text(name);
-            let entries: Vec<Value> = text.lines().filter_map(parse_line).collect();
-            let mut projected: Vec<Value> = text.lines().filter_map(navigation_line).collect();
-            assert_eq!(projected.len(), entries.len());
-            for (index, v) in projected.iter_mut().enumerate() {
-                v.as_object_mut().unwrap().insert("source".into(), index.into());
-                assert!(v.get("message").is_none());
-            }
-            for complete in [false, true] {
-                let expected: Vec<_> = rows_from_values(entries.clone(), complete)
-                    .into_iter()
-                    .map(|r| (r.active, r.parent, r.v))
-                    .collect();
-                let actual: Vec<_> = rows_from_values(projected.clone(), complete)
-                    .into_iter()
-                    .map(|r| {
-                        (
-                            r.active,
-                            r.parent,
-                            entries[r.v["source"].as_u64().unwrap() as usize].clone(),
-                        )
-                    })
-                    .collect();
-                assert_eq!(actual, expected, "{name}, complete={complete}");
-            }
-        }
-        let nested = format!("{{\"ignored\":{}0{}}}", "[".repeat(140), "]".repeat(140));
-        for text in [
-            "null",
-            "true",
-            "42",
-            "[]",
-            "\"a string\"",
-            "{}",
-            "{\"ignored\":1e1000}",
-            "{\"ignored\":\"\\uD800\"}",
-            "{\"ignored\": [1,]}",
-            &nested,
-        ] {
-            assert_eq!(navigation_line(text).is_some(), parse_line(text).is_some(), "{text}");
-        }
+    fn collect(r: &SessionRef, opts: &ParseOptions) -> Result<Session> {
+        let mut sink = crate::stream::CollectSink::default();
+        let mut session = OpenClaw { roots: vec![] }.stream(r, opts, &mut sink)?;
+        session.messages = sink.messages;
+        Ok(session)
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
-    fn flat_sqlite_stream_matches_replay_and_counts_late_corruption_on_stop() {
+    fn sqlite_rows_read_like_the_jsonl_lines_they_hold_and_count_late_corruption_on_stop() {
         let agents = tmp_agents();
         let mut events: Vec<String> = fixture_text("v3-full.jsonl").lines().map(str::to_string).collect();
         events.extend(["unreadable".into(), "{\"ignored\":1e1000}".into()]);
         let db = write_store(&agents, "flat", &events);
         let r = discover_sqlite(&db).unwrap().remove(0);
-        let conn = open_ro(&db).unwrap();
-        let facts = sqlite_key_facts(&conn, &r.id).unwrap();
-        let entries: Vec<Value> = events.iter().filter_map(|v| parse_line(v)).collect();
-        for opts in [ParseOptions::lazy(), ParseOptions::full(), ParseOptions::complete()] {
-            let mut expected = crate::stream::CollectSink::default();
-            let mut reference = stream_rows(
-                rows_from_values(entries.clone(), opts.complete).into_iter(),
-                &r,
-                &facts,
-                &opts,
-                &mut expected,
-            );
-            super::super::note_skipped_lines(&mut reference, 2);
-            let mut actual = crate::stream::CollectSink::default();
-            let result = stream_sqlite(&r, &opts, &mut actual).unwrap();
+        let jsonl = agents.join("flat.jsonl");
+        fs::write(&jsonl, events.join("\n")).unwrap();
+        let mut line_ref = r.clone();
+        line_ref.path = jsonl;
+        for opts in [ParseOptions::full(), ParseOptions::complete()] {
+            let rows = collect(&r, &opts).unwrap();
+            let lines = collect(&line_ref, &opts).unwrap();
+            assert_eq!(rows.extra["cv"]["skipped_lines"], 2);
             assert_eq!(
-                serde_json::to_value(&actual.messages).unwrap(),
-                serde_json::to_value(&expected.messages).unwrap()
-            );
-            assert_eq!(
-                serde_json::to_value(&result).unwrap(),
-                serde_json::to_value(&reference).unwrap()
+                serde_json::to_value(&rows.messages).unwrap(),
+                serde_json::to_value(&lines.messages).unwrap()
             );
         }
         struct StopAfterOne(usize);
@@ -2616,15 +1979,12 @@ mod tests {
         let s = stream_sqlite(&r, &ParseOptions::lazy(), &mut sink).unwrap();
         assert_eq!(sink.0, 1);
         assert_eq!(s.extra["cv"]["skipped_lines"], 2);
-        let mut point = EventReader::point(&conn).unwrap();
-        point.at(&r.id, 0).unwrap();
-        assert_eq!(point.stmt.get_status(rusqlite::StatementStatus::FullscanStep), 0);
         fs::remove_dir_all(agents.parent().unwrap()).unwrap();
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
-    fn selected_sqlite_cells_match_owned_branches_complete_and_retained_wal_guards() {
+    fn sqlite_cells_keep_long_text_in_the_store_across_branches_and_retain_wal_guards() {
         for branch in [false, true] {
             let agents = tmp_agents();
             let mut events: Vec<String> = fixture_text(if branch { "branchy-v4.jsonl" } else { "v3-full.jsonl" })
@@ -2640,8 +2000,9 @@ mod tests {
                 }
             }
             events.extend([
-                "malformed".into(), "{\"ignored\":1e999}".into(), "{\"ignored\":\"\\ud800\"}".into(),
-                "\u{2003}{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"Unicode wrapper\"}}\u{2003}".into(),
+                "malformed".into(),
+                "{\"ignored\":1e999}".into(),
+                "{\"ignored\":\"\\ud800\"}".into(),
                 "{\"type\":\"future\",\"payload\":{\"unknown\":[true,42]}}".into(),
             ]);
             let db = write_store(&agents, "checked", &events);
@@ -2656,10 +2017,7 @@ mod tests {
                     .ok()
                     .is_some_and(|v| matches!(v["id"].as_str(), Some("a2" | "m4")))
                 {
-                    let compressed = ruzstd::encoding::compress_to_vec(
-                        event.as_bytes(),
-                        ruzstd::encoding::CompressionLevel::Fastest,
-                    );
+                    let compressed = zstd::encode_all(event.as_bytes(), 1).unwrap();
                     writer.execute("UPDATE transcript_events SET event_json=NULL,event_zstd=?1 WHERE session_id='checked' AND seq=?2", rusqlite::params![compressed, seq as i64]).unwrap();
                 }
             }
@@ -2670,40 +2028,30 @@ mod tests {
                     complete,
                     ..ParseOptions::full()
                 };
-                let mut owned_sink = crate::stream::CollectSink::default();
-                let mut owned = stream_sqlite(&r, &options, &mut owned_sink).unwrap();
-                owned.messages = owned_sink.messages;
-                let mut checked_sink = crate::stream::CollectSink::default();
-                let mut checked =
-                    stream_sqlite(&r, &ParseOptions { spans: true, ..options }, &mut checked_sink).unwrap();
-                checked.messages = checked_sink.messages;
-                if branch {
-                    assert!(checked.messages.iter().any(|m| m.content.iter().any(|b| matches!(
-                        b,
-                        Block::Text {
-                            text: crate::Text::Source(_)
-                        }
-                    ))));
-                }
-                let mut materialized = checked.clone();
-                materialized.materialize().unwrap();
+                let inline = collect(&r, &options).unwrap();
+                let mut spans = collect(&r, &ParseOptions { spans: true, ..options }).unwrap();
+                assert_eq!(inline.extra["cv"]["skipped_lines"], 4);
+                assert!(spans.messages.iter().any(|m| m.content.iter().any(|b| matches!(
+                    b,
+                    Block::Text {
+                        text: crate::Text::Source(_)
+                    }
+                ))));
+                spans.materialize().unwrap();
                 assert_eq!(
-                    serde_json::to_value(owned).unwrap(),
-                    serde_json::to_value(materialized).unwrap(),
+                    serde_json::to_value(inline).unwrap(),
+                    serde_json::to_value(spans).unwrap(),
                     "branch={branch}/complete={complete}"
                 );
             }
-            let mut sink = crate::stream::CollectSink::default();
-            let mut retained = stream_sqlite(
+            let mut retained = collect(
                 &r,
                 &ParseOptions {
                     spans: true,
                     ..ParseOptions::complete()
                 },
-                &mut sink,
             )
             .unwrap();
-            retained.messages = sink.messages;
             writer
                 .execute(
                     "UPDATE transcript_events SET event_json='{}' WHERE session_id='checked' AND seq=1",
@@ -2721,9 +2069,14 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[test]
-    fn selected_sqlite_without_rowid_keeps_owned_compatibility() {
+    fn a_without_rowid_store_reads_its_cells_from_the_row() {
         let agents = tmp_agents();
-        let db = write_store(&agents, "compat", &branchy_events());
+        let mut events = branchy_events();
+        events[1] = serde_json::json!({"type":"message","id":"u1","parentId":null,
+            "message":{"role":"user","content":"long λ\n".repeat(4096)}})
+        .to_string();
+        let db = write_store(&agents, "compat", &events);
+        let expected = collect(&discover_sqlite(&db).unwrap().remove(0), &ParseOptions::complete()).unwrap();
         let writer = rusqlite::Connection::open(&db).unwrap();
         writer.execute_batch("ALTER TABLE transcript_events RENAME TO old_events;
             CREATE TABLE transcript_events (session_id TEXT NOT NULL,seq INTEGER NOT NULL,event_json TEXT,created_at INTEGER NOT NULL,PRIMARY KEY(session_id,seq)) WITHOUT ROWID;
@@ -2731,31 +2084,103 @@ mod tests {
             DROP TABLE old_events;").unwrap();
         drop(writer);
         let r = discover_sqlite(&db).unwrap().remove(0);
-        let mut owned_sink = crate::stream::CollectSink::default();
-        let mut owned = stream_sqlite(&r, &ParseOptions::complete(), &mut owned_sink).unwrap();
-        owned.messages = owned_sink.messages;
-        let mut sink = crate::stream::CollectSink::default();
-        let mut actual = stream_sqlite(
+        let mut actual = collect(
             &r,
             &ParseOptions {
                 spans: true,
                 ..ParseOptions::complete()
             },
-            &mut sink,
         )
         .unwrap();
-        actual.messages = sink.messages;
-        assert!(!actual.messages.iter().any(|m| m.content.iter().any(|b| matches!(
+        assert!(actual.messages.iter().any(|m| m.content.iter().any(|b| matches!(
             b,
             Block::Text {
                 text: crate::Text::Source(_)
             }
         ))));
+        actual.materialize().unwrap();
         assert_eq!(
-            serde_json::to_value(owned).unwrap(),
+            serde_json::to_value(expected).unwrap(),
             serde_json::to_value(actual).unwrap()
         );
         fs::remove_dir_all(agents.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_source_replaced_during_the_read_fails_it_flat_or_tree() -> Result<()> {
+        let world = crate::test_world("openclaw-owned-tree-identity");
+        let path = world.base.join("source.jsonl");
+        for tree in [false, true] {
+            let mut bytes =
+                b"{\"type\":\"message\",\"id\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"original\"}}\n"
+                    .to_vec();
+            if tree {
+                bytes.extend_from_slice(b"{\"type\":\"leaf\",\"id\":\"l\",\"parentId\":\"u\",\"targetId\":\"u\"}\n");
+            }
+            for spans in [false, true] {
+                fs::write(&path, &bytes)?;
+                // Use a fallible callback so its diagnostic cannot hide the primary-source race.
+                struct MutateFallible<'a>(&'a Path);
+                impl MessageSink for MutateFallible<'_> {
+                    fn message(&mut self, _: Message) -> Flow {
+                        unreachable!()
+                    }
+                    fn try_message(&mut self, _: Message) -> Result<Flow> {
+                        fs::write(self.0, b"replacement")?;
+                        anyhow::bail!("callback diagnostic")
+                    }
+                }
+                let r = SessionRef::new("identity", Harness::OpenClaw, &path);
+                let options = ParseOptions {
+                    spans,
+                    ..ParseOptions::complete()
+                };
+                let error = OpenClaw { roots: vec![] }
+                    .stream(&r, &options, &mut MutateFallible(&path))
+                    .unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("source changed"),
+                    "tree={tree}/spans={spans}: {error:#}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn formatted_leaf_controls_select_the_same_visible_branch() -> Result<()> {
+        let world = crate::test_world("openclaw-formatted-leaf");
+        let path = world.base.join("tree.jsonl");
+        let r = SessionRef::new("formatted", Harness::OpenClaw, &path);
+        for leaf in [
+            r#"{"type":"leaf","id":"l1","parentId":"a2","targetId":"a1"}"#,
+            r#"{ "type" : "leaf", "id" : "l1", "parentId" : "a2", "targetId" : "a1" }"#,
+            r#"{"\u0074ype":"l\u0065af","id":"l1","parentId":"a2","targetId":"a1"}"#,
+            r#"{"type":"future","type":"leaf","id":"l1","parentId":"a2","targetId":"a1"}"#,
+        ] {
+            let text = branchy_events()
+                .into_iter()
+                .map(|line| {
+                    if line.contains("\"leaf\"") {
+                        leaf.to_string()
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(&path, &text)?;
+            for spans in [false, true] {
+                let options = ParseOptions {
+                    spans,
+                    ..ParseOptions::full()
+                };
+                let s = collect(&r, &options)?;
+                let ids: Vec<&str> = s.messages.iter().filter_map(|m| m.id.as_deref()).collect();
+                assert_eq!(ids, ["u1", "a1", "u2", "c1", "a3"], "{leaf}");
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "sqlite")]
@@ -3505,7 +2930,7 @@ mod tests {
         let rows: Vec<Row> = vec![
             ("parent-1", 0, Some(r#"{"type":"session","version":4,"id":"parent-1","timestamp":"2026-10-11T20:00:00Z","cwd":"/w"}"#.into()), None),
             ("parent-1", 1, Some(r#"{"type":"message","id":"p2","parentId":null,"timestamp":"2026-10-11T20:00:01Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"sessions_spawn","arguments":{}}],"model":"m"}}"#.into()), None),
-            ("parent-1", 2, None, Some(ruzstd::encoding::compress_to_vec(spawn_result.as_bytes(), ruzstd::encoding::CompressionLevel::Fastest))),
+            ("parent-1", 2, None, Some(zstd::encode_all(spawn_result.as_bytes(), 1).unwrap())),
             ("parent-1", 3, Some(announce), None),
             ("parent-1", 4, None, Some(b"\x28\xb5\x2f\xfd not a frame".to_vec())),
             ("child-1", 0, Some(r#"{"type":"message","id":"k1","parentId":null,"timestamp":"2026-10-11T20:00:01Z","message":{"role":"user","content":"Reply ok."}}"#.into()), None),
@@ -3543,7 +2968,7 @@ mod tests {
 
     #[test]
     fn bounded_parent_scan_matches_lexical_policy_across_boundaries_and_utf8_failures() -> Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-parent-scan");
+        let world = crate::test_world("openclaw-parent-scan");
         let path = world.base.join("parent.jsonl");
         let key = "agent:main:subagent:child-λ";
         for marker in [
@@ -3566,8 +2991,8 @@ mod tests {
     }
 
     #[test]
-    fn selected_child_bodies_and_owned_completion_guard_parent_lookup_dependencies() -> Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-parent-source-guard");
+    fn child_bodies_and_completion_guard_parent_lookup_dependencies() -> Result<()> {
+        let world = crate::test_world("openclaw-parent-source-guard");
         let dir = world.base.join("agents/main/sessions");
         fs::create_dir_all(&dir)?;
         let path = dir.join("child.jsonl");
@@ -3609,7 +3034,7 @@ mod tests {
 
     #[test]
     fn jsonl_key_inventory_matches_value_first_key_and_final_duplicate_precedence() -> Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-json-key-duplicates");
+        let world = crate::test_world("openclaw-json-key-duplicates");
         let path = world.base.join("sessions.json");
         for text in [
             r#"{"z":{"sessionId":"same","spawnedBy":"first"},"a":{"sessionId":"same","spawnedBy":"second"}}"#,
@@ -3647,7 +3072,7 @@ mod tests {
 
     #[test]
     fn jsonl_key_inventory_reads_once_per_scope_and_keeps_negative_dependency_guards() -> Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-json-key-scope");
+        let world = crate::test_world("openclaw-json-key-scope");
         let dir = world.base.join("agents/main/sessions");
         fs::create_dir_all(&dir)?;
         let adapter = OpenClaw::with_state_dir(&world.base);
@@ -3706,7 +3131,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_scoped_parent_fallback_keys_both_parameters_under_nocase() -> Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-nocase-parent-scope");
+        let world = crate::test_world("openclaw-nocase-parent-scope");
         let path = world.base.join("sessions.db");
         let conn = rusqlite::Connection::open(&path)?;
         conn.execute_batch(
@@ -3723,7 +3148,8 @@ mod tests {
                 |row| row.get(0),
             )?;
             let reference = SessionRef::new(id, Harness::OpenClaw, &path);
-            let facts = sqlite_key_facts_scoped(&conn, &reference, &reads)?;
+            let events = Events::new(&conn, &path, &reads)?;
+            let facts = sqlite_key_facts(&conn, &reference, &reads, &events)?;
             assert_eq!(facts.parent.as_deref(), Some(original.as_str()));
             assert_ne!(
                 facts.parent.as_deref(),
@@ -3779,7 +3205,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_parent_window_scan_runs_once_per_scope_and_preserves_negative_groups() -> Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-sql-parent-scope");
+        let world = crate::test_world("openclaw-sql-parent-scope");
         let dir = world.base.join("agents/main/agent");
         fs::create_dir_all(&dir)?;
         let path = dir.join("openclaw-agent.sqlite");
@@ -3869,7 +3295,7 @@ mod tests {
 
     #[test]
     fn preferred_jsonl_parent_avoids_global_candidate_inventory_and_preserves_fallback_order() -> Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-parent-preferred-order");
+        let world = crate::test_world("openclaw-parent-preferred-order");
         let dir = &world.base;
         let child = dir.join("child.jsonl");
         let preferred = dir.join("preferred.jsonl");

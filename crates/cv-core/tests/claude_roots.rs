@@ -2,9 +2,8 @@
 //! `~/.claude/projects`, `$CLAUDE_CONFIG_DIR/projects`, each entry of `$CLUSTERVISION_CLAUDE_ROOTS`,
 //! and each line of `$CLUSTERVISION_HOME/claude-roots` (an entry may hold `*` segments).
 //!
-//! These tests mutate process-global env (`HOME`, `CLUSTERVISION_HOME`, `CLAUDE_CONFIG_DIR`,
-//! `CLUSTERVISION_CLAUDE_ROOTS`), so every test holds the testkit's process lock for its whole body
-//! (`cv_testkit::World::in_process`), the same way `freshness.rs` does.
+//! These tests set `CLAUDE_CONFIG_DIR` and `CLUSTERVISION_CLAUDE_ROOTS` in their world's
+//! environment (`cv_testkit::World::in_process`), never the process's.
 
 use cv_core::harness::claude::Claude;
 use cv_core::ir::{Harness, SessionRef};
@@ -16,8 +15,8 @@ use std::path::{Path, PathBuf};
 /// The catalog's recorded-watch fudge window (2s) plus margin; see `freshness.rs`.
 const FUDGE: std::time::Duration = std::time::Duration::from_millis(2100);
 
-fn world(tag: &str) -> World {
-    World::in_process(tag)
+fn world(tag: &str) -> cv_testkit::InProcess<cv_core::env::Scope> {
+    World::in_process(tag, cv_core::env::Env::enter_isolated)
 }
 
 fn default_projects(w: &World) -> PathBuf {
@@ -82,7 +81,8 @@ fn env_roots_are_discovered() {
     let config_dir = w.base.join("otherconfig");
     write_session(&projects_dir, "-work-proj", "projdirsess");
     write_session(&config_dir.join("projects"), "-work-proj", "configdirsess");
-    std::env::set_var("CLUSTERVISION_CLAUDE_ROOTS", join(&[projects_dir, config_dir]));
+    w.scope
+        .set("CLUSTERVISION_CLAUDE_ROOTS", join(&[projects_dir, config_dir]));
 
     assert_eq!(discovered(), vec!["configdirsess", "defaultsess", "projdirsess"]);
     assert_eq!(
@@ -102,7 +102,8 @@ fn wildcard_root_finds_every_seat_including_later_ones() {
     write_session(&seats.join("two/claude/projects"), "-work-proj", "seattwosess");
     fs::write(seats.join("ports.lock"), b"").unwrap(); // a plain file beside the seats is skipped
     fs::create_dir_all(seats.join("noclaude")).unwrap(); // a seat with no claude dir is skipped
-    std::env::set_var("CLUSTERVISION_CLAUDE_ROOTS", seats.join("*").join("claude"));
+    w.scope
+        .set("CLUSTERVISION_CLAUDE_ROOTS", seats.join("*").join("claude"));
 
     let adapter = Claude::detect();
     assert_eq!(
@@ -140,7 +141,8 @@ fn every_wildcard_segment_expands() {
         "instkimisess",
     );
     write_session(&seats.join("codex/claude/projects"), "-work-proj", "flatsess"); // not this entry's layout
-    std::env::set_var("CLUSTERVISION_CLAUDE_ROOTS", seats.join("*/instances/*/claude"));
+    w.scope
+        .set("CLUSTERVISION_CLAUDE_ROOTS", seats.join("*/instances/*/claude"));
 
     assert_eq!(discovered(), vec!["instkimisess", "instonesess", "insttwosess"]);
 }
@@ -171,7 +173,7 @@ fn claude_config_dir_is_read() {
     write_session(&default_projects(&w), "-work-proj", "defaultsess");
     let cfg = w.base.join("seatconfig");
     write_session(&cfg.join("projects"), "-work-proj", "configsess");
-    std::env::set_var("CLAUDE_CONFIG_DIR", &cfg);
+    w.scope.set("CLAUDE_CONFIG_DIR", &cfg);
 
     assert_eq!(discovered(), vec!["configsess", "defaultsess"]);
     assert_eq!(Claude::detect().roots().into_iter().next(), Some(cfg.join("projects")));
@@ -185,8 +187,8 @@ fn missing_roots_are_ignored() {
     write_session(&default_projects(&w), "-work-proj", "defaultsess");
     let a_file = w.base.join("not-a-dir");
     fs::write(&a_file, b"x").unwrap();
-    std::env::set_var("CLAUDE_CONFIG_DIR", w.base.join("no-such-config"));
-    std::env::set_var(
+    w.scope.set("CLAUDE_CONFIG_DIR", w.base.join("no-such-config"));
+    w.scope.set(
         "CLUSTERVISION_CLAUDE_ROOTS",
         join(&[
             w.base.join("no-such-root"),
@@ -205,7 +207,7 @@ fn missing_roots_are_ignored() {
 fn a_root_named_twice_is_read_once() {
     let w = world("dedupe");
     write_session(&default_projects(&w), "-work-proj", "defaultsess");
-    std::env::set_var("CLAUDE_CONFIG_DIR", w.home.join(".claude"));
+    w.scope.set("CLAUDE_CONFIG_DIR", w.home.join(".claude"));
     let mut roots = vec![default_projects(&w), w.home.join(".claude")];
     #[cfg(unix)]
     {
@@ -213,7 +215,7 @@ fn a_root_named_twice_is_read_once() {
         std::os::unix::fs::symlink(w.home.join(".claude"), &link).unwrap();
         roots.push(link);
     }
-    std::env::set_var("CLUSTERVISION_CLAUDE_ROOTS", join(&roots));
+    w.scope.set("CLUSTERVISION_CLAUDE_ROOTS", join(&roots));
 
     assert_eq!(discovered(), vec!["defaultsess"], "one directory, one listing");
     assert_eq!(Claude::detect().roots().into_iter().next(), Some(default_projects(&w)));
@@ -228,7 +230,7 @@ fn same_id_in_two_roots_resolves_to_the_newest_copy() {
     write_session_at(&default_projects(&w), "-work-proj", "dupsess", "2026-01-01T10:00:00Z");
     let seat = w.base.join("seat/projects");
     let newer = write_session_at(&seat, "-work-proj", "dupsess", "2026-02-01T10:00:00Z");
-    std::env::set_var("CLUSTERVISION_CLAUDE_ROOTS", &seat);
+    w.scope.set("CLUSTERVISION_CLAUDE_ROOTS", &seat);
 
     assert_eq!(discovered(), vec!["dupsess", "dupsess"], "both copies are listed");
     // First call: cold catalog → full scan path. Second: the warm catalog path.
@@ -252,7 +254,7 @@ fn catalog_sees_new_sessions_under_extra_roots() {
     write_session(&extra, "-work-proj", "extrasess");
     let seats = w.base.join("seats");
     write_session(&seats.join("one/claude/projects"), "-work-proj", "seatonesess");
-    std::env::set_var(
+    w.scope.set(
         "CLUSTERVISION_CLAUDE_ROOTS",
         join(&[extra.clone(), seats.join("*/claude")]),
     );
