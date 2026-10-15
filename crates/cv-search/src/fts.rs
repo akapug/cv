@@ -2286,9 +2286,12 @@ fn staleness_over(dir: &Path, refs: &[cv_core::SessionRef]) -> Option<Staleness>
     let (index, f) = open_existing(dir).ok()?;
     let (sigs, _) = read_indexed_sigs(&index, &f).ok()?;
     let indexed = sigs.values().filter(|(_, size)| *size >= 0).map(|&(mt, _)| mt).max()?;
+    // Count against the same preferred-candidate set the sweep indexes: a second on-disk
+    // copy of one session is not another stale session.
+    let prov = cv_core::events::Provenance::default();
     let mut stale_sessions = 0usize;
     let mut newest_on_disk = 0i64;
-    for r in refs {
+    for (r, _) in preferred_index_candidates(refs.iter().map(|r| (r, &prov)).collect()) {
         let cur = cv_core::offsets::file_sig(&cv_core::source::primary_path(r));
         newest_on_disk = newest_on_disk.max(cur.0);
         if !sigs
@@ -2368,9 +2371,17 @@ fn landable(sig: (i64, i64)) -> bool {
 fn pass_needed_over(dir: &Path, refs: &[cv_core::SessionRef], subagents: bool) -> Option<bool> {
     let (index, f) = open_existing(dir).ok()?;
     let (sigs, folded, meta, _) = read_indexed_metadata(&index, &f, subagents).ok()?;
-    let live: HashSet<&str> = refs.iter().map(|r| r.id.as_str()).collect();
+    // The corpus the sweep would actually index: one preferred candidate per session id —
+    // a discovered second copy is not drift, it is the same logical session again.
+    let prov = cv_core::events::Provenance::default();
+    let candidates: Vec<&cv_core::SessionRef> =
+        preferred_index_candidates(refs.iter().map(|r| (r, &prov)).collect())
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+    let live: HashSet<&str> = candidates.iter().map(|r| r.id.as_str()).collect();
     // A live session whose source moved since its stamp — or that no pass has ever seen.
-    if refs.iter().any(|r| {
+    if candidates.iter().any(|r| {
         let cur = cv_core::offsets::file_sig(&cv_core::source::primary_path(r));
         landable(cur) && sigs.get(&r.id).copied() != Some(cur)
     }) {
@@ -7373,6 +7384,34 @@ mod tests {
             Some(true),
             "a forest pass owns folded docs — their drift must open the gate"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// Discovery can report the same session twice (overlapping roots, a copy under another
+    /// layout). The pass indexes one preferred candidate per id, so the gate must check that
+    /// same one — a losing copy's differing file is not drift, and a winning copy's is.
+    #[test]
+    fn pass_needed_checks_the_preferred_copy_only() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let p = write_claude(&sdir, "s1", "alpha corpus seed");
+        let r1 = sref("s1", "one", p); // updated_at = 2s
+        index_refs(&dir, &[r1.clone()], false).unwrap();
+
+        // An older duplicate at a different path loses preference → not drift.
+        let p_old = write_claude(&sdir, "s1dup", "different, older copy");
+        let mut dup = sref("s1", "one", p_old);
+        dup.updated_at = chrono::DateTime::from_timestamp(0, 0);
+        assert_eq!(pass_needed_over(&dir, &[r1.clone(), dup], false), Some(false));
+
+        // A newer duplicate wins preference → its file is the session now → drift.
+        let p_new = write_claude(&sdir, "s1new", "newer copy content");
+        let mut dup = sref("s1", "one", p_new);
+        dup.updated_at = chrono::DateTime::from_timestamp(3, 0);
+        assert_eq!(pass_needed_over(&dir, &[r1, dup], false), Some(true));
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&sdir).ok();
