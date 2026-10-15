@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "claude"
-source_files = ["harness/claude.rs", "harness/claude_workflow.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
+source_files = ["harness/claude.rs", "harness/claude/record.rs", "harness/claude_workflow.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
 ignore_literals = ["jsonl", "json"]
 store = [
   "~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl",

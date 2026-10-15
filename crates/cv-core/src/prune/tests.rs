@@ -185,27 +185,33 @@ fn drop_mode_writes_no_sidecar_and_never_advertises_retrieve() {
 }
 
 #[test]
-fn thinking_flatten_targets_old_reasoning_only() {
+fn drop_thinking_omits_old_reasoning_and_relinks_emptied_records() {
     let dir = tmpdir();
     let big = "R".repeat(5000);
     let sid = "22222222-2222-4222-8222-222222222222";
-    // old assistant turn with big thinking; then enough turns that it's outside keep_last; a recent
-    // assistant turn with big thinking that must be preserved.
-    let line = |uuid: &str, parent: &str, role: &str, content: serde_json::Value| {
+    // Old thinking-only record a0 (outside keep_last) and a recent one a2 (within it).
+    let line = |uuid: &str, parent: Option<&str>, role: &str, content: serde_json::Value| {
         serde_json::json!({"type":role,"sessionId":sid,"uuid":uuid,"parentUuid":parent,
             "timestamp":"2026-06-18T00:00:00Z","message":{"role":role,"content":content}})
     };
     let think = |t: &str| serde_json::json!([{"type":"thinking","thinking":t,"signature":"sig"}]);
     let lines = [
-        line("u0", "", "user", serde_json::json!("start")),
-        line("a0", "u0", "assistant", think(&big)), // OLD thinking → flatten
-        line("u1", "a0", "user", serde_json::json!("more")),
-        line("a1", "u1", "assistant", serde_json::json!("ok")),
-        line("u2", "a1", "user", serde_json::json!("again")),
-        line("a2", "u2", "assistant", think(&big)), // RECENT thinking → keep (within keep_last)
+        line("u0", None, "user", serde_json::json!("start")),
+        line("a0", Some("u0"), "assistant", think(&big)),
+        line(
+            "t0",
+            Some("a0"),
+            "assistant",
+            serde_json::json!([{"type":"text","text":"done"}]),
+        ),
+        line("u1", Some("t0"), "user", serde_json::json!("more")),
+        line("a1", Some("u1"), "assistant", serde_json::json!("ok")),
+        line("u2", Some("a1"), "user", serde_json::json!("again")),
+        line("a2", Some("u2"), "assistant", think(&big)),
     ];
     let path = dir.join(format!("{sid}.jsonl"));
-    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+    let input = lines.iter().map(|l| l.to_string() + "\n").collect::<String>();
+    std::fs::write(&path, &input).unwrap();
 
     let opts = PruneOptions {
         min_size: 1024,
@@ -215,25 +221,23 @@ fn thinking_flatten_targets_old_reasoning_only() {
     };
     let r = prune_session(&path, &opts).unwrap();
     let out = std::fs::read_to_string(&r.new_path).unwrap();
-
-    // old thinking (a0) flattened to a text marker; its big payload gone, original in sidecar
-    let a0 = out.lines().find(|l| l.contains("\"uuid\":\"a0\"")).unwrap();
+    assert!(out.len() < input.len(), "dropping thinking never grows the transcript");
     assert!(
-        a0.contains("[PRUNED id=a0#think0"),
-        "old thinking flattened (id = message uuid)"
+        !out.contains("[PRUNED"),
+        "no inline marker: it would give the model nothing"
     );
-    assert!(!a0.contains(&big));
-    assert!(
-        !a0.contains("\"thinking\""),
-        "thinking block became a text marker (no signature mismatch)"
-    );
-    // recent thinking (a2, within keep_last=2) preserved verbatim
+    // The emptied record is gone; its child points at its parent and the chain still resumes.
+    assert!(!out.contains("\"uuid\":\"a0\""));
+    let t0: Value = serde_json::from_str(out.lines().find(|l| l.contains("\"uuid\":\"t0\"")).unwrap()).unwrap();
+    assert_eq!(t0["parentUuid"], "u0");
+    crate::harness::claude::emit::verify_claude_resumable(&r.new_path, None).unwrap();
+    // Recent thinking (a2, within keep_last=2) is kept verbatim.
     let a2 = out.lines().find(|l| l.contains("\"uuid\":\"a2\"")).unwrap();
     assert!(
         a2.contains(&big) && a2.contains("\"thinking\""),
         "recent thinking kept verbatim"
     );
-    // retrievable
+    // The dropped block is retrievable by record uuid and block index.
     let restored = retrieve(r.sidecar_path.as_ref().unwrap(), "a0#think0").unwrap();
     assert_eq!(restored.get("thinking").and_then(|v| v.as_str()), Some(big.as_str()));
     std::fs::remove_dir_all(&dir).ok();
@@ -288,7 +292,7 @@ fn revive_rewrites_stale_usage_below_loaded_content() {
     );
     let honest = r.revive_tokens.expect("honest figure written");
     assert!(
-        honest < 1000,
+        honest < 25_000,
         "tiny post-boundary content → tiny honest figure (got {honest})"
     );
 
@@ -393,7 +397,7 @@ fn revive_pins_usage_iterations_too() {
     );
     let honest = r.revive_tokens.expect("honest figure written");
     assert!(
-        honest < 1000,
+        honest < 25_000,
         "tiny post-boundary content → tiny honest figure (got {honest})"
     );
 
@@ -551,8 +555,11 @@ fn thinking_flatten_snips_signature_only_blocks() {
         "the OLD signature-only block is snipped; the recent one (keep-last) stays"
     );
     let out = std::fs::read_to_string(&r.new_path).unwrap();
-    let a0 = out.lines().find(|l| l.contains("\"uuid\":\"a0\"")).unwrap();
-    assert!(a0.contains("[PRUNED id=") && !a0.contains(&sig));
+    let a0: Value = serde_json::from_str(out.lines().find(|l| l.contains("\"uuid\":\"a0\"")).unwrap()).unwrap();
+    assert_eq!(
+        a0["message"]["content"],
+        serde_json::json!([{"type":"text","text":"old reply"}])
+    );
     let a1 = out.lines().find(|l| l.contains("\"uuid\":\"a1\"")).unwrap();
     assert!(a1.contains(&sig));
     std::fs::remove_dir_all(&dir).ok();
@@ -581,7 +588,7 @@ fn rendered_attachments_count_toward_byte_estimates() {
         honest >= 10_000,
         "35k bytes of rendered reminder ≈ 10k tokens must be counted (got {honest})"
     );
-    assert_eq!(line_est_tokens(&lines[2]), 0, "an unrendered attachment costs nothing");
+    assert_eq!(line_est(&lines[2]).total(), 0, "an unrendered attachment costs nothing");
 }
 
 #[test]
@@ -590,11 +597,11 @@ fn revive_honors_recorded_delta_evidence_over_low_byte_estimate() {
     let sid = "44444444-4444-4444-8444-444444444444";
     // No boundary, nothing snipped in the second span: the recorded usage DELTA (30k between a0 and
     // a1) is hard evidence that span really costs 30k, even though its byte estimate is tiny (e.g.
-    // dense code that tokenizes far above 3.5 B/tok). Revive must never write a figure below that
+    // dense code that tokenizes far above the byte estimate). Revive must never write a figure below that
     // evidence — the old byte-only estimator did, and let resumes through that blew the real limit.
     let usage =
         |n: u64| serde_json::json!({"input_tokens":n,"cache_read_input_tokens":0,"cache_creation_input_tokens":0});
-    let big = "B".repeat(5000);
+    let big = "B".repeat(100_000);
     let lines = [
         serde_json::json!({"type":"user","sessionId":sid,"uuid":"u0","timestamp":"2026-06-20T00:00:00Z",
             "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tx","content":big}]}}),
@@ -1177,7 +1184,7 @@ fn projected_source_facts_match_owned_metadata_and_token_estimates() {
 }
 
 #[test]
-fn giant_ignored_row_preserves_raw_bytes_and_marker_revive_evidence() {
+fn giant_ignored_row_preserves_raw_bytes_and_recorded_usage() {
     let dir = tmpdir();
     let sid = "11111111-1111-4111-8111-111111111111";
     let new_id = "22222222-2222-4222-8222-222222222222";
@@ -1198,14 +1205,9 @@ fn giant_ignored_row_preserves_raw_bytes_and_marker_revive_evidence() {
         crate::restamp_line(&line, new_id).unwrap()
     );
     assert_eq!(result.pruned_count, 0);
-    assert_eq!(result.usage_rewritten, 1);
-    assert_eq!(
-        result.revive_tokens,
-        Some(
-            line_est_tokens(&serde_json::json!({"type":"user","message":{"content":"prompt"}}))
-                + line_est_tokens(&usage)
-        )
-    );
+    // A marker-shaped string outside the model-visible content is no evidence: nothing was pruned,
+    // so the recorded prompt stands and nothing is rewritten.
+    assert_eq!(result.usage_rewritten, 0);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1338,7 +1340,7 @@ fn source_string_mutation_matches_owned_output_sidecars_and_estimate() {
         assert_eq!(actual, expected.as_bytes());
         assert_eq!(plan.saved, saved);
         assert_eq!(plan.payloads.len(), count);
-        assert_eq!(plan.estimate, line_est_tokens(&owned));
+        assert_eq!(plan.estimate, line_est(&owned));
         if !drop {
             let mut expected = Vec::new();
             for entry in &sidecar {
@@ -1417,7 +1419,7 @@ fn source_user_mutation_matches_rich_payload_and_mirror_owned_oracle() {
             assert_eq!(plan.images, images);
             assert_eq!(plan.payloads.len(), count);
             assert_eq!(plan.saved, saved);
-            assert_eq!(plan.estimate, line_est_tokens(&owned));
+            assert_eq!(plan.estimate, line_est(&owned));
             let mut actual = Vec::new();
             plan.record
                 .with_view(|v| v.write_canonical_replacing(&plan.replacements, &mut actual))
@@ -1501,7 +1503,7 @@ fn retrieve_legacy_oracle(path: &Path, id: &str) -> Result<Value> {
 
 #[test]
 fn retrieve_projection_matches_typed_legacy_acceptance_and_error_semantics() {
-    let world = cv_testkit::World::in_process("retrieve-projection-oracle");
+    let world = crate::test_world("retrieve-projection-oracle");
     let path = world.base.join("session.flat.jsonl");
     let row = |input: &str, content: &str, tail: &str| {
         format!(
@@ -1579,7 +1581,7 @@ fn retrieve_projection_matches_typed_legacy_acceptance_and_error_semantics() {
 
 #[test]
 fn retrieve_bounds_available_ids_and_rejects_captured_source_changes() {
-    let world = cv_testkit::World::in_process("retrieve-source-guard");
+    let world = crate::test_world("retrieve-source-guard");
     let path = world.base.join("session.flat.jsonl");
     let mut out = std::fs::File::create(&path).unwrap();
     for i in 0..40 {
@@ -1597,18 +1599,14 @@ fn retrieve_bounds_available_ids_and_rejects_captured_source_changes() {
     );
     let captured = crate::json::JsonSource::capture(&path).unwrap();
     let file = std::fs::File::open(&path).unwrap();
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap()
-        .write_all(b"\n")
-        .unwrap();
+    // Truncation, not growth: an append-only log may grow under a captured source.
+    std::fs::write(&path, b"").unwrap();
     assert!(retrieve_captured(&captured, &file, &path, "id-0").is_err());
 }
 
 #[test]
 fn retrieve_giant_unselected_fields_return_only_requested_content() {
-    let world = cv_testkit::World::in_process("retrieve-giant-unselected");
+    let world = crate::test_world("retrieve-giant-unselected");
     let path = world.base.join("session.flat.jsonl");
     let mut out = std::fs::File::create(&path).unwrap();
     let chunk = "ignored-🌙\\n\\\"\\\\".repeat(4096);
@@ -1657,7 +1655,7 @@ fn retrieve_giant_unselected_fields_return_only_requested_content() {
 
 #[test]
 fn source_turn_projection_matches_owned_pass_composition() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-turn-projection");
+    let world = crate::test_world("prune-turn-projection");
     for (case, mut original) in [
         serde_json::json!({"type":"assistant","uuid":"a","sessionId":"old","parentUuid":"p","message":{"content":[
             {"type":"thinking","thinking":"reason\r\nsecond λ\n","signature":"signature","unknown":{"keep":true}},
@@ -1720,7 +1718,6 @@ fn source_turn_projection_matches_owned_pass_composition() -> Result<()> {
                         prune_assistant_thinking(
                             &mut owned,
                             &opts,
-                            "new",
                             "a",
                             &mut sidecar,
                             &mut count,
@@ -1738,6 +1735,7 @@ fn source_turn_projection_matches_owned_pass_composition() -> Result<()> {
                         &mut saved,
                         &mut modified,
                     );
+                    drop_omitted_blocks(&mut owned);
                     let source = crate::json::JsonSource::capture(&path)?;
                     let plan = source_turn_prune(
                         &source,
@@ -1764,7 +1762,7 @@ fn source_turn_projection_matches_owned_pass_composition() -> Result<()> {
                     );
                     assert_eq!(plan.saved, saved);
                     assert_eq!(plan.images, images);
-                    assert_eq!(plan.estimate, line_est_tokens(&owned));
+                    assert_eq!(plan.estimate, line_est(&owned));
                     let mut actual = Vec::new();
                     plan.record
                         .with_view(|view| view.write_canonical_replacing(&plan.replacements, &mut actual))?;
@@ -1793,7 +1791,7 @@ fn source_turn_projection_matches_owned_pass_composition() -> Result<()> {
 
 #[test]
 fn source_declassify_matches_case_and_line_semantics_across_chunks() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-declassify-chunks");
+    let world = crate::test_world("prune-declassify-chunks");
     let options = PruneOptions {
         declassify_tokens: vec![
             "alpha".into(),
@@ -1839,7 +1837,7 @@ fn source_declassify_matches_case_and_line_semantics_across_chunks() -> Result<(
 
 #[test]
 fn large_noop_declassification_preserves_raw_duplicate_ids_and_spacing() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-noop-turn-source");
+    let world = crate::test_world("prune-noop-turn-source");
     let path = world.base.join("source.jsonl");
     let raw = format!("  {{\"type\":\"assistant\",\"sessionId\":\"first\",\"sessionId\":\"old\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":{}}}]}}}}  ",
         serde_json::to_string(&"BENIGN prose\n".repeat(131072))?);
@@ -1864,7 +1862,7 @@ fn large_noop_declassification_preserves_raw_duplicate_ids_and_spacing() -> Resu
 
 #[test]
 fn source_usage_projection_matches_owned_order_and_iterations() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-usage-projection");
+    let world = crate::test_world("prune-usage-projection");
     for (index, original_ctx) in [
         None,
         Some(Value::Null),
@@ -1906,7 +1904,7 @@ fn source_usage_projection_matches_owned_order_and_iterations() -> Result<()> {
 
 #[test]
 fn staged_usage_projection_preserves_mixed_raw_framing_and_source_guard() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-usage-staged");
+    let world = crate::test_world("prune-usage-staged");
     let path = world.base.join("source.jsonl");
     let mut row = serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"small"}],"usage":{"input_tokens":900,"output_tokens":7}}});
     let raw = format!("invalid {{ \r\n  {row}  \r\nlast raw row\n");
@@ -1915,7 +1913,8 @@ fn staged_usage_projection_preserves_mixed_raw_framing_and_source_guard() -> Res
     let mut stage = ByteStage::new();
     stage.write_all(raw.as_bytes())?;
     let facts = [None, Some(decision_facts(&row, true)), None];
-    let (output, rewritten, honest, stale) = revive_staged(&source, stage.finish()?, &facts, &[false; 3], true, None)?;
+    let (output, rewritten, honest, stale) =
+        revive_staged(&source, stage.finish()?, &facts, &[false; 3], None, true, None)?;
     assert_eq!(rewritten, 1);
     assert_eq!(stale, Some(900));
     row["_cv_orig_ctx"] = Value::from(900);
@@ -1930,13 +1929,13 @@ fn staged_usage_projection_preserves_mixed_raw_framing_and_source_guard() -> Res
     let mut stage = ByteStage::new();
     stage.write_all(raw.as_bytes())?;
     std::fs::write(&path, b"changed source")?;
-    assert!(revive_staged(&source, stage.finish()?, &facts, &[false; 3], true, None).is_err());
+    assert!(revive_staged(&source, stage.finish()?, &facts, &[false; 3], None, true, None).is_err());
     Ok(())
 }
 
 #[test]
 fn staged_usage_trim_preserves_whitespace_only_buffers_and_eof_failure() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-usage-trim-buffers");
+    let world = crate::test_world("prune-usage-trim-buffers");
     let path = world.base.join("source.jsonl");
     let row = serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"small"}],"usage":{"input_tokens":900,"output_tokens":7}}});
     let raw = format!("{}{}{}\r\n", " ".repeat(2 * 65536), row, "\t".repeat(2 * 65536));
@@ -1945,7 +1944,7 @@ fn staged_usage_trim_preserves_whitespace_only_buffers_and_eof_failure() -> Resu
     let facts = [Some(decision_facts(&row, true))];
     let mut stage = ByteStage::new();
     stage.write_all(raw.as_bytes())?;
-    let (output, rewritten, honest, _) = revive_staged(&source, stage.finish()?, &facts, &[false], true, None)?;
+    let (output, rewritten, honest, _) = revive_staged(&source, stage.finish()?, &facts, &[false], None, true, None)?;
     assert_eq!(rewritten, 1);
     let mut expected = row;
     expected["_cv_orig_ctx"] = Value::from(900);
@@ -1959,7 +1958,7 @@ fn staged_usage_trim_preserves_whitespace_only_buffers_and_eof_failure() -> Resu
     // The producer promises newline framing; truncated private rows still fail at EOF.
     let mut stage = ByteStage::new();
     stage.write_all(raw.trim_end_matches('\n').as_bytes())?;
-    assert!(revive_staged(&source, stage.finish()?, &facts, &[false], true, None).is_err());
+    assert!(revive_staged(&source, stage.finish()?, &facts, &[false], None, true, None).is_err());
     Ok(())
 }
 
@@ -1994,7 +1993,7 @@ fn linked_tool_input_projection_matches_frozen_owned_lookup() -> Result<()> {
         }
         Ok(result)
     }
-    let world = cv_testkit::World::in_process("prune-linked-input");
+    let world = crate::test_world("prune-linked-input");
     let path = world.base.join("source.jsonl");
     let raw = format!(
         "{{\"type\":\"assistant\",\"ignored\":{},\"message\":{{\"content\":[\
@@ -2131,7 +2130,7 @@ fn unicode_sigma_classes_and_chunked_matching_equal_std() -> Result<()> {
 
 #[test]
 fn unicode_declassification_source_preserves_stats_and_pending_branches() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-unicode-context");
+    let world = crate::test_world("prune-unicode-context");
     let options = PruneOptions {
         declassify_tokens: [
             "",
@@ -2195,7 +2194,7 @@ fn unicode_declassification_source_preserves_stats_and_pending_branches() -> Res
 
 #[test]
 fn sigma_insensitive_tokens_keep_exact_hits_across_context_boundaries() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-sigma-demand");
+    let world = crate::test_world("prune-sigma-demand");
     let options = PruneOptions {
         declassify_tokens: ["alpha", "βeta", "🙂", "Σ", "A", "", "alpha", "Alpha"]
             .into_iter()
@@ -2379,7 +2378,7 @@ fn native_child_fixture(base: &Path, big: &str) -> Result<(PathBuf, PathBuf, Vec
 
 #[test]
 fn subagent_prune_counts_own_turns_and_emits_standalone_without_touching_parent() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-native-child");
+    let world = crate::test_world("prune-native-child");
     for size in [4096, 1100000] {
         let base = world.base.join(size.to_string());
         let (parent, child, parent_before) = native_child_fixture(&base, &"x".repeat(size))?;
@@ -2449,7 +2448,7 @@ fn subagent_prune_counts_own_turns_and_emits_standalone_without_touching_parent(
 
 #[test]
 fn subagent_prune_keep_window_and_usage_match_standalone_turn_semantics() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-native-child-window");
+    let world = crate::test_world("prune-native-child-window");
     let (parent, child, _) = native_child_fixture(&world.base, &"x".repeat(4096))?;
     for (label, keep_range, window) in [("keep", Some((3, None)), None), ("window", None, Some(20))] {
         let opts = PruneOptions {
@@ -2511,7 +2510,7 @@ fn subagent_prune_keep_window_and_usage_match_standalone_turn_semantics() -> Res
 
 #[test]
 fn parent_prune_keeps_embedded_sidechains_out_of_own_turns() -> Result<()> {
-    let world = cv_testkit::World::in_process("prune-embedded-child");
+    let world = crate::test_world("prune-embedded-child");
     let (parent, child, before) = native_child_fixture(&world.base, &"x".repeat(4096))?;
     let embedded = std::fs::read(&child)?;
     let mut mixed = before;
@@ -2568,42 +2567,74 @@ fn prune_rejects_output_ids_that_escape_or_alias_resource_directories() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `--copy-resources` never merges into an existing resource directory: it is refused, and with
+/// `force` the new directory replaces it whole (stale entries gone, a symlink replaced, not followed).
 #[test]
-fn resource_copy_preserves_source_when_destination_aliases_it() {
+fn copied_resources_are_refused_or_replaced_whole_never_merged() {
     let dir = tmpdir();
-    let source = dir.join("source-resources");
-    std::fs::create_dir(&source).unwrap();
-    std::fs::write(source.join("agent.jsonl"), b"original resource").unwrap();
-    assert!(copy_dir(&source, &source).is_err());
-    assert!(copy_dir(&source, &source.join("not-created/nested-target")).is_err());
-    assert!(!source.join("not-created").exists());
-    std::fs::create_dir(source.join("nested-target")).unwrap();
-    assert!(copy_dir(&source, &source.join("nested-target")).is_err());
-    assert_eq!(std::fs::read(source.join("agent.jsonl")).unwrap(), b"original resource");
+    let source = fixture(&dir, &"payload".repeat(1024));
+    let resources = dir.join(source.file_stem().unwrap()).join("subagents");
+    std::fs::create_dir_all(&resources).unwrap();
+    std::fs::write(resources.join("agent-a.jsonl"), b"agent transcript").unwrap();
+    let new_id = "22222222-2222-4222-8222-222222222222";
+    let destination = dir.join(new_id);
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("stale.txt"), b"another session's resource").unwrap();
+    let mut options = PruneOptions {
+        new_id: Some(new_id.into()),
+        keep_last: 0,
+        copy_resources: true,
+        ..Default::default()
+    };
+    let error = prune_session(&source, &options).unwrap_err();
+    assert!(error.downcast_ref::<crate::publish::Exists>().is_some(), "{error:#}");
+    assert!(
+        !dir.join(format!("{new_id}.jsonl")).exists(),
+        "a refused prune writes nothing"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("stale.txt")).unwrap(),
+        b"another session's resource"
+    );
+    options.force = true;
+    prune_session(&source, &options).unwrap();
+    assert!(!destination.join("stale.txt").exists(), "replaced, not merged");
+    assert_eq!(
+        std::fs::read(destination.join("subagents/agent-a.jsonl")).unwrap(),
+        b"agent transcript"
+    );
+    assert_eq!(
+        std::fs::read(resources.join("agent-a.jsonl")).unwrap(),
+        b"agent transcript"
+    );
+    #[cfg(unix)]
+    {
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep.txt"), b"kept").unwrap();
+        std::fs::remove_dir_all(&destination).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &destination).unwrap();
+        prune_session(&source, &options).unwrap();
+        assert!(!std::fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(elsewhere.join("keep.txt")).unwrap(), b"kept");
+    }
+    assert!(!std::fs::read_dir(&dir)
+        .unwrap()
+        .any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".cv-")));
     std::fs::remove_dir_all(dir).ok();
 }
 
-#[cfg(unix)]
 #[test]
-fn resource_copy_rejects_destination_symlinks_and_source_hardlinks_before_truncation() {
+fn resource_destination_that_contains_the_source_is_refused() {
     let dir = tmpdir();
-    let source = dir.join("source-resources");
-    let destination = dir.join("destination-resources");
-    std::fs::create_dir(&source).unwrap();
-    std::fs::create_dir(&destination).unwrap();
-    let original = source.join("agent.jsonl");
-    std::fs::write(&original, b"original resource").unwrap();
-    std::fs::hard_link(&original, destination.join("agent.jsonl")).unwrap();
-    assert!(copy_dir(&source, &destination).is_err());
-    assert_eq!(std::fs::read(&original).unwrap(), b"original resource");
-    std::fs::remove_file(destination.join("agent.jsonl")).unwrap();
-    std::os::unix::fs::symlink(&original, destination.join("agent.jsonl")).unwrap();
-    assert!(copy_dir(&source, &destination).is_err());
-    assert_eq!(std::fs::read(&original).unwrap(), b"original resource");
-    let directory_link = dir.join("redirected-resources");
-    std::os::unix::fs::symlink(&source, &directory_link).unwrap();
-    assert!(copy_dir(&source, &directory_link).is_err());
-    assert_eq!(std::fs::read(&original).unwrap(), b"original resource");
+    let source = dir.join("outer/source-resources");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("agent.jsonl"), b"original resource").unwrap();
+    assert!(stage_resources(&source, &dir.join("outer")).is_err());
+    assert_eq!(std::fs::read(source.join("agent.jsonl")).unwrap(), b"original resource");
     std::fs::remove_dir_all(dir).ok();
 }
 

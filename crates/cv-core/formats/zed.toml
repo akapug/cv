@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "zed"
-source_files = ["harness/zed.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
+source_files = ["harness/zed.rs", "harness/zed/record.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
 ignore_literals = []
 store = [
   "<data_dir>/threads/threads.db (zstd blobs)",

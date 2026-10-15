@@ -40,6 +40,11 @@ jobs:
 
       # The corpus generators' shared key proxy (every translator, every generator's own launch
       # line) against a local mock upstream, and scrub.py over a synthetic store. No network.
+      # Product lines per crate stay within tools/size-budget.txt (raised only as a reviewed
+      # decision, lowered as code shrinks); no committed evidence files; design docs stay short.
+      - name: Parsimony budget
+        run: python3 -I tools/check-size.py
+
       - name: Corpus tools
         run: python3 -I tools/harness-corpus/test_tools.py
 
@@ -52,8 +57,9 @@ jobs:
       - name: Build (default features)
         run: cargo build --workspace --all-targets
 
-      # One process per test, so the testkit's process-wide environment lock stops serializing
-      # the suite. nextest does not run doctests; the second line keeps them.
+      # One process per test (a test that hangs or aborts takes only itself down). nextest does
+      # not run doctests; the second line keeps them.
+
       - name: Install cargo-nextest
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf -o "$RUNNER_TEMP/nextest.tgz" \
@@ -141,19 +147,21 @@ jobs:
       - name: Build the manual
         run: mdbook build manual
 
-      - name: Build cv-core for wasm config (no default features)
-        run: cargo build -p clustervision-core --no-default-features
+      # Warnings are errors in every feature configuration, not only the default one.
+      - name: Lint cv-core for wasm config (no default features)
+        run: cargo clippy -p clustervision-core --no-default-features --all-targets -- -D warnings
 
-      # Native tests do not exercise the portable reader/sink implementations. These
-      # controls cover cancellation attribution, prefix checks and SQLite decoding parity.
-      - name: Portable reader and checked transport controls
+      # Native tests do not exercise the positioned (no-mmap) build: its lazy text, source
+      # identity and every reader, then the corpus golden read through them.
+      - name: Positioned build readers, lazy text and source identity
         run: |
-          cargo test -p clustervision-core --lib --no-default-features --features sqlite -- watch:: stream:: harness::claude:: harness::hermes:: --test-threads=2
+          cargo nextest run --profile ci -p clustervision-core --lib --no-default-features --features sqlite -E 'test(/^(lazy|source|json|watch|stream|harness)::/)'
+          cargo nextest run --profile ci -p clustervision-core --test corpus --no-default-features --features sqlite
 
       # cv-search's `semantic` feature (the embedding stack) is default-on, so the keyword-only
       # build is one nothing else compiles.
-      - name: Build cv-search without the semantic feature
-        run: cargo build -p cv-search --no-default-features
+      - name: Lint cv-search without the semantic feature
+        run: cargo clippy -p cv-search --no-default-features -- -D warnings
 
       # `dist plan` parses dist-workspace.toml and the release matrix without building anything.
       # A bad `publish-jobs` value sat in that file from v0.9.22 until 0.11.0 and every tag in
@@ -180,6 +188,7 @@ jobs:
         with:
           toolchain: 1.99.0
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
@@ -190,7 +199,7 @@ jobs:
       - name: Check cv-core on wasm32 (standalone)
         # cv-web enables uuid/js for the whole graph, which can mask a cv-core that doesn't
         # compile for wasm32 on its own (the uuid randomness backend regression class).
-        run: cargo check -p clustervision-core --no-default-features --target wasm32-unknown-unknown
+        run: cargo clippy -p clustervision-core --no-default-features --target wasm32-unknown-unknown -- -D warnings
       - name: Build cv-web to wasm
         run: wasm-pack build --target web --out-dir /tmp/pkg crates/cv-web -- --no-default-features
 

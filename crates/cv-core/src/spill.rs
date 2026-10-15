@@ -2,7 +2,7 @@
 mod exact;
 mod ordered;
 pub(crate) use exact::ExactStrings;
-pub(crate) use ordered::{Ordered, Record, Rows};
+pub(crate) use ordered::{Ordered, Record};
 
 use anyhow::{Context, Result};
 use std::fs::{self, File};

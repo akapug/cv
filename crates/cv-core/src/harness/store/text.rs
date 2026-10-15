@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn counted_generated_lengths_match_decoding_and_validate_every_demand() {
-        let world = cv_testkit::World::in_process("generated-string-length");
+        let world = crate::test_world("generated-string-length");
         let path = world.base.join("original");
         let journal = world.base.join("original-journal");
         std::fs::write(&path, "original snapshot").unwrap();
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn generated_string_matches_full_codec_and_keeps_original_provenance() {
-        let world = cv_testkit::World::in_process("generated-string-source");
+        let world = crate::test_world("generated-string-source");
         let path = world.base.join("original");
         std::fs::write(&path, "snapshot provenance").unwrap();
         let source = JsonSource::capture(&path).unwrap();
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn malformed_syntax_only_strings_and_failed_writers_never_publish_a_carrier() {
-        let world = cv_testkit::World::in_process("generated-string-errors");
+        let world = crate::test_world("generated-string-errors");
         let path = world.base.join("original");
         std::fs::write(&path, "snapshot provenance").unwrap();
         let source = JsonSource::capture(&path).unwrap();

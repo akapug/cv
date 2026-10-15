@@ -31,23 +31,21 @@
 //!   under `subagents/<child id>/meta.json` (→ the child's `lineage.parent`).
 
 pub(crate) mod emit;
-mod metadata;
-mod selected;
+mod record;
 pub use emit::emit;
 
-use super::store::document;
-#[cfg(feature = "mmap")]
-use super::store::document::{Raw, Record};
-use super::wire::{openai, text_parts};
+use super::store::document::{self, Fields};
+use super::store::jsonl;
+use super::wire::openai;
 use super::{parse_ts, Adapter};
 use crate::ir::*;
-use crate::lazy::{Text, INLINE_MAX};
+use crate::json::{JsonSource, JsonView};
+use crate::lazy::Text;
 use crate::stream::{Checkpoint, Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -57,7 +55,7 @@ pub struct Grok {
 
 impl Grok {
     pub fn detect() -> Self {
-        let root = dirs::home_dir().map(|h| h.join(".grok").join("sessions"));
+        let root = crate::env::home_dir().map(|h| h.join(".grok").join("sessions"));
         Grok {
             root: root.filter(|p| p.exists()),
         }
@@ -107,13 +105,7 @@ impl Adapter for Grok {
             let sink: &mut dyn MessageSink = &mut spawns;
             let (s, enrich) = session_header(r);
             sink.meta(&s);
-            let source = opts
-                .spans
-                .then(|| crate::json::JsonSource::capture(&self.resume_source(r)))
-                .transpose()?;
-            let file = fs::File::open(self.resume_source(r))
-                .with_context(|| format!("reading chat_history in {}", r.path.display()))?;
-            stream_history_at(file, &self.resume_source(r), 0, s, &enrich, 0, sink, source.as_ref())
+            stream_history_at(&self.resume_source(r), 0, s, &enrich, 0, opts, sink).map(Option::unwrap)
         })
     }
 
@@ -140,28 +132,10 @@ impl Adapter for Grok {
             if state.wire != wire {
                 return Ok(None);
             }
-            let mut file = fs::File::open(&wire)?;
-            if file.metadata()?.len() < from.offset {
-                return Ok(None);
-            }
-            file.seek(SeekFrom::Start(from.offset))?;
             let (s, enrich) = session_header(r);
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Grok, sink);
             spawns.meta(&s);
-            let source = opts
-                .spans
-                .then(|| crate::json::JsonSource::capture(&wire))
-                .transpose()?;
-            Ok(Some(stream_history_at(
-                file,
-                &wire,
-                from.offset,
-                s,
-                &enrich,
-                state.skipped,
-                &mut spawns,
-                source.as_ref(),
-            )?))
+            stream_history_at(&wire, from.offset, s, &enrich, state.skipped, opts, &mut spawns)
         })
     }
 
@@ -189,14 +163,23 @@ impl Adapter for Grok {
 fn rewind_points(dir: &Path) -> Vec<crate::affordance::Affordance> {
     use crate::affordance::{Affordance, Kind};
     let mut out = Vec::new();
-    if metadata::scan(&dir.join("rewind_points.jsonl"), |v| {
-        let ts = v.string_field("created_at")?.as_deref().and_then(parse_ts);
-        let files = v
-            .get("file_snapshots")?
-            .map(|v| v.ordered_keys())
-            .transpose()?
-            .unwrap_or_default();
-        let mut summary = match v.number_field("prompt_index")?.and_then(|n| n.as_u64()) {
+    if jsonl::for_each_record(&dir.join("rewind_points.jsonl"), |v| {
+        let Some(v) = Fields::parse(v, &["created_at", "file_snapshots", "prompt_index"])? else {
+            return Ok(());
+        };
+        let ts = v.string("created_at")?.as_deref().and_then(parse_ts);
+        let mut files = Vec::new();
+        if let Some(snapshots) = v.get("file_snapshots") {
+            // Original key order; a repeated key keeps its first place.
+            let mut seen = std::collections::HashSet::new();
+            snapshots.for_each_entry(|key, _| {
+                if seen.insert(key.to_owned()) {
+                    files.push(key.to_owned());
+                }
+                Ok(())
+            })?;
+        }
+        let mut summary = match number(v.get("prompt_index"))?.and_then(|n| n.as_u64()) {
             Some(i) => format!("prompt {i}"),
             None => "prompt".into(),
         };
@@ -212,7 +195,7 @@ fn rewind_points(dir: &Path) -> Vec<crate::affordance::Affordance> {
         ));
         Ok(())
     })
-    .is_none()
+    .is_err()
     {
         out.clear();
     }
@@ -220,75 +203,60 @@ fn rewind_points(dir: &Path) -> Vec<crate::affordance::Affordance> {
     out
 }
 
-/// Preserve the original key insertion order (including duplicate-key replacement) without
-/// decoding snapshot bodies. The surrounding line has already passed strict Value validation.
-#[cfg(feature = "mmap")]
-fn ordered_keys(raw: Raw<'_>) -> Vec<String> {
-    struct Keys;
-    impl<'de> serde::de::Visitor<'de> for Keys {
-        type Value = Vec<String>;
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("file snapshots")
-        }
-        fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> std::result::Result<Self::Value, M::Error> {
-            let mut seen = std::collections::HashSet::new();
-            let mut keys = Vec::new();
-            while let Some(key) = map.next_key::<String>()? {
-                map.next_value::<&crate::lazy::RawValue>()?;
-                if seen.insert(key.clone()) {
-                    keys.push(key);
-                }
-            }
-            Ok(keys)
-        }
-    }
-    use serde::Deserializer;
-    let mut de = serde_json::Deserializer::from_str(raw.get());
-    de.deserialize_map(Keys).unwrap_or_default()
+/// A number field, or None for any other value.
+fn number(v: Option<JsonView<'_>>) -> Result<Option<serde_json::Number>> {
+    Ok(v.map(JsonView::as_number).transpose()?.flatten())
 }
 
-/// Hook rows preserve the old literal-marker selection and reduce only metadata. Unknown
-/// update/run payloads are validated at the line boundary but never materialized.
+/// A string field of an object view, or None.
+fn string(v: Option<JsonView<'_>>, key: &str) -> Result<Option<String>> {
+    let Some(field) = v.map(|v| v.get(key)).transpose()?.flatten() else {
+        return Ok(None);
+    };
+    Ok(field
+        .is_string()?
+        .then(|| field.resolve())
+        .transpose()?
+        .and_then(|v| v.as_str().map(str::to_owned)))
+}
+
+/// The `hook_execution` updates, reduced to metadata. Unknown update/run payloads are validated
+/// at the line boundary but never materialized.
 fn hook_runs(dir: &Path) -> Vec<crate::affordance::Affordance> {
     use crate::affordance::{Affordance, Kind};
     let mut out = Vec::new();
-    if metadata::scan_hooks(&dir.join("updates.jsonl"), |v| {
+    if jsonl::for_each_record(&dir.join("updates.jsonl"), |v| {
         let Some(params) = v.get("params")? else { return Ok(()) };
         let Some(u) = params.get("update")? else { return Ok(()) };
-        if u.string_field("sessionUpdate")?.as_deref() != Some("hook_execution") {
+        if string(Some(u), "sessionUpdate")?.as_deref() != Some("hook_execution") {
             return Ok(());
         }
-        let event = u.string_field("event_name")?.unwrap_or_else(|| "hook".into());
-        let millis = params
-            .get("_meta")?
-            .map(|v| v.number_field("agentTimestampMs"))
-            .transpose()?
-            .flatten()
-            .and_then(|n| n.as_i64());
+        let event = string(Some(u), "event_name")?.unwrap_or_else(|| "hook".into());
+        let millis = number(
+            params
+                .get("_meta")?
+                .map(|v| v.get("agentTimestampMs"))
+                .transpose()?
+                .flatten(),
+        )?
+        .and_then(|n| n.as_i64());
         let timestamp = millis.and_then(chrono::DateTime::from_timestamp_millis);
         let timestamp = if timestamp.is_some() {
             timestamp
         } else {
-            v.number_field("timestamp")?
+            number(v.get("timestamp")?)?
                 .and_then(|n| n.as_i64())
                 .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
         };
-        if let Some(runs) = u.get("runs")? {
-            for run in runs.array()? {
+        if let Some(runs) = u.get("runs")?.map(|v| v.array()).transpose()?.flatten() {
+            for run in runs {
                 let run = run?;
-                let name = run.string_field("name")?.unwrap_or_default();
+                let name = string(Some(run), "name")?.unwrap_or_default();
                 let status = run.get("status")?;
-                let label = status
-                    .map(|v| v.string_field("status"))
-                    .transpose()?
-                    .flatten()
-                    .unwrap_or_default();
+                let label = string(status, "status")?.unwrap_or_default();
                 let mut summary = format!("{event}: {name} · {label}");
-                if let Some(ms) = status
-                    .map(|v| v.number_field("elapsed_ms"))
-                    .transpose()?
-                    .flatten()
-                    .and_then(|n| n.as_u64())
+                if let Some(ms) =
+                    number(status.map(|v| v.get("elapsed_ms")).transpose()?.flatten())?.and_then(|n| n.as_u64())
                 {
                     summary.push_str(&format!(" · {ms} ms"));
                 }
@@ -303,7 +271,7 @@ fn hook_runs(dir: &Path) -> Vec<crate::affordance::Affordance> {
         }
         Ok(())
     })
-    .is_none()
+    .is_err()
     {
         out.clear();
     }
@@ -376,30 +344,45 @@ struct HistoryCheckpoint {
     skipped: u64,
 }
 
-#[allow(clippy::too_many_arguments)] // Existing replay state plus its optional checked source.
+/// The one Grok read: records `at..` of `chat_history.jsonl`, each through the record codec. A
+/// standalone `reasoning` record is held and joins the next assistant turn. After a finished
+/// line that delivered a message (and holds no reasoning) the sink may take a checkpoint with
+/// the rejected-line count so far. `Ok(None)`: `at` lies beyond the file (a resume that cannot be).
 fn stream_history_at(
-    file: fs::File,
     wire: &Path,
     at: u64,
     mut s: Session,
     enrich: &HashMap<String, ToolEnrich>,
     prior_skipped: u64,
+    opts: &ParseOptions,
     sink: &mut dyn MessageSink,
-    source: Option<&crate::json::JsonSource>,
-) -> Result<Session> {
+) -> Result<Option<Session>> {
+    let source = JsonSource::capture(wire).with_context(|| format!("reading {}", wire.display()))?;
+    let file = fs::File::open(wire).with_context(|| format!("reading {}", wire.display()))?;
+    source.check_metadata(file.metadata()?)?;
+    if at > source.len() {
+        return Ok(None);
+    }
+    let spans = opts.spans.then_some(&source);
     let session_model = s.model.clone();
     let mut pending: Option<Message> = None;
     let mut stopped = false;
-    let mut accept = |is_reasoning, message: Option<Message>, offset, complete, skipped| {
+    let mut skipped = prior_skipped;
+    jsonl::for_each_line(&source, &file, at, source.len(), |line| {
+        let Some(view) = line.view else {
+            skipped += u64::from(!line.blank);
+            return Ok(Flow::Continue);
+        };
+        let (is_reasoning, message) = record::message(view, spans, enrich)?;
         let Some(mut m) = message else {
-            return Flow::Continue;
+            return Ok(Flow::Continue);
         };
         if is_reasoning {
             match pending.as_mut() {
                 Some(p) => p.content.append(&mut m.content),
                 None => pending = Some(m),
             }
-            return Flow::Continue;
+            return Ok(Flow::Continue);
         }
         if let Some(mut p) = pending.take() {
             if m.role == Role::Assistant {
@@ -407,7 +390,7 @@ fn stream_history_at(
                 m.content = p.content;
             } else if sink.message(p) == Flow::Stop {
                 stopped = true;
-                return Flow::Stop;
+                return Ok(Flow::Stop);
             }
         }
         if m.model.is_some() && m.model == session_model {
@@ -417,47 +400,25 @@ fn stream_history_at(
         stopped = flow == Flow::Stop;
         // Reasoning at EOF is provisional: only a finished record with no held reasoning can
         // finalize the emitted prefix. AffordanceSink also excludes unresolved synchronous spawns.
-        if !stopped && complete && sink.wants_checkpoint(offset) {
+        if !stopped && line.complete && sink.wants_checkpoint(line.end) {
             #[derive(serde::Serialize)]
             struct State<'a> {
                 wire: &'a Path,
                 skipped: u64,
             }
-            let mut checkpoint = Checkpoint::new(offset);
-            checkpoint.put(
-                crate::stream::ADAPTER_LAYER,
-                &State {
-                    wire,
-                    skipped: prior_skipped + skipped,
-                },
-            );
+            let mut checkpoint = Checkpoint::new(line.end);
+            checkpoint.put(crate::stream::ADAPTER_LAYER, &State { wire, skipped });
             sink.checkpoint(&mut checkpoint);
         }
-        flow
-    };
-    let skipped = if let Some(source) = source {
-        selected::for_each(&file, at, source, enrich, &mut accept)?
-    } else {
-        super::try_for_each_json_line_at(BufReader::new(file), at, |v, offset, complete, skipped| {
-            accept(
-                v.get("type").and_then(Value::as_str) == Some("reasoning"),
-                chat_message(&v, enrich),
-                offset,
-                complete,
-                skipped,
-            )
-        })?
-    };
+        Ok(flow)
+    })?;
+    source.check_metadata(file.metadata()?)?;
+    source.check()?;
     if let (Some(p), false) = (pending, stopped) {
         sink.message(p);
     }
-    super::note_skipped_lines(&mut s, prior_skipped + skipped);
-    Ok(s)
-}
-
-#[cfg(feature = "mmap")]
-fn fields(raw: Raw<'_>) -> Record<'_> {
-    Record::parse(raw).unwrap_or_else(|| Record::empty(raw))
+    super::note_skipped_lines(&mut s, skipped);
+    Ok(Some(s))
 }
 
 /// Subagent nickname + Grok-specific session facts from `summary.json`: a subagent's `agent_name`
@@ -561,228 +522,54 @@ fn read_update_enrichment(dir: &Path) -> HashMap<String, ToolEnrich> {
     // Preserve first-seen order in the public vector without repeatedly scanning its prefix.
     // Membership belongs to this one read, not the retained enrichment or replay state.
     let mut seen_locations: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
-    if metadata::scan(&dir.join("updates.jsonl"), |v| {
+    if jsonl::for_each_record(&dir.join("updates.jsonl"), |v| {
         let Some(u) = v.get("params")?.map(|p| p.get("update")).transpose()?.flatten() else {
             return Ok(());
         };
-        let su = u.string_field("sessionUpdate")?;
+        let Some(u) = Fields::parse(
+            u,
+            &["sessionUpdate", "toolCallId", "title", "kind", "locations", "status"],
+        )?
+        else {
+            return Ok(());
+        };
+        let su = u.string("sessionUpdate")?;
         if !matches!(su.as_deref(), Some("tool_call") | Some("tool_call_update")) {
             return Ok(());
         }
-        let Some(id) = u.string_field("toolCallId")? else {
+        let Some(id) = u.string("toolCallId")? else {
             return Ok(());
         };
         let seen = seen_locations.entry(id.clone()).or_default();
         let e = map.entry(id).or_default();
-        if let Some(title) = u.string_field("title")? {
+        if let Some(title) = u.string("title")? {
             if su.as_deref() == Some("tool_call_update") || e.title.is_none() {
                 e.title = Some(title)
             }
         }
-        if let Some(kind) = u.string_field("kind")? {
+        if let Some(kind) = u.string("kind")? {
             e.kind = Some(kind)
         }
-        if let Some(locations) = u.get("locations")? {
-            for location in locations.array()? {
-                if let Some(path) = location?.string_field("path")? {
+        if let Some(locations) = u.get("locations").map(|v| v.array()).transpose()?.flatten() {
+            for location in locations {
+                if let Some(path) = string(Some(location?), "path")? {
                     if seen.insert(path.clone()) {
                         e.locations.push(path)
                     }
                 }
             }
         }
-        if let Some(status) = u.string_field("status")? {
+        if let Some(status) = u.string("status")? {
             e.status = Some(status)
         }
         Ok(())
     })
-    .is_none()
+    .is_err()
     {
         map.clear();
     }
 
     map
-}
-
-fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Message> {
-    let ty = v.get("type").and_then(Value::as_str)?;
-
-    // tool_result lines become a distinct Tool-role message so conversions re-encode them correctly.
-    if ty == "tool_result" {
-        let tool_use_id = v
-            .get("tool_call_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let content = text_parts(v.get("content"));
-        let e = enrich.get(&tool_use_id);
-        let is_error = e.map(|e| e.is_error()).unwrap_or(false);
-        let status = e.and_then(|e| e.status.clone());
-        let tool_name = e.and_then(|e| e.title.clone());
-        let mut m = Message::new(Role::Tool);
-        m.content.push(Block::ToolResult {
-            tool_use_id,
-            content: content.into(),
-            is_error,
-            tool_name,
-            status,
-            details: None,
-        });
-        return Some(m);
-    }
-
-    // 1.0.5x writes reasoning as its own record before the assistant turn it belongs to:
-    // `{type: reasoning, id, summary: [{type: summary_text, text}], encrypted_content?}`. Older
-    // versions nest it in the assistant line (`reasoning{text,encrypted}`, below).
-    if ty == "reasoning" {
-        let text = v
-            .get("summary")
-            .and_then(Value::as_array)
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        let encrypted = v.get("encrypted_content").and_then(Value::as_str).map(str::to_string);
-        if text.is_empty() && encrypted.is_none() {
-            return None;
-        }
-        let mut m = Message::new(Role::Assistant);
-        m.content.push(Block::Thinking {
-            text: text.into(),
-            signature: None,
-            encrypted,
-            redacted: false,
-        });
-        return Some(m);
-    }
-
-    let role = match ty {
-        "system" => Role::System,
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        _ => return None,
-    };
-    let mut m = Message::new(role);
-    // kind/origin from Grok's own turn semantics. `assistant` keeps the role-implied Reply/Model.
-    match ty {
-        // The system prompt (also `system_prompt.txt`, mirrored into `Session::system_prompt`).
-        "system" => m.kind = MessageKind::SystemPrompt,
-        "user" => {
-            let (kind, origin) = user_kind_origin(v);
-            m.kind = kind;
-            m.origin = origin;
-        }
-        _ => {}
-    }
-
-    // assistant lines may carry reasoning (summarized text + opaque encrypted blob).
-    if let Some(reasoning) = v.get("reasoning") {
-        let text = reasoning.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-        let encrypted = reasoning.get("encrypted").and_then(Value::as_str).map(str::to_string);
-        if !text.is_empty() || encrypted.is_some() {
-            m.content.push(Block::Thinking {
-                text: text.into(),
-                signature: None,
-                encrypted,
-                redacted: false,
-            });
-        }
-    }
-    if let Some(model) = v.get("model_id").and_then(Value::as_str) {
-        m.model = Some(model.to_string());
-    }
-
-    let text = text_parts(v.get("content"));
-    if !text.is_empty() {
-        m.content.push(Block::Text { text: text.into() });
-    }
-
-    // assistant tool_calls → ToolUse blocks (arguments is a JSON *string*).
-    if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
-        for c in calls {
-            let id = c.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-            let name = c.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
-            let input = openai::parse_arguments(c.get("arguments"));
-            // Stash sidecar enrichment so nothing is lost (ir.rs has no field for it yet).
-            if let Some(e) = enrich.get(&id) {
-                let mut info = serde_json::Map::new();
-                if let Some(t) = &e.title {
-                    info.insert("title".into(), Value::String(t.clone()));
-                }
-                if let Some(k) = &e.kind {
-                    info.insert("kind".into(), Value::String(k.clone()));
-                }
-                if !e.locations.is_empty() {
-                    info.insert(
-                        "locations".into(),
-                        Value::Array(e.locations.iter().cloned().map(Value::String).collect()),
-                    );
-                }
-                if !info.is_empty() {
-                    let bag = m.harness_extra_mut(Harness::Grok);
-                    if let Value::Object(obj) = bag
-                        .entry("tool_calls")
-                        .or_insert_with(|| Value::Object(serde_json::Map::new()))
-                    {
-                        obj.insert(id.clone(), Value::Object(info));
-                    }
-                }
-            }
-            m.content.push(Block::ToolUse {
-                id,
-                name,
-                input: input.into(),
-                namespace: None,
-            });
-        }
-    }
-
-    // Preserve a couple of high-signal scalars for round-tripping (the injected-context flavor —
-    // `system_reminder` / `project_instructions` / `task_completed` — is already on `kind`/`origin`,
-    // but the exact `synthetic_reason` is kept so the distinction survives).
-    let fingerprint = v.get("model_fingerprint").and_then(Value::as_str).map(str::to_string);
-    let synthetic = v.get("synthetic_reason").and_then(Value::as_str).map(str::to_string);
-    if fingerprint.is_some() || synthetic.is_some() {
-        let bag = m.harness_extra_mut(Harness::Grok);
-        if let Some(fp) = fingerprint {
-            bag.insert("model_fingerprint".into(), Value::String(fp));
-        }
-        if let Some(sr) = synthetic {
-            bag.insert("synthetic_reason".into(), Value::String(sr));
-        }
-    }
-
-    if m.content.is_empty() {
-        return None;
-    }
-    Some(m)
-}
-
-/// kind/origin for a Grok `user` record from its own semantics. A real typed prompt is
-/// Prompt/Human; the harness injects several kinds of context as their own `user` turns —
-/// `<system-reminder>` skill/rule blocks and background-task notices (flagged by
-/// `synthetic_reason`) and the unflagged `<user_info>` environment block — all InjectedContext /
-/// Harness. A `compaction_meta` turn is the summary that seeds the post-compaction window.
-fn user_kind_origin(v: &Value) -> (MessageKind, Origin) {
-    match v.get("synthetic_reason").and_then(Value::as_str) {
-        // After a compaction 1.0.5x re-tags the leading `<user_info>` block `compaction_meta` too;
-        // only the summary itself is the compaction summary.
-        Some("compaction_meta") if !text_parts(v.get("content")).trim_start().starts_with("<user_info>") => {
-            (MessageKind::CompactionSummary, Origin::Harness)
-        }
-        Some(_) => (MessageKind::InjectedContext, Origin::Harness),
-        None => {
-            if text_parts(v.get("content")).trim_start().starts_with("<user_info>") {
-                (MessageKind::InjectedContext, Origin::Harness)
-            } else {
-                (MessageKind::Prompt, Origin::Human)
-            }
-        }
-    }
 }
 
 /// `summary_path` is `.../<sid>/summary.json`; the session dir is its parent.
@@ -819,21 +606,17 @@ fn scan(summary_path: &Path) -> Result<Option<SessionRef>> {
     // pass supplies the title fallback (first non-empty user text).
     let mut message_count = 0usize;
     let initial_title = title.clone();
-    let history = dir.join("chat_history.jsonl");
-    let resolver = crate::lazy::Resolver::new(Some(history.clone()));
-    if metadata::scan(&history, |v| {
-        let ty = v.string_field("type")?;
+    if jsonl::for_each_record(&dir.join("chat_history.jsonl"), |v| {
+        let ty = string(Some(v), "type")?;
         if matches!(ty.as_deref(), Some("user") | Some("assistant")) {
             message_count += 1;
         }
         if title.is_none() && ty.as_deref() == Some("user") {
-            if let Some(content) = v.get("content")? {
-                title = content.title(&resolver)?;
-            }
+            title = super::wire::text_title(v.get("content")?)?;
         }
         Ok(())
     })
-    .is_none()
+    .is_err()
     {
         message_count = 0;
         title = initial_title;
@@ -875,51 +658,22 @@ mod tests {
         }
     }
 
-    fn old_history_oracle(r: &SessionRef) -> Session {
-        let (mut s, enrich) = session_header(r);
-        let model = s.model.clone();
-        let mut kept = ResumeKeep::default();
-        let mut spawns = crate::affordance::AffordanceSink::new(Harness::Grok, &mut kept);
-        let mut pending: Option<Message> = None;
-        let skipped = super::super::for_each_json_line(
-            BufReader::new(fs::File::open(r.path.join("chat_history.jsonl")).unwrap()),
-            |v| {
-                let reasoning = v.get("type").and_then(Value::as_str) == Some("reasoning");
-                let Some(mut m) = chat_message(&v, &enrich) else {
-                    return Flow::Continue;
-                };
-                if reasoning {
-                    match &mut pending {
-                        Some(p) => p.content.append(&mut m.content),
-                        None => pending = Some(m),
-                    }
-                    return Flow::Continue;
-                }
-                if let Some(mut p) = pending.take() {
-                    if m.role == Role::Assistant {
-                        p.content.append(&mut m.content);
-                        m.content = p.content;
-                    } else {
-                        spawns.message(p);
-                    }
-                }
-                if m.model.is_some() && m.model == model {
-                    m.model = None;
-                }
-                spawns.message(m)
-            },
-        );
-        if let Some(p) = pending {
-            spawns.message(p);
-        }
-        super::super::note_skipped_lines(&mut s, skipped);
-        s.messages = kept.messages;
+    /// The record codec over an owned value, no spans.
+    fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Message> {
+        record::message(v.into(), None, enrich).unwrap().1
+    }
+
+    /// A whole stream of `r`, messages collected.
+    fn whole(adapter: &Grok, r: &SessionRef, opts: &ParseOptions) -> Session {
+        let mut all = ResumeKeep::default();
+        let mut s = adapter.try_stream(r, opts, &mut all).unwrap();
+        s.messages = all.messages;
         s
     }
 
     #[test]
     fn enrichment_many_locations_keeps_first_seen_order_per_call() {
-        let world = cv_testkit::World::in_process("grok-many-tool-locations");
+        let world = crate::test_world("grok-many-tool-locations");
         let dir = world.base.join("session");
         fs::create_dir_all(&dir).unwrap();
         let mut rows = Vec::new();
@@ -944,7 +698,7 @@ mod tests {
 
     #[test]
     fn checked_resume_retains_reasoning_arguments_results_and_source_identity() {
-        let world = cv_testkit::World::in_process("grok_selected_resume");
+        let world = crate::test_world("grok_selected_resume");
         let dir = world.home.join(".grok/session");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chat_history.jsonl");
@@ -991,13 +745,14 @@ mod tests {
             .iter()
             .flat_map(|m| &m.content)
             .any(|b| matches!(b, Block::ToolUse { id, input: crate::Json::Source(_), .. } if id == "structured")));
-        fs::write(&path, format!("{body}\n")).unwrap();
+        // Truncation, not growth: an append-only log may grow under a retained source.
+        fs::write(&path, "").unwrap();
         assert!(serde_json::to_value(&resumed.messages).is_err());
     }
 
     #[test]
     fn resume_corpus_keeps_grouping_enrichment_and_exact_suffixes() {
-        let world = cv_testkit::World::in_process("grok_resume_corpus");
+        let world = crate::test_world("grok_resume_corpus");
         let adapter = Grok::with_home(&world.home.join(".grok"));
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/grok");
         let mut files = 0;
@@ -1011,7 +766,6 @@ mod tests {
                 continue;
             }
             let r = SessionRef::new("corpus", Harness::Grok, file.path().parent().unwrap());
-            let old = old_history_oracle(&r);
             for opts in [
                 ParseOptions::lazy(),
                 ParseOptions::lazy_extra(),
@@ -1019,15 +773,7 @@ mod tests {
                 ParseOptions::complete(),
             ] {
                 let mut full = ResumeKeep::default();
-                let mut shell = adapter.try_stream(&r, &opts, &mut full).unwrap();
-                shell.messages = full.messages.clone();
-                assert_eq!(
-                    serde_json::to_value(&shell).unwrap(),
-                    serde_json::to_value(&old).unwrap(),
-                    "{} old collector",
-                    file.path().display()
-                );
-                shell.messages.clear();
+                let shell = adapter.try_stream(&r, &opts, &mut full).unwrap();
                 let stride = (full.checkpoints.len() / 12).max(1);
                 for (i, (count, cp)) in full.checkpoints.iter().enumerate().step_by(stride) {
                     let mut rest = ResumeKeep::default();
@@ -1056,7 +802,7 @@ mod tests {
     #[test]
     fn resume_replays_eof_reasoning_and_partial_records_and_reads_only_appends() {
         use std::io::Write as _;
-        let world = cv_testkit::World::in_process("grok_reasoning_resume");
+        let world = crate::test_world("grok_reasoning_resume");
         let dir = world.home.join(".grok/sessions/group/session");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -1084,6 +830,7 @@ mod tests {
         file.write_all(line.repeat(200).as_bytes()).unwrap();
         drop(file);
         r.title = Some("current catalog title".into());
+        let expected = whole(&adapter, &r, &opts);
         let mut suffix = ResumeKeep::default();
         let mut shell = adapter.try_resume(&r, &opts, &mut suffix, cp).unwrap().unwrap();
         assert_eq!(suffix.messages.len(), 201);
@@ -1095,7 +842,7 @@ mod tests {
             .collect();
         assert_eq!(
             serde_json::to_value(shell).unwrap(),
-            serde_json::to_value(old_history_oracle(&r)).unwrap()
+            serde_json::to_value(expected).unwrap()
         );
         let mut other = r.clone();
         other.path = dir.join("other");
@@ -1107,13 +854,9 @@ mod tests {
         bytes.extend_from_slice(b"\xff\n");
         bytes.extend_from_slice(line.as_bytes());
         fs::write(adapter.resume_source(&r), bytes).unwrap();
-        let mut all = ResumeKeep::default();
-        let mut shell = adapter.try_stream(&r, &opts, &mut all).unwrap();
-        shell.messages = all.messages;
-        assert_eq!(
-            serde_json::to_value(shell).unwrap(),
-            serde_json::to_value(old_history_oracle(&r)).unwrap()
-        );
+        let after = whole(&adapter, &r, &opts);
+        assert_eq!(after.messages.len(), count + 1 + 200 + 1);
+        assert_eq!(after.cv_extra().unwrap()["skipped_lines"], 2);
         eprintln!(
             "grok stable_prefix=20000 appended_callbacks=201 whole_callbacks=20201 checkpoint_bytes={}",
             serde_json::to_vec(cp).unwrap().len()
@@ -1161,7 +904,7 @@ mod tests {
                 let ty = v.get("type").and_then(Value::as_str);
                 expected_count += usize::from(matches!(ty, Some("user" | "assistant")));
                 if expected_title.is_none() && ty == Some("user") {
-                    let text = text_parts(v.get("content"));
+                    let text = super::super::wire::text_parts(v.get("content"));
                     if !text.trim().is_empty() {
                         expected_title = Some(crate::ir::truncate(&text, 80));
                     }
@@ -1177,14 +920,15 @@ mod tests {
                 first.len()
             );
         }
+        // A non-UTF-8 line is one rejected record, as in the stream.
         fs::write(
             dir.join("chat_history.jsonl"),
             b"{\"type\":\"user\",\"content\":\"prefix\"}\n\xff",
         )
         .unwrap();
         let actual = scan(&summary).unwrap().unwrap();
-        assert_eq!(actual.message_count, 0);
-        assert_eq!(actual.title, None);
+        assert_eq!(actual.message_count, 1);
+        assert_eq!(actual.title.as_deref(), Some("prefix"));
     }
 
     #[test]
@@ -1197,8 +941,7 @@ mod tests {
             r#"{"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"call","title":"old","ti\u0074le":"rich","status":"completed","locations":[{"path":"a"},{"path":"c"}]}}}"#,
             r#"{"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"call","status":"failed"}},"ignored":"\ud800"}"#,
             r#"{"params":{"update":{"sessionUpdate":"hook_execution","event_name":"after","runs":[{"name":"check","status":{"status":"ok","elapsed_ms":3}},{"name":"second","status":null}]},"_meta":{"agentTimestampMs":1700000000123}},"timestamp":1}"#,
-            // Original hook reader only selects a literal marker, even when semantic type matches.
-            r#"{"params":{"update":{"sessionUpdate":"hook\u005fexecution","runs":[{"name":"not selected"}]}}}"#,
+            r#"{"params":{"update":{"sessionUpdate":"hook\u005fexecution","runs":[{"name":"escaped"}]}}}"#,
             r#"{"params":{"update":{"sessionUpdate":"hook\u005fexecution","runs":[{"name":"selected","status":{"status":"ok"}}]}},"ignored":"hook_execution"}"#,
             r#"{"params":{"update":{"sessionUpdate":"hook_execution","runs":[{"name":"invalid"}]}},"ignored":1e400}"#,
         ].join("\n");
@@ -1213,6 +956,7 @@ mod tests {
         let expected = [
             Affordance::store_event(Kind::Hook, "run", ts, "updates.jsonl", "after: check · ok · 3 ms"),
             Affordance::store_event(Kind::Hook, "run", ts, "updates.jsonl", "after: second · "),
+            Affordance::store_event(Kind::Hook, "run", None, "updates.jsonl", "hook: escaped · "),
             Affordance::store_event(Kind::Hook, "run", None, "updates.jsonl", "hook: selected · ok"),
         ];
         assert_eq!(
@@ -1243,14 +987,14 @@ mod tests {
             serde_json::to_value(rewind_points(dir)).unwrap(),
             serde_json::to_value(expected).unwrap()
         );
-        // Bad UTF-8 anywhere retracts earlier rows, for the literal-selected reader too.
+        // A non-UTF-8 line is one rejected record; the rows around it stand.
         let mut bad = updates.into_bytes();
         bad.extend_from_slice(b"\n\xff");
         fs::write(dir.join("updates.jsonl"), bad).unwrap();
-        assert!(hook_runs(dir).is_empty());
-        assert!(read_update_enrichment(dir).is_empty());
+        assert_eq!(hook_runs(dir).len(), 4);
+        assert_eq!(read_update_enrichment(dir).len(), 1);
         fs::write(dir.join("rewind_points.jsonl"), b"{}\n\xff").unwrap();
-        assert!(rewind_points(dir).is_empty());
+        assert_eq!(rewind_points(dir).len(), 1);
     }
 
     fn enrich_from(s: &str) -> HashMap<String, ToolEnrich> {

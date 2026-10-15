@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "qwen"
-source_files = ["harness/qwen.rs"]
+source_files = ["harness/qwen.rs", "harness/qwen/record.rs"]
 ignore_literals = ["json", "jsonl", "chats"]
 store = [
   "~/.qwen/projects/<sanitized cwd>/chats/<sessionId>.jsonl",

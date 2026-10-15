@@ -33,11 +33,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
-/// Bytes per token for distilled content. Prune's 3.5 suits prose; a distilled pack is dense with
-/// shas, paths, hosts and code, and measured on three real lanes (resumed with Claude Code, harness
-/// overhead subtracted) it ran 2.2–2.4 characters per token. The arithmetic is
-/// [`crate::ir::est_tokens`]'s, shared with `doctor`; only the constant is distill's.
-const BYTES_PER_TOKEN: f64 = 2.4;
+/// A distilled pack is dense with shas, paths, hosts and code: measured on three real lanes
+/// (resumed with Claude Code, harness overhead subtracted) it ran 2.2–2.4 bytes per token, so it is
+/// priced like tool-call JSON. Blocks use the shared [`crate::ir::est_tokens`].
+const PACK_KIND: crate::ir::TokenKind = crate::ir::TokenKind::ToolInput;
 
 /// Knobs for [`distill`].
 #[derive(Debug, Clone)]
@@ -193,9 +192,10 @@ pub fn prepare_distill(session: &Session, opts: &DistillOptions) -> anyhow::Resu
     analyze(session, opts, Demand::Full)
 }
 
-/// Serialize elided outputs through the shared bounded JSONL stage before opening the sidecar.
-/// Inputs and content are borrowed from the existing elision roster; no artifact-sized copy is made.
-pub fn write_sidecar(path: &std::path::Path, elided: &[Elided]) -> anyhow::Result<()> {
+/// Serialize elided outputs through the shared bounded JSONL stage, then publish the sidecar
+/// whole under `claim`. Inputs and content are borrowed from the existing elision roster; no
+/// artifact-sized copy is made.
+pub fn write_sidecar(path: &std::path::Path, elided: &[Elided], claim: crate::publish::Claim) -> anyhow::Result<()> {
     let mut stage = crate::harness::store::JsonlStage::new();
     for entry in elided {
         stage.push(crate::prune::BorrowedSidecarEntry::text(
@@ -205,7 +205,7 @@ pub fn write_sidecar(path: &std::path::Path, elided: &[Elided]) -> anyhow::Resul
             &entry.content,
         ))?;
     }
-    stage.publish(path)
+    stage.publish(path, claim)
 }
 
 // ── analysis ─────────────────────────────────────────────────────────────────────────────────
@@ -412,23 +412,11 @@ fn attachment_type(m: &Message) -> Option<&str> {
 }
 
 fn est(s: &str) -> u64 {
-    est_tokens_bytes(s.len(), BYTES_PER_TOKEN)
+    est_tokens_bytes(s.len(), PACK_KIND)
 }
 
 fn block_est(b: &Block) -> anyhow::Result<u64> {
-    est_tokens(b, BYTES_PER_TOKEN)
-}
-
-#[cfg(test)]
-fn message_est(m: &Message) -> anyhow::Result<u64> {
-    #[cfg(test)]
-    note_work(|work| work.source_estimates += 1);
-    if !m.is_model_visible() {
-        return Ok(0);
-    }
-    m.content
-        .iter()
-        .try_fold(0u64, |sum, block| Ok(sum + block_est(block)?))
+    est_tokens(b)
 }
 
 // Count decoded model-visible bodies without retaining them for the analysis lifetime.
@@ -439,7 +427,7 @@ fn message_est_resolved(m: &Message, resolver: &crate::Resolver) -> anyhow::Resu
         return Ok(0);
     }
     m.content.iter().try_fold(0u64, |sum, block| {
-        Ok(sum + crate::ir::est_tokens_resolved(block, BYTES_PER_TOKEN, resolver)?)
+        Ok(sum + crate::ir::est_tokens_resolved(block, resolver)?)
     })
 }
 
@@ -1552,19 +1540,6 @@ fn render_prepared_tail(tail: &[Message], tail_start: usize, opts: &DistillOptio
     Ok(s)
 }
 
-#[cfg(test)]
-fn session_label(s: &Session) -> String {
-    let desc = s
-        .extra
-        .get("claude")
-        .and_then(|b| b.get("agent_description"))
-        .and_then(Value::as_str);
-    match desc {
-        Some(d) => d.to_string(),
-        None => s.label(),
-    }
-}
-
 /// The preamble a resumed distilled session opens with, ahead of the head of the pack.
 pub fn resume_preamble(d: &Distilled, keep_last: usize) -> String {
     format!(
@@ -1648,6 +1623,7 @@ pub fn findings(session: &Session, opts: &DistillOptions) -> anyhow::Result<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::emit::grok_qwen_tests::Frozen;
     use crate::ir::Harness;
     use serde_json::json;
 
@@ -1678,6 +1654,27 @@ pub(crate) mod tests {
         }
     }
 
+    fn digest(bytes: impl AsRef<[u8]>) -> Value {
+        let bytes = bytes.as_ref();
+        json!([bytes.len(), crate::digest::sha256_hex(bytes)])
+    }
+    fn json_digest(value: &impl serde::Serialize) -> Value {
+        digest(serde_json::to_vec(value).unwrap())
+    }
+    /// One distillation, frozen: each product's length and SHA-256.
+    fn products(d: &Distilled) -> Value {
+        let elided: Vec<_> = (d.elided.iter())
+            .map(|e| json!({"id":e.tool_use_id,"name":e.tool_name,"input":e.input,"content":e.content}))
+            .collect();
+        json!({
+            "head": digest(&d.head_md),
+            "tail": digest(&d.tail_md),
+            "tail_start": d.tail_start,
+            "pack": digest(d.pack()),
+            "stats": json_digest(&d.stats),
+            "elided": json_digest(&elided),
+        })
+    }
     fn same_products(actual: &Distilled, expected: &Distilled) {
         assert_eq!(actual.head_md, expected.head_md);
         assert_eq!(actual.tail_md, expected.tail_md);
@@ -1730,6 +1727,7 @@ body λ",
             message.timestamp = Some(fixed_time);
         }
         let world = cv_testkit::World::new("distill-products-native");
+        let mut frozen = Frozen::new("distill-shared-products");
         for keep_last in [0, 2, 12, 999] {
             for tail_result_max in [0, 17, 6000] {
                 let opts = DistillOptions {
@@ -1740,12 +1738,8 @@ body λ",
                     ..Default::default()
                 };
                 WORK.with(|cell| cell.set(Work::default()));
-                let expected = legacy_products::distill(&source, &opts)?;
-                let expected_session = legacy_products::resumable_session(&source, &expected, &opts)?;
-                let old_work = WORK.with(|cell| cell.get());
-                WORK.with(|cell| cell.set(Work::default()));
                 let prepared = prepare_distill(&source, &opts)?;
-                same_products(&prepared.distilled, &expected);
+                let expected = prepared.distilled.clone();
                 let pointers: Vec<_> = prepared
                     .tail
                     .iter()
@@ -1760,10 +1754,6 @@ body λ",
                 let (actual, actual_session) = prepared.into_resumable_session(&source);
                 let new_work = WORK.with(|cell| cell.get());
                 same_products(&actual, &expected);
-                assert_eq!(
-                    serde_json::to_value(&actual_session)?,
-                    serde_json::to_value(&expected_session)?
-                );
                 let moved: Vec<_> = actual_session
                     .messages
                     .iter()
@@ -1777,54 +1767,40 @@ body λ",
                     })
                     .collect();
                 assert_eq!(pointers, moved, "prepared tail bodies must move");
-                assert_eq!(old_work.tail_preparations, 3);
                 assert_eq!(new_work.tail_preparations, 1);
-                assert_eq!(new_work.elided_copy_bytes, old_work.elided_copy_bytes);
-                assert_eq!(new_work.source_estimates, old_work.source_estimates);
-                let sidecar = |d: &Distilled| {
-                    d.elided
-                        .iter()
-                        .map(|e| crate::prune::sidecar_line(&e.tool_use_id, &e.tool_name, &e.input, &e.content))
-                        .collect::<Vec<_>>()
-                };
-                assert_eq!(sidecar(&actual), sidecar(&expected));
+                let mut entry = json!({
+                    "products": products(&actual),
+                    "session": json_digest(&actual_session),
+                    "work": [new_work.elided_copy_bytes, new_work.source_estimates],
+                });
                 if keep_last == 2 && tail_result_max == 17 {
-                    let mut expected_native = expected_session.clone();
                     let mut actual_native = actual_session.clone();
-                    for session in [&mut expected_native, &mut actual_native] {
-                        session.messages[0].id = Some("00000000-0000-4000-8000-000000000001".into());
-                    }
+                    actual_native.messages[0].id = Some("00000000-0000-4000-8000-000000000001".into());
                     for target in [Harness::Claude, Harness::Codex] {
                         let emit_opts = crate::emit::EmitOptions {
                             new_id: Some("00000000-0000-4000-8000-000000000002".into()),
+                            // Without a cwd the Codex writer falls back to $HOME: pin it.
+                            new_cwd: Some("/synthetic/distill".into()),
                             ..Default::default()
                         };
-                        let old = crate::emit::emit(
-                            &expected_native,
-                            target,
-                            &world.base.join(format!("old-{target}")),
-                            &emit_opts,
-                        )?;
                         let new = crate::emit::emit(
                             &actual_native,
                             target,
                             &world.base.join(format!("new-{target}")),
                             &emit_opts,
                         )?;
-                        assert!(
-                            std::fs::read(old.path)? == std::fs::read(new.path)?,
-                            "native {target} output"
-                        );
+                        entry[target.as_str()] = digest(std::fs::read(&new.path)?);
                     }
                 }
-                same_products(&distill(&source, &opts)?, &expected);
+                frozen.insert(format!("keep{keep_last}-result{tail_result_max}"), entry);
+                same_products(&distill(&source, &opts)?, &actual);
                 assert_eq!(
-                    serde_json::to_value(resumable_session(&source, &expected, &opts)?)?,
-                    serde_json::to_value(&expected_session)?
+                    serde_json::to_value(resumable_session(&source, &actual, &opts)?)?,
+                    serde_json::to_value(&actual_session)?
                 );
             }
         }
-        Ok(())
+        frozen.check()
     }
     #[test]
     fn prepared_products_allow_findings_append_and_preserve_source_errors() -> anyhow::Result<()> {
@@ -1833,28 +1809,29 @@ body λ",
             keep_last: 2,
             ..Default::default()
         };
-        let mut expected = legacy_products::distill(&source, &opts)?;
         let mut actual = prepare_distill(&source, &opts)?;
-        for d in [&mut expected, &mut actual.distilled] {
-            d.append_findings(&findings(&source, &opts)?);
-        }
-        let expected_session = legacy_products::resumable_session(&source, &expected, &opts)?;
+        actual.distilled.append_findings(&findings(&source, &opts)?);
         let (actual, actual_session) = actual.into_resumable_session(&source);
-        same_products(&actual, &expected);
-        assert_eq!(
-            serde_json::to_value(actual_session)?,
-            serde_json::to_value(expected_session)?
-        );
         let changed_opts = DistillOptions {
             tail_result_max: 17,
             keep_tail_thinking: true,
             ..opts.clone()
         };
-        assert_eq!(
+        // The compatibility wrapper must honor its caller's options.
+        assert_ne!(
             serde_json::to_value(resumable_session(&source, &actual, &changed_opts)?)?,
-            serde_json::to_value(legacy_products::resumable_session(&source, &expected, &changed_opts)?)?,
-            "compatibility wrapper must honor its caller's options",
+            serde_json::to_value(&actual_session)?,
         );
+        let mut frozen = Frozen::new("distill-findings-append");
+        frozen.insert(
+            "keep2",
+            json!({
+                "products": products(&actual),
+                "session": json_digest(&actual_session),
+                "changed_options_session": json_digest(&resumable_session(&source, &actual, &changed_opts)?),
+            }),
+        );
+        frozen.check()?;
         let world = cv_testkit::World::new("distill-products-source-error");
         let path = world.base.join("body.json");
         let bytes = serde_json::to_vec(&"guarded body".repeat(1024))?;
@@ -1872,8 +1849,6 @@ body λ",
         assert!(prepare_distill(&source, &opts).is_err());
         assert!(distill(&source, &opts).is_err());
         assert!(findings(&source, &opts).is_err());
-        assert!(legacy_products::distill(&source, &opts).is_err());
-        assert!(legacy_products::findings(&source, &opts).is_err());
         Ok(())
     }
 
@@ -1897,21 +1872,12 @@ facts text",
         ));
         let opts = DistillOptions::default();
         WORK.with(|cell| cell.set(Work::default()));
-        let expected = legacy_products::findings(&source, &opts)?;
-        let old_work = WORK.with(|cell| cell.get());
-        WORK.with(|cell| cell.set(Work::default()));
         let actual = findings(&source, &opts)?;
         let new_work = WORK.with(|cell| cell.get());
-        assert_ne!(
-            actual, expected,
-            "the frozen section parser drops embedded source Markdown"
-        );
+        // Embedded source Markdown survives (the retired section parser dropped it).
         assert!(actual.contains("### agent said nested\nbody\n## 3. Facts\nfacts text"));
         assert!(actual.contains("Chose rebase over merge"));
         assert!(actual.contains("`lane/x` `4795b657` kernel: wave one"));
-        assert_eq!(old_work.tail_preparations, 2);
-        assert!(old_work.elided_copy_bytes > 1024 * 1024);
-        assert_eq!(old_work.source_estimates, source.messages.len());
         assert_eq!(new_work.tail_preparations, 0);
         assert_eq!(new_work.elided_copy_bytes, 0);
         assert_eq!(new_work.source_estimates, 0);
@@ -1974,35 +1940,27 @@ facts text",
                 redacted: false,
             },
         );
+        let mut frozen = Frozen::new("distill-complete-demand");
         for keep_last in [0, 2, 100] {
             let opts = DistillOptions {
                 keep_last,
                 ..Default::default()
             };
-            let expected = legacy_products::distill(&source, &opts)?;
             let prepared = prepare_distill(&source, &opts)?;
-            let expected_session = legacy_products::resumable_session(&source, &expected, &opts)?;
             let (actual, actual_session) = prepared.into_resumable_session(&source);
-            same_products(&actual, &expected);
-            assert_eq!(
-                serde_json::to_value(actual_session)?,
-                serde_json::to_value(expected_session)?
-            );
+            same_products(&distill(&source, &opts)?, &actual);
             WORK.with(|cell| cell.set(Work::default()));
             let pack = distill_pack(&source, &opts)?;
             let work = WORK.with(|cell| cell.get());
             assert_eq!(work.elided_copy_bytes, 0);
             assert_eq!(work.tail_preparations, 1);
             assert_eq!(work.source_estimates, source.messages.len());
-            assert_eq!(pack.pack(), expected.pack());
-            assert_eq!(
-                serde_json::to_value(pack.stats)?,
-                serde_json::to_value(&expected.stats)?
-            );
+            assert_eq!(pack.pack(), actual.pack());
+            assert_eq!(serde_json::to_value(pack.stats)?, serde_json::to_value(&actual.stats)?);
             assert!(pack.elided.is_empty());
             let sidecar = world.base.join(format!("sidecar-{keep_last}.jsonl"));
-            write_sidecar(&sidecar, &actual.elided)?;
-            let expected_bytes: String = expected
+            write_sidecar(&sidecar, &actual.elided, crate::publish::Claim::New)?;
+            let expected_bytes: String = actual
                 .elided
                 .iter()
                 .map(|row| {
@@ -2013,22 +1971,29 @@ facts text",
                 })
                 .collect();
             assert!(
-                std::fs::read(sidecar)? == expected_bytes.as_bytes(),
+                std::fs::read(&sidecar)? == expected_bytes.as_bytes(),
                 "sidecar bytes differ"
             );
+            frozen.insert(
+                format!("keep{keep_last}"),
+                json!({
+                    "products": products(&actual),
+                    "session": json_digest(&actual_session),
+                    "sidecar": digest(std::fs::read(&sidecar)?),
+                }),
+            );
         }
+        frozen.check()?;
         // Omitted thinking and code input retain the same checked failure boundary.
         std::fs::write(&thinking_path, b"changed")?;
         assert!(distill_pack(&source, &Default::default()).is_err());
         assert!(prepare_distill(&source, &Default::default()).is_err());
-        assert!(legacy_products::distill(&source, &Default::default()).is_err());
         source.messages[1]
             .content
             .retain(|block| !matches!(block, Block::Thinking { .. }));
         std::fs::write(&input_path, b"changed arguments")?;
         assert!(distill_pack(&source, &Default::default()).is_err());
         assert!(prepare_distill(&source, &Default::default()).is_err());
-        assert!(legacy_products::distill(&source, &Default::default()).is_err());
         Ok(())
     }
 
@@ -2040,6 +2005,7 @@ facts text",
             keep_last: 0,
             ..Default::default()
         };
+        let mut frozen = Frozen::new("distill-span-text");
         for body in [Some(r#"escaped\n\u03bb"#), Some(r#"malformed\q"#), None] {
             if let Some(body) = body {
                 std::fs::write(&path, body)?;
@@ -2060,20 +2026,19 @@ facts text",
                 }],
             ));
             if body.is_none() {
-                assert!(legacy_products::distill(&source, &opts).is_err());
                 assert!(distill(&source, &opts).is_err());
                 assert!(prepare_distill(&source, &opts).is_err());
                 assert!(distill_pack(&source, &opts).is_err());
                 assert!(findings(&source, &opts).is_err());
                 continue;
             }
-            let expected = legacy_products::distill(&source, &opts)?;
-            same_products(&distill(&source, &opts)?, &expected);
+            let expected = distill(&source, &opts)?;
+            frozen.insert(body.unwrap(), products(&expected));
             let pack = distill_pack(&source, &opts)?;
             assert_eq!(pack.pack(), expected.pack());
             assert_eq!(serde_json::to_value(pack.stats)?, serde_json::to_value(expected.stats)?);
         }
-        Ok(())
+        frozen.check()
     }
 
     #[test]
@@ -2101,6 +2066,7 @@ facts text",
             }"#
             .to_vec(),
         ]);
+        let mut frozen = Frozen::new("distill-write-projection");
         for (i, bytes) in inputs.into_iter().enumerate() {
             let input: Value = serde_json::from_slice(&bytes)?;
             let path = world.base.join(format!("input-{i}.json"));
@@ -2139,13 +2105,13 @@ facts text",
                 keep_last: 0,
                 ..Default::default()
             };
-            let expected = legacy_products::distill(&session, &options)?;
-            same_products(&distill(&session, &options)?, &expected);
+            let expected = distill(&session, &options)?;
+            frozen.insert(format!("input{i}"), products(&expected));
             let pack = distill_pack(&session, &options)?;
             assert_eq!(pack.pack(), expected.pack());
             assert_eq!(serde_json::to_value(pack.stats)?, serde_json::to_value(expected.stats)?);
         }
-        Ok(())
+        frozen.check()
     }
 
     #[test]
@@ -2204,19 +2170,14 @@ facts text",
         }
         let options = DistillOptions::default();
         let actual = findings(&source, &options)?;
+        // The final own-words entry survives the following Facts section.
         assert!(actual.contains("Chose simple /tmp/notes.md."));
-        assert_ne!(
-            actual,
-            legacy_products::findings(&source, &options)?,
-            "the final own-words entry now survives the following Facts section"
-        );
         let owned = crate::emit::materialized_session(&source)?;
         assert_eq!(findings(&source, &options)?, findings(&owned, &options)?);
         let argument_path = world.base.join("1-0.json");
         let original_arguments = std::fs::read(&argument_path)?;
         std::fs::write(&argument_path, b"changed arguments")?;
         assert!(findings(&source, &options).is_err());
-        assert!(legacy_products::findings(&source, &options).is_err());
         // Use a fresh descriptor after restoring bytes; guards intentionally reject old identities.
         std::fs::write(&argument_path, &original_arguments)?;
         let Block::ToolUse { input, .. } = &mut source.messages[1].content[0] else {
@@ -2258,11 +2219,9 @@ facts text",
             }],
         ));
         assert!(findings(&wrong, &options).is_err());
-        assert!(legacy_products::findings(&wrong, &options).is_err());
         // Even completely ignored source payloads preserve the old failure boundary.
         std::fs::write(&ignored_path, b"changed")?;
         assert!(findings(&source, &options).is_err());
-        assert!(legacy_products::findings(&source, &options).is_err());
         Ok(())
     }
 
@@ -2457,7 +2416,7 @@ facts text",
         assert!(distilled.stats.pack_est_tokens > original);
         assert_eq!(
             distilled.stats.pack_est_tokens,
-            est_tokens_bytes(distilled.head_md.len(), BYTES_PER_TOKEN)
+            est_tokens_bytes(distilled.head_md.len(), PACK_KIND)
         );
         assert_eq!(distilled.stats.tail_est_tokens, tail);
         assert_eq!(
@@ -2625,7 +2584,3 @@ facts text",
         assert!(distill_pack(&source, &Default::default()).is_err());
     }
 }
-
-#[cfg(test)]
-#[path = "distill/legacy_products.rs"]
-mod legacy_products;

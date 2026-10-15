@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn rejected_giant_frames_stage_only_remaining_budget_and_still_demand_late_sources() {
-        let world = cv_testkit::World::in_process("capped-session-frame");
+        let world = crate::test_world("capped-session-frame");
         let resolver = cv_core::Resolver::new(None);
         let mut first = cv_core::Message::new(cv_core::Role::User);
         first.content.push(cv_core::Block::Text { text: "tiny".into() });

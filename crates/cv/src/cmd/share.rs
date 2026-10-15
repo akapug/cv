@@ -18,7 +18,13 @@ use cv_core::{Flow, MessageSink, ParseOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
-pub(crate) fn cmd_share(id: &str, harness: Option<String>, out: Option<PathBuf>, no_redact: bool) -> Result<()> {
+pub(crate) fn cmd_share(
+    id: &str,
+    harness: Option<String>,
+    out: Option<PathBuf>,
+    force: bool,
+    no_redact: bool,
+) -> Result<()> {
     let want = parse_harness(&harness)?;
     let (r, adapter) = resolve(id, want)?;
 
@@ -27,7 +33,8 @@ pub(crate) fn cmd_share(id: &str, harness: Option<String>, out: Option<PathBuf>,
     }
 
     let out_path = out.unwrap_or_else(|| PathBuf::from(format!("{}.html", safe_stem(&r.id))));
-    let (count, stats) = share_session(adapter.as_ref(), &r, &out_path, no_redact)?;
+    let claim = crate::util::user_file_claim(&out_path, force)?;
+    let (count, stats) = share_session(adapter.as_ref(), &r, &out_path, claim, no_redact)?;
 
     let size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
     eprintln!(
@@ -45,6 +52,7 @@ fn share_session(
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::SessionRef,
     out_path: &std::path::Path,
+    claim: cv_core::publish::Claim,
     no_redact: bool,
 ) -> Result<(usize, RedactStats)> {
     // Never open the destination for writing: it may be a transcript, a hard link to one,
@@ -71,7 +79,13 @@ fn share_session(
         count: 0,
         result: Ok(()),
     };
-    let (_, guard) = cv_core::stream::stream_counted_guarded(adapter, r, &ParseOptions::bulk(), &mut sink)?;
+    let pass = cv_core::stream::Pass {
+        guard: true,
+        ..cv_core::stream::Pass::RECORD
+    };
+    let guard = cv_core::stream::stream_counted(adapter, r, &ParseOptions::bulk(), &mut sink, pass)?
+        .guard
+        .expect("guarded pass");
     sink.finish(env!("CARGO_PKG_VERSION"));
 
     let count = sink.count;
@@ -82,7 +96,7 @@ fn share_session(
     w.flush().with_context(|| format!("writing {}", out_path.display()))?;
     drop(w);
     guard.verify(r)?;
-    temporary.publish(out_path, cv_core::publish::Claim::New)?;
+    temporary.publish(out_path, claim)?;
 
     Ok((count, stats))
 }
@@ -282,7 +296,7 @@ mod tests {
                 anyhow::bail!("source failed after a message from {}", r.id)
             }
         }
-        let world = cv_testkit::World::in_process("share-failed-read");
+        let world = crate::test_world("share-failed-read");
         let source = world.base.join("source.jsonl");
         std::fs::write(&source, "source").unwrap();
         let reference = cv_core::SessionRef::new("failed", Harness::Claude, &source);
@@ -291,7 +305,7 @@ mod tests {
             if existing {
                 std::fs::write(&output, "prior artifact").unwrap();
             }
-            assert!(share_session(&Fails, &reference, &output, false).is_err());
+            assert!(share_session(&Fails, &reference, &output, cv_core::publish::Claim::Replace, false).is_err());
             if existing {
                 assert_eq!(std::fs::read(&output).unwrap(), b"prior artifact");
             } else {
@@ -343,7 +357,7 @@ mod tests {
 
     #[test]
     fn source_share_matches_owned_and_rejects_deleted_or_changed_arguments() {
-        let world = cv_testkit::World::in_process("share-json-boundary");
+        let world = crate::test_world("share-json-boundary");
         let path = world.base.join("arguments.json");
         let value =
             serde_json::json!({"command": "echo \"月🌙é\"\n".repeat(300), "api_key": "sk-abcDEF1234567890ghijkl"});

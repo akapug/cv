@@ -42,8 +42,6 @@ use crate::json::{JsonSource, JsonView};
 use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-#[cfg(test)]
-use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,7 +59,7 @@ impl LmStudio {
     }
 
     pub fn detect() -> Self {
-        let root = dirs::home_dir().map(|h| h.join(".lmstudio").join("conversations"));
+        let root = crate::env::home_dir().map(|h| h.join(".lmstudio").join("conversations"));
         LmStudio {
             root: root.filter(|p| p.exists()),
         }
@@ -78,7 +76,11 @@ impl Adapter for LmStudio {
         self.root
             .as_ref()
             .map(|conversations| conversations.parent().unwrap_or(conversations).to_path_buf())
-            .or_else(|| dirs::home_dir().map(|h| h.join(".lmstudio")).filter(|p| p.exists()))
+            .or_else(|| {
+                crate::env::home_dir()
+                    .map(|h| h.join(".lmstudio"))
+                    .filter(|p| p.exists())
+            })
             .into_iter()
             .collect()
     }
@@ -495,7 +497,7 @@ fn projected_content(
 }
 
 fn projected_text(view: JsonView<'_>, message: &mut Message, thinking: bool, opts: &ParseOptions) -> Result<()> {
-    let Some(text) = view.text(opts.spans)? else {
+    let Some(text) = view.lazy_text(opts.spans)? else {
         return Ok(());
     };
     if text.is_empty() {
@@ -585,148 +587,6 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
     emit::emit(session, out_dir, opts)
 }
 mod emit;
-#[cfg(test)]
-/// Build the single `version` object for one IR message turn (the parser only reads the
-/// `currentlySelected` version, so we emit exactly one). Returns `None` for empty turns.
-fn emit_version(session: &Session, msg: &Message, fallback: DateTime<Utc>) -> Result<Option<Value>> {
-    Ok(match msg.role {
-        Role::Assistant => {
-            let steps = emit_assistant_steps(session, msg, fallback)?;
-            if steps.is_empty() {
-                return Ok(None);
-            }
-            Some(json!({
-                "type": "multiStep",
-                "role": "assistant",
-                "steps": steps,
-            }))
-        }
-        // User, System, and Tool turns all become a single-step turn with content parts.
-        role => {
-            let content = emit_content_parts(&msg.content)?;
-            if content.is_empty() {
-                return Ok(None);
-            }
-            let role_str = match role {
-                Role::System => "system",
-                _ => "user", // Tool results have no native shape; carry them on a user turn.
-            };
-            Some(json!({
-                "type": "singleStep",
-                "role": role_str,
-                "content": content,
-            }))
-        }
-    })
-}
-
-/// Map an assistant message's blocks into LM Studio `steps[]` (`contentBlock`s). Model + usage ride
-/// on the first step's `genInfo`; the `stepIdentifier` prefix carries the step timestamp.
-#[cfg(test)]
-fn emit_assistant_steps(session: &Session, msg: &Message, fallback: DateTime<Utc>) -> Result<Vec<Value>> {
-    let ts = msg.timestamp.unwrap_or(fallback);
-    let step_id = format!("{}-0.{}", ts.timestamp_millis(), "0000000000000000");
-    let model = msg.model.as_ref().or(session.model.as_ref());
-
-    let mut steps: Vec<Value> = Vec::new();
-    let mut attached_gen = false;
-
-    let mut push_block = |content: Value, thinking: bool, steps: &mut Vec<Value>| {
-        let mut step = Map::new();
-        step.insert("type".into(), json!("contentBlock"));
-        step.insert("role".into(), json!("assistant"));
-        step.insert("content".into(), content);
-        step.insert("stepIdentifier".into(), json!(step_id));
-        if thinking {
-            step.insert("style".into(), json!({ "type": "thinking" }));
-        }
-        // Attach model + usage to the first content block, mirroring how the parser reads them.
-        if !attached_gen {
-            let mut gen = Map::new();
-            if let Some(m) = model {
-                gen.insert("indexedModelIdentifier".into(), json!(m));
-            }
-            if let Some(u) = &msg.usage {
-                let mut stats = Map::new();
-                if let Some(i) = u.input_tokens {
-                    stats.insert("promptTokensCount".into(), json!(i));
-                }
-                if let Some(o) = u.output_tokens {
-                    stats.insert("predictedTokensCount".into(), json!(o));
-                }
-                if !stats.is_empty() {
-                    gen.insert("stats".into(), Value::Object(stats));
-                }
-            }
-            if !gen.is_empty() {
-                step.insert("genInfo".into(), Value::Object(gen));
-                attached_gen = true;
-            }
-        }
-        steps.push(Value::Object(step));
-    };
-
-    for b in &msg.content {
-        match b {
-            Block::Text { text } => {
-                push_block(text_parts(text), false, &mut steps);
-            }
-            Block::Thinking { text, .. } => {
-                if !text.is_empty() {
-                    push_block(text_parts(text), true, &mut steps);
-                }
-            }
-            Block::ToolUse { name, input, .. } => {
-                // No native tool structure: render a readable, self-describing text block. The
-                // parser reads it back as text (round-trips as content, not as a ToolUse).
-                let args = serde_json::to_string(input.resolve()?.as_ref())?;
-                push_block(text_parts(&format!("[tool call: {name} {args}]")), false, &mut steps);
-            }
-            Block::ToolResult { content, .. } => {
-                push_block(text_parts(&format!("[tool result: {content}]")), false, &mut steps);
-            }
-            Block::File { .. } | Block::Image { .. } => {
-                if let Some(part) = emit_file_part(b) {
-                    push_block(Value::Array(vec![part]), false, &mut steps);
-                }
-            }
-        }
-    }
-    Ok(steps)
-}
-
-/// Map a (user/system/tool) message's blocks into a `content[]` parts array (`text` / `file`).
-#[cfg(test)]
-fn emit_content_parts(blocks: &[Block]) -> Result<Vec<Value>> {
-    let mut out = Vec::new();
-    for b in blocks {
-        match b {
-            Block::Text { text } => out.push(json!({ "type": "text", "text": text })),
-            // Reasoning is unusual on a user turn, but keep the text rather than drop it.
-            Block::Thinking { text, .. } if !text.is_empty() => out.push(json!({ "type": "text", "text": text })),
-            Block::ToolResult { content, .. } => {
-                out.push(json!({ "type": "text", "text": format!("[tool result: {content}]") }))
-            }
-            Block::ToolUse { name, input, .. } => {
-                let args = serde_json::to_string(input.resolve()?.as_ref())?;
-                out.push(json!({ "type": "text", "text": format!("[tool call: {name} {args}]") }))
-            }
-            Block::File { .. } | Block::Image { .. } => {
-                if let Some(part) = emit_file_part(b) {
-                    out.push(part);
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(out)
-}
-
-/// A `content[]` array holding a single `text` part.
-#[cfg(test)]
-fn text_parts(text: &str) -> Value {
-    json!([{ "type": "text", "text": text }])
-}
 
 /// Map a [`Block::File`] / [`Block::Image`] into LM Studio's `{type:"file", ...}` part (a reference,
 /// matching how the parser reads `identifier`/`fileIdentifier`, `name`, `fileType`).
@@ -951,288 +811,6 @@ impl TitleHead {
     }
 }
 
-/// Title: the explicit `name` (when meaningful), else the first user text. LM Studio writes
-/// `"Untitled"` / `"Untitled - Branched"` for un-named chats, so we treat those as absent.
-#[cfg(test)]
-fn chat_title(v: &Value) -> Option<String> {
-    if let Some(name) = v.get("name").and_then(Value::as_str) {
-        let t = name.trim();
-        if !t.is_empty() && t != "Untitled" && !t.starts_with("Untitled -") {
-            return Some(crate::ir::truncate(t, 80));
-        }
-    }
-    // Fall back to the first user text part.
-    let messages = v.get("messages").and_then(Value::as_array)?;
-    for msg in messages {
-        let version = selected_version(msg)?;
-        if version.get("role").and_then(Value::as_str) == Some("user") {
-            let t = super::wire::text_parts(version.get("content"));
-            if !t.trim().is_empty() {
-                return Some(crate::ir::truncate(&t, 80));
-            }
-        }
-    }
-    None
-}
-
-/// The system prompt over a whole `Value`: the per-chat override (`perChatPredictionConfig.fields[
-/// key==llm.prediction.systemPrompt]`) takes precedence over the top-level `systemPrompt`. The
-/// streaming parser uses the borrowed [`Doc::system_prompt`] instead; this whole-`Value` form is
-/// retained as the reference the unit test pins the precedence rule against.
-#[cfg(test)]
-fn system_prompt(v: &Value) -> Option<String> {
-    if let Some(fields) = v.pointer("/perChatPredictionConfig/fields").and_then(Value::as_array) {
-        for f in fields {
-            if f.get("key").and_then(Value::as_str) == Some("llm.prediction.systemPrompt") {
-                if let Some(val) = f.get("value").and_then(Value::as_str) {
-                    if !val.trim().is_empty() {
-                        return Some(val.to_string());
-                    }
-                }
-            }
-        }
-    }
-    v.get("systemPrompt")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-}
-
-/// Pick the `currentlySelected` version of a message turn, falling back to the last / first.
-#[cfg(test)]
-fn selected_version(msg: &Value) -> Option<&Value> {
-    let versions = msg.get("versions").and_then(Value::as_array)?;
-    if versions.is_empty() {
-        return None;
-    }
-    let idx = msg
-        .get("currentlySelected")
-        .and_then(Value::as_u64)
-        .map(|i| i as usize)
-        .filter(|i| *i < versions.len())
-        .unwrap_or(versions.len() - 1);
-    versions.get(idx)
-}
-
-/// Parse one message turn's visible (`currentlySelected`) version into an IR [`Message`]. Updates
-/// `session_model` with the first model seen.
-#[cfg(test)]
-fn parse_message(msg: &Value, session_model: &mut Option<String>) -> Option<Message> {
-    parse_version(selected_version(msg)?, session_model)
-}
-
-/// Parse one specific `version` object into an IR [`Message`].
-#[cfg(test)]
-fn parse_version(version: &Value, session_model: &mut Option<String>) -> Option<Message> {
-    let role = match version.get("role").and_then(Value::as_str) {
-        Some("user") => Role::User,
-        Some("assistant") => Role::Assistant,
-        Some("system") => Role::System,
-        _ => return None,
-    };
-    let mut m = Message::new(role);
-    // A `system` turn is the system prompt (session-level copy in `Session::system_prompt`).
-    if role == Role::System {
-        m.kind = MessageKind::SystemPrompt;
-    }
-
-    match version.get("type").and_then(Value::as_str) {
-        // Assistant turns: a list of steps (contentBlock / debugInfoBlock / status).
-        Some("multiStep") => {
-            if let Some(steps) = version.get("steps").and_then(Value::as_array) {
-                for step in steps {
-                    parse_step(step, &mut m, session_model);
-                }
-            }
-        }
-        // User (and any other single-step) turns: content parts directly on the version.
-        _ => {
-            push_content_parts(version.get("content"), &mut m, false);
-        }
-    }
-
-    if m.content.is_empty() && !(role == Role::Assistant && m.usage.is_some()) {
-        return None;
-    }
-    Some(m)
-}
-
-/// Every NON-selected `versions[]` entry of a turn, as `Branch`-kind messages — the regenerations
-/// and edits LM Studio keeps beside the visible one. Only emitted under [`ParseOptions::complete`];
-/// each carries its `versions[]` index in `extra["lmstudio"]["variant"]`. A throwaway model sink is
-/// used so an alternate never redefines the session model.
-#[cfg(test)]
-fn parse_variants(msg: &Value) -> Vec<Message> {
-    let versions = match msg.get("versions").and_then(Value::as_array) {
-        Some(v) if v.len() > 1 => v,
-        _ => return Vec::new(),
-    };
-    let selected = msg
-        .get("currentlySelected")
-        .and_then(Value::as_u64)
-        .map(|i| i as usize)
-        .filter(|i| *i < versions.len())
-        .unwrap_or(versions.len() - 1);
-    let mut out = Vec::new();
-    let mut throwaway_model = None;
-    let _ = parse_message(msg, &mut throwaway_model);
-    for (i, version) in versions.iter().enumerate() {
-        if i == selected {
-            continue;
-        }
-        if let Some(mut m) = parse_version(version, &mut throwaway_model) {
-            m.kind = MessageKind::Branch;
-            m.harness_extra_mut(Harness::LmStudio)
-                .insert("variant".into(), Value::Number(i.into()));
-            out.push(m);
-        }
-    }
-    out
-}
-
-/// Parse one assistant `step`. Only `contentBlock` carries content; others are app-internal.
-#[cfg(test)]
-fn parse_step(step: &Value, m: &mut Message, session_model: &mut Option<String>) {
-    if step.get("type").and_then(Value::as_str) != Some("contentBlock") {
-        return; // debugInfoBlock / status — nothing to render.
-    }
-
-    // Model + usage live on genInfo. IR diet: the first model seen becomes the session default, so
-    // it is NOT repeated on the message; a later, differing model would name itself.
-    if let Some(gen) = step.get("genInfo") {
-        if let Some(model) = gen
-            .get("indexedModelIdentifier")
-            .or_else(|| gen.get("identifier"))
-            .and_then(Value::as_str)
-        {
-            match session_model {
-                None => *session_model = Some(model.to_string()),
-                Some(cur) if cur != model && m.model.is_none() => m.model = Some(model.to_string()),
-                _ => {}
-            }
-        }
-        if m.usage.is_none() {
-            if let Some(u) = parse_usage(gen.get("stats")) {
-                m.usage = Some(u);
-            }
-        }
-    }
-
-    // Per-step timestamp from the stepIdentifier prefix ("<ms-epoch>-<rand>").
-    if m.timestamp.is_none() {
-        if let Some(ts) = step.get("stepIdentifier").and_then(Value::as_str).and_then(step_id_ts) {
-            m.timestamp = Some(ts);
-        }
-    }
-
-    // A `style.type == "thinking"` block is chain-of-thought reasoning.
-    let is_thinking = step.pointer("/style/type").and_then(Value::as_str) == Some("thinking");
-    push_content_parts(step.get("content"), m, is_thinking);
-}
-
-/// Append text/file/image parts from a `content` array (or bare string) onto `m`.
-/// When `as_thinking`, text parts become [`Block::Thinking`] instead of [`Block::Text`].
-#[cfg(test)]
-fn push_content_parts(content: Option<&Value>, m: &mut Message, as_thinking: bool) {
-    match content {
-        Some(Value::String(s)) => {
-            if !s.is_empty() {
-                push_text(m, s.clone(), as_thinking);
-            }
-        }
-        Some(Value::Array(parts)) => {
-            for part in parts {
-                match part.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(t) = part.get("text").and_then(Value::as_str) {
-                            if !t.is_empty() {
-                                push_text(m, t.to_string(), as_thinking);
-                            }
-                        }
-                    }
-                    Some("file") => push_file(m, part),
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-#[cfg(test)]
-fn push_text(m: &mut Message, text: String, as_thinking: bool) {
-    if as_thinking {
-        // Explicit reasoning steps (`style.type=="thinking"`) stay a single Thinking block.
-        m.content.push(Block::Thinking {
-            text: text.into(),
-            signature: None,
-            encrypted: None,
-            redacted: false,
-        });
-    } else if super::harmony::looks_like_harmony(&text) {
-        // gpt-oss (common in LM Studio) embeds Harmony channel markers in plain assistant text:
-        // analysis → Thinking, commentary tool calls → ToolUse, final → Text. Decode them into
-        // first-class IR blocks instead of leaving the raw `<|channel|>…` markers in the text.
-        m.content.extend(super::harmony::decode_content(&text));
-    } else {
-        m.content.push(Block::Text { text: text.into() });
-    }
-}
-
-/// A `{type:"file",...}` part. `fileType:"image"` → [`Block::Image`]; otherwise [`Block::File`].
-/// The reference is `identifier`/`fileIdentifier` (bytes live under `.lmstudio/.internal/files/`).
-#[cfg(test)]
-fn push_file(m: &mut Message, part: &Value) {
-    let data_ref = part
-        .get("identifier")
-        .or_else(|| part.get("fileIdentifier"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let name = part.get("name").and_then(Value::as_str).map(str::to_string);
-    let file_type = part.get("fileType").and_then(Value::as_str);
-
-    if file_type == Some("image") {
-        m.content.push(Block::Image {
-            media_type: None,
-            data_ref: data_ref.or(name),
-        });
-    } else {
-        m.content.push(Block::File {
-            mime: file_type.map(str::to_string),
-            path: name,
-            source: data_ref,
-        });
-    }
-}
-
-/// Map LM Studio's `genInfo.stats` to IR [`Usage`].
-#[cfg(test)]
-fn parse_usage(stats: Option<&Value>) -> Option<Usage> {
-    let stats = stats?;
-    let input = stats.get("promptTokensCount").and_then(Value::as_u64);
-    let output = stats.get("predictedTokensCount").and_then(Value::as_u64);
-    if input.is_none() && output.is_none() {
-        return None;
-    }
-    Some(Usage {
-        input_tokens: input,
-        output_tokens: output,
-        ..Usage::default()
-    })
-}
-
-/// A `stepIdentifier` is `"<ms-epoch>-<rand>"`; mine its prefix as a timestamp.
-#[cfg(test)]
-fn step_id_ts(id: &str) -> Option<DateTime<Utc>> {
-    let prefix = id.split('-').next()?;
-    let ms: i64 = prefix.parse().ok()?;
-    // Sanity bound: between ~2010 and ~2100 (ms epoch).
-    if !(1_200_000_000_000..=4_000_000_000_000).contains(&ms) {
-        return None;
-    }
-    DateTime::from_timestamp_millis(ms)
-}
-
 fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
     let mtime = fs::metadata(path).ok()?.modified().ok()?;
     Some(DateTime::<Utc>::from(mtime))
@@ -1241,29 +819,29 @@ fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emit::grok_qwen_tests::Frozen;
     use crate::harness::Parse;
+
+    /// The selected version of one `messages[]` turn, through the stream's codec.
+    fn selected(turn: &Value) -> Option<Message> {
+        let fields = Fields::parse(JsonView::from(turn), &["versions", "currentlySelected"]).unwrap()?;
+        let (_, version, _) = projected_selected_version(&fields, fields.get("versions")?).unwrap()?;
+        projected_version(version, &mut None, &ParseOptions::full()).unwrap()
+    }
+
+    /// The simple oracle for [`projected_step_timestamp`]: a whole-string integer prefix.
+    fn step_id_ts(id: &str) -> Option<DateTime<Utc>> {
+        let ms: i64 = id.split('-').next()?.parse().ok()?;
+        (1_200_000_000_000..=4_000_000_000_000)
+            .contains(&ms)
+            .then(|| DateTime::from_timestamp_millis(ms))
+            .flatten()
+    }
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/lmstudio")
             .join(name)
-    }
-
-    /// The pre-projection borrowed envelope; pin its stricter top-level schema independently
-    /// from record Values, whose malformed scalar/depth fields are silently skipped.
-    #[derive(Deserialize)]
-    #[allow(dead_code)]
-    struct PreviousDoc<'a> {
-        #[serde(default, rename = "createdAt")]
-        created_at: Option<Value>,
-        #[serde(default, rename = "systemPrompt")]
-        system_prompt: Option<String>,
-        #[serde(default, rename = "perChatPredictionConfig")]
-        config: Option<Value>,
-        #[serde(default)]
-        pinned: Option<bool>,
-        #[serde(default, borrow)]
-        messages: Vec<&'a serde_json::value::RawValue>,
     }
 
     #[test]
@@ -1277,9 +855,9 @@ mod tests {
             r#"{"currentlySelected":-1,"versions":[{"role":"user","content":null},{"role":"invalid","content":"ignored"}]}"#,
             "null",
         ];
-        for text in cases {
+        let mut frozen = Frozen::new("lmstudio-turns");
+        for (case, text) in cases.into_iter().enumerate() {
             let value: Value = serde_json::from_str(text).unwrap();
-            let expected = parse_message(&value, &mut None);
             let fields = Fields::parse(JsonView::from(&value), &["versions", "currentlySelected"]).unwrap();
             let actual = if let Some(fields) = fields {
                 if let Some(versions) = fields.get("versions") {
@@ -1294,12 +872,7 @@ mod tests {
             } else {
                 None
             };
-            assert_eq!(
-                serde_json::to_value(actual).unwrap(),
-                serde_json::to_value(expected).unwrap(),
-                "{text}"
-            );
-            let expected = parse_variants(&value);
+            let selected = serde_json::to_value(actual).unwrap();
             let mut actual = Vec::new();
             if let Some(fields) = Fields::parse(JsonView::from(&value), &["versions", "currentlySelected"]).unwrap() {
                 if let Some(versions) = fields.get("versions") {
@@ -1324,12 +897,10 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(
-                serde_json::to_value(actual).unwrap(),
-                serde_json::to_value(expected).unwrap(),
-                "variants {text}"
-            );
+            let variants = serde_json::to_value(actual).unwrap();
+            frozen.insert(format!("{case}"), json!({ "selected": selected, "variants": variants }));
         }
+        frozen.check().unwrap();
     }
 
     #[test]
@@ -1370,27 +941,19 @@ mod tests {
                 "]".repeat(depth)
             ));
         }
-        for text in cases {
+        let mut frozen = Frozen::new("lmstudio-schema");
+        for (case, text) in cases.into_iter().enumerate() {
             fs::write(&path, &text).unwrap();
-            let expected = serde_json::from_str::<PreviousDoc>(&text);
             let r = SessionRef::new("schema", Harness::LmStudio, path.clone());
             let actual = crate::stream::collect_with(&LmStudio { root: None }, &r, &ParseOptions::full());
-            assert_eq!(actual.is_ok(), expected.is_ok(), "{text}");
-            if let Ok(doc) = expected {
-                let mut model = None;
-                let messages: Vec<_> = doc
-                    .messages
-                    .iter()
-                    .filter_map(|raw| serde_json::from_str::<Value>(raw.get()).ok())
-                    .filter_map(|value| parse_message(&value, &mut model))
-                    .collect();
-                assert_eq!(
-                    serde_json::to_value(&actual.unwrap().messages).unwrap(),
-                    serde_json::to_value(messages).unwrap(),
-                    "{text}"
-                );
-            }
+            frozen.insert(
+                format!("{case:02}"),
+                actual
+                    .as_ref()
+                    .map_or(Value::Null, |s| serde_json::to_value(&s.messages).unwrap()),
+            );
         }
+        frozen.check().unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1470,7 +1033,7 @@ mod tests {
 
     #[test]
     fn harmony_absence_hint_preserves_owned_and_encoded_marker_oracles() -> Result<()> {
-        let world = cv_testkit::World::in_process("lm-harmony-absence");
+        let world = crate::test_world("lm-harmony-absence");
         let path = world.base.join("text.json");
         for marker in [
             "ordinary λ",
@@ -1552,7 +1115,8 @@ mod tests {
     #[test]
     fn empty_messages_and_untitled_yield_no_title() {
         let v: Value = serde_json::from_str(r#"{"name":"Untitled","createdAt":1754424586190,"messages":[]}"#).unwrap();
-        assert!(chat_title(&v).is_none());
+        let scan = scan_view(JsonView::from(&v)).unwrap();
+        assert!(scan.name.or(scan.messages.title).is_none());
     }
 
     #[test]
@@ -1561,7 +1125,10 @@ mod tests {
             r#"{"systemPrompt":"global","perChatPredictionConfig":{"fields":[{"key":"llm.prediction.systemPrompt","value":"tsundere"}]}}"#,
         )
         .unwrap();
-        assert_eq!(system_prompt(&v).as_deref(), Some("tsundere"));
+        let doc = Fields::parse(JsonView::from(&v), &["systemPrompt", "perChatPredictionConfig"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected_system_prompt(&doc).unwrap().as_deref(), Some("tsundere"));
     }
 
     #[test]
@@ -1570,8 +1137,7 @@ mod tests {
             r#"{"currentlySelected":0,"versions":[{"type":"singleStep","role":"user","content":[{"type":"text","text":"look"},{"type":"file","name":"image.png","identifier":"123 - 4.png","fileType":"image","sizeBytes":100}]}]}"#,
         )
         .unwrap();
-        let mut model = None;
-        let m = parse_message(&msg, &mut model).unwrap();
+        let m = selected(&msg).unwrap();
         assert_eq!(m.role, Role::User);
         assert!(matches!(m.content[1], Block::Image { .. }));
         match &m.content[1] {
@@ -1589,8 +1155,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let mut model = None;
-        let m = parse_message(&msg, &mut model).unwrap();
+        let m = selected(&msg).unwrap();
         assert_eq!(m.text().as_deref(), Some("v1"));
     }
 
@@ -1895,7 +1460,7 @@ mod tests {
 
     #[test]
     fn repeated_discovery_reuses_unchanged_documents_and_refreshes_changed_files() -> Result<()> {
-        let world = cv_testkit::World::in_process("lmstudio-discovery-cache");
+        let world = crate::test_world("lmstudio-discovery-cache");
         let context = crate::discover_cache::read::Context::current();
         let _scope = context.enter();
         let store = world.home.join("conversations");
@@ -1939,7 +1504,7 @@ mod tests {
 
     #[test]
     fn discovery_scan_matches_whole_value_metadata() {
-        let _world = cv_testkit::World::in_process("lmstudio-scan");
+        let _world = crate::test_world("lmstudio-scan");
         let dir = std::env::temp_dir().join(format!("cv-lmstudio-scan-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sample.conversation.json");
@@ -1977,23 +1542,17 @@ mod tests {
             })
             .to_string(),
         );
-        for text in cases {
+        let mut frozen = Frozen::new("lmstudio-scan");
+        for (case, text) in cases.into_iter().enumerate() {
             fs::write(&path, &text).unwrap();
-            // The independent pre-change scanner: whole Value, original chat_title and array len.
-            let expected = serde_json::from_str::<Value>(&text).ok().map(|v| {
-                (
-                    chat_title(&v),
-                    v.get("createdAt").and_then(super::super::ts_from_value),
-                    v.get("messages").and_then(Value::as_array).map_or(0, Vec::len),
-                )
-            });
             let actual = scan(&path).ok().flatten().map(|r| {
                 assert_eq!(r.id, "sample");
                 assert_eq!(r.updated_at, file_mtime(&path).or(r.created_at));
                 (r.title, r.created_at, r.message_count)
             });
-            assert_eq!(actual, expected, "case prefix: {:?}", &text[..text.len().min(120)]);
+            frozen.insert(format!("{case:02}"), serde_json::to_value(&actual).unwrap());
         }
+        frozen.check().unwrap();
         fs::write(&path, b"{\"messages\":[\"\xff\"]}").unwrap();
         assert!(scan(&path).is_err());
         fs::remove_dir_all(dir).unwrap();

@@ -2,11 +2,50 @@
 
 ## Unreleased
 
+- SQLite readers cannot create harness WAL sidecars when a rollback-mode database switches to WAL during a read.
+
+- New-name publication fails safely when neither hard links nor exclusive rename are supported, instead of risking overwriting a concurrent writer.
+
+- Kimi deferred wire outputs retain their parsed source identity and reject replaced files before the first read.
+
+- Hook settings and skills publish by atomic replacement, preserving existing readers, permissions, and dotfile symlinks.
+
+- Ported project context files publish only after copying succeeds; failed copies leave no partial destination and preserve existing files.
+
+- HTTP overload shedding bounds retained sockets and drain work, preventing rejected clients from bypassing connection limits.
+
+- HTTP body framing errors now close the connection; malformed chunks cannot recover during draining and execute a pipelined request.
+- Resume guard sampling preserves open transcript read positions on Unix.
+
+- Correct search defaults and fallback semantics, document affordance views and MCP window exceptions, and point the prompt-row schema to the current command.
+- MCP task tools use the actual CLI flags; generated schemas describe repeatable arguments, and the command reference shows their correct spellings.
+- Positioned (no-mmap) builds resolve large transcript text from a live, growing session, as mapped builds do; a replaced or shrunk file still fails.
+- `cv index` decodes each compressed Codex rollout once: discovery hands its decoded bytes to the sweep beside it (cold index: 15% fewer instructions).
+- Watch cursors and Kimi, Kimi Code and Qwen checkpoints serialize in a stable order: the same state always yields the same bytes.
+- OpenCode skips message and part cells that are not TEXT, UTF-8 JSON (2.x counts them as skipped lines) instead of failing the session.
+- OpenClaw: lazy reads skip an empty `event_json` row instead of failing; store discovery no longer holds whole transcripts in memory.
+- Native builds decode zstd (Codex rollouts, Zed and OpenClaw blobs) with libzstd: a cold index of compressed rollouts takes 39% fewer instructions.
+- A copied or moved `CLUSTERVISION_HOME` keeps its full-text index: baselines follow an identity stored in the index, not its path.
+- Gemini recordings read through one message codec; a 314 MB session's lazy read takes 3.4x fewer instructions.
+- Devin, OpenCode, Hermes, Zed and Goose discovery reuse cached results while their database, WAL and journal are unchanged.
+- Compressed Codex rollouts read from one mapping of their decoded bytes: first listing and `show` use about half the instructions.
+- `ls -q has:` and unchanged `cv index` detect only the adapter a session needs, once per operation: 2.9x and 1.7x fewer instructions.
+- Emitted sessions, distill sidecars and packs, dataset, pack and share files are published whole, never written into an existing file; a taken name exits 2.
+- `--force` on dataset, pack, distill `--pack` and share replaces a taken file by rename; a symlink there is replaced, other hard links keep old bytes.
+- Harness indexes cv updates on emit (Continue, OpenClaw, Gemini) and cv's config are replaced by rename; a symlinked config is replaced at its target.
+- `prune --copy-resources` refuses an existing resource directory; with `--force` the new directory replaces it whole instead of merging into it.
+- Reading SQLite harness stores no longer rewrites their `-shm`: WAL stores are opened `immutable=1` when frameless, otherwise through a private db+WAL snapshot.
+- `prune --drop-thinking` omits old thinking blocks with no inline marker, removing emptied records and relinking their children; `cv cat` still retrieves them.
+- Prune's revive estimate anchors on recorded usage and the resumed branch, erring high; calibrated against the API it never read more than 1% low.
+- One token estimator with per-kind rates calibrated against `count_tokens` replaces the flat 3.5 bytes/token in doctor, prune and distill.
 - `cv serve` runs on a small built-in server: idle connections close after 5 s, excess connections get 503, and accept errors no longer stop serving.
 - `cv prune --to` refuses an existing session or sidecar name (exit 2, nothing written); `--force` replaces it by atomic rename, never truncating in place.
 - Prune, rewind, adopt, share and archive outputs publish fsynced, without needing hard links (FAT, exFAT); rewind outputs keep the source's permissions.
 - Rewind, adopt and share exit 2 when their output name is already taken.
 - A transcript replaced or rewritten after parsing fails its first lazy content read instead of silently returning the replacement's bytes.
+- Cline, Roo, LM Studio, OpenSession and account exports read through one codec each; lazy text follows Claude's span rule (decoded length over 4 KiB).
+- Claude transcripts parse through one record codec in every mode and build, using about 20% fewer instructions; malformed records get one acceptance rule everywhere.
+- Codex, Grok, Qwen, Kimi, Kimi Code and Continue read through one record codec per format: a cold Codex index takes 13% fewer instructions; bad lines skip individually.
 - OpenSession preserves optional opaque principals through reads and transformations; mixed-source compositions retain attribution only when every source agrees.
 - The first fleet read after an upgrade that invalidates the catalog prints one stderr note that it is re-discovering, suggesting `cv index`.
 - `ls --json --enrich` `display_title` uses the row's `title` when present and never picks harness-injected turns such as Codex AGENTS.md instructions.

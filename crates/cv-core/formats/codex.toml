@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "codex"
-source_files = ["harness/codex.rs", "harness/wire/openai.rs", "harness/wire/mod.rs"]
+source_files = ["harness/codex.rs", "harness/codex/record.rs", "harness/codex/legacy.rs", "harness/wire/openai.rs", "harness/wire/mod.rs"]
 ignore_literals = ["jsonl"]
 store = [
   "~/.codex/sessions/YYYY/MM/DD/rollout-<local ts>-<uuid>.jsonl[.zst]",

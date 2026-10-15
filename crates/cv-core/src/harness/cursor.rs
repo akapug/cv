@@ -26,20 +26,19 @@
 //! one machine). Anything absent is skipped gracefully — a missing table, key, or field never
 //! panics and never fails the whole session.
 
-use super::store::sqlite::open_ro;
+use super::store::sqlite::{open_ro, Cells};
 use super::{ts_from_epoch, Adapter};
 use crate::ir::*;
 use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, Statement};
+use rusqlite::Connection;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 mod cli;
-mod composer;
 mod legacy;
-mod selected;
+mod record;
 mod source;
 
 pub struct Cursor {
@@ -51,19 +50,19 @@ pub struct Cursor {
 impl Cursor {
     pub fn detect() -> Self {
         // CURSOR_USER_DIR overrides the platform default (used by tests / non-mac).
-        let user_dir = std::env::var_os("CURSOR_USER_DIR")
+        let user_dir = crate::env::var_os("CURSOR_USER_DIR")
             .map(PathBuf::from)
             .or_else(default_user_dir)
             .filter(|p| p.exists());
-        let cli_home = std::env::var_os("CURSOR_CONFIG_DIR")
+        let cli_home = crate::env::var_os("CURSOR_CONFIG_DIR")
             .filter(|value| !value.to_string_lossy().trim().is_empty())
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::var_os("XDG_CONFIG_HOME")
+                crate::env::var_os("XDG_CONFIG_HOME")
                     .filter(|value| !value.to_string_lossy().trim().is_empty())
                     .map(|base| PathBuf::from(base).join("cursor"))
             })
-            .or_else(|| dirs::home_dir().map(|home| home.join(".cursor")))
+            .or_else(|| crate::env::home_dir().map(|home| home.join(".cursor")))
             .filter(|path| path.is_dir());
         Cursor { user_dir, cli_home }
     }
@@ -116,15 +115,15 @@ impl Cursor {
 
 /// Default macOS/Linux/Windows location of `Cursor/User`.
 fn default_user_dir() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+    let home = crate::env::home_dir()?;
     #[cfg(target_os = "macos")]
     let base = home.join("Library/Application Support");
     #[cfg(target_os = "windows")]
-    let base = std::env::var_os("APPDATA")
+    let base = crate::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join("AppData/Roaming"));
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    let base = crate::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
     Some(base.join("Cursor").join("User"))
@@ -173,7 +172,7 @@ impl Adapter for Cursor {
             if let Ok(conn) = open_ro(&db) {
                 if let Ok(rows) = conn.read(|conn| {
                     let mut rows = Vec::new();
-                    discover_legacy_workspace(conn, &db, cwd.as_deref(), &mut rows);
+                    legacy::discover(conn, &db, cwd.as_deref(), &mut rows)?;
                     Ok(rows)
                 }) {
                     out.extend(rows);
@@ -200,14 +199,9 @@ impl Adapter for Cursor {
                     return cli::stream(conn, r, opts, sink);
                 }
                 if let Some(legacy_id) = r.id.strip_prefix("legacy:") {
-                    return stream_legacy(conn, r, legacy_id, sink);
+                    return legacy::stream(conn, conn.reads(), r, legacy_id, opts.spans, sink);
                 }
-                // Modern IDE's selected builder retains the complete emitted field roster;
-                // rich lazy output can keep checked carriers without owning every bubble.
-                if opts.spans && !opts.complete {
-                    return selected::global_with_reads(conn, r, conn.reads(), sink);
-                }
-                stream_global(conn, r, sink)
+                stream_global(conn, conn.reads(), r, opts.spans, sink)
             })
         })
     }
@@ -254,17 +248,6 @@ fn item_table_get(conn: &Connection, key: &str) -> Option<String> {
                 .get::<_, Vec<u8>>(0)
                 .map(|b| String::from_utf8_lossy(&b).into_owned()),
         }
-    })
-    .ok()
-}
-
-/// Read a cursorDiskKV value as a UTF-8 string.
-fn disk_kv_get(stmt: &mut Statement<'_>, key: &str) -> Option<String> {
-    stmt.query_row([key], |row| match row.get::<_, String>(0) {
-        Ok(s) => Ok(s),
-        Err(_) => row
-            .get::<_, Vec<u8>>(0)
-            .map(|b| String::from_utf8_lossy(&b).into_owned()),
     })
     .ok()
 }
@@ -339,14 +322,23 @@ fn discover_global(conn: &Connection, db: &Path, cwd_map: &HashMap<String, PathB
         let Some(composer_id) = key.strip_prefix("composerData:") else {
             continue;
         };
-        let Ok(source) = source::cell(conn, "cursorDiskKV", &key) else {
+        // A private arena per composer: discovery holds one composer cell at a time.
+        let Ok(cells) = Cells::new(conn, db, &crate::source::ReadSet::default(), "cursorDiskKV") else {
+            return;
+        };
+        let Ok(Some(cell)) = source::cell(conn, &cells, "cursorDiskKV", &key) else {
             continue;
         };
-        let Some(header) = composer::header(&source) else {
-            continue;
-        };
-        let d = &header.metadata;
-        let count = header.count();
+        let header = cells.read(cell, |root| {
+            let composer = record::composer(root)?;
+            let mut count = 0;
+            for row in composer.rows.into_iter().flatten() {
+                row?;
+                count += 1;
+            }
+            Ok((composer.metadata, count))
+        });
+        let Ok(Some((d, count))) = header else { continue };
         // Skip threads that have no messages at all (Cursor leaves empty composer shells around).
         if count == 0 {
             continue;
@@ -371,70 +363,60 @@ fn discover_global(conn: &Connection, db: &Path, cwd_map: &HashMap<String, PathB
     }
 }
 
-/// Number of messages in a composerData record, across both shapes.
-#[cfg(test)]
-fn conversation_len(d: &Value) -> usize {
-    if let Some(h) = d.get("fullConversationHeadersOnly").and_then(Value::as_array) {
-        return h.len();
-    }
-    d.get("conversation")
-        .and_then(Value::as_array)
-        .map(|c| c.len())
-        .unwrap_or(0)
-}
-
-fn stream_global(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
+/// One composer: its session facts, then each bubble of its authoritative conversation, inline or
+/// external (`bubbleId:<composer>:<bubble>` cells; missing or malformed ones are skipped).
+fn stream_global(
+    conn: &Connection,
+    reads: &crate::source::ReadSet,
+    r: &SessionRef,
+    spans: bool,
+    sink: &mut dyn MessageSink,
+) -> Result<Session> {
     let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
+    let cells = Cells::new(conn, &r.path, reads, "cursorDiskKV")?;
     let key = format!("composerData:{}", r.id);
-    let source = source::cell(conn, "cursorDiskKV", &key)?;
-    let header = composer::header(&source).context("composerData JSON")?;
-    let d = &header.metadata;
-    let mut lookup = conn.prepare("SELECT value FROM cursorDiskKV WHERE key = ?1")?;
-
-    let mut session = global_session(d, r);
-
-    // Session model: the latest message's model (whole-Vec `rev().find_map` originally). Tracked
-    // incrementally here — each emitted message overwrites it when it carries a model — so the last
-    // one wins without retaining the body. Falls back to the composer's modelConfig below.
-    let mut last_model: Option<String> = None;
-    let mut emit = |sink: &mut dyn MessageSink, m: Message| -> Flow {
-        if m.model.is_some() {
-            last_model = m.model.clone();
-        }
-        sink.message(m)
-    };
-
-    // The immutable, fully validated source replays only the authoritative selected array.
-    header.replay(&source, &mut |value, external| {
-        let bubble = if external {
-            let Some(bubble_id) = value.get("bubbleId").and_then(Value::as_str) else {
-                return Flow::Continue;
-            };
-            let bkey = format!("bubbleId:{}:{}", r.id, bubble_id);
-            let Some(braw) = disk_kv_get(&mut lookup, &bkey) else {
-                return Flow::Continue;
-            };
-            let Ok(bubble) = serde_json::from_str::<Value>(&braw) else {
-                return Flow::Continue;
-            };
-            bubble
-        } else {
-            value
-        };
-        if let Some(message) = bubble_to_message(&bubble) {
-            emit(sink, message)
-        } else {
-            Flow::Continue
-        }
-    })?;
-
-    session.model = last_model.or_else(|| {
-        d.pointer("/modelConfig/modelName")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    });
-
+    let cell = source::cell(conn, &cells, "cursorDiskKV", &key)?.with_context(|| format!("{key} missing"))?;
+    let session = cells
+        .read(cell, |root| {
+            let composer = record::composer(root)?;
+            let mut session = global_session(&composer.metadata, r);
+            // The session model is the latest message's, else the composer's modelConfig.
+            let mut last_model = None;
+            for row in composer.rows.into_iter().flatten() {
+                let row = row?;
+                let message = if composer.external {
+                    let Some(id) = row.get("bubbleId")?.map(record::string).transpose()?.flatten() else {
+                        continue;
+                    };
+                    let key = format!("bubbleId:{}:{id}", r.id);
+                    let Ok(Some(cell)) = source::cell(conn, &cells, "cursorDiskKV", &key) else {
+                        continue;
+                    };
+                    cells.read(cell, |view| record::bubble(view, &cells, spans))?.flatten()
+                } else {
+                    record::bubble(row, &cells, spans)?
+                };
+                if let Some(message) = message {
+                    if message.model.is_some() {
+                        last_model = message.model.clone();
+                    }
+                    if sink.message(message) == Flow::Stop {
+                        break;
+                    }
+                }
+            }
+            session.model = last_model.or_else(|| {
+                composer
+                    .metadata
+                    .pointer("/modelConfig/modelName")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            });
+            Ok(session)
+        })?
+        .context("composerData JSON")?;
+    cells.check()?;
     Ok(session)
 }
 
@@ -491,89 +473,6 @@ fn global_session(d: &Value, r: &SessionRef) -> Session {
     session
 }
 
-/// Convert one Cursor "bubble" (message) object into an IR [`Message`].
-/// `type`: 1 = user, 2 = assistant. Returns None for an entirely empty bubble.
-fn bubble_to_message(b: &Value) -> Option<Message> {
-    let btype = b.get("type").and_then(Value::as_i64).unwrap_or(0);
-    let role = match btype {
-        1 => Role::User,
-        2 => Role::Assistant,
-        _ => Role::Assistant,
-    };
-    let mut m = Message::new(role);
-    m.id = b.get("bubbleId").and_then(Value::as_str).map(str::to_string);
-    m.timestamp = b.get("createdAt").and_then(bubble_timestamp);
-
-    // Thinking block (assistant): {text: "..."} (and sometimes signature).
-    if let Some(th) = b.get("thinking") {
-        let text = th.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-        let signature = th
-            .get("signature")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
-        if !text.is_empty() || signature.is_some() {
-            m.content.push(Block::Thinking {
-                text: text.into(),
-                signature,
-                encrypted: None,
-                redacted: false,
-            });
-        }
-    }
-
-    // Primary text. Fall back to richText (Lexical JSON) if `text` is empty.
-    let text = b.get("text").and_then(Value::as_str).unwrap_or("");
-    if !text.is_empty() {
-        m.content.push(Block::Text {
-            text: text.to_string().into(),
-        });
-    } else if let Some(rt) = b.get("richText") {
-        if let Some(extracted) = lexical_plain_text(rt) {
-            if !extracted.trim().is_empty() {
-                m.content.push(Block::Text { text: extracted.into() });
-            }
-        }
-    }
-
-    // A tool call + its result, stored together in `toolFormerData`.
-    if let Some(tf) = b.get("toolFormerData") {
-        push_tool_former(&mut m, tf);
-    }
-
-    // Model on assistant bubbles: `modelInfo.modelName` (newer) or a bare `modelType`/`model`.
-    if let Some(model) = b
-        .pointer("/modelInfo/modelName")
-        .or_else(|| b.get("modelType"))
-        .or_else(|| b.get("model"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        m.model = Some(model.to_string());
-    }
-    if let Some(tc) = b.get("tokenCount") {
-        let input = tc.get("inputTokens").and_then(Value::as_u64);
-        let output = tc.get("outputTokens").and_then(Value::as_u64);
-        if input.is_some() || output.is_some() {
-            m.usage = Some(Usage {
-                input_tokens: input,
-                output_tokens: output,
-                ..Usage::default()
-            });
-        }
-    }
-    // A bubble's own `unifiedMode` overrides the composer's (which `stream_global` puts on the
-    // session bag) for this message only — a mode switched mid-thread.
-    if let Some(value) = b.get("unifiedMode") {
-        let metadata = unified_mode_metadata(value);
-        if !metadata.is_empty() {
-            m.harness_extra_mut(Harness::Cursor).extend(metadata);
-        }
-    }
-
-    (!m.content.is_empty() || !m.extra.is_empty()).then_some(m)
-}
-
 /// IDE bubbles use RFC3339 creation times; tolerate older numeric epoch records too.
 fn bubble_timestamp(value: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
     match value {
@@ -611,208 +510,11 @@ fn unified_mode_metadata(value: &Value) -> Map<String, Value> {
     extra
 }
 
-/// `toolFormerData` carries a single tool invocation and (usually) its result:
-/// `{name, toolCallId, params|rawArgs (JSON string), result (JSON string), status, error}`.
-fn push_tool_former(m: &mut Message, tf: &Value) {
-    let name = tf.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
-    let id = tf
-        .get("toolCallId")
-        .and_then(Value::as_str)
-        .or_else(|| tf.get("modelCallId").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_string();
-    // Arguments: prefer the model-issued `rawArgs`, fall back to normalized `params`.
-    let input = tf
-        .get("rawArgs")
-        .and_then(Value::as_str)
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .or_else(|| {
-            tf.get("params")
-                .and_then(Value::as_str)
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        })
-        .or_else(|| tf.get("params").cloned())
-        .unwrap_or(Value::Null);
-    let tool_name = name.clone();
-    m.content.push(Block::ToolUse {
-        id: id.clone(),
-        name,
-        input: input.into(),
-        namespace: None,
-    });
-
-    // Result: a JSON string (or nested obj) plus a status/error flag.
-    let status = tf.get("status").and_then(Value::as_str).unwrap_or("");
-    // Native IDE terminal calls can finish successfully as a tool invocation while the
-    // command fails: 3.24.12 records status=completed and additionalData.status=error.
-    let command_failed = tf
-        .pointer("/additionalData/status")
-        .and_then(Value::as_str)
-        .is_some_and(|s| s.eq_ignore_ascii_case("error"));
-    let is_error = status.eq_ignore_ascii_case("error")
-        || command_failed
-        || tf.get("error").map(|e| !e.is_null()).unwrap_or(false);
-    let result_text = tf
-        .get("result")
-        .and_then(|r| match r {
-            Value::String(s) => Some(s.clone()),
-            Value::Null => None,
-            other => Some(other.to_string()),
-        })
-        .or_else(|| {
-            tf.get("error").and_then(|e| match e {
-                Value::Null => None,
-                Value::String(s) => Some(s.clone()),
-                other => Some(other.to_string()),
-            })
-        });
-    if let Some(content) = result_text {
-        m.content.push(Block::ToolResult {
-            tool_use_id: id,
-            content: content.into(),
-            is_error,
-            tool_name: Some(tool_name),
-            status: (!status.is_empty()).then(|| status.to_string()),
-            details: None,
-        });
-    }
-}
-
-/// Extract concatenated plain text from a Lexical editor-state JSON tree (Cursor's `richText`).
-/// The tree is `{root:{children:[{children:[{text,type:"text"},...]}]}}`. Best-effort; returns
-/// None if it doesn't look like a Lexical state.
-fn lexical_plain_text(rt: &Value) -> Option<String> {
-    // richText may be either a JSON object or a JSON-encoded string.
-    let owned;
-    let v = if let Some(s) = rt.as_str() {
-        owned = serde_json::from_str::<Value>(s).ok()?;
-        &owned
-    } else {
-        rt
-    };
-    let root = v.get("root")?;
-    let mut out = String::new();
-    collect_lexical_text(root, &mut out);
-    (!out.is_empty()).then_some(out)
-}
-
-fn collect_lexical_text(node: &Value, out: &mut String) {
-    if let Some(t) = node.get("text").and_then(Value::as_str) {
-        out.push_str(t);
-    }
-    if let Some(children) = node.get("children").and_then(Value::as_array) {
-        for (i, child) in children.iter().enumerate() {
-            collect_lexical_text(child, out);
-            // paragraph break between top-level block children
-            if i + 1 < children.len() && child.get("children").is_some() {
-                out.push('\n');
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Legacy in-workspace format (`workbench.panel.aichat.view.aichat.chatdata`)
-// ---------------------------------------------------------------------------
-
-/// Legacy key holding an array of chat tabs in the workspace ItemTable.
-const LEGACY_CHAT_KEY: &str = "workbench.panel.aichat.view.aichat.chatdata";
-
-fn discover_legacy_workspace(conn: &Connection, db: &Path, cwd: Option<&Path>, out: &mut Vec<SessionRef>) {
-    let Ok(source) = source::cell(conn, "ItemTable", LEGACY_CHAT_KEY) else {
-        return;
-    };
-    let Some(header) = legacy::header(&source) else { return };
-    let Some((_, tabs)) = &header.tabs else { return };
-    for tab in tabs {
-        let Some(tab_id) = tab.metadata.get("tabId").and_then(Value::as_str) else {
-            continue;
-        };
-        let count = tab.bubbles.map_or(0, |(_, count)| count);
-        if count == 0 {
-            continue;
-        }
-        let title = tab
-            .metadata
-            .get("chatTitle")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| crate::ir::truncate(s, 80));
-        out.push(SessionRef {
-            cwd: cwd.map(Path::to_path_buf),
-            title,
-            message_count: count,
-            ..SessionRef::new(format!("legacy:{tab_id}"), Harness::Cursor, db.to_path_buf())
-        });
-    }
-}
-
-fn stream_legacy(conn: &Connection, r: &SessionRef, tab_id: &str, sink: &mut dyn MessageSink) -> Result<Session> {
-    let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
-    let source = source::cell(conn, "ItemTable", LEGACY_CHAT_KEY)?;
-    let header = legacy::header(&source).context("legacy chatdata JSON")?;
-    let (_, tabs) = header.tabs.as_ref().context("legacy chatdata has no tabs")?;
-    let selected = tabs
-        .iter()
-        .position(|tab| tab.metadata.get("tabId").and_then(Value::as_str) == Some(tab_id))
-        .with_context(|| format!("legacy tab {tab_id} not found"))?;
-    let tab = &tabs[selected].metadata;
-
-    let title = tab
-        .get("chatTitle")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| r.title.clone());
-    let session = Session {
-        cwd: r.cwd.clone(),
-        title,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        source_path: Some(r.path.clone()),
-        ..Session::new(r.id.clone(), Harness::Cursor)
-    };
-    sink.meta(&session);
-    header.replay(&source, selected, &mut |bubble| {
-        if let Some(message) = legacy_bubble_to_message(&bubble) {
-            sink.message(message)
-        } else {
-            Flow::Continue
-        }
-    })?;
-    Ok(session)
-}
-
-/// Legacy bubbles use a string `type` ("user"/"ai") and a `text` field.
-fn legacy_bubble_to_message(b: &Value) -> Option<Message> {
-    let role = match b.get("type").and_then(Value::as_str) {
-        Some("user") => Role::User,
-        Some("ai") | Some("assistant") => Role::Assistant,
-        _ => Role::Assistant,
-    };
-    let mut m = Message::new(role);
-    if let Some(text) = b.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        m.content.push(Block::Text {
-            text: text.to_string().into(),
-        });
-    }
-    (!m.content.is_empty()).then_some(m)
-}
-
 /// Whole-`Session` convenience over [`stream_global`] for tests: stream into a [`CollectSink`].
 #[cfg(test)]
 fn parse_global(conn: &Connection, r: &SessionRef) -> Result<Session> {
     let mut sink = crate::stream::CollectSink::default();
-    let mut s = stream_global(conn, r, &mut sink)?;
-    s.messages = sink.messages;
-    Ok(s)
-}
-
-/// Whole-`Session` convenience over [`stream_legacy`] for tests.
-#[cfg(test)]
-fn parse_legacy(conn: &Connection, r: &SessionRef, tab_id: &str) -> Result<Session> {
-    let mut sink = crate::stream::CollectSink::default();
-    let mut s = stream_legacy(conn, r, tab_id, &mut sink)?;
+    let mut s = stream_global(conn, &Default::default(), r, false, &mut sink)?;
     s.messages = sink.messages;
     Ok(s)
 }
@@ -821,15 +523,42 @@ fn parse_legacy(conn: &Connection, r: &SessionRef, tab_id: &str) -> Result<Sessi
 mod tests {
     use super::*;
 
-    /// Build an in-memory state.vscdb resembling the global cursorDiskKV layout.
-    fn mk_global() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+    /// A state.vscdb file resembling the global cursorDiskKV layout.
+    struct Db {
+        _world: cv_testkit::World,
+        conn: Connection,
+        path: PathBuf,
+    }
+    impl std::ops::Deref for Db {
+        type Target = Connection;
+        fn deref(&self) -> &Connection {
+            &self.conn
+        }
+    }
+    impl std::ops::DerefMut for Db {
+        fn deref_mut(&mut self) -> &mut Connection {
+            &mut self.conn
+        }
+    }
+    impl Db {
+        fn sref(&self, id: &str) -> SessionRef {
+            SessionRef::new(id, Harness::Cursor, self.path.clone())
+        }
+    }
+    fn mk_global() -> Db {
+        let world = cv_testkit::World::new("cursor-global");
+        let path = world.base.join("state.vscdb");
+        let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB);
              CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);",
         )
         .unwrap();
-        conn
+        Db {
+            _world: world,
+            conn,
+            path,
+        }
     }
 
     fn put(conn: &Connection, key: &str, value: &str) {
@@ -840,8 +569,11 @@ mod tests {
         .unwrap();
     }
 
-    fn sref(id: &str) -> SessionRef {
-        SessionRef::new(id, Harness::Cursor, PathBuf::from(":memory:"))
+    /// One bubble decoded from an owned value, as the bulk demand reads it.
+    fn bubble_to_message(b: &Value) -> Option<Message> {
+        let db = mk_global();
+        let cells = Cells::new(&db, &db.path, &Default::default(), "cursorDiskKV").unwrap();
+        record::bubble(crate::json::JsonView::owned(b), &cells, false).unwrap()
     }
 
     #[test]
@@ -904,7 +636,7 @@ mod tests {
     fn native_ide_failed_command_and_reopened_conversation() {
         use crate::harness::Parse;
 
-        let _world = cv_testkit::World::in_process("cursor-native-ide");
+        let _world = crate::test_world("cursor-native-ide");
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/cursor/3.24.12-ide/Cursor/User");
         let adapter = Cursor::with_user_dir(&root);
         let refs = adapter.discover().unwrap();
@@ -972,14 +704,14 @@ mod tests {
 
         let mut out = Vec::new();
         let map = HashMap::new();
-        discover_global(&conn, Path::new(":memory:"), &map, &mut out);
+        discover_global(&conn, &conn.path, &map, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "comp-1");
         assert_eq!(out[0].title.as_deref(), Some("My Chat"));
         assert_eq!(out[0].message_count, 2);
         assert!(out[0].created_at.is_some());
 
-        let s = parse_global(&conn, &sref(cid)).unwrap();
+        let s = parse_global(&conn, &conn.sref(cid)).unwrap();
         assert_eq!(s.title.as_deref(), Some("My Chat"));
         assert_eq!(s.messages.len(), 2);
         assert_eq!(s.messages[0].role, Role::User);
@@ -1095,7 +827,7 @@ mod tests {
             "composerData:mode",
             r#"{"composerId":"mode","unifiedMode":"agent","conversation":[{"type":2,"text":"chat reply","unifiedMode":1}]}"#,
         );
-        let reference = SessionRef::new("mode", Harness::Cursor, ":memory:");
+        let reference = conn.sref("mode");
         let session = parse_global(&conn, &reference).unwrap();
         assert_eq!(session.harness_extra(Harness::Cursor).unwrap()["unified_mode"], "agent");
         assert_eq!(
@@ -1124,7 +856,7 @@ mod tests {
             &format!("bubbleId:{cid}:b1"),
             r#"{"bubbleId":"b1","type":1,"text":"look"}"#,
         );
-        let s = parse_global(&conn, &sref(cid)).unwrap();
+        let s = parse_global(&conn, &conn.sref(cid)).unwrap();
         assert_eq!(s.lineage.parent.as_deref(), Some("comp-parent"));
         assert_eq!(s.lineage.spawned_by_tool_use.as_deref(), Some("tool_7"));
         assert_eq!(s.lineage.agent_path.as_deref(), Some("explore"));
@@ -1145,7 +877,7 @@ mod tests {
             &format!("bubbleId:{cid}:b1"),
             r#"{"bubbleId":"b1","type":2,"text":"answer","modelInfo":{"modelName":"claude-4.5-sonnet-thinking"}}"#,
         );
-        let s = parse_global(&conn, &sref(cid)).unwrap();
+        let s = parse_global(&conn, &conn.sref(cid)).unwrap();
         // Per-message model from modelInfo.modelName; session model prefers the assistant's.
         assert_eq!(s.messages[0].model.as_deref(), Some("claude-4.5-sonnet-thinking"));
         assert_eq!(s.model.as_deref(), Some("claude-4.5-sonnet-thinking"));
@@ -1166,7 +898,7 @@ mod tests {
             &format!("bubbleId:{cid}:b1"),
             r#"{"bubbleId":"b1","type":1,"text":"hi"}"#,
         );
-        let s = parse_global(&conn, &sref(cid)).unwrap();
+        let s = parse_global(&conn, &conn.sref(cid)).unwrap();
         assert_eq!(s.model.as_deref(), Some("gpt-5"));
     }
 
@@ -1182,13 +914,13 @@ mod tests {
         );
         let mut out = Vec::new();
         let map = HashMap::new();
-        discover_global(&conn, Path::new(":memory:"), &map, &mut out);
+        discover_global(&conn, &conn.path, &map, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].message_count, 2);
         // no name -> title falls back to None at discover; label() uses first user text.
         assert!(out[0].title.is_none());
 
-        let s = parse_global(&conn, &sref(cid)).unwrap();
+        let s = parse_global(&conn, &conn.sref(cid)).unwrap();
         assert_eq!(s.messages.len(), 2);
         assert_eq!(s.messages[0].text().as_deref(), Some("hi"));
         assert_eq!(s.messages[1].text().as_deref(), Some("hello"));
@@ -1204,7 +936,7 @@ mod tests {
         );
         let mut out = Vec::new();
         let map = HashMap::new();
-        discover_global(&conn, Path::new(":memory:"), &map, &mut out);
+        discover_global(&conn, &conn.path, &map, &mut out);
         assert!(out.is_empty());
     }
 
@@ -1223,7 +955,7 @@ mod tests {
             &format!("bubbleId:{cid}:b1"),
             r#"{"bubbleId":"b1","type":1,"text":"","richText":"{\"root\":{\"children\":[{\"children\":[{\"text\":\"from rich text\",\"type\":\"text\"}],\"type\":\"paragraph\"}],\"type\":\"root\"}}"}"#,
         );
-        let s = parse_global(&conn, &sref(cid)).unwrap();
+        let s = parse_global(&conn, &conn.sref(cid)).unwrap();
         assert_eq!(s.messages.len(), 1);
         assert_eq!(s.messages[0].text().as_deref(), Some("from rich text"));
     }
@@ -1243,7 +975,7 @@ mod tests {
             r#"{"bubbleId":"b1","type":2,"text":"oops",
                 "toolFormerData":{"name":"read_file","toolCallId":"t9","status":"error","params":"{\"path\":\"/x\"}","error":"not found"}}"#,
         );
-        let s = parse_global(&conn, &sref(cid)).unwrap();
+        let s = parse_global(&conn, &conn.sref(cid)).unwrap();
         let tr = s.messages[0].content.iter().find_map(|b| match b {
             Block::ToolResult { content, is_error, .. } => Some((content.clone(), *is_error)),
             _ => None,
@@ -1267,32 +999,349 @@ mod tests {
 
     #[test]
     fn legacy_workspace_chatdata() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)", [])
-            .unwrap();
+        let conn = mk_global();
         let blob = r#"{"tabs":[{"tabId":"tab-1","chatTitle":"Old Tab",
             "bubbles":[{"type":"user","text":"legacy question"},{"type":"ai","text":"legacy answer"}]}]}"#;
         conn.execute(
             "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
-            rusqlite::params![LEGACY_CHAT_KEY, blob],
+            rusqlite::params![legacy::CHAT_KEY, blob],
         )
         .unwrap();
 
         let mut out = Vec::new();
-        discover_legacy_workspace(&conn, Path::new(":memory:"), Some(Path::new("/tmp/proj")), &mut out);
+        legacy::discover(&conn, &conn.path, Some(Path::new("/tmp/proj")), &mut out).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "legacy:tab-1");
         assert_eq!(out[0].cwd.as_deref(), Some(Path::new("/tmp/proj")));
         assert_eq!(out[0].message_count, 2);
 
-        let mut r = sref("legacy:tab-1");
+        let mut r = conn.sref("legacy:tab-1");
         r.cwd = Some(PathBuf::from("/tmp/proj"));
-        let s = parse_legacy(&conn, &r, "tab-1").unwrap();
+        let mut sink = crate::stream::CollectSink::default();
+        let s = legacy::stream(&conn, &Default::default(), &r, "tab-1", false, &mut sink).unwrap();
         assert_eq!(s.title.as_deref(), Some("Old Tab"));
-        assert_eq!(s.messages.len(), 2);
-        assert_eq!(s.messages[0].role, Role::User);
-        assert_eq!(s.messages[0].text().as_deref(), Some("legacy question"));
-        assert_eq!(s.messages[1].role, Role::Assistant);
+        assert_eq!(sink.messages.len(), 2);
+        assert_eq!(sink.messages[0].role, Role::User);
+        assert_eq!(sink.messages[0].text().as_deref(), Some("legacy question"));
+        assert_eq!(sink.messages[1].role, Role::Assistant);
+    }
+
+    /// A file store with one composer and external bubbles, for the decoder's behavior tests.
+    fn fixture(dir: &Path, root: &str, bubbles: &[(&str, &[u8])]) -> (Connection, SessionRef) {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("state.vscdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY,value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO cursorDiskKV VALUES('composerData:test',?1)", [root])
+            .unwrap();
+        for (id, raw) in bubbles {
+            conn.execute(
+                "INSERT INTO cursorDiskKV VALUES(?1,?2)",
+                rusqlite::params![format!("bubbleId:test:{id}"), raw],
+            )
+            .unwrap();
+        }
+        (conn, SessionRef::new("test", Harness::Cursor, path))
+    }
+    /// The bulk read's messages; the lazy read resolves to the same (spans pick representation only).
+    fn read_both(conn: &Connection, r: &SessionRef) -> Vec<Message> {
+        let mut bulk = crate::stream::CollectSink::default();
+        let mut lazy = crate::stream::CollectSink::default();
+        let bulk_session = stream_global(conn, &Default::default(), r, false, &mut bulk).unwrap();
+        let lazy_session = stream_global(conn, &Default::default(), r, true, &mut lazy).unwrap();
+        assert_eq!(
+            serde_json::to_value(bulk_session).unwrap(),
+            serde_json::to_value(lazy_session).unwrap()
+        );
+        let resolver = crate::lazy::Resolver::new(Some(r.path.clone()));
+        for message in &mut lazy.messages {
+            message.materialize(&resolver).unwrap();
+        }
+        assert_eq!(
+            serde_json::to_value(&bulk.messages).unwrap(),
+            serde_json::to_value(&lazy.messages).unwrap()
+        );
+        bulk.messages
+    }
+
+    #[test]
+    fn giant_identity_and_model_stay_inline_and_set_the_session_model() {
+        let world = crate::test_world("cursor-giant-metadata");
+        let id = "bubble-🌙".repeat(crate::lazy::INLINE_MAX);
+        let model = "native-model-🌙".repeat(crate::lazy::INLINE_MAX);
+        let root = serde_json::json!({"fullConversationHeadersOnly":[{"bubbleId":id}]});
+        let bubble =
+            serde_json::json!({"bubbleId":id,"type":2,"text":"retained message","modelInfo":{"modelName":model}});
+        let (conn, r) = fixture(&world.base, &root.to_string(), &[(&id, bubble.to_string().as_bytes())]);
+        let messages = read_both(&conn, &r);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id.as_deref(), Some(id.as_str()));
+        assert_eq!(messages[0].model.as_deref(), Some(model.as_str()));
+        let session = stream_global(
+            &conn,
+            &Default::default(),
+            &r,
+            true,
+            &mut crate::stream::CollectSink::default(),
+        )
+        .unwrap();
+        assert_eq!(session.model.as_deref(), Some(model.as_str()));
+    }
+
+    #[test]
+    fn lazy_demands_keep_long_text_and_arguments_in_the_store() {
+        use crate::json::Json;
+        use crate::lazy::Text;
+        let world = crate::test_world("cursor-ide-facts");
+        let big = "日本語\n".repeat(8192);
+        let root = serde_json::json!({"name":"composer","createdAt":1,"lastUpdatedAt":2,"unifiedMode":"agent","subagentInfo":{"parentComposerId":"parent","toolCallId":"spawn","subagentTypeName":"researcher","ignored":big},"modelConfig":{"modelName":"fallback","ignored":big},"fullConversationHeadersOnly":[{"bubbleId":"user"},{"bubbleId":"assistant"}],"conversation":[{"type":1,"text":"must not emit"}],"ignored":big});
+        let user = serde_json::json!({"bubbleId":"user","type":1,"text":"question","unifiedMode":99});
+        let assistant = serde_json::json!({"bubbleId":"assistant","type":2,"thinking":{"text":big,"signature":"sig"},"text":big,"modelInfo":{"modelName":"native-model","ignored":big},"tokenCount":{"inputTokens":10,"outputTokens":5,"ignored":big},"unifiedMode":1,"toolFormerData":{"name":"run_terminal_cmd","toolCallId":"call","rawArgs":serde_json::json!({"command":"cat /scratch/file","content":big}).to_string(),"result":big,"status":"ERROR","error":{"ignored":big},"restorable":["not-an-emitted-detail"]},"providerOptions":{"ignored":big}});
+        let (conn, r) = fixture(
+            &world.base,
+            &root.to_string(),
+            &[
+                ("user", user.to_string().as_bytes()),
+                ("assistant", assistant.to_string().as_bytes()),
+            ],
+        );
+        let messages = read_both(&conn, &r);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content.len(), 4);
+        let adapter = Cursor::with_user_dir(&world.base);
+        let owned = crate::stream::collect_with(&adapter, &r, &ParseOptions::bulk()).unwrap();
+        assert_eq!(owned.title.as_deref(), Some("composer"));
+        assert_eq!(owned.lineage.agent_path.as_deref(), Some("researcher"));
+        assert_eq!(owned.model.as_deref(), Some("native-model"));
+        let mut expected = Vec::new();
+        crate::dataset::write_record(&owned, &mut expected, crate::dataset::Format::Chatml, None).unwrap();
+        let query = crate::SessionQuery::parse("harness:cursor").unwrap();
+        for filter in [None, Some(&query)] {
+            let staged = crate::dataset::stage_record(
+                &adapter,
+                &r,
+                crate::dataset::Format::Chatml,
+                None,
+                0,
+                filter,
+                &crate::query::TextSets::default(),
+            )
+            .unwrap()
+            .unwrap();
+            let mut actual = Vec::new();
+            staged.publish(&mut actual).unwrap();
+            actual.pop();
+            assert_eq!(expected, actual);
+        }
+        for options in [ParseOptions::facts(), ParseOptions::lazy()] {
+            let collected = crate::stream::collect_with(&adapter, &r, &options).unwrap();
+            let content = &collected.messages[1].content;
+            assert!(matches!(&content[1], Block::Text { text: Text::Source(_) }));
+            assert!(matches!(
+                &content[2],
+                Block::ToolUse {
+                    input: Json::Source(_),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn array_authority_argument_fallback_and_lexical_results() {
+        let world = crate::test_world("cursor-ide-edges");
+        let mut bubbles = Vec::new();
+        for raw in ["true", "null", "17", "\"literal\"", " ", "{"] {
+            bubbles.push(serde_json::json!({"type":2,"toolFormerData":{"rawArgs":raw,"params":"[1,2]","result":{"z":2,"a":1},"status":"error"},"modelInfo":{"modelName":null},"modelType":"must-not-fallback"}));
+        }
+        bubbles.extend([
+            serde_json::json!({"type":2,"text":"","richText":{"root":{"children":[{"text":"line","children":[{"text":" two"}]}]}},"unifiedMode":{}}),
+            serde_json::json!({"type":2,"richText":serde_json::json!({"root":{"text":"encoded lexical"}}).to_string()}),
+            serde_json::json!({"type":2,"toolFormerData":null}),
+            serde_json::json!({"type":2,"toolFormerData":{"params":"invalid string","result":null,"error":"failure"}}),
+            serde_json::json!({"type":2,"richText":{"root":{"text":"start","children":[{"text":"日本語","children":null},{"text":" next"},{"children":[{"text":"last"}]}]}}}),
+            serde_json::json!({"type":2,"richText":{"root":{"text":" \n\t","children":[null,17,{"text":false}]}}}),
+            serde_json::json!({"type":2,"richText":"{broken"}),
+            serde_json::json!({"type":2,"richText":"","toolFormerData":{"name":"shell","result":"still visible"}}),
+            serde_json::json!({"type":2,"toolFormerData":{"result":[true,null,1.5,{"z":"日本語\n","a":"\\quoted\""}]}}),
+            serde_json::json!({"type":2,"richText":{"root":{"text":"\u{2003}".repeat(2048)}}}),
+        ]);
+        let root = serde_json::json!({"conversation":bubbles,"fullConversationHeadersOnly":false});
+        let (conn, r) = fixture(&world.base.join("inline"), &root.to_string(), &[]);
+        let messages = read_both(&conn, &r);
+        let input = |m: &Message| match &m.content[0] {
+            Block::ToolUse { input, .. } => input.resolve().unwrap().into_owned(),
+            other => panic!("{other:?}"),
+        };
+        let inputs: Vec<_> = messages[..6].iter().map(input).collect();
+        let fallback = serde_json::json!([1, 2]);
+        assert_eq!(
+            inputs,
+            [
+                serde_json::json!(true),
+                Value::Null,
+                serde_json::json!(17),
+                serde_json::json!("literal"),
+                fallback.clone(),
+                fallback
+            ]
+        );
+        assert!(messages[..6].iter().all(|m| m.model.is_none()));
+        assert!(
+            matches!(&messages[0].content[1], Block::ToolResult { content, is_error: true, .. } if &**content == r#"{"z":2,"a":1}"#)
+        );
+        let texts: Vec<_> = messages[6..].iter().map(|m| m.text()).collect();
+        assert_eq!(texts[0].as_deref(), Some("line two"));
+        assert_eq!(texts[1].as_deref(), Some("encoded lexical"));
+        assert!(
+            matches!(&messages[8].content[..], [Block::ToolUse { name, input, .. }] if name == "tool" && input.resolve().unwrap().is_null())
+        );
+        assert!(
+            matches!(&messages[9].content[0], Block::ToolUse { input, .. } if input.resolve().unwrap().as_str() == Some("invalid string"))
+        );
+        assert!(
+            matches!(&messages[9].content[1], Block::ToolResult { content, is_error: true, .. } if &**content == "failure")
+        );
+        assert_eq!(messages[10].text().as_deref(), Some("start日本語\n nextlast"));
+        // Blank and broken editor states carry nothing (those bubbles are skipped); a tool call shows.
+        assert!(matches!(&messages[11].content[1], Block::ToolResult { content, .. } if &**content == "still visible"));
+        assert!(
+            matches!(&messages[12].content[1], Block::ToolResult { content, .. } if &**content == r#"[true,null,1.5,{"z":"日本語\n","a":"\\quoted\""}]"#)
+        );
+        assert_eq!(messages.len(), 13);
+        for (index, root) in [
+            r#"{"conversation":[{"type":1,"text":"first"}],"conversation":[{"type":1,"text":"last"}]}"#,
+            r#"{"conversation":[{"type":1,"text":"fallback"}],"fullConversationHeadersOnly":[]}"#,
+            r#"{"conversation":[{"type":1,"text":"fallback"}],"fullConversationHeadersOnly":[],"fullConversationHeadersOnly":false}"#,
+            r#"{"fullConversationHeadersOnly":[{"bubbleId":"missing"},{"bubbleId":"invalid"},{"bubbleId":"empty"},{"bubbleId":"lossy"}]}"#,
+            "null",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (conn, r) = fixture(
+                &world.base.join(index.to_string()),
+                root,
+                &[
+                    ("invalid", b"{broken"),
+                    ("empty", b""),
+                    ("lossy", b"{\"type\":1,\"text\":\"bad\xff\"}"),
+                ],
+            );
+            let texts: Vec<_> = read_both(&conn, &r).iter().map(|m| m.text()).collect();
+            let expected: &[&str] = [&["last"][..], &[], &["fallback"], &["bad\u{fffd}"], &[]][index];
+            assert_eq!(texts, expected.iter().map(|t| Some(t.to_string())).collect::<Vec<_>>(), "{root}");
+        }
+        for (index, root) in [
+            r#"{"conversation":[],"ignored":"\uD800"}"#,
+            r#"{"conversation":[],"ignored":1e9999}"#,
+            r#"{"conversation":[]} trailing"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (conn, r) = fixture(&world.base.join(format!("invalid-{index}")), root, &[]);
+            assert!(stream_global(
+                &conn,
+                &Default::default(),
+                &r,
+                true,
+                &mut crate::stream::CollectSink::default()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_external_bubbles_are_skipped_rows() {
+        let world = crate::test_world("cursor-rich-lazy-validation");
+        let root = r#"{"name":"title","modelConfig":{"modelName":"fallback"},"fullConversationHeadersOnly":[{"bubbleId":"first"},{"bubbleId":"bad-escape"},{"bubbleId":"bad-number"},{"bubbleId":"bad-type"},{"bubbleId":"missing"},{"bubbleId":"last"}]}"#;
+        let (conn, r) = fixture(
+            &world.base,
+            root,
+            &[
+                ("first", br#"{"bubbleId":"first","type":1,"text":"first","unifiedMode":99}"#),
+                ("bad-escape", br#"{"type":2,"text":"must be omitted","providerOptions":{"unused":"\ud800"}}"#),
+                ("bad-number", br#"{"type":2,"text":"must be omitted","providerOptions":{"unused":1e9999}}"#),
+                ("bad-type", br#"{"type":"future","text":false,"thinking":false,"toolFormerData":null,"modelInfo":{"modelName":null},"modelType":"do not fallback","unifiedMode":{}}"#),
+                ("last", br#"{"bubbleId":"last","type":2,"text":"last","modelInfo":{"modelName":"last-model"},"unifiedMode":5}"#),
+            ],
+        );
+        let messages = read_both(&conn, &r);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].model, None);
+        assert_eq!(messages.last().unwrap().model.as_deref(), Some("last-model"));
+    }
+
+    #[test]
+    fn cold_wal_adapter_preserves_original_sidecars_and_journal_guard() {
+        let world = crate::test_world("cursor-ide-cold-wal");
+        let root = serde_json::json!({"conversation":[{"type":1,"text":"日本語\n".repeat(4096)}]});
+        let (conn, r) = fixture(&world.base, &root.to_string(), &[]);
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        drop(conn);
+        let wal = r.path.with_file_name("state.vscdb-wal");
+        let shm = r.path.with_file_name("state.vscdb-shm");
+        let journal = r.path.with_file_name("state.vscdb-journal");
+        assert!(!wal.exists() && !shm.exists());
+        let adapter = Cursor::with_user_dir(&world.base);
+        let retained = crate::stream::collect_with(&adapter, &r, &ParseOptions::lazy_extra()).unwrap();
+        assert!(!wal.exists() && !shm.exists());
+        let Block::Text {
+            text: crate::lazy::Text::Source(text),
+        } = &retained.messages[0].content[0]
+        else {
+            panic!("source text required")
+        };
+        std::fs::write(&journal, b"changed journal").unwrap();
+        assert!(text.try_prefix(10).is_err());
+        std::fs::remove_file(&journal).unwrap();
+        struct Stop(PathBuf);
+        impl MessageSink for Stop {
+            fn message(&mut self, _: Message) -> Flow {
+                std::fs::write(&self.0, b"changed journal").unwrap();
+                Flow::Stop
+            }
+        }
+        assert!(adapter
+            .stream(&r, &ParseOptions::bulk(), &mut Stop(journal))
+            .unwrap_err()
+            .to_string()
+            .contains("dependencies changed"));
+        assert!(!wal.exists() && !shm.exists());
+    }
+
+    #[test]
+    fn wal_guard_covers_retained_text_and_an_intentional_stop() {
+        let world = crate::test_world("cursor-ide-facts-guard");
+        let root = serde_json::json!({"conversation":[{"type":1,"text":"日本語\n".repeat(4096)}]});
+        let (conn, r) = fixture(&world.base, &root.to_string(), &[]);
+        let wal = r.path.with_file_name("state.vscdb-wal");
+        let mut reads = crate::source::ReadSet::default();
+        reads.record(&wal);
+        let mut sink = crate::stream::CollectSink::default();
+        stream_global(&conn, &reads, &r, true, &mut sink).unwrap();
+        std::fs::write(&wal, b"changed WAL").unwrap();
+        let Block::Text {
+            text: crate::lazy::Text::Source(text),
+        } = &sink.messages[0].content[0]
+        else {
+            panic!("expected source text")
+        };
+        assert!(text.try_prefix(10).is_err());
+        std::fs::remove_file(&wal).unwrap();
+        struct Stop(PathBuf);
+        impl MessageSink for Stop {
+            fn message(&mut self, _: Message) -> Flow {
+                std::fs::write(&self.0, b"changed WAL").unwrap();
+                Flow::Stop
+            }
+        }
+        assert!(stream_global(&conn, &reads, &r, true, &mut Stop(wal))
+            .unwrap_err()
+            .to_string()
+            .contains("dependencies changed"));
     }
 
     #[test]

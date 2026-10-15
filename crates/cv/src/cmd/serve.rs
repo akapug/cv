@@ -51,7 +51,7 @@ struct Ctx {
 /// whole transcript corpus (secrets included) and the inbox's writes to anyone who can reach the
 /// port, so it demands a bearer token or an explicit `--insecure-expose`, and warns either way.
 pub(crate) fn cmd_serve(opts: ServeOpts) -> Result<()> {
-    if std::env::var_os("CVD_TOKEN").is_some() && std::env::var_os("CV_SERVE_TOKEN").is_none() {
+    if cv_core::env::var_os("CVD_TOKEN").is_some() && cv_core::env::var_os("CV_SERVE_TOKEN").is_none() {
         return crate::util::usage(
             "$CVD_TOKEN was renamed $CV_SERVE_TOKEN in 0.15.0 with `cvd serve` → `cv serve` \
              (or pass --token)",
@@ -59,7 +59,7 @@ pub(crate) fn cmd_serve(opts: ServeOpts) -> Result<()> {
     }
     let token = opts
         .token
-        .or_else(|| std::env::var("CV_SERVE_TOKEN").ok())
+        .or_else(|| cv_core::env::var("CV_SERVE_TOKEN").ok())
         .filter(|t| !t.is_empty());
     let host = opts.host.as_str();
     if !is_loopback_host(host) {
@@ -921,7 +921,7 @@ mod staged_tests {
     #[test]
     #[ignore = "isolated actual HTTP response allocation control"]
     fn staged_http_giant_selected_window_heap() {
-        let world = cv_testkit::World::in_process("staged-http-heap");
+        let world = crate::test_world("staged-http-heap");
         for kind in ["text", "arguments"] {
             for mib in [16, 64] {
                 let body = "x\n月".repeat(mib * 1024 * 1024 / 5);

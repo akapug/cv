@@ -418,6 +418,7 @@ fn parse_chunk(
     #[cfg(feature = "sqlite")] cache: Option<&usage_cache::Cache>,
 ) -> Vec<Result<Option<UsageBatch>>> {
     let inventory = crate::source::inventory_context();
+    let env = crate::env::Env::scoped();
     let parse = |r: &SessionRef| {
         let load = || {
             usage_hits(
@@ -426,10 +427,10 @@ fn parse_chunk(
                 cache,
             )
         };
-        match &inventory {
+        crate::env::within(&env, || match &inventory {
             Some(context) => context.run(load),
             None => load(),
-        }
+        })
     };
     #[cfg(feature = "parallel")]
     {
@@ -915,7 +916,7 @@ mod tests {
 
     #[test]
     fn old_parallel_compute_matches_multiple_transcript_precedence_and_cost_bits() {
-        let world = cv_testkit::World::in_process("token-stats-parallel-oracle");
+        let world = crate::test_world("token-stats-parallel-oracle");
         let mut refs = Vec::new();
         for (i, model) in ["first", "ignored", "ignored-again"].into_iter().enumerate() {
             let value = json!({"padding":"x".repeat(64 * 1024),"type":"assistant","uuid":format!("a{i}"),"message":{
@@ -982,7 +983,7 @@ mod tests {
                 .num_threads(workers)
                 .build()
                 .unwrap()
-                .install(check);
+                .install(crate::env::carry(&check));
         }
         #[cfg(not(feature = "parallel"))]
         check();
@@ -1021,7 +1022,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn tiny_native_sources_parse_without_publishing_usage_cache() {
-        let world = cv_testkit::World::in_process("token-stats-tiny");
+        let world = crate::test_world("token-stats-tiny");
         let path = world.write_session(
             "tiny",
             &[json!({"type":"assistant","message":{
@@ -1047,7 +1048,7 @@ mod tests {
         // Two lines of one streamed response in the parent, the same response again in a resumed
         // copy, and a sub-agent's own call: three distinct calls' worth of lines, two calls counted
         // from the catalog sessions plus one from the sub-agent forest.
-        let world = cv_testkit::World::in_process("token-stats");
+        let world = crate::test_world("token-stats");
         let root = world.base.join("token-fixtures");
         let proj = root.join("-enc");
         let subs = proj.join("sess").join("subagents");

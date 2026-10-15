@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "cursor"
-source_files = ["harness/cursor.rs", "harness/cursor/cli.rs"]
+source_files = ["harness/cursor.rs", "harness/cursor/record.rs", "harness/cursor/legacy.rs", "harness/cursor/cli.rs"]
 ignore_literals = []
 store = [
   "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb",

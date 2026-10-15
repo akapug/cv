@@ -128,13 +128,11 @@ fn block_from_fields(item: &Value, q: &Quirks, text: &mut dyn FnMut(&'static str
             redacted: true,
         });
     }
-    if ty == q.tool_use.0 {
-        return Some(Block::ToolUse {
-            id: str_field(item, "id"),
-            name: str_field(item, "name"),
-            input: item.get(q.tool_use.1).cloned().unwrap_or(Value::Null).into(),
-            namespace: None,
-        });
+    if ty == q.tool_use.0 || matches!(ty, "image" | "document") {
+        // These shapes do not use the caller's text callback. Owned entry points use the
+        // same field selection and conversion as the source-backed codec.
+        return block_from_view_with(item.into(), q, false, &mut |v| v.text(false), u64::MAX)
+            .expect("an owned JSON value has no source reads");
     }
     match ty {
         "tool_result" => {
@@ -149,24 +147,21 @@ fn block_from_fields(item: &Value, q: &Quirks, text: &mut dyn FnMut(&'static str
                 details: None,
             })
         }
-        "image" => Some(image_from(item, q)),
-        // A `document` block (PDF/text attachments on user turns) is a File.
-        "document" => Some(document_from(item, q)),
         _ => None,
     }
 }
 
-/// A schema projection shared by mapped and portable document readers. Whole value acceptance
-/// happens at their source boundary; only decoded metadata and demanded composite text are owned.
-pub(crate) fn block_from_view(
+/// A content block from a view, with the caller's text rule for content strings, `spans` for tool
+/// arguments, and the size above which a source-backed tool-result array becomes checked joined
+/// text rather than being coerced inline. Unselected fields are never decoded, in every demand.
+pub(crate) fn block_from_view_with(
     view: crate::json::JsonView<'_>,
     q: &Quirks,
     spans: bool,
+    text: &mut dyn FnMut(crate::json::JsonView<'_>) -> anyhow::Result<Option<Text>>,
+    joined_over: u64,
 ) -> anyhow::Result<Option<Block>> {
     use super::super::store::document::Fields;
-    if !spans {
-        return Ok(block_from(view.resolve()?.as_ref(), q));
-    }
     let keys = [
         "type",
         "source",
@@ -195,7 +190,7 @@ pub(crate) fn block_from_view(
             name: record.string("name")?.unwrap_or_default(),
             input: record
                 .get(q.tool_use.1)
-                .map(|v| v.argument(true))
+                .map(|v| v.argument(spans))
                 .transpose()?
                 .unwrap_or_default(),
             namespace: None,
@@ -279,25 +274,25 @@ pub(crate) fn block_from_view(
         return Ok(None);
     };
     let mut fields = record.project(keys)?;
-    let mut result = record.get("content").map(|v| v.text(true)).transpose()?.flatten();
+    let mut result = record.get("content").map(&mut *text).transpose()?.flatten();
     if ty == "tool_result" && result.is_none() {
         if let Some(content) = record.get("content") {
-            if content.is_array()? && content.source_range()?.is_some() {
+            if content.is_array()? && content.source_range()?.is_some_and(|(_, len)| len > joined_over) {
                 result = Some(coerce_selected_array(content)?);
             } else {
                 fields.insert("content".into(), content.resolve()?.into_owned());
             }
         }
     }
-    let text = record.get("text").map(|v| v.text(true)).transpose()?.flatten();
-    let thinking = record.get(q.thinking.0).map(|v| v.text(true)).transpose()?.flatten();
+    let body = record.get("text").map(&mut *text).transpose()?.flatten();
+    let thinking = record.get(q.thinking.0).map(&mut *text).transpose()?.flatten();
     Ok(block_from_fields(&Value::Object(fields), q, &mut |key| {
         if key == "content" {
             result.clone()
         } else if key == q.thinking.0 {
             thinking.clone()
         } else if key == "text" {
-            text.clone()
+            body.clone()
         } else {
             None
         }
@@ -364,64 +359,6 @@ pub fn blocks_from(content: Option<&Value>, q: &Quirks) -> Vec<Block> {
         Some(Value::String(s)) => vec![Block::Text { text: s.clone().into() }],
         Some(Value::Array(items)) => items.iter().filter_map(|i| block_from(i, q)).collect(),
         _ => Vec::new(),
-    }
-}
-
-/// `source {type, media_type, …}` → (media type, reference). The IR never inlines image bytes: a
-/// `base64` source is recorded only as the marker `base64:inline`, a Files-API id as `file:<id>`,
-/// a URL as itself.
-fn source_ref(source: Option<&Value>, base64_marker: bool) -> (Option<String>, Option<String>) {
-    let media_type = source
-        .and_then(|s| s.get("media_type"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let data_ref = source.and_then(|s| match s.get("type").and_then(Value::as_str) {
-        Some("url") => s.get("url").and_then(Value::as_str).map(str::to_string),
-        Some("file") => s.get("file_id").and_then(Value::as_str).map(|id| format!("file:{id}")),
-        Some("base64") | None if base64_marker => s
-            .get("data")
-            .and_then(Value::as_str)
-            .map(|_| "base64:inline".to_string()),
-        Some(other) if base64_marker => Some(other.to_string()),
-        _ => None,
-    });
-    (media_type, data_ref)
-}
-
-fn image_from(item: &Value, q: &Quirks) -> Block {
-    match q.flat_media {
-        Some(n) => Block::Image {
-            media_type: item.get("mimeType").and_then(Value::as_str).map(str::to_string),
-            data_ref: item
-                .get("data")
-                .and_then(Value::as_str)
-                .map(|d| crate::ir::truncate(d, n)),
-        },
-        None => {
-            let (media_type, data_ref) = source_ref(item.get("source"), true);
-            Block::Image { media_type, data_ref }
-        }
-    }
-}
-
-fn document_from(item: &Value, q: &Quirks) -> Block {
-    match q.flat_media {
-        Some(_) => Block::File {
-            mime: item.get("mimeType").and_then(Value::as_str).map(str::to_string),
-            path: item.get("name").and_then(Value::as_str).map(str::to_string),
-            source: item
-                .get("data")
-                .and_then(Value::as_str)
-                .map(|_| "base64:inline".to_string()),
-        },
-        None => {
-            let (mime, source) = source_ref(item.get("source"), false);
-            Block::File {
-                mime,
-                path: item.get("title").and_then(Value::as_str).map(str::to_string),
-                source,
-            }
-        }
     }
 }
 
@@ -716,7 +653,7 @@ mod selected_media_tests {
     use super::*;
     #[test]
     fn owned_codec_returns_changed_text_errors_instead_of_panicking() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("anthropic-owned-source-error");
+        let world = crate::test_world("anthropic-owned-source-error");
         let path = world.base.join("text.json");
         let raw = serde_json::to_vec(&"large text ".repeat(10000))?;
         std::fs::write(&path, &raw)?;
@@ -747,7 +684,7 @@ mod selected_media_tests {
     }
     #[test]
     fn wide_composite_results_preserve_empty_parts_image_precedence_and_guard() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("wire-wide-result");
+        let world = crate::test_world("wire-wide-result");
         let path = world.base.join("result.json");
         let mut parts = Vec::new();
         for i in 0..8192 {
@@ -762,7 +699,9 @@ mod selected_media_tests {
         std::fs::write(&path, serde_json::to_vec(&value)?)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let block = source
-            .read_range_value(0, source.len(), |view| block_from_view(view, &ANTHROPIC, true))?
+            .read_range_value(0, source.len(), |view| {
+                block_from_view_with(view, &ANTHROPIC, true, &mut |v| v.text(true), 0)
+            })?
             .unwrap();
         assert_eq!(
             serde_json::to_value(&block)?,
@@ -779,14 +718,16 @@ mod selected_media_tests {
 
     #[test]
     fn composite_result_projection_matches_owned_codec_without_joined_body_ownership() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("wire-composite-result");
+        let world = crate::test_world("wire-composite-result");
         let path = world.base.join("result.json");
         let body = "λ\n\"result\"".repeat(20000);
         let value = json!({"type":"tool_result","tool_use_id":"call","is_error":true,"content":[{"text":""},{"text":body,"ignored":body},{"type":"image_url","text":"ignored image text"},{"text":""},{"text":body}],"ignored":body});
         std::fs::write(&path, serde_json::to_vec(&value)?)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let block = source
-            .read_range_value(0, source.len(), |view| block_from_view(view, &ANTHROPIC, true))?
+            .read_range_value(0, source.len(), |view| {
+                block_from_view_with(view, &ANTHROPIC, true, &mut |v| v.text(true), 0)
+            })?
             .unwrap();
         assert!(matches!(
             &block,
@@ -805,7 +746,9 @@ mod selected_media_tests {
             serde_json::to_value(block_from(&value, &ANTHROPIC))?
         );
         let block = source
-            .read_range_value(0, source.len(), |view| block_from_view(view, &ANTHROPIC, true))?
+            .read_range_value(0, source.len(), |view| {
+                block_from_view_with(view, &ANTHROPIC, true, &mut |v| v.text(true), 0)
+            })?
             .unwrap();
         std::fs::write(&path, b"changed after selected join")?;
         if let Block::ToolResult { content, .. } = block {
@@ -815,7 +758,7 @@ mod selected_media_tests {
     }
     #[test]
     fn flat_media_projection_matches_owned_codec_with_large_ignored_payloads() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("wire-flat-media");
+        let world = crate::test_world("wire-flat-media");
         let path = world.base.join("part.json");
         for quirks in [OPENCLAW, GOOSE] {
             for ty in ["image", "document"] {
@@ -823,8 +766,9 @@ mod selected_media_tests {
                     let value = json!({"type":ty,"mimeType":"image/png","data":data,"name":"attachment","unknown":"x".repeat(200000)});
                     std::fs::write(&path, serde_json::to_vec(&value)?)?;
                     let source = crate::json::JsonSource::capture(&path)?;
-                    let selected =
-                        source.read_range_value(0, source.len(), |view| block_from_view(view, &quirks, true))?;
+                    let selected = source.read_range_value(0, source.len(), |view| {
+                        block_from_view_with(view, &quirks, true, &mut |v| v.text(true), 0)
+                    })?;
                     assert_eq!(
                         serde_json::to_value(selected)?,
                         serde_json::to_value(block_from(&value, &quirks))?

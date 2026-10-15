@@ -1195,7 +1195,7 @@ mod tests {
 
     #[test]
     fn run_names_selects_decoded_top_level_fields_and_only_script_files() {
-        let world = cv_testkit::World::in_process("workflow-name-projection");
+        let world = crate::test_world("workflow-name-projection");
         let parent = world.base.join("sess.jsonl");
         let dir = world.base.join("sess/workflows");
         fs::create_dir_all(dir.join("scripts")).unwrap();
@@ -1235,7 +1235,7 @@ mod tests {
 
     #[test]
     fn partial_journal_recovers_only_missing_agent_returns() {
-        let world = cv_testkit::World::in_process("workflow-partial-journal");
+        let world = crate::test_world("workflow-partial-journal");
         let parent = world.base.join("sess.jsonl");
         let run = world.base.join("sess/subagents/workflows/wf_partial");
         fs::create_dir_all(&run).unwrap();
@@ -1409,7 +1409,7 @@ mod tests {
 
     #[test]
     fn workflow_receipts_resolve_large_outstanding_fanout_in_original_launch_order() {
-        let world = cv_testkit::World::in_process("workflow-pending-fanout");
+        let world = crate::test_world("workflow-pending-fanout");
         let path = world.base.join("session.jsonl");
         let count = 1024;
         let mut rows = String::new();

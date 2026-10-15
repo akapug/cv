@@ -1066,7 +1066,7 @@ mod tests {
                 Ok(cv_core::Session::new(&r.id, r.harness))
             }
         }
-        let world = cv_testkit::World::in_process("prompt-selected-demands");
+        let world = crate::test_world("prompt-selected-demands");
         let prompt_path = world.base.join("prompt.txt");
         let answer_path = world.base.join("answer.txt");
         let prompt = "typed🌙\n".repeat(1000);

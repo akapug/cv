@@ -42,10 +42,10 @@ it runs, then caches it. `--subagents` folds the sub-agent/workflow forest in to
 
 ### What gets indexed
 
-Each session becomes one document built from its **entire textual content**, not
+Each session is indexed from its **entire textual content**, not
 just metadata: the title, every message's text and thinking blocks, tool-call
 names and their JSON inputs, tool results, and referenced file paths — all
-concatenated into one searchable blob. Alongside that body, each document stores
+stored in searchable chunks and ranked as one session. Alongside the body, the index stores
 the session `id`, its `harness`, the working directory (`cwd`, tokenized so path
 fragments are searchable), the `title`, and created/updated timestamps.
 
@@ -82,17 +82,18 @@ full syntax:
 Terms are **conjunctive by default**: every term must match (better precision
 than OR). Results are ranked by BM25, with a highlighted snippet drawn from the
 matching region of the body. `--limit` caps the number of rows shown (default
-**20**); `--harness` filters by harness after ranking.
-
-Here `--limit` defaults to **10**.
+**20**); `--harness` restricts candidates before the top results are selected, in both
+full-text and semantic mode.
 
 ### How `cv search` resolves
 
 `cv search` prefers the tantivy index when it exists — and when present it's
 *authoritative*: an empty result means "no match", not "go scan everything."
-Only when no index is built does it scan sessions live (slow — that's what the
-index is for). When you see `(no index yet — scanning live; run cv index for
-instant search)`, build the index.
+When the index is missing or unreadable, it scans sessions live and says so on stderr.
+That fallback is case-insensitive substring matching over only the first 256 KiB of
+searchable content per session, in discovery order; it does not interpret Tantivy
+operators or rank by BM25. Build or repair the index with `cv index` for full-transcript
+search. Invalid indexed query syntax is an error, not a reason to scan live.
 
 > Older releases also kept a SQLite full-text index as a middle tier; it's
 > retired (tantivy is canonical). If a stale `index.sqlite` lingers in your
@@ -109,7 +110,7 @@ finds documents that *mean* what you asked, even with **zero word overlap**.
 > ranks that Lean session right at the top — because "formalizing proofs" and
 > "proving theorems in Lean" live near each other in meaning-space.
 
-Two front doors, both backed by the embeddings store:
+Select semantic ranking on the same command:
 
 ```sh
 cv search "formalizing proofs" --semantic   # semantic mode of the normal search

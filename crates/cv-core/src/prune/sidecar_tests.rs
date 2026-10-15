@@ -46,14 +46,20 @@ fn borrowed_sidecar_schema_and_staged_file_match_owned_oracle() -> anyhow::Resul
         });
     }
     std::fs::write(&path, b"previous artifact")?;
-    crate::distill::write_sidecar(&path, &elided)?;
+    let taken = crate::distill::write_sidecar(&path, &elided, crate::publish::Claim::New).unwrap_err();
+    assert!(taken.downcast_ref::<crate::publish::Exists>().is_some(), "{taken:#}");
+    assert_eq!(std::fs::read(&path)?, b"previous artifact");
+    crate::distill::write_sidecar(&path, &elided, crate::publish::Claim::Replace)?;
     assert_eq!(std::fs::read(&path)?, expected.as_bytes());
     let mut persisted: Vec<SidecarEntry> = Vec::new();
     for line in expected.lines() {
         persisted.push(serde_json::from_str(line)?);
     }
     assert_eq!(persisted.len(), elided.len());
-    assert!(crate::distill::write_sidecar(&world.base.join("missing/sidecar"), &elided).is_err());
+    assert!(
+        crate::distill::write_sidecar(&world.base.join("missing/sidecar"), &elided, crate::publish::Claim::New)
+            .is_err()
+    );
     assert_eq!(std::fs::read(&path)?, expected.as_bytes());
     Ok(())
 }
@@ -74,9 +80,11 @@ fn owned_sidecar_deserialization_shape_and_positional_order_remain_unchanged() -
     Ok(())
 }
 
+/// A replaced sidecar is a new file under the name: the old inode and its hard links keep the
+/// old bytes, a symlink at the name is replaced (its target untouched), permissions carry over.
 #[cfg(unix)]
 #[test]
-fn staged_sidecar_preserves_existing_inode_links_and_permissions() -> anyhow::Result<()> {
+fn replaced_sidecar_is_a_new_file_and_linked_targets_keep_their_bytes() -> anyhow::Result<()> {
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     let world = cv_testkit::World::new("distill-sidecar-links");
     let path = world.base.join("sidecar.jsonl");
@@ -93,12 +101,15 @@ fn staged_sidecar_preserves_existing_inode_links_and_permissions() -> anyhow::Re
         input: Value::Null,
         content: "new λ".into(),
     }];
-    crate::distill::write_sidecar(&link, &elided)?;
-    assert_eq!(std::fs::metadata(&path)?.ino(), inode);
+    let expected = format!("{}\n", owned_line("id", "Read", &Value::Null, "new λ"));
+    crate::distill::write_sidecar(&link, &elided, crate::publish::Claim::Replace)?;
+    assert!(!std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+    assert_eq!(std::fs::read(&link)?, expected.as_bytes());
+    assert_eq!(std::fs::read(&path)?, b"old");
+    crate::distill::write_sidecar(&path, &elided, crate::publish::Claim::Replace)?;
+    assert_ne!(std::fs::metadata(&path)?.ino(), inode);
     assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o640);
-    assert_eq!(
-        std::fs::read(&hard)?,
-        format!("{}\n", owned_line("id", "Read", &Value::Null, "new λ")).as_bytes()
-    );
+    assert_eq!(std::fs::read(&path)?, expected.as_bytes());
+    assert_eq!(std::fs::read(&hard)?, b"old");
     Ok(())
 }

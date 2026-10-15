@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn unavailable_index_and_missing_index_have_distinct_query_outcomes() {
-        let _world = cv_testkit::World::in_process("query-text-index-errors");
+        let _world = crate::test_world("query-text-index-errors");
         let query = SessionQuery::parse("NOT text:needle").unwrap();
         let absent = text_sets(&query).unwrap();
         assert!(!absent.contains("needle", "session"));
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn text_sets_batch_distinct_needles_without_losing_membership() {
-        let world = cv_testkit::World::in_process("query_text_sets_batch");
+        let world = crate::test_world("query_text_sets_batch");
         let refs: Vec<_> = [("first", "alpha"), ("second", "beta")]
             .into_iter()
             .map(|(id, content)| {

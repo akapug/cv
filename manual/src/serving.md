@@ -1,7 +1,7 @@
 # The server and the archive: `cv serve`, `cv watch`, `cv archive`
 
-Where most of [`cv`](cli.md) is your interactive map of *this* machine, three commands are the
-long-running side of it: the pieces that turn a pile of per-machine, per-harness session files into
+Where most of [`cv`](cli.md) is your interactive map of *this* machine, these commands
+turn a pile of per-machine, per-harness session files into
 a single durable **archive**, and serve the live state as JSON so [the app](viewing-and-sharing.md)'s dashboard and
 [the task inbox](tasks.md) can render it. 🔮 (They were the `cvd` binary until 0.15.0; its 0.15 shim
 was removed in 0.16.0.)
@@ -30,7 +30,7 @@ Inside it:
     └── <harness>/<id>.json       # the full parsed session, harness-agnostic IR
 ```
 
-`catalog.jsonl` is an append-only JSONL index — lightweight rows for listings and search — while the
+`catalog.jsonl` is an append-only JSONL index — lightweight rows for archive listings — while the
 full transcript for each session lives in `archive/<harness>/<id>.json` as clustervision's unified
 representation. Storing is **idempotent**: if a session's serialized bytes are byte-identical to
 what's already on disk, the write is skipped entirely. The catalog dedupes by `(harness, id)` with
@@ -111,9 +111,9 @@ Two things worth noting up front:
 
 - **It reads *live* sessions, not the archive.** `serve`'s session endpoints call into the same
   discovery/parse engine `cv` uses, so they reflect the current on-disk state of each harness in
-  real time. (The archive is what `sync`/`watch` build for durability and search; `serve` is the
-  live window.)
-- **Every response is JSON, and the API is locked to local callers.** Your transcripts can contain
+  real time. `sync`/`watch` build the archive for durability; `archive ls` lists its snapshots.
+  `cv index` and the session API do not automatically include archived snapshots.
+- **API responses use JSON, except the event feed and export downloads.** Access defaults to local callers. Your transcripts can contain
   secrets, so `serve` treats them that way:
   - **CORS is an allow-list, never `*`.** Only local origins (`http://localhost:*`,
     `http://127.0.0.1:*`, `[::1]`, your configured `--host`) and the desktop app's Tauri origins get
@@ -136,7 +136,8 @@ Two things worth noting up front:
 
 ### Routes
 
-All routes are `GET` and live under `/api`. Unknown paths return `404`; a bad `harness` name returns
+The read routes below are `GET` requests under `/api`; the inbox also has the `POST` routes
+described above and in [the task guide](tasks.md). Unknown paths return `404`; a bad `harness` name returns
 `400`. The routes are `cv_core::api::route_json` (plus `/api/search` and `/api/stats`); its rows are the
 functions `cv <cmd> --json` prints with, so the two doors cannot disagree.
 

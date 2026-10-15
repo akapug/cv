@@ -709,7 +709,7 @@ mod tests {
 
     #[test]
     fn selected_timeline_does_not_demand_excluded_call_arguments() {
-        let world = cv_testkit::World::in_process("timeline-selected-call");
+        let world = crate::test_world("timeline-selected-call");
         let path = world.base.join("arguments.json");
         std::fs::write(&path, b"{\"command\":\"ignored\"}").unwrap();
         let excluded = crate::Json::source(&path, 0, std::fs::metadata(&path).unwrap().len()).unwrap();
@@ -833,7 +833,7 @@ mod tests {
     }
     #[test]
     fn histogram_and_timeline_stop_on_unreadable_tool_arguments() {
-        let world = cv_testkit::World::in_process("tool_json_failures");
+        let world = crate::test_world("tool_json_failures");
         let path = world.home.join("input.json");
         let body = r#"{"file_path":"a.rs"}"#;
         std::fs::write(&path, body).unwrap();

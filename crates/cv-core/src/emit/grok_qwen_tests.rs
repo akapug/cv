@@ -198,7 +198,7 @@ fn normalized_qwen(bytes: &[u8]) -> Result<Vec<u8>> {
 fn entry(target: Harness, result: &EmitResult, owned: &Session, mode: ThinkingMode) -> Result<Value> {
     let mut files = serde_json::Map::new();
     // Grok's summary names the per-test `$HOME`; everything else is fixed by the fixture.
-    let home = std::env::var("HOME")?;
+    let home = crate::env::var("HOME")?;
     let mut digest = |name: &str, bytes: Vec<u8>| {
         let bytes = String::from_utf8(bytes).unwrap().replace(&home, "$HOME");
         files.insert(
@@ -235,20 +235,26 @@ fn compare(frozen: &mut Frozen, session: &Session, target: Harness, mode: Thinki
     let report = crate::digest::sha256_hex(&serde_json::to_vec(&report)?);
     assert_eq!(actual["fidelity"], report, "exact fidelity classification");
     let label = base.file_name().unwrap().to_string_lossy().into_owned();
-    assert!(frozen.0.insert(label, actual).is_none(), "unique label");
+    frozen.insert(label, actual);
     Ok(())
 }
 
-/// Emitted-output goldens per test under `tests/fixtures/emit-frozen/`, frozen from the
-/// pre-streaming emitters. `CV_REGEN_CORPUS=1` rewrites them; explain every diff in the commit.
-struct Frozen(std::collections::BTreeMap<String, Value>, &'static str);
+/// Output goldens per test under `tests/fixtures/emit-frozen/`, frozen from retired oracles
+/// (the pre-streaming emitters, distill's pre-sharing products). `CV_REGEN_CORPUS=1` rewrites
+/// them; explain every diff in the commit.
+pub(crate) struct Frozen(pub(crate) std::collections::BTreeMap<String, Value>, &'static str);
 
 impl Frozen {
-    fn new(name: &'static str) -> Self {
+    pub(crate) fn new(name: &'static str) -> Self {
         Self(Default::default(), name)
     }
 
-    fn check(self) -> Result<()> {
+    /// Record one labelled entry; labels are unique per golden.
+    pub(crate) fn insert(&mut self, label: impl Into<String>, entry: Value) {
+        assert!(self.0.insert(label.into(), entry).is_none(), "unique label");
+    }
+
+    pub(crate) fn check(self) -> Result<()> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/emit-frozen/{}.json", self.1));
         let rows: Vec<String> = (self.0.iter())
             .map(|(label, entry)| {
@@ -307,7 +313,7 @@ fn capture_bodies(session: &mut Session, base: &Path) -> Result<()> {
 
 #[test]
 fn checked_grok_qwen_frozen_all_modes_owned_and_captured() -> Result<()> {
-    let world = cv_testkit::World::in_process("checked-grok-qwen-wire");
+    let world = crate::test_world("checked-grok-qwen-wire");
     let mut frozen = Frozen::new("grok-qwen-fixture");
     for (target, source) in [
         (Harness::Grok, Harness::Grok),
@@ -340,7 +346,7 @@ fn checked_grok_qwen_frozen_all_modes_owned_and_captured() -> Result<()> {
 
 #[test]
 fn checked_grok_qwen_real_corpus_matches_frozen_all_modes() -> Result<()> {
-    let world = cv_testkit::World::in_process("checked-grok-qwen-corpus");
+    let world = crate::test_world("checked-grok-qwen-corpus");
     let mut frozen = Frozen::new("grok-qwen-corpus");
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
     for (target, version, adapter) in [
@@ -375,7 +381,7 @@ fn checked_grok_qwen_real_corpus_matches_frozen_all_modes() -> Result<()> {
 
 #[test]
 fn checked_grok_qwen_source_failure_preserves_every_destination() -> Result<()> {
-    let world = cv_testkit::World::in_process("checked-grok-qwen-failure");
+    let world = crate::test_world("checked-grok-qwen-failure");
     for target in [Harness::Grok, Harness::Qwen] {
         for mode in ThinkingMode::ALL {
             for variant in ["text", "thinking", "argument", "omitted"] {
@@ -457,7 +463,7 @@ fn checked_grok_qwen_source_failure_preserves_every_destination() -> Result<()> 
 
 #[test]
 fn checked_grok_qwen_complete_selected_producer_matches_owned() -> Result<()> {
-    let world = cv_testkit::World::in_process("grok-qwen-selected-complete");
+    let world = crate::test_world("grok-qwen-selected-complete");
     let mut frozen = Frozen::new("grok-qwen-selected");
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
     for (target, adapter) in [
@@ -558,8 +564,8 @@ fn checked_grok_qwen_complete_selected_producer_matches_owned() -> Result<()> {
             )?;
         }
         let wire = adapter.resume_source(&reference);
-        let mut file = std::fs::OpenOptions::new().append(true).open(&wire)?;
-        file.write_all(b"\nchanged source\n")?;
+        // Truncation, not growth: an append-only log may grow under a selected source.
+        std::fs::write(&wire, b"")?;
         let absent = world.base.join(format!("changed-{target}"));
         assert!(emit(&selected, target, &absent, &EmitOptions::default()).is_err());
         assert!(!absent.exists());

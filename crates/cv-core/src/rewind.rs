@@ -652,13 +652,7 @@ fn rewind_session_after_scan(
         }),
         foreign: Vec::new(),
     };
-    crate::harness::claude::stream_reader(
-        &r.id,
-        BufReader::new(file.try_clone()?.take(size)),
-        Some(r.path.clone()),
-        &ParseOptions::lazy_offsets(),
-        &mut scan,
-    );
+    crate::harness::claude::stream_prefix(r, size, &ParseOptions::lazy_offsets(), &mut scan)?;
     if let Some(error) = scan.take_error() {
         return Err(error);
     }
@@ -1157,7 +1151,7 @@ mod json_read_tests {
 
     #[test]
     fn commit_evidence_scans_guarded_source_text_without_an_implicit_path() {
-        let world = cv_testkit::World::in_process("rewind-guarded-text");
+        let world = crate::test_world("rewind-guarded-text");
         let path = world.home.join("source.json");
         let sidecar = world.home.join("meta.json");
         let body = format!("{}[main ABCDEF123] done", "λ\n".repeat(30_000));
@@ -1195,7 +1189,7 @@ mod json_read_tests {
 
     #[test]
     fn commit_evidence_reports_unavailable_lazy_results() {
-        let world = cv_testkit::World::in_process("rewind_text_failure");
+        let world = crate::test_world("rewind_text_failure");
         let path = world.home.join("absent-output");
         let mut sink = CommitEvidenceSink::new(vec!["abcdef1".into()], None);
         sink.git_calls
@@ -1221,7 +1215,7 @@ mod json_read_tests {
 
     #[test]
     fn commit_evidence_does_not_ignore_unreadable_command_arguments() {
-        let world = cv_testkit::World::in_process("rewind_json_failure");
+        let world = crate::test_world("rewind_json_failure");
         let path = world.home.join("input.json");
         let body = r#"{"command":"git commit -m test"}"#;
         std::fs::write(&path, body).unwrap();

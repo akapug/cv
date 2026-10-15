@@ -459,7 +459,7 @@ fn write_replayed_view(
                             .map(|v| v.resolve())
                             .transpose()?
                             .is_some_and(|state| {
-                                super::super::find_signature(Some(&state)).is_some()
+                                super::super::record::find_signature(Some(&state)).is_some()
                                     || state.get("signature").and_then(Value::as_str).is_some()
                             });
                         if text_present || signature {
@@ -530,7 +530,14 @@ fn owned_replay<'a>(raw: &'a Value, current: &[Message], model: Option<&String>)
     owned_replay_data(id, ty, raw, current, model).map(|count| (ty, count))
 }
 fn owned_replay_data(id: &str, ty: &str, data: &Value, current: &[Message], model: Option<&String>) -> Option<usize> {
-    let mut original = super::super::v2::build(id, ty, data, &crate::stream::ParseOptions::complete()).ok()?;
+    let mut original = super::super::v2::build(
+        id,
+        ty,
+        crate::json::JsonView::owned(data),
+        &crate::stream::ParseOptions::complete(),
+        super::super::record::Ctx::Owned,
+    )
+    .ok()??;
     super::super::v2::tag_complete(&mut original, id, ty);
     let mut model = model.cloned();
     for message in &mut original {

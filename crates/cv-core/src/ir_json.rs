@@ -756,7 +756,7 @@ mod output_freshness_tests {
     use super::*;
     #[test]
     fn earlier_source_mutation_during_trailing_metadata_rejects_ir_json() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("ir-json-final-source-check");
+        let world = crate::test_world("ir-json-final-source-check");
         let path = world.base.join("body.json");
         let raw = serde_json::to_vec(&"source body ".repeat(10000))?;
         std::fs::write(&path, &raw)?;

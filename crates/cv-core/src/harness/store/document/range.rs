@@ -1,6 +1,7 @@
 //! Positioned, bounded input windows for source-backed JSON. Offsets count consumed bytes, never
 //! underlying reads or serde lookahead. The same structural scanner works on bytes and files.
 
+use super::super::bytes::read_at;
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{self, BufRead, Read};
@@ -69,11 +70,6 @@ impl RangeSource {
         source.check_identity()?;
         Ok(source)
     }
-    /// File-backed positioned sources expose their read-only descriptor without reopening it.
-    pub(crate) fn file(&self) -> Option<&File> {
-        self.file.as_ref()
-    }
-
     pub(crate) fn decoded(
         captured: crate::json::JsonSource,
         bytes: &std::sync::Arc<crate::harness::store::bytes::ByteSource>,
@@ -94,7 +90,6 @@ impl RangeSource {
         source.check_identity()?;
         Ok(source)
     }
-    #[cfg(not(feature = "mmap"))]
     pub(crate) fn matches_original(&self, captured: &crate::json::JsonSource) -> bool {
         self.decoded_len.is_none() && self.captured.as_ref() == Some(captured)
     }
@@ -361,28 +356,6 @@ impl Read for Cursor<'_> {
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_at(buf, offset)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        file.seek_read(buf, offset)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        use std::io::{Seek, SeekFrom};
-        // Files are unavailable on wasm32-unknown-unknown. Keep its build portable without
-        // introducing OS-specific APIs; native supported platforms use independent positions.
-        let mut cloned = file.try_clone()?;
-        cloned.seek(SeekFrom::Start(offset))?;
-        cloned.read(buf)
-    }
-}
-
 /// A grammar-only view: quoted tokens are independently validated in bounded windows, then
 /// represented by an empty string. The original source and all consumer values remain intact.
 /// Keeping punctuation, numbers and literals lets serde retain authority over JSON grammar.
@@ -441,9 +414,9 @@ impl Read for SyntaxReader<'_> {
                         len: string.len - 2,
                     })?;
                     let valid = if self.strict_strings {
-                        crate::lazy::validate_value_json_body(&mut body).is_ok()
+                        super::super::json::validate_body(&mut body, true).is_ok()
                     } else {
-                        crate::lazy::validate_json_body_syntax(&mut body).is_ok()
+                        super::super::json::validate_body(&mut body, false).is_ok()
                     };
                     if let Some(kind) = body.read_error {
                         return Err(io::Error::new(kind, "reading JSON string syntax"));
@@ -468,15 +441,6 @@ impl Read for SyntaxReader<'_> {
 }
 
 impl RangeSource {
-    /// Validate a physical byte range without JSON parsing. Line readers can preserve their
-    /// stop-on-invalid-UTF-8 policy while separately skipping malformed JSON records.
-    #[cfg(not(feature = "mmap"))]
-    pub fn valid_utf8(&self, range: Range) -> Result<bool> {
-        self.check_identity()?;
-        let result = super::super::jsonl::ranges::valid_utf8(&mut self.cursor(range)?);
-        self.check_identity()?;
-        Ok(result?)
-    }
     /// Validate grammar and whole-range UTF-8 once. Export archives use this boundary before
     /// validating individual conversations with Value's independently reset recursion budget.
     pub fn syntax(&self, range: Range) -> Result<bool> {
@@ -533,7 +497,7 @@ impl RangeSource {
                             len: string.len - 2,
                         };
                         let mut body = self.cursor(body)?;
-                        let valid = crate::lazy::validate_value_json_body(&mut body).is_ok();
+                        let valid = super::super::json::validate_body(&mut body, true).is_ok();
                         if let Some(kind) = body.read_error {
                             return Err(io::Error::new(kind, "reading JSON string").into());
                         }
@@ -601,7 +565,10 @@ impl RangeSource {
             len: string.len - 2,
         };
         let mut cursor = self.cursor(body)?;
-        let decoded = crate::lazy::decode_json_body(&mut cursor, &mut visit);
+        let decoded = super::super::json::decode_body(&mut cursor, &mut |text| {
+            visit(text);
+            true
+        });
         if let Some(kind) = cursor.read_error {
             return Err(io::Error::new(kind, "reading JSON string").into());
         }
@@ -648,7 +615,7 @@ impl RangeSource {
         };
         let mut cursor = self.cursor(body)?;
         let mut callback_error = None;
-        let decoded = crate::lazy::decode_validated_json_body_until(&mut cursor, &mut |part| {
+        let decoded = super::super::json::decode_body(&mut cursor, &mut |part| {
             callback_error = visit(part).err();
             callback_error.is_none()
         });
@@ -658,7 +625,9 @@ impl RangeSource {
         if let Some(error) = callback_error {
             return Err(error);
         }
-        decoded.map_err(|_| anyhow::anyhow!("validated JSON string failed decoding"))
+        decoded
+            .map(|_| ())
+            .map_err(|_| anyhow::anyhow!("validated JSON string failed decoding"))
     }
     pub fn key_matches(&self, string: Range, key: &str) -> Result<bool> {
         // An escaped ASCII byte needs at most six encoded bytes; surrogate pairs encode one
@@ -997,7 +966,12 @@ mod tests {
             panic!("large string must remain a span")
         };
         assert!(span.escaped);
-        assert_eq!(crate::lazy::Resolver::new(Some(path.clone())).resolve(&span), body);
+        assert_eq!(
+            crate::lazy::Resolver::new(Some(path.clone()))
+                .try_resolve(&span)
+                .unwrap(),
+            body
+        );
         std::fs::remove_file(path).unwrap();
     }
     #[test]

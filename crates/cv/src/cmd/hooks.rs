@@ -176,7 +176,7 @@ const SPECS: &[Spec] = &[
 
 /// Claude Code's config dir: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
 fn claude_config_dir() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
+    cv_core::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| crate::util::dirs_home().map(|h| h.join(".claude")))
@@ -212,7 +212,15 @@ fn write_settings(path: &Path, v: &Value) -> Result<()> {
     }
     let mut text = serde_json::to_string_pretty(v)?;
     text.push('\n');
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+    publish_hook_file(path, &text)
+}
+
+fn publish_hook_file(path: &Path, text: &str) -> Result<()> {
+    // Preserve dotfile symlinks, but replace the target inode so existing readers keep
+    // complete old bytes and a failed write cannot truncate the user's settings.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    cv_core::publish::publish_reader(&target, "hooks", text.as_bytes(), cv_core::publish::Claim::Replace)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Shell-quote a path for a `command` string (shell form): bare when it is plain, single-quoted otherwise.
@@ -362,7 +370,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
                 if let Some(dir) = skill_path.parent() {
                     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
                 }
-                std::fs::write(&skill_path, SKILL).with_context(|| format!("writing {}", skill_path.display()))?;
+                publish_hook_file(&skill_path, SKILL)?;
                 changed.push(format!("skill → {}", home_rel(&skill_path)));
             }
             if changed.is_empty() {
@@ -505,7 +513,7 @@ pub(crate) fn status() -> (Vec<(Scope, usize, PathBuf)>, Policy) {
     }
     let env = POLICY_ENV
         .iter()
-        .map(|k| (*k, std::env::var(k).ok().or_else(|| env_block.get(*k).cloned())))
+        .map(|k| (*k, cv_core::env::var(k).ok().or_else(|| env_block.get(*k).cloned())))
         .collect();
     (
         scopes,
@@ -979,6 +987,34 @@ fn hook_edit(input: &Input) -> Result<Option<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_install_keeps_existing_readers_on_the_previous_files() {
+        use std::io::Read;
+        let _world = crate::test_world("hooks-atomic");
+        let (settings, skill) = paths(Scope::User).unwrap();
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "{}").unwrap();
+        std::fs::write(&skill, "previous skill").unwrap();
+        let mut previous_settings = std::fs::File::open(&settings).unwrap();
+        let mut previous_skill = std::fs::File::open(&skill).unwrap();
+        cmd_hooks(HooksCmd::Install {
+            harness: "claude".into(),
+            scope: Scope::User,
+        })
+        .unwrap();
+        let mut held = String::new();
+        previous_settings.read_to_string(&mut held).unwrap();
+        assert_eq!(held, "{}");
+        held.clear();
+        previous_skill.read_to_string(&mut held).unwrap();
+        assert_eq!(held, "previous skill");
+        assert_eq!(
+            read_settings(&settings).unwrap(),
+            with_ours(json!({}), &this_exe().unwrap())
+        );
+        assert_eq!(std::fs::read_to_string(skill).unwrap(), SKILL);
+    }
 
     #[test]
     fn edit_conflicts_distinguish_parent_sibling_and_reused_agent_identities() {

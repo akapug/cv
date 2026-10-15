@@ -58,8 +58,7 @@ OpenSession and account exports scan only the explicit root, excluding configure
 | `discover` | Explicit-root discovery; requires scratch `CLUSTERVISION_HOME` |
 | `sessions` | Production catalog listing/scoped refresh; requires scratch catalog and synthetic `HOME`/XDG roots |
 | `chunks` | Direct span decoding; `--span OFFSET:LENGTH [--escaped] --chunk-bytes N` |
-| `checked-chunks` | Same chunk callback work, using fallible source reads; same span flags |
-| `prefix` / `checked-prefix` | Retain a text prefix under `--prefix-bytes N` raw encoded bytes, using legacy / fallible reads; same span flags |
+| `prefix` | Retain a text prefix under `--prefix-bytes N` raw encoded bytes; same span flags |
 | `resolve` | Direct span materialization into a retained owned string; `--span OFFSET:LENGTH [--escaped]` |
 | `resolved-len` | Direct decoded byte counting without owning text; same span flags |
 
@@ -302,12 +301,12 @@ the queue charge alone is capped at 64 MiB. A compact document can reach about 1
 not a 4 MiB document limit or a total RSS/native heap guarantee. See the search example's
 `sweep_probe.md` for the exact isolated command and optional unbounded negative control.
 
-`checked-chunks` and `checked-prefix` report demanded source failures. The prefix budget counts
-raw encoded bytes, with UTF-8/escape boundary handling; it is distinct from `json-prefix`'s
-canonical output budget. Both prefix operations retain the returned string through the heap
-snapshot and hash it only with `--hash-output`. The checked operations guard the whole supplied
-span even when the prefix budget is zero. They do not prove historical source identity from an
-unstamped `Span`; the resolver captures identity at first demand.
+The text span operations report demanded source failures. The prefix budget counts raw encoded
+bytes, with UTF-8/escape boundary handling; it is distinct from `json-prefix`'s canonical output
+budget. `prefix` retains the returned string through the heap snapshot and hashes it only with
+`--hash-output`. It guards the whole supplied span even when the prefix budget is zero. None
+proves historical source identity from an unstamped `Span`; the resolver captures identity at
+first demand.
 
 First-use metadata-cache allocation control uses `tools/profiling/discovery-cache.py` with two
 `store_probe` binaries built with `--features probe-heap`. It creates a new synthetic home and

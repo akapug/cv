@@ -113,7 +113,7 @@ pub(crate) fn data_schema_json() -> Value {
             },
         },
         "prompt_row": {
-            "description": "one row of `prompts --json`: what the person typed, or an AskUserQuestion answer",
+            "description": "one row of `show --kind prompt,answer --json`: what the person typed, or an AskUserQuestion answer",
             "keys": ["index", "timestamp", "kind", "text"],
             "kind": ["prompt", "answer"],
         },
@@ -223,6 +223,12 @@ fn arg_json(a: &clap::Arg) -> Value {
         "required": a.is_required_set(),
     });
     let obj = v.as_object_mut().expect("json object");
+    if let Some(long) = a.get_long() {
+        obj.insert("long".into(), json!(long));
+    }
+    if matches!(a.get_action(), clap::ArgAction::Append) || a.get_num_args().is_some_and(|n| n.max_values() > 1) {
+        obj.insert("multiple".into(), json!(true));
+    }
     if takes_values {
         let possible: Vec<String> = a
             .get_possible_values()
@@ -291,6 +297,27 @@ mod tests {
         // The default-by-role table the contract fixes.
         assert_eq!(MessageKind::for_role(Role::User), MessageKind::Prompt);
         assert_eq!(MessageKind::for_role(Role::System), MessageKind::Notice);
+    }
+
+    #[test]
+    fn prompt_row_reference_names_a_live_command() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let schema = data_schema_json();
+                let description = schema["prompt_row"]["description"].as_str().unwrap();
+                let command = description.split('`').nth(1).unwrap();
+                let mut tree = crate::build_cli();
+                tree.build();
+                let mut words = command.split_whitespace();
+                let name = words.next().unwrap();
+                assert!(tree.get_subcommands().any(|c| c.get_name() == name && !c.is_hide_set()));
+                tree.try_get_matches_from(["cv", name, "session-id"].into_iter().chain(words))
+                    .unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// `docs/INTERFACE-V2.md` §1 (the command groups) and §6 (the MCP roster) are generated from

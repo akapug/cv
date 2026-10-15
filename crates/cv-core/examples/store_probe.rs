@@ -82,7 +82,7 @@ fn args() -> Result<Args> {
             "--help" | "-h" => bail!(
                 "store_probe OP HARNESS ID PATH [--root DIR] [--mode lazy|lazy-extra|facts|bulk|full|complete] \
                  [--materialize] [--sqlite-heap] [--hash-output] [--hash-detail] [--raw-order] [--warm-discover] [--query EXPR] [--resume-from CHECKPOINT] [--span OFFSET:LENGTH --escaped --chunk-bytes N --prefix-bytes N]\n\
-                 OP: baseline|discard|count|checkpoint|resume|collect|window|affordances|affordance-read|doctor|token-stats|dataset|dataset-collect|tools|tools-collect|query|query-collect|hash|discover|sessions|events|events-collected|chunks|checked-chunks|prefix|checked-prefix|resolve|resolved-len|json-len|json-write|json-prefix\n\
+                 OP: baseline|discard|count|checkpoint|resume|collect|window|affordances|affordance-read|doctor|token-stats|dataset|dataset-collect|tools|tools-collect|query|query-collect|hash|discover|sessions|events|events-collected|chunks|prefix|resolve|resolved-len|json-len|json-write|json-prefix\n\
                  HARNESS: claude|codex|gemini|openclaw|continue|lmstudio|cline|kimi|kimi-code|grok|qwen|devin|zed|opensession|chatgpt-export|claude-export; use scratch CLUSTERVISION_HOME"
             ),
             s if s.starts_with('-') => bail!("unknown option {s}"),
@@ -336,9 +336,12 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
                 }
             }
             let mut sink = CheckpointSink::default();
-            let done =
-                cv_core::stream::stream_resumable(adapter, r, &opts, &mut sink, a.chunk_bytes as u64, from.as_ref())?
-                    .context("adapter declined this fixture checkpoint")?;
+            let pass = cv_core::stream::Pass {
+                from: from.as_ref(),
+                every: Some(a.chunk_bytes as u64),
+                ..Default::default()
+            };
+            let done = cv_core::stream::stream_counted(adapter, r, &opts, &mut sink, pass)?;
             out.messages = sink.messages;
             let counted = done.counted.context("whole diagnostic pass must count")?;
             out.detail = json!({"checkpoint":done.last,"counts":counted.counts,"turns":counted.turns,
@@ -602,7 +605,7 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
                 out.detail = json!({ "canonical_bytes": writer.0 });
             }
         }
-        "chunks" | "checked-chunks" | "prefix" | "checked-prefix" | "resolve" | "resolved-len" => {
+        "chunks" | "prefix" | "resolve" | "resolved-len" => {
             let (offset, len) = a.span.context("text span operations require --span OFFSET:LENGTH")?;
             if offset
                 .checked_add(len)
@@ -618,16 +621,11 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
             };
             let resolver = cv_core::Resolver::new(Some(r.path.clone()));
             if a.operation == "resolved-len" {
-                out.detail = json!({ "decoded_bytes": resolver.resolved_len(&span) });
+                out.detail = json!({ "decoded_bytes": resolver.try_resolved_len(&span)? });
                 return Ok(out);
             }
-            if matches!(a.operation.as_str(), "prefix" | "checked-prefix") {
-                let text = if a.operation == "checked-prefix" {
-                    resolver.try_resolve_prefix(&span, a.prefix_bytes as u64)?
-                } else {
-                    resolver.resolve_prefix(&span, a.prefix_bytes as u64)
-                }
-                .into_owned();
+            if a.operation == "prefix" {
+                let text = resolver.try_resolve_prefix(&span, a.prefix_bytes as u64)?.into_owned();
                 out.detail = json!({ "prefix_bytes": text.len(), "raw_budget_bytes": a.prefix_bytes });
                 if a.hash_output {
                     let mut digest = DigestWriter::default();
@@ -638,7 +636,7 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
                 return Ok(out);
             }
             if a.operation == "resolve" {
-                let text = resolver.resolve(&span).into_owned();
+                let text = resolver.try_resolve(&span)?.into_owned();
                 out.detail = json!({ "decoded_bytes": text.len() });
                 if a.hash_output {
                     let mut digest = DigestWriter::default();
@@ -655,14 +653,10 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
                 max = max.max(text.len());
                 std::hint::black_box(text);
             };
-            if a.operation == "checked-chunks" {
-                resolver.try_for_each_chunk(&span, a.chunk_bytes, |text| {
-                    consume(text);
-                    Ok(())
-                })?;
-            } else {
-                resolver.for_each_chunk(&span, a.chunk_bytes, consume);
-            }
+            resolver.try_for_each_chunk(&span, a.chunk_bytes, |text| {
+                consume(text);
+                Ok(())
+            })?;
             out.detail = json!({ "chunks": chunks, "decoded_bytes": bytes, "largest_chunk_bytes": max });
         }
         op => bail!("unknown operation {op}"),
@@ -746,7 +740,7 @@ fn main() -> Result<()> {
                 "affordance-read" | "token-stats" => "production-defined",
                 "dataset-collect" => &a.mode,
                 "query" | "query-collect" | "tools" | "tools-collect" | "dataset" => "lazy",
-                "baseline" | "discover" | "sessions" | "chunks" | "checked-chunks" | "prefix" | "checked-prefix" | "resolve" | "resolved-len" | "json-len" | "json-write" | "json-prefix" => "not-applicable",
+                "baseline" | "discover" | "sessions" | "chunks" | "prefix" | "resolve" | "resolved-len" | "json-len" | "json-write" | "json-prefix" => "not-applicable",
                 _ => &a.mode,
             },
             "materialize": if a.operation == "affordance-read" { Value::Null }

@@ -166,7 +166,13 @@ impl Writer {
     pub(super) fn fail_after(&self, documents: usize) {
         *self.fail_after.lock().unwrap() = Some(documents);
     }
+    /// Close the writer and join the merge/GC work its commits started.
+    #[cfg(test)]
+    pub(super) fn wait_merging_threads(self) -> Result<()> {
+        self.inner.wait_merging_threads().map_err(Into::into)
+    }
 }
+
 impl Deref for Writer {
     type Target = IndexWriter<AdmittedDocument>;
     fn deref(&self) -> &Self::Target {

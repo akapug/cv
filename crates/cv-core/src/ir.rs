@@ -350,7 +350,7 @@ impl Session {
                         if !s.is_empty() {
                             s.push('\n');
                         }
-                        s.push_str(&text.resolve_prefix(&resolver, HEAD));
+                        s.push_str(&text.try_resolve_prefix(&resolver, HEAD).unwrap_or_default());
                     }
                 }
                 meaningful_prompt(&s)
@@ -758,13 +758,10 @@ impl Message {
                 Block::ToolResult { content, .. } => content,
                 _ => continue,
             };
-            if let crate::lazy::Text::Source(source) = slot {
-                if let Ok(owned) = source.try_resolve() {
-                    *slot = crate::lazy::Text::Inline(owned);
+            if !matches!(slot, crate::lazy::Text::Inline(_)) {
+                if let Ok(owned) = slot.try_resolve(resolver) {
+                    *slot = crate::lazy::Text::Inline(owned.into_owned());
                 }
-            } else if slot.is_span() {
-                let owned = slot.resolve(resolver).into_owned();
-                *slot = crate::lazy::Text::Inline(owned);
             }
         }
     }
@@ -1092,61 +1089,204 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// One image tile ≈ this many context tokens (image bytes are never inlined into the IR).
-pub const IMAGE_TOKENS: u64 = 1500;
-
-/// Byte-estimated tokens for `len` bytes at `bytes_per_token` (ceiling). The one arithmetic behind
-/// every estimate cv prints; callers keep their own constant (Claude's tokenizer runs ≈ 3.3–3.7
-/// bytes/token on prose; `distill` uses a deliberately pessimistic 2.4 for its budget).
-pub fn est_tokens_bytes(len: usize, bytes_per_token: f64) -> u64 {
-    (len as f64 / bytes_per_token).ceil() as u64
+/// What a run of bytes is, for [`est_tokens_bytes`]: content kinds tokenize at different rates.
+///
+/// Calibrated 2026-10-14 against the API's `count_tokens` on the exact requests Claude Code
+/// 2.1.299 built when resuming 14 sessions (claude-opus-4-6 through claude-opus-5-5, tool-heavy and
+/// prose-heavy, each unpruned and pruned): the per-kind token cost was isolated by blanking one
+/// kind at a time. Measured bytes/token on the post-4.6 tokenizer: prose 2.4–2.7, tool-call input
+/// 1.8–2.5, tool-result text 1.9–2.8, thinking signatures 3.6–5.8, prune markers 1.6. Each ratio
+/// here sits at or below the measured middle, so estimates err high; the claude-opus-4-6 tokenizer
+/// is about 1.35× sparser ([`tokenizer_scale`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    /// Prose: user and assistant text, thinking plaintext.
+    Text,
+    /// A tool call's input JSON (compact serialization).
+    ToolInput,
+    /// A tool result's text.
+    ToolResult,
+    /// Opaque reasoning: thinking signatures, redacted/encrypted payloads.
+    Signature,
+    /// `cv prune` markers (`[PRUNED id=…]`): ids and hex tokenize densely.
+    Marker,
 }
 
-/// Stored payload token equivalents for one block, byte-estimated at `bytes_per_token`.
-/// A ceiling per field, summed: text as-is; thinking plaintext PLUS signature/encrypted bytes;
-/// tool-call input JSON; tool-result content; a fixed [`IMAGE_TOKENS`] image estimate; no cost for
-/// a file reference. Opaque signatures/encrypted blobs are payload-size proxies, not measured
-/// provider reasoning tokens or validated resume costs. Shared by doctor and distill estimates;
-/// provider-reported usage statistics use [`Usage`] instead.
-pub fn est_tokens(block: &Block, bytes_per_token: f64) -> anyhow::Result<u64> {
-    est_tokens_with(block, bytes_per_token, |text| Ok(text.len()))
+impl TokenKind {
+    pub const fn bytes_per_token(self) -> f64 {
+        match self {
+            TokenKind::Text => 2.5,
+            TokenKind::ToolInput => 2.1,
+            TokenKind::ToolResult => 2.2,
+            TokenKind::Signature => 3.6,
+            TokenKind::Marker => 1.5,
+        }
+    }
+}
+
+/// One image ≈ this many context tokens (image bytes are never inlined into the IR). Measured
+/// images cost 1.4k–4.2k tokens; this sits high.
+pub const IMAGE_TOKENS: u64 = 3000;
+
+/// Structure per content block (type tags, tool ids and names): 8–25 tokens measured.
+pub const BLOCK_TOKENS: u64 = 12;
+
+/// The marker `cv prune` leaves where a payload was; [`est_str_tokens`] prices it as
+/// [`TokenKind::Marker`].
+const MARKER_PREFIX: &str = crate::prune::MARKER_PREFIX;
+
+/// Byte-estimated tokens for `len` bytes of `kind` (ceiling). The one arithmetic behind every
+/// token estimate cv prints.
+pub fn est_tokens_bytes(len: usize, kind: TokenKind) -> u64 {
+    (len as f64 / kind.bytes_per_token()).ceil() as u64
+}
+
+/// [`est_tokens_bytes`] for a string, pricing any embedded prune markers as [`TokenKind::Marker`].
+pub fn est_str_tokens(text: &str, kind: TokenKind) -> u64 {
+    let mut tokens = StrTokens::new(kind);
+    tokens.push(text.as_bytes());
+    tokens.tokens()
+}
+
+/// Streaming [`est_str_tokens`] over bytes in any chunking; also a [`std::io::Write`] sink, so a
+/// serializer can be priced without materializing its output.
+pub struct StrTokens {
+    kind: TokenKind,
+    plain: usize,
+    marker: usize,
+    in_marker: bool,
+    carry: Vec<u8>,
+}
+
+impl StrTokens {
+    pub fn new(kind: TokenKind) -> Self {
+        StrTokens {
+            kind,
+            plain: 0,
+            marker: 0,
+            in_marker: false,
+            carry: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        let prefix = MARKER_PREFIX.as_bytes();
+        let joined;
+        let mut rest = if self.carry.is_empty() {
+            bytes
+        } else {
+            let mut carry = std::mem::take(&mut self.carry);
+            carry.extend_from_slice(bytes);
+            joined = carry;
+            &joined[..]
+        };
+        loop {
+            if self.in_marker {
+                match memchr::memchr(b']', rest) {
+                    Some(end) => {
+                        self.marker += end + 1;
+                        rest = &rest[end + 1..];
+                        self.in_marker = false;
+                    }
+                    None => {
+                        self.marker += rest.len();
+                        return;
+                    }
+                }
+            } else if let Some(at) = memchr::memmem::find(rest, prefix) {
+                self.plain += at;
+                rest = &rest[at..];
+                self.in_marker = true;
+            } else {
+                // A prefix may straddle the next chunk: hold back its longest possible start.
+                let keep = (prefix.len() - 1).min(rest.len());
+                self.plain += rest.len() - keep;
+                self.carry = rest[rest.len() - keep..].to_vec();
+                return;
+            }
+        }
+    }
+
+    pub fn tokens(&self) -> u64 {
+        est_tokens_bytes(self.plain + self.carry.len(), self.kind) + est_tokens_bytes(self.marker, TokenKind::Marker)
+    }
+}
+
+impl std::io::Write for StrTokens {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.push(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// How much sparser a model's tokenizer is than the one [`TokenKind`] is calibrated for:
+/// 1.35 for the Claude 4.6-and-earlier tokenizer (claude-opus-4-6, -sonnet-4-6, -opus-4-5,
+/// -haiku-4-5, -sonnet-4-5 measured 3.77 bytes/token on prose where 4.7 and later measured 2.74),
+/// 1 otherwise, including unknown models.
+pub fn tokenizer_scale(model: &str) -> f64 {
+    let Some(rest) = model.strip_prefix("claude-") else {
+        return 1.0;
+    };
+    let mut parts = rest.split('-').skip_while(|p| p.parse::<u32>().is_err() || p.len() > 2);
+    let (Some(major), minor) = (parts.next().and_then(|p| p.parse::<u32>().ok()), parts.next()) else {
+        return 1.0;
+    };
+    // A dated id (`claude-opus-4-20250514`) or a missing minor is the .0 release.
+    let minor = minor
+        .filter(|m| m.len() <= 2)
+        .and_then(|m| m.parse::<u32>().ok())
+        .unwrap_or(0);
+    if major < 4 || (major == 4 && minor <= 6) {
+        1.35
+    } else {
+        1.0
+    }
+}
+
+/// Estimated context tokens for one block: [`BLOCK_TOKENS`] plus each field at its kind's rate —
+/// text as prose; thinking plaintext as prose plus signature/encrypted bytes as
+/// [`TokenKind::Signature`]; tool-call input JSON; tool-result content; [`IMAGE_TOKENS`] per image;
+/// nothing for a file reference. Shared by doctor and distill; provider-reported usage statistics
+/// use [`Usage`] instead.
+pub fn est_tokens(block: &Block) -> anyhow::Result<u64> {
+    est_tokens_with(block, |text| Ok(text.len()))
 }
 
 /// The same estimate as [`est_tokens`] after materializing the block, without retaining its
 /// decoded text. Spans are read in bounded chunks; malformed fields retain the resolver's raw
 /// fallback. Unavailable sources and out-of-bounds spans return errors instead of zero tokens.
 /// This is useful for byte-counting consumers such as the compaction doctor.
-pub fn est_tokens_resolved(
-    block: &Block,
-    bytes_per_token: f64,
-    resolver: &crate::lazy::Resolver,
-) -> anyhow::Result<u64> {
-    est_tokens_with(block, bytes_per_token, |text| text.try_decoded_len(resolver))
+pub fn est_tokens_resolved(block: &Block, resolver: &crate::lazy::Resolver) -> anyhow::Result<u64> {
+    est_tokens_with(block, |text| text.try_decoded_len(resolver))
 }
 
 fn est_tokens_with(
     block: &Block,
-    bytes_per_token: f64,
     text_len: impl Fn(&crate::lazy::Text) -> anyhow::Result<usize>,
 ) -> anyhow::Result<u64> {
-    let b = |len: usize| est_tokens_bytes(len, bytes_per_token);
-    Ok(match block {
-        Block::Text { text } => b(text_len(text)?),
-        Block::Thinking {
-            text,
-            signature,
-            encrypted,
-            ..
-        } => {
-            b(text_len(text)?)
-                + b(signature.as_deref().map_or(0, str::len))
-                + b(encrypted.as_deref().map_or(0, str::len))
-        }
-        Block::ToolUse { input, .. } => (input.canonical_len()? as f64 / bytes_per_token).ceil() as u64,
-        Block::ToolResult { content, .. } => b(text_len(content)?),
-        Block::Image { .. } => IMAGE_TOKENS,
-        Block::File { .. } => 0,
-    })
+    use TokenKind::*;
+    let b = est_tokens_bytes;
+    Ok(BLOCK_TOKENS
+        + match block {
+            Block::Text { text } => b(text_len(text)?, Text),
+            Block::Thinking {
+                text,
+                signature,
+                encrypted,
+                ..
+            } => {
+                b(text_len(text)?, Text)
+                    + b(signature.as_deref().map_or(0, str::len), Signature)
+                    + b(encrypted.as_deref().map_or(0, str::len), Signature)
+            }
+            Block::ToolUse { input, .. } => b(usize::try_from(input.canonical_len()?)?, ToolInput),
+            Block::ToolResult { content, .. } => b(text_len(content)?, ToolResult),
+            Block::Image { .. } => IMAGE_TOKENS,
+            Block::File { .. } => 0,
+        })
 }
 
 /// Whether a tool is an MCP server's: Claude Code names those `mcp__<server>__<tool>`. Decided by
@@ -1205,7 +1345,7 @@ pub fn human_bytes(n: u64) -> String {
 /// `~/dev/x` for a path under `$HOME`, the full path otherwise. `$HOME` (not `dirs::home_dir`) so a
 /// test or a daemon running under a redirected home agrees with the CLI.
 pub fn home_rel(p: &std::path::Path) -> String {
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+    if let Some(home) = crate::env::var_os("HOME").map(std::path::PathBuf::from) {
         if let Ok(rest) = p.strip_prefix(&home) {
             return format!("~/{}", rest.display());
         }
@@ -1245,7 +1385,7 @@ mod tests {
 
     #[test]
     fn full_materialization_rejects_missing_span_sources_without_erasing_text() {
-        let world = cv_testkit::World::in_process("materialize-span-failure");
+        let world = crate::test_world("materialize-span-failure");
         let path = world.base.join("gone.txt");
         let span = crate::Text::Span(crate::Span {
             source: None,
@@ -1272,7 +1412,7 @@ mod tests {
 
     #[test]
     fn checked_text_materialization_preserves_lazy_arguments_and_reports_failed_text() {
-        let world = cv_testkit::World::in_process("checked-message-text");
+        let world = crate::test_world("checked-message-text");
         let path = world.base.join("text.json");
         let body = "exact🌙\n\"".repeat(1024);
         let wire = serde_json::to_vec(&body).unwrap();
@@ -1364,13 +1504,11 @@ mod tests {
                     let mut message = Message::new(Role::Assistant);
                     message.content.push(block.clone());
                     message.materialize(&resolver).unwrap();
-                    for ratio in [2.4, 3.5, 4.0] {
-                        assert_eq!(
-                            est_tokens_resolved(&block, ratio, &resolver).unwrap(),
-                            est_tokens(&message.content[0], ratio).unwrap(),
-                            "escaped={escaped}, ratio={ratio}"
-                        );
-                    }
+                    assert_eq!(
+                        est_tokens_resolved(&block, &resolver).unwrap(),
+                        est_tokens(&message.content[0]).unwrap(),
+                        "escaped={escaped}"
+                    );
                 }
             }
         }
@@ -1384,11 +1522,52 @@ mod tests {
                     escaped: true,
                 }),
             };
-            let error = est_tokens_resolved(&block, 3.5, &resolver).unwrap_err();
+            let error = est_tokens_resolved(&block, &resolver).unwrap_err();
             assert!(error.to_string().contains("Text span is outside source"));
         }
         drop(resolver);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn markers_price_at_their_own_rate_across_any_chunking() {
+        let marker = format!("{MARKER_PREFIX}t1 tool=Read | text 9000B/12L | retrieve: cv cat s t1]");
+        let text = format!("{}{marker}{}", "a".repeat(250), "b".repeat(250));
+        let whole = est_str_tokens(&text, TokenKind::ToolResult);
+        assert_eq!(
+            whole,
+            est_tokens_bytes(500, TokenKind::ToolResult) + est_tokens_bytes(marker.len(), TokenKind::Marker)
+        );
+        for split in 0..text.len() {
+            let mut tokens = StrTokens::new(TokenKind::ToolResult);
+            tokens.push(&text.as_bytes()[..split]);
+            tokens.push(&text.as_bytes()[split..]);
+            assert_eq!(tokens.tokens(), whole, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn tokenizer_scale_separates_the_pre_4_7_tokenizer() {
+        for old in [
+            "claude-opus-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-20250514",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            assert_eq!(tokenizer_scale(old), 1.35, "{old}");
+        }
+        for new in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "<synthetic>",
+            "gpt-6",
+        ] {
+            assert_eq!(tokenizer_scale(new), 1.0, "{new}");
+        }
     }
 
     #[test]
@@ -1420,8 +1599,8 @@ mod tests {
             namespace: None,
         });
         assert_eq!(
-            est_tokens(&message.content[0], 3.5).unwrap(),
-            est_tokens_bytes(serde_json::to_vec(&value).unwrap().len(), 3.5)
+            est_tokens(&message.content[0]).unwrap(),
+            BLOCK_TOKENS + est_tokens_bytes(serde_json::to_vec(&value).unwrap().len(), TokenKind::ToolInput)
         );
         let mut text = "earlier\n".to_string();
         message.append_searchable(&mut text).unwrap();
@@ -1439,7 +1618,7 @@ mod tests {
         owned.materialize(&crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(serde_json::to_vec(&owned).unwrap(), wire);
         std::fs::remove_file(&path).unwrap();
-        assert!(est_tokens(&message.content[0], 3.5).is_err());
+        assert!(est_tokens(&message.content[0]).is_err());
         assert!(message.append_searchable(&mut String::new()).is_err());
         assert!(message.materialize(&crate::lazy::Resolver::new(None)).is_err());
         assert!(serde_json::to_vec(&message).is_err());

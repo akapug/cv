@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn streamed_facts_keep_boundary_metadata_and_requested_summary() {
-        let world = cv_testkit::World::in_process("compaction-facts-detect");
+        let world = crate::test_world("compaction-facts-detect");
         let path = world.base.join("session.jsonl");
         let body = "full summary🌙\n".repeat(8192);
         let lines = [
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn full_summaries_match_inline_span_and_source_without_truncation() {
-        let world = cv_testkit::World::in_process("compaction-checked-summary");
+        let world = crate::test_world("compaction-checked-summary");
         let path = world.base.join("summary.json");
         for body in [" \n\t".repeat(9000), "🌙\n\"\\".repeat(32768)] {
             let wire = serde_json::to_vec(&body).unwrap();
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn demanded_summary_failure_stops_and_rejects_partial_boundaries() {
-        let world = cv_testkit::World::in_process("compaction-summary-mutation");
+        let world = crate::test_world("compaction-summary-mutation");
         let path = world.base.join("original");
         std::fs::write(&path, "snapshot provenance").unwrap();
         let capture = crate::json::JsonSource::capture(&path).unwrap();

@@ -76,12 +76,14 @@ pub(crate) struct ScanContinuation {
 }
 
 struct Entry {
+    #[cfg(feature = "sqlite")]
     mtime_ns: u64,
     size: u64,
     payload: Payload,
     /// Private reducer state, independent of mutable published refs; decode only on append.
     continuation: Option<String>,
     /// Scanned this run and not yet written back to sqlite.
+    #[cfg(feature = "sqlite")]
     dirty: bool,
 }
 
@@ -94,23 +96,18 @@ struct Cache {
 /// Bump when discovery changes the interpretation of unchanged source bytes.
 #[cfg(feature = "sqlite")]
 pub(crate) const INTERPRETATION_VERSION: u32 = 4;
-#[derive(Default)]
-struct CacheStore {
-    // Retain the current catalog as before; other homes survive only while operations use them.
-    current: Option<(PathBuf, Arc<Cache>)>,
-    active: HashMap<PathBuf, std::sync::Weak<Cache>>,
-}
-static CACHE: OnceLock<RwLock<CacheStore>> = OnceLock::new();
+/// Every live cache by catalog. Each environment ([`crate::env`]) retains its current catalog's;
+/// other homes survive only while operations use them.
+static CACHE: OnceLock<RwLock<HashMap<PathBuf, std::sync::Weak<Cache>>>> = OnceLock::new();
 fn cache_for(path: &Path) -> Arc<Cache> {
-    let mut caches = CACHE.get_or_init(Default::default).write().unwrap();
-    caches.active.retain(|_, cache| cache.strong_count() != 0);
-    if let Some(cache) = caches.active.get(path).and_then(std::sync::Weak::upgrade) {
-        caches.current = Some((path.to_path_buf(), cache.clone()));
-        return cache;
-    }
-    let cache = Arc::new(load());
-    caches.active.insert(path.to_path_buf(), Arc::downgrade(&cache));
-    caches.current = Some((path.to_path_buf(), cache.clone()));
+    let mut active = CACHE.get_or_init(Default::default).write().unwrap();
+    active.retain(|_, cache| cache.strong_count() != 0);
+    let cache = active.get(path).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
+        let cache = Arc::new(load());
+        active.insert(path.to_path_buf(), Arc::downgrade(&cache));
+        cache
+    });
+    *crate::env::Env::current().retained().lock().unwrap() = Some(Arc::new((path.to_path_buf(), cache.clone())));
     cache
 }
 #[cfg(all(test, feature = "sqlite"))]
@@ -119,13 +116,7 @@ fn current_cache() -> Arc<Cache> {
 }
 fn existing_cache(path: &Path) -> Option<Arc<Cache>> {
     let key = read::catalog_key(path);
-    let caches = CACHE.get()?.read().ok()?;
-    if let Some((path, cache)) = &caches.current {
-        if *path == key {
-            return Some(cache.clone());
-        }
-    }
-    caches.active.get(&key)?.upgrade()
+    CACHE.get()?.read().ok()?.get(&key)?.upgrade()
 }
 
 #[cfg(feature = "sqlite")]
@@ -147,7 +138,7 @@ fn clear_invalidated(cache: &Cache) {
 
 /// One-time nudge about the pre-0.9.12 JSON cache this module replaced.
 fn note_legacy_json() {
-    let Some(path) = dirs::cache_dir().map(|d| d.join("clustervision").join("discover.json")) else {
+    let Some(path) = crate::env::cache_dir().map(|d| d.join("clustervision").join("discover.json")) else {
         return;
     };
     if path.exists() {
@@ -208,37 +199,30 @@ fn admit_loaded(
     cache: &Cache,
     path: &Path,
     entry: Entry,
-    key: (u64, u64),
     reads: &crate::source::ReadSet,
 ) -> Option<(Vec<SessionRef>, crate::source::ReadSet)> {
     let mut entries = cache.entries.write().unwrap();
     let entry = entries.entry(path.to_path_buf()).or_insert(entry);
-    if (entry.mtime_ns, entry.size) != key {
-        return None;
-    }
     entry
         .payload
         .known()
         .and_then(|(refs, captured)| captured.includes(reads).then(|| (refs.clone(), captured.clone())))
 }
 
-/// `(mtime_ns, size)` for `path`, or `None` if it can't be stat'd (then callers just scan).
-fn stat_key(path: &Path) -> Option<(u64, u64)> {
-    let m = std::fs::metadata(path).ok()?;
-    let mtime = m
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as u64;
-    Some((mtime, m.len()))
+/// The persisted key a capture of `path` would use now.
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) fn stat_key(path: &Path) -> Option<(u64, u64)> {
+    let mut reads = crate::source::ReadSet::default();
+    reads.record(path);
+    reads.signature(path)
 }
 
-/// Return cached refs for `path` when its `(mtime, size)` is unchanged; otherwise run `scan`, cache
-/// any non-empty result, and return it. One file may map to several sessions (e.g. Gemini logs).
+/// Return cached refs for `path` when its captured identity (and every auxiliary read) is
+/// unchanged; otherwise run `scan`, cache any non-empty result, and return it. One file may map
+/// to several sessions (e.g. Gemini logs).
 ///
-/// The stat happens **before** the scan, so a write racing the scan leaves a too-old `(mtime, size)`
-/// in the cache — which misses next time and re-scans. The safe direction.
+/// The capture happens **before** the scan, so a write racing the scan leaves a too-old stamp in
+/// the cache, which misses next time and re-scans. The safe direction.
 pub(crate) fn cached_scan_many<F>(path: &Path, scan: F) -> Vec<SessionRef>
 where
     F: FnOnce() -> Vec<SessionRef>,
@@ -255,6 +239,15 @@ where
     cached_scan_inner(path, None, reads, |_| (scan().into_iter().collect(), None))
         .into_iter()
         .next()
+}
+
+/// [`cached_scan_many`] with auxiliary identities captured before the caller reads them.
+#[cfg(feature = "sqlite")]
+pub(crate) fn cached_scan_many_with_reads<F>(path: &Path, reads: crate::source::ReadSet, scan: F) -> Vec<SessionRef>
+where
+    F: FnOnce() -> Vec<SessionRef>,
+{
+    cached_scan_inner(path, None, reads, |_| (scan(), None))
 }
 
 /// Opt-in append metadata state. Exact hits retain their existing guards; a continuation is
@@ -280,8 +273,11 @@ fn cached_scan_inner<F>(
 where
     F: FnOnce(Option<&crate::stream::Checkpoint>) -> (Vec<SessionRef>, Option<ScanContinuation>),
 {
+    // One capture decides freshness: the path's full identity, inside the read set. Its
+    // `(mtime, size)` only keys the persisted rows.
     reads.record(path);
-    let Some((mtime_ns, size)) = stat_key(path) else {
+    #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
+    let Some(key @ (_, size)) = reads.signature(path) else {
         return scan(None).0;
     };
     let context = read::Context::current();
@@ -291,7 +287,6 @@ where
         let entries = cache.entries.read().unwrap();
         entries
             .get(path)
-            .filter(|entry| entry.mtime_ns == mtime_ns && entry.size == size)
             .and_then(|entry| entry.payload.known())
             .and_then(|(refs, captured)| captured.includes(&reads).then(|| (refs.clone(), captured.clone())))
     };
@@ -305,9 +300,7 @@ where
     if !cache.entries.read().unwrap().contains_key(path) {
         #[cfg(test)]
         context.note_lookup();
-        let loaded = context
-            .with_connection(|conn| load_entry(conn, path, (mtime_ns, size)))
-            .flatten();
+        let loaded = context.with_connection(|conn| load_entry(conn, path, key)).flatten();
         // A lazy standalone open may migrate interpretation; clear before retaining this scan.
         clear_invalidated(&cache);
         if let Some(mut entry) = loaded {
@@ -316,7 +309,7 @@ where
             // Decode outside locks, then choose the actual current process entry. A concurrent
             // scan/count update must win over the older SQL snapshot, including on return.
             entry.payload.parsed();
-            let candidate = admit_loaded(&cache, path, entry, (mtime_ns, size), &reads);
+            let candidate = admit_loaded(&cache, path, entry, &reads);
             if let Some((refs, captured)) = candidate {
                 if captured.fresh(&mut crate::source::Probe::default()) {
                     return refs;
@@ -385,13 +378,15 @@ where
         entries.insert(
             path.to_path_buf(),
             Entry {
-                mtime_ns,
+                #[cfg(feature = "sqlite")]
+                mtime_ns: key.0,
                 size,
                 payload: Payload::Parsed {
                     refs: refs.clone(),
                     reads,
                 },
                 continuation,
+                #[cfg(feature = "sqlite")]
                 dirty: true,
             },
         );
@@ -439,11 +434,8 @@ fn persistence_cache(path: &Path, prune: bool) -> Option<Arc<Cache>> {
 /// *full* [`crate::discover_all`] (the stat-per-row cost belongs on the slow path; per-harness
 /// probe refreshes skip it). Best-effort: a failed flush just means a re-scan next run.
 pub(crate) fn persist(prune: bool) {
-    if persistence_cache(&read::Context::current().path(), prune).is_none() {
-        return;
-    }
-    #[cfg(feature = "sqlite")]
-    {
+    if persistence_cache(&read::Context::current().path(), prune).is_some() {
+        #[cfg(feature = "sqlite")]
         read::Context::current().with_connection_mut(|conn| persist_in(conn, prune));
     }
 }
@@ -588,7 +580,7 @@ mod tests {
 
     #[test]
     fn auxiliary_scan_baselines_invalidate_changes_and_preserve_raced_stamps() {
-        let world = cv_testkit::World::in_process("scan-auxiliary-baselines");
+        let world = crate::test_world("scan-auxiliary-baselines");
         let path = world.base.join("source");
         let sidecar = world.base.join("state");
         std::fs::write(&path, "unchanged primary").unwrap();
@@ -634,7 +626,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn continuation_checks_auxiliary_identity_and_does_not_publish_raced_passes() {
-        let w = cv_testkit::World::in_process("scan-continuation-freshness");
+        let w = crate::test_world("scan-continuation-freshness");
         let path = w.base.join("s.jsonl");
         let aux = w.base.join("dependency");
         std::fs::write(&path, "first\n").unwrap();
@@ -728,7 +720,7 @@ mod tests {
 
     #[test]
     fn lazy_payload_preserves_demand_guards_count_updates_and_malformed_fallback() {
-        let w = cv_testkit::World::in_process("scan-lazy");
+        let w = crate::test_world("scan-lazy");
         let mut conn = crate::catalog::open_db().unwrap();
         let paths: Vec<_> = ["valid", "invalid", "stale", "invalid-reads"]
             .map(|name| w.base.join(name))
@@ -825,7 +817,7 @@ mod tests {
 
     #[test]
     fn interpretation_upgrade_rejects_persisted_and_process_scan_rows() {
-        let w = cv_testkit::World::in_process("scan-interpretation");
+        let w = crate::test_world("scan-interpretation");
         let path = w.base.join("unchanged.jsonl");
         std::fs::write(&path, "unchanged").unwrap();
         let old = SessionRef {
@@ -907,7 +899,7 @@ mod tests {
     }
     #[test]
     fn concurrent_count_update_wins_over_loaded_sql_snapshot() {
-        let world = cv_testkit::World::in_process("scan-admission-count");
+        let world = crate::test_world("scan-admission-count");
         let path = world.base.join("source");
         std::fs::write(&path, "metadata").unwrap();
         let reference = SessionRef::new("counted", crate::Harness::Claude, path.clone());
@@ -921,7 +913,7 @@ mod tests {
         let cache = current_cache();
         let mut reads = crate::source::ReadSet::default();
         reads.record(&path);
-        let actual = admit_loaded(&cache, &path, old_sql, key, &reads).unwrap();
+        let actual = admit_loaded(&cache, &path, old_sql, &reads).unwrap();
         assert_eq!(
             actual.0[0].message_count, 7,
             "newer process count wins on admission AND return"
@@ -930,7 +922,7 @@ mod tests {
 
     #[test]
     fn failed_flush_retries_and_prunes_newly_vanished_entries() {
-        let w = cv_testkit::World::in_process("scan-persist-retry");
+        let w = crate::test_world("scan-persist-retry");
         let path = w.base.join("retry.jsonl");
         std::fs::write(&path, "data").unwrap();
         let r = SessionRef {
@@ -989,7 +981,7 @@ mod tests {
 
     #[test]
     fn discovery_mutation_keeps_original_identity_and_forces_rescan() {
-        let w = cv_testkit::World::in_process("scan-mutation");
+        let w = crate::test_world("scan-mutation");
         let path = w.base.join("raced.jsonl");
         std::fs::write(&path, "before").unwrap();
         let r = SessionRef {

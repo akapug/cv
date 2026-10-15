@@ -9,8 +9,6 @@ use crate::{
 use std::io::{BufWriter, Write};
 
 #[cfg(test)]
-mod legacy;
-#[cfg(test)]
 mod tests;
 
 fn text_block(writer: &mut dyn Write, parts: &[&str]) -> Result<()> {

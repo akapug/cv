@@ -483,9 +483,9 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     fs::create_dir_all(&chats).with_context(|| format!("creating {}", chats.display()))?;
     if w.lines.is_empty() {
         // The original Qwen writer emits one blank line even for an empty session.
-        fs::write(&path, b"\n").with_context(|| format!("writing {}", path.display()))?;
+        crate::publish::publish_reader(&path, "stage", &b"\n"[..], opts.claim())?;
     } else {
-        w.lines.publish(&path)?;
+        w.lines.publish(&path, opts.claim())?;
     }
     Ok(EmitResult {
         path,
@@ -593,6 +593,7 @@ mod staged_tests {
         session.lineage.forked_from = Some("parent-session".into());
         let opts = EmitOptions {
             new_id: Some("synthetic-qwen".into()),
+            force: true, // this test emits the same pinned id again
             ..Default::default()
         };
         let empty = emit(&session, &world.base, &opts)?;

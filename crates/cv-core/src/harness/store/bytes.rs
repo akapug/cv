@@ -236,6 +236,7 @@ impl ByteSource {
         }
     }
 
+    #[cfg(any(test, feature = "sqlite"))]
     pub(crate) fn read(mut input: impl std::io::Read) -> std::io::Result<Self> {
         use std::io::Write;
         let mut stage = ByteStage::new();
@@ -250,25 +251,18 @@ impl ByteSource {
         stage.finish()
     }
     /// Prefer native contiguous parsing. Mapping never outlives this exclusively owned source.
+    #[cfg(feature = "mmap")]
     pub(crate) fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> std::io::Result<Option<T>> {
         match &self.bytes {
             Bytes::Memory(bytes) => Ok(Some(f(bytes))),
             Bytes::Arena { .. } => Ok(None),
             Bytes::File(spill) => {
-                #[cfg(feature = "mmap")]
-                {
-                    let file = spill.file.as_ref().unwrap();
-                    if file.metadata()?.len() == 0 {
-                        return Ok(Some(f(&[])));
-                    }
-                    // Only this operation owns the backing descriptor; it is never mutated.
-                    if let Ok(map) = unsafe { memmap2::Mmap::map(file) } {
-                        return Ok(Some(f(&map)));
-                    }
+                let file = spill.file.as_ref().unwrap();
+                if file.metadata()?.len() == 0 {
+                    return Ok(Some(f(&[])));
                 }
-                #[cfg(not(feature = "mmap"))]
-                let _ = (spill, f);
-                Ok(None)
+                // Only this operation owns the backing descriptor; it is never mutated.
+                Ok(unsafe { memmap2::Mmap::map(file) }.ok().map(|map| f(&map)))
             }
         }
     }
@@ -304,26 +298,28 @@ struct FileReader<F> {
 }
 impl<F: std::borrow::Borrow<std::fs::File>> std::io::Read for FileReader<F> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        let backing_file = self.file.borrow();
-        #[cfg(unix)]
-        let n = {
-            use std::os::unix::fs::FileExt;
-            backing_file.read_at(bytes, self.position)?
-        };
-        #[cfg(windows)]
-        let n = {
-            use std::os::windows::fs::FileExt;
-            backing_file.seek_read(bytes, self.position)?
-        };
-        #[cfg(not(any(unix, windows)))]
-        let n = {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = backing_file.try_clone()?;
-            file.seek(SeekFrom::Start(self.position))?;
-            file.read(bytes)?
-        };
+        let n = read_at(self.file.borrow(), bytes, self.position)?;
         self.position += n as u64;
         Ok(n)
+    }
+}
+/// The platform boundary for positioned source reads. Unix reads leave the shared cursor
+/// untouched; other targets retain their platform's positioned-read or seek fallback.
+pub(crate) fn read_at(file: &std::fs::File, bytes: &mut [u8], at: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, bytes, at)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, bytes, at)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut file = file.try_clone()?;
+        use std::io::{Read, Seek};
+        file.seek(std::io::SeekFrom::Start(at))?;
+        file.read(bytes)
     }
 }
 #[cfg(test)]

@@ -18,6 +18,12 @@ mod http;
 mod llm;
 mod util;
 
+/// A hermetic world whose environment this thread's library calls read (see `cv_core::env`).
+#[cfg(test)]
+fn test_world(tag: &str) -> cv_testkit::InProcess<cv_core::env::Scope> {
+    cv_testkit::World::in_process(tag, cv_core::env::Env::enter_isolated)
+}
+
 // Crate-root re-exports for `blame.rs`, which renders conversation windows via the same
 // streaming renderer `cv show` uses.
 pub(crate) use cmd::view::{show_header, show_message, stream_session_render, RenderOpts};
@@ -501,9 +507,9 @@ enum Cmd {
         /// Hard-drop payloads (no sidecar, irreversible) instead of stashing them for retrieval.
         #[arg(long)]
         drop: bool,
-        /// Also flatten the OLDEST assistant reasoning (thinking blocks) — recent thinking (within
-        /// --keep-last) stays verbatim. On a long session the chain-of-thought dominates the loaded
-        /// context; flattening the old reasoning is the biggest lever for shrinking it. Lossless.
+        /// Also omit the OLDEST assistant reasoning (thinking blocks) — recent thinking (within
+        /// --keep-last) stays verbatim. Omitted blocks leave no marker; `cv cat <new-id>
+        /// <record-uuid>#think<i>` returns each from the sidecar. Lossless.
         ///
         /// Renamed from `--thinking` in 0.11.0: that spelling now names the emit-side
         /// `--thinking <native|text|drop>`, and one word may not mean two things.
@@ -639,6 +645,9 @@ enum Cmd {
         /// Write the markdown pack to this file (instead of stdout).
         #[arg(long, value_name = "FILE")]
         pack: Option<PathBuf>,
+        /// Replace an existing --pack file by atomic rename (otherwise a taken name exits 2).
+        #[arg(long, requires = "pack")]
+        force: bool,
         /// Emit a resumable main-thread session (new id) under the Claude store or --out.
         #[arg(long, conflicts_with = "agent_of")]
         session: bool,
@@ -833,6 +842,9 @@ enum Cmd {
         /// Write to this file instead of stdout.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Replace an existing output file by atomic rename (otherwise a taken name exits 2).
+        #[arg(long)]
+        force: bool,
     },
     /// Compile a context bundle for a new task from your whole session corpus.
     Pack {
@@ -848,8 +860,12 @@ enum Cmd {
         /// Max past sessions to draw from.
         #[arg(long, default_value_t = 8)]
         limit: usize,
+        /// Write the md/prompt bundle to this file, or `--format session` under this directory.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Replace an existing output file by atomic rename (otherwise a taken name exits 2).
+        #[arg(long)]
+        force: bool,
         /// What to do with the model's reasoning on the way out: `native` keeps it where the target
         /// format holds it and drops it elsewhere, `text` keeps the turn by demoting thinking to
         /// text (a placeholder for provider-signed blobs, which have no text), `drop` omits it.
@@ -947,6 +963,9 @@ enum Cmd {
         /// Write here instead of `./<id>.html`.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Replace an existing output file by atomic rename (otherwise a taken name exits 2).
+        #[arg(long)]
+        force: bool,
         /// Skip the redaction pass (default is to scrub secrets/PII before sharing).
         #[arg(long)]
         no_redact: bool,
@@ -1211,6 +1230,7 @@ fn run() -> Result<()> {
             redact,
             redact_only,
             out,
+            force,
         } => compose::cmd_dataset(
             &format,
             harness,
@@ -1221,6 +1241,7 @@ fn run() -> Result<()> {
             redact,
             redact_only,
             out,
+            force,
         ),
         Cmd::Port {
             id,
@@ -1259,16 +1280,18 @@ fn run() -> Result<()> {
             id,
             harness,
             out,
+            force,
             no_redact,
-        } => share::cmd_share(&id, harness, out, no_redact),
+        } => share::cmd_share(&id, harness, out, force, no_redact),
         Cmd::Pack {
             task,
             format,
             harness,
             limit,
             out,
+            force,
             thinking,
-        } => pack::cmd_pack(&task, &format, harness, limit, out, util::parse_thinking(&thinking)?),
+        } => pack::cmd_pack(&task, &format, harness, limit, out, force, util::parse_thinking(&thinking)?),
         Cmd::Stats { query, json, tokens } => browse::cmd_stats(query, json, tokens),
         Cmd::Prune {
             id,
@@ -1472,6 +1495,7 @@ fn run() -> Result<()> {
             upto,
             with,
             pack,
+            force,
             session,
             agent_of,
             model,
@@ -1488,7 +1512,7 @@ fn run() -> Result<()> {
                 retrieve_ref: None,
             };
             let target = cmd::distill::target(session, agent_of, model, cwd, out)?;
-            cmd::distill::cmd_distill(&id, harness, opts, upto, &with, pack, target, json)
+            cmd::distill::cmd_distill(&id, harness, opts, upto, &with, pack, force, target, json)
         }
         Cmd::Adopt {
             agents,

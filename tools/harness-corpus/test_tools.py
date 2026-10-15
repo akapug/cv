@@ -24,6 +24,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# A subprocess guard that only stops a hung driver; a busy machine must not fail a passing run.
+HANG = 120
 KEY = "sk-corpustest0123456789abcdefXYZ"
 
 
@@ -343,7 +345,7 @@ class TuiTests(unittest.TestCase):
                     result = subprocess.run([sys.executable, "-I", os.path.join(HERE, "hermes", "drive_tty.py"),
                                              "--log", os.path.join(directory, "output.log"), "--idle", "0.01", "--startup", "0.01",
                                              "--min", "0.01", "--timeout", "5", "-l", "hello", "--", sys.executable, "-c", child],
-                                            capture_output=True, text=True, timeout=8)
+                                            capture_output=True, text=True, timeout=HANG)
                     self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_early_exit_does_not_satisfy_required_expect(self):
@@ -358,7 +360,7 @@ class TuiTests(unittest.TestCase):
                         json.dump(steps, file)
                     result = subprocess.run([sys.executable, "-I", os.path.join(HERE, "tui_driver.py"), log,
                                              sys.executable, "-c", "pass"], env=dict(os.environ, TUI_SCRIPT=script),
-                                            capture_output=True, text=True, timeout=8)
+                                            capture_output=True, text=True, timeout=HANG)
                     self.assertEqual(result.returncode, 3, result.stderr)
                     with open(log) as file:
                         self.assertIn("child exited before", file.read())
@@ -370,7 +372,7 @@ class TuiTests(unittest.TestCase):
                 json.dump([], file)
             result = subprocess.run([sys.executable, "-I", os.path.join(HERE, "tui_driver.py"),
                                      os.path.join(directory, "output.log"), sys.executable, "-c", "import sys; sys.exit(7)"],
-                                    env=dict(os.environ, TUI_SCRIPT=script), capture_output=True, text=True, timeout=8)
+                                    env=dict(os.environ, TUI_SCRIPT=script), capture_output=True, text=True, timeout=HANG)
             self.assertEqual(result.returncode, 7, result.stderr)
 
     def test_sigterm_ignoring_owned_child_is_reaped(self):
@@ -381,7 +383,7 @@ class TuiTests(unittest.TestCase):
             child = 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready",flush=True); time.sleep(60)'
             result = subprocess.run([sys.executable, "-I", os.path.join(HERE, "tui_driver.py"),
                                      os.path.join(directory, "output.log"), sys.executable, "-c", child],
-                                    env=dict(os.environ, TUI_SCRIPT=script), capture_output=True, text=True, timeout=8)
+                                    env=dict(os.environ, TUI_SCRIPT=script), capture_output=True, text=True, timeout=HANG)
             self.assertEqual(result.returncode, 3, result.stderr)
 
 

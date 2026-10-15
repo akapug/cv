@@ -339,6 +339,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "zip",
+ "zstd",
 ]
 
 [[package]]
@@ -446,6 +447,7 @@ dependencies = [
  "serde_json",
  "tantivy",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

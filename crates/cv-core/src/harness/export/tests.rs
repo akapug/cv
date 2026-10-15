@@ -1,5 +1,36 @@
 use super::*;
-use serde_json::json;
+use crate::emit::grok_qwen_tests::Frozen;
+use crate::stream::{CollectSink, ParseOptions};
+use serde_json::{json, Value};
+
+/// A read session, frozen: its length and SHA-256, the temporary archive path aside.
+fn digest(session: &Session) -> Value {
+    let mut session = session.clone();
+    session.source_path = None;
+    let bytes = serde_json::to_vec(&session).unwrap();
+    json!([bytes.len(), crate::digest::sha256_hex(&bytes)])
+}
+
+/// A discovered ref, frozen: every field but the temporary archive path.
+fn reference(r: &SessionRef) -> Value {
+    let mut value = serde_json::to_value(r).unwrap();
+    value.as_object_mut().unwrap().remove("path");
+    value
+}
+
+/// One conversation as cv reads it: alone in an archive, discovered, then streamed in full.
+fn read(kind: Kind, conv: &Value) -> (SessionRef, Session) {
+    let dir = std::env::temp_dir().join(format!("cv-export-read-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("conversations.json");
+    std::fs::write(&path, serde_json::to_vec(&json!([conv])).unwrap()).unwrap();
+    let r = discover_kind_in(kind, vec![path]).remove(0);
+    let mut sink = CollectSink::default();
+    let mut session = native::stream(kind, &r, &ParseOptions::full(), &mut sink).unwrap();
+    session.messages = sink.messages;
+    std::fs::remove_dir_all(dir).unwrap();
+    (r, session)
+}
 
 #[test]
 fn chatgpt_walks_mapping_active_branch() {
@@ -18,7 +49,8 @@ fn chatgpt_walks_mapping_active_branch() {
                 "message": { "author": { "role": "assistant" }, "content": { "content_type": "text", "parts": ["DEAD BRANCH"] }, "recipient": "all" } }
         }
     });
-    let msgs = chatgpt_messages(&conv);
+    let (r, session) = read(Kind::ChatGpt, &conv);
+    let msgs = session.messages;
     assert_eq!(msgs.len(), 2, "only the root->current_node branch");
     assert_eq!(msgs[0].role, Role::User);
     assert_eq!(msgs[1].role, Role::Assistant);
@@ -28,7 +60,6 @@ fn chatgpt_walks_mapping_active_branch() {
         .iter()
         .any(|m| m.text().unwrap_or_default().contains("DEAD BRANCH")));
 
-    let r = conv_ref(Kind::ChatGpt, std::path::Path::new("/x/conversations.json"), &conv).unwrap();
     assert_eq!(r.id, "c1");
     assert_eq!(r.harness, Harness::ChatGptExport);
     assert_eq!(r.title.as_deref(), Some("Soy Sauce"));
@@ -46,7 +77,7 @@ fn chatgpt_tool_call_and_image() {
                     "content": { "content_type": "code", "text": "print(1)" } } },
         }
     });
-    let m = &chatgpt_messages(&conv)[0];
+    let m = &read(Kind::ChatGpt, &conv).1.messages[0];
     assert!(matches!(&m.content[0], Block::ToolUse { name, .. } if name == "python"));
 
     let conv2 = json!({ "id": "c3", "current_node": "i1", "mapping": {
@@ -54,7 +85,7 @@ fn chatgpt_tool_call_and_image() {
             "message": { "author": { "role": "assistant" },
                 "content": { "content_type": "multimodal_text", "parts": [ {"content_type":"image_asset_pointer","asset_pointer":"file-service://abc"}, "see image" ] } } }
     }});
-    let m2 = &chatgpt_messages(&conv2)[0];
+    let m2 = &read(Kind::ChatGpt, &conv2).1.messages[0];
     assert!(m2
         .content
         .iter()
@@ -76,7 +107,7 @@ fn chatgpt_tool_call_links_to_result() {
             "message": { "author": { "role": "tool", "name": "browser" }, "recipient": "all",
                 "content": { "content_type": "tether_quote", "text": "the answer is 42" } } }
     }});
-    let msgs = chatgpt_messages(&conv);
+    let msgs = read(Kind::ChatGpt, &conv).1.messages;
     assert_eq!(msgs.len(), 2);
     // the call
     let Block::ToolUse { id, name, input, .. } = &msgs[0].content[0] else {
@@ -111,7 +142,7 @@ fn kind_and_origin_chatgpt_and_claude() {
         "res": { "id": "res", "parent": "call", "children": [],
             "message": { "author": { "role": "tool", "name": "python" }, "recipient": "all", "content": { "content_type": "execution_output", "text": "1" } } }
     }});
-    let msgs = chatgpt_messages(&conv);
+    let msgs = read(Kind::ChatGpt, &conv).1.messages;
     assert_eq!((msgs[0].kind, msgs[0].origin), (MessageKind::Prompt, Origin::Human));
     assert_eq!((msgs[1].kind, msgs[1].origin), (MessageKind::Reply, Origin::Model));
     assert_eq!(
@@ -129,7 +160,7 @@ fn kind_and_origin_chatgpt_and_claude() {
         { "uuid": "m1", "sender": "human", "content": [{ "type": "text", "text": "q" }] },
         { "uuid": "m2", "sender": "assistant", "content": [{ "type": "text", "text": "a" }] }
     ]});
-    let cm = claude_messages(&cc);
+    let cm = read(Kind::Claude, &cc).1.messages;
     assert_eq!((cm[0].kind, cm[0].origin), (MessageKind::Prompt, Origin::Human));
     assert_eq!((cm[1].kind, cm[1].origin), (MessageKind::Reply, Origin::Model));
 }
@@ -149,7 +180,8 @@ fn claude_export_blocks() {
               ] }
         ]
     });
-    let msgs = claude_messages(&conv);
+    let (r, session) = read(Kind::Claude, &conv);
+    let msgs = session.messages;
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[0].role, Role::User);
     assert_eq!(msgs[1].role, Role::Assistant);
@@ -158,14 +190,13 @@ fn claude_export_blocks() {
     assert!(matches!(&a.content[1], Block::Text { .. }));
     assert!(matches!(&a.content[2], Block::ToolUse { name, .. } if name == "str_replace"));
 
-    let r = conv_ref(Kind::Claude, std::path::Path::new("/x/conversations.json"), &conv).unwrap();
     assert_eq!(r.id, "u1");
     assert_eq!(r.harness, Harness::ClaudeExport);
     assert_eq!(r.message_count, 2);
 }
 
 #[test]
-fn parse_ref_finds_conversation_in_file_and_sniffs_kind() {
+fn read_finds_conversation_in_file_and_sniffs_kind() {
     let dir = std::env::temp_dir().join(format!("cv-export-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("conversations.json");
@@ -175,17 +206,18 @@ fn parse_ref_finds_conversation_in_file_and_sniffs_kind() {
     ]);
     std::fs::write(&path, arr.to_string()).unwrap();
 
-    // sniff signal: Claude convos have chat_messages, not a ChatGPT mapping
-    let (_t, arr) = read_array(&path).unwrap();
-    let first: serde_json::Value = serde_json::from_str(arr[0].get()).unwrap();
-    assert!(first.get("chat_messages").is_some() && first.get("mapping").is_none());
+    // Claude convos have chat_messages, not a ChatGPT mapping: discovery sniffs the kind.
+    assert!(discover_kind_in(Kind::ChatGpt, vec![path.clone()]).is_empty());
+    assert_eq!(discover_kind_in(Kind::Claude, vec![path.clone()]).len(), 2);
 
     let r = SessionRef {
         title: Some("second".into()),
         message_count: 1,
         ..SessionRef::new("b", Harness::ClaudeExport, path.clone())
     };
-    let s = parse_ref(Kind::Claude, &r).unwrap();
+    let mut sink = CollectSink::default();
+    let mut s = native::stream(Kind::Claude, &r, &ParseOptions::full(), &mut sink).unwrap();
+    s.messages = sink.messages;
     assert_eq!(s.id, "b");
     assert_eq!(s.messages.len(), 1);
     assert_eq!(s.messages[0].role, Role::Assistant);
@@ -198,12 +230,15 @@ fn parse_ref_finds_conversation_in_file_and_sniffs_kind() {
 #[ignore]
 fn real_downloads_exports_parse() {
     // discovery is opt-in; point it at Downloads for this machine-specific probe.
-    std::env::set_var("CV_EXPORTS", dirs::home_dir().unwrap().join("Downloads"));
+    let env = crate::env::Env::from_process().enter();
+    env.set("CV_EXPORTS", dirs::home_dir().unwrap().join("Downloads"));
     for kind in [Kind::ChatGpt, Kind::Claude] {
         let refs = discover_kind(kind);
         eprintln!("{:?}: {} conversation(s)", kind, refs.len());
         if let Some(r) = refs.iter().find(|r| r.message_count > 0) {
-            let s = parse_ref(kind, r).unwrap();
+            let mut sink = CollectSink::default();
+            let mut s = native::stream(kind, r, &ParseOptions::full(), &mut sink).unwrap();
+            s.messages = sink.messages;
             let tools = s
                 .messages
                 .iter()
@@ -220,26 +255,29 @@ fn real_downloads_exports_parse() {
             assert!(!s.messages.is_empty());
         }
     }
-    std::env::remove_var("CV_EXPORTS");
 }
 
 // Full-session composition, not a count-only or selected-prefix heap assertion. The routine
 // fixture crosses INLINE_MAX (4 KiB) and positioned windows (64 KiB) without making every
 // workspace run pay for repeated 32 MiB serialization and hashing in debug builds.
 #[test]
-fn account_archive_full_output_matches_owned_codec() {
+fn account_archive_full_output_matches_frozen() {
     account_archive_full_output_oracle(2 << 20);
 }
 
 #[test]
 #[ignore = "32 MiB full-session composition control; run explicitly after relevant reader changes"]
-fn giant_account_archive_full_output_matches_owned_codec() {
+fn giant_account_archive_full_output_matches_frozen() {
     account_archive_full_output_oracle(32 << 20);
 }
 
 fn account_archive_full_output_oracle(payload_bytes: usize) {
-    use crate::stream::{CollectSink, ParseOptions};
     use std::io::Write;
+    let mut frozen = Frozen::new(if payload_bytes > 2 << 20 {
+        "export-archive-giant"
+    } else {
+        "export-archive"
+    });
 
     #[derive(Default)]
     struct HashOutput {
@@ -288,7 +326,6 @@ fn account_archive_full_output_oracle(payload_bytes: usize) {
                 "dead":{"parent":"u","message":{"author":{"role":"assistant"},"content":{"parts":["excluded branch"]}}}
             }}),
         };
-        let expected_ref = conv_ref(kind, &path, &conv).unwrap();
         let unrelated = match kind {
             Kind::Claude => json!({"uuid":"unrelated","chat_messages":[]}),
             Kind::ChatGpt => json!({"conversation_id":"unrelated","mapping":{}}),
@@ -297,12 +334,8 @@ fn account_archive_full_output_oracle(payload_bytes: usize) {
         let before = source_hash(&path);
         let refs = discover_kind_in(kind, vec![path.clone()]);
         assert_eq!(refs.len(), 2);
-        assert_eq!(refs.iter().find(|r| r.id == "selected").unwrap().message_count, 3);
-        let expected = parse_ref(kind, &expected_ref).unwrap();
-        assert_eq!(expected.messages.len(), 3);
-        assert_eq!(expected.messages.last().unwrap().text().unwrap(), "final EOF marker");
-        let expected_output = output(&expected);
-        assert!(expected_output.0 > payload_bytes);
+        let expected_ref = refs.into_iter().find(|r| r.id == "selected").unwrap();
+        assert_eq!(expected_ref.message_count, 3);
         for opts in [
             ParseOptions::lazy(),
             ParseOptions::bulk(),
@@ -324,16 +357,29 @@ fn account_archive_full_output_oracle(payload_bytes: usize) {
             );
             actual.materialize().unwrap();
             assert_eq!(actual.messages.len(), 3);
-            assert_eq!(output(&actual), expected_output, "full archive output differs");
+            assert_eq!(actual.messages.last().unwrap().text().unwrap(), "final EOF marker");
+            assert!(output(&actual).0 > payload_bytes);
+            frozen.insert(format!("{kind:?} {}", mode(&opts)), digest(&actual));
         }
         assert_eq!(source_hash(&path), before);
     }
+    frozen.check().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+fn mode(opts: &ParseOptions) -> &'static str {
+    match (opts.spans, opts.complete, opts.extra) {
+        (true, _, _) => "lazy",
+        (false, true, _) => "complete",
+        (false, false, true) => "full",
+        (false, false, false) => "bulk",
+    }
+}
+
 #[test]
-fn native_archive_matches_owned_codec_across_modes_and_invalidation() {
-    use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
+fn native_archive_matches_frozen_across_modes_and_invalidation() {
+    use crate::stream::{Flow, MessageSink};
+    let mut frozen = Frozen::new("export-native");
     struct Stop;
     impl MessageSink for Stop {
         fn message(&mut self, _: Message) -> Flow {
@@ -375,13 +421,13 @@ fn native_archive_matches_owned_codec_across_modes_and_invalidation() {
             Kind::ChatGpt => json!({"id":"unrelated","mapping":{},"unknown":body}),
         };
         std::fs::write(&path, serde_json::to_vec(&json!([prefix, conv])).unwrap()).unwrap();
-        let expected_ref = conv_ref(kind, &path, &conv).unwrap();
-        let refs = discover_kind_in(kind, vec![path.clone()]);
-        assert_eq!(
-            serde_json::to_value(refs.iter().find(|r| r.id == expected_ref.id).unwrap()).unwrap(),
-            serde_json::to_value(&expected_ref).unwrap()
-        );
-        let expected = parse_ref(kind, &expected_ref).unwrap();
+        let id = conv.get("uuid").or_else(|| conv.get("conversation_id")).unwrap();
+        let expected_ref = discover_kind_in(kind, vec![path.clone()])
+            .into_iter()
+            .find(|r| id == r.id.as_str())
+            .unwrap();
+        frozen.insert(format!("{kind:?} ref"), reference(&expected_ref));
+        let mut title = None;
         for opts in [ParseOptions::lazy(), ParseOptions::full(), ParseOptions::complete()] {
             let mut sink = CollectSink::default();
             let mut actual = native::stream(kind, &expected_ref, &opts, &mut sink).unwrap();
@@ -399,14 +445,8 @@ fn native_archive_matches_owned_codec_across_modes_and_invalidation() {
                 opts.spans
             );
             actual.materialize().unwrap();
-            assert_eq!(
-                serde_json::to_string(&actual).unwrap(),
-                serde_json::to_string(&expected).unwrap()
-            );
-            assert_eq!(
-                serde_json::to_value(&actual).unwrap(),
-                serde_json::to_value(&expected).unwrap()
-            );
+            title = actual.title.clone();
+            frozen.insert(format!("{kind:?} {}", mode(&opts)), digest(&actual));
         }
         let mut published = None;
         let mut mutate = |message: Message| {
@@ -445,7 +485,7 @@ fn native_archive_matches_owned_codec_across_modes_and_invalidation() {
             native::stream(kind, &expected_ref, &ParseOptions::lazy(), &mut Stop)
                 .unwrap()
                 .title,
-            expected.title
+            title
         );
         // A same-size replacement with a new inode must invalidate descriptors and metadata.
         let changed = serde_json::to_string(&json!([conv]))
@@ -458,12 +498,13 @@ fn native_archive_matches_owned_codec_across_modes_and_invalidation() {
         assert_eq!(fresh[0].id, "changed");
         assert!(native::stream(kind, &expected_ref, &ParseOptions::lazy(), &mut Stop).is_err());
     }
+    frozen.check().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
-fn native_archive_matches_raw_value_acceptance_and_duplicate_precedence() {
-    use crate::stream::{CollectSink, ParseOptions};
+fn native_archive_keeps_raw_value_acceptance_and_duplicate_precedence() {
+    let mut frozen = Frozen::new("export-acceptance");
     let dir = std::env::temp_dir().join(format!("cv-export-validation-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("conversations.json");
@@ -474,16 +515,14 @@ fn native_archive_matches_raw_value_acceptance_and_duplicate_precedence() {
         // Invalid first conversation prevents sniffed discovery; explicit reads skip it.
         assert!(discover_kind_in(Kind::Claude, vec![path.clone()]).is_empty());
         let r = SessionRef::new("same", Harness::ClaudeExport, path.clone());
-        let expected = parse_ref(Kind::Claude, &r).unwrap();
         let mut sink = CollectSink::default();
         let mut actual = native::stream(Kind::Claude, &r, &ParseOptions::lazy(), &mut sink).unwrap();
         actual.messages = sink.messages;
         actual.materialize().unwrap();
-        assert_eq!(
-            serde_json::to_value(actual).unwrap(),
-            serde_json::to_value(expected).unwrap()
-        );
+        assert_eq!(actual.messages.len(), 1);
+        frozen.insert(invalid, digest(&actual));
     }
+    frozen.check().unwrap();
     let duplicate = r#"[{"conversation_id":false,"uuid":"hidden","chat_messages":[]},{"uuid":"old","\u0075uid":"new","chat_messages":[]}]"#;
     std::fs::write(&path, duplicate).unwrap();
     let refs = discover_kind_in(Kind::Claude, vec![path.clone()]);
@@ -493,10 +532,6 @@ fn native_archive_matches_raw_value_acceptance_and_duplicate_precedence() {
     ]});
     std::fs::write(&path, serde_json::to_vec(&json!([roles])).unwrap()).unwrap();
     let refs = discover_kind_in(Kind::Claude, vec![path.clone()]);
-    assert_eq!(
-        refs[0].message_count,
-        conv_ref(Kind::Claude, &path, &roles).unwrap().message_count
-    );
     assert_eq!(refs[0].message_count, 2);
     std::fs::write(&path, "[]").unwrap();
     assert!(discover_kind_in(Kind::Claude, vec![path.clone()]).is_empty());
@@ -528,7 +563,7 @@ fn cached_export_discovery_preserves_the_callers_path_spelling() {
 
 #[test]
 fn native_chatgpt_fallback_keeps_insertion_order_and_final_duplicate_value() {
-    use crate::stream::{CollectSink, ParseOptions};
+    let mut frozen = Frozen::new("export-order");
     let dir = std::env::temp_dir().join(format!("cv-export-order-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("conversations.json");
@@ -539,27 +574,24 @@ fn native_chatgpt_fallback_keeps_insertion_order_and_final_duplicate_value() {
     }}]"#;
     std::fs::write(&path, archive).unwrap();
     let r = SessionRef::new("ordered", Harness::ChatGptExport, path.clone());
-    let expected = parse_ref(Kind::ChatGpt, &r).unwrap();
-    assert_eq!(
-        expected.messages.iter().map(|m| m.id.as_deref()).collect::<Vec<_>>(),
-        [Some("first"), Some("second")]
-    );
     for opts in [ParseOptions::lazy(), ParseOptions::full(), ParseOptions::complete()] {
         let mut sink = CollectSink::default();
         let mut actual = native::stream(Kind::ChatGpt, &r, &opts, &mut sink).unwrap();
         actual.messages = sink.messages;
         actual.materialize().unwrap();
         assert_eq!(
-            serde_json::to_string(&actual).unwrap(),
-            serde_json::to_string(&expected).unwrap()
+            actual.messages.iter().map(|m| m.id.as_deref()).collect::<Vec<_>>(),
+            [Some("first"), Some("second")]
         );
+        frozen.insert(mode(&opts), digest(&actual));
     }
+    frozen.check().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn multipart_chatgpt_read_keeps_lazy_payloads_and_breaks_parent_cycles() -> Result<()> {
-    let world = cv_testkit::World::in_process("account-multipart-cycle");
+    let world = crate::test_world("account-multipart-cycle");
     let path = world.base.join("conversations.json");
     let body = "λ\n\"escaped\"".repeat(20000);
     let conversation = json!({"conversation_id":"multi","title":"explicit","current_node":"reply","mapping":{
@@ -568,7 +600,6 @@ fn multipart_chatgpt_read_keeps_lazy_payloads_and_breaks_parent_cycles() -> Resu
     }});
     std::fs::write(&path, serde_json::to_vec(&json!([conversation]))?)?;
     let reference = discover_kind_in(Kind::ChatGpt, vec![path.clone()]).remove(0);
-    let expected = parse_ref(Kind::ChatGpt, &reference)?;
     let mut sink = crate::stream::CollectSink::default();
     let mut actual = native::stream(Kind::ChatGpt, &reference, &ParseOptions::lazy(), &mut sink)?;
     actual.messages = sink.messages;
@@ -582,7 +613,9 @@ fn multipart_chatgpt_read_keeps_lazy_payloads_and_breaks_parent_cycles() -> Resu
         "joined ordinary bodies remain checked backing"
     );
     actual.materialize()?;
-    assert_eq!(serde_json::to_value(&actual)?, serde_json::to_value(&expected)?);
+    let mut frozen = Frozen::new("export-multipart");
+    frozen.insert("lazy", digest(&actual));
+    frozen.check()?;
     let cycle = json!({"conversation_id":"cycle","current_node":"reply","mapping":{
         "reply":{"id":"reply","parent":"reply","message":{"author":{"role":"assistant"},"content":{"parts":["one reply"]}}}
     }});
@@ -601,7 +634,7 @@ fn multipart_chatgpt_read_keeps_lazy_payloads_and_breaks_parent_cycles() -> Resu
 
 #[test]
 fn wide_chatgpt_parts_preserve_filtered_join_and_source_guard() -> Result<()> {
-    let world = cv_testkit::World::in_process("account-wide-parts");
+    let world = crate::test_world("account-wide-parts");
     let path = world.base.join("parts.json");
     let mut parts = Vec::new();
     for i in 0..8192 {

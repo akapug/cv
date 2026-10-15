@@ -17,6 +17,57 @@ pub mod anthropic;
 pub mod openai;
 pub(crate) mod write;
 
+/// A string, or the string `text` fields of its parts joined by newlines. Keep the caller's
+/// text rule for a singleton; multiple parts use the source's checked backing when supplied.
+/// Empty text parts still contribute separators, and non-text parts contribute nothing.
+pub(crate) fn joined_text(
+    content: Option<crate::json::JsonView<'_>>,
+    source: Option<&crate::json::JsonSource>,
+    text: openai::TextRule<'_>,
+) -> anyhow::Result<crate::Text> {
+    let Some(content) = content else {
+        return Ok(crate::Text::default());
+    };
+    if let Some(text) = text(content)? {
+        return Ok(text);
+    }
+    let Some(parts) = content.array()? else {
+        return Ok(crate::Text::default());
+    };
+    let mut strings = parts.filter_map(|part| {
+        part.and_then(|part| Ok(part.get("text")?.filter(|v| v.is_string().unwrap_or(false))))
+            .transpose()
+    });
+    let Some(first) = strings.next().transpose()? else {
+        return Ok(crate::Text::default());
+    };
+    let Some(second) = strings.next().transpose()? else {
+        return Ok(text(first)?.unwrap_or_default());
+    };
+    let strings = [Ok(first), Ok(second)].into_iter().chain(strings);
+    match source {
+        Some(source) => super::store::text::append(source, &source.decoded_backing()?, |out| {
+            for (index, view) in strings.enumerate() {
+                if index > 0 {
+                    out.push("\n")?;
+                }
+                out.push_string(view?)?;
+            }
+            Ok(())
+        }),
+        None => {
+            let mut joined = String::new();
+            for (index, view) in strings.enumerate() {
+                if index > 0 {
+                    joined.push('\n');
+                }
+                joined.push_str(view?.resolve()?.as_str().unwrap_or_default());
+            }
+            Ok(crate::Text::Inline(joined))
+        }
+    }
+}
+
 /// A part is an image whatever the family calls it.
 pub(crate) fn is_image_part(ty: &str) -> bool {
     matches!(ty, "image" | "image_url" | "input_image" | "output_image" | "imageUrl")
@@ -44,6 +95,7 @@ pub(crate) fn coerce_text(v: Option<&Value>) -> String {
 
 /// The text parts of a `content` field only (no placeholders): for titles and cwd sniffing, where
 /// `[image]` would be noise.
+#[cfg(test)]
 pub(crate) fn text_parts(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
@@ -101,8 +153,53 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn joined_text_preserves_parts_singleton_spans_and_source_guards() -> anyhow::Result<()> {
+        let world = crate::test_world("wire-joined-text");
+        let path = world.base.join("parts.json");
+        let long = "λ\n\"".repeat(20_000);
+        for value in [
+            Value::Null,
+            json!(""),
+            json!(long),
+            json!([]),
+            json!([null, {"text": 3}, {"type": "image"}]),
+            json!([{"text": ""}, {"text": ""}, {"text": "end"}]),
+            json!([{"text": long}]),
+            json!([{"text": long}, {"text": ""}, {"text": long}]),
+        ] {
+            let expected = text_parts(Some(&value));
+            let owned = joined_text(Some((&value).into()), None, &mut |v| v.text(false))?;
+            assert_eq!(owned, expected.as_str());
+            std::fs::write(&path, serde_json::to_vec(&value)?)?;
+            for primary_span in [false, true] {
+                let source = crate::json::JsonSource::capture(&path)?;
+                let text = source.read_range_value(0, source.len(), |view| {
+                    joined_text(Some(view), Some(&source), &mut |v| {
+                        if primary_span {
+                            v.lazy_text(true)
+                        } else {
+                            v.source_text()
+                        }
+                    })
+                })?;
+                let resolver = crate::lazy::Resolver::new(Some(path.clone()));
+                assert_eq!(text.try_resolve(&resolver)?.as_ref(), expected);
+                if value.as_array().is_some_and(|parts| parts.len() == 1) && primary_span {
+                    assert!(matches!(text, crate::Text::Span(_)));
+                }
+                if let crate::Text::Source(_) = &text {
+                    std::fs::write(&path, b"null")?;
+                    assert!(text.try_resolve(&resolver).is_err());
+                    std::fs::write(&path, serde_json::to_vec(&value)?)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn selected_title_matches_full_text_join_without_part_roster() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("wire-title-parts");
+        let world = crate::test_world("wire-title-parts");
         let path = world.base.join("content.json");
         let mut many = vec![serde_json::json!({"text":""}); 4096];
         many.push(serde_json::json!({"text":"late"}));

@@ -3,7 +3,9 @@
 //! protobuf schema was recovered from the installed 2026.10.01-e373342 bundle; the corpus
 //! contains actual CLI-written data, not reconstructed protocol examples.
 use super::*;
-use crate::harness::store::bytes::ByteSource;
+use crate::harness::store::{bytes::ByteSource, document::Fields, sqlite::Cells};
+use crate::json::JsonView;
+use crate::lazy::Text;
 use std::io::Read;
 
 pub(super) fn roots(home: &Path) -> Vec<PathBuf> {
@@ -25,14 +27,10 @@ pub(super) fn discover(home: &Path, out: &mut Vec<SessionRef>) {
             let result = conn.read(|conn| -> Result<SessionRef> {
                 let mut collector = Count::default();
                 let r = SessionRef::new("cli:", Harness::Cursor, path);
-                let session = read_with_reads(
-                    conn,
-                    &r,
-                    &ParseOptions::default(),
-                    true,
-                    Some(conn.reads()),
-                    &mut collector,
-                )?;
+                let session = read_with_reads(conn, &r, &ParseOptions::lazy(), true, conn.reads(), &mut collector)?;
+                if let Some(error) = collector.error {
+                    return Err(error);
+                }
                 Ok(SessionRef {
                     id: session.id,
                     cwd: session.cwd,
@@ -53,22 +51,77 @@ pub(super) fn discover(home: &Path, out: &mut Vec<SessionRef>) {
     }
 }
 
+/// Discovery's sink: turns, and the title of the first human prompt (its text blocks, each without
+/// leading whitespace, joined by newlines, the first 96 characters).
 #[derive(Default)]
 struct Count {
     count: usize,
     title: Option<String>,
+    error: Option<anyhow::Error>,
 }
 impl MessageSink for Count {
     fn message(&mut self, message: Message) -> Flow {
         self.count += usize::from(message.is_turn());
         if self.title.is_none() && message.kind == MessageKind::Prompt && message.origin == Origin::Human {
-            self.title = message
-                .text()
-                .filter(|text| !text.trim().is_empty())
-                .map(|text| crate::ir::truncate(&text, 80));
+            match title(&message) {
+                Ok(title) => {
+                    self.title = Some(title)
+                        .filter(|text| !text.trim().is_empty())
+                        .map(|text| crate::ir::truncate(&text, 80))
+                }
+                Err(error) => {
+                    self.error.get_or_insert(error);
+                    return Flow::Stop;
+                }
+            }
         }
         Flow::Continue
     }
+}
+fn title(message: &Message) -> Result<String> {
+    const MAX: usize = 96;
+    #[derive(Debug, thiserror::Error)]
+    #[error("Cursor CLI title prefix complete")]
+    struct Complete;
+    let mut title = String::new();
+    let mut chars = 0;
+    for block in &message.content {
+        let Block::Text { text } = block else { continue };
+        // Each block's prefix without leading whitespace; a blank block counts as one space.
+        let mut part = String::new();
+        let mut taken = 0;
+        let mut trimming = true;
+        let result = text.try_for_each_chunk(&crate::lazy::Resolver::new(None), 4096, |chunk| {
+            for ch in chunk.chars() {
+                if trimming && ch.is_whitespace() {
+                    continue;
+                }
+                trimming = false;
+                if taken == MAX - chars {
+                    return Err(Complete.into());
+                }
+                part.push(ch);
+                taken += 1;
+            }
+            Ok(())
+        });
+        match result {
+            Err(error) if error.downcast_ref::<Complete>().is_some() => {}
+            other => other?,
+        }
+        if part.is_empty() {
+            part.push(' ');
+        }
+        if !title.is_empty() && chars < MAX {
+            title.push('\n');
+            chars += 1;
+        }
+        for ch in part.chars().take(MAX - chars) {
+            title.push(ch);
+            chars += 1;
+        }
+    }
+    Ok(title)
 }
 
 pub(super) fn stream(
@@ -77,7 +130,7 @@ pub(super) fn stream(
     opts: &ParseOptions,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
-    read_with_reads(conn, r, opts, false, Some(conn.reads()), sink)
+    read_with_reads(conn, r, opts, false, conn.reads(), sink)
 }
 
 #[cfg(test)]
@@ -88,7 +141,7 @@ fn read(
     counting: bool,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
-    read_with_reads(conn, r, opts, counting, None, sink)
+    read_with_reads(conn, r, opts, counting, &Default::default(), sink)
 }
 
 fn read_with_reads(
@@ -96,34 +149,22 @@ fn read_with_reads(
     r: &SessionRef,
     opts: &ParseOptions,
     counting: bool,
-    original_reads: Option<&crate::source::ReadSet>,
+    reads: &crate::source::ReadSet,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
-    // Cursor's fact reducers consume native summary/context/error markers through the IR;
-    // its record_metadata and part_metadata bags have no fact keys. Session modes stay intact.
-    let lazy = opts.spans && !opts.wants_full_extra();
-    let captured = if counting || lazy {
-        // Capture the compound provenance before the first SQL read establishes its snapshot.
-        // A checkpoint can leave the DB tuple unchanged while the WAL or optional ACP head changes.
-        let mut reads = original_reads.cloned().unwrap_or_default();
-        let mut wal = r.path.as_os_str().to_os_string();
-        wal.push("-wal");
-        reads.record(&PathBuf::from(wal));
-        if let Some(meta) = crate::source::cursor_cli_metadata(r) {
-            reads.record(&meta);
-        }
-        Some(crate::json::JsonSource::capture_with_reads(&r.path, &reads)?)
-    } else {
-        None
-    };
-    // One operation-owned arena serves every retained message range; no per-message descriptor
-    // or private-file growth. Counting releases each transient blob after its bounded projection.
-    let arena = lazy.then(|| ByteSource::arena().map(std::sync::Arc::new)).transpose()?;
-    let result = read_snapshot(conn, r, opts, counting, sink, captured.as_ref(), arena.as_ref());
-    // Even Stop and callback errors must not hide a source mutation before publication.
-    if let Some(captured) = &captured {
-        captured.check()?;
+    // The compound provenance is captured before the first SQL read establishes its snapshot: a
+    // checkpoint can leave the DB unchanged while the WAL or the optional ACP head changes.
+    let mut reads = reads.clone();
+    let mut wal = r.path.as_os_str().to_os_string();
+    wal.push("-wal");
+    reads.record(&PathBuf::from(wal));
+    if let Some(meta) = crate::source::cursor_cli_metadata(r) {
+        reads.record(&meta);
     }
+    let cells = Cells::new(conn, &r.path, &reads, "blobs")?;
+    let result = read_snapshot(conn, r, opts, counting, sink, &cells);
+    // Even Stop and callback errors must not hide a source mutation before publication.
+    cells.check()?;
     result
 }
 
@@ -133,8 +174,7 @@ fn read_snapshot(
     opts: &ParseOptions,
     counting: bool,
     sink: &mut dyn MessageSink,
-    captured: Option<&crate::json::JsonSource>,
-    arena: Option<&std::sync::Arc<ByteSource>>,
+    cells: &Cells,
 ) -> Result<Session> {
     let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
     let encoded: String = conn.query_row("SELECT value FROM meta WHERE key='0'", [], |row| row.get(0))?;
@@ -268,43 +308,26 @@ fn read_snapshot(
     if let Some(error) = sink.take_error() {
         return Err(error);
     }
+    // Cursor's fact reducers read native summary/context/error markers through the IR; the
+    // record and part metadata bags are full-metadata demands.
+    let demand = Demand {
+        spans: opts.spans,
+        extra: opts.wants_full_extra(),
+        complete: opts.complete,
+    };
     let mut emit = |id: &str| -> Result<Flow> {
-        let message = if let Some(captured) = captured {
-            let (backing, offset, length) = if let Some(arena) = arena {
-                let (offset, length) =
-                    crate::harness::store::sqlite::append_cell(conn, "blobs", "data", blob_rowid(conn, id)?, arena)?;
-                (arena.clone(), offset, length)
-            } else {
-                let backing = std::sync::Arc::new(blob(conn, id)?);
-                let length = backing.len()?;
-                (backing, 0, length)
-            };
-            captured.read_backing_value(backing, offset, length, |view| {
-                if counting {
-                    Ok(message(projection::view(view)?, false, false))
-                } else {
-                    let message = selected::message(view)?;
-                    if let Some(model) = selected::model(view)? {
-                        session.model.get_or_insert(model);
-                    }
-                    Ok(message)
-                }
-            })?
-        } else {
-            let source = blob(conn, id)?;
-            let value: Value = serde_json::from_reader(source.reader()?)?;
-            if let Some(model) = value
-                .pointer("/providerOptions/cursor/systemPromptFingerprint/model")
-                .and_then(Value::as_str)
-            {
-                session.model.get_or_insert_with(|| model.to_owned());
-            }
-            message(value, opts.extra, opts.complete)
+        let decoded = match cells.row(conn, "blobs", "data", blob_rowid(conn, id)?)? {
+            Some(cell) => cells.read(cell, |view| Ok((message(view, demand)?, model(view)?)))?,
+            None => None,
         };
-        if let Some(message) = message {
-            return Ok(sink.message(message));
+        let (message, model) = decoded.with_context(|| format!("Cursor CLI message blob {id} is not JSON"))?;
+        if let Some(model) = model {
+            session.model.get_or_insert(model);
         }
-        Ok(Flow::Continue)
+        match message {
+            Some(message) => Ok(sink.message(message)),
+            None => Ok(Flow::Continue),
+        }
     };
     // Archives precede the current prompt. Preserve each archive's ordered message references;
     // the summary_message field is represented in the current prompt, not emitted twice.
@@ -455,33 +478,87 @@ fn encode_hex(bytes: &[u8]) -> String {
     text
 }
 
-fn take_string(object: &mut Map<String, Value>, key: &str) -> Option<String> {
-    match object.remove(key) {
-        Some(Value::String(text)) => Some(text),
-        _ => None,
-    }
+/// What a read resolves: long text and arguments held in the store (`spans`), the record and part
+/// metadata bags (`extra`), and every record, carriers included (`complete`).
+#[derive(Clone, Copy)]
+struct Demand {
+    spans: bool,
+    extra: bool,
+    complete: bool,
 }
-fn message(mut value: Value, extra: bool, complete: bool) -> Option<Message> {
-    let original = complete.then(|| value.clone());
-    let object = value.as_object_mut()?;
-    let role = match object.get("role").and_then(Value::as_str)? {
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        "tool" => Role::Tool,
-        "system" | "developer" => Role::System,
-        _ => return None,
+
+fn string(view: Option<JsonView<'_>>) -> Result<Option<String>> {
+    Ok(match view {
+        Some(view) => view.text(false)?.and_then(|text| match text {
+            Text::Inline(s) => Some(s),
+            _ => None,
+        }),
+        None => None,
+    })
+}
+fn path<'a>(view: Option<JsonView<'a>>, keys: &[&str]) -> Result<Option<JsonView<'a>>> {
+    let mut view = view;
+    for key in keys {
+        view = match view {
+            Some(v) => v.get(key)?,
+            None => return Ok(None),
+        };
+    }
+    Ok(view)
+}
+fn flag(view: Option<JsonView<'_>>) -> Result<bool> {
+    Ok(match view {
+        Some(view) => view.as_bool()? == Some(true),
+        None => false,
+    })
+}
+
+/// The model the record's system prompt was fingerprinted for.
+fn model(view: JsonView<'_>) -> Result<Option<String>> {
+    string(path(
+        Some(view),
+        &["providerOptions", "cursor", "systemPromptFingerprint", "model"],
+    )?)
+}
+
+/// An object's entries as an owned map holds them, less `taken` keys removed in order (an
+/// order-preserving map's remove moves the last entry into the hole). Only the rest is resolved.
+fn remainder(view: JsonView<'_>, taken: &[&str]) -> Result<Map<String, Value>> {
+    let mut entries = Vec::new();
+    view.for_each_entry(|key, value| {
+        entries.push((key.to_owned(), value));
+        Ok(())
+    })?;
+    for key in taken {
+        if let Some(position) = entries.iter().position(|(name, _)| name == key) {
+            entries.swap_remove(position);
+        }
+    }
+    entries
+        .into_iter()
+        .map(|(key, value)| Ok((key, value.resolve()?.into_owned())))
+        .collect()
+}
+
+/// One message record (`{role, id, content, providerOptions, ...}`); None for an unknown role or
+/// an empty message the demand does not carry.
+fn message(view: JsonView<'_>, demand: Demand) -> Result<Option<Message>> {
+    let Some(fields) = Fields::parse(view, &["role", "id", "content", "providerOptions"])? else {
+        return Ok(None);
     };
-    let cursor = object.get("providerOptions").and_then(|v| v.get("cursor"));
-    let injected = role == Role::System
-        || (role == Role::User
-            && cursor
-                .and_then(|v| v.get("requestContextCompleteness"))
-                .is_some_and(|v| !v.is_null()));
-    let summary = cursor.and_then(|v| v.get("isSummary")).and_then(Value::as_bool) == Some(true);
-    let is_error = cursor
-        .and_then(|v| v.pointer("/highLevelToolCallResult/isError"))
-        .and_then(Value::as_bool)
-        == Some(true);
+    let role = match fields.string("role")?.as_deref() {
+        Some("user") => Role::User,
+        Some("assistant") => Role::Assistant,
+        Some("tool") => Role::Tool,
+        Some("system" | "developer") => Role::System,
+        _ => return Ok(None),
+    };
+    let cursor = path(fields.get("providerOptions"), &["cursor"])?;
+    let context = path(cursor, &["requestContextCompleteness"])?;
+    let injected =
+        role == Role::System || (role == Role::User && context.map(|v| v.is_null()).transpose()? == Some(false));
+    let summary = flag(path(cursor, &["isSummary"])?)?;
+    let is_error = flag(path(cursor, &["highLevelToolCallResult", "isError"])?)?;
     let mut message = if injected {
         Message::of_kind(role, MessageKind::InjectedContext, Origin::Harness)
     } else if summary {
@@ -489,111 +566,154 @@ fn message(mut value: Value, extra: bool, complete: bool) -> Option<Message> {
     } else {
         Message::new(role)
     };
-    message.id = take_string(object, "id");
-    let content = object.remove("content").unwrap_or(Value::Null);
-    let parts = match content {
-        Value::String(text) => {
-            if !text.is_empty() {
-                message.content.push(Block::Text { text: text.into() });
-            }
-            Vec::new()
-        }
-        Value::Array(parts) => parts,
-        _ => Vec::new(),
+    message.id = fields.string("id")?;
+    let spans = demand.spans;
+    let text = |view: Option<JsonView<'_>>| -> Result<Option<Text>> {
+        Ok(match view {
+            Some(view) => view.lazy_text(spans)?,
+            None => None,
+        })
     };
-    for mut part in parts {
-        let Some(part) = part.as_object_mut() else { continue };
-        match part.get("type").and_then(Value::as_str).unwrap_or("") {
-            "text" => {
-                if let Some(text) = take_string(part, "text").filter(|s| !s.is_empty()) {
-                    message.content.push(Block::Text { text: text.into() });
+    let nonempty = |text: &Text| !matches!(text, Text::Inline(s) if s.is_empty());
+    let content = fields.get("content");
+    if let Some(content) = text(content)? {
+        if nonempty(&content) {
+            message.content.push(Block::Text { text: content });
+        }
+    } else if let Some(parts) = content.map(|v| v.array()).transpose()?.flatten() {
+        for part in parts {
+            let part = part?;
+            let Some(fields) = Fields::parse(
+                part,
+                &[
+                    "type",
+                    "text",
+                    "signature",
+                    "toolCallId",
+                    "toolName",
+                    "args",
+                    "result",
+                    "isError",
+                    "mimeType",
+                    "filename",
+                ],
+            )?
+            else {
+                continue;
+            };
+            let kind = fields.string("type")?.unwrap_or_default();
+            let taken: &[&str] = match kind.as_str() {
+                "text" => {
+                    if let Some(text) = text(fields.get("text"))?.filter(nonempty) {
+                        message.content.push(Block::Text { text });
+                    }
+                    &["text"]
                 }
-            }
-            "reasoning" | "redacted-reasoning" => {
-                let redacted = part.get("type").and_then(Value::as_str) == Some("redacted-reasoning");
-                message.content.push(Block::Thinking {
-                    text: take_string(part, "text").unwrap_or_default().into(),
-                    signature: take_string(part, "signature"),
-                    encrypted: None,
-                    redacted,
-                });
-            }
-            "tool-call" => message.content.push(Block::ToolUse {
-                id: take_string(part, "toolCallId").unwrap_or_default(),
-                name: take_string(part, "toolName").unwrap_or_else(|| "tool".into()),
-                input: part.remove("args").unwrap_or(Value::Null).into(),
-                namespace: None,
-            }),
-            "tool-result" => {
-                let result = part.remove("result").unwrap_or(Value::Null);
-                let content = match result {
-                    Value::String(text) => text,
-                    Value::Null => String::new(),
-                    other => other.to_string(),
-                };
-                message.content.push(Block::ToolResult {
-                    tool_use_id: take_string(part, "toolCallId").unwrap_or_default(),
-                    content: content.into(),
-                    is_error: is_error || part.get("isError").and_then(Value::as_bool) == Some(true),
-                    tool_name: take_string(part, "toolName"),
-                    status: None,
-                    details: None,
-                });
-            }
-            "image" => message.content.push(Block::Image {
-                media_type: take_string(part, "mimeType"),
-                data_ref: Some("inline:cursor-cli".into()),
-            }),
-            "file" => message.content.push(Block::File {
-                mime: take_string(part, "mimeType"),
-                path: take_string(part, "filename"),
-                source: None,
-            }),
-            _ => {
-                if complete {
+                "reasoning" | "redacted-reasoning" => {
+                    message.content.push(Block::Thinking {
+                        text: text(fields.get("text"))?.unwrap_or_default(),
+                        signature: fields.string("signature")?,
+                        encrypted: None,
+                        redacted: kind == "redacted-reasoning",
+                    });
+                    &["text", "signature"]
+                }
+                "tool-call" => {
+                    message.content.push(Block::ToolUse {
+                        id: fields.string("toolCallId")?.unwrap_or_default(),
+                        name: fields.string("toolName")?.unwrap_or_else(|| "tool".into()),
+                        input: match fields.get("args") {
+                            Some(args) => args.argument(spans)?,
+                            None => Value::Null.into(),
+                        },
+                        namespace: None,
+                    });
+                    &["toolCallId", "toolName", "args"]
+                }
+                "tool-result" => {
+                    // Native results are strings; any other value keeps its compact JSON.
+                    let content = match fields.get("result") {
+                        None => Text::default(),
+                        Some(result) => match result.lazy_text(spans)? {
+                            Some(text) => text,
+                            None if result.is_null()? => Text::default(),
+                            None => result.resolve()?.to_string().into(),
+                        },
+                    };
+                    message.content.push(Block::ToolResult {
+                        tool_use_id: fields.string("toolCallId")?.unwrap_or_default(),
+                        content,
+                        is_error: is_error || flag(fields.get("isError"))?,
+                        tool_name: fields.string("toolName")?,
+                        status: None,
+                        details: None,
+                    });
+                    &["result", "toolCallId", "toolName"]
+                }
+                "image" => {
+                    message.content.push(Block::Image {
+                        media_type: fields.string("mimeType")?,
+                        data_ref: Some("inline:cursor-cli".into()),
+                    });
+                    &["mimeType"]
+                }
+                "file" => {
+                    message.content.push(Block::File {
+                        mime: fields.string("mimeType")?,
+                        path: fields.string("filename")?,
+                        source: None,
+                    });
+                    &["mimeType", "filename"]
+                }
+                _ => {
+                    if demand.complete {
+                        message
+                            .harness_extra_mut(Harness::Cursor)
+                            .entry("unhandled_parts")
+                            .or_insert_with(|| Value::Array(Vec::new()))
+                            .as_array_mut()
+                            .context("unhandled_parts")?
+                            .push(part.resolve()?.into_owned());
+                    }
+                    &[]
+                }
+            };
+            if demand.extra && !demand.complete {
+                let rest = remainder(part, taken)?;
+                if rest.len() > 1 {
                     message
                         .harness_extra_mut(Harness::Cursor)
-                        .entry("unhandled_parts")
+                        .entry("part_metadata")
                         .or_insert_with(|| Value::Array(Vec::new()))
-                        .as_array_mut()?
-                        .push(Value::Object(std::mem::take(part)));
+                        .as_array_mut()
+                        .context("part_metadata")?
+                        .push(Value::Object(rest));
                 }
             }
-        }
-        if extra && !complete && part.len() > 1 {
-            message
-                .harness_extra_mut(Harness::Cursor)
-                .entry("part_metadata")
-                .or_insert_with(|| Value::Array(Vec::new()))
-                .as_array_mut()?
-                .push(Value::Object(std::mem::take(part)));
         }
     }
     if message.content.is_empty() {
-        if !complete {
-            return None;
+        if !demand.complete {
+            return Ok(None);
         }
         message.kind = MessageKind::Carrier;
         message.origin = Origin::Harness;
     }
-    if extra || complete {
-        object.remove("role");
-        if !object.is_empty() {
+    if demand.extra || demand.complete {
+        let rest = remainder(view, &["id", "content", "role"])?;
+        if !rest.is_empty() {
             message
                 .harness_extra_mut(Harness::Cursor)
-                .insert("record_metadata".into(), Value::Object(std::mem::take(object)));
+                .insert("record_metadata".into(), Value::Object(rest));
         }
     }
-    if let Some(original) = original {
+    if demand.complete {
         message
             .harness_extra_mut(Harness::Cursor)
-            .insert("record".into(), original);
+            .insert("record".into(), view.resolve()?.into_owned());
     }
-    (!message.content.is_empty() || !message.extra.is_empty()).then_some(message)
+    Ok((!message.content.is_empty() || !message.extra.is_empty()).then_some(message))
 }
-
-mod projection;
-mod selected;
 
 #[cfg(test)]
 mod tests {
@@ -616,8 +736,10 @@ mod tests {
         out.extend(bytes);
         out
     }
-    fn fixture(root: Vec<u8>, messages: &[(u8, Vec<u8>)]) -> (Connection, SessionRef) {
-        let conn = Connection::open_in_memory().unwrap();
+    fn fixture(root: Vec<u8>, messages: &[(u8, Vec<u8>)], dir: &Path) -> (Connection, SessionRef) {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("store.db");
+        let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE blobs(id TEXT PRIMARY KEY,data BLOB); CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);",
         )
@@ -640,7 +762,7 @@ mod tests {
             )
             .unwrap();
         }
-        (conn, SessionRef::new("cli:fixture", Harness::Cursor, ":memory:"))
+        (conn, SessionRef::new("cli:fixture", Harness::Cursor, path))
     }
     #[test]
     fn native_capture_counts_and_tool_links_match_stream() {
@@ -680,6 +802,7 @@ mod tests {
     }
     #[test]
     fn archives_precede_live_messages_and_unknown_mode_is_retained() {
+        let world = crate::test_world("cursor-cli-archives");
         for archive_field in [11, 13] {
             let mut root = field(archive_field, &[1; 32]);
             root.extend(field(1, &[3; 32]));
@@ -689,7 +812,11 @@ mod tests {
             let newer = json!({"role":"assistant","content":[{"type":"text","text":"newer"}]})
                 .to_string()
                 .into_bytes();
-            let (conn, r) = fixture(root, &[(1, archive), (2, older), (3, newer)]);
+            let (conn, r) = fixture(
+                root,
+                &[(1, archive), (2, older), (3, newer)],
+                &world.base.join(archive_field.to_string()),
+            );
             let mut sink = CollectSink::default();
             let session = read(&conn, &r, &ParseOptions::default(), false, &mut sink).unwrap();
             assert_eq!(sink.messages.len(), 2);
@@ -698,50 +825,126 @@ mod tests {
             assert_eq!(session.harness_extra(Harness::Cursor).unwrap()["cli_mode_raw"], 99);
         }
     }
+    /// One record decoded from an owned value.
+    fn decode(value: &Value, extra: bool, complete: bool) -> Option<Message> {
+        let demand = Demand {
+            spans: false,
+            extra,
+            complete,
+        };
+        message(JsonView::owned(value), demand).unwrap()
+    }
     #[test]
-    fn projected_count_obeys_injected_and_summary_semantics() {
+    fn count_obeys_injected_and_summary_semantics_and_titles_the_first_prompt() {
+        let world = crate::test_world("cursor-cli-count");
         let cases = [
-            json!({"role":"user","content":"injected","providerOptions":{"cursor":{"requestContextCompleteness":{}}}}),
-            json!({"role":"user","content":"summary","providerOptions":{"cursor":{"isSummary":true}}}),
-            json!({"role":"assistant","content":[{"type":"tool-call","toolCallId":"call","toolName":"Read","args":{"large":"x".repeat(2_000_000)}}]}),
-            json!({"role":"tool","content":[{"type":"tool-result","toolCallId":"call","result":"x".repeat(2_000_000)}]}),
-            json!({"role":"user","content":"   "}),
+            (
+                json!({"role":"user","content":"injected","providerOptions":{"cursor":{"requestContextCompleteness":{}}}}),
+                MessageKind::InjectedContext,
+                false,
+            ),
+            (
+                json!({"role":"user","content":"summary","providerOptions":{"cursor":{"isSummary":true}}}),
+                MessageKind::CompactionSummary,
+                false,
+            ),
+            (
+                json!({"role":"assistant","content":[{"type":"tool-call","toolCallId":"call","toolName":"Read","args":{"large":"x".repeat(2_000_000)}}]}),
+                MessageKind::Reply,
+                true,
+            ),
+            (
+                json!({"role":"tool","content":[{"type":"tool-result","toolCallId":"call","result":"x".repeat(2_000_000)}]}),
+                MessageKind::for_role(Role::Tool),
+                false,
+            ),
+            (json!({"role":"user","content":"   "}), MessageKind::Prompt, true),
         ];
-        for value in cases {
-            let full = message(value.clone(), false, false).unwrap();
-            let projected = message(projection::read(value.to_string().as_bytes()).unwrap(), false, false).unwrap();
-            assert_eq!((full.kind, full.is_turn()), (projected.kind, projected.is_turn()));
+        for (value, kind, turn) in &cases {
+            let message = decode(value, false, false).unwrap();
+            assert_eq!((message.kind, message.is_turn()), (*kind, *turn), "{value}");
         }
+        let prompt = json!({"role":"user","content":[{"type":"text","text":"  first line"},{"type":"image"},{"type":"text","text":format!("\n{}", "y".repeat(200))}]});
+        let root = (1..=3).flat_map(|id| field(1, &[id; 32])).collect();
+        let records = [&cases[4].0, &prompt, &cases[2].0].map(|v| v.to_string().into_bytes());
+        let records: Vec<_> = records
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| ((i + 1) as u8, r))
+            .collect();
+        let (conn, r) = fixture(root, &records, &world.base);
+        let mut count = Count::default();
+        read(&conn, &r, &ParseOptions::lazy(), true, &mut count).unwrap();
+        assert_eq!(count.count, 3);
+        // A blank first prompt titles nothing, so the next prompt titles the session.
+        let expected = crate::ir::truncate(&format!("first line\n{}", "y".repeat(85)), 80);
+        assert_eq!(count.title.as_deref(), Some(expected.as_str()));
+        let only = Message {
+            content: vec![
+                Block::Text {
+                    text: "  first line".into(),
+                },
+                Block::Text {
+                    text: format!("\n{}", "y".repeat(200)).into(),
+                },
+            ],
+            ..Message::new(Role::User)
+        };
+        assert_eq!(title(&only).unwrap(), format!("first line\n{}", "y".repeat(85)));
         let empty = json!({"role":"assistant","content":[],"providerOptions":{"cursor":{"opaque":1}}});
-        assert!(message(empty.clone(), true, false).is_none());
-        assert!(!message(empty, true, true).unwrap().is_turn());
+        assert!(decode(&empty, true, false).is_none());
+        assert!(!decode(&empty, true, true).unwrap().is_turn());
         let v = json!({"role":"assistant","content":[{"type":"reasoning","text":"thought","providerOptions":{"opaque":42}}]});
         assert_eq!(
-            message(v.clone(), true, false)
-                .unwrap()
-                .harness_extra(Harness::Cursor)
-                .unwrap()["part_metadata"][0]["providerOptions"]["opaque"],
+            decode(&v, true, false).unwrap().harness_extra(Harness::Cursor).unwrap()["part_metadata"][0]
+                ["providerOptions"]["opaque"],
             42
         );
         assert_eq!(
-            message(v.clone(), true, true)
-                .unwrap()
-                .harness_extra(Harness::Cursor)
-                .unwrap()["record"],
+            decode(&v, true, true).unwrap().harness_extra(Harness::Cursor).unwrap()["record"],
             v
         );
     }
     #[test]
+    fn metadata_bags_keep_an_owned_map_s_order_after_its_removals() {
+        let v =
+            json!({"role":"user","a":1,"id":"m","b":2,"content":[{"type":"text","x":1,"text":"t","y":2,"z":3}],"c":3});
+        let extra = decode(&v, true, false).unwrap();
+        let bag = extra.harness_extra(Harness::Cursor).unwrap();
+        let mut owned = v.as_object().unwrap().clone();
+        for key in ["id", "content", "role"] {
+            owned.remove(key);
+        }
+        assert_eq!(
+            serde_json::to_string(&bag["record_metadata"]).unwrap(),
+            serde_json::to_string(&owned).unwrap()
+        );
+        let mut part = v["content"][0].as_object().unwrap().clone();
+        part.remove("text");
+        assert_eq!(
+            serde_json::to_string(&bag["part_metadata"][0]).unwrap(),
+            serde_json::to_string(&part).unwrap()
+        );
+    }
+    #[test]
     fn malformed_wire_and_missing_blob_fail_while_stop_is_demand_bounded() {
-        for root in [vec![0], vec![10, 32, 1], vec![128; 11], field(1, &[1; 31])] {
-            let (conn, r) = fixture(root, &[]);
+        let world = crate::test_world("cursor-cli-malformed");
+        for (index, root) in [vec![0], vec![10, 32, 1], vec![128; 11], field(1, &[1; 31])]
+            .into_iter()
+            .enumerate()
+        {
+            let (conn, r) = fixture(root, &[], &world.base.join(index.to_string()));
             assert!(read(&conn, &r, &ParseOptions::default(), false, &mut Count::default()).is_err());
         }
-        let (conn, r) = fixture(field(1, &[1; 32]), &[]);
+        let (conn, r) = fixture(field(1, &[1; 32]), &[], &world.base.join("missing"));
         assert!(read(&conn, &r, &ParseOptions::default(), false, &mut Count::default()).is_err());
         let mut root = field(1, &[1; 32]);
         root.extend(field(1, &[2; 32]));
-        let (conn, r) = fixture(root, &[(1, br#"{"role":"user","content":"one"}"#.to_vec())]);
+        let (conn, r) = fixture(
+            root,
+            &[(1, br#"{"role":"user","content":"one"}"#.to_vec())],
+            &world.base.join("stop"),
+        );
         struct Stop;
         impl MessageSink for Stop {
             fn message(&mut self, _: Message) -> Flow {
@@ -749,24 +952,17 @@ mod tests {
             }
         }
         assert!(read(&conn, &r, &ParseOptions::default(), false, &mut Stop).is_ok());
-        for text in [
-            r#"{"role":"user","content":"ok","ignored":"\uD800"}"#,
-            r#"{"role":"user","content":"ok","ignored":1e9999}"#,
-            r#"{"role":"user","content":"ok"} garbage"#,
-        ] {
-            assert!(projection::read(text.as_bytes()).is_err());
-        }
     }
     #[test]
     fn acp_sidecar_creation_change_and_identity_invalidate() {
-        let world = cv_testkit::World::in_process("cursor-acp");
+        let world = crate::test_world("cursor-acp");
         let dir = &world.base;
         std::fs::create_dir_all(dir).unwrap();
         let (conn, mut reference) = fixture(
             field(1, &[1; 32]),
             &[(1, br#"{"role":"user","content":"one"}"#.to_vec())],
+            dir,
         );
-        reference.path = dir.join("store.db");
         struct Reads(crate::source::ReadSet);
         impl MessageSink for Reads {
             fn message(&mut self, _: Message) -> Flow {
@@ -796,12 +992,16 @@ mod tests {
     }
     #[test]
     fn updated_time_observes_active_wal() {
-        let world = cv_testkit::World::in_process("cursor-cli-wal-time");
+        let world = crate::test_world("cursor-cli-wal-time");
         std::fs::create_dir_all(&world.base).unwrap();
-        let (conn, mut reference) = fixture(Vec::new(), &[]);
-        reference.path = world.base.join("store.db");
+        let (conn, reference) = fixture(Vec::new(), &[], &world.base);
         for (name, seconds) in [("store.db", 1), ("store.db-wal", 2)] {
-            let file = std::fs::File::create(world.base.join(name)).unwrap();
+            let file = std::fs::File::options()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(world.base.join(name))
+                .unwrap();
             file.set_times(
                 std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
             )
@@ -810,23 +1010,13 @@ mod tests {
         let session = read(&conn, &reference, &ParseOptions::bulk(), false, &mut Count::default()).unwrap();
         assert_eq!(session.updated_at.unwrap().timestamp(), 2);
     }
-    fn disk_fixture(root: Vec<u8>, messages: &[(u8, Vec<u8>)], dir: &Path) -> (Connection, SessionRef) {
-        std::fs::create_dir_all(dir).unwrap();
-        let (memory, mut reference) = fixture(root, messages);
-        reference.path = dir.join("store.db");
-        memory
-            .execute("VACUUM INTO ?1", [reference.path.to_str().unwrap()])
-            .unwrap();
-        let disk = Connection::open(&reference.path).unwrap();
-        (disk, reference)
-    }
     #[test]
     fn cold_wal_adapter_preserves_original_sidecars_and_journal_guard() {
-        let world = cv_testkit::World::in_process("cursor-cli-cold-wal");
+        let world = crate::test_world("cursor-cli-cold-wal");
         let record = json!({"role":"user","content":"日本語\n".repeat(4096)})
             .to_string()
             .into_bytes();
-        let (conn, r) = disk_fixture(field(1, &[1; 32]), &[(1, record)], &world.base.join("source"));
+        let (conn, r) = fixture(field(1, &[1; 32]), &[(1, record)], &world.base.join("source"));
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
         drop(conn);
         let wal = r.path.with_file_name("store.db-wal");
@@ -860,8 +1050,8 @@ mod tests {
         assert!(!wal.exists() && !shm.exists());
     }
     #[test]
-    fn selected_large_fields_match_owned_messages_and_dataset() {
-        let world = cv_testkit::World::in_process("cursor-cli-selected");
+    fn lazy_and_bulk_demands_resolve_alike_and_stage_the_same_dataset() {
+        let world = crate::test_world("cursor-cli-selected");
         let big = "日本語\n".repeat(4096);
         let records = [
             json!({"role":"user","content":[{"type":"text","text":big}],"providerOptions":{"cursor":{"requestId":"request"}}}),
@@ -874,7 +1064,7 @@ mod tests {
             .enumerate()
             .map(|(i, v)| ((i + 1) as u8, v.to_string().into_bytes()))
             .collect();
-        let (_conn, reference) = disk_fixture(root, &records, &world.base.join("source"));
+        let (_conn, reference) = fixture(root, &records, &world.base.join("source"));
         let adapter = Cursor::with_cli_home(&world.base);
         let owned = crate::stream::collect_with(&adapter, &reference, &ParseOptions::bulk()).unwrap();
         let mut lazy = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy()).unwrap();
@@ -920,8 +1110,8 @@ mod tests {
         );
     }
     #[test]
-    fn selected_schema_edges_and_ignored_invalid_values_match_owned_acceptance() {
-        let world = cv_testkit::World::in_process("cursor-cli-selected-edges");
+    fn schema_edges_and_invalid_records_resolve_alike_across_demands() {
+        let world = crate::test_world("cursor-cli-selected-edges");
         let cases = [
             r#"{"role":"user","content":"first","content":"last","providerOptions":{"cursor":{"requestContextCompleteness":false,"isSummary":true}}}"#,
             r#"{"role":"developer","content":[{"type":"text","text":""},{"type":"unknown","opaque":7},{"type":"redacted-reasoning","text":null},{"type":"image","mimeType":false},{"type":"file","filename":"a"}]}"#,
@@ -931,7 +1121,7 @@ mod tests {
             r#"{"role":"user","content":"ok"} garbage"#,
         ];
         for (index, record) in cases.into_iter().enumerate() {
-            let (conn, reference) = disk_fixture(
+            let (conn, reference) = fixture(
                 field(1, &[1; 32]),
                 &[(1, record.as_bytes().to_vec())],
                 &world.base.join(index.to_string()),
@@ -956,7 +1146,7 @@ mod tests {
     }
     #[test]
     fn facts_preserve_doctor_compaction_affordance_and_session_facts() {
-        let world = cv_testkit::World::in_process("cursor-cli-facts");
+        let world = crate::test_world("cursor-cli-facts");
         let big = "日本語\n".repeat(8192);
         let values = [
             json!({"role":"user","content":"question"}),
@@ -971,7 +1161,7 @@ mod tests {
             .enumerate()
             .map(|(i, value)| ((i + 1) as u8, value.to_string().into_bytes()))
             .collect();
-        let (conn, reference) = disk_fixture(root, &records, &world.base.join("source"));
+        let (conn, reference) = fixture(root, &records, &world.base.join("source"));
         let mut reports = Vec::new();
         let mut sessions = Vec::new();
         let mut counts = Vec::new();
@@ -1022,9 +1212,9 @@ mod tests {
     }
     #[test]
     fn wal_guard_survives_lazy_blob_arguments_and_intentional_stop() {
-        let world = cv_testkit::World::in_process("cursor-cli-guard");
+        let world = crate::test_world("cursor-cli-guard");
         let record=json!({"role":"assistant","content":[{"type":"tool-call","toolCallId":"call","toolName":"Read","args":{"body":"x".repeat(8192)}},{"type":"text","text":"日本語\n".repeat(4096)}]}).to_string().into_bytes();
-        let (conn, reference) = disk_fixture(field(1, &[1; 32]), &[(1, record)], &world.base.join("source"));
+        let (conn, reference) = fixture(field(1, &[1; 32]), &[(1, record)], &world.base.join("source"));
         let mut retained = CollectSink::default();
         read(&conn, &reference, &ParseOptions::lazy(), false, &mut retained).unwrap();
         let input = match &retained.messages[0].content[0] {

@@ -577,22 +577,19 @@ pub fn stage_record(
         failed: false,
     };
     let counted_query = query.is_some_and(crate::SessionQuery::needs_counted);
-    let source = counted_query.then(|| crate::source::Probe::default().snapshot(r));
-    let read = if counted_query {
-        crate::stream::stream_counting(adapter, r, &crate::ParseOptions::lazy(), &mut sink)
-    } else {
-        crate::stream::stream_counted(adapter, r, &crate::ParseOptions::lazy(), &mut sink)
-            .map(|session| (session, None))
-    };
+    let read = crate::stream::stream_counted(
+        adapter,
+        r,
+        &crate::ParseOptions::lazy(),
+        &mut sink,
+        crate::stream::Pass::RECORD,
+    );
     let (session, counted) = match read {
-        Ok(done) => done,
+        Ok(done) => (done.session, done.counted),
         Err(error) if sink.failed => return Err(error),
         Err(error) => return Err(InputError(error).into()),
     };
-    let counts = counted.as_ref().map(|c| c.counts.clone());
-    if let Some(counted) = counted {
-        counted.record_with_source(r, source.as_ref().expect("counted source"));
-    }
+    let counts = counted.filter(|_| counted_query).map(|c| c.counts);
     if sink.messages < min_messages {
         return Ok(None);
     }
@@ -854,7 +851,7 @@ mod tests {
 
     #[test]
     fn staged_records_match_collected_bytes_and_full_query_semantics() {
-        let world = cv_testkit::World::in_process("staged-dataset-equivalence");
+        let world = crate::test_world("staged-dataset-equivalence");
         let rich = "escaped\n\"🌙\" sk-abcDEF1234567890ghijkl".repeat(300);
         let path = world.write_session(
             "dataset",
@@ -983,7 +980,7 @@ mod tests {
 
     #[test]
     fn unreadable_demanded_tool_value_aborts_record() {
-        let world = cv_testkit::World::in_process("dataset-json-failure");
+        let world = crate::test_world("dataset-json-failure");
         let path = world.base.join("argument.json");
         let bytes = br#"{"rich":"selected value"}"#;
         std::fs::write(&path, bytes).unwrap();
@@ -1040,7 +1037,7 @@ mod tests {
                 Ok(session)
             }
         }
-        let world = cv_testkit::World::in_process("dataset-backed-text-late-model");
+        let world = crate::test_world("dataset-backed-text-late-model");
         let path = world.base.join("original");
         std::fs::write(&path, "snapshot").unwrap();
         let source = crate::json::JsonSource::capture(&path).unwrap();
@@ -1137,7 +1134,7 @@ mod tests {
                 Ok(session)
             }
         }
-        let world = cv_testkit::World::in_process("dataset-filter-before-render");
+        let world = crate::test_world("dataset-filter-before-render");
         let path = world.write_session("filtered", &[]);
         let r = crate::ir::SessionRef::new("filtered", Harness::Claude, path);
         let adapter = MissingText(world.base.join("missing-text"));
@@ -1187,7 +1184,7 @@ mod tests {
                 anyhow::bail!("late input unavailable")
             }
         }
-        let world = cv_testkit::World::in_process("staged-dataset-read-failure");
+        let world = crate::test_world("staged-dataset-read-failure");
         let path = world.write_session("fail", &[]);
         let r = crate::ir::SessionRef::new("fail", Harness::Claude, path);
         let error = stage_record(&Fails, &r, Format::Chatml, None, 0, None, &Default::default())
@@ -1320,7 +1317,7 @@ mod tests {
 
     #[test]
     fn session_only_system_prompts_are_leading_and_equivalent_copies_do_not_duplicate() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("dataset-system-metadata");
+        let world = crate::test_world("dataset-system-metadata");
         let path = world.base.join("source");
         std::fs::write(&path, "stable source")?;
         let reference = crate::SessionRef::new("system-metadata", Harness::OpenSession, path);
@@ -1409,7 +1406,7 @@ mod tests {
 
     #[test]
     fn checked_system_prompt_equivalence_spills_and_redacts_without_losing_changes() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("dataset-system-source");
+        let world = crate::test_world("dataset-system-source");
         let prompt = format!("{}\nprivate@example.com", "prompt λ ".repeat(512));
         let path = world.base.join("prompt.json");
         let wire = serde_json::to_vec(&prompt)?;
@@ -1475,7 +1472,7 @@ mod tests {
     }
     #[test]
     fn lmstudio_metadata_only_system_prompt_reaches_dataset_output() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("dataset-lmstudio-system");
+        let world = crate::test_world("dataset-lmstudio-system");
         let path = world.base.join("conversation.json");
         std::fs::write(
             &path,

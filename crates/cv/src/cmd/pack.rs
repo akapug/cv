@@ -45,10 +45,14 @@ pub(crate) fn cmd_pack(
     harness: Option<String>,
     limit: usize,
     out: Option<PathBuf>,
+    force: bool,
     thinking: cv_core::emit::ThinkingMode,
 ) -> Result<()> {
     if !matches!(format, "md" | "prompt" | "session") {
         bail!("unknown format {format:?} (use md, prompt, or session)");
+    }
+    if let (Some(path), "md" | "prompt") = (&out, format) {
+        crate::util::user_file_claim(path, force)?;
     }
     let to_h = match (format, &harness) {
         ("session", Some(s)) => Some(Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?),
@@ -94,8 +98,8 @@ pub(crate) fn cmd_pack(
 
     // 3. EMIT.
     match format {
-        "md" => write_text(&md_bundle(task, &sources, &rollup), out, "context pack"),
-        "prompt" => write_text(&prompt_bundle(task, &sources, &rollup), out, "context prompt"),
+        "md" => write_text(&md_bundle(task, &sources, &rollup), out, force, "context pack"),
+        "prompt" => write_text(&prompt_bundle(task, &sources, &rollup), out, force, "context prompt"),
         _ => emit_pack_session(task, &sources, &rollup, to_h.expect("validated above"), out, thinking),
     }
 }
@@ -103,7 +107,7 @@ pub(crate) fn cmd_pack(
 /// `CV_PACK_LLM` unset/empty/`0` → no LLM. `1`/`true` → provider default model. Anything else is
 /// taken as the model id.
 fn llm_from_env() -> Option<Option<String>> {
-    let v = std::env::var("CV_PACK_LLM").ok()?;
+    let v = cv_core::env::var("CV_PACK_LLM").ok()?;
     let v = v.trim();
     match v {
         "" | "0" | "false" => None,
@@ -466,7 +470,7 @@ fn best_window_and_ingest(
     r: &cv_core::SessionRef,
     task: &str,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
-    if !cv_core::events::needs_ingest(r, cv_core::events::file_mtime_ns(&r.path)) {
+    if !cv_core::events::needs_ingest(r) {
         return best_window(adapter, r, task);
     }
     let source = cv_core::source::Probe::default().snapshot(r);
@@ -917,10 +921,10 @@ fn emit_pack_session(
 }
 
 /// Write a text bundle to `--out` (with a stderr note) or stdout.
-fn write_text(text: &str, out: Option<PathBuf>, what: &str) -> Result<()> {
+fn write_text(text: &str, out: Option<PathBuf>, force: bool, what: &str) -> Result<()> {
     match out {
         Some(path) => {
-            std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+            crate::util::write_user_file(&path, text.as_bytes(), force)?;
             eprintln!("✦ wrote {what} → {}", path.display());
         }
         None => print!("{text}"),
@@ -1008,7 +1012,7 @@ mod tests {
 
     #[test]
     fn shared_pack_pass_matches_two_pass_excerpt_rows_and_facts_with_cold_and_warm_counts() -> Result<()> {
-        let world = cv_testkit::World::in_process("pack-shared-real");
+        let world = crate::test_world("pack-shared-real");
         let path = world.base.join("real.opensession.json");
         let mut session = Session::new("real", Harness::OpenSession);
         session.cwd = Some(world.base.clone());
@@ -1067,10 +1071,7 @@ mod tests {
         assert_eq!(adapter.calls.load(Ordering::Relaxed), session.messages.len());
         assert_eq!(format!("{:?}", rows(&r)), expected_rows);
         assert_eq!(event_facts(&rows(&r)), expected_facts);
-        assert!(!cv_core::events::needs_ingest(
-            &r,
-            cv_core::events::file_mtime_ns(&path)
-        ));
+        assert!(!cv_core::events::needs_ingest(&r));
         let conn = rusqlite::Connection::open(world.cv_home.join("catalog.db"))?;
         conn.execute_batch("CREATE TABLE pack_event_writes(n INTEGER); INSERT INTO pack_event_writes VALUES(0); CREATE TRIGGER count_pack_events AFTER INSERT ON events BEGIN UPDATE pack_event_writes SET n=n+1; END;")?;
         adapter.calls.store(0, Ordering::Relaxed);
@@ -1094,7 +1095,7 @@ mod tests {
             adapter.mutate = Some(mutation.clone());
             assert_eq!(best_window_and_ingest(&adapter, &r, "chosen")?, expected);
             assert_eq!(format!("{:?}", rows(&r)), expected_rows);
-            assert!(cv_core::events::needs_ingest(&r, cv_core::events::file_mtime_ns(&path)));
+            assert!(cv_core::events::needs_ingest(&r));
         }
         adapter.mutate = None;
         // Publication failure rolls back rows without failing the successful excerpt.
@@ -1104,7 +1105,7 @@ mod tests {
         )?;
         assert_eq!(best_window_and_ingest(&adapter, &r, "chosen")?, expected);
         assert_eq!(format!("{:?}", rows(&r)), expected_rows);
-        assert!(cv_core::events::needs_ingest(&r, cv_core::events::file_mtime_ns(&path)));
+        assert!(cv_core::events::needs_ingest(&r));
         std::fs::write(&path, b"{broken transcript")?;
         assert!(best_window_and_ingest(&adapter, &r, "chosen").is_err());
         assert_eq!(format!("{:?}", rows(&r)), expected_rows);
@@ -1113,7 +1114,7 @@ mod tests {
 
     #[test]
     fn optional_event_extraction_failure_keeps_excerpt_and_never_publishes_partial_rows() -> Result<()> {
-        let world = cv_testkit::World::in_process("pack-event-failure");
+        let world = crate::test_world("pack-event-failure");
         let path = world.base.join("source");
         std::fs::write(&path, "source")?;
         let r = cv_core::SessionRef::new("event-failure", Harness::OpenSession, &path);
@@ -1157,7 +1158,7 @@ mod tests {
         });
         assert!(best_window_and_ingest(&ExcerptFixture(vec![unreadable]), &r, "chosen").is_err());
         assert!(rows(&r).is_empty());
-        assert!(cv_core::events::needs_ingest(&r, cv_core::events::file_mtime_ns(&path)));
+        assert!(cv_core::events::needs_ingest(&r));
         Ok(())
     }
 

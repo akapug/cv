@@ -325,7 +325,7 @@ fn summarize(h: &CorpusHarness, version_dir: &Path) -> Value {
 #[test]
 fn every_corpus_version_reads_as_its_golden_summary() {
     // In-process world: discovery's scan cache lives in $CLUSTERVISION_HOME, never the real one.
-    let _w = World::in_process("corpus");
+    let _w = World::in_process("corpus", cv_core::env::Env::enter_isolated);
     let regen = std::env::var_os("CV_REGEN_CORPUS").is_some();
     let known: Vec<&str> = HARNESSES.iter().map(|h| h.name).collect();
     for dir in subdirs(&corpus_root()) {
@@ -373,11 +373,50 @@ fn every_corpus_version_reads_as_its_golden_summary() {
     );
 }
 
+/// What cv persists or prints is byte-deterministic: two reads of one session take byte-identical
+/// checkpoints at every offset an adapter allows. Each read's hash maps get their own random seed,
+/// so a map serialized in iteration order differs between them.
+#[test]
+fn every_corpus_checkpoint_serializes_deterministically() {
+    struct Checkpoints(Vec<Vec<u8>>);
+    impl cv_core::MessageSink for Checkpoints {
+        fn message(&mut self, _: cv_core::Message) -> cv_core::Flow {
+            cv_core::Flow::Continue
+        }
+        fn wants_checkpoint(&mut self, _: u64) -> bool {
+            true
+        }
+        fn checkpoint(&mut self, cp: &mut cv_core::stream::Checkpoint) {
+            self.0.push(serde_json::to_vec(cp).unwrap());
+        }
+    }
+    let _w = World::in_process("corpus-checkpoints", cv_core::env::Env::enter_isolated);
+    let mut taken = 0;
+    for h in HARNESSES {
+        for v in subdirs(&corpus_root().join(h.name)) {
+            let adapter = (h.adapter)(&v);
+            for r in adapter.discover().expect("discover") {
+                let read = || {
+                    let mut sink = Checkpoints(Vec::new());
+                    let session = adapter
+                        .try_stream(&r, &cv_core::ParseOptions::full(), &mut sink)
+                        .unwrap();
+                    (sink.0, serde_json::to_vec(&session).unwrap())
+                };
+                let first = read();
+                taken += first.0.len();
+                assert!(first == read(), "{}/{}: {}", h.name, v.display(), r.id);
+            }
+        }
+    }
+    assert!(taken > 0, "no adapter took a checkpoint");
+}
+
 /// Doctor needs rich metadata but only decoded byte counts from text. Check every actual
 /// adapter's lazy-extra interpretation against its full reader, including child sessions.
 #[test]
 fn doctor_lazy_report_matches_full_corpus() -> anyhow::Result<()> {
-    let _world = World::in_process("corpus-doctor");
+    let _world = World::in_process("corpus-doctor", cv_core::env::Env::enter_isolated);
     let mut checked = 0;
     for harness in HARNESSES {
         for version in subdirs(&corpus_root().join(harness.name)) {
@@ -458,7 +497,7 @@ fn no_corpus_file_carries_a_secret_or_a_real_path() {
 #[test]
 fn claude_corpus_workflow_runs_read_as_recorded() {
     use cv_core::harness::{claude, claude_workflow};
-    let _w = World::in_process("corpus-workflows");
+    let _w = World::in_process("corpus-workflows", cv_core::env::Env::enter_isolated);
     let regen = std::env::var_os("CV_REGEN_CORPUS").is_some();
     let mut failures = Vec::new();
     for v in subdirs(&corpus_root().join("claude")) {
@@ -704,7 +743,7 @@ const PERSISTED: &[(&str, &[&str])] = &[
 
 #[test]
 fn every_persisted_affordance_surfaces_in_the_view() {
-    let _w = World::in_process("corpus-affordances");
+    let _w = World::in_process("corpus-affordances", cv_core::env::Env::enter_isolated);
     let mut missing = Vec::new();
     for h in HARNESSES {
         for v in subdirs(&corpus_root().join(h.name)) {
@@ -814,7 +853,7 @@ fn query_facts_match_collected_corpus() {
         h
     }
 
-    let world = World::in_process("query_corpus_oracle");
+    let world = World::in_process("query_corpus_oracle", cv_core::env::Env::enter_isolated);
     let mut checked = HashMap::<&str, usize>::new();
     for harness in HARNESSES {
         for version in subdirs(&corpus_root().join(harness.name)) {
@@ -943,13 +982,15 @@ fn query_facts_match_collected_corpus() {
                 // Presence queries cannot reveal count inflation: compare the entire tiny counter
                 // against the old row collector, including this adapter's own side stores.
                 let mut discard = cv_core::stream::Discard;
-                let (_, counted) = cv_core::stream::stream_counting(
+                let counted = cv_core::stream::stream_counted(
                     adapter.as_ref(),
                     &r,
                     &cv_core::ParseOptions::lazy(),
                     &mut discard,
+                    Default::default(),
                 )
-                .unwrap();
+                .unwrap()
+                .counted;
                 assert_eq!(
                     counted.unwrap().counts,
                     counts,

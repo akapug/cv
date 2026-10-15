@@ -399,29 +399,6 @@ fn absolutize(p: &str, cwd: Option<&Path>) -> String {
     }
 }
 
-/// File mtime in integer nanoseconds (0 when unreadable) — half of the `(mtime, size)`
-/// incremental-ingest skip key, identical semantics to the FTS indexer's.
-pub fn file_mtime_ns(path: &Path) -> i64 {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
-
-/// File size in bytes (0 when unreadable) — the other half of the `(mtime, size)` ingest key.
-pub fn file_size(path: &Path) -> i64 {
-    std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0)
-}
-
-/// Compatibility entry point for the former size-only freshness policy. No source can safely
-/// ignore a changed mtime merely because its size is unchanged: an edit can preserve length.
-/// Incremental stores now use [`crate::offsets::sig_is_fresh_with_source`].
-pub fn size_primary_freshness(_r: &SessionRef) -> bool {
-    false
-}
-
 /// Provenance for a sub-agent event source: which parent session, which workflow run (if any), and
 /// which agent inside it the events came from. A top-level session has none of these (`None`).
 ///
@@ -695,13 +672,13 @@ mod db {
         })
     }
 
-    /// Whether `r` needs an event (re)ingest: its file `(mtime, size)` signature differs from the
-    /// `event_sync` row (or there is none). `false` when the catalog can't be opened — events
+    /// Whether `r` needs an event (re)ingest: its source as captured now is not the one the
+    /// `event_sync` row's baseline recorded (or there is none). `false` when the catalog can't be opened — events
     /// degrade silently rather than re-streaming the corpus into a broken db forever.
     ///
     /// Opens a fresh connection per call — fine for a one-off check (`cv events <id>`), wrong for
     /// a corpus sweep: bulk callers use [`SyncTable`] (one query for the whole skip-table).
-    pub fn needs_ingest(r: &SessionRef, mtime_ns: i64) -> bool {
+    pub fn needs_ingest(r: &SessionRef) -> bool {
         let Some(conn) = open() else { return false };
         let stored: Option<(i64, Option<i64>)> = conn
             .query_row(
@@ -719,18 +696,7 @@ mod db {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .ok();
-        let primary = crate::source::primary_path(r);
-        let mut probe = crate::source::Probe::default();
-        let source = if primary == r.path {
-            crate::source::Snapshot {
-                primary: (mtime_ns, file_size(&r.path)),
-                dependencies: probe.dependencies(r),
-            }
-        } else {
-            // Existing callers pass the logical directory's mtime. Directory adapters stamp
-            // their actual append file; keep the legacy signature without mixing two sources.
-            probe.snapshot_from(r, &primary)
-        };
+        let source = crate::source::Probe::default().snapshot(r);
         !sync_fresh(stored, source.primary.0, source.primary.1, || {
             crate::source::Table::load("events").fresh(r, source.primary, &source.dependencies)
         })
@@ -802,33 +768,9 @@ mod db {
             }
         }
 
-        /// Same answer [`needs_ingest`] would give for `r`, from the preloaded table. Takes the
-        /// file `size` the caller already stat'ed (bulk sweeps have it from `file_sig`) instead of
-        /// re-stat'ing per row.
-        pub fn needs_ingest(&self, r: &SessionRef, mtime_ns: i64, size: i64) -> bool {
-            let source = crate::source::Snapshot {
-                primary: (mtime_ns, size),
-                dependencies: crate::source::Probe::default().dependencies(r),
-            };
-            self.needs_ingest_with_source(r, &source)
-        }
-
-        /// The same decision with dependencies already gathered by the operation's shared probe.
-        pub fn needs_ingest_with_source(&self, r: &SessionRef, source: &crate::source::Snapshot) -> bool {
-            self.needs_ingest_with_probe(r, source, &mut crate::source::Probe::default())
-        }
-
-        pub fn needs_ingest_with_probe(
-            &self,
-            r: &SessionRef,
-            source: &crate::source::Snapshot,
-            probe: &mut crate::source::Probe,
-        ) -> bool {
-            self.needs_ingest_with_provenance(r, source, &Provenance::default(), probe)
-        }
-
-        /// Freshness of the one published output: source copy, provenance, tuple and dependencies.
-        pub fn needs_ingest_with_provenance(
+        /// Whether `r`'s one published event output is stale: source copy, provenance, tuple and
+        /// dependencies, checked against the preloaded table with the operation's shared probe.
+        pub fn needs_ingest(
             &self,
             r: &SessionRef,
             source: &crate::source::Snapshot,
@@ -876,7 +818,7 @@ mod db {
     }
 
     /// Persist `events` as the complete event set for session `r` (one transaction: delete prior
-    /// rows, insert, stamp `event_sync` with the `(mtime_ns, size)` signature — captured by the
+    /// rows, insert, stamp `event_sync` and the source baseline from `source`, captured by the
     /// caller **before** streaming, so content appended mid-parse reads as stale next time).
     /// Idempotent — a re-ingest of an unchanged session rewrites identical rows. Best-effort: any
     /// sqlite error leaves the previous state and returns quietly.
@@ -885,33 +827,9 @@ mod db {
     /// batch-INSERT shape makes cross-session duplicates impossible by construction, and
     /// duplicates *within* this batch — same `(msg_idx, kind, target)`, matching the old index's
     /// `COALESCE(target,'')` semantics — are dropped by the in-memory set below.
-    pub fn record(r: &SessionRef, events: &[Event], mtime_ns: i64, size: i64) {
-        record_with(r, events, mtime_ns, size, &Provenance::default());
-    }
-
-    /// [`record`], additionally stamping sub-agent `prov`enance onto the `event_sessions` row so the
-    /// stored events are attributable to the orchestrator that spawned the agent. A top-level
-    /// session passes an empty [`Provenance`] (this is exactly what [`record`] does); the columns
-    /// stay NULL and existing queries are unaffected.
-    pub fn record_with(r: &SessionRef, events: &[Event], mtime_ns: i64, size: i64, prov: &Provenance) {
-        record_from(r, 0, events, mtime_ns, size, prov);
-    }
-
-    /// [`record_with`] for a pass that resumed at message `from`: only the rows of messages
-    /// `from` and later are replaced by `events` (all of which are), the earlier ones stay as the
-    /// pass that read them stored them. The same dedup rule, within the new rows.
-    /// `mtime_ns` and `size` must have been captured before the source read, never after it.
-    /// This legacy API leaves source freshness stale; [`record_from_with_source`] carries
-    /// their before-read snapshot and can publish auxiliary freshness.
-    pub fn record_from(r: &SessionRef, from: usize, events: &[Event], mtime_ns: i64, size: i64, prov: &Provenance) {
-        let source = crate::source::Snapshot {
-            primary: (mtime_ns, size),
-            dependencies: None,
-        };
-        record_from_inner(r, from, events.iter().map(Ok), false, mtime_ns, size, prov, &source);
-    }
-
-    /// Record a completed pass and its captured dependencies atomically with the event rows.
+    ///
+    /// From `from`, only the rows of messages `from` and later are replaced; the earlier ones
+    /// stay as the pass that read them stored them.
     pub fn record_from_with_source(
         r: &SessionRef,
         from: usize,
@@ -919,16 +837,9 @@ mod db {
         source: &crate::source::Snapshot,
         prov: &Provenance,
     ) {
-        record_from_inner(
-            r,
-            from,
-            events.iter().map(Ok),
-            false,
-            source.primary.0,
-            source.primary.1,
-            prov,
-            source,
-        );
+        if let Some(mut conn) = open() {
+            let _ = record_from_in(&mut conn, r, from, events.iter().map(Ok), false, prov, source);
+        }
     }
 
     /// Publish a completed ordered batch with bounded row/target retention in one transaction.
@@ -953,32 +864,7 @@ mod db {
         prov: &Provenance,
     ) -> Result<()> {
         let rows = events.rows()?;
-        record_from_in(
-            conn,
-            r,
-            from,
-            rows,
-            true,
-            source.primary.0,
-            source.primary.1,
-            prov,
-            source,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn record_from_inner<E: std::borrow::Borrow<Event>>(
-        r: &SessionRef,
-        from: usize,
-        events: impl IntoIterator<Item = Result<E>>,
-        ordered: bool,
-        mtime_ns: i64,
-        size: i64,
-        prov: &Provenance,
-        source: &crate::source::Snapshot,
-    ) -> Option<()> {
-        let mut conn = open()?;
-        record_from_in(&mut conn, r, from, events, ordered, mtime_ns, size, prov, source).ok()
+        record_from_in(conn, r, from, rows, true, prov, source)
     }
 
     // Acquire write ownership before reading authority. A deferred WAL transaction can read
@@ -996,18 +882,16 @@ mod db {
         Ok(tx)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn record_from_in<E: std::borrow::Borrow<Event>>(
         conn: &mut Connection,
         r: &SessionRef,
         from: usize,
         events: impl IntoIterator<Item = Result<E>>,
         ordered: bool,
-        mtime_ns: i64,
-        size: i64,
         prov: &Provenance,
         source: &crate::source::Snapshot,
     ) -> Result<()> {
+        let (mtime_ns, size) = source.primary;
         let tx = publication_transaction(conn, r, from, prov)?;
         let harness = r.harness.as_str();
         tx.execute(
@@ -1156,7 +1040,7 @@ mod db {
         let mut n = 0;
         for (r, provenance) in sources {
             let source = probe.snapshot(&r);
-            if !force && !sync.needs_ingest_with_provenance(&r, &source, &provenance, &mut probe) {
+            if !force && !sync.needs_ingest(&r, &source, &provenance, &mut probe) {
                 continue;
             }
             match ingest_subagent(&r, &provenance) {
@@ -1412,7 +1296,7 @@ mod db {
         use super::*;
         #[test]
         fn publication_owns_writer_before_authority_read_and_rejects_intervening_change() {
-            let world = cv_testkit::World::in_process("event-authority-lock");
+            let world = crate::test_world("event-authority-lock");
             let path = world.base.join("source.jsonl");
             std::fs::write(&path, "source").unwrap();
             let r = SessionRef::new("lock", crate::Harness::Claude, path);
@@ -1509,9 +1393,8 @@ mod db {
 
 #[cfg(feature = "sqlite")]
 pub use db::{
-    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent, needs_ingest, record,
-    record_from, record_from_with_source, record_spooled_with_source, record_with, sessions_editing, sessions_touching,
-    SyncTable,
+    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent, needs_ingest,
+    record_from_with_source, record_spooled_with_source, sessions_editing, sessions_touching, SyncTable,
 };
 
 /// No-op fallbacks without sqlite: extraction still works (the sink is pure), persistence and
@@ -1524,7 +1407,7 @@ mod db_stub {
     use super::*;
     use anyhow::Result;
 
-    pub fn needs_ingest(_r: &SessionRef, _mtime_ns: i64) -> bool {
+    pub fn needs_ingest(_r: &SessionRef) -> bool {
         false
     }
     /// No-op twin of the sqlite [`SyncTable`]: nothing is ever stale.
@@ -1533,21 +1416,7 @@ mod db_stub {
         pub fn load() -> SyncTable {
             SyncTable
         }
-        pub fn needs_ingest(&self, _r: &SessionRef, _mtime_ns: i64, _size: i64) -> bool {
-            false
-        }
-        pub fn needs_ingest_with_source(&self, _r: &SessionRef, _source: &crate::source::Snapshot) -> bool {
-            false
-        }
-        pub fn needs_ingest_with_probe(
-            &self,
-            _r: &SessionRef,
-            _source: &crate::source::Snapshot,
-            _probe: &mut crate::source::Probe,
-        ) -> bool {
-            false
-        }
-        pub fn needs_ingest_with_provenance(
+        pub fn needs_ingest(
             &self,
             _r: &SessionRef,
             _source: &crate::source::Snapshot,
@@ -1560,8 +1429,6 @@ mod db_stub {
             false
         }
     }
-    pub fn record(_r: &SessionRef, _events: &[Event], _mtime_ns: i64, _size: i64) {}
-    pub fn record_with(_r: &SessionRef, _events: &[Event], _mtime_ns: i64, _size: i64, _prov: &Provenance) {}
     pub fn record_from_with_source(
         _r: &SessionRef,
         _from: usize,
@@ -1578,15 +1445,6 @@ mod db_stub {
         _prov: &Provenance,
     ) -> Result<()> {
         Ok(())
-    }
-    pub fn record_from(
-        _r: &SessionRef,
-        _from: usize,
-        _events: &[Event],
-        _mtime_ns: i64,
-        _size: i64,
-        _prov: &Provenance,
-    ) {
     }
     pub fn ingest_ref(_r: &SessionRef) -> Result<usize> {
         Ok(0)
@@ -1615,9 +1473,8 @@ mod db_stub {
 }
 #[cfg(not(feature = "sqlite"))]
 pub use db_stub::{
-    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent, needs_ingest, record,
-    record_from, record_from_with_source, record_spooled_with_source, record_with, sessions_editing, sessions_touching,
-    SyncTable,
+    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent, needs_ingest,
+    record_from_with_source, record_spooled_with_source, sessions_editing, sessions_touching, SyncTable,
 };
 
 #[cfg(test)]
@@ -1950,7 +1807,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn published_event_authority_tracks_copy_provenance_and_cwd_atomically() {
-        let world = cv_testkit::World::in_process("events-authority");
+        let world = crate::test_world("events-authority");
         let fixture = |name: &str, target: &str| {
             let path = world.base.join(format!("{name}.jsonl"));
             let line = serde_json::json!({"type":"assistant","uuid":"a","sessionId":"shared",
@@ -1971,7 +1828,7 @@ mod tests {
         let stale = |r: &SessionRef, prov: &Provenance| {
             let mut probe = crate::source::Probe::default();
             let source = probe.snapshot(r);
-            SyncTable::load().needs_ingest_with_provenance(r, &source, prov, &mut probe)
+            SyncTable::load().needs_ingest(r, &source, prov, &mut probe)
         };
         let rows = || format!("{:?}", events_for("claude", "shared", None));
         ingest_ref(&a).unwrap();
@@ -1981,7 +1838,7 @@ mod tests {
         ingest_ref(&b).unwrap();
         assert!(stale(&a, &direct));
         assert!(!stale(&b, &direct));
-        assert!(!needs_ingest(&b, file_mtime_ns(&b.path)));
+        assert!(!needs_ingest(&b));
         assert!(!SyncTable::load().can_resume(&a, &direct));
         assert_eq!(
             events_for("claude", "shared", None)[0].target.as_deref(),
@@ -2013,7 +1870,7 @@ mod tests {
         );
         ingest_subagent(&b, &folded).unwrap();
         assert!(stale(&b, &direct));
-        assert!(needs_ingest(&b, file_mtime_ns(&b.path)));
+        assert!(needs_ingest(&b));
         assert!(!stale(&b, &folded));
         assert_eq!(
             events_for("claude", "shared", None)[0].parent_id.as_deref(),
@@ -2068,7 +1925,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn event_source_selection_is_newest_qualified_and_direct_on_identical_copy() {
-        let world = cv_testkit::World::in_process("events-copy-selection");
+        let world = crate::test_world("events-copy-selection");
         let old_path = world.base.join("older.jsonl");
         let new_path = world.base.join("newer.jsonl");
         std::fs::write(&old_path, []).unwrap();
@@ -2128,7 +1985,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn event_forest_selection_keeps_unique_children_of_nonpreferred_parent_copies() {
-        let world = cv_testkit::World::in_process("events-forest-selection");
+        let world = crate::test_world("events-forest-selection");
         let mut parents = Vec::new();
         for (name, timestamp) in [("older", 1), ("newer", 2)] {
             let dir = world.base.join(name);
@@ -2165,27 +2022,23 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn guarded_empty_events_reuse_requires_known_size_and_source_identity() {
-        let world = cv_testkit::World::in_process("events-empty");
+        let world = crate::test_world("events-empty");
         let path = world.cv_home.join("empty.jsonl");
         std::fs::write(&path, []).unwrap();
         let r = SessionRef::new("empty", crate::Harness::Claude, &path);
         assert_eq!(ingest_ref(&r).unwrap(), 0);
-        assert!(!needs_ingest(&r, file_mtime_ns(&path)));
-        assert!(!SyncTable::load().needs_ingest(&r, file_mtime_ns(&path), 0));
+        assert!(!needs_ingest(&r));
+        let source = crate::source::Probe::default().snapshot(&r);
+        let mut probe = crate::source::Probe::default();
+        assert!(!SyncTable::load().needs_ingest(&r, &source, &Provenance::default(), &mut probe));
         let conn = crate::catalog::open_db().unwrap();
         conn.execute("UPDATE event_sync SET size=NULL WHERE id='empty'", [])
             .unwrap();
-        assert!(
-            needs_ingest(&r, file_mtime_ns(&path)),
-            "historical unknown size still misses"
-        );
+        assert!(needs_ingest(&r), "historical unknown size still misses");
         ingest_ref(&r).unwrap();
         conn.execute("DELETE FROM source_dependencies WHERE consumer='events'", [])
             .unwrap();
-        assert!(
-            needs_ingest(&r, file_mtime_ns(&path)),
-            "missing captured authority still misses"
-        );
+        assert!(needs_ingest(&r), "missing captured authority still misses");
         ingest_ref(&r).unwrap();
         let text: String = conn
             .query_row(
@@ -2202,16 +2055,13 @@ mod tests {
             [legacy.to_string()],
         )
         .unwrap();
-        assert!(
-            needs_ingest(&r, file_mtime_ns(&path)),
-            "old source stamps cannot authorize empty reuse"
-        );
+        assert!(needs_ingest(&r), "old source stamps cannot authorize empty reuse");
         ingest_ref(&r).unwrap();
         std::fs::write(&path, "\n").unwrap();
-        assert!(needs_ingest(&r, file_mtime_ns(&path)), "empty file growth is stale");
+        assert!(needs_ingest(&r), "empty file growth is stale");
         ingest_ref(&r).unwrap();
         std::fs::remove_file(&path).unwrap();
-        assert!(needs_ingest(&r, 0), "missing primary cannot match");
+        assert!(needs_ingest(&r), "missing primary cannot match");
     }
 
     /// End-to-end against a real temp catalog db: stream a claude JSONL fixture through
@@ -2219,7 +2069,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn ingest_and_query_roundtrip_in_temp_catalog() {
-        let world = cv_testkit::World::in_process("events-roundtrip");
+        let world = crate::test_world("events-roundtrip");
         let home = &world.cv_home;
 
         let sdir = home.join("sessions");
@@ -2266,7 +2116,7 @@ mod tests {
         assert!(n >= 3, "expected at least edit+command+error events, got {n}");
 
         // Freshly ingested → no longer needs ingest at the same mtime; a re-ingest is idempotent.
-        assert!(!needs_ingest(&r, file_mtime_ns(&r.path)));
+        assert!(!needs_ingest(&r));
         ingest_ref(&r).unwrap();
 
         let rows = events_for("claude", "evt-e2e", None);
@@ -2295,15 +2145,12 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(next_mtime))
             .unwrap();
-        assert!(
-            needs_ingest(&r, file_mtime_ns(&r.path)),
-            "same-size rewrites must force an event re-ingest"
-        );
+        assert!(needs_ingest(&r), "same-size rewrites must force an event re-ingest");
         ingest_ref(&r).unwrap();
         let edited_rows = events_for("claude", "evt-e2e", Some("file_edit"));
         assert_eq!(edited_rows.len(), 1);
         assert_eq!(edited_rows[0].target.as_deref(), Some("/repo/src/reader.rs"));
-        assert!(!needs_ingest(&r, file_mtime_ns(&r.path)));
+        assert!(!needs_ingest(&r));
 
         // Restore the original edit for the remaining query checks below.
         std::fs::write(&path, &content).unwrap();
@@ -2318,9 +2165,9 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(needs_ingest(&r, file_mtime_ns(&r.path)), "an append must read stale");
+        assert!(needs_ingest(&r), "an append must read stale");
         ingest_ref(&r).unwrap();
-        assert!(!needs_ingest(&r, file_mtime_ns(&r.path)));
+        assert!(!needs_ingest(&r));
 
         // The touched query finds the session by absolute path and by suffix.
         let touched = sessions_touching("/repo/src/parser.rs", false);
@@ -2361,7 +2208,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn v1_catalog_migrates_by_drop_and_lazy_reingest() {
-        let world = cv_testkit::World::in_process("events-migration");
+        let world = crate::test_world("events-migration");
         let home = &world.cv_home;
 
         const V1_DDL: &str = "CREATE TABLE events(
@@ -2396,7 +2243,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let mtime = file_mtime_ns(&path);
+        let mtime = crate::offsets::file_sig(&path).0;
         {
             let conn = rusqlite::Connection::open(home.join("catalog.db")).unwrap();
             conn.execute_batch(&format!(
@@ -2422,16 +2269,13 @@ mod tests {
         };
 
         // First v2 open (inside needs_ingest) migrates: v1 rows gone, sync stamp gone → stale.
-        assert!(
-            needs_ingest(&r, mtime),
-            "v1 event_sync stamps must not survive migration"
-        );
+        assert!(needs_ingest(&r), "v1 event_sync stamps must not survive migration");
         assert!(!catalog_has_events(), "v1 event rows must not survive migration");
 
         // The normal lazy path then rebuilds cleanly on the v2 schema.
         let n = ingest_ref(&r).unwrap();
         assert_eq!(n, 1);
-        assert!(!needs_ingest(&r, mtime));
+        assert!(!needs_ingest(&r));
         let rows = events_for("claude", "mig-e2e", None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].target.as_deref(), Some("/repo/src/lib.rs"));
@@ -2451,7 +2295,7 @@ mod tests {
             !catalog_has_events(),
             "a v1-shaped table under a v2 stamp must be dropped"
         );
-        assert!(needs_ingest(&r, mtime));
+        assert!(needs_ingest(&r));
         ingest_ref(&r).unwrap();
         assert_eq!(events_for("claude", "mig-e2e", None).len(), 1);
     }

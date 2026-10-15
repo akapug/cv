@@ -38,8 +38,8 @@
 
 use super::store::document::{Fields, InvalidStruct};
 use crate::json::{InvalidJson, JsonSource, JsonView};
-mod view;
-use super::wire::{openai, text_parts};
+mod record;
+use super::wire::openai;
 use super::{ts_from_epoch, Adapter};
 use crate::ir::*;
 use crate::stream::{Flow, MessageSink, ParseOptions};
@@ -57,9 +57,9 @@ pub struct Continue {
 
 impl Continue {
     pub fn detect() -> Self {
-        let root = std::env::var_os("CONTINUE_GLOBAL_DIR")
+        let root = crate::env::var_os("CONTINUE_GLOBAL_DIR")
             .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".continue")));
+            .or_else(|| crate::env::home_dir().map(|h| h.join(".continue")));
         let sessions = root.map(|r| r.join("sessions")).filter(|p| p.exists());
         Continue { sessions }
     }
@@ -161,7 +161,7 @@ impl Adapter for Continue {
                 let Some(doc) = Fields::parse_struct(root, &["title", "workspaceDirectory", "history"])? else {
                     return Err(InvalidStruct("expected Continue session struct").into());
                 };
-                let title = view::title(doc.get("title"), true)?;
+                let title = record::title(doc.get("title"), true)?;
                 let workspace = optional_string(doc.get("workspaceDirectory"))?;
                 let history = doc.get("history").map(JsonView::accepted_array).transpose()?;
                 if doc.get("history").is_some() && history.as_ref().is_some_and(Option::is_none) {
@@ -178,19 +178,11 @@ impl Adapter for Continue {
                 let mut has_sources = false;
                 for item in history.into_iter().flatten().flatten() {
                     let Some(item) = item? else { continue };
-                    let reply_id = view::reply_id(item)?;
+                    let reply_id = record::reply_id(item)?;
                     if reply_id.is_some_and(|id| answered.contains(&id)) {
                         continue;
                     }
-                    let (message, results) = if opts.spans {
-                        view::messages(item, &mut s.model)?
-                    } else {
-                        let value = item.resolve()?;
-                        (
-                            history_item_to_message(value.as_ref(), &mut s.model),
-                            tool_states_message(value.as_ref()),
-                        )
-                    };
+                    let (message, results) = record::messages(item, opts.spans, &mut s.model)?;
                     if let Some(message) = message {
                         if s.system_prompt.is_none() && message.kind == MessageKind::SystemPrompt {
                             let mut text_message = message.clone();
@@ -200,7 +192,7 @@ impl Adapter for Continue {
                                 s.system_prompt = Some(text);
                             }
                         }
-                        let sourced = view::has_sources(&message);
+                        let sourced = record::has_sources(&message);
                         has_sources |= sourced;
                         if sourced {
                             source.check()?;
@@ -306,6 +298,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
         cwd_str.as_deref(),
         &file_path,
         opts.thinking,
+        opts.claim(),
     )?;
 
     // ── index: sessions.json (merge-or-create) ──
@@ -329,7 +322,8 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
     entries.push(Value::Object(entry));
     let mut stage = super::store::bytes::ByteStage::new();
     serde_json::to_writer_pretty(&mut stage, &entries)?;
-    super::store::publish_stage(stage, &index_path)?;
+    // Continue's own index: cv's update replaces it whole.
+    super::store::publish_stage(stage, &index_path, crate::publish::Claim::Replace)?;
 
     Ok(super::EmitResult {
         path: file_path,
@@ -433,7 +427,7 @@ fn history_item(msg: &Message, session_model: Option<&str>) -> Result<Value> {
 }
 
 /// Map a `Block::File` to a Continue `contextItem` (`{name, description, uri:{type, value}}`) that
-/// the parser's `context_item_to_block` round-trips back into a `File` block.
+/// the parser's `record::context_item` round-trips back into a `File` block.
 fn file_context_item(path: &Option<String>, source: &Option<String>, mime: &Option<String>) -> Value {
     let mut ci = Map::new();
     match (path, source) {
@@ -509,7 +503,7 @@ fn read_index(path: &Path) -> Vec<IndexMeta> {
                     };
                     out.push(IndexMeta {
                         session_id,
-                        title: view::title(fields.get("title"), false)?,
+                        title: record::title(fields.get("title"), false)?,
                         cwd: fields
                             .string("workspaceDirectory")?
                             .filter(|p| !p.is_empty())
@@ -554,7 +548,7 @@ fn scan_session(path: &Path) -> Option<Scan> {
         .read_document(|root| {
             let mut scan = Scan::default();
             if let Some(fields) = Fields::parse(root, &["title", "workspaceDirectory", "history"])? {
-                scan.title = view::title(fields.get("title"), false)?;
+                scan.title = record::title(fields.get("title"), false)?;
                 scan.cwd = fields
                     .string("workspaceDirectory")?
                     .filter(|p| !p.is_empty())
@@ -574,176 +568,6 @@ fn scan_session(path: &Path) -> Option<Scan> {
 // ---------------------------------------------------------------------------
 // history[] -> IR
 // ---------------------------------------------------------------------------
-
-/// Convert one `history` item into an IR `Message`. `None` for an empty/message-less item. `model`
-/// is filled opportunistically from a `promptLogs[].modelTitle`/`modelProvider` if present.
-fn history_item_to_message(item: &Value, model: &mut Option<String>) -> Option<Message> {
-    history_item_with_body(item, model, None)
-}
-
-fn history_item_with_body(item: &Value, model: &mut Option<String>, body: Option<Vec<Block>>) -> Option<Message> {
-    let message = item.get("message")?;
-    let role_str = message.get("role").and_then(Value::as_str).unwrap_or("user");
-    let role = match role_str {
-        "system" => Role::System,
-        "assistant" => Role::Assistant,
-        "tool" => Role::Tool,
-        _ => Role::User,
-    };
-
-    let mut m = Message::new(role);
-    // A `system` role history item carries the system prompt.
-    if role == Role::System {
-        m.kind = MessageKind::SystemPrompt;
-    }
-
-    // Opportunistically capture the model from promptLogs (assistant turns).
-    if model.is_none() {
-        if let Some(mt) = item
-            .get("promptLogs")
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(|l| l.get("modelTitle").or_else(|| l.get("modelProvider")))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            *model = Some(mt.to_string());
-        }
-    }
-
-    if let Some(body) = body {
-        m.content = body;
-    } else {
-        match role {
-            Role::Tool => {
-                // A tool result. Continue stores the output in `content`.
-                let content = text_parts(message.get("content"));
-                let tool_use_id = message
-                    .get("toolCallId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                m.content.push(Block::ToolResult {
-                    tool_use_id,
-                    content: content.into(),
-                    is_error: false,
-                    tool_name: None,
-                    status: Some("completed".into()),
-                    details: None,
-                });
-            }
-            _ => {
-                push_content(&mut m, message.get("content"));
-                if role == Role::Assistant {
-                    m.content.extend(openai::tool_calls(message.get("toolCalls")));
-                }
-            }
-        }
-    }
-
-    // Attached context items (files / snippets / docs) → File blocks (best-effort).
-    if let Some(items) = item.get("contextItems").and_then(Value::as_array) {
-        for ci in items {
-            if let Some(b) = context_item_to_block(ci) {
-                m.content.push(b);
-            }
-        }
-    }
-
-    // Per-request usage on assistant turns (`message.usage`, OpenAI's names): `prompt_tokens`
-    // includes the cached part, which the IR keeps disjoint.
-    if let Some(u) = message.get("usage").filter(|u| u.is_object()) {
-        let n = |p: &str| u.pointer(p).and_then(Value::as_u64);
-        let cached = n("/prompt_tokens_details/cached_tokens");
-        m.usage = Some(Usage {
-            input_tokens: n("/prompt_tokens").map(|p| p.saturating_sub(cached.unwrap_or(0))),
-            output_tokens: n("/completion_tokens"),
-            cache_read_tokens: cached,
-            reasoning_tokens: n("/completion_tokens_details/reasoning_tokens"),
-            cost_usd: u.get("cost_cents").and_then(Value::as_f64).map(|c| c / 100.0),
-            ..Usage::default()
-        });
-        m.model = u.get("model").and_then(Value::as_str).map(str::to_string);
-        if model.is_none() {
-            model.clone_from(&m.model);
-        }
-    }
-
-    (!m.content.is_empty()).then_some(m)
-}
-
-/// The tool results an assistant item carries in `toolCallStates` (what the cn CLI writes instead
-/// of `role: "tool"` items): `[{toolCallId, toolCall: {function: {name}}, status, output:
-/// [{content, name, description}]}]` → one [`Role::Tool`] message of [`Block::ToolResult`]s.
-/// `status` is `done` | `errored` | `canceled` | ...; a state with no output yet is skipped.
-fn tool_states_message(item: &Value) -> Option<Message> {
-    let states = item.get("toolCallStates")?.as_array()?;
-    let mut m = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
-    for st in states {
-        let Some(out) = st.get("output").and_then(Value::as_array) else {
-            continue;
-        };
-        let content = out
-            .iter()
-            .filter_map(|o| o.get("content").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let status = st.get("status").and_then(Value::as_str);
-        m.content.push(Block::ToolResult {
-            tool_use_id: st.get("toolCallId").and_then(Value::as_str).unwrap_or("").to_string(),
-            content: content.into(),
-            is_error: status == Some("errored"),
-            tool_name: st
-                .pointer("/toolCall/function/name")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            status: status.map(str::to_string),
-            details: None,
-        });
-    }
-    (!m.content.is_empty()).then_some(m)
-}
-
-/// Push `message.content` (string or `[Part]`) onto a message as Text/Image blocks.
-fn push_content(m: &mut Message, content: Option<&Value>) {
-    m.content.extend(openai::blocks_from(content, &openai::CONTINUE));
-}
-
-/// A `contextItem` → a `File` block (best-effort). The path/source is taken from `uri.value` (a file
-/// path or URL) and falls back to `description`/`name`.
-fn context_item_to_block(ci: &Value) -> Option<Block> {
-    let uri_val = ci
-        .get("uri")
-        .and_then(|u| u.get("value"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
-    let desc = ci.get("description").and_then(Value::as_str).filter(|s| !s.is_empty());
-    let name = ci.get("name").and_then(Value::as_str).filter(|s| !s.is_empty());
-
-    let uri_type = ci
-        .get("uri")
-        .and_then(|u| u.get("type"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-
-    // Nothing identifiable → skip.
-    if uri_val.is_none() && desc.is_none() && name.is_none() {
-        return None;
-    }
-
-    // `uri.type == "file"` → a filesystem path; otherwise treat the value as an opaque source/URL.
-    let (path, source) = match (uri_val, uri_type) {
-        (Some(v), "file") => (Some(v.to_string()), None),
-        (Some(v), _) => (None, Some(v.to_string())),
-        (None, _) => (None, desc.or(name).map(str::to_string)),
-    };
-
-    Some(Block::File {
-        mime: None,
-        path,
-        source,
-    })
-}
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -789,7 +613,7 @@ mod tests {
 
     #[test]
     fn export_preserves_existing_files_when_index_is_unusable() {
-        let world = cv_testkit::World::in_process("continue-index-export-error");
+        let world = crate::test_world("continue-index-export-error");
         let dir = world.base.join("sessions");
         fs::create_dir(&dir).unwrap();
         let transcript = dir.join("fixed.json");
@@ -814,15 +638,28 @@ mod tests {
         assert!(emit(&session, &dir, &reserved).is_err());
         assert_eq!(fs::read_to_string(&index).unwrap(), "[]");
         fs::write(&index, r#"[{"sessionId":"other","custom":{"retain":true}}]"#).unwrap();
-        emit(&session, &dir, &opts).unwrap();
+        // `fixed.json` is taken: refused without force, replaced (and indexed) with it.
+        assert!(emit(&session, &dir, &opts)
+            .unwrap_err()
+            .downcast_ref::<crate::publish::Exists>()
+            .is_some());
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), "original transcript");
+        let forced = crate::emit::EmitOptions { force: true, ..opts };
+        emit(&session, &dir, &forced).unwrap();
         let merged: Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
         assert_eq!(merged[0]["custom"]["retain"], true);
         assert_eq!(merged[1]["sessionId"], "fixed");
     }
     use crate::harness::Parse;
 
+    /// The history-item codec over an owned value, no spans.
+    fn history_item_to_message(item: &Value, model: &mut Option<String>) -> Option<Message> {
+        record::messages(item.into(), false, model).unwrap().0
+    }
+
+    /// Source-backed items with spans resolve to exactly what the owned value gives.
     #[test]
-    fn selected_history_views_match_owned_codec_and_derived_header_acceptance() {
+    fn history_items_resolve_alike_from_source_and_value_and_header_acceptance() {
         #[derive(serde::Deserialize)]
         struct OldDoc<'a> {
             #[serde(default)]
@@ -854,14 +691,11 @@ mod tests {
                 let mut expected_model = None;
                 let mut actual_model = None;
                 for (view, owned) in root.array()?.unwrap().zip(items.as_array().unwrap()) {
-                    let expected = (
-                        history_item_to_message(owned, &mut expected_model),
-                        tool_states_message(owned),
-                    );
-                    let mut actual = view::messages(view?, &mut actual_model)?;
+                    let expected = record::messages(owned.into(), false, &mut expected_model)?;
+                    let mut actual = record::messages(view?, true, &mut actual_model)?;
                     if let Some(message) = &actual.0 {
                         if owned.pointer("/message/toolCalls").is_some() {
-                            assert!(view::has_sources(message));
+                            assert!(record::has_sources(message));
                         }
                     }
                     let resolver = crate::lazy::Resolver::new(Some(path.clone()));
@@ -930,7 +764,7 @@ mod tests {
 
     #[test]
     fn encoded_arguments_survive_minimum_message_deferred_staging() {
-        let world = cv_testkit::World::in_process("continue-encoded-minimum-staging");
+        let world = crate::test_world("continue-encoded-minimum-staging");
         let path = world.base.join("session.json");
         let argument = serde_json::to_string(&json!({"payload":"x".repeat(8192)})).unwrap();
         let history = (0..3).map(|i| json!({"message":{"role":"assistant","usage":{"model":(i == 2).then_some("present")},"toolCalls":[{"id":i.to_string(),"function":{"name":"read","arguments":argument}}]}})).collect::<Vec<_>>();
@@ -1391,7 +1225,7 @@ mod tests {
 
     #[test]
     fn discovery_scan_matches_whole_value_metadata() {
-        let _world = cv_testkit::World::in_process("continue-scan");
+        let _world = crate::test_world("continue-scan");
         let dir = std::env::temp_dir().join(format!("cv-continue-scan-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.json");
@@ -1450,7 +1284,7 @@ mod tests {
 
     #[test]
     fn discovery_scan_preserves_index_precedence_and_unindexed_fallback() {
-        let _world = cv_testkit::World::in_process("continue-scan-index");
+        let _world = crate::test_world("continue-scan-index");
         let dir = std::env::temp_dir().join(format!("cv-continue-index-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(

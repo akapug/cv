@@ -341,17 +341,19 @@ shapes cannot drift. Mechanism (the server is `cv mcp`, so the clap tree is in-p
 
 - `cv schema --commands --json` dumps the command tree: for every visible command and subcommand,
   `{ name, group, about, args: [{ name, kind: "flag"|"option"|"positional", value_type:
-  "string"|"integer"|"number"|"boolean"|"path", possible_values?, default?, help, required }] }`,
+  "string"|"integer"|"number"|"boolean"|"path", long?, multiple?, possible_values?, default?, help, required }] }`,
   produced from clap's `Command` introspection (`CommandFactory`), including the window flags.
 - `cv mcp` reads that tree from its own clap `Command` at startup (no binary to look up, so none
   to be stale) and registers one tool per Read/Reshape/Export/System command and subcommand and
   per `cv task` subcommand (a parent with no arguments of its own is not a tool), named after the
   command with a subcommand joined by `_` (`ls`, `show`, `task_open`, `hooks_install`, …); each argument becomes a JSON-schema
   property with the clap help as its description. Positionals map to properties named after the
-  argument. A call runs the same executable as `cv <cmd> <args> --json` (or without `--json` for commands that have no
+  argument; repeatable arguments accept a scalar or an array. `long` carries the actual CLI flag
+  spelling, which can differ from the argument's property name. A call runs the same executable as `cv <cmd> <args> --json` (or without `--json` for commands that have no
   JSON form, returning text) and returns stdout; a non-zero exit returns stderr as the error.
-- Over MCP, `show` defaults to `last: 50` and `max_bytes: 200000` (a full transcript is never the
-  default there); `ls`/`search` default `limit` stays the CLI default.
+- Over MCP, transcript `show` defaults to `last: 50` and `max_bytes: 200000` when no window,
+  byte cap or `pre_compaction` is supplied. A `kind` row view suppresses these defaults;
+  `ls`/`search` default `limit` stays the CLI default.
 - MCP-only tools keep their names and hand-written schemas: `observe_stream`, `await_omen` (one
   blocks, one holds a cursor). `read_session`, `search_sessions`,
   `list_sessions`, `project_sessions`, `recall`, `prune_session`, `prune_retrieve` are removed

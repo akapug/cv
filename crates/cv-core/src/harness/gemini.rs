@@ -40,14 +40,12 @@
 //! with no filesystem access.
 
 mod emit;
-mod input;
-mod lean;
-#[cfg(not(feature = "mmap"))]
-mod replay;
+mod record;
 pub use emit::emit;
 
 use super::{parse_ts, Adapter};
 use crate::ir::*;
+use crate::json::JsonSource;
 use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -64,7 +62,7 @@ pub struct Gemini {
 
 impl Gemini {
     pub fn detect() -> Self {
-        let roots = dirs::home_dir()
+        let roots = crate::env::home_dir()
             .map(|h| {
                 vec![
                     h.join(".gemini").join("tmp"),
@@ -323,8 +321,6 @@ pub(crate) fn stream_for(
     opts: &ParseOptions,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
-    // Lazy reads borrow large text from recordings; full reads materialize one record at a time.
-    // The small harness facts remain identical in both modes.
     let name = r
         .path
         .file_name()
@@ -332,34 +328,27 @@ pub(crate) fn stream_for(
         .unwrap_or_default();
 
     // Chat recording (legacy whole-file .json / modern append-only .jsonl): one session per
-    // file, id authoritative. These are the only shapes large enough to OOM, so they get
-    // the native streaming paths; the bounded shapes below stay on the materializing bridge.
+    // file, id authoritative. These are the only shapes large enough to OOM, so they are read
+    // one message at a time; the bounded shapes below stay on the materializing bridge. A
+    // `.json` that is not a single document (a `.json`-named JSONL recording) is read as JSONL.
     if is_chat_recording(&r.path) {
-        let ext = r.path.extension().and_then(|e| e.to_str());
-        if ext == Some("jsonl") {
-            if let Some(mut s) = stream_jsonl_recording(&r.path, harness, opts, sink)? {
-                s.harness = harness;
-                return Ok(s);
-            }
-        } else {
-            // Legacy `.json`: a single JSON document. Memory-map it and iterate the `messages`
-            // array as borrowed `RawValue`s so the whole-document `Value` is never built — peak
-            // is one message + the (reclaimable) mapping. If the file isn't actually the
-            // single-document shape (e.g. a `.json`-extensioned JSONL recording), fall through.
-            if let Some(mut s) = stream_legacy_json_recording(&r.path, harness, opts, sink)? {
-                s.harness = harness;
-                return Ok(s);
-            }
-            if let Some(mut s) = stream_jsonl_recording(&r.path, harness, opts, sink)? {
-                s.harness = harness;
-                return Ok(s);
-            }
+        let document = match r.path.extension().and_then(|e| e.to_str()) {
+            Some("jsonl") => None,
+            _ => read_document(&r.path, harness, opts, sink)?,
+        };
+        let recording = match document {
+            Some(s) => Some(s),
+            None => read_jsonl(&r.path, harness, opts, sink)?,
+        };
+        if let Some(mut s) = recording {
+            s.harness = harness;
+            return Ok(s);
         }
     }
 
     // Bounded shapes (checkpoints, logs.json): a few KB–MB, never the OOM risk. Bridge through a
     // whole-Session parse and replay its messages into the sink.
-    let mut session = parse_bounded(r, &name, harness)?;
+    let mut session = parse_bounded(r, &name)?;
     session.harness = harness;
     let messages = std::mem::take(&mut session.messages);
     sink.meta(&session);
@@ -373,17 +362,9 @@ pub(crate) fn stream_for(
 
 /// Whole-`Session` parse for the bounded (non-streamed) shapes: gemini-cli checkpoints and
 /// `logs.json` (many sessions per file — picks the one matching `r.id`). These are small enough
-/// to materialize. Also handles the rare case where a chat-recording path didn't stream.
-fn parse_bounded(r: &SessionRef, name: &str, harness: Harness) -> Result<Session> {
+/// to materialize.
+fn parse_bounded(r: &SessionRef, name: &str) -> Result<Session> {
     let text = fs::read_to_string(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
-
-    // A chat recording that the streaming paths couldn't handle (shouldn't normally happen) —
-    // fall back to the pure parser so we never silently lose a session.
-    if is_chat_recording(&r.path) {
-        if let Some(s) = parse_chat_recording(&text, harness, Some(r.path.clone())) {
-            return Ok(s);
-        }
-    }
     // Checkpoint: one session per file.
     if is_checkpoint(name) {
         if let Some(s) = parse_checkpoint(&text, name, Some(r.path.clone())) {
@@ -424,239 +405,56 @@ fn is_checkpoint(name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming chat recordings — the only Gemini shapes large enough to OOM.
+// Chat recordings: one reader per era, both feeding the message codec in `record.rs`.
 // ---------------------------------------------------------------------------
 
-/// Stream a *legacy whole-file* chat recording (`{sessionId, messages:[…]}` as one JSON document)
-/// into `sink` without ever building the whole-document `Value`.
-///
-/// The file is memory-mapped (behind the `mmap` feature; a `fs::read` fallback otherwise) and a thin
-/// wrapper is deserialized that keeps each element of `messages` as a borrowed
-/// [`RawValue`](serde_json::value::RawValue). We then parse one raw item at a time into a [`Value`],
-/// run it through [`emit_record_message`], and drop it before the next — so peak memory is one
-/// message plus the (reclaimable) mapping, not the multi-GB document.
-///
-/// Returns `Ok(None)` if the bytes aren't the single-document shape (e.g. a `.json`-named JSONL log),
-/// so the caller can fall back to the JSONL path.
-fn stream_legacy_json_recording(
+/// The demand a recording read puts to the codec: under spans, large fields stay in `source`.
+fn demand<'a>(
+    harness: Harness,
+    opts: &ParseOptions,
+    source: &'a JsonSource,
+    resolver: &'a crate::lazy::Resolver,
+) -> record::Demand<'a> {
+    record::Demand {
+        harness,
+        source: opts.spans.then_some(source),
+        resolver,
+    }
+}
+
+/// Read a *legacy whole-file* chat recording (`{sessionId, messages:[…]}` as one JSON document):
+/// a streaming visitor over `messages[]`, one message through the codec at a time, so the
+/// document is never materialized. Mapped builds borrow it from one mapping; positioned builds
+/// read it in place. `Ok(None)` when the bytes are not that shape (e.g. a `.json`-named JSONL
+/// log), so the caller can try JSONL.
+fn read_document(
     path: &Path,
     harness: Harness,
     opts: &ParseOptions,
     sink: &mut dyn MessageSink,
 ) -> Result<Option<Session>> {
-    #[cfg(not(feature = "mmap"))]
-    if opts.spans {
-        return stream_legacy_views(path, harness, sink);
-    }
-    use serde::Deserialize;
-    use serde_json::value::RawValue;
-
-    /// Borrows just the metadata fields [`record_metadata`] reads, plus the message array as raw
-    /// (unparsed) items. `#[serde(borrow)]` keeps everything pointing into the mapping.
-    #[derive(Deserialize)]
-    struct Wrapper<'a> {
-        #[serde(rename = "sessionId", borrow, default)]
-        session_id: Option<std::borrow::Cow<'a, str>>,
-        #[serde(rename = "startTime", borrow, default)]
-        start_time: Option<std::borrow::Cow<'a, str>>,
-        #[serde(rename = "lastUpdated", borrow, default)]
-        last_updated: Option<std::borrow::Cow<'a, str>>,
-        #[serde(borrow, default)]
-        summary: Option<std::borrow::Cow<'a, str>>,
-        #[serde(borrow, default)]
-        directories: Option<Vec<std::borrow::Cow<'a, str>>>,
-        #[serde(borrow, default)]
-        messages: Option<Vec<&'a RawValue>>,
-        #[serde(borrow, default)]
-        kind: Option<std::borrow::Cow<'a, str>>,
-    }
-
-    let source = opts.spans.then(|| crate::json::JsonSource::capture(path)).transpose()?;
-    let arena = source
-        .as_ref()
-        .map(|_| super::store::bytes::ByteSource::arena().map(std::sync::Arc::new))
-        .transpose()?;
-    let bytes = map_file(path)?;
-    if let Some(source) = &source {
-        source.check_metadata(bytes.file.metadata()?)?;
-    }
-    // A legacy recording is a single JSON object with both `sessionId` and `messages`. If this parse
-    // fails, or those keys are absent, it's not the whole-file shape — let the caller try JSONL.
-    let Ok(w) = serde_json::from_slice::<Wrapper>(&bytes) else {
+    let source = JsonSource::capture(path)?;
+    if source.len() == 0 {
         return Ok(None);
-    };
-    let (Some(_sid), Some(raw_msgs)) = (&w.session_id, &w.messages) else {
-        return Ok(None);
-    };
-
-    // Rebuild a tiny metadata map (only the fields record_metadata consults) — never the document.
-    let mut meta = serde_json::Map::new();
-    if let Some(v) = w.session_id {
-        meta.insert("sessionId".into(), Value::String(v.to_string()));
     }
-    if let Some(v) = w.start_time {
-        meta.insert("startTime".into(), Value::String(v.to_string()));
-    }
-    if let Some(v) = w.last_updated {
-        meta.insert("lastUpdated".into(), Value::String(v.to_string()));
-    }
-    if let Some(v) = w.summary {
-        meta.insert("summary".into(), Value::String(v.to_string()));
-    }
-    if let Some(dirs) = &w.directories {
-        meta.insert(
-            "directories".into(),
-            Value::Array(dirs.iter().map(|d| Value::String(d.to_string())).collect()),
-        );
-    }
-
-    if let Some(kind) = w.kind {
-        meta.insert("kind".into(), Value::String(kind.into_owned()));
-    }
-
-    let mut session = record_metadata(&meta, harness, Some(path.to_path_buf()));
-    let summary = session.title.take();
-    let mut st = EmitState::default();
-
     let resolver = crate::lazy::Resolver::new(Some(path.to_path_buf()));
-    let index = lean::Index::default();
-    let mut sink = input::SourceSink::new(source.as_ref(), sink);
-    for item in raw_msgs {
-        if opts.spans {
-            let raw = lean::Raw::new(item.get(), &index);
-            if !lean::accepts_value(raw) {
-                continue;
-            }
-            if lean::emit(
-                raw,
-                lean::Context {
-                    bytes: &bytes,
-                    base: 0,
-                    source: source.as_ref(),
-                    arena: arena.as_ref(),
-                },
-                harness,
-                &mut st,
-                &resolver,
-                &mut sink,
-            )? == Flow::Stop
-            {
-                break;
-            }
-            continue;
-        }
-        // Parse just this one message; it (and its owned strings) drop at the end of the iteration.
-        let Ok(rm) = serde_json::from_str::<Value>(item.get()) else {
-            continue;
-        };
-        let Some(obj) = rm.as_object() else { continue };
-        if emit_record_message(harness, obj, &mut st, &mut sink) == Flow::Stop {
-            break;
-        }
-    }
-    if sink.finish()? {
-        let source = source.as_ref().expect("sourced payload has a capture");
-        source.check_metadata(bytes.file.metadata()?)?;
-        source.check()?;
-    }
-
-    session.model = st.session_model;
-    session.title = summary.or(st.title);
-    Ok(Some(session))
-}
-
-/// Preserve the legacy Wrapper's typed/unique known fields and independent message acceptance,
-/// while portable views keep large payloads in the positioned source rather than encoded buffers.
-#[cfg(not(feature = "mmap"))]
-fn stream_legacy_views(path: &Path, harness: Harness, sink: &mut dyn MessageSink) -> Result<Option<Session>> {
-    const KEYS: &[&str] = &[
-        "sessionId",
-        "startTime",
-        "lastUpdated",
-        "summary",
-        "directories",
-        "messages",
-        "kind",
-    ];
-    let captured = crate::json::JsonSource::capture(path)?;
-    let arena = std::sync::Arc::new(super::store::bytes::ByteSource::arena()?);
-    if captured.len() == 0 {
-        return Ok(None);
-    }
-    let result = captured.read_syntax(|view| {
-        // serde's struct decoder rejects duplicate known fields, even when their values agree.
-        let Some(fields) = super::store::document::Fields::parse_struct(view, KEYS)? else {
-            return Ok(None);
-        };
-        let mut meta = serde_json::Map::new();
-        for key in KEYS {
-            let value = fields.get(key);
-            if matches!(*key, "directories" | "messages") {
-                continue;
-            }
-            let Some(value) = value else { continue };
-            if value.is_null()? {
-                continue;
-            }
-            if !value.is_string()? || !value.accepts_value()? {
-                return Ok(None);
-            }
-            meta.insert((*key).into(), value.resolve()?.into_owned());
-        }
-        if !meta.contains_key("sessionId") {
-            return Ok(None);
-        }
-        if let Some(dirs) = fields.get("directories") {
-            if !dirs.is_null()? {
-                let Some(dirs) = dirs.array()? else { return Ok(None) };
-                let mut directories = Vec::new();
-                for dir in dirs {
-                    let dir = dir?;
-                    if !dir.is_string()? || !dir.accepts_value()? {
-                        return Ok(None);
-                    }
-                    directories.push(dir.resolve()?.into_owned());
-                }
-                meta.insert("directories".into(), Value::Array(directories));
-            }
-        }
-        let Some(messages) = fields
-            .get("messages")
-            .map(crate::json::JsonView::accepted_array)
-            .transpose()?
-            .flatten()
-        else {
-            return Ok(None);
-        };
-        let mut session = record_metadata(&meta, harness, Some(path.to_path_buf()));
-        let summary = session.title.take();
-        let mut st = EmitState::default();
-        let resolver = crate::lazy::Resolver::new(Some(path.to_path_buf()));
-        let mut sink = input::SourceSink::new(Some(&captured), sink);
-        for message in messages {
-            let Some(message) = message? else { continue };
-            if lean::emit_view(
-                message,
-                lean::output::Output {
-                    source: &captured,
-                    arena: &arena,
-                },
-                harness,
-                &mut st,
-                &resolver,
-                &mut sink,
-            )? == Flow::Stop
-            {
-                break;
-            }
-        }
-        sink.finish()?;
-        // read_syntax checks the same opened descriptor and named identity after this callback.
-        session.model = st.session_model;
-        session.title = summary.or(st.title);
-        Ok(Some(session))
+    let d = demand(harness, opts, &source, &resolver);
+    // Nearly every recording is one Value-compatible document: one validating pass, and its
+    // messages need no check of their own. One that is not (a field Value rejects) is read as
+    // serde's typed envelope: syntax only, each message accepted on its own. Either way the
+    // source view checks the descriptor's identity after the visit.
+    let mut visited = false;
+    let read = source.read_document(|view| {
+        visited = true;
+        document(view, Some(path), d, sink, true)
     });
-    match result {
+    let read = match read {
+        Err(error) if !visited && error.is::<crate::json::InvalidJson>() => {
+            source.read_syntax(|view| document(view, Some(path), d, sink, false))
+        }
+        read => read,
+    };
+    match read {
         Err(error) if error.is::<crate::json::InvalidJson>() || error.is::<super::store::document::InvalidStruct>() => {
             Ok(None)
         }
@@ -664,279 +462,152 @@ fn stream_legacy_views(path: &Path, harness: Harness, sink: &mut dyn MessageSink
     }
 }
 
-/// Memory-map `path` (feature `mmap`) or read it into a `Vec<u8>` (fallback). Returns an opaque
-/// byte container that derefs to `[u8]` either way, so callers don't branch on the feature.
-fn map_file(path: &Path) -> Result<FileBytes> {
-    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    #[cfg(feature = "mmap")]
-    {
-        // Safety: cv reads its own on-disk transcripts; we treat the mapping as immutable bytes and
-        // never alias it mutably. A concurrent external truncation is the documented mmap caveat and
-        // not a case cv creates.
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mmapping {}", path.display()))?;
-        Ok(FileBytes {
-            file,
-            bytes: FileContents::Mapped(mmap),
-        })
-    }
-    #[cfg(not(feature = "mmap"))]
-    {
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut &file, &mut bytes).with_context(|| format!("reading {}", path.display()))?;
-        Ok(FileBytes {
-            file,
-            bytes: FileContents::Owned(bytes),
-        })
-    }
-}
+/// The document's known fields, in the order serde's derived struct reads them positionally.
+const DOCUMENT: &[&str] = &[
+    "sessionId",
+    "startTime",
+    "lastUpdated",
+    "summary",
+    "directories",
+    "messages",
+    "kind",
+];
 
-/// Byte container abstracting over an mmap (feature `mmap`) and an owned read (fallback).
-struct FileBytes {
-    file: fs::File,
-    bytes: FileContents,
-}
-enum FileContents {
-    #[cfg(feature = "mmap")]
-    Mapped(memmap2::Mmap),
-    #[cfg(not(feature = "mmap"))]
-    Owned(Vec<u8>),
-}
-
-impl std::ops::Deref for FileBytes {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match &self.bytes {
-            #[cfg(feature = "mmap")]
-            FileContents::Mapped(m) => m,
-            #[cfg(not(feature = "mmap"))]
-            FileContents::Owned(v) => v,
+/// A whole-file recording: typed, unique known fields (strings or null, `sessionId` required,
+/// `messages` an array), each message Value-compatible on its own (`accepted` when the whole
+/// document already is). `None` when it is not one.
+fn document(
+    view: crate::json::JsonView<'_>,
+    path: Option<&Path>,
+    d: record::Demand<'_>,
+    sink: &mut dyn MessageSink,
+    accepted: bool,
+) -> Result<Option<Session>> {
+    let Some(fields) = super::store::document::Fields::parse_struct(view, DOCUMENT)? else {
+        return Ok(None);
+    };
+    let mut meta = serde_json::Map::new();
+    for key in ["sessionId", "startTime", "lastUpdated", "summary", "kind"] {
+        let Some(value) = fields.get(key) else { continue };
+        if value.is_null()? {
+            continue;
+        }
+        if !value.is_string()? || !value.accepts_value()? {
+            return Ok(None);
+        }
+        meta.insert(key.into(), value.resolve()?.into_owned());
+    }
+    if !meta.contains_key("sessionId") {
+        return Ok(None);
+    }
+    if let Some(dirs) = fields.get("directories") {
+        if !dirs.is_null()? {
+            let Some(dirs) = dirs.array()? else { return Ok(None) };
+            let mut directories = Vec::new();
+            for dir in dirs {
+                let dir = dir?;
+                if !dir.is_string()? || !dir.accepts_value()? {
+                    return Ok(None);
+                }
+                directories.push(dir.resolve()?.into_owned());
+            }
+            meta.insert("directories".into(), Value::Array(directories));
         }
     }
+    let Some(messages) = fields
+        .get("messages")
+        .map(crate::json::JsonView::array)
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let mut session = record_metadata(&meta, d.harness, path.map(Path::to_path_buf));
+    let summary = session.title.take();
+    let mut st = EmitState::default();
+    let mut published = false;
+    for message in messages {
+        let message = message?;
+        if !accepted && !message.accepts_value()? {
+            continue;
+        }
+        if d.decode(message, &mut st, sink, &mut published)? == Flow::Stop {
+            break;
+        }
+    }
+    session.model = st.session_model;
+    session.title = summary.or(st.title);
+    Ok(Some(session))
 }
 
-/// Replay a modern JSONL recording's navigation into borrowed record descriptors, then emit
-/// the effective messages. A later record can replace/truncate earlier output, so selection
-/// must reach EOF; only keys and source ranges are retained, never historical payload Values.
+/// Read a *modern* append-only JSONL recording. A later record can replace or truncate earlier
+/// messages, so a first pass over [`for_each_line`](super::store::jsonl::for_each_line) reaches
+/// EOF retaining only keys and byte ranges, never a superseded message's content; the effective
+/// messages are then read again by range, in order, through the codec.
 ///
-/// Returns `Ok(None)` if the file is not a recording (no metadata line and no message records), so
-/// the caller can fall back.
-#[cfg(feature = "mmap")]
-fn stream_jsonl_recording(
+/// `Ok(None)` when the file is not a recording (no metadata line and no message records).
+fn read_jsonl(
     path: &Path,
     harness: Harness,
     opts: &ParseOptions,
     sink: &mut dyn MessageSink,
 ) -> Result<Option<Session>> {
-    let source = opts.spans.then(|| crate::json::JsonSource::capture(path)).transpose()?;
-    let arena = source
-        .as_ref()
-        .map(|_| super::store::bytes::ByteSource::arena().map(std::sync::Arc::new))
-        .transpose()?;
-    let bytes = map_file(path)?;
-    if let Some(source) = &source {
-        source.check_metadata(bytes.file.metadata()?)?;
-    }
-    let index = lean::Index::default();
-    let mut replay = RecordingReplay::<ReplayBody<'_>>::default();
-    for line in bytes.split(|b| *b == b'\n') {
-        let Ok(raw) = serde_json::from_slice::<&crate::lazy::RawValue>(line) else {
-            continue;
-        };
-        let raw = lean::Raw::new(raw.get(), &index);
-        if lean::accepts_value(raw) {
-            replay.ingest_projected(raw, ReplayBody::Raw, ReplayBody::Marker);
+    let source = JsonSource::capture(path)?;
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    source.check_metadata(file.metadata()?)?;
+    let mut replay = RecordingReplay::default();
+    super::store::jsonl::for_each_line(&source, &file, 0, source.len(), |line| {
+        if let Some(view) = line.view {
+            replay.ingest(view)?;
         }
-    }
-    if !replay.saw_meta && replay.msgs.is_empty() {
-        return Ok(None);
-    }
-    let mut session = record_metadata(&replay.metadata, harness, Some(path.to_path_buf()));
-    let summary = session.title.take();
-    let mut st = EmitState::default();
+        Ok(Flow::Continue)
+    })?;
     let resolver = crate::lazy::Resolver::new(Some(path.to_path_buf()));
-    let mut sink = input::SourceSink::new(source.as_ref(), sink);
-    for id in &replay.order {
-        let Some(body) = replay.msgs.remove(id) else { continue };
-        let flow = match body {
-            ReplayBody::Raw(raw) if opts.spans => lean::emit(
-                raw,
-                lean::Context {
-                    bytes: &bytes,
-                    base: 0,
-                    source: source.as_ref(),
-                    arena: arena.as_ref(),
-                },
-                harness,
-                &mut st,
-                &resolver,
-                &mut sink,
-            )?,
-            body => {
-                let rm = match body {
-                    ReplayBody::Raw(raw) => serde_json::from_str::<Value>(raw.get()).unwrap_or(Value::Null),
-                    ReplayBody::Marker(v) => v,
-                };
-                let Some(obj) = rm.as_object() else { continue };
-                emit_record_message(harness, obj, &mut st, &mut sink)
-            }
-        };
-        if flow == Flow::Stop {
-            break;
-        }
-    }
-    if sink.finish()? {
-        let source = source.as_ref().expect("sourced payload has a capture");
-        source.check_metadata(bytes.file.metadata()?)?;
+    let mut records = super::store::jsonl::Records::new(&source, &file);
+    let mut published = false;
+    let session = replay.emit(
+        demand(harness, opts, &source, &resolver),
+        Some(path),
+        Some(&mut records),
+        sink,
+        &mut published,
+    )?;
+    if published {
+        source.check_metadata(file.metadata()?)?;
         source.check()?;
     }
-    session.model = st.session_model;
-    session.title = summary.or(st.title);
-    Ok(Some(session))
+    Ok(session)
 }
 
-// Keep the original buffered replay when mapping is unavailable: a long historical file can
-// rewind to a tiny active history, so reading the entire source would increase its heap cost.
-#[cfg(not(feature = "mmap"))]
-fn stream_jsonl_recording(
-    path: &Path,
-    harness: Harness,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-) -> Result<Option<Session>> {
-    if opts.spans {
-        return stream_jsonl_ranges(path, harness, sink);
-    }
-    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-
-    let mut replay = RecordingReplay::default();
-    super::for_each_json_line(std::io::BufReader::new(file), |rec| {
-        replay.ingest(rec);
-        Flow::Continue
-    });
-    if !replay.saw_meta && replay.msgs.is_empty() {
-        return Ok(None);
-    }
-
-    let mut session = record_metadata(&replay.metadata, harness, Some(path.to_path_buf()));
-    let summary = session.title.take();
-    let mut st = EmitState::default();
-
-    // Emit retained messages in order, dropping each raw Value as we go (so we never hold the
-    // reassembled array and the IR messages at the same time).
-    for id in &replay.order {
-        let Some(rm) = replay.msgs.remove(id) else { continue };
-        let Some(obj) = rm.as_object() else { continue };
-        if emit_record_message(harness, obj, &mut st, sink) == Flow::Stop {
-            break;
-        }
-    }
-
-    session.model = st.session_model;
-    session.title = summary.or(st.title);
-    Ok(Some(session))
+/// Where a retained message lives: a byte range of the source, or an owned value (records of a
+/// parsed string, and the synthetic rewind markers).
+#[derive(Debug, PartialEq)]
+enum Body {
+    Range(u64, u64),
+    Owned(Value),
 }
 
-/// Portable lazy replay owns navigation ranges and one encoded record at a time. The positioned
-/// cursor is the same captured source used by JSON consumers, not a second source authority.
-#[cfg(not(feature = "mmap"))]
-fn stream_jsonl_ranges(path: &Path, harness: Harness, sink: &mut dyn MessageSink) -> Result<Option<Session>> {
-    use super::store::document::range::{Range, RangeSource};
-    use std::io::BufRead;
-    let captured = crate::json::JsonSource::capture(path)?;
-    let arena = std::sync::Arc::new(super::store::bytes::ByteSource::arena()?);
-    let source = RangeSource::from_captured(captured.clone())?;
-    let mut cursor = source.cursor(source.range())?;
-    let mut recording = RecordingReplay::<replay::RangeBody>::default();
-    loop {
-        let offset = cursor.position();
-        loop {
-            let bytes = cursor.fill_buf()?;
-            if bytes.is_empty() {
-                break;
-            }
-            let newline = memchr::memchr(b'\n', bytes);
-            let n = newline.map_or(bytes.len(), |i| i + 1);
-            cursor.consume(n);
-            if newline.is_some() {
-                break;
-            }
-        }
-        let len = cursor.position() - offset;
-        if len == 0 {
-            break;
-        }
-        let Some(range) = replay::trim(&source, Range { offset, len })? else {
-            continue;
-        };
-        if source.validate(range)? {
-            replay::ingest(&mut recording, &source, range)?;
-        }
+impl Body {
+    fn of(view: crate::json::JsonView<'_>) -> Result<Self> {
+        Ok(match view.source_range()? {
+            Some((at, len)) => Body::Range(at, len),
+            None => Body::Owned(view.resolve()?.into_owned()),
+        })
     }
-    if !recording.saw_meta && recording.msgs.is_empty() {
-        return Ok(None);
-    }
-    let mut session = record_metadata(&recording.metadata, harness, Some(path.to_path_buf()));
-    let summary = session.title.take();
-    let mut st = EmitState::default();
-    drop(cursor);
-    let resolver = crate::lazy::Resolver::new(Some(path.to_path_buf()));
-    let mut sink = input::SourceSink::new(Some(&captured), sink);
-    for id in &recording.order {
-        let Some(body) = recording.msgs.remove(id) else {
-            continue;
-        };
-        let flow = match body {
-            replay::RangeBody::Range(range) => {
-                captured.validated_range(range.offset, range.len)?.with_view(|view| {
-                    lean::emit_view(
-                        view,
-                        lean::output::Output {
-                            source: &captured,
-                            arena: &arena,
-                        },
-                        harness,
-                        &mut st,
-                        &resolver,
-                        &mut sink,
-                    )
-                })?
-            }
-            replay::RangeBody::Marker(value) => {
-                let Some(obj) = value.as_object() else { continue };
-                emit_record_message(harness, obj, &mut st, &mut sink)
-            }
-        };
-        if flow == Flow::Stop {
-            break;
-        }
-    }
-    sink.finish()?;
-    source.check_identity()?;
-    session.model = st.session_model;
-    session.title = summary.or(st.title);
-    Ok(Some(session))
-}
-
-/// Effective messages point into the mapped source. Navigation retains small keys/ranges,
-/// never the content of an inactive or superseded message.
-#[cfg(feature = "mmap")]
-enum ReplayBody<'a> {
-    Raw(lean::Raw<'a>),
-    Marker(Value),
 }
 
 /// Replays a *modern* append-only JSONL recording's records into its effective state: the metadata
-/// map plus the retained raw message records (insertion-ordered, with `$set` replacement and
-/// `$rewindTo` truncation applied). Shared by the streaming [`stream_jsonl_recording`] and the pure
-/// [`parse_chat_recording`] so both apply identical control-record semantics.
-struct RecordingReplay<T = Value> {
+/// map plus the retained message bodies (insertion-ordered, with `$set` replacement and
+/// `$rewindTo` truncation applied).
+#[derive(Default)]
+struct RecordingReplay {
     metadata: serde_json::Map<String, Value>,
     /// Insertion order of message keys (replacement keeps the original position). A key is the
     /// record's `type` and `id` ([`replay_key`]): a resume's `$set.messages` (re-synced from the API
     /// history) can give the tool-response `user` turn the SAME id as the `gemini` turn that made the
     /// call (seen on 0.63.0), and keying by id alone let it overwrite the assistant turn.
     order: Vec<String>,
-    msgs: BTreeMap<String, T>,
+    msgs: BTreeMap<String, Body>,
     /// First insertion position for each wire ID, shared across type-qualified replay keys.
     first_positions: HashMap<String, usize>,
     /// Whether a real metadata line (sessionId + projectHash) was seen.
@@ -945,11 +616,16 @@ struct RecordingReplay<T = Value> {
     rewinds: usize,
 }
 
-/// A message record's replay key, `<type>\u{1f}<id>` (see [`RecordingReplay::order`]).
-fn replay_key(rec: &Value) -> Option<String> {
-    let id = rec.get("id").and_then(Value::as_str)?;
-    let ty = rec.get("type").and_then(Value::as_str).unwrap_or("");
-    Some(format!("{ty}\u{1f}{id}"))
+/// A message record's replay key, `<type>\u{1f}<id>` (see [`RecordingReplay::order`]); `None`
+/// without a string `id`.
+fn replay_key(fields: &super::store::document::Fields<'_>) -> Result<Option<String>> {
+    let Some(id) = fields.string("id")? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "{}\u{1f}{id}",
+        fields.string("type")?.unwrap_or_default()
+    )))
 }
 
 /// The id part of a [`replay_key`].
@@ -957,21 +633,8 @@ fn key_id(key: &str) -> &str {
     key.split_once('\u{1f}').map_or(key, |(_, id)| id)
 }
 
-impl<T> Default for RecordingReplay<T> {
-    fn default() -> Self {
-        Self {
-            metadata: Default::default(),
-            order: Vec::new(),
-            msgs: BTreeMap::new(),
-            first_positions: HashMap::new(),
-            saw_meta: false,
-            rewinds: 0,
-        }
-    }
-}
-
-impl<T> RecordingReplay<T> {
-    fn insert(&mut self, key: String, body: T) {
+impl RecordingReplay {
+    fn insert(&mut self, key: String, body: Body) {
         match self.msgs.entry(key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 self.first_positions
@@ -992,7 +655,7 @@ impl<T> RecordingReplay<T> {
         self.first_positions.clear();
     }
 
-    fn rewind(&mut self, target: &str, make_marker: impl FnOnce(Value) -> T) {
+    fn rewind(&mut self, target: &str) {
         if let Some(pos) = self.first_positions.get(target).copied() {
             for key in self.order.drain(pos..) {
                 let id = key_id(&key);
@@ -1007,128 +670,114 @@ impl<T> RecordingReplay<T> {
         self.rewinds += 1;
         let marker_id = format!("$rewind-{}", self.rewinds);
         let marker = serde_json::json!({ "id": marker_id, "type": "rewind", "rewindTo": target });
-        self.insert(marker_id, make_marker(marker));
+        self.insert(marker_id, Body::Owned(marker));
     }
-}
 
-#[cfg(feature = "mmap")]
-impl<T> RecordingReplay<T> {
-    fn ingest_projected<'a>(
-        &mut self,
-        raw: lean::Raw<'a>,
-        mut body: impl FnMut(lean::Raw<'a>) -> T,
-        marker: impl FnOnce(Value) -> T,
-    ) {
-        let Some(rec) = lean::Record::parse(raw) else {
-            return;
-        };
-        if let Some(target) = rec.string("$rewindTo") {
-            self.rewind(&target, marker);
-            return;
-        }
-        if let Some(set) = rec.fields.get("$set") {
-            if let Some(set) = lean::Record::parse(*set) {
-                for (k, v) in set.fields {
-                    if k == "messages" {
-                        self.clear_messages();
-                        if let Some(messages) = lean::array(v) {
-                            for raw in messages {
-                                if let Some(m) = lean::Record::parse(raw) {
-                                    if let Some(key) = raw_replay_key(&m) {
-                                        self.insert(key, body(raw));
-                                    }
-                                }
-                            }
-                        }
-                    } else if RECORD_METADATA.contains(&k.as_str()) {
-                        if let Ok(v) = serde_json::from_str(v.get()) {
-                            self.metadata.insert(k, v);
-                        }
-                    }
-                }
-                return;
+    fn note_metadata(&mut self, fields: &super::store::document::Fields<'_>) -> Result<()> {
+        for key in RECORD_METADATA {
+            if let Some(value) = fields.value(key)? {
+                self.metadata.insert((*key).into(), value);
             }
         }
-        if let Some(key) = raw_replay_key(&rec) {
-            if rec.fields.contains_key("type") || rec.fields.contains_key("content") {
-                self.insert(key, body(raw));
-            }
-            return;
-        }
-        if rec.fields.contains_key("sessionId") && rec.fields.contains_key("projectHash") {
-            self.saw_meta = true;
-            for (k, v) in rec.fields {
-                if RECORD_METADATA.contains(&k.as_str()) {
-                    if let Ok(v) = serde_json::from_str(v.get()) {
-                        self.metadata.insert(k, v);
-                    }
-                }
-            }
-        }
+        Ok(())
     }
-}
 
-#[cfg(feature = "mmap")]
-fn raw_replay_key(rec: &lean::Record<'_>) -> Option<String> {
-    Some(format!(
-        "{}\u{1f}{}",
-        rec.string("type").unwrap_or_default(),
-        rec.string("id")?
-    ))
-}
-
-impl RecordingReplay<Value> {
     /// Fold one JSONL record into the replay state. Non-object junk is ignored.
-    fn ingest(&mut self, mut rec: Value) {
-        if !rec.is_object() {
-            return;
+    fn ingest(&mut self, view: crate::json::JsonView<'_>) -> Result<()> {
+        use super::store::document::Fields;
+        let Some(rec) = Fields::parse(
+            view,
+            &["$rewindTo", "$set", "id", "type", "content", "sessionId", "projectHash"],
+        )?
+        else {
+            return Ok(());
+        };
+        if let Some(target) = rec.string("$rewindTo")? {
+            self.rewind(&target);
+            return Ok(());
         }
-        if let Some(rewind) = rec.get("$rewindTo").and_then(Value::as_str) {
-            self.rewind(rewind, |v| v);
-            return;
-        }
-        if rec.get("$set").is_some_and(Value::is_object) {
-            // This replay owns the record: transfer checkpoint bodies and metadata rather than
-            // cloning the entire effective history before dropping its source record.
-            let Value::Object(set) = rec.as_object_mut().unwrap().remove("$set").unwrap() else {
-                unreachable!("$set was checked as an object")
-            };
-            for (k, v) in set {
-                if k == "messages" {
+        if let Some(set) = rec.get("$set") {
+            const SET: &[&str] = &[
+                "sessionId",
+                "startTime",
+                "lastUpdated",
+                "summary",
+                "directories",
+                "kind",
+                "messages",
+            ];
+            if let Some(set) = Fields::parse(set, SET)? {
+                if let Some(messages) = set.get("messages") {
                     // Checkpoint: rebuild the whole message list.
                     self.clear_messages();
-                    if let Value::Array(arr) = v {
-                        for m in arr {
-                            if let Some(key) = replay_key(&m) {
-                                self.insert(key, m);
+                    if let Some(messages) = messages.array()? {
+                        for message in messages {
+                            let message = message?;
+                            if let Some(key) = Fields::parse(message, &["id", "type"])?
+                                .map(|m| replay_key(&m))
+                                .transpose()?
+                                .flatten()
+                            {
+                                self.insert(key, Body::of(message)?);
                             }
                         }
                     }
-                } else {
-                    self.metadata.insert(k, v);
                 }
+                return self.note_metadata(&set);
             }
-            return;
         }
-        if let Some(key) = replay_key(&rec) {
+        if let Some(key) = replay_key(&rec)? {
             // A message record (must have an id and a type/content); a junk record with an id but
             // no message shape is ignored either way.
             if rec.get("type").is_some() || rec.get("content").is_some() {
-                self.insert(key, rec);
+                self.insert(key, Body::of(view)?);
             }
-            return;
+            return Ok(());
         }
         // Metadata line(s): a real recording's metadata carries BOTH sessionId and projectHash
         // (gemini-cli's `isPartialMetadataRecord`). This guards against mistaking a `logs.json`
         // entry (sessionId + messageId + message, no projectHash) for a recording.
         if rec.get("sessionId").is_some() && rec.get("projectHash").is_some() {
             self.saw_meta = true;
-            if let Value::Object(obj) = rec {
-                for (k, v) in obj {
-                    self.metadata.insert(k, v);
-                }
+            if let Some(meta) = Fields::parse(view, RECORD_METADATA)? {
+                self.note_metadata(&meta)?;
             }
         }
+        Ok(())
+    }
+
+    /// The effective session: its metadata, then each retained message through the codec in
+    /// order (`records` reads the ranged ones). `None` when nothing marked it a recording.
+    fn emit(
+        mut self,
+        d: record::Demand<'_>,
+        path: Option<&Path>,
+        mut records: Option<&mut super::store::jsonl::Records<'_>>,
+        sink: &mut dyn MessageSink,
+        published: &mut bool,
+    ) -> Result<Option<Session>> {
+        if !self.saw_meta && self.msgs.is_empty() {
+            return Ok(None);
+        }
+        let mut session = record_metadata(&self.metadata, d.harness, path.map(Path::to_path_buf));
+        let summary = session.title.take();
+        let mut st = EmitState::default();
+        for key in &self.order {
+            let flow = match self.msgs.remove(key) {
+                Some(Body::Range(at, len)) => records
+                    .as_deref_mut()
+                    .context("ranged record without its source")?
+                    .read(at, len, |view| d.decode(view, &mut st, sink, published))?,
+                Some(Body::Owned(value)) => d.decode((&value).into(), &mut st, sink, published)?,
+                None => continue,
+            };
+            if flow == Flow::Stop {
+                break;
+            }
+        }
+        session.model = st.session_model;
+        session.title = summary.or(st.title);
+        Ok(Some(session))
     }
 }
 
@@ -1268,45 +917,48 @@ fn parse_logs_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
 // Chat recordings (ConversationRecord) — legacy whole-file .json or modern .jsonl
 // ---------------------------------------------------------------------------
 
-/// Parse a gemini-cli chat recording. Handles both the legacy whole-file JSON object
-/// (`{sessionId, messages:[…]}`) and the modern append-only JSONL log (metadata line + message
-/// records + `$set` / `$rewindTo` control records). Returns `None` if the text is not a recording.
+/// Parse a gemini-cli chat recording from text, with no filesystem access: the legacy whole-file
+/// JSON object (`{sessionId, messages:[…]}`) or the modern append-only JSONL log (metadata line +
+/// message records + `$set` / `$rewindTo` control records), through the same readers as a file.
+/// `None` if the text is not a recording.
 fn parse_chat_recording(text: &str, harness: Harness, source_path: Option<PathBuf>) -> Option<Session> {
-    let trimmed = text.trim_start();
-
-    // Legacy: a single JSON object spanning the whole file.
-    if trimmed.starts_with('{') {
-        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text) {
-            if map.contains_key("sessionId") && map.contains_key("messages") {
-                return Some(record_to_session(&map, harness, source_path));
-            }
-            // A modern recording happens to also start with `{` on its metadata first line,
-            // but a *whole-file* parse of multi-line JSONL fails, so we fall through to JSONL below.
+    let resolver = crate::lazy::Resolver::new(None);
+    let d = record::Demand {
+        harness,
+        source: None,
+        resolver: &resolver,
+    };
+    let mut sink = CollectSink::default();
+    // A modern recording's metadata line also starts with `{`, but a whole-file parse of
+    // multi-line JSONL fails, so it falls through to the line replay.
+    let document = match serde_json::from_str::<Value>(text) {
+        Ok(value @ Value::Object(_)) => document((&value).into(), source_path.as_deref(), d, &mut sink, true)
+            .ok()
+            .flatten(),
+        _ => None,
+    };
+    let mut session = match document {
+        Some(session) => session,
+        None => {
+            let mut replay = RecordingReplay::default();
+            super::for_each_json_line_str(text, |rec| {
+                let _ = replay.ingest((&rec).into());
+                Flow::Continue
+            });
+            replay
+                .emit(d, source_path.as_deref(), None, &mut sink, &mut false)
+                .ok()
+                .flatten()?
         }
-    }
-
-    // Modern JSONL: replay metadata + message records + control records.
-    let mut replay = RecordingReplay::default();
-    super::for_each_json_line_str(text, |rec| {
-        replay.ingest(rec);
-        Flow::Continue
-    });
-
-    if !replay.saw_meta && replay.msgs.is_empty() {
-        return None;
-    }
-
-    // Reassemble a ConversationRecord-shaped map.
-    let mut metadata = replay.metadata;
-    let messages: Vec<Value> = replay.order.iter().filter_map(|id| replay.msgs.remove(id)).collect();
-    metadata.insert("messages".into(), Value::Array(messages));
-    Some(record_to_session(&metadata, harness, source_path))
+    };
+    session.messages = sink.messages;
+    Some(session)
 }
 
 /// Build the IR [`Session`] *metadata* (everything but `messages`) from a `ConversationRecord`'s
 /// top-level fields. `title` is the record's `summary` when present; the per-message scan fills in a
 /// first-user-turn fallback and the session `model`. `messages` is left empty — the caller streams
-/// them via [`emit_record_message`].
+/// them through the message codec (`record.rs`).
 const RECORD_METADATA: &[&str] = &[
     "sessionId",
     "startTime",
@@ -1371,505 +1023,6 @@ struct EmitState {
     answered: std::collections::HashSet<String>,
 }
 
-/// Translate one raw `ConversationRecord` message (`obj`) into 0..2 IR [`Message`]s and hand them to
-/// `sink` (an assistant turn may also emit a trailing [`Role::Tool`] turn for its tool results).
-///
-/// Threads [`EmitState`] across messages. Returns the sink's [`Flow`] so a streaming caller can stop
-/// early.
-fn emit_record_message(
-    harness: Harness,
-    obj: &serde_json::Map<String, Value>,
-    st: &mut EmitState,
-    sink: &mut dyn MessageSink,
-) -> Flow {
-    emit_record_message_with(harness, obj, st, None, sink)
-}
-
-fn emit_record_message_with(
-    harness: Harness,
-    obj: &serde_json::Map<String, Value>,
-    st: &mut EmitState,
-    payload: Option<&lean::Payload<'_>>,
-    sink: &mut dyn MessageSink,
-) -> Flow {
-    let content_blocks = |out: &mut Vec<Block>| match payload {
-        Some(payload) => out.extend(payload.take_content()),
-        None => push_content_blocks(out, obj.get("content")),
-    };
-    let mty = obj.get("type").and_then(Value::as_str).unwrap_or("user");
-    let ts = obj.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
-    let id = obj.get("id").and_then(Value::as_str).map(str::to_string);
-
-    match mty {
-        "gemini" | "model" | "assistant" => {
-            let mut m = Message::new(Role::Assistant);
-            m.id = id;
-            m.timestamp = ts;
-            // The first model seen becomes `Session::model`; a turn records its own only when it
-            // differs (`Message::model` is the exception, not the rule — IR diet).
-            if let Some(model) = obj.get("model").and_then(Value::as_str) {
-                match st.session_model.as_deref() {
-                    None => st.session_model = Some(model.to_string()),
-                    Some(m0) if m0 != model => m.model = Some(model.to_string()),
-                    _ => {}
-                }
-            }
-            m.usage = obj.get("tokens").and_then(parse_tokens);
-
-            // Thoughts → Thinking blocks (subject + description).
-            let thoughts = obj.get("thoughts").and_then(Value::as_array);
-            if let Some(thoughts) = payload.and_then(lean::Payload::take_thoughts) {
-                m.content.extend(thoughts);
-            } else if let Some(thoughts) = thoughts {
-                for t in thoughts {
-                    let subj = t.get("subject").and_then(Value::as_str).unwrap_or("");
-                    let desc = t.get("description").and_then(Value::as_str).unwrap_or("");
-                    let text = if subj.is_empty() {
-                        desc.to_string()
-                    } else if desc.is_empty() {
-                        subj.to_string()
-                    } else {
-                        format!("**{subj}** {desc}")
-                    };
-                    if !text.is_empty() {
-                        m.content.push(Block::Thinking {
-                            text: text.into(),
-                            signature: None,
-                            encrypted: None,
-                            redacted: false,
-                        });
-                    }
-                }
-            }
-
-            // Assistant content: string, or array of Parts (text / inlineData / functionCall). A
-            // record re-synced from the API history (`updateMessagesFromHistory`, every `$set.messages`
-            // since 0.46.0) carries its thoughts and calls twice: as `thought`/`functionCall` parts
-            // in `content` AND in `thoughts[]`/`toolCalls[]`. The structured fields win; the parts
-            // are kept only when the fields are absent (older records, checkpoints).
-            let calls = obj.get("toolCalls").and_then(Value::as_array);
-            let call_ids: std::collections::HashSet<&str> = calls
-                .into_iter()
-                .flatten()
-                .filter_map(|c| c.get("id").and_then(Value::as_str))
-                .collect();
-            let has_thoughts = thoughts.is_some_and(|t| !t.is_empty());
-            let mut parts = Vec::new();
-            content_blocks(&mut parts);
-            m.content.extend(parts.into_iter().filter(|b| match b {
-                Block::Thinking { .. } => !has_thoughts,
-                Block::ToolUse { id, .. } => !call_ids.contains(id.as_str()),
-                _ => true,
-            }));
-
-            // Tool calls (gemini-cli ToolCallRecord) → ToolUse + paired ToolResult. A call with an
-            // `agentId` ran a sub-agent (`invoke_agent`), whose own recording is
-            // `chats/<this session>/<agentId>.jsonl`: the turn is a SubagentSpawn, its result a
-            // SubagentReturn.
-            let mut tool_results: Vec<Block> = Vec::new();
-            let mut agent_ids: Vec<Value> = Vec::new();
-            if let Some(calls) = calls {
-                for (i, c) in calls.iter().enumerate() {
-                    let name = c.get("name").and_then(Value::as_str).unwrap_or("tool");
-                    let call_id = c
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("{name}-call"));
-                    let input = payload
-                        .and_then(|p| p.take_input(i))
-                        .unwrap_or_else(|| c.get("args").cloned().unwrap_or(Value::Null).into());
-                    if let Some(a) = c.get("agentId").and_then(Value::as_str) {
-                        agent_ids.push(Value::String(a.to_string()));
-                    }
-                    m.content.push(Block::ToolUse {
-                        id: call_id.clone(),
-                        name: name.to_string(),
-                        input,
-                        namespace: None,
-                    });
-                    let status = c.get("status").and_then(Value::as_str);
-                    let is_error = status.map(|s| s.eq_ignore_ascii_case("error")).unwrap_or(false);
-                    let content = payload
-                        .and_then(|p| p.take_result(i))
-                        .or_else(|| {
-                            tool_result_text(c.get("result"))
-                                .or_else(|| c.get("resultDisplay").and_then(Value::as_str).map(str::to_string))
-                                .map(crate::lazy::Text::from)
-                        })
-                        .unwrap_or_default();
-                    // A tool that completed with EMPTY output still ran and still answered — the
-                    // turn is real. Requiring non-empty text dropped it, and with it the whole Tool
-                    // turn, so a `ToolSearch` that found nothing vanished from a round trip. A call
-                    // with no `status` yet has not completed and still contributes no result.
-                    if !content.is_empty() || status.is_some() {
-                        st.answered.insert(call_id.clone());
-                        tool_results.push(Block::ToolResult {
-                            tool_use_id: call_id,
-                            content,
-                            is_error,
-                            tool_name: Some(name.to_string()),
-                            status: status.map(str::to_string),
-                            details: None,
-                        });
-                    }
-                }
-            }
-
-            let spawned = !agent_ids.is_empty();
-            if spawned {
-                m.kind = MessageKind::SubagentSpawn;
-                m.harness_extra_mut(harness)
-                    .insert("subagent_ids".into(), Value::Array(agent_ids));
-            }
-            if !m.content.is_empty() && sink.message(m) == Flow::Stop {
-                return Flow::Stop;
-            }
-            // Emit tool results as a separate Tool-role turn (mirrors how Gemini feeds
-            // functionResponses back as a user turn, but kept distinct in the IR).
-            if !tool_results.is_empty() {
-                let mut tm = Message::new(Role::Tool);
-                if spawned {
-                    tm.kind = MessageKind::SubagentReturn;
-                    tm.origin = Origin::Subagent;
-                }
-                tm.timestamp = ts;
-                tm.content = tool_results;
-                if sink.message(tm) == Flow::Stop {
-                    return Flow::Stop;
-                }
-            }
-        }
-        "info" | "error" | "warning" => {
-            // Harness notices (`info`/`warning`) and errors the model never answered (`error`):
-            // System turns, searchable, typed by kind; the record type is a Gemini fact.
-            let kind = if mty == "error" {
-                MessageKind::Error
-            } else {
-                MessageKind::Notice
-            };
-            let mut m = Message::of_kind(Role::System, kind, Origin::Harness);
-            m.id = id;
-            m.timestamp = ts;
-            m.harness_extra_mut(harness)
-                .insert("record_type".into(), Value::String(mty.to_string()));
-            content_blocks(&mut m.content);
-            if !m.content.is_empty() && sink.message(m) == Flow::Stop {
-                return Flow::Stop;
-            }
-        }
-        "rewind" => {
-            // A `$rewindTo` control record (see `RecordingReplay::ingest`): what follows does not
-            // continue what precedes. Kept as a Branch marker so a reader sees the cut; it is not a
-            // message record, so it carries no id or timestamp of its own.
-            let target = obj.get("rewindTo").and_then(Value::as_str).unwrap_or("");
-            let mut m = Message::of_kind(Role::System, MessageKind::Branch, Origin::Harness);
-            m.content.push(Block::Text {
-                text: format!("[rewound to {target}]").into(),
-            });
-            let bag = m.harness_extra_mut(harness);
-            bag.insert("record_type".into(), Value::String("rewind".into()));
-            bag.insert("rewind_to".into(), Value::String(target.to_string()));
-            if sink.message(m) == Flow::Stop {
-                return Flow::Stop;
-            }
-        }
-        _ if payload.map_or_else(
-            || is_tool_response_turn(obj.get("content")),
-            lean::Payload::is_tool_response,
-        ) =>
-        {
-            // A `user` record of bare `functionResponse` parts: the tool output fed back to the
-            // model (see [`EmitState::answered`]). A copy of results already emitted is dropped;
-            // otherwise (no `toolCalls[]` result to pair with) it is the Tool turn itself.
-            let mut blocks = Vec::new();
-            content_blocks(&mut blocks);
-            blocks.retain(|b| match b {
-                Block::ToolResult { tool_use_id, .. } => st.answered.insert(tool_use_id.clone()),
-                _ => true,
-            });
-            if !blocks.is_empty() {
-                let mut m = Message::new(Role::Tool);
-                m.id = id;
-                m.timestamp = ts;
-                m.content = blocks;
-                if sink.message(m) == Flow::Stop {
-                    return Flow::Stop;
-                }
-            }
-        }
-        _ => {
-            // user (and anything else) → a human prompt, or context gemini-cli injected.
-            let mut m = Message::new(Role::User);
-            m.id = id;
-            m.timestamp = ts;
-            content_blocks(&mut m.content);
-            // A BeforeAgent hook's `additionalContext` rides in the SAME record as the prompt, as a
-            // trailing `<hook_context>` part (0.46.0, 0.63.0): split it off into its own Hook turn.
-            let mut hook = Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Hook);
-            if m.content.len() > 1 {
-                let (hooked, rest): (Vec<Block>, Vec<Block>) = std::mem::take(&mut m.content).into_iter().partition(
-                    |b| matches!(b, Block::Text { text } if payload.map_or_else(|| text.trim_start().starts_with("<hook_context>"), |p| p.is_hook(text))),
-                );
-                m.content = rest;
-                hook.content = hooked;
-                if m.content.is_empty() {
-                    m.content = std::mem::take(&mut hook.content);
-                }
-            }
-            if let Some(payload) = payload {
-                payload.user_facts(&mut m, st);
-            } else {
-                type_user_turn(&mut m);
-            }
-            // `displayContent`: what the user typed when it differs from what the model got (a
-            // custom `/command` before expansion, an `@file` prompt before the file was inlined).
-            let typed = match payload {
-                Some(payload) => payload.take_display_text(),
-                None => obj.get("displayContent").map(display_text),
-            };
-            if let Some(typed) = typed.filter(|t| !t.is_empty()) {
-                m.harness_extra_mut(harness)
-                    .insert("display_text".into(), Value::String(typed));
-            }
-            if payload.is_none() && st.title.is_none() {
-                st.title = m
-                    .text()
-                    .filter(|t| !is_ignored_user_content(t))
-                    .map(|t| crate::ir::truncate(&t, 80));
-            }
-            if !m.content.is_empty() && sink.message(m) == Flow::Stop {
-                return Flow::Stop;
-            }
-            if !hook.content.is_empty() {
-                hook.timestamp = ts;
-                if sink.message(hook) == Flow::Stop {
-                    return Flow::Stop;
-                }
-            }
-        }
-    }
-    Flow::Continue
-}
-
-/// The text of a `displayContent` (`PartListUnion`): a string, or its parts' `text` joined.
-fn display_text(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| p.as_str().or_else(|| p.get("text").and_then(Value::as_str)))
-            .collect::<Vec<_>>()
-            .join(""),
-        Value::Object(_) => v.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
-        _ => String::new(),
-    }
-}
-
-/// Whether a record's `content` is a non-empty list of `functionResponse` parts and nothing else.
-fn is_tool_response_turn(content: Option<&Value>) -> bool {
-    let Some(Value::Array(parts)) = content else {
-        return false;
-    };
-    !parts.is_empty() && parts.iter().all(|p| p.get("functionResponse").is_some())
-}
-
-/// Map a `ConversationRecord` (as a JSON object) onto an IR [`Session`] — the whole-`Session`
-/// convenience used by the pure (no-filesystem) [`parse_all_str`] / [`parse_chat_recording`] paths.
-/// Builds the metadata via [`record_metadata`] and collects messages via [`emit_record_message`].
-///
-/// `summary` (when present) is the title and overrides the first-user-turn fallback that the message
-/// scan fills in — same precedence as before this was split for streaming.
-fn record_to_session(rec: &serde_json::Map<String, Value>, harness: Harness, source_path: Option<PathBuf>) -> Session {
-    let mut session = record_metadata(rec, harness, source_path);
-    let summary = session.title.take();
-
-    let empty = vec![];
-    let raw_msgs = rec.get("messages").and_then(Value::as_array).unwrap_or(&empty);
-
-    let mut sink = CollectSink::default();
-    let mut st = EmitState::default();
-    for rm in raw_msgs {
-        let Some(obj) = rm.as_object() else { continue };
-        if emit_record_message(harness, obj, &mut st, &mut sink) == Flow::Stop {
-            break;
-        }
-    }
-
-    session.model = st.session_model;
-    session.title = summary.or(st.title);
-    session.messages = sink.messages;
-    session
-}
-
-/// Append IR blocks for a Gemini `content` value, which is a `PartListUnion`: a bare string, a single
-/// Part object, or an array of Parts. Each Part may carry `text`, `inlineData`, `functionCall`, or
-/// `functionResponse`.
-fn push_content_blocks(out: &mut Vec<Block>, content: Option<&Value>) {
-    let Some(content) = content else { return };
-    match content {
-        Value::String(s) => {
-            if !s.is_empty() {
-                out.push(Block::Text { text: s.clone().into() });
-            }
-        }
-        Value::Array(parts) => {
-            for p in parts {
-                push_part(out, p);
-            }
-        }
-        Value::Object(_) => push_part(out, content),
-        _ => {}
-    }
-}
-
-fn push_part(out: &mut Vec<Block>, part: &Value) {
-    if let Some(s) = part.as_str() {
-        if !s.is_empty() {
-            out.push(Block::Text {
-                text: s.to_string().into(),
-            });
-        }
-        return;
-    }
-    let Some(obj) = part.as_object() else { return };
-
-    if let Some(fc) = obj.get("functionCall").and_then(Value::as_object) {
-        let name = fc.get("name").and_then(Value::as_str).unwrap_or("tool");
-        let id = fc
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{name}-call"));
-        out.push(Block::ToolUse {
-            id,
-            name: name.to_string(),
-            input: fc.get("args").cloned().unwrap_or(Value::Null).into(),
-            namespace: None,
-        });
-        return;
-    }
-    if let Some(fr) = obj.get("functionResponse").and_then(Value::as_object) {
-        let name = fr.get("name").and_then(Value::as_str).unwrap_or("tool");
-        let id = fr
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{name}-call"));
-        let content = fr.get("response").map(value_to_text).unwrap_or_default();
-        out.push(Block::ToolResult {
-            tool_use_id: id,
-            content: content.into(),
-            is_error: false,
-            tool_name: Some(name.to_string()),
-            status: None,
-            details: None,
-        });
-        return;
-    }
-    if let Some(inline) = obj.get("inlineData").and_then(Value::as_object) {
-        out.push(Block::Image {
-            media_type: inline.get("mimeType").and_then(Value::as_str).map(str::to_string),
-            data_ref: None, // we don't inline base64 bytes into the IR
-        });
-        return;
-    }
-    if let Some(fd) = obj.get("fileData").and_then(Value::as_object) {
-        out.push(Block::File {
-            mime: fd.get("mimeType").and_then(Value::as_str).map(str::to_string),
-            path: None,
-            source: fd.get("fileUri").and_then(Value::as_str).map(str::to_string),
-        });
-        return;
-    }
-    if let Some(text) = obj.get("text").and_then(Value::as_str) {
-        let is_thought = obj.get("thought").and_then(Value::as_bool).unwrap_or(false);
-        if text.is_empty() {
-            return;
-        }
-        if is_thought {
-            out.push(Block::Thinking {
-                text: text.to_string().into(),
-                signature: None,
-                encrypted: None,
-                redacted: false,
-            });
-        } else {
-            out.push(Block::Text {
-                text: text.to_string().into(),
-            });
-        }
-    }
-}
-
-/// Extract human-readable text from a `toolCall.result` (a `PartListUnion`, typically a list of
-/// `{functionResponse:{response:{output}}}` parts).
-fn tool_result_text(result: Option<&Value>) -> Option<String> {
-    let result = result?;
-    match result {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(parts) => {
-            let mut out = String::new();
-            for p in parts {
-                let chunk = if let Some(fr) = p.get("functionResponse") {
-                    fr.get("response").map(value_to_text).unwrap_or_default()
-                } else if let Some(t) = p.get("text").and_then(Value::as_str) {
-                    t.to_string()
-                } else {
-                    value_to_text(p)
-                };
-                if !chunk.is_empty() {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(&chunk);
-                }
-            }
-            (!out.is_empty()).then_some(out)
-        }
-        Value::Object(_) => {
-            if let Some(fr) = result.get("functionResponse") {
-                Some(fr.get("response").map(value_to_text).unwrap_or_default())
-            } else {
-                Some(value_to_text(result))
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Turn an arbitrary JSON value into display text, unwrapping the common `{output: "…"}` wrapper.
-fn value_to_text(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Object(map) => {
-            if let Some(Value::String(o)) = map.get("output") {
-                o.clone()
-            } else if let Some(Value::String(e)) = map.get("error") {
-                e.clone()
-            } else {
-                v.to_string()
-            }
-        }
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
-}
-
-/// Gemini's `tokens.input` is the API's `promptTokenCount`, which *includes* `cached`; the IR's
-/// disjoint `input_tokens` is the remainder (the emitter adds `cached` back).
-fn parse_tokens(v: &Value) -> Option<Usage> {
-    let obj = v.as_object()?;
-    let get = |k: &str| obj.get(k).and_then(Value::as_u64);
-    let cached = get("cached");
-    Some(Usage {
-        input_tokens: get("input").map(|i| i.saturating_sub(cached.unwrap_or(0))),
-        output_tokens: get("output"),
-        cache_read_tokens: get("cached"),
-        ..Usage::default()
-    })
-}
-
 // ---------------------------------------------------------------------------
 // gemini-cli checkpoints — `{history: Content[]}` or bare `Content[]`
 // ---------------------------------------------------------------------------
@@ -1885,6 +1038,12 @@ fn parse_checkpoint(text: &str, file_name: &str, source_path: Option<PathBuf>) -
     };
 
     let id = checkpoint_id(file_name);
+    let resolver = crate::lazy::Resolver::new(None);
+    let parts_demand = record::Demand {
+        harness: Harness::Gemini,
+        source: None,
+        resolver: &resolver,
+    };
     let mut messages = Vec::new();
     let mut title: Option<String> = None;
 
@@ -1899,7 +1058,9 @@ fn parse_checkpoint(text: &str, file_name: &str, source_path: Option<PathBuf>) -
         if role == Role::System {
             m.kind = MessageKind::SystemPrompt;
         }
-        push_content_blocks(&mut m.content, obj.get("parts"));
+        if let Some(parts) = obj.get("parts") {
+            let _ = record::content_blocks(parts.into(), parts_demand, &mut m.content);
+        }
         // If this "user" turn is purely tool results, retag it as a Tool turn.
         if role == Role::User
             && !m.content.is_empty()
@@ -2062,55 +1223,84 @@ mod tests {
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"))
     }
 
-    #[cfg(not(feature = "mmap"))]
+    /// A document is serde's typed envelope: unknown fields need only be JSON, known ones are
+    /// unique strings (or null), the positional form works, and each message is accepted on its
+    /// own, whether or not the whole document is Value-compatible.
     #[test]
-    fn portable_legacy_views_preserve_wrapper_acceptance_and_independent_children() {
-        let world = cv_testkit::World::in_process("gemini-legacy-acceptance");
+    fn document_acceptance_is_the_typed_envelope_with_independent_messages() {
+        let world = crate::test_world("gemini-document-acceptance");
         let path = world.base.join("source.json");
         let large = serde_json::to_string(&"x\nβ".repeat(6000)).unwrap();
         let message = format!("{{\"type\":\"gemini\",\"id\":\"a\",\"toolCalls\":[{{\"name\":\"custom\",\"args\":{{\"payload\":{large}}}}}]}}");
         let child_poison = r#"{"type":"user","id":"bad","content":"poison","ignored":"\ud800"}"#;
         let mut cases = vec![
-            format!("{{\"sessionId\":\"source\",\"messages\":[{child_poison},{message}],\"ignored\":1e400}}"),
-            format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"ignored\":\"\\ud800\"}}"),
-            format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"ignored\":1,\"ignored\":2}}"),
-            format!("[\"source\",null,null,\"summary\",[],[{message}],\"main\"]"),
-            format!("[\"source\",null,null,\"summary\",[],[{message}]]"),
-            format!("[\"source\",null,null,\"summary\",[],[{message}],\"main\",0]"),
-            format!("{{\"sessionId\":\"source\",\"session\\u0049d\":\"source\",\"messages\":[{message}]}}"),
-            format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"messages\":[]}}"),
-            format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"directories\":[\"ok\",false]}}"),
-            format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"directories\":[\"\\ud800\"]}}"),
-            format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"\\ud800\":0}}"),
-            format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"summary\":\"\\ud800\"}}"),
-            "".into(),
-            "not JSON".into(),
-            "null".into(),
-            r#"{"sessionId":"source","messages":null}"#.into(),
+            (
+                format!("{{\"sessionId\":\"source\",\"messages\":[{child_poison},{message}],\"ignored\":1e400}}"),
+                true,
+            ),
+            (
+                format!("{{\"sessionId\":\"source\",\"messages\":[{child_poison},{message}]}}"),
+                true,
+            ),
+            (
+                format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"ignored\":\"\\ud800\"}}"),
+                true,
+            ),
+            (
+                format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"ignored\":1,\"ignored\":2}}"),
+                true,
+            ),
+            (
+                format!("[\"source\",null,null,\"summary\",[],[{message}],\"main\"]"),
+                true,
+            ),
+            (format!("[\"source\",null,null,\"summary\",[],[{message}]]"), true),
+            (
+                format!("[\"source\",null,null,\"summary\",[],[{message}],\"main\",0]"),
+                false,
+            ),
+            (
+                format!("{{\"sessionId\":\"source\",\"session\\u0049d\":\"source\",\"messages\":[{message}]}}"),
+                false,
+            ),
+            (
+                format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"messages\":[]}}"),
+                false,
+            ),
+            (
+                format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"directories\":[\"ok\",false]}}"),
+                false,
+            ),
+            (
+                format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"directories\":[\"\\ud800\"]}}"),
+                false,
+            ),
+            (
+                format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"summary\":\"\\ud800\"}}"),
+                false,
+            ),
+            ("".into(), false),
+            ("not JSON".into(), false),
+            ("null".into(), false),
+            (r#"{"sessionId":"source","messages":null}"#.into(), false),
         ];
         for field in ["sessionId", "startTime", "lastUpdated", "summary", "kind"] {
-            cases.push(format!(
-                "{{\"sessionId\":\"source\",\"messages\":[{message}],\"{field}\":false}}"
+            cases.push((
+                format!("{{\"sessionId\":\"source\",\"messages\":[{message}],\"{field}\":false}}"),
+                false,
             ));
         }
-        for (i, text) in cases.into_iter().enumerate() {
+        for (i, (text, accepted)) in cases.into_iter().enumerate() {
             fs::write(&path, &text).unwrap();
-            let mut full = CollectSink::default();
-            let expected = stream_legacy_json_recording(&path, Harness::Gemini, &ParseOptions::full(), &mut full)
-                .unwrap()
-                .map(|mut s| {
-                    s.messages = full.messages;
-                    s
-                });
-            let mut lazy = CollectSink::default();
-            let actual = stream_legacy_json_recording(&path, Harness::Gemini, &ParseOptions::lazy(), &mut lazy)
-                .unwrap()
-                .map(|mut s| {
-                    s.messages = lazy.messages;
-                    s.materialize().unwrap();
-                    s
-                });
-            assert_eq!(actual.as_ref().map(as_json), expected.as_ref().map(as_json), "case {i}");
+            for opts in [ParseOptions::full(), ParseOptions::lazy()] {
+                let mut sink = CollectSink::default();
+                let session = read_document(&path, Harness::Gemini, &opts, &mut sink).unwrap();
+                assert_eq!(session.is_some(), accepted, "case {i}");
+                if accepted {
+                    let ids: Vec<_> = sink.messages.iter().map(|m| m.id.as_deref()).collect();
+                    assert_eq!(ids, [Some("a")], "case {i}: only the poisoned message is dropped");
+                }
+            }
         }
     }
 
@@ -2128,7 +1318,7 @@ mod tests {
 
     #[test]
     fn native_json_arguments_keep_real_values_and_exact_ranges() {
-        let world = cv_testkit::World::in_process("gemini-json-inputs");
+        let world = crate::test_world("gemini-json-inputs");
         let chats = world.base.join("chats");
         fs::create_dir_all(&chats).unwrap();
         let big = serde_json::to_string(&"x\nβ".repeat(crate::lazy::INLINE_MAX)).unwrap();
@@ -2201,7 +1391,7 @@ mod tests {
 
     #[test]
     fn native_json_arguments_survive_set_replacement_rewind_and_invalid_lines() {
-        let world = cv_testkit::World::in_process("gemini-json-replay");
+        let world = crate::test_world("gemini-json-replay");
         let chats = world.base.join("chats");
         fs::create_dir_all(&chats).unwrap();
         let path = chats.join("session-source.jsonl");
@@ -2239,7 +1429,7 @@ mod tests {
 
     #[test]
     fn selected_composite_results_and_thoughts_match_owned_and_keep_source_guards() {
-        let world = cv_testkit::World::in_process("gemini-selected-results");
+        let world = crate::test_world("gemini-selected-results");
         let chats = world.base.join("chats");
         fs::create_dir_all(&chats).unwrap();
         let body = "escaped\n\"quote\" β😀".repeat(7000);
@@ -2298,7 +1488,7 @@ mod tests {
 
     #[test]
     fn native_json_source_mutation_stops_before_paired_result_and_at_completion() {
-        let world = cv_testkit::World::in_process("gemini-json-errors");
+        let world = crate::test_world("gemini-json-errors");
         let chats = world.base.join("chats");
         fs::create_dir_all(&chats).unwrap();
         struct Delete {
@@ -2349,7 +1539,7 @@ mod tests {
 
     #[test]
     fn native_json_arguments_feed_consumers_and_fail_when_detached_source_changes() {
-        let world = cv_testkit::World::in_process("gemini-json-consumers");
+        let world = crate::test_world("gemini-json-consumers");
         let chats = world.base.join("chats");
         fs::create_dir_all(&chats).unwrap();
         let path = chats.join("session-source.jsonl");
@@ -2386,17 +1576,6 @@ mod tests {
         assert!(json_inputs(&lazy)[0].resolve().is_err());
         let mut events = crate::events::EventSink::new(None);
         assert!(events.try_message(lazy.messages[0].clone()).is_err());
-    }
-
-    #[test]
-    fn tokens_input_is_made_disjoint_from_cached() {
-        // Gemini's `input` is `promptTokenCount`, which includes `cached`.
-        let u = parse_tokens(&serde_json::json!({"input": 1000, "output": 40, "cached": 600})).unwrap();
-        assert_eq!(
-            (u.input_tokens, u.cache_read_tokens, u.output_tokens),
-            (Some(400), Some(600), Some(40))
-        );
-        assert_eq!(u.prompt_tokens(), 1000, "the prompt the model read is unchanged");
     }
 
     #[test]
@@ -2531,18 +1710,18 @@ mod tests {
 
     #[test]
     fn rewind_index_matches_linear_first_wire_id_oracle_on_long_history() {
-        let mut replay = RecordingReplay::<Value>::default();
+        let mut replay = RecordingReplay::default();
         let mut order = Vec::<String>::new();
-        let mut bodies = BTreeMap::<String, Value>::new();
-        let insert = |replay: &mut RecordingReplay<Value>,
+        let mut bodies = BTreeMap::<String, Body>::new();
+        let insert = |replay: &mut RecordingReplay,
                       order: &mut Vec<String>,
-                      bodies: &mut BTreeMap<String, Value>,
+                      bodies: &mut BTreeMap<String, Body>,
                       key: String| {
             if !bodies.contains_key(&key) {
                 order.push(key.clone());
             }
-            bodies.insert(key.clone(), Value::Null);
-            replay.insert(key, Value::Null);
+            bodies.insert(key.clone(), Body::Range(0, 1));
+            replay.insert(key, Body::Range(0, 1));
         };
         for index in 0..4096 {
             insert(
@@ -2566,8 +1745,8 @@ mod tests {
             let marker_id = format!("$rewind-{turn}");
             let marker = serde_json::json!({"id":marker_id,"type":"rewind","rewindTo":target});
             order.push(marker_id.clone());
-            bodies.insert(marker_id, marker);
-            replay.rewind(&target, |value| value);
+            bodies.insert(marker_id, Body::Owned(marker));
+            replay.rewind(&target);
         }
         assert_eq!(replay.order, order);
         assert_eq!(replay.msgs, bodies);
@@ -2577,43 +1756,49 @@ mod tests {
         }
         replay.clear_messages();
         assert!(replay.first_positions.is_empty());
-        replay.insert("user\u{1f}prefix-0".into(), Value::Null);
-        replay.rewind("prefix-0", |value| value);
+        replay.insert("user\u{1f}prefix-0".into(), Body::Range(0, 1));
+        replay.rewind("prefix-0");
         assert_eq!(replay.order, ["$rewind-129"]);
-        replay.rewind("missing", |value| value);
+        replay.rewind("missing");
         assert_eq!(replay.order, ["$rewind-130"]);
     }
 
     #[test]
-    fn owned_checkpoint_transfers_payloads_and_preserves_control_precedence() {
-        let mut replay = RecordingReplay::<Value>::default();
-        let body = "checkpoint body".repeat(1024);
-        let body_ptr = body.as_ptr();
-        let summary = "checkpoint metadata".repeat(1024);
-        let summary_ptr = summary.as_ptr();
-        let mut checkpoint = serde_json::json!({"$set": {
-            "messages": [
-                {"id":"same", "type":"user", "content":"obsolete"},
-                {"id":"same", "type":"user", "content":null},
-                {"type":"user", "content":"missing id"}
-            ],
-            "summary":null
-        }});
-        checkpoint["$set"]["messages"][1]["content"] = Value::String(body);
-        checkpoint["$set"]["summary"] = Value::String(summary);
-        replay.ingest(checkpoint);
+    fn replay_controls_keep_their_precedence() {
+        let mut replay = RecordingReplay::default();
+        let ingest = |replay: &mut RecordingReplay, record: Value| replay.ingest((&record).into()).unwrap();
+        ingest(
+            &mut replay,
+            serde_json::json!({"$set": {
+                "messages": [
+                    {"id":"same", "type":"user", "content":"obsolete"},
+                    {"id":"same", "type":"user", "content":"kept"},
+                    {"type":"user", "content":"missing id"}
+                ],
+                "summary":"checkpoint summary"
+            }}),
+        );
         assert_eq!(replay.order, ["user\u{1f}same"]);
         assert_eq!(
-            replay.msgs["user\u{1f}same"]["content"].as_str().unwrap().as_ptr(),
-            body_ptr
+            replay.msgs["user\u{1f}same"],
+            Body::Owned(serde_json::json!({"id":"same", "type":"user", "content":"kept"}))
         );
-        assert_eq!(replay.metadata["summary"].as_str().unwrap().as_ptr(), summary_ptr);
-
-        replay.ingest(serde_json::json!({"$rewindTo":"same", "$set":{"summary":"ignored"}}));
-        assert_eq!(replay.metadata["summary"].as_str().unwrap().as_ptr(), summary_ptr);
-        replay.ingest(serde_json::json!({"$set":false,"id":"fallback","type":"user","content":"kept"}));
+        // A rewind wins over a `$set` in the same record.
+        ingest(
+            &mut replay,
+            serde_json::json!({"$rewindTo":"same", "$set":{"summary":"ignored"}}),
+        );
+        assert_eq!(replay.metadata["summary"], "checkpoint summary");
+        // A non-object `$set` leaves a message record a message.
+        ingest(
+            &mut replay,
+            serde_json::json!({"$set":false,"id":"fallback","type":"user","content":"kept"}),
+        );
         assert!(replay.msgs.contains_key("user\u{1f}fallback"));
-        replay.ingest(serde_json::json!({"$set":{"messages":false,"summary":null}}));
+        ingest(
+            &mut replay,
+            serde_json::json!({"$set":{"messages":false,"summary":null}}),
+        );
         assert!(replay.order.is_empty());
         assert!(replay.msgs.is_empty());
         assert_eq!(replay.metadata["summary"], Value::Null);
@@ -2785,7 +1970,7 @@ mod tests {
         fs::write(&file, text).unwrap();
         let mut sink = CollectSink::default();
         // Call this path directly: a fallback would hide the borrowing failure.
-        let mut streamed = stream_legacy_json_recording(&file, Harness::Gemini, &ParseOptions::full(), &mut sink)
+        let mut streamed = read_document(&file, Harness::Gemini, &ParseOptions::full(), &mut sink)
             .unwrap()
             .expect("escaped strings are a legacy recording");
         streamed.messages = sink.messages;
@@ -2921,9 +2106,7 @@ mod tests {
                 checked_complete(),
             ] {
                 let mut sink = CollectSink::default();
-                let mut streamed = stream_jsonl_recording(&file, Harness::Gemini, &opts, &mut sink)
-                    .unwrap()
-                    .unwrap();
+                let mut streamed = read_jsonl(&file, Harness::Gemini, &opts, &mut sink).unwrap().unwrap();
                 streamed.messages = sink.messages;
                 streamed.materialize().unwrap();
                 assert_eq!(as_json(&streamed), as_json(&reference), "invalid field {unknown}");
@@ -2944,7 +2127,7 @@ mod tests {
             checked_complete(),
         ] {
             let mut sink = CollectSink::default();
-            let mut streamed = stream_legacy_json_recording(&file, Harness::Gemini, &opts, &mut sink)
+            let mut streamed = read_document(&file, Harness::Gemini, &opts, &mut sink)
                 .unwrap()
                 .unwrap();
             streamed.messages = sink.messages;
@@ -2954,27 +2137,6 @@ mod tests {
         }
         assert!(sessions.windows(2).all(|s| s[0] == s[1]));
         fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn lazy_recording_matches_every_recording_fixture() {
-        for name in ["session_legacy.json", "session_modern.jsonl"] {
-            let (dir, file) = chats_fixture(name);
-            let text = fs::read_to_string(&file).unwrap();
-            let reference = parse_all_str(&text, Some(file.clone())).remove(0);
-            let mut sink = CollectSink::default();
-            let mut s = Gemini { roots: vec![] }
-                .stream(
-                    &SessionRef::new(&reference.id, Harness::Gemini, file.clone()),
-                    &ParseOptions::lazy(),
-                    &mut sink,
-                )
-                .unwrap();
-            s.messages = sink.messages;
-            s.materialize().unwrap();
-            assert_eq!(as_json(&s), as_json(&reference));
-            fs::remove_dir_all(dir).unwrap();
-        }
     }
 
     #[test]
@@ -3283,103 +2445,61 @@ mod tests {
         assert_eq!(s.messages[2].content.len(), 1, "one result, not three");
     }
 
+    /// A `user` record is a tool-response turn only when its content is a nonempty array whose
+    /// every part has a `functionResponse` key, whatever that key's value; `displayContent` is a
+    /// string, an object's `text`, or the concatenated strings and `text`s of a part list.
     #[test]
-    fn selected_content_dispatch_preserves_tool_response_presence() {
-        let root = std::env::temp_dir().join(format!("cv-gemini-dispatch-{}", uuid::Uuid::new_v4()));
-        // Native recording selection keys off the chats directory, not merely JSON contents.
-        let dir = root.join("chats");
-        fs::create_dir_all(&dir).unwrap();
-        let adapter = Gemini { roots: vec![] };
+    fn tool_response_turns_and_display_text_follow_the_part_list_rules() {
         let response =
             serde_json::json!({"functionResponse":{"id":"call","name":"read","response":{"output":"result"}}});
         let cases = [
-            Value::Null,
-            serde_json::json!([]),
-            serde_json::json!([response]),
-            serde_json::json!([response, {"text":"mixed prompt"}]),
-            serde_json::json!(["", response]),
-            serde_json::json!([{ "functionResponse":null, "text":"presence is authoritative" }]),
-            serde_json::json!([{ "functionResponse":false, "functionCall":{"id":"call","name":"read","args":{}} }]),
-            response.clone(),
+            (Value::Null, vec![]),
+            (serde_json::json!([]), vec![]),
+            (serde_json::json!([response]), vec![Role::Tool]),
+            (serde_json::json!([response, {"text":"mixed prompt"}]), vec![Role::User]),
+            (serde_json::json!(["", response]), vec![Role::User]),
+            (
+                serde_json::json!([{ "functionResponse":null, "text":"presence is authoritative" }]),
+                vec![Role::Tool],
+            ),
+            (
+                serde_json::json!([{ "functionResponse":false, "functionCall":{"id":"call","name":"read","args":{}} }]),
+                vec![Role::Tool],
+            ),
+            (response.clone(), vec![Role::User]),
         ];
-        for modern in [false, true] {
-            let path = dir.join(if modern { "session.jsonl" } else { "session.json" });
-            let reference = SessionRef::new("source", Harness::Gemini, path.clone());
-            for content in &cases {
-                let record = serde_json::json!({"id":"u", "type":"user", "content":content});
-                let text = if modern {
-                    format!("{{\"sessionId\":\"source\",\"projectHash\":\"x\"}}\n{record}\n")
-                } else {
-                    serde_json::json!({"sessionId":"source", "messages":[record]}).to_string()
-                };
-                fs::write(&path, &text).unwrap();
-                let expected = parse_all_str(&text, Some(path.clone())).remove(0);
-                for opts in [ParseOptions::lazy(), ParseOptions::lazy_extra(), checked_complete()] {
-                    let mut actual = crate::stream::collect_with(&adapter, &reference, &opts).unwrap();
-                    actual.materialize().unwrap();
-                    assert_eq!(as_json(&actual), as_json(&expected), "content={content}");
-                }
-            }
+        for (content, roles) in cases {
+            let record = serde_json::json!({"id":"u", "type":"user", "content":content});
+            let text = serde_json::json!({"sessionId":"source", "messages":[record]}).to_string();
+            let session = parse_all_str(&text, None).remove(0);
+            let actual: Vec<_> = session.messages.iter().map(|m| m.role).collect();
+            assert_eq!(actual, roles, "content={content}");
         }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn selected_display_content_matches_owned_shapes_and_demand_modes() {
-        let root = std::env::temp_dir().join(format!("cv-gemini-display-{}", uuid::Uuid::new_v4()));
-        let dir = root.join("chats");
-        fs::create_dir_all(&dir).unwrap();
-        let body = "display é\n\"quoted\" ".repeat(512);
-        let displays = [
-            Value::String(body.clone()),
-            serde_json::json!({"text":body,"ignored":"not display"}),
-            serde_json::json!(["prefix", {"text":body}, null, {"text":false}, ["ignored"], "suffix"]),
-            serde_json::json!(["", {"text":""}]),
-            serde_json::json!({"text":false}),
-            Value::Null,
-        ];
-        let adapter = Gemini { roots: vec![] };
-        for modern in [false, true] {
-            let path = dir.join(if modern { "session.jsonl" } else { "session.json" });
-            let reference = SessionRef::new("source", Harness::Gemini, path.clone());
-            for display in &displays {
-                let records = serde_json::json!([
-                    {"id":"u", "type":"user", "content":"ordinary prompt", "displayContent":display},
-                    {"id":"a", "type":"gemini", "content":"reply", "displayContent":display},
-                    {"id":"empty", "type":"user", "content":"", "displayContent":display}
-                ]);
-                let text = if modern {
-                    format!(
-                        "{{\"sessionId\":\"source\",\"projectHash\":\"x\"}}\n{}\n",
-                        records
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(Value::to_string)
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    )
-                } else {
-                    serde_json::json!({"sessionId":"source", "messages":records}).to_string()
-                };
-                fs::write(&path, &text).unwrap();
-                let expected = parse_all_str(&text, Some(path.clone())).remove(0);
-                for opts in [
-                    ParseOptions::lazy(),
-                    ParseOptions::bulk(),
-                    ParseOptions::full(),
-                    ParseOptions::lazy_extra(),
-                    ParseOptions::complete(),
-                    checked_complete(),
-                    ParseOptions::facts(),
-                ] {
-                    let mut actual = crate::stream::collect_with(&adapter, &reference, &opts).unwrap();
-                    actual.materialize().unwrap();
-                    assert_eq!(as_json(&actual), as_json(&expected));
-                }
-            }
+        let body = "display é\n\"quoted\" ";
+        for (display, expected) in [
+            (Value::String(body.into()), Some(body.to_string())),
+            (
+                serde_json::json!({"text":body,"ignored":"not display"}),
+                Some(body.into()),
+            ),
+            (
+                serde_json::json!(["prefix", {"text":body}, null, {"text":false}, ["ignored"], "suffix"]),
+                Some(format!("prefix{body}suffix")),
+            ),
+            (serde_json::json!(["", {"text":""}]), None),
+            (serde_json::json!({"text":false}), None),
+            (Value::Null, None),
+        ] {
+            let record = serde_json::json!({"id":"u", "type":"user", "content":"prompt", "displayContent":display});
+            let text = serde_json::json!({"sessionId":"source", "messages":[record]}).to_string();
+            let session = parse_all_str(&text, None).remove(0);
+            let actual = session.messages[0]
+                .harness_extra(Harness::Gemini)
+                .and_then(|bag| bag.get("display_text"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            assert_eq!(actual, expected, "display={display}");
         }
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

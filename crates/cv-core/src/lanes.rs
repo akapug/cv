@@ -101,9 +101,8 @@ pub struct LaneEvent {
 
 /// `$CLUSTERVISION_HOME/lanes.jsonl` (default `~/.clustervision/lanes.jsonl`).
 pub fn ledger_path() -> PathBuf {
-    std::env::var_os("CLUSTERVISION_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".clustervision")))
+    crate::env::Env::current()
+        .cv_home()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("lanes.jsonl")
 }
@@ -794,7 +793,7 @@ mod tests {
 
     #[test]
     fn lane_pass_preserves_full_report_while_skipping_unrelated_large_content() {
-        let world = cv_testkit::World::in_process("lane-pass-projections");
+        let world = crate::test_world("lane-pass-projections");
         let path = world.proj.join("lane.jsonl");
         let giant = "unneeded λ\n".repeat(10_000);
         let records = [

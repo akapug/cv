@@ -51,7 +51,8 @@ impl Namespace {
     pub(super) fn current() -> Self {
         // Separate users in a shared /tmp without depending on a writable cv catalog. The
         // namespace remains private and identity checked; this hash is a name, not authority.
-        let home = dirs::home_dir().unwrap_or_default();
+        let home = crate::env::home_dir().unwrap_or_default();
+
         let hash = home
             .as_os_str()
             .to_string_lossy()

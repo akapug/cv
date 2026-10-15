@@ -3,7 +3,6 @@
 //! **string**. Codex, Kimi, Kimi Code, Hermes, Continue and Grok all persist a dialect of it; a
 //! [`Quirks`] constant names the dialect.
 
-use super::str_field;
 use crate::ir::Block;
 use crate::lazy::Text;
 use serde_json::Value;
@@ -68,20 +67,20 @@ pub const KIMI_CODE: Quirks = Quirks {
     ..OPENAI
 };
 
-/// Every block of a `content` field: a bare string is one text block (none when empty), an array
-/// is its parts through [`part_to_block`].
-pub fn blocks_from(content: Option<&Value>, q: &Quirks) -> Vec<Block> {
-    match content {
-        Some(Value::String(s)) if !s.is_empty() => vec![Block::Text { text: s.clone().into() }],
-        Some(Value::Array(parts)) => parts.iter().filter_map(|p| part_to_block(p, q)).collect(),
-        _ => Vec::new(),
-    }
-}
+/// The caller's rule for turning a content string into a [`Text`] (inline, a span, or checked
+/// source text); `None` for a nonstring. [`JsonView::lazy_text`](crate::json::JsonView) is the
+/// shared one.
+pub(crate) type TextRule<'r> = &'r mut dyn FnMut(crate::json::JsonView<'_>) -> anyhow::Result<Option<Text>>;
 
-/// Selected counterpart of [`blocks_from`], retaining checked text and argument backing.
-pub(crate) fn blocks_view(content: Option<crate::json::JsonView<'_>>, q: &Quirks) -> anyhow::Result<Vec<Block>> {
+/// Every block of a `content` field through the family's view codec: a bare string is one text
+/// block (none when empty), an array is its parts through [`part_from_view`].
+pub(crate) fn blocks_from_view(
+    content: Option<crate::json::JsonView<'_>>,
+    q: &Quirks,
+    text: TextRule<'_>,
+) -> anyhow::Result<Vec<Block>> {
     let Some(content) = content else { return Ok(Vec::new()) };
-    if let Some(text) = content.source_text()? {
+    if let Some(text) = text(content)? {
         return Ok(if text.is_empty() {
             Vec::new()
         } else {
@@ -91,7 +90,7 @@ pub(crate) fn blocks_view(content: Option<crate::json::JsonView<'_>>, q: &Quirks
     let mut blocks = Vec::new();
     if let Some(parts) = content.array()? {
         for part in parts {
-            if let Some(block) = part_view(part?, q)? {
+            if let Some(block) = part_from_view(part?, q, text)? {
                 blocks.push(block);
             }
         }
@@ -99,8 +98,17 @@ pub(crate) fn blocks_view(content: Option<crate::json::JsonView<'_>>, q: &Quirks
     Ok(blocks)
 }
 
-/// Apply the same dialect rules while selecting only the part's semantic fields.
-pub(crate) fn part_view(part: crate::json::JsonView<'_>, q: &Quirks) -> anyhow::Result<Option<Block>> {
+/// One part → one [`Block`], the twin of `anthropic::block_from_view_with`: the dialect's rules
+/// over only the part's semantic fields, with the caller's text rule for text and reasoning
+/// strings. Any part carrying a string `text` is text (`text`, `input_text`, `output_text`,
+/// `summary_text`, …); the image types become an [`Block::Image`] reference; a reasoning part
+/// (when the dialect has one) a [`Block::Thinking`]; Kimi's `audio_url`/`video_url` a
+/// [`Block::File`]. `None` for anything else.
+pub(crate) fn part_from_view(
+    part: crate::json::JsonView<'_>,
+    q: &Quirks,
+    text_rule: TextRule<'_>,
+) -> anyhow::Result<Option<Block>> {
     use crate::harness::store::document::Fields;
     let Some(fields) = Fields::parse(part, &["type", "text", "think", "encrypted"])? else {
         return Ok(None);
@@ -108,12 +116,11 @@ pub(crate) fn part_view(part: crate::json::JsonView<'_>, q: &Quirks) -> anyhow::
     let ty = fields.string("type")?.unwrap_or_default();
     if let Some((think_ty, text_key)) = q.thinking {
         if ty == think_ty {
-            let text = part
-                .get(text_key)?
-                .map(|v| v.source_text())
-                .transpose()?
-                .flatten()
-                .unwrap_or_default();
+            let text = match part.get(text_key)? {
+                Some(v) => text_rule(v)?,
+                None => None,
+            }
+            .unwrap_or_default();
             let encrypted = fields.string("encrypted")?;
             if q.skip_empty_thinking && text.is_empty() && encrypted.is_none() {
                 return Ok(None);
@@ -209,17 +216,19 @@ pub(crate) fn part_view(part: crate::json::JsonView<'_>, q: &Quirks) -> anyhow::
             source,
         }));
     }
-    Ok(fields
-        .get("text")
-        .map(|v| v.source_text())
-        .transpose()?
-        .flatten()
-        .filter(|text| !q.skip_empty_text || !text.is_empty())
-        .map(|text| Block::Text { text }))
+    Ok(match fields.get("text") {
+        Some(v) => text_rule(v)?,
+        None => None,
+    }
+    .filter(|text| !q.skip_empty_text || !text.is_empty())
+    .map(|text| Block::Text { text }))
 }
 
-/// Selected chat/Responses call, including checked JSON-encoded argument handling.
-pub(crate) fn tool_call_view(call: crate::json::JsonView<'_>) -> anyhow::Result<Block> {
+/// One `tool_calls[]` entry → a [`Block::ToolUse`]: `{id, function: {name, arguments}}` (chat) or
+/// the flattened `{id, name, arguments}` (Grok), `call_id` as the id's Responses spelling. The
+/// JSON-encoded `arguments` string is decoded into a checked private backing when `spans` is
+/// demanded and it is large, inline otherwise.
+pub(crate) fn tool_call_from_view(call: crate::json::JsonView<'_>, spans: bool) -> anyhow::Result<Block> {
     use crate::harness::store::document::Fields;
     let fields = Fields::parse(call, &["id", "call_id", "name", "arguments", "function"])?;
     let function = fields
@@ -250,7 +259,8 @@ pub(crate) fn tool_call_view(call: crate::json::JsonView<'_>) -> anyhow::Result<
     }
     .unwrap_or_default();
     let input = match get("arguments") {
-        Some(v) => v.encoded_argument()?,
+        Some(v) if spans => v.encoded_argument()?,
+        Some(v) => parse_arguments(Some(v.resolve()?.as_ref())).into(),
         None => Value::Object(Default::default()).into(),
     };
     Ok(Block::ToolUse {
@@ -261,93 +271,9 @@ pub(crate) fn tool_call_view(call: crate::json::JsonView<'_>) -> anyhow::Result<
     })
 }
 
-/// One part → one [`Block`]. Any part carrying a string `text` is text (`text`, `input_text`,
-/// `output_text`, `summary_text`, …); the image types become an [`Block::Image`] reference; a
-/// reasoning part (when the dialect has one) a [`Block::Thinking`]; Kimi's `audio_url`/`video_url`
-/// a [`Block::File`]. `None` for anything else.
+/// [`part_from_view`] over an owned value, every string inline.
 pub fn part_to_block(p: &Value, q: &Quirks) -> Option<Block> {
-    let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
-    if let Some((think_ty, text_key)) = q.thinking {
-        if ty == think_ty {
-            let text = p.get(text_key).and_then(Value::as_str).unwrap_or("");
-            let encrypted = p.get("encrypted").and_then(Value::as_str).map(str::to_string);
-            if q.skip_empty_thinking && text.is_empty() && encrypted.is_none() {
-                return None;
-            }
-            return Some(Block::Thinking {
-                text: Text::from(text),
-                signature: if q.thinking_signature_mirrors_encrypted {
-                    encrypted.clone()
-                } else {
-                    None
-                },
-                encrypted,
-                redacted: false,
-            });
-        }
-    }
-    if super::is_image_part(ty) {
-        return Some(image_from(p, q));
-    }
-    if matches!(ty, "audio_url" | "video_url") {
-        return Some(Block::File {
-            mime: None,
-            path: None,
-            source: nested_url(p, ty),
-        });
-    }
-    let t = p.get("text").and_then(Value::as_str)?;
-    if q.skip_empty_text && t.is_empty() {
-        return None;
-    }
-    Some(Block::Text { text: Text::from(t) })
-}
-
-/// `{<key>: {url}}` — media parts nest the URL under a key named after the type.
-fn nested_url(p: &Value, key: &str) -> Option<String> {
-    p.get(key)
-        .and_then(|u| u.get("url"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-/// An image part's URL: `image_url.url` (chat), `image_url` as a string (Responses `input_image`),
-/// `imageUrl.url` (Continue), or a bare `url`.
-fn image_url(p: &Value) -> Option<&str> {
-    p.pointer("/image_url/url")
-        .or_else(|| p.get("image_url"))
-        .or_else(|| p.pointer("/imageUrl/url"))
-        .or_else(|| p.get("url"))
-        .and_then(Value::as_str)
-}
-
-fn image_from(p: &Value, q: &Quirks) -> Block {
-    let url = image_url(p);
-    if q.data_url_as_marker {
-        // Never inline the bytes: a `data:` URL becomes the marker, its media type lifted out;
-        // an `http(s)`/`file:` URL is kept as a reference.
-        let media_type = url.and_then(|u| {
-            u.strip_prefix("data:")
-                .and_then(|rest| rest.split(';').next())
-                .filter(|m| m.contains('/'))
-                .map(str::to_string)
-        });
-        let data_ref = url.map(|u| {
-            if u.starts_with("data:") {
-                "base64:inline".to_string()
-            } else {
-                u.to_string()
-            }
-        });
-        return Block::Image { media_type, data_ref };
-    }
-    Block::Image {
-        media_type: None,
-        data_ref: url.map(|u| match q.image_ref_truncate {
-            Some(n) => crate::ir::truncate(u, n),
-            None => u.to_string(),
-        }),
-    }
+    part_from_view(p.into(), q, &mut |v| v.text(false)).ok().flatten()
 }
 
 /// A tool call's `arguments`: a JSON-encoded **string** on the wire (possibly streamed/partial).
@@ -375,45 +301,33 @@ pub fn structured_arguments(s: &str) -> Value {
     }
 }
 
-/// One `tool_calls[]` entry → a [`Block::ToolUse`]: `{id, function: {name, arguments}}` (chat) or
-/// the flattened `{id, name, arguments}` (Grok), `call_id` as the id's Responses spelling.
-pub fn tool_call(c: &Value) -> Block {
-    let func = c.get("function");
-    let name = func
-        .and_then(|f| f.get("name"))
-        .or_else(|| c.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let id = if c.get("id").is_some() {
-        str_field(c, "id")
-    } else {
-        str_field(c, "call_id")
-    };
-    Block::ToolUse {
-        id,
-        name,
-        input: parse_arguments(func.and_then(|f| f.get("arguments")).or_else(|| c.get("arguments"))).into(),
-        namespace: None,
-    }
-}
-
 /// Every entry of a `tool_calls` array (a JSON array value, or `None`).
 pub fn tool_calls(v: Option<&Value>) -> Vec<Block> {
     v.and_then(Value::as_array)
-        .map(|a| a.iter().map(tool_call).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| tool_call_from_view(c.into(), false).ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blocks_from(content: Option<&Value>, q: &Quirks) -> Vec<Block> {
+        blocks_from_view(content.map(Into::into), q, &mut |v| v.text(false)).unwrap()
+    }
+    fn tool_call(c: &Value) -> Block {
+        tool_call_from_view(c.into(), false).unwrap()
+    }
     use serde_json::json;
 
     #[test]
     fn checked_views_match_owned_parts_and_all_argument_shapes() {
         use crate::json::JsonSource;
-        let world = cv_testkit::World::in_process("openai_checked_views");
+        let world = crate::test_world("openai_checked_views");
         let path = world.home.join("selected.json");
         let long = "é\n\"\\".repeat(10_000);
         let parts = json!([
@@ -433,7 +347,9 @@ mod tests {
         let source = JsonSource::capture(&path).unwrap();
         for q in [&KIMI, &KIMI_CODE, &HERMES, &CODEX] {
             let selected = source
-                .read_range_value(0, bytes.len() as u64, |view| blocks_view(Some(view), q))
+                .read_range_value(0, bytes.len() as u64, |view| {
+                    blocks_from_view(Some(view), q, &mut |v| v.source_text())
+                })
                 .unwrap();
             assert_eq!(
                 serde_json::to_value(selected).unwrap(),
@@ -456,7 +372,9 @@ mod tests {
             let bytes = serde_json::to_vec(&call).unwrap();
             std::fs::write(&path, &bytes).unwrap();
             let source = JsonSource::capture(&path).unwrap();
-            let selected = source.read_range_value(0, bytes.len() as u64, tool_call_view).unwrap();
+            let selected = source
+                .read_range_value(0, bytes.len() as u64, |v| tool_call_from_view(v, true))
+                .unwrap();
             assert_eq!(
                 serde_json::to_value(&selected).unwrap(),
                 serde_json::to_value(tool_call(&call)).unwrap()
@@ -464,7 +382,7 @@ mod tests {
         }
         let call = json!({"call_id":"missing","name":"Read"});
         assert_eq!(
-            serde_json::to_value(tool_call_view((&call).into()).unwrap()).unwrap(),
+            serde_json::to_value(tool_call_from_view((&call).into(), true).unwrap()).unwrap(),
             serde_json::to_value(tool_call(&call)).unwrap()
         );
     }

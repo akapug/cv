@@ -25,8 +25,11 @@ pub mod discover_cache;
 pub mod distill;
 pub mod doctor;
 pub mod emit;
+pub mod env;
+
 pub mod events;
 pub mod formats;
+pub mod handoff;
 pub mod harness;
 pub mod html;
 pub mod ingest;
@@ -82,6 +85,12 @@ pub fn discover_all() -> Vec<SessionRef> {
     discover_all_with_catalog(catalog::Reader::open())
 }
 
+/// [`discover_all`], handing every rollout it decodes in full to `handoff`'s consumer (an index
+/// sweep running beside it), so that consumer reads each one without decoding it again.
+pub fn discover_all_handing_off(handoff: handoff::Handoff) -> Vec<SessionRef> {
+    handoff::within(&Some(handoff), discover_all)
+}
+
 fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<SessionRef> {
     let _sources = source::read_scope();
     let _cache_scope = catalog.as_ref().map(catalog::Reader::discovery_scope);
@@ -134,12 +143,14 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<Sessio
     }
 
     let inventory = source::inventory_context();
+    let env = env::Env::scoped();
+    let handoff = handoff::current();
     let run_job = |(a, known): (Box<dyn Adapter>, Vec<SessionRef>)| {
-        let discover = || discovery.run(|| run(a.as_ref(), known));
-        match &inventory {
+        let discover = || handoff::within(&handoff, || discovery.run(|| run(a.as_ref(), known)));
+        env::within(&env, || match &inventory {
             Some(context) => context.run(discover),
             None => discover(),
-        }
+        })
     };
 
     #[cfg(feature = "parallel")]
@@ -227,8 +238,8 @@ pub fn cataloged_sessions() -> Vec<SessionRef> {
 /// [`sessions`] plus whether the answer came from a full [`discover_all`] (so `find` knows not to
 /// escalate to a second full scan).
 fn sessions_impl() -> (Vec<SessionRef>, bool) {
-    let max_stale = std::env::var("CLUSTERVISION_MAX_STALE_SECS")
-        .or_else(|_| std::env::var("CLAURDVOYANT_MAX_STALE_SECS")) // back-compat with the old name
+    let max_stale = env::var("CLUSTERVISION_MAX_STALE_SECS")
+        .or_else(|_| env::var("CLAURDVOYANT_MAX_STALE_SECS")) // back-compat with the old name
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(900);
@@ -303,9 +314,12 @@ where
     F: Fn(T) -> Option<R> + Sync + Send,
 {
     let inventory = source::inventory_context();
-    let f = |item| match &inventory {
-        Some(context) => context.run(|| f(item)),
-        None => f(item),
+    let env = env::Env::scoped();
+    let f = |item| {
+        env::within(&env, || match &inventory {
+            Some(context) => context.run(|| f(item)),
+            None => f(item),
+        })
     };
     #[cfg(feature = "parallel")]
     {
@@ -327,7 +341,8 @@ where
     F: Fn(T) -> Option<R> + Sync + Send,
 {
     let context = discover_cache::read::Context::current();
-    par_filter_map(items, |item| context.run(|| f(item)))
+    let handoff = handoff::current();
+    par_filter_map(items, |item| handoff::within(&handoff, || context.run(|| f(item))))
 }
 pub(crate) fn par_discovery_flat_map<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
 where
@@ -336,7 +351,8 @@ where
     F: Fn(T) -> Vec<R> + Sync + Send,
 {
     let context = discover_cache::read::Context::current();
-    par_flat_map(items, |item| context.run(|| f(item)))
+    let handoff = handoff::current();
+    par_flat_map(items, |item| handoff::within(&handoff, || context.run(|| f(item))))
 }
 
 /// Like [`par_filter_map`] but each input may yield zero, one, or many results (e.g. a Gemini
@@ -348,9 +364,12 @@ where
     F: Fn(T) -> Vec<R> + Sync + Send,
 {
     let inventory = source::inventory_context();
-    let f = |item| match &inventory {
-        Some(context) => context.run(|| f(item)),
-        None => f(item),
+    let env = env::Env::scoped();
+    let f = |item| {
+        env::within(&env, || match &inventory {
+            Some(context) => context.run(|| f(item)),
+            None => f(item),
+        })
     };
     #[cfg(feature = "parallel")]
     {
@@ -727,6 +746,12 @@ fn ambiguous<'a>(id: &str, hits: impl Iterator<Item = &'a SessionRef>) -> anyhow
 }
 
 /// Bounded text projections for API and search consumers.
+/// A hermetic world whose environment this thread's library calls read (see [`env`]).
+#[cfg(test)]
+pub(crate) fn test_world(tag: &str) -> cv_testkit::InProcess<env::Scope> {
+    cv_testkit::World::in_process(tag, env::Env::enter_isolated)
+}
+
 pub mod projection;
 
 #[cfg(test)]
@@ -735,7 +760,7 @@ mod copy_authority_tests {
 
     #[test]
     fn qualified_cold_lookup_only_discovers_its_harness_and_preserves_resolution() {
-        let world = cv_testkit::World::in_process("qualified-discovery");
+        let world = crate::test_world("qualified-discovery");
         let codex = world.home.join(".codex/sessions");
         std::fs::create_dir_all(&codex).unwrap();
         let write = |id: &str| {
@@ -789,7 +814,7 @@ mod copy_authority_tests {
 
     #[test]
     fn scoped_sessions_refresh_only_requested_rows_without_certifying_the_fleet() {
-        let world = cv_testkit::World::in_process("scoped-session-enumeration");
+        let world = crate::test_world("scoped-session-enumeration");
         let codex = world.home.join(".codex/sessions");
         std::fs::create_dir_all(&codex).unwrap();
         let path = codex.join("rollout-scoped.jsonl");
@@ -820,7 +845,7 @@ mod copy_authority_tests {
 
     #[test]
     fn exact_copy_authority_is_newest_then_deterministic_and_harness_qualified() {
-        let world = cv_testkit::World::in_process("copy-authority");
+        let world = crate::test_world("copy-authority");
         let make = |name: &str, harness, updated| {
             let path = world.home.join(name);
             std::fs::write(&path, "{}").unwrap();

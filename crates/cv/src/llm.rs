@@ -120,7 +120,7 @@ fn egress_notice(provider: &Provider, model: &str, approx_bytes: usize) {
 fn provider_from_env() -> Option<Provider> {
     // A configured local OpenAI-compatible server (LM Studio etc.) wins — free + private. Set
     // `LMSTUDIO_API_BASE` to its base URL, or to `1`/`default`/`local` for the LM Studio default.
-    if let Ok(base) = std::env::var("LMSTUDIO_API_BASE") {
+    if let Ok(base) = cv_core::env::var("LMSTUDIO_API_BASE") {
         let base = base.trim();
         if !base.is_empty() {
             let base = if matches!(base, "1" | "true" | "default" | "local") {
@@ -131,12 +131,12 @@ fn provider_from_env() -> Option<Provider> {
             return Some(Provider::LmStudio { base });
         }
     }
-    if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+    if let Ok(key) = cv_core::env::var("OPENROUTER_API_KEY") {
         if !key.trim().is_empty() {
             return Some(Provider::OpenRouter { key });
         }
     }
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+    if let Ok(key) = cv_core::env::var("ANTHROPIC_API_KEY") {
         if !key.trim().is_empty() {
             return Some(Provider::Anthropic { key });
         }
@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn source_tool_arguments_match_owned_chat_and_reject_changed_or_deleted_source() {
-        let world = cv_testkit::World::in_process("llm-json-boundary");
+        let world = crate::test_world("llm-json-boundary");
         let path = world.base.join("arguments.json");
         let value = json!({"command": "echo \"月🌙é\"\n".repeat(300), "tail": "complete argument"});
         let bytes = serde_json::to_vec(&value).unwrap();
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn chat_generation_reads_checked_text_and_results_without_materializing_session() {
-        let world = cv_testkit::World::in_process("llm-retained-text");
+        let world = crate::test_world("llm-retained-text");
         let path = world.base.join("text.json");
         let text = "λ🌙 checked text\n".repeat(1000);
         let wire = serde_json::to_vec(&text).unwrap();

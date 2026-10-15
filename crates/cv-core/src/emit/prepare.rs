@@ -118,7 +118,8 @@ pub(super) fn selected(
     if fs::metadata(&primary).is_ok_and(|metadata| metadata.is_file()) {
         sink.capture(&primary)?;
     }
-    let (mut session, counted) = crate::stream::stream_counting(adapter, reference, options, &mut sink)?;
+    let read = crate::stream::stream_counted(adapter, reference, options, &mut sink, Default::default())?;
+    let (mut session, counted) = (read.session, read.counted);
     if let Some(counted) = &counted {
         sink.reads.merge(&counted.dependencies);
     }
@@ -284,6 +285,7 @@ mod tests {
             assert_serialized_equal(&materialized, &expected)?;
             let options = EmitOptions {
                 new_id: Some("00000000-0000-0000-0000-000000000001".into()),
+                force: true, // this test emits the same pinned id again
                 ..Default::default()
             };
             let (old, old_report) = super::super::emit_report(

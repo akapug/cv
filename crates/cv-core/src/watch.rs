@@ -8,7 +8,7 @@
 use crate::harness;
 use crate::ir::{Harness, Message, SessionRef};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 mod read;
@@ -237,7 +237,7 @@ impl From<Pos> for State {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cursor {
     v: u32,
-    o: HashMap<String, Pos>,
+    o: BTreeMap<String, Pos>,
 }
 
 const CURSOR_VERSION: u32 = 1;
@@ -270,7 +270,7 @@ impl Cursor {
 /// tail — so every one of them compares against a parsed count, never a row count.
 pub struct Watcher {
     filter: Filter,
-    seen: HashMap<String, State>,
+    seen: BTreeMap<String, State>,
     /// Where sessions come from: [`crate::discover_all`] (stat the fleet, the default) or
     /// [`crate::sessions`] (the catalog fast path, for a poller that runs every few seconds).
     discover: fn() -> Vec<SessionRef>,
@@ -287,7 +287,7 @@ impl Watcher {
     pub fn with_discovery(filter: Filter, emit_existing: bool, discover: fn() -> Vec<SessionRef>) -> Self {
         let mut w = Watcher {
             filter,
-            seen: HashMap::new(),
+            seen: BTreeMap::new(),
             discover,
         };
         if !emit_existing {
@@ -819,9 +819,9 @@ mod tests {
 
     #[test]
     fn duplicate_copies_do_not_reset_the_cursor_and_repeat_preferred_copy_tails() {
-        let world = cv_testkit::World::in_process("watch-copy-tails");
+        let world = crate::test_world("watch-copy-tails");
         fn discovery() -> Vec<SessionRef> {
-            let dir = std::path::PathBuf::from(std::env::var_os("CLUSTERVISION_HOME").unwrap());
+            let dir = std::path::PathBuf::from(crate::env::var_os("CLUSTERVISION_HOME").unwrap());
             let mut old = sref(Harness::Claude, dir.join("old.jsonl"));
             old.updated_at = chrono::DateTime::from_timestamp(1, 0);
             old.message_count = 1;
@@ -862,7 +862,7 @@ mod tests {
 
     #[test]
     fn prefix_resolution_checks_read_boundaries_even_without_messages() {
-        let world = cv_testkit::World::in_process("checked-prefix-empty-rows");
+        let world = crate::test_world("checked-prefix-empty-rows");
         let dir = world.base.join("projects").join("fixture").join("chats");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prefix.jsonl");
@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn interrupted_first_update_prefix_keeps_byte_cursor_and_retries_only_the_append() {
         static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        let world = cv_testkit::World::in_process("cancelled-prefix-cursor");
+        let world = crate::test_world("cancelled-prefix-cursor");
         let path = world.write_session(
             "prefix-cursor",
             &[serde_json::json!({"type":"user", "uuid":"u0", "message":{"role":"user", "content":"existing"}})],
@@ -950,7 +950,7 @@ mod tests {
     #[test]
     fn append_between_byte_mark_and_baseline_completion_is_delivered_with_unchanged_trigger() {
         static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        let world = cv_testkit::World::in_process("baseline-append-race");
+        let world = crate::test_world("baseline-append-race");
         let path = world.write_session(
             "baseline-race",
             &[serde_json::json!({"type":"user", "uuid":"u0", "message":{"role":"user", "content":"existing"}})],
@@ -1015,7 +1015,7 @@ mod tests {
     #[test]
     fn demanded_baseline_counts_existing_messages_and_checks_during_read() {
         static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        let world = cv_testkit::World::in_process("controlled-baseline");
+        let world = crate::test_world("controlled-baseline");
         let path = world.base.join("checkpoint-baseline.json");
         std::fs::write(
             &path,
@@ -1047,7 +1047,7 @@ mod tests {
     #[test]
     fn incremental_stop_cursor_and_failed_callback_preserve_unseen_messages() {
         static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        let world = cv_testkit::World::in_process("incremental-watch");
+        let world = crate::test_world("incremental-watch");
         let path = world.write_session("incremental", &(0..5).map(|n| serde_json::json!({
             "type":"user", "uuid":format!("u{n}"), "message":{"role":"user", "content":format!("message-{n}")}
         })).collect::<Vec<_>>());
@@ -1105,7 +1105,7 @@ mod tests {
     #[test]
     fn interrupted_stream_retries_delivery_and_rejects_changed_source() {
         static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        let world = cv_testkit::World::in_process("interrupted-watch");
+        let world = crate::test_world("interrupted-watch");
         let path = world.write_session("interrupted", &(0..4).map(|n| serde_json::json!({
             "type":"user", "uuid":format!("u{n}"), "message":{"role":"user", "content":format!("message-{n}")}
         })).collect::<Vec<_>>());
@@ -1172,7 +1172,7 @@ mod tests {
 
     #[test]
     fn cursor_reader_budget_preserves_positions_and_wire_selection() {
-        let _world = cv_testkit::World::in_process("watch-cursor_reader_budget_preserves_positions_and_wire_selection");
+        let _world = crate::test_world("watch-cursor_reader_budget_preserves_positions_and_wire_selection");
         let mut watcher = Watcher::with_discovery(Filter::default(), true, Vec::new);
         for n in 0..16 {
             let r = sref(
@@ -1198,7 +1198,7 @@ mod tests {
         // Prior wire selection: size eligibility first, then the first eight eligible
         // reader states in the map's iteration order. Positions always survive both limits.
         let mut readers = 0;
-        let expected: HashMap<_, _> = watcher
+        let expected: BTreeMap<_, _> = watcher
             .seen
             .iter()
             .map(|(key, state)| {
@@ -1230,9 +1230,8 @@ mod tests {
 
     #[test]
     fn same_size_replacement_prunes_positions_even_when_new_source_cannot_be_read() {
-        let _world = cv_testkit::World::in_process(
-            "watch-same_size_replacement_prunes_positions_even_when_new_source_cannot_be_read",
-        );
+        let _world =
+            crate::test_world("watch-same_size_replacement_prunes_positions_even_when_new_source_cannot_be_read");
         fn replacement() -> Vec<SessionRef> {
             let mut r = sref(
                 Harness::Claude,
@@ -1310,7 +1309,7 @@ mod tests {
     /// file was that long — at EVERY cut point, including mid-line (a record still being written).
     #[test]
     fn byte_baseline_resolves_to_the_count_a_parse_saw_then() {
-        let _world = cv_testkit::World::in_process("watch-byte_baseline_resolves_to_the_count_a_parse_saw_then");
+        let _world = crate::test_world("watch-byte_baseline_resolves_to_the_count_a_parse_saw_then");
         let dir = std::env::temp_dir().join(format!("cv-watch-baseline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude");
@@ -1346,7 +1345,7 @@ mod tests {
     /// both must be exactly the parse's.
     #[test]
     fn streamed_count_and_tail_equal_the_parse() {
-        let _world = cv_testkit::World::in_process("watch-streamed_count_and_tail_equal_the_parse");
+        let _world = crate::test_world("watch-streamed_count_and_tail_equal_the_parse");
         let fx = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
         let mut checked = 0;
         for (h, rel) in [
@@ -1397,8 +1396,7 @@ mod tests {
     /// writes a new session) rewrites in place; this pins the failure mode should anything else.
     #[test]
     fn a_byte_mark_on_a_rewritten_transcript_resolves_within_the_new_file() {
-        let _world =
-            cv_testkit::World::in_process("watch-a_byte_mark_on_a_rewritten_transcript_resolves_within_the_new_file");
+        let _world = crate::test_world("watch-a_byte_mark_on_a_rewritten_transcript_resolves_within_the_new_file");
         let dir = std::env::temp_dir().join(format!("cv-watch-rewrite-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.jsonl");
@@ -1449,7 +1447,7 @@ mod tests {
 
     #[test]
     fn baseline_is_a_byte_mark_only_for_append_only_transcripts() {
-        let _world = cv_testkit::World::in_process("watch-baseline_is_a_byte_mark_only_for_append_only_transcripts");
+        let _world = crate::test_world("watch-baseline_is_a_byte_mark_only_for_append_only_transcripts");
         let dir = std::env::temp_dir().join(format!("cv-watch-mark-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let jsonl = dir.join("s.jsonl");
@@ -1471,8 +1469,7 @@ mod tests {
     /// runs over one temp transcript instead of the machine's fleet.
     #[test]
     fn bounded_poll_leaves_the_rest_pending_and_a_cursor_resumes_it() {
-        let _world =
-            cv_testkit::World::in_process("watch-bounded_poll_leaves_the_rest_pending_and_a_cursor_resumes_it");
+        let _world = crate::test_world("watch-bounded_poll_leaves_the_rest_pending_and_a_cursor_resumes_it");
         static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         let dir = DIR
             .get_or_init(|| std::env::temp_dir().join(format!("cv-watch-cursor-{}", std::process::id())))
@@ -1554,8 +1551,7 @@ mod tests {
 
     #[test]
     fn optional_resume_state_is_bounded_and_old_cursors_keep_positions() {
-        let _world =
-            cv_testkit::World::in_process("watch-optional_resume_state_is_bounded_and_old_cursors_keep_positions");
+        let _world = crate::test_world("watch-optional_resume_state_is_bounded_and_old_cursors_keep_positions");
         let mut watcher = Watcher::with_discovery(Filter::default(), true, Vec::new);
         let r = sref(
             Harness::Claude,
@@ -1584,7 +1580,7 @@ mod tests {
 
     #[test]
     fn source_observer_retries_failure_without_advancing_positions() {
-        let _world = cv_testkit::World::in_process("watch-source_observer_retries_failure_without_advancing_positions");
+        let _world = crate::test_world("watch-source_observer_retries_failure_without_advancing_positions");
         fn discover() -> Vec<SessionRef> {
             vec![sref(
                 Harness::Claude,
@@ -1623,8 +1619,7 @@ mod tests {
 
     #[test]
     fn demanded_poll_surfaces_read_failure_without_a_success_position() {
-        let _world =
-            cv_testkit::World::in_process("watch-demanded_poll_surfaces_read_failure_without_a_success_position");
+        let _world = crate::test_world("watch-demanded_poll_surfaces_read_failure_without_a_success_position");
         fn discover() -> Vec<SessionRef> {
             vec![sref(
                 Harness::Claude,

@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "opencode"
-source_files = ["harness/opencode.rs", "harness/opencode/v2.rs"]
+source_files = ["harness/opencode.rs", "harness/opencode/record.rs", "harness/opencode/v2.rs"]
 ignore_literals = ["db"]
 store = [
   "${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db (1.x: session/message/part; 2.x: session_v2/session_message; a migrated 2.x db has both)",

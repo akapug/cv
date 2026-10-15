@@ -11,14 +11,10 @@ use super::{parse_ts, Adapter};
 /// `cv adopt`: move a sub-agent stranded by a dead session into a live one — Claude-only byte
 /// surgery on this store's layout, so it lives beside the adapter that knows it.
 pub mod adopt;
-mod borrowed;
 pub(crate) mod emit;
-mod facts;
 mod fork;
-mod lean;
 mod metadata;
-#[cfg(not(feature = "mmap"))]
-mod portable;
+mod record;
 pub(crate) mod replay;
 /// The sidecar tree beside a transcript (`subagents/`, `workflows/`, `journal.jsonl`): every path
 /// spelled once, and the one journal parser.
@@ -27,117 +23,17 @@ use super::wire::anthropic;
 use crate::ir::*;
 use crate::ir::{MessageKind, Origin};
 use crate::json::{Json, JsonSource};
-use crate::lazy::{Span, Text, INLINE_MAX};
+use crate::lazy::Text;
 use crate::stream::{Checkpoint, CollectSink, Flow, MessageSink, ParseOptions, ADAPTER_LAYER};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 pub use emit::{emit, verify_claude_resumable};
-use serde_json::value::RawValue;
 use serde_json::{Map, Value};
-use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
-/// Context for turning large content fields into lazy [`Span`]s during streaming: the raw bytes of
-/// the current record line and the file offset where they begin. Present only on the on-disk
-/// streaming path (which knows file offsets); the pure-string [`parse_str`] path passes `None` and
-/// keeps content inline.
-struct SpanCtx<'a> {
-    slice: &'a [u8],
-    base_off: u64,
-    json_inputs: Option<&'a JsonInputs>,
-}
-
-/// One captured source shared by validated lazy fields in a read. Byte-reader helpers
-/// have no such capture: recording a provenance path does not establish where their bytes came from.
-struct JsonInputs {
-    source: JsonSource,
-    error: RefCell<Option<anyhow::Error>>,
-    record_source: Cell<bool>,
-    has_sources: Cell<bool>,
-}
-
-impl JsonInputs {
-    fn capture(path: &Path, opts: &ParseOptions) -> Result<Option<Self>> {
-        if !opts.spans {
-            return Ok(None);
-        }
-        Ok(Some(Self {
-            source: JsonSource::capture(path)?,
-            error: RefCell::new(None),
-            record_source: Cell::new(false),
-            has_sources: Cell::new(false),
-        }))
-    }
-
-    fn check_record(&self) -> bool {
-        if self.error.borrow().is_some() {
-            return false;
-        }
-        if !self.record_source.get() {
-            return true;
-        }
-        if let Err(error) = self.source.check() {
-            *self.error.borrow_mut() = Some(error);
-            return false;
-        }
-        true
-    }
-
-    fn input(&self, raw: &RawValue, ctx: &SpanCtx<'_>) -> Option<Json> {
-        // borrowed::ingest has strictly validated the entire record before exposing these complete
-        // raw values. Use their actual quoted/braced range, including scalar tool inputs.
-        let result = (|| {
-            let relative = (raw.get().as_ptr() as usize)
-                .checked_sub(ctx.slice.as_ptr() as usize)
-                .context("Claude tool input is outside its validated record")?;
-            let end = relative
-                .checked_add(raw.get().len())
-                .context("Claude lazy field range overflow")?;
-            anyhow::ensure!(end <= ctx.slice.len(), "Claude lazy field exceeds its validated record");
-            let offset = ctx
-                .base_off
-                .checked_add(relative as u64)
-                .context("Claude lazy field offset overflow")?;
-            self.source.validated_range(offset, raw.get().len() as u64)
-        })();
-        match result {
-            Ok(input) => {
-                self.record_source.set(true);
-                Some(input)
-            }
-            Err(error) => {
-                if self.error.borrow().is_none() {
-                    *self.error.borrow_mut() = Some(error);
-                }
-                None
-            }
-        }
-    }
-
-    fn check_opened(&self, file: &fs::File) -> Result<()> {
-        self.source.check_metadata(file.metadata()?)
-    }
-
-    fn finish(&self, file: &fs::File) -> Result<()> {
-        if let Some(error) = self.error.borrow_mut().take() {
-            return Err(error);
-        }
-        if self.has_sources.get() {
-            self.check_opened(file)?;
-            self.source.check()
-        } else {
-            Ok(())
-        }
-    }
-}
-
-fn finish_inputs(inputs: Option<&JsonInputs>, file: &fs::File) -> Result<()> {
-    inputs.map_or(Ok(()), |inputs| inputs.finish(file))
-}
 
 pub struct Claude {
     /// Root entries in priority order, before `*` expansion and the existence check. They are
@@ -172,18 +68,18 @@ impl Claude {
     /// dir itself, may start with `~`, and may hold path segments that are exactly `*`; each stands
     /// for every entry of the directory before it (`~/.agents/*/claude`, `~/.agents/*/instances/*/claude`).
     pub fn detect() -> Self {
-        let home = dirs::home_dir();
+        let home = crate::env::home_dir();
         let mut entries: Vec<PathBuf> = Vec::new();
         entries.extend(
-            std::env::var_os("CLAUDE_CONFIG_DIR")
+            crate::env::var_os("CLAUDE_CONFIG_DIR")
                 .filter(|v| !v.is_empty())
                 .map(|d| PathBuf::from(d).join("projects")),
         );
         entries.extend(home.as_ref().map(|h| h.join(".claude").join("projects")));
-        if let Some(list) = std::env::var_os("CLUSTERVISION_CLAUDE_ROOTS") {
+        if let Some(list) = crate::env::var_os("CLUSTERVISION_CLAUDE_ROOTS") {
             entries.extend(std::env::split_paths(&list).filter(|p| !p.as_os_str().is_empty()));
         }
-        let cv_home = std::env::var_os("CLUSTERVISION_HOME")
+        let cv_home = crate::env::var_os("CLUSTERVISION_HOME")
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|h| h.join(".clustervision")));
         if let Some(text) = cv_home.and_then(|d| fs::read_to_string(d.join("claude-roots")).ok()) {
@@ -309,49 +205,8 @@ impl Adapter for Claude {
 
     fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
-            let inputs = JsonInputs::capture(&r.path, opts)?;
-            let file = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
-            if let Some(inputs) = &inputs {
-                inputs.check_opened(&file)?;
-            }
-            // Lazy spans borrow record slices from the file: even a giant output needs no private
-            // largest-line buffer. Buffered readers remain the fallback and the bulk/full path.
-            #[cfg(feature = "mmap")]
-            if opts.spans {
-                if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
-                    #[cfg(unix)]
-                    let _ = map.advise(memmap2::Advice::Sequential);
-                    let s = stream_bytes_at(
-                        new_session_for(&r.id, Some(r.path.clone()), opts),
-                        &map,
-                        0,
-                        opts,
-                        sink,
-                        inputs.as_ref(),
-                    )?;
-                    finish_inputs(inputs.as_ref(), &file)?;
-                    return Ok(with_fork_source(s, &r.path, sink));
-                }
-            }
-            #[cfg(not(feature = "mmap"))]
-            let s = portable::stream(
-                new_session_for(&r.id, Some(r.path.clone()), opts),
-                &file,
-                inputs.as_ref(),
-                0,
-                opts,
-                sink,
-            )?;
-            #[cfg(feature = "mmap")]
-            let s = stream_reader_at_checked(
-                new_session_for(&r.id, Some(r.path.clone()), opts),
-                BufReader::new(&file),
-                0,
-                opts,
-                sink,
-                inputs.as_ref(),
-            )?;
-            finish_inputs(inputs.as_ref(), &file)?;
+            let session = new_session_for(&r.id, Some(r.path.clone()), opts);
+            let s = read(session, &r.path, 0, None, opts, sink, &mut || Ok(()))?;
             Ok(with_fork_source(s, &r.path, sink))
         })
     }
@@ -370,40 +225,10 @@ impl Adapter for Claude {
         from: &Checkpoint,
     ) -> Result<Option<Session>> {
         crate::stream::checked(sink, |sink| {
-            #[cfg(feature = "mmap")]
-            use std::io::{Seek as _, SeekFrom};
             let Some(session) = from.get::<Session>(ADAPTER_LAYER) else {
                 return Ok(None);
             };
-            let inputs = JsonInputs::capture(&r.path, opts)?;
-            let file = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
-            #[cfg(feature = "mmap")]
-            let mut file = file;
-            if let Some(inputs) = &inputs {
-                inputs.check_opened(&file)?;
-            }
-            #[cfg(feature = "mmap")]
-            if opts.spans {
-                if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
-                    #[cfg(unix)]
-                    let _ = map.advise(memmap2::Advice::Sequential);
-                    let bytes = usize::try_from(from.offset)
-                        .ok()
-                        .and_then(|offset| map.get(offset..))
-                        .unwrap_or(&[]);
-                    let s = stream_bytes_at(session, bytes, from.offset, opts, sink, inputs.as_ref())?;
-                    finish_inputs(inputs.as_ref(), &file)?;
-                    return Ok(Some(with_fork_source(s, &r.path, sink)));
-                }
-            }
-            #[cfg(not(feature = "mmap"))]
-            let s = portable::stream(session, &file, inputs.as_ref(), from.offset, opts, sink)?;
-            #[cfg(feature = "mmap")]
-            file.seek(SeekFrom::Start(from.offset))
-                .with_context(|| format!("seeking {}", r.path.display()))?;
-            #[cfg(feature = "mmap")]
-            let s = stream_reader_at_checked(session, BufReader::new(&file), from.offset, opts, sink, inputs.as_ref())?;
-            finish_inputs(inputs.as_ref(), &file)?;
+            let s = read(session, &r.path, from.offset, None, opts, sink, &mut || Ok(()))?;
             Ok(Some(with_fork_source(s, &r.path, sink)))
         })
     }
@@ -452,254 +277,107 @@ pub fn stream_str(
 ) -> Session {
     let mut session = new_session_for(id, source_path, opts);
     let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
-    let sink = &mut spawns;
     // Pure-string path (parse_str, tests): no file offsets, so all content stays inline.
-    super::for_each_json_line_str(text, |v| ingest_value(&mut session, &v, opts, sink, None));
-    session
-}
-
-/// Fully parse from a buffered reader (full fidelity) — the whole-`Session` convenience over
-/// [`stream_reader`], used by tests. The on-disk [`Adapter::parse`] goes through
-/// [`crate::stream::collect`] → [`Adapter::stream`] → [`stream_reader`] instead.
-pub fn parse_reader<R: BufRead>(id: &str, reader: R, source_path: Option<PathBuf>) -> Session {
-    let mut sink = CollectSink::default();
-    let mut session = stream_reader(id, reader, source_path, &ParseOptions::full(), &mut sink);
-    session.messages = sink.messages;
+    super::for_each_json_line_str(text, |v| {
+        record::ingest(&mut session, (&v).into(), None, opts, &mut spawns, &mut false).unwrap_or(Flow::Stop)
+    });
     session
 }
 
 /// How many messages a full parse of the transcript's first `len` bytes yields — the count a
 /// parse would have returned when the file was `len` bytes long, since a Claude transcript only
-/// grows by appending. Streams the prefix, so peak memory is O(largest line).
+/// grows by appending. `check` runs at every line, including lines that emit no message.
 pub(crate) fn count_prefix(r: &SessionRef, len: u64) -> Result<usize> {
     count_prefix_checked(r, len, &mut || Ok(()))
 }
 
 pub(crate) fn count_prefix_checked(r: &SessionRef, len: u64, check: &mut dyn FnMut() -> Result<()>) -> Result<usize> {
-    use std::io::Read as _;
-    let file = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
     let mut n = 0usize;
     let mut count = |_: Message| {
         n += 1;
         Flow::Continue
     };
-    crate::stream::with_read_check(BufReader::new(file.take(len)), check, |reader| {
-        stream_reader(&r.id, reader, Some(r.path.clone()), &ParseOptions::full(), &mut count)
-    })?;
+    let opts = ParseOptions::full();
+    read(
+        new_session_for(&r.id, Some(r.path.clone()), &opts),
+        &r.path,
+        0,
+        Some(len),
+        &opts,
+        &mut count,
+        check,
+    )?;
     Ok(n)
 }
 
-/// Streaming parse from a buffered reader — the memory-safe core the on-disk [`Adapter::stream`]
-/// uses. A single Claude transcript can exceed 1 GB; reading it whole (`read_to_string`)
-/// resident-spiked cv to ~65 GB across the corpus and OOM-killed it. Reading line-by-line and
-/// handing each message to `sink` keeps peak at O(largest line). Returns the [`Session`] metadata
-/// with empty `messages` (they went to the sink).
-pub fn stream_reader<R: BufRead>(
-    id: &str,
-    reader: R,
-    source_path: Option<PathBuf>,
+/// Stream the transcript's first `len` bytes: the session as it was at that length.
+pub(crate) fn stream_prefix(
+    r: &SessionRef,
+    len: u64,
     opts: &ParseOptions,
     sink: &mut dyn MessageSink,
-) -> Session {
-    stream_reader_at(new_session_for(id, source_path, opts), reader, 0, opts, sink, None)
-}
-
-/// [`stream_reader`] over a reader positioned `file_off` bytes into the transcript, accumulating
-/// into `session` (the state a checkpoint at `file_off` kept, or a fresh shell at 0). After every
-/// whole line it offers the sink a [`Checkpoint`] holding the session so far.
-fn stream_reader_at<R: BufRead>(
-    session: Session,
-    reader: R,
-    file_off: u64,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    json_inputs: Option<&JsonInputs>,
-) -> Session {
-    let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
-    stream_reader_unwrapped(session, reader, file_off, opts, &mut spawns, json_inputs)
-}
-
-#[cfg(feature = "mmap")]
-fn stream_reader_at_checked<R: BufRead>(
-    session: Session,
-    reader: R,
-    file_off: u64,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    json_inputs: Option<&JsonInputs>,
 ) -> Result<Session> {
-    let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
-    crate::stream::checked(&mut spawns, |sink| {
-        Ok(stream_reader_unwrapped(
-            session,
-            reader,
-            file_off,
+    crate::stream::checked(sink, |sink| {
+        read(
+            new_session_for(&r.id, Some(r.path.clone()), opts),
+            &r.path,
+            0,
+            Some(len),
             opts,
             sink,
-            json_inputs,
-        ))
+            &mut || Ok(()),
+        )
     })
 }
 
-fn stream_reader_unwrapped<R: BufRead>(
+/// The one Claude read: lines `from..to` (EOF by default) of the captured transcript, each through
+/// the record codec, accumulating into `session` (a checkpoint's state, or a fresh shell at 0).
+/// After every finished line the sink may take a [`Checkpoint`] holding the session so far; a
+/// partial last line is read but re-read whole next time. A message holding a source descriptor
+/// makes the reader recheck the source's identity before going on, and once more at the end.
+fn read(
     mut session: Session,
-    reader: R,
-    mut file_off: u64,
+    path: &Path,
+    from: u64,
+    to: Option<u64>,
     opts: &ParseOptions,
     sink: &mut dyn MessageSink,
-    json_inputs: Option<&JsonInputs>,
-) -> Session {
-    // Read raw bytes (not `lines()`) so we know each record's byte offset in the file — that's what
-    // lets large content fields become lazy [`Span`]s pointing back into the source instead of owned
-    // strings. `read_until` keeps peak at O(largest line) just like `lines()` did.
-    let mut reader = reader;
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        buf.clear();
-        let n = match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        if ingest_bytes(&mut session, &buf[..n], file_off, opts, sink, json_inputs) == Flow::Stop {
-            break;
-        }
-        file_off += n as u64;
-        // Only after a line its writer finished: a partial last line is re-read whole next time.
-        if buf[n - 1] == b'\n' && sink.wants_checkpoint(file_off) {
-            let mut cp = Checkpoint::new(file_off);
-            cp.put(ADAPTER_LAYER, &session);
-            sink.checkpoint(&mut cp);
-        }
-    }
-    session
-}
-
-/// The mapped-file counterpart of `stream_reader_at`. Newline slices include their LF so
-/// checkpoint eligibility and partial-tail replay use exactly the buffered reader's boundaries.
-#[cfg(feature = "mmap")]
-fn stream_bytes_at(
-    mut session: Session,
-    bytes: &[u8],
-    base_off: u64,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    json_inputs: Option<&JsonInputs>,
+    check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Session> {
+    let source = JsonSource::capture(path)?;
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    source.check_metadata(file.metadata()?)?;
+    let to = to.map_or(source.len(), |to| to.min(source.len()));
     let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
+    let mut published = false;
     crate::stream::checked(&mut spawns, |sink| {
-        let mut start = 0;
-        for end in memchr::memchr_iter(b'\n', bytes).map(|i| i + 1) {
-            if ingest_bytes(
-                &mut session,
-                &bytes[start..end],
-                base_off + start as u64,
-                opts,
-                sink,
-                json_inputs,
-            ) == Flow::Stop
-            {
-                return Ok(session);
+        crate::harness::store::jsonl::for_each_line(&source, &file, from, to, |line| {
+            check()?;
+            if let Some(view) = line.view {
+                let mut sourced = false;
+                let flow = record::ingest(&mut session, view, Some(line.at), opts, sink, &mut sourced)?;
+                if sourced {
+                    published = true;
+                    source.check()?;
+                }
+                if flow == Flow::Stop {
+                    return Ok(Flow::Stop);
+                }
             }
-            let file_off = base_off + end as u64;
-            if sink.wants_checkpoint(file_off) {
-                let mut cp = Checkpoint::new(file_off);
+            // Only after a line its writer finished: a partial last line is re-read whole next time.
+            if line.complete && sink.wants_checkpoint(line.end) {
+                let mut cp = Checkpoint::new(line.end);
                 cp.put(ADAPTER_LAYER, &session);
                 sink.checkpoint(&mut cp);
             }
-            start = end;
-        }
-        if start < bytes.len() {
-            ingest_bytes(
-                &mut session,
-                &bytes[start..],
-                base_off + start as u64,
-                opts,
-                sink,
-                json_inputs,
-            );
-        }
-        Ok(session)
-    })
-}
-
-/// Streaming ingest of one raw record line (with its file offset) — parses, updates metadata, and
-/// emits the message to `sink`, turning large content fields into [`Span`]s into the source file.
-fn ingest_bytes(
-    session: &mut Session,
-    buf: &[u8],
-    file_off: u64,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    json_inputs: Option<&JsonInputs>,
-) -> Flow {
-    if let Some(inputs) = json_inputs {
-        if inputs.error.borrow().is_some() {
-            return Flow::Stop;
-        }
-        inputs.record_source.set(false);
+            Ok(Flow::Continue)
+        })
+    })?;
+    if published {
+        source.check_metadata(file.metadata()?)?;
+        source.check()?;
     }
-    // Trim leading/trailing ASCII whitespace (incl. the trailing `\n`), tracking how far the content
-    // shifted so span offsets stay relative to the file.
-    let lead = buf.iter().take_while(|b| b.is_ascii_whitespace()).count();
-    let end = buf.len() - buf[lead..].iter().rev().take_while(|b| b.is_ascii_whitespace()).count();
-    if lead >= end {
-        return Flow::Continue;
-    }
-    let slice = &buf[lead..end];
-    let ctx = opts.spans.then(|| SpanCtx {
-        slice,
-        base_off: file_off + lead as u64,
-        json_inputs,
-    });
-    if !opts.complete || opts.spans {
-        let flow = borrowed::ingest(session, slice, opts, sink, ctx.as_ref());
-        // A failed source capture/range is an operation error, never eligibility for the owned
-        // fallback codec. In particular, do not materialize a giant input after invalidation.
-        if let Some(inputs) = json_inputs {
-            if flow.is_none() && inputs.error.borrow().is_none() {
-                // Eligibility failed before publication: discard any candidate ranges alongside
-                // the borrowed blocks and keep the existing owned fallback's behavior.
-                inputs.record_source.set(false);
-            } else if inputs.record_source.get() {
-                inputs.has_sources.set(true);
-            }
-            if !inputs.check_record() {
-                return Flow::Stop;
-            }
-        }
-        if let Some(flow) = flow {
-            return flow;
-        }
-    }
-    let lean = if opts.facts_only() {
-        match facts::parse(slice) {
-            Ok(value) => Some(value),
-            Err(_) => return Flow::Continue,
-        }
-    } else {
-        (!opts.extra && !opts.complete)
-            .then(|| lean::parse(slice).ok())
-            .flatten()
-    };
-    let v: Value = match lean.map_or_else(|| serde_json::from_slice(slice), Ok) {
-        Ok(v) => v,
-        Err(_) => return Flow::Continue,
-    };
-    // Usage previously requested rich extras, whose Value codec rejects invalid numbers,
-    // surrogates and excessive nesting even inside discarded sidecars. Keep that acceptance
-    // contract for usage while leaving ordinary lean fallback behavior unchanged.
-    if opts.usage_identity && !super::store::json::value_compatible(slice) {
-        return Flow::Continue;
-    }
-    // Only defer large content to spans when the consumer asked for it (partial-access). Bulk/full
-    // consumers read everything, so inline content is cheaper (no mmap on resolve).
-    let flow = ingest_value(session, &v, opts, sink, ctx.as_ref());
-    if json_inputs.is_some_and(|inputs| !inputs.check_record()) {
-        Flow::Stop
-    } else {
-        flow
-    }
+    Ok(session)
 }
 
 /// An empty Claude [`Session`] shell, ready to accumulate records. A sub-agent transcript (by its
@@ -767,172 +445,6 @@ fn apply_subagent_lineage(s: &mut Session, path: &std::path::Path, rich: bool) {
     }
 }
 
-/// Shared record handler: session-level metadata + emit the conversational message to `sink`. With a
-/// [`SpanCtx`] (streaming on-disk path) large content fields become [`Span`]s; without it (string
-/// path) they're inline.
-fn ingest_value(
-    session: &mut Session,
-    v: &Value,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    span: Option<&SpanCtx>,
-) -> Flow {
-    let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-
-    // The approval mode a prompt ran under (`permissionMode` on user rows and on `permission-mode`
-    // records), and the file checkpoints `/rewind` restores: session-level affordance facts.
-    if let Some(mode) = v.get("permissionMode").and_then(Value::as_str) {
-        crate::affordance::note_mode(session.harness_extra_mut(Harness::Claude), mode);
-    }
-    match ty {
-        "file-history-snapshot" => {
-            let fresh = u64::from(v.get("isSnapshotUpdate").and_then(Value::as_bool) != Some(true));
-            let files = v.pointer("/snapshot/trackedFileBackups").and_then(Value::as_object);
-            let bag = session.harness_extra_mut(Harness::Claude);
-            crate::affordance::note_checkpoints(
-                bag,
-                fresh,
-                files.into_iter().flat_map(|f| f.keys().map(String::as_str)),
-            );
-        }
-        "file-history-delta" => {
-            let file = v.get("trackingPath").and_then(Value::as_str);
-            crate::affordance::note_checkpoints(session.harness_extra_mut(Harness::Claude), 0, file);
-        }
-        _ => {}
-    }
-
-    // session-level metadata records
-    match ty {
-        // Titles, by precedence: an explicit `/rename` (`custom-title`) outranks the model-generated
-        // `ai-title`, which outranks the legacy `summary` (Claude Code stopped writing `summary`
-        // records around 2.1.25x; `ai-title` is rewritten on every prompt).
-        "ai-title" => {
-            if let Some(t) = v.get("aiTitle").and_then(Value::as_str) {
-                let renamed = session
-                    .harness_extra(Harness::Claude)
-                    .is_some_and(|b| b.contains_key("custom_title"));
-                if !renamed {
-                    session.title = Some(t.to_string());
-                }
-            }
-            return carry_or_skip(v, opts, sink);
-        }
-        "custom-title" => {
-            if let Some(t) = v.get("customTitle").and_then(Value::as_str) {
-                session.title = Some(t.to_string());
-                session
-                    .harness_extra_mut(Harness::Claude)
-                    .insert("custom_title".into(), Value::String(t.to_string()));
-            }
-            return carry_or_skip(v, opts, sink);
-        }
-        "summary" => {
-            if session.title.is_none() {
-                if let Some(t) = v.get("summary").and_then(Value::as_str) {
-                    session.title = Some(t.to_string());
-                }
-            }
-            return carry_or_skip(v, opts, sink);
-        }
-        // Session-level facts. The continuation pointer is first-class lineage; the derived agent
-        // name, a `/tag`, a fork's relocated cwd and the linked PR(s) are Claude facts in
-        // `extra["claude"]` (snake_case: these names are cv's).
-        "agent-name" | "tag" | "relocated" | "continued-in" | "pr-link" => {
-            match ty {
-                "continued-in" => {
-                    if let Some(id) = v.get("continuedInSessionId").and_then(Value::as_str) {
-                        session.lineage.continued_in = Some(id.to_string());
-                    }
-                }
-                _ => {
-                    let bag = session.harness_extra_mut(Harness::Claude);
-                    match ty {
-                        "agent-name" => copy_str_field(v, "agentName", "agent_name", bag),
-                        "tag" => copy_str_field(v, "tag", "tag", bag),
-                        "relocated" => copy_str_field(v, "relocatedCwd", "relocated_cwd", bag),
-                        _ => {
-                            if let Some(url) = v.get("prUrl").and_then(Value::as_str) {
-                                if let Some(list) = bag
-                                    .entry("pr_links")
-                                    .or_insert_with(|| Value::Array(Vec::new()))
-                                    .as_array_mut()
-                                {
-                                    list.push(Value::String(url.to_string()));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return carry_or_skip(v, opts, sink);
-        }
-        // Model-visible attachments. Since ~2.1.23x the system reminders Claude Code appends to the
-        // prompt — hook output, edited-file notices, queued task notifications, CLAUDE.md
-        // `instructions`, skill/agent listings, … — are separate `attachment` records whose
-        // `rendered[].content` is byte-for-byte what the model saw (they used to be inline
-        // `<system-reminder>` text in user content). Surface those as System turns; an attachment
-        // with nothing rendered (a hook that printed nothing) is bookkeeping only.
-        "attachment" => {
-            // `prompt_snapshot` records the whole system prompt Claude Code sent (an array of
-            // sections) — the session-level fact, never a message. The latest snapshot wins: a
-            // resume re-snapshots, and that is the prompt the rest of the transcript ran under.
-            if let Some(sections) = v.pointer("/attachment/systemPrompt").and_then(Value::as_array) {
-                let joined = sections.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n");
-                if !joined.trim().is_empty() {
-                    session.system_prompt = Some(joined);
-                }
-            }
-            return match parse_attachment_message(v, opts, span) {
-                Some(mut m) => {
-                    stamp_offset(&mut m, opts, span);
-                    sink.message(m)
-                }
-                None => carry_or_skip(v, opts, sink),
-            };
-        }
-        // Pure bookkeeping / live-process records with no conversational payload: the input queue,
-        // UI/permission state, the leaf pointer, sub-agent hook/streaming telemetry, running cost,
-        // the ATIS latch, artifact watches, request-side content replacements. The lean passes drop
-        // them; `complete` carries them verbatim as round-trippable carrier messages.
-        "mode"
-        | "permission-mode"
-        | "last-prompt"
-        | "progress"
-        | "started"
-        | "result"
-        | "queue-operation"
-        | "x-quota"
-        | "file-history-snapshot"
-        | "cost-state"
-        | "atis-latch"
-        | "frame-link"
-        | "content-replacement"
-        | "artifact-comment-monitor"
-        | "artifact-autoreact-ledger" => {
-            return carry_or_skip(v, opts, sink);
-        }
-        "user" | "assistant" | "system" | "" => {}
-        // Any other record without a `message` body is a bookkeeping record we haven't met yet
-        // (Claude Code adds a few per release). Never conversational — carry it in `complete` mode
-        // so round-trips stay lossless, skip it otherwise.
-        _ if v.get("message").is_none() => return carry_or_skip(v, opts, sink),
-        _ => {}
-    }
-
-    note_conversation_metadata(
-        session,
-        v.get("cwd").and_then(Value::as_str),
-        v.get("gitBranch").and_then(Value::as_str),
-        v.get("timestamp").and_then(Value::as_str).and_then(parse_ts),
-    );
-
-    match parse_message(ty, v, opts, span) {
-        Some(msg) => emit_conversation(session, msg, opts, sink, span),
-        None => Flow::Continue,
-    }
-}
-
 fn note_conversation_metadata(
     session: &mut Session,
     cwd: Option<&str>,
@@ -955,51 +467,6 @@ fn note_conversation_metadata(
     }
 }
 
-fn emit_conversation(
-    session: &mut Session,
-    mut msg: Message,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    span: Option<&SpanCtx>,
-) -> Flow {
-    stamp_offset(&mut msg, opts, span);
-    // Record-local models must not depend on how much of a transcript preceded the window.
-    if session.model.is_none() && msg.model.as_deref() != Some(SYNTHETIC_MODEL) {
-        session.model = msg.model.clone();
-    }
-    sink.message(msg)
-}
-
-/// Offset-stamping pass: stamp the record's byte offset so `cv rewind` can map a message to its
-/// record (see [`crate::offsets::OFFSET_KEY`]). Requires the on-disk span path (`span` carries the
-/// offset); ordinary lazy/bulk/full streams never set `opts.offsets`. EVERY message-producing
-/// record must call this — an unstamped message is one rewind cannot cut at.
-fn stamp_offset(msg: &mut Message, opts: &ParseOptions, span: Option<&SpanCtx>) {
-    if opts.offsets {
-        if let Some(ctx) = span {
-            msg.extra.insert(crate::offsets::OFFSET_KEY.into(), ctx.base_off.into());
-        }
-    }
-}
-
-/// A non-conversational meta record (mode/attachment/queue-operation/hook telemetry/ai-title/…)
-/// carried verbatim under [`ParseOptions::complete`] so a `parse → emit` round-trip reproduces it.
-/// Modeled as an empty-content `System` message — render/dataset/count all skip empty turns, so
-/// existing consumers are unaffected — with the full original record stashed under `extra["_record"]`
-/// for the emitter to replay byte-for-byte.
-fn carrier_record(v: &Value) -> Message {
-    let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
-    m.id = v.get("uuid").and_then(Value::as_str).map(String::from);
-    m.parent_id = v.get("parentUuid").and_then(Value::as_str).map(String::from);
-    m.timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
-    if let Some(t) = v.get("type").and_then(Value::as_str) {
-        m.harness_extra_mut(Harness::Claude)
-            .insert("record_type".into(), Value::String(t.to_string()));
-    }
-    m.extra.insert(CARRIER_KEY.into(), v.clone());
-    m
-}
-
 /// `extra` key under which a [`carrier_record`] stashes the verbatim original meta record.
 pub const CARRIER_KEY: &str = "_record";
 
@@ -1017,37 +484,6 @@ pub const PERSISTED_OUTPUT_KEY: &str = "persistedOutput";
 /// "Prompt is too long", "No response requested.", …): never model output, never sent to the API.
 pub const SYNTHETIC_MODEL: &str = "<synthetic>";
 
-/// Carry `v` verbatim under `complete`, skip it otherwise — the shared tail of every
-/// non-conversational record arm in [`ingest_value`].
-fn carry_or_skip(v: &Value, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Flow {
-    if opts.complete {
-        sink.message(carrier_record(v))
-    } else {
-        Flow::Continue
-    }
-}
-
-/// Copy string field `from` of `v` into `bag` under cv's snake_case name `to`, if present.
-fn copy_str_field(v: &Value, from: &str, to: &str, bag: &mut Map<String, Value>) {
-    if let Some(s) = v.get(from).and_then(Value::as_str) {
-        bag.insert(to.to_string(), Value::String(s.to_string()));
-    }
-}
-
-/// Where a `user` record came from: a typed prompt is human; `isMeta` rows ("Continue from where
-/// you left off.", the local-command caveat) and non-human `origin.kind`s are the harness; a
-/// cron/loop fire (`scheduledTaskId`) or a `ScheduleWakeup` turn (`turnOrigin: "scheduled"`, which
-/// 2.1.296 writes with `isMeta` and no task id) is the scheduler.
-fn user_origin(v: &Value) -> Origin {
-    user_origin_from(
-        v.get("scheduledTaskId").is_some()
-            || v.get("scheduledFireId").is_some()
-            || v.get("turnOrigin").and_then(Value::as_str) == Some("scheduled"),
-        v.get("isMeta").and_then(Value::as_bool) == Some(true),
-        v.pointer("/origin/kind").and_then(Value::as_str),
-    )
-}
-
 fn user_origin_from(scheduled: bool, is_meta: bool, kind: Option<&str>) -> Origin {
     if scheduled {
         return Origin::Scheduler;
@@ -1059,26 +495,6 @@ fn user_origin_from(scheduled: bool, is_meta: bool, kind: Option<&str>) -> Origi
         None | Some("human") => Origin::Human,
         Some(_) => Origin::Harness,
     }
-}
-
-/// What a non-slash-command `user` record IS. A typed prompt (and a scheduler fire, which acts as
-/// one) is a `Prompt`; everything else the harness wrote is not: a `<task-notification>` for an
-/// agent or a workflow is that sub-agent's return, one for a command (or a monitor) is injected
-/// context, and so are the interrupt marker (`[Request interrupted by user…]`) and every other
-/// `isMeta` row (the local-command caveat, a skill's body, an image reference).
-fn user_kind(v: &Value, msg: &Value) -> (MessageKind, Origin) {
-    let origin = user_origin(v);
-    let head = match msg.get("content") {
-        Some(Value::String(s)) => s.trim_start(),
-        Some(Value::Array(a)) => a
-            .first()
-            .and_then(|b| b.get("text"))
-            .and_then(Value::as_str)
-            .map(str::trim_start)
-            .unwrap_or(""),
-        _ => "",
-    };
-    user_kind_from_head(origin, head)
 }
 
 fn user_kind_from_head(origin: Origin, head: &str) -> (MessageKind, Origin) {
@@ -1103,117 +519,6 @@ fn user_kind_from_head(origin: Origin, head: &str) -> (MessageKind, Origin) {
         }
     }
     (MessageKind::InjectedContext, Origin::Harness)
-}
-
-/// A `tool_result` record that is a sub-agent's final answer: the `Agent`/`Task` call ran in the
-/// foreground, so its `toolUseResult` names the agent and is not an `async_launched` receipt.
-fn is_sync_agent_return(v: &Value) -> bool {
-    let Some(t) = v.get("toolUseResult").filter(|t| t.is_object()) else {
-        return false;
-    };
-    t.get("agentId").is_some() && t.get("status").and_then(Value::as_str) != Some("async_launched")
-}
-
-/// A `user` record whose whole content is a slash-command record: the invocation
-/// (`<command-name>/foo</command-name>` + `<command-message>`/`<command-args>`) or the captured
-/// output (`<local-command-stdout>…</local-command-stdout>`). Only a bare-string content that
-/// *starts* with the tag qualifies — a person pasting one of these tags mid-prompt is still a
-/// person.
-fn is_slash_command_record(msg: &Value) -> bool {
-    match msg.get("content") {
-        Some(Value::String(s)) => {
-            let s = s.trim_start();
-            s.starts_with("<command-name>") || s.starts_with("<local-command-stdout>")
-        }
-        _ => false,
-    }
-}
-
-/// Is this `assistant` record one of Claude Code's synthetic notices (an `isApiErrorMessage`, or any
-/// `model: "<synthetic>"` row such as "No response requested.")? Claude Code itself filters these out
-/// of the API messages; they are not turns.
-fn is_synthetic_assistant(v: &Value, msg: &Value) -> bool {
-    v.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false)
-        || msg.get("model").and_then(Value::as_str) == Some(SYNTHETIC_MODEL)
-}
-
-/// A model-visible `attachment` record (one with a non-empty `rendered[]`) as a [`Role::System`]
-/// message: one text block per rendered item, exactly the text appended to the prompt. `None` when
-/// nothing was rendered. Under `complete` the message is also a carrier of the verbatim record, so
-/// the emitter replays it byte-for-byte while lean consumers still see its text. `kind` is
-/// [`MessageKind::InjectedContext`]; `origin` is [`Origin::Hook`] for `hook_*` attachments (a
-/// user-configured hook's stdout) and [`Origin::Harness`] otherwise. The attachment kind always
-/// rides in `extra["claude"]["attachment_type"]` (it is what the text *is*); the full `attachment`
-/// object only under [`ParseOptions::extra`].
-fn parse_attachment_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) -> Option<Message> {
-    let rendered = v.get("rendered").and_then(Value::as_array).filter(|r| !r.is_empty())?;
-    let att = v.get("attachment").and_then(Value::as_object)?;
-    let att_type = att.get("type").and_then(Value::as_str).unwrap_or("attachment");
-    let raw_items = span.and_then(|ctx| rendered_content_raw(ctx.slice));
-    let mut blocks = Vec::with_capacity(rendered.len());
-    for (i, item) in rendered.iter().enumerate() {
-        let Some(text) = item.get("content").and_then(Value::as_str) else {
-            continue;
-        };
-        let raw = raw_items.as_ref().and_then(|r| r.get(i).copied().flatten());
-        let t = match (span, raw) {
-            (Some(ctx), Some(raw)) if text.len() > INLINE_MAX => raw_string_span(raw, ctx)
-                .inspect(|sp| debug_assert_span(sp, ctx, text))
-                .map(Text::Span)
-                .unwrap_or_else(|| Text::Inline(text.to_string())),
-            _ => Text::Inline(text.to_string()),
-        };
-        blocks.push(Block::Text { text: t });
-    }
-    if blocks.is_empty() {
-        return None;
-    }
-    let mut m = if opts.complete {
-        carrier_record(v)
-    } else {
-        Message::new(Role::System)
-    };
-    m.kind = MessageKind::InjectedContext;
-    m.origin = if att_type.starts_with("hook_") {
-        Origin::Hook
-    } else {
-        Origin::Harness
-    };
-    m.id = v.get("uuid").and_then(Value::as_str).map(String::from);
-    m.parent_id = v.get("parentUuid").and_then(Value::as_str).map(String::from);
-    m.timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
-    m.content = blocks;
-    let with_extra = opts.wants_full_extra();
-    let bag = m.harness_extra_mut(Harness::Claude);
-    bag.insert("attachment_type".into(), Value::String(att_type.to_string()));
-    if with_extra {
-        bag.insert("attachment".into(), Value::Object(att.clone()));
-        for key in ["renderedInHumanTurn", "agentId"] {
-            if let Some(val) = v.get(key) {
-                bag.insert(key.to_string(), val.clone());
-            }
-        }
-        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            bag.insert("isSidechain".into(), Value::Bool(true));
-        }
-    }
-    Some(m)
-}
-
-/// Raw JSON of each `rendered[i].content` (aligned 1:1 with the parsed array), borrowing `slice`.
-fn rendered_content_raw(slice: &[u8]) -> Option<Vec<Option<&RawValue>>> {
-    #[derive(serde::Deserialize)]
-    struct R<'a> {
-        #[serde(borrow, default)]
-        rendered: Option<Vec<Ri<'a>>>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Ri<'a> {
-        #[serde(borrow, default)]
-        content: Option<&'a RawValue>,
-    }
-    let r = serde_json::from_slice::<R>(slice).ok()?.rendered?;
-    Some(r.into_iter().map(|i| i.content).collect())
 }
 
 /// Recognize Claude Code's persisted-output stub — the note left in a `tool_result` when the real
@@ -1589,7 +894,7 @@ pub fn subagent_end(path: &std::path::Path) -> SubagentEnd {
                             .and_then(Value::as_i64)
                             .and_then(|s| DateTime::from_timestamp(s, 0)),
                     });
-                } else if kind == "user" || !is_synthetic_assistant(&v, msg) {
+                } else if kind == "user" || msg.get("model").and_then(Value::as_str) != Some(SYNTHETIC_MODEL) {
                     // A real turn after the notice: the agent was resumed; the error is history.
                     end.api_error = None;
                 }
@@ -1691,192 +996,13 @@ fn scan_at(path: &Path, from: Option<&Checkpoint>) -> Result<(SessionRef, Option
     let file = fs::File::open(path)?;
     source.check_metadata(file.metadata()?)?;
     let (mut scan, offset) = metadata::Scan::restore(path, from);
-    let _remaining = source
-        .len()
-        .checked_sub(offset)
-        .context("discovery checkpoint outside source")?;
+    anyhow::ensure!(offset <= source.len(), "discovery checkpoint outside source");
     #[cfg(test)]
-    metadata::FRAMED.with(|frames| frames.borrow_mut().push((offset, _remaining)));
-    #[cfg(feature = "mmap")]
-    if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
-        #[cfg(unix)]
-        let _ = map.advise(memmap2::Advice::Sequential);
-        let bytes = map
-            .get(usize::try_from(offset)?..usize::try_from(source.len())?)
-            .context("discovery offset outside source")?;
-        scan.bytes_at(bytes, offset);
-        source.check_metadata(file.metadata()?)?;
-        let checkpoint = scan.checkpoint();
-        return Ok((scan.finish(), checkpoint));
-    }
-    #[cfg(not(feature = "mmap"))]
-    scan.positioned_at(&file, &source, offset)?;
-    #[cfg(feature = "mmap")]
-    {
-        use std::io::{Seek, SeekFrom};
-        let mut reader = &file;
-        reader.seek(SeekFrom::Start(offset))?;
-        scan.reader_at(BufReader::new(reader), offset);
-    }
+    metadata::FRAMED.with(|frames| frames.borrow_mut().push((offset, source.len() - offset)));
+    scan.read(&source, &file, offset)?;
     source.check_metadata(file.metadata()?)?;
     let checkpoint = scan.checkpoint();
     Ok((scan.finish(), checkpoint))
-}
-
-/// Turn one record into an IR [`Message`]. Handles `user`/`assistant` (the conversation) and the
-/// content-bearing `system` lines (compaction notices, away/error summaries, slash-command output).
-/// Returns `None` for line types with no conversational payload.
-struct ConversationContent {
-    blocks: Vec<Block>,
-    user: (MessageKind, Origin),
-    slash_command: bool,
-}
-
-fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) -> Option<Message> {
-    parse_message_projected(ty, v, opts, span, None)
-}
-
-fn parse_message_projected(
-    ty: &str,
-    v: &Value,
-    opts: &ParseOptions,
-    span: Option<&SpanCtx>,
-    projected: Option<ConversationContent>,
-) -> Option<Message> {
-    if ty == "system" {
-        return parse_system_message(v, opts, span);
-    }
-
-    let role = match ty {
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        _ => return None,
-    };
-
-    let msg = v.get("message")?;
-    let id = v.get("uuid").and_then(Value::as_str).map(str::to_string);
-    let parent_id = v.get("parentUuid").and_then(Value::as_str).map(str::to_string);
-    let timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
-    let model = msg.get("model").and_then(Value::as_str).map(str::to_string);
-    let usage = msg.get("usage").map(parse_usage);
-
-    let facts = projected.as_ref().map(|p| (p.user, p.slash_command));
-    let mut blocks = if let Some(projected) = projected {
-        projected.blocks
-    } else {
-        let mut blocks = Vec::new();
-        match msg.get("content") {
-            Some(Value::String(s)) => {
-                // Bare-string content: span it (the whole `message.content` string) when large.
-                let text = match span {
-                    Some(ctx) if s.len() > INLINE_MAX => raw_msg_content_string_span(ctx)
-                        .inspect(|sp| debug_assert_span(sp, ctx, s))
-                        .map(Text::Span)
-                        .unwrap_or_else(|| Text::Inline(s.clone())),
-                    _ => Text::Inline(s.clone()),
-                };
-                blocks.push(Block::Text { text });
-            }
-            Some(Value::Array(items)) => {
-                // Raw items are the *same* JSON array as `items`, so they align 1:1 by index — giving
-                // each block its source field's byte span for free.
-                let raw_items = span.and_then(|ctx| raw_msg_content_items(ctx.slice));
-                for (i, item) in items.iter().enumerate() {
-                    let raw = raw_items.as_ref().and_then(|r| r.get(i).copied());
-                    if let Some(b) = parse_block(item, raw.zip(span)) {
-                        blocks.push(b);
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        blocks
-    };
-
-    // INTERFACE-V2 §4: `toolUseResult` — the structured sidecar Claude writes *next to* the
-    // `tool_result` block (structuredPatch, oldTodos/newTodos, stdout/stderr, file contents,
-    // persisted-output pointers) — is a SHARED concept, so it rides on the block as
-    // `Block::ToolResult::details`, not in the harness bag. Gated on `opts.extra` because the
-    // sidecar routinely dwarfs the visible transcript and the bulk text passes must not materialize
-    // it (that gate is the whole point of `ParseOptions::extra`).
-    if opts.wants_full_extra() {
-        if let Some(tur) = v.get("toolUseResult").filter(|t| !t.is_null()) {
-            attach_tool_use_result(&mut blocks, tur);
-        }
-    } else if opts.facts_only() {
-        if let Some(tur) = v.get("toolUseResult") {
-            facts::attach_restorable(&mut blocks, tur);
-        }
-    }
-
-    // A `user` line carrying only tool results is really a Tool turn.
-    let role =
-        if role == Role::User && !blocks.is_empty() && blocks.iter().all(|b| matches!(b, Block::ToolResult { .. })) {
-            Role::Tool
-        } else {
-            role
-        };
-
-    let synthetic = ty == "assistant" && is_synthetic_assistant(v, msg);
-    let class = ConversationClass {
-        synthetic,
-        api_error: synthetic && v.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false),
-        compact_summary: v.get("isCompactSummary").and_then(Value::as_bool) == Some(true),
-        sync_agent_return: is_sync_agent_return(v),
-        slash_command: facts.map_or_else(|| is_slash_command_record(msg), |f| f.1),
-        user: facts.map_or_else(|| user_kind(v, msg), |f| f.0),
-    };
-    let (role, kind, origin) = classify_conversation(role, class, opts.complete);
-    let model = if synthetic && !opts.complete { None } else { model };
-
-    // Everything Claude-specific lands in `extra["claude"]`; the top level stays clean.
-    let mut bag = Map::new();
-    if synthetic && !opts.complete && !opts.facts_only() {
-        for key in [
-            "isApiErrorMessage",
-            "error",
-            "errorDetails",
-            "apiErrorStatus",
-            "requestId",
-        ] {
-            if let Some(val) = v.get(key).filter(|val| !val.is_null()) {
-                bag.insert(key.to_string(), val.clone());
-            }
-        }
-    }
-    if opts.facts_only() {
-        facts::collect_message(msg, &mut bag);
-    } else if opts.extra {
-        collect_extra(v, msg, &mut bag);
-    } else if opts.usage_identity {
-        if let Some(id) = msg.get("id").and_then(Value::as_str) {
-            bag.insert("message.id".into(), Value::String(id.to_owned()));
-        }
-    }
-    // Format-complete: capture EVERY remaining top-level + message-level field (beyond the
-    // first-classed ones) so `parse → emit` reproduces the record with no dropped keys.
-    if opts.complete {
-        collect_extra_complete(v, msg, &mut bag);
-    }
-    let mut extra = Map::new();
-    if !bag.is_empty() {
-        extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));
-    }
-
-    Some(Message {
-        complete_record: None,
-        id,
-        parent_id,
-        role,
-        kind,
-        origin,
-        timestamp,
-        model,
-        content: blocks,
-        usage,
-        extra,
-    })
 }
 
 /// The classification shared by owned and borrowed records. Content storage never chooses kind.
@@ -1921,145 +1047,6 @@ fn classify_conversation(role: Role, class: ConversationClass, complete: bool) -
         }
     };
     (role, kind, origin)
-}
-
-/// `system` records cover a grab-bag of subtypes. Only some carry user-visible text worth surfacing
-/// as a [`Role::System`] message; the rest (timing, hook bookkeeping, killed-agent notices) have no
-/// body and are dropped. We preserve `subtype`/`level`/metadata in `extra` either way.
-fn parse_system_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) -> Option<Message> {
-    // Format-complete: `system` records are carried verbatim. The lean passes *render* them
-    // (slash-command distillation, the synthesized `[conversation compacted]` marker, the ⛓ hook
-    // one-liner), which is lossy — the rendered body can't reconstruct the original `content`/
-    // structured fields. Carrying the raw record (system bodies are small notices, never large tool
-    // payloads) is the only way `parse → emit` reproduces it. The non-complete passes are untouched.
-    if opts.complete {
-        return Some(carrier_record(v));
-    }
-
-    let subtype = v.get("subtype").and_then(Value::as_str).unwrap_or("");
-    // Body text lives either at top-level `content` (a string) or, for compaction, is implied.
-    let content = v.get("content").and_then(Value::as_str);
-
-    // `stop_hook_summary` carries no `content`, but it IS the record of a Stop-hook firing — its
-    // `hookInfos`/`hookErrors` are the actual hook activity (a hook's command + output, or its
-    // error). Surface it as a readable line when there's something to show (output or an error), so
-    // hooks are visible rather than silently dropped; a no-op hook summary still leaves the stream.
-    if subtype == "stop_hook_summary" {
-        if let Some(body) = render_hook_summary(v) {
-            return system_msg(v, Text::Inline(body), subtype, opts);
-        }
-        return None;
-    }
-
-    // Subtypes with no human-readable body — keep them out of the message stream.
-    let bodyless = matches!(subtype, "turn_duration" | "agents_killed");
-    if bodyless || (content.is_none() && subtype != "compact_boundary") {
-        return None;
-    }
-
-    // Slash-command records (`subtype == "local_command"`) wrap their payload in pseudo-XML tags
-    // (`<command-name>/foo</command-name>`, `<command-args>`, `<local-command-stdout>`). Rendering
-    // the raw tag soup is noise — distill it to a readable one/two-liner, but keep it inline (these
-    // are always small, so no span path is needed).
-    if subtype == "local_command" {
-        if let Some(c) = content {
-            if let Some(rendered) = render_slash_command(c) {
-                return system_msg(v, Text::Inline(rendered), subtype, opts);
-            }
-        }
-    }
-
-    let text: Text = match content {
-        Some(c) => match span {
-            Some(ctx) if c.len() > INLINE_MAX => top_content_span(ctx)
-                .inspect(|sp| debug_assert_span(sp, ctx, c))
-                .map(Text::Span)
-                .unwrap_or_else(|| Text::Inline(c.to_string())),
-            _ => Text::Inline(c.to_string()),
-        },
-        // compact_boundary often has only structured metadata; synthesize a marker.
-        None => Text::Inline("[conversation compacted]".to_string()),
-    };
-
-    system_msg(v, text, subtype, opts)
-}
-
-/// Build a [`Role::System`] [`Message`] from a system record `v` with its already-resolved body
-/// `text`. The shared tail of [`parse_system_message`] (and the slash-command path), so both keep
-/// identical id/parent/timestamp/`extra` handling.
-fn system_msg(v: &Value, text: Text, subtype: &str, opts: &ParseOptions) -> Option<Message> {
-    let id = v.get("uuid").and_then(Value::as_str).map(str::to_string);
-    let parent_id = v.get("parentUuid").and_then(Value::as_str).map(str::to_string);
-    let timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
-
-    // The subtype says what the notice IS: a compaction marker, an error the model never answered
-    // (an API error, a refusal that re-routed to another model), a Stop hook's output, a scheduled
-    // wakeup, or a plain harness notice (slash-command output, away summary, informational).
-    let (kind, origin) = match subtype {
-        "compact_boundary" => (MessageKind::CompactionBoundary, Origin::Harness),
-        "api_error" | "model_refusal_fallback" => (MessageKind::Error, Origin::Harness),
-        "stop_hook_summary" => (MessageKind::Notice, Origin::Hook),
-        "scheduled_task_fire" => (MessageKind::Notice, Origin::Scheduler),
-        _ => (MessageKind::Notice, Origin::Harness),
-    };
-
-    let mut bag = Map::new();
-    if opts.facts_only() {
-        facts::collect_compaction(v, &mut bag);
-    } else if opts.extra {
-        if !subtype.is_empty() {
-            bag.insert("subtype".into(), Value::String(subtype.to_string()));
-        }
-        for key in [
-            "level",
-            "compactMetadata",
-            "cause",
-            "error",
-            "isMeta",
-            "isSidechain",
-            "agentId",
-            "slug",
-            "logicalParentUuid",
-            // Hook activity (Stop/PreToolUse/… hook firings): the command, its output, and errors.
-            "hookCount",
-            "hookInfos",
-            "hookErrors",
-            "stopReason",
-            "preventedContinuation",
-            "toolUseID",
-            // Model-refusal fallback (a provider safety refusal that re-routed to another model):
-            // which models, the refusal category/explanation, and what got retracted.
-            "originalModel",
-            "fallbackModel",
-            "apiRefusalCategory",
-            "apiRefusalExplanation",
-            "retractedMessageUuids",
-            "trigger",
-            "direction",
-        ] {
-            if let Some(val) = v.get(key) {
-                bag.insert(key.to_string(), val.clone());
-            }
-        }
-    }
-    let mut extra = Map::new();
-    if !bag.is_empty() {
-        extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));
-    }
-
-    Some(Message {
-        complete_record: None,
-        id,
-        parent_id,
-        role: Role::System,
-        kind,
-        origin,
-        timestamp,
-        model: None,
-        content: vec![Block::Text { text }],
-        usage: None,
-        extra,
-    })
 }
 
 /// Distill a `stop_hook_summary` record into a readable one-liner, or `None` when the hook did
@@ -2169,48 +1156,6 @@ fn keep_extra_top(key: &str, val: &Value) -> bool {
         && !matches!((key, val), ("isSidechain", Value::Bool(false)))
 }
 
-fn collect_extra_owned(mut top: Map<String, Value>, mut msg: Map<String, Value>, extra: &mut Map<String, Value>) {
-    // Source maps preserve insertion order. Emit the historical roster order while moving
-    // selected Values, so rich parsing changes neither serialized bytes nor retained ownership.
-    for &key in CLAUDE_EXTRA_TOP {
-        if let Some(value) = top.remove(key).filter(|v| keep_extra_top(key, v)) {
-            extra.insert(key.to_owned(), value);
-        }
-    }
-    for &key in CLAUDE_EXTRA_MSG {
-        if let Some(value) = msg.remove(key).filter(|v| !v.is_null()) {
-            extra.insert(format!("{MESSAGE_EXTRA_PREFIX}{key}"), value);
-        }
-    }
-}
-
-/// Preserve Claude-specific record fields that the IR has no first-class home for, into the
-/// message's `extra["claude"]` bag, so conversions and the viewer can still surface them. Keys keep
-/// Claude's own spelling; cv-invented names are snake_case.
-///
-/// The rich `toolUseResult` sidecar is deliberately NOT here: it is a shared concept and lives on
-/// the block ([`attach_tool_use_result`] → [`Block::ToolResult::details`]). Under
-/// [`ParseOptions::complete`] a verbatim copy still lands in the bag via [`collect_extra_complete`]
-/// — that copy exists only so byte-exact same-harness replay has a fallback if a block's details
-/// were rewritten or dropped between parse and emit.
-fn collect_extra(v: &Value, msg: &Value, extra: &mut Map<String, Value>) {
-    collect_extra_owned(
-        CLAUDE_EXTRA_TOP
-            .iter()
-            .filter_map(|&k| {
-                v.get(k)
-                    .filter(|v| keep_extra_top(k, v))
-                    .map(|v| (k.to_owned(), v.clone()))
-            })
-            .collect(),
-        CLAUDE_EXTRA_MSG
-            .iter()
-            .filter_map(|&k| msg.get(k).filter(|v| !v.is_null()).map(|v| (k.to_owned(), v.clone())))
-            .collect(),
-        extra,
-    );
-}
-
 /// Top-level record fields the IR first-classes (so they must NOT be duplicated into `extra` —
 /// the emitter reconstructs them from the [`Message`]'s own fields).
 const CLAUDE_FIRSTCLASS_TOP: &[&str] = &["type", "uuid", "parentUuid", "timestamp", "message"];
@@ -2220,71 +1165,7 @@ const CLAUDE_FIRSTCLASS_MSG: &[&str] = &["content", "usage", "role", "model"];
 /// route it back inside the `message` object on replay.
 pub const MESSAGE_EXTRA_PREFIX: &str = "message.";
 
-/// Format-complete capture (only under [`ParseOptions::complete`]): mirror EVERY top-level and
-/// `message.*` field that the IR doesn't already first-class into the `extra["claude"]` bag, so a
-/// `parse → emit` round-trip reproduces the record's full key set + values. Runs *after* [`collect_extra`], so the
-/// already-captured fields (`requestId`, `message.stop_reason`, …) are simply re-confirmed (same
-/// key, same value) rather than dropped. This is also the *only* producer of the bag's
-/// [`TOOL_USE_RESULT_KEY`] copy — the block's `details` is the sidecar's real home, and this
-/// verbatim copy is the complete-mode replay fallback. Large content lives in `content`/`usage`
-/// and is first-classed, so nothing big is duplicated here.
-fn collect_extra_complete(v: &Value, msg: &Value, extra: &mut Map<String, Value>) {
-    if let Some(obj) = v.as_object() {
-        for (k, val) in obj {
-            if CLAUDE_FIRSTCLASS_TOP.contains(&k.as_str()) {
-                continue;
-            }
-            extra.entry(k.clone()).or_insert_with(|| val.clone());
-        }
-    }
-    if let Some(mobj) = msg.as_object() {
-        for (k, val) in mobj {
-            if CLAUDE_FIRSTCLASS_MSG.contains(&k.as_str()) {
-                continue;
-            }
-            extra
-                .entry(format!("{MESSAGE_EXTRA_PREFIX}{k}"))
-                .or_insert_with(|| val.clone());
-        }
-    }
-}
-
-fn collect_extra_complete_owned(top: Map<String, Value>, message: Map<String, Value>, extra: &mut Map<String, Value>) {
-    for (key, value) in top {
-        extra.entry(key).or_insert(value);
-    }
-    for (key, value) in message {
-        extra.entry(format!("{MESSAGE_EXTRA_PREFIX}{key}")).or_insert(value);
-    }
-}
-
-/// The inline text of a just-built tool-result `content`, or (for a lazy span — always a large real
-/// payload, never the small persisted-output stub) the raw `content` string of `item`.
-fn coerced_ref<'a>(content: &'a Text, item: &'a Value) -> &'a str {
-    content
-        .inline_str()
-        .or_else(|| item.get("content").and_then(Value::as_str))
-        .unwrap_or("")
-}
-
-/// Fold a record's `toolUseResult` sidecar into its `tool_result` block's
-/// [`Block::ToolResult::details`] — the IR's home for a tool result's structured extras
-/// (INTERFACE-V2 §4). Claude writes one sidecar per record and (in every transcript we have seen)
-/// one `tool_result` block per record, so it attaches to the first result block.
-///
-/// cv's own derived persisted-output pointer may already be sitting in `details`; it is *merged
-/// into* the sidecar object, and `emit_claude` strips it back out, so a same-harness replay
-/// reproduces `toolUseResult` exactly. A sidecar that is not an object (Claude writes a bare error
-/// string for some tools: 28% of the 89k sidecars in a census of real transcripts, 3 of which also
-/// had a spilled output) leaves no room for that pointer, so the two are parked side by side under
-/// [`TOOL_USE_RESULT_KEY`] and the emitter unwraps them.
-fn attach_tool_use_result(blocks: &mut [Block], tur: &Value) {
-    if blocks.iter().any(|b| matches!(b, Block::ToolResult { .. })) {
-        attach_tool_use_result_owned(blocks, tur.clone());
-    }
-}
-
-fn attach_tool_use_result_owned(blocks: &mut [Block], tur: Value) {
+fn attach_tool_use_result(blocks: &mut [Block], tur: Value) {
     let Some(Block::ToolResult { details, .. }) = blocks.iter_mut().find(|b| matches!(b, Block::ToolResult { .. }))
     else {
         return;
@@ -2300,142 +1181,6 @@ fn attach_tool_use_result_owned(blocks: &mut [Block], tur: Value) {
         }
         (sidecar, _) => sidecar,
     });
-}
-
-/// One Anthropic content block → IR, with large strings spanned into the source (the wire codec
-/// maps the shape; `span_field` is the item's raw JSON + record context, when the reader has it).
-/// A persisted-output stub keeps the stub as `content` (that IS what the model saw) and records
-/// where the full output lives, so renders can point at it and indexers can read it.
-fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Option<Block> {
-    let mut block = anthropic::block_from_with(item, &anthropic::ANTHROPIC, &mut |s, field| {
-        spanned_or_inline(s, field, span_field)
-    })?;
-    if let Block::ToolResult { content, details, .. } = &mut block {
-        *details = persisted_output(coerced_ref(content, item))
-            .map(|(path, size)| serde_json::json!({ "persistedOutput": { "path": path, "size": size } }));
-    }
-    Some(block)
-}
-
-/// Make a [`Text`] for a content string: a lazy [`Span`] into the source when large and a span is
-/// computable, else inline. The `debug_assert` re-resolves the span from the same bytes and checks it
-/// equals `s`, so any offset/escape bug trips immediately in dev/test.
-fn spanned_or_inline(s: &str, field: &str, span_field: Option<(&RawValue, &SpanCtx)>) -> Text {
-    if s.len() > INLINE_MAX {
-        if let Some((raw, ctx)) = span_field {
-            if let Some(sp) = span_of_string_field(raw, field, ctx) {
-                debug_assert_span(&sp, ctx, s);
-                return Text::Span(sp);
-            }
-        }
-    }
-    Text::Inline(s.to_string())
-}
-
-/// The byte span of a string `field` inside a content item's raw JSON (`item_raw`), as an absolute
-/// file offset. `None` if the field is absent or isn't a JSON string.
-fn span_of_string_field(item_raw: &RawValue, field: &str, ctx: &SpanCtx) -> Option<Span> {
-    let map: std::collections::HashMap<&str, &RawValue> = serde_json::from_str(item_raw.get()).ok()?;
-    raw_string_span(map.get(field)?, ctx)
-}
-
-/// Span the *body* of a raw JSON string value as an absolute file offset (delegates to the shared
-/// [`crate::lazy::json_string_span`]; relies on `fr` borrowing `ctx.slice`).
-fn raw_string_span(fr: &RawValue, ctx: &SpanCtx) -> Option<Span> {
-    crate::lazy::json_string_span(fr, ctx.slice, ctx.base_off)
-}
-
-/// The raw JSON of `message.content`, borrowing `slice`.
-fn message_content_raw(slice: &[u8]) -> Option<&RawValue> {
-    #[derive(serde::Deserialize)]
-    struct P<'a> {
-        #[serde(borrow)]
-        message: Option<Pm<'a>>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Pm<'a> {
-        #[serde(borrow, default)]
-        content: Option<&'a RawValue>,
-    }
-    serde_json::from_slice::<P>(slice)
-        .ok()
-        .and_then(|p| p.message)
-        .and_then(|m| m.content)
-}
-
-/// The content array items as raw JSON (aligned 1:1 with the `Value` array), or `None` if content
-/// isn't an array.
-fn raw_msg_content_items(slice: &[u8]) -> Option<Vec<&RawValue>> {
-    let content = message_content_raw(slice)?;
-    if content.get().as_bytes().first() == Some(&b'[') {
-        serde_json::from_str::<Vec<&RawValue>>(content.get()).ok()
-    } else {
-        None
-    }
-}
-
-/// Span for a bare-string `message.content` (the whole string is the content).
-fn raw_msg_content_string_span(ctx: &SpanCtx) -> Option<Span> {
-    let content = message_content_raw(ctx.slice)?;
-    if content.get().as_bytes().first() == Some(&b'"') {
-        raw_string_span(content, ctx)
-    } else {
-        None
-    }
-}
-
-/// Span for a top-level `content` string (system records).
-fn top_content_span(ctx: &SpanCtx) -> Option<Span> {
-    #[derive(serde::Deserialize)]
-    struct T<'a> {
-        #[serde(borrow, default)]
-        content: Option<&'a RawValue>,
-    }
-    let content = serde_json::from_slice::<T>(ctx.slice).ok()?.content?;
-    if content.get().as_bytes().first() == Some(&b'"') {
-        raw_string_span(content, ctx)
-    } else {
-        None
-    }
-}
-
-/// Dev/test guard: resolve `sp` from the same record bytes and assert it equals the inline text the
-/// span replaces. Compiled out in release.
-#[cfg(debug_assertions)]
-fn debug_assert_span(sp: &Span, ctx: &SpanCtx, expected: &str) {
-    let lo = match sp.offset.checked_sub(ctx.base_off) {
-        Some(x) => x as usize,
-        None => {
-            debug_assert!(false, "span offset before base");
-            return;
-        }
-    };
-    let hi = lo + sp.len as usize;
-    debug_assert!(hi <= ctx.slice.len(), "span exceeds record slice");
-    let raw = &ctx.slice[lo..hi.min(ctx.slice.len())];
-    let got = if sp.escaped {
-        let mut q = Vec::with_capacity(raw.len() + 2);
-        q.push(b'"');
-        q.extend_from_slice(raw);
-        q.push(b'"');
-        serde_json::from_slice::<String>(&q).unwrap_or_default()
-    } else {
-        String::from_utf8_lossy(raw).into_owned()
-    };
-    debug_assert_eq!(got, expected, "lazy span resolved to the wrong content");
-}
-#[cfg(not(debug_assertions))]
-fn debug_assert_span(_: &Span, _: &SpanCtx, _: &str) {}
-
-fn parse_usage(v: &Value) -> Usage {
-    let get = |k: &str| v.get(k).and_then(Value::as_u64);
-    Usage {
-        input_tokens: get("input_tokens"),
-        output_tokens: get("output_tokens"),
-        cache_read_tokens: get("cache_read_input_tokens"),
-        cache_creation_tokens: get("cache_creation_input_tokens"),
-        ..Usage::default()
-    }
 }
 
 #[cfg(test)]
@@ -2464,6 +1209,7 @@ fn task_list(transcript: &Path, id: &str) -> Option<crate::affordance::Affordanc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lazy::INLINE_MAX;
     use std::sync::LazyLock;
 
     static NO_BAG: LazyLock<Map<String, Value>> = LazyLock::new(Map::new);
@@ -2827,13 +1573,7 @@ mod tests {
             ..Default::default()
         };
         let mut sink = CollectSink::default();
-        stream_reader(
-            "s1",
-            BufReader::new(fs::File::open(&path).unwrap()),
-            Some(path.clone()),
-            &opts,
-            &mut sink,
-        );
+        stream_file("s1", &path, &opts, &mut sink);
         let allowed = ["claude", CARRIER_KEY, crate::offsets::OFFSET_KEY];
         let mut saw_carrier = false;
         let mut saw_offset = false;
@@ -3234,7 +1974,7 @@ mod tests {
     #[test]
     fn subagent_tree_discovers_both_tiers_with_meta_and_journal() {
         use std::io::Write;
-        let _world = cv_testkit::World::in_process("claude-subagent-ref-projection");
+        let _world = crate::test_world("claude-subagent-ref-projection");
         // Lay out a parent session with one directly-spawned sub-agent and one workflow holding
         // two agents (one journaled done, one a string return), mirroring the real on-disk shape.
         let root = std::env::temp_dir().join(format!("cv-subtree-{}", uuid::Uuid::new_v4()));
@@ -3353,10 +2093,9 @@ mod tests {
         }
 
         let mut sink = CollectSink::default();
-        let usage = stream_reader(
+        let usage = stream_file(
             "a111",
-            BufReader::new(fs::File::open(subs.join("agent-a111.jsonl")).unwrap()),
-            Some(subs.join("agent-a111.jsonl")),
+            &subs.join("agent-a111.jsonl"),
             &ParseOptions::usage(),
             &mut sink,
         );
@@ -3414,7 +2153,7 @@ mod tests {
 
     #[test]
     fn native_json_inputs_preserve_values_modes_and_exact_ranges() {
-        let world = cv_testkit::World::in_process("claude-json-inputs");
+        let world = crate::test_world("claude-json-inputs");
         let path = world.proj.join("source.jsonl");
         let big = serde_json::to_string(&"a\nβ".repeat(INLINE_MAX)).unwrap();
         let inputs = vec![
@@ -3448,14 +2187,7 @@ mod tests {
             let mut sink = CollectSink::default();
             let mut actual = adapter.stream(&reference, &opts, &mut sink).unwrap();
             actual.messages = sink.messages;
-            let mut expected_sink = CollectSink::default();
-            let mut expected = stream_str("source", &text, Some(path.clone()), &opts, &mut expected_sink);
-            expected.messages = expected_sink.messages;
-            assert_eq!(
-                serde_json::to_value(&actual).unwrap(),
-                serde_json::to_value(&expected).unwrap(),
-                "{opts:?}"
-            );
+            assert_eq!(actual.messages.len(), inputs.len() + 1, "{opts:?}");
             for (i, message) in actual.messages.iter().enumerate() {
                 let Block::ToolUse { input, .. } = &message.content[0] else {
                     panic!("expected tool")
@@ -3467,55 +2199,31 @@ mod tests {
                         assert_eq!(&text[start..start + range.len() as usize], inputs[i]);
                         assert_eq!(range.path(), path);
                     }
-                    Json::Owned(value) => {
+                    Json::Owned(_) => {
                         assert!(!opts.spans || opts.complete || i == inputs.len() || inputs[i].len() <= INLINE_MAX);
-                        if i == inputs.len() {
-                            assert!(value.is_null());
-                        }
                     }
                 }
+                let expected = inputs
+                    .get(i)
+                    .map_or(Value::Null, |input| serde_json::from_str(input).unwrap());
+                assert_eq!(*input.resolve().unwrap(), expected, "{opts:?} input {i}");
             }
-            actual.materialize().unwrap();
-            assert_eq!(
-                serde_json::to_value(actual).unwrap(),
-                serde_json::to_value(expected).unwrap()
-            );
         }
-        // A provenance path alone must not bind arbitrary reader/string bytes to that file.
-        for mut actual in [
-            {
-                let mut sink = CollectSink::default();
-                let mut s = stream_reader(
-                    "source",
-                    std::io::Cursor::new(text.as_bytes()),
-                    Some(path.clone()),
-                    &ParseOptions::lazy(),
-                    &mut sink,
-                );
-                s.messages = sink.messages;
-                s
-            },
-            {
-                let mut sink = CollectSink::default();
-                let mut s = stream_str("source", &text, Some(path.clone()), &ParseOptions::lazy(), &mut sink);
-                s.messages = sink.messages;
-                s
-            },
-        ] {
-            assert!(actual.messages.iter().flat_map(|m| &m.content).all(|b| !matches!(
-                b,
-                Block::ToolUse {
-                    input: Json::Source(_),
-                    ..
-                }
-            )));
-            actual.materialize().unwrap();
-        }
+        // Strings have no source file: their inputs are always owned.
+        let mut sink = CollectSink::default();
+        stream_str("source", &text, Some(path.clone()), &ParseOptions::lazy(), &mut sink);
+        assert!(sink.messages.iter().flat_map(|m| &m.content).all(|b| !matches!(
+            b,
+            Block::ToolUse {
+                input: Json::Source(_),
+                ..
+            }
+        )));
     }
 
     #[test]
     fn native_json_inputs_keep_owned_fallback_last_wins_and_invalid_tail() {
-        let world = cv_testkit::World::in_process("claude-json-input-fallback");
+        let world = crate::test_world("claude-json-input-fallback");
         let path = world.proj.join("source.jsonl");
         let text = concat!(
             r#"{"type":"assistant","uuid":"duplicate","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"custom_tool","input":{"old":1},"input":{"winner":2}}]}}"#,
@@ -3530,20 +2238,13 @@ mod tests {
             let mut sink = CollectSink::default();
             let mut actual = adapter.stream(&reference, &opts, &mut sink).unwrap();
             actual.messages = sink.messages;
-            let mut expected_sink = CollectSink::default();
-            let mut expected = stream_str("source", text, Some(path.clone()), &opts, &mut expected_sink);
-            expected.messages = expected_sink.messages;
-            assert_eq!(
-                serde_json::to_value(&actual).unwrap(),
-                serde_json::to_value(expected).unwrap()
-            );
-            assert_eq!(actual.messages.len(), 1);
+            assert_eq!(actual.messages.len(), 1, "the record with a lone surrogate is skipped");
             let Block::ToolUse {
                 input: Json::Owned(value),
                 ..
             } = &actual.messages[0].content[0]
             else {
-                panic!("duplicate item must retain owned fallback")
+                panic!("a small input is owned")
             };
             assert_eq!(value, &serde_json::json!({"winner": 2}));
         }
@@ -3551,7 +2252,7 @@ mod tests {
 
     #[test]
     fn native_json_inputs_reject_changed_source_and_resume_exact_ranges() {
-        let world = cv_testkit::World::in_process("claude-json-input-errors");
+        let world = crate::test_world("claude-json-input-errors");
         let path = world.proj.join("source.jsonl");
         let padding = "x".repeat(INLINE_MAX);
         let line = |id: &str| {
@@ -3618,23 +2319,8 @@ mod tests {
     }
 
     #[test]
-    fn native_json_inputs_verify_the_opened_file_before_using_ranges() {
-        let world = cv_testkit::World::in_process("claude-json-input-opened");
-        let path = world.proj.join("source.jsonl");
-        let replacement = world.proj.join("replacement.jsonl");
-        fs::write(&path, "{\"a\":1}").unwrap();
-        fs::write(&replacement, "{\"b\":200}").unwrap();
-        let inputs = JsonInputs::capture(&path, &ParseOptions::lazy()).unwrap().unwrap();
-        // The named path still matches capture, but a file opened during a transient path swap
-        // must not lend its validated bytes/offsets to descriptors of the original file.
-        inputs.source.check().unwrap();
-        assert!(inputs.check_opened(&fs::File::open(&replacement).unwrap()).is_err());
-        inputs.check_opened(&fs::File::open(&path).unwrap()).unwrap();
-    }
-
-    #[test]
     fn native_json_inputs_check_completion_only_after_source_publication() {
-        let world = cv_testkit::World::in_process("claude-json-input-completion");
+        let world = crate::test_world("claude-json-input-completion");
         let path = world.proj.join("source.jsonl");
         let record = |input: Value| {
             serde_json::json!({
@@ -3683,41 +2369,6 @@ mod tests {
     }
 
     #[test]
-    fn native_json_inputs_feed_events_and_affordances_like_owned_inputs() {
-        let world = cv_testkit::World::in_process("claude-json-input-consumers");
-        let path = world.proj.join("source.jsonl");
-        let tools = [
-            ("Read", serde_json::json!({"file_path": "/tmp/a.rs"})),
-            ("Bash", serde_json::json!({"command": "echo hello"})),
-            (
-                "AskUserQuestion",
-                serde_json::json!({"questions": [{"question": "Ship?", "options": [{"label": "yes"}]}]}),
-            ),
-        ];
-        let text = tools.into_iter().enumerate().map(|(i, (name, mut input))| {
-            input.as_object_mut().unwrap().insert("ignored_payload".into(), Value::String("x\nβ".repeat(INLINE_MAX)));
-            serde_json::json!({"type": "assistant", "uuid": i.to_string(), "message": {"role": "assistant", "content": [{"type": "tool_use", "id": i.to_string(), "name": name, "input": input}]}}).to_string() + "\n"
-        }).collect::<String>();
-        fs::write(&path, text).unwrap();
-        let reference = SessionRef::new("source", Harness::Claude, path.clone());
-        let adapter = Claude::with_config_dir(&world.proj);
-        let full = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full()).unwrap();
-        let mut expected = crate::events::EventSink::new(None);
-        for message in &full.messages {
-            expected.try_message(message.clone()).unwrap();
-        }
-        let mut actual = crate::events::EventSink::new(None);
-        adapter.stream(&reference, &ParseOptions::lazy(), &mut actual).unwrap();
-        assert_eq!(actual.into_events().unwrap(), expected.into_events().unwrap());
-        let expected = crate::affordance::of_session(&full).unwrap();
-        let actual = crate::affordance::read(&adapter, &reference).unwrap();
-        assert_eq!(
-            serde_json::to_value(actual).unwrap(),
-            serde_json::to_value(expected).unwrap()
-        );
-    }
-
-    #[test]
     fn lazy_spans_resolve_to_same_text() {
         // A record with content well over INLINE_MAX: the lazy path must produce a Span whose
         // resolved text equals the inline parse, byte-for-byte (incl. escapes).
@@ -3742,14 +2393,13 @@ mod tests {
         };
         // Lazy parse → expect a Span; resolving it must equal `big`.
         let mut sink = CollectSink::default();
-        let file = BufReader::new(fs::File::open(&path).unwrap());
-        let mut s = stream_reader_lazy(&r.id, file, Some(path.clone()), &mut sink);
+        let mut s = stream_file(&r.id, &path, &ParseOptions::lazy(), &mut sink);
         s.messages = sink.messages;
         match &s.messages[0].content[0] {
             Block::Text { text } => {
                 assert!(text.is_span(), "large content should be a span");
                 let resolver = s.resolver();
-                assert_eq!(text.resolve(&resolver), big.as_str());
+                assert_eq!(text.try_resolve(&resolver).unwrap(), big.as_str());
             }
             _ => panic!("expected text block"),
         }
@@ -3765,23 +2415,26 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // Test helper: stream a file with span production enabled.
-    fn stream_reader_lazy<R: BufRead>(
-        id: &str,
-        reader: R,
-        source_path: Option<PathBuf>,
-        sink: &mut dyn MessageSink,
-    ) -> Session {
-        stream_reader(id, reader, source_path, &ParseOptions::lazy(), sink)
+    /// Stream a transcript file through the one reader.
+    fn stream_file(id: &str, path: &Path, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Session {
+        read(
+            new_session_for(id, Some(path.to_path_buf()), opts),
+            path,
+            0,
+            None,
+            opts,
+            sink,
+            &mut || Ok(()),
+        )
+        .unwrap()
     }
 
-    #[cfg(feature = "mmap")]
     #[test]
-    fn mapped_lines_preserve_checkpoints_offsets_resume_and_partial_tails() {
+    fn checkpoints_mark_finished_lines_and_resume_continues_from_them() {
         #[derive(Default)]
         struct Capture {
             messages: Vec<Message>,
-            checkpoints: Vec<Checkpoint>,
+            checkpoints: Vec<(Checkpoint, usize)>,
             stop_after: Option<usize>,
         }
         impl MessageSink for Capture {
@@ -3797,83 +2450,70 @@ mod tests {
                 true
             }
             fn checkpoint(&mut self, cp: &mut Checkpoint) {
-                self.checkpoints.push(cp.clone());
+                self.checkpoints.push((cp.clone(), self.messages.len()));
             }
         }
-        fn resolved(mut session: Session, sink: &mut Capture) -> Value {
-            session.messages = std::mem::take(&mut sink.messages);
-            session.materialize().unwrap();
-            serde_json::to_value(session).unwrap()
+        fn resolved(mut messages: Vec<Message>, path: &Path) -> Value {
+            let resolver = crate::Resolver::new(Some(path.to_path_buf()));
+            for m in &mut messages {
+                m.materialize(&resolver).unwrap();
+            }
+            serde_json::to_value(messages).unwrap()
         }
-        let dir = cv_testkit::temp_dir("claude-mapped-lines");
+        let dir = cv_testkit::temp_dir("claude-checkpoint-lines");
         let path = dir.join("s.jsonl");
         let body = "wide \"payload\"\n".repeat(1000);
         let first = serde_json::json!({"type":"user","uuid":"u","cwd":"/project","permissionMode":"plan","timestamp":"2026-01-02T00:00:00Z","message":{"content":"question"}});
         let second = serde_json::json!({"type":"assistant","uuid":"a","parentUuid":"u","timestamp":"2026-01-01T00:00:00Z","message":{"model":"test-model","content":[{"type":"text","text":body},{"type":"tool_use","id":"call","name":"Agent","input":{"prompt":"test"}}]}});
         let tail = serde_json::json!({"type":"user","uuid":"t","parentUuid":"a","toolUseResult":{"agentId":"agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"call","content":"done"}]}});
         let prefix = format!("  {first}\r\n\n{second}\n");
-        for tail in [
-            tail.to_string(),
-            r#"{"type":"assistant","message": {"content":"partial"#.to_owned(),
+        let ends: Vec<u64> = prefix.match_indices('\n').map(|(i, _)| i as u64 + 1).collect();
+        for (tail, tail_messages) in [
+            (tail.to_string(), 1),
+            (r#"{"type":"assistant","message": {"content":"partial"#.to_owned(), 0),
         ] {
             let text = format!("{prefix}{tail}");
             fs::write(&path, &text).unwrap();
+            let r = scan(&path).unwrap();
             for opts in [
                 ParseOptions::lazy(),
                 ParseOptions::lazy_offsets(),
                 ParseOptions::lazy_extra(),
             ] {
-                for stop_after in [None, Some(1), Some(2)] {
-                    let mut buffered = Capture {
-                        stop_after,
-                        ..Capture::default()
-                    };
-                    let expected = stream_reader(
-                        "s",
-                        BufReader::new(fs::File::open(&path).unwrap()),
-                        Some(path.clone()),
-                        &opts,
-                        &mut buffered,
-                    );
-                    let mut mapped = Capture {
-                        stop_after,
-                        ..Capture::default()
-                    };
-                    let actual = Claude::with_config_dir(&dir)
-                        .stream(&scan(&path).unwrap(), &opts, &mut mapped)
+                let mut whole = Capture::default();
+                let session = Claude::with_config_dir(&dir).stream(&r, &opts, &mut whole).unwrap();
+                assert_eq!(whole.messages.len(), 2 + tail_messages);
+                // Every finished line, and never the unterminated tail.
+                assert_eq!(
+                    whole.checkpoints.iter().map(|(cp, _)| cp.offset).collect::<Vec<_>>(),
+                    ends
+                );
+                assert_eq!(session.cwd.as_deref(), Some(Path::new("/project")));
+                for (cp, seen) in &whole.checkpoints {
+                    let mut rest = Capture::default();
+                    let resumed = Claude::with_config_dir(&dir)
+                        .resume(&r, &opts, &mut rest, cp)
+                        .unwrap()
                         .unwrap();
-                    assert_eq!(mapped.checkpoints, buffered.checkpoints);
-                    assert_eq!(resolved(actual, &mut mapped), resolved(expected, &mut buffered));
-                    if stop_after.is_none() {
-                        assert_eq!(
-                            mapped.checkpoints.last().unwrap().offset,
-                            prefix.len() as u64,
-                            "partial tail is never checkpointed"
-                        );
-                        for cp in &mapped.checkpoints {
-                            let mut mapped_tail = Capture::default();
-                            let actual = Claude::with_config_dir(&dir)
-                                .resume(&scan(&path).unwrap(), &opts, &mut mapped_tail, cp)
-                                .unwrap()
-                                .unwrap();
-                            let offset = cp.offset as usize;
-                            let mut buffered_tail = Capture::default();
-                            let expected = stream_reader_at(
-                                cp.get(ADAPTER_LAYER).unwrap(),
-                                std::io::Cursor::new(&text.as_bytes()[offset..]),
-                                cp.offset,
-                                &opts,
-                                &mut buffered_tail,
-                                None,
-                            );
-                            assert_eq!(mapped_tail.checkpoints, buffered_tail.checkpoints);
-                            assert_eq!(
-                                resolved(actual, &mut mapped_tail),
-                                resolved(expected, &mut buffered_tail)
-                            );
-                        }
-                    }
+                    assert_eq!(
+                        resolved(rest.messages, &path),
+                        resolved(whole.messages[*seen..].to_vec(), &path)
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&resumed).unwrap(),
+                        serde_json::to_value(&session).unwrap()
+                    );
                 }
+                let mut stopped = Capture {
+                    stop_after: Some(1),
+                    ..Capture::default()
+                };
+                Claude::with_config_dir(&dir).stream(&r, &opts, &mut stopped).unwrap();
+                assert_eq!(stopped.messages.len(), 1);
+                assert_eq!(
+                    stopped.checkpoints.iter().map(|(cp, _)| cp.offset).collect::<Vec<_>>(),
+                    ends[..0]
+                );
             }
         }
         fs::remove_dir_all(dir).unwrap();
@@ -3915,13 +2555,7 @@ mod tests {
 
         let opts = ParseOptions::lazy_offsets();
         let mut full = CollectSink::default();
-        stream_reader(
-            "s",
-            BufReader::new(fs::File::open(&path).unwrap()),
-            Some(path.clone()),
-            &opts,
-            &mut full,
-        );
+        stream_file("s", &path, &opts, &mut full);
         let full = full.messages;
         assert_eq!(full.len(), 7); // user, assistant, tool, system, attachment, user, assistant
         let offs: Vec<u64> = full
@@ -3954,13 +2588,7 @@ mod tests {
 
         // And bulk/full options never stamp (their output stays byte-identical to before).
         let mut bulk = CollectSink::default();
-        stream_reader(
-            "s",
-            BufReader::new(fs::File::open(&path).unwrap()),
-            Some(path.clone()),
-            &ParseOptions::bulk(),
-            &mut bulk,
-        );
+        stream_file("s", &path, &ParseOptions::bulk(), &mut bulk);
         assert!(bulk
             .messages
             .iter()
@@ -4013,26 +2641,5 @@ mod tests {
         };
         let _ = stream_str("s1", &text, None, &ParseOptions::bulk(), &mut sink);
         assert_eq!(seen, 1, "Stop after the first message must halt streaming");
-    }
-
-    #[test]
-    fn parse_reader_matches_parse_str() {
-        // The streaming on-disk path (`parse_reader`, used by `Adapter::parse` to avoid loading a
-        // multi-GB transcript whole) must produce the same Session as the whole-text `parse_str`.
-        // Both delegate to `ingest_value`; this guards the OOM-fix refactor against divergence.
-        let text = fixture("rich_blocks.jsonl");
-        let whole = parse_str("s1", &text, None);
-        let streamed = parse_reader("s1", std::io::Cursor::new(text.as_bytes()), None);
-        assert_eq!(whole.title, streamed.title);
-        assert_eq!(whole.cwd, streamed.cwd);
-        assert_eq!(
-            whole.git.as_ref().map(|g| g.branch.clone()),
-            streamed.git.as_ref().map(|g| g.branch.clone())
-        );
-        assert_eq!(whole.model, streamed.model);
-        assert_eq!(whole.created_at, streamed.created_at);
-        assert_eq!(whole.updated_at, streamed.updated_at);
-        assert_eq!(whole.messages.len(), streamed.messages.len());
-        assert_eq!(whole.searchable_text().unwrap(), streamed.searchable_text().unwrap());
     }
 }

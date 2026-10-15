@@ -46,6 +46,9 @@ const DEPENDENCY_ALLOWLIST: &[&str] = &[
     "toml",
     "uuid",
     "walkdir",
+    // Native only: libzstd for compressed sources, already in the shipped binary via tantivy and
+    // about 4x ruzstd's decode rate; wasm keeps the pure-Rust ruzstd.
+    "zstd",
     // Optional zip-ingest shares the desktop/Web decoder; no default feature or task IO.
     "zip",
 ];

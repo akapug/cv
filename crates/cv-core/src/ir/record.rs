@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn materialized_empty_replay_never_looks_like_checked_unchanged() -> Result<()> {
-        let world = cv_testkit::World::in_process("record-empty-replay");
+        let world = crate::test_world("record-empty-replay");
         let path = world.base.join("empty.json");
         std::fs::write(&path, "{}")?;
         let mut messages = vec![Message::new(super::super::Role::User)];

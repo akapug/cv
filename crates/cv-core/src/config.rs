@@ -24,10 +24,8 @@ pub struct Config {
 /// Back-compat: if the legacy `…/claurdvoyant` dir still exists and the new one hasn't been created,
 /// keep using it — so registered export sources survive the rename without a manual move.
 pub fn config_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
+    let base = crate::env::Env::current().config_home()?;
+
     let new = base.join("clustervision");
     let legacy = base.join("claurdvoyant");
     Some(if !new.exists() && legacy.exists() { legacy } else { new })
@@ -82,7 +80,11 @@ pub fn save(cfg: &Config) -> Result<PathBuf> {
         table.insert(key.clone(), value.clone());
     }
     let body = toml::to_string_pretty(&document).context("serializing config")?;
-    std::fs::write(&p, body).with_context(|| format!("writing {}", p.display()))?;
+    // Replaced whole, never rewritten in place. A symlinked config (a dotfiles checkout) is
+    // replaced at its target, so the link keeps pointing at the new file.
+    let target = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+    crate::publish::publish_reader(&target, "config", body.as_bytes(), crate::publish::Claim::Replace)
+        .with_context(|| format!("writing {}", p.display()))?;
     Ok(p)
 }
 
@@ -92,7 +94,7 @@ mod tests {
 
     #[test]
     fn updates_preserve_unknown_keys_and_reject_malformed_existing_files() {
-        let _world = cv_testkit::World::in_process("config-update-preservation");
+        let _world = crate::test_world("config-update-preservation");
         assert!(load_for_update().unwrap().exports.is_empty());
         let path = save(&Config::default()).unwrap();
         std::fs::write(&path, "exports = ['/old']\nfuture = 42\n[extension]\nlabel = 'keep'\n").unwrap();
@@ -108,6 +110,25 @@ mod tests {
         assert!(load_for_update().is_err());
         assert!(save(&cfg).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), malformed);
+    }
+
+    /// The config is replaced whole; a symlinked config (dotfiles) is replaced at its target and
+    /// stays a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_replaced_at_its_target() {
+        let world = crate::test_world("config-symlink");
+        let path = save(&Config::default()).unwrap();
+        let dotfile = world.base.join("dotfiles-config.toml");
+        std::fs::rename(&path, &dotfile).unwrap();
+        std::os::unix::fs::symlink(&dotfile, &path).unwrap();
+        let cfg = Config {
+            exports: vec![PathBuf::from("/linked")],
+        };
+        save(&cfg).unwrap();
+        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!(load_for_update().unwrap().exports, cfg.exports);
+        assert!(std::fs::read_to_string(&dotfile).unwrap().contains("/linked"));
     }
 
     #[test]

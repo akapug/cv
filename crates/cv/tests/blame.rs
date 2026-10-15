@@ -53,7 +53,7 @@ fn cv(w: &World, dir: &Path, args: &[&str]) -> (String, String) {
 #[test]
 fn blame_end_to_end() {
     // In-process: the catalog ingest below reads `CLUSTERVISION_HOME` from the process env.
-    let w = World::in_process("blame-e2e");
+    let w = World::in_process("blame-e2e", cv_core::env::Env::enter_isolated);
     let base = w.base.clone();
     let home = w.cv_home.clone();
     let repo_raw = base.join("repo");

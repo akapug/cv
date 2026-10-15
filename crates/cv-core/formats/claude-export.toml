@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "claude-export"
-source_files = ["harness/export.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
+source_files = ["harness/export.rs", "harness/export/native.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
 ignore_literals = ["conversations.json"]
 store = [
   "registered conversations.json (cv config --add-export)",

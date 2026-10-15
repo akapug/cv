@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "kimi"
-source_files = ["harness/kimi.rs", "harness/wire/openai.rs", "harness/wire/mod.rs"]
+source_files = ["harness/kimi.rs", "harness/kimi/record.rs", "harness/wire/openai.rs", "harness/wire/mod.rs"]
 ignore_literals = ["context.jsonl", "metadata"]
 store = [
   "$KIMI_SHARE_DIR or ~/.kimi/sessions/<md5(cwd)>/<uuid>/context.jsonl",

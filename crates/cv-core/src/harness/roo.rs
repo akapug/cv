@@ -28,7 +28,7 @@ pub struct Roo {
 impl Roo {
     pub fn detect() -> Self {
         let mut roots = task_roots(ROO_EXT_IDS, ".roo");
-        roots.extend(dirs::home_dir().and_then(|h| cli_tasks_root(&h)));
+        roots.extend(crate::env::home_dir().and_then(|h| cli_tasks_root(&h)));
         Roo { roots }
     }
 

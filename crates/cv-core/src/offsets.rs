@@ -23,8 +23,7 @@ use std::path::Path;
 pub const OFFSET_KEY: &str = "cv_byte_offset";
 
 /// File `(mtime_ns, size)`: the staleness signature catalog rows are keyed by.
-/// `(0, 0)` when unreadable, which is never treated as fresh (mirrors
-/// [`events::file_mtime_ns`](crate::events::file_mtime_ns) semantics).
+/// `(0, 0)` when unreadable, which is never treated as fresh.
 pub fn file_sig(path: &Path) -> (i64, i64) {
     let Ok(md) = std::fs::metadata(path) else { return (0, 0) };
     let mtime = md
@@ -34,12 +33,6 @@ pub fn file_sig(path: &Path) -> (i64, i64) {
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
     (mtime, md.len() as i64)
-}
-
-/// Whether a stored file signature still matches a readable, nonempty source. File size alone
-/// cannot distinguish an unchanged transcript from a same-size rewrite, even for append logs.
-pub fn sig_is_fresh(stored: (i64, i64), current: (i64, i64)) -> bool {
-    current.0 != 0 && current.1 > 0 && stored == current
 }
 
 /// A matching tuple, including a real empty file, may be reused only with fresh captured
@@ -69,14 +62,5 @@ mod tests {
         assert!(!sig_is_fresh_with_source((111, 0), (222, 0), || panic!(
             "mismatching tuple must not probe source"
         )));
-    }
-
-    #[test]
-    fn freshness_requires_both_known_mtime_and_size() {
-        assert!(sig_is_fresh((111, 4096), (111, 4096)));
-        assert!(!sig_is_fresh((111, 4096), (222, 4096)), "same-size rewrites are stale");
-        assert!(!sig_is_fresh((111, 4096), (111, 8192)), "appends are stale");
-        assert!(!sig_is_fresh((0, 4096), (0, 4096)));
-        assert!(!sig_is_fresh((111, 0), (111, 0)));
     }
 }

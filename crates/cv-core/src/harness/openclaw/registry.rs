@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn jsonl_run_order_and_ownership_match_global_sort_with_many_unrelated_runs() -> anyhow::Result<()> {
-        let world = cv_testkit::World::in_process("openclaw-owned-run-order");
+        let world = crate::test_world("openclaw-owned-run-order");
         fs::create_dir_all(world.base.join("subagents"))?;
         let key = "agent:main:explicit:requested";
         let mut runs = serde_json::Map::new();

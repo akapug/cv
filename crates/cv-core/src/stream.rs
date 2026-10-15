@@ -273,83 +273,6 @@ pub trait MessageSink {
     fn checkpoint(&mut self, _cp: &mut Checkpoint) {}
 }
 
-/// Check cancellation at buffered input boundaries, including rows which emit no message.
-/// Legacy tolerant readers may swallow I/O errors, so preserve the original control failure
-/// independently and return it after the reader operation instead of accepting a partial count.
-pub(crate) fn with_read_check<R: std::io::BufRead, T>(
-    reader: R,
-    check: &mut dyn FnMut() -> Result<()>,
-    read: impl FnOnce(CheckedReader<'_, R>) -> T,
-) -> Result<T> {
-    let mut error = None;
-    let result = read(CheckedReader {
-        reader,
-        check,
-        error: &mut error,
-    });
-    if let Some(error) = error {
-        return Err(error);
-    }
-    Ok(result)
-}
-
-pub(crate) struct CheckedReader<'a, R> {
-    reader: R,
-    check: &'a mut dyn FnMut() -> Result<()>,
-    error: &'a mut Option<anyhow::Error>,
-}
-impl<R> CheckedReader<'_, R> {
-    fn check(&mut self) -> std::io::Result<bool> {
-        // Some tolerant line readers continue after errors. Once interruption is latched,
-        // terminate their input rather than providing an infinite sequence of errors.
-        if self.error.is_some() {
-            return Ok(false);
-        }
-        if let Err(error) = (self.check)() {
-            *self.error = Some(error);
-            return Err(std::io::Error::other("input read interrupted"));
-        }
-        Ok(true)
-    }
-    fn latch_io<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
-        match result {
-            Err(error) if error.kind() != std::io::ErrorKind::Interrupted => {
-                let forwarded = std::io::Error::new(error.kind(), error.to_string());
-                self.error.get_or_insert(error.into());
-                Err(forwarded)
-            }
-            other => other,
-        }
-    }
-}
-impl<R: std::io::Read> std::io::Read for CheckedReader<'_, R> {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        if !self.check()? {
-            return Ok(0);
-        }
-        let result = self.reader.read(bytes);
-        self.latch_io(result)
-    }
-}
-impl<R: std::io::BufRead> std::io::BufRead for CheckedReader<'_, R> {
-    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        if !self.check()? {
-            return Ok(&[]);
-        }
-        match self.reader.fill_buf() {
-            Err(error) if error.kind() != std::io::ErrorKind::Interrupted => {
-                let forwarded = std::io::Error::new(error.kind(), error.to_string());
-                self.error.get_or_insert(error.into());
-                Err(forwarded)
-            }
-            other => other,
-        }
-    }
-    fn consume(&mut self, bytes: usize) {
-        self.reader.consume(bytes);
-    }
-}
-
 /// Run an adapter boundary with a consumer error guard. Legacy adapter loops can keep using
 /// `message() -> Flow`; failures stop delivery immediately and surface after the adapter returns,
 /// including errors raised by metadata, dependencies, checkpoints or an EOF-only sink check.
@@ -712,26 +635,71 @@ pub fn collect(adapter: &dyn Adapter, r: &SessionRef) -> Result<Session> {
 /// Use [`collect`] (or call `.materialize()`) when you need owned inline content.
 pub fn collect_with(adapter: &dyn Adapter, r: &SessionRef, opts: &ParseOptions) -> Result<Session> {
     let mut sink = CollectSink::default();
-    let mut session = stream_counted(adapter, r, opts, &mut sink)?;
+    let mut session = stream_counted(adapter, r, opts, &mut sink, Pass::RECORD)?.session;
     session.messages = sink.messages;
     Ok(session)
 }
 
-/// `adapter.try_stream(r, opts, sink)`, plus what a pass that read the whole session learned: when the
-/// sink never said [`Flow::Stop`], the parse's own turn count ([`Message::is_turn`]) is written back
-/// to the catalog for a row that holds `0` ("not counted" — a Codex rollout over the discovery scan
-/// cap, an adapter that cannot count cheaply), so `cv ls` shows the real number from the first full
-/// read on. The same pass counts the session's affordances ([`crate::affordance::Counter`]) and
-/// records them unless the catalog's are still fresh, which is what lets `has:<kind>` answer from
-/// the catalog. The full-read doors (`collect`/`parse`, `cv show`, `cv index`) stream through this.
-pub fn stream_counted(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-) -> Result<Session> {
-    let source = crate::source::Probe::default().snapshot(r);
-    stream_counted_with_source(adapter, r, opts, sink, &source)
+/// How a [`stream_counted`] pass reads. The default reads the whole session once, takes no
+/// checkpoint, records nothing and gives no receipt.
+#[derive(Default, Clone, Copy)]
+pub struct Pass<'a> {
+    /// Start at this checkpoint instead of byte 0, with the counts restored from it. The caller
+    /// restores its own sinks from it and checks that it still describes the file. An adapter
+    /// that cannot resume from it touches nothing and the pass fails with [`Declined`].
+    pub from: Option<&'a Checkpoint>,
+    /// Take a checkpoint each time the file has advanced this many bytes past the last one,
+    /// where the adapter and every sink allow.
+    pub every: Option<u64>,
+    /// Amortize checkpoint work against new transcript bytes: after a checkpoint the next one
+    /// also waits for that checkpoint's encoded size in new bytes. Every layer still keeps its
+    /// exact owned state; a large growing replay history takes fewer checkpoints at the cost of a
+    /// larger suffix to reread on the next append.
+    pub amortized: bool,
+    /// Publish what a whole read counted to the catalog, against a source snapshot taken before
+    /// the read: a "not counted" (`0`) row gets the parse's turn count, so `cv ls` shows the real
+    /// number from the first full read on, and the affordance counts that let `has:<kind>` answer
+    /// from the catalog are recorded unless still fresh. A sweep that parses on many threads
+    /// leaves this off and publishes [`Counted`] itself, on one.
+    pub record: bool,
+    /// Return a [`StagedReadGuard`] covering the primary, adapter dependencies and retained
+    /// message sources, for an operation that stages output before publishing it.
+    pub guard: bool,
+}
+
+impl Pass<'_> {
+    /// A whole read that records what it counted: what the full-read doors use.
+    pub const RECORD: Pass<'static> = Pass {
+        from: None,
+        every: None,
+        amortized: false,
+        record: true,
+        guard: false,
+    };
+}
+
+/// The adapter could not resume from [`Pass::from`] and touched nothing: read the session whole
+/// instead, from sinks that were not restored from the checkpoint.
+#[derive(Debug)]
+pub struct Declined;
+impl std::fmt::Display for Declined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("adapter declined to resume from the checkpoint")
+    }
+}
+impl std::error::Error for Declined {}
+
+/// What a [`stream_counted`] pass gives back.
+pub struct Streamed {
+    pub session: Session,
+    /// What the whole session counted (a resumed part added to the checkpoint's), `None` when the
+    /// sink stopped early.
+    pub counted: Option<Counted>,
+    /// The last checkpoint the pass took, or else the one it resumed from (`None` when it has
+    /// neither, or stopped early): the mark the next pass over the grown file resumes from.
+    pub last: Option<Checkpoint>,
+    /// With [`Pass::guard`]: the receipt to verify before publishing staged output.
+    pub guard: Option<StagedReadGuard>,
 }
 
 /// Source receipt for an operation that stages output before publication.
@@ -751,14 +719,18 @@ impl StagedReadGuard {
     }
 }
 
-/// Counted streaming with a publication receipt covering the primary, adapter dependencies,
-/// and retained message sources. Output consumers still own staging and publication.
-pub fn stream_counted_guarded(
+/// The one counted read: `adapter.try_stream(r, opts, sink)` (or `try_resume` from
+/// [`Pass::from`]) through a wrapper that counts turns ([`Message::is_turn`]), messages and
+/// affordances ([`crate::affordance::Counter`]) as they go by, and takes the checkpoints the pass
+/// asks for. The full-read doors (`collect`/`parse`, `cv show`, `cv index`, watch) all read
+/// through this.
+pub fn stream_counted(
     adapter: &dyn Adapter,
     r: &SessionRef,
     opts: &ParseOptions,
     sink: &mut dyn MessageSink,
-) -> Result<(Session, StagedReadGuard)> {
+    pass: Pass<'_>,
+) -> Result<Streamed> {
     struct Guarded<'a> {
         sink: &'a mut dyn MessageSink,
         guard: StagedReadGuard,
@@ -788,43 +760,52 @@ pub fn stream_counted_guarded(
             self.sink.message(message)
         }
     }
-    let primary = adapter.resume_source(r);
-    let source = crate::source::Probe::default().snapshot_from(r, &primary);
-    let mut wrapped = Guarded {
-        sink,
-        guard: StagedReadGuard {
-            source,
+    // Captured before the adapter opens anything; a guarded pass's covers the resume source.
+    let mut guarded = None;
+    let (sink, source): (&mut dyn MessageSink, _) = if pass.guard {
+        let primary = adapter.resume_source(r);
+        let source = crate::source::Probe::default().snapshot_from(r, &primary);
+        let guard = StagedReadGuard {
+            source: source.clone(),
             reads: Default::default(),
             primary,
-        },
+        };
+        (guarded.insert(Guarded { sink, guard }), Some(source))
+    } else {
+        (sink, pass.record.then(|| crate::source::Probe::default().snapshot(r)))
     };
-    let source = wrapped.guard.source.clone();
-    let session = stream_counted_with_source(adapter, r, opts, &mut wrapped, &source)?;
-    Ok((session, wrapped.guard))
-}
-
-/// [`stream_counted`] using an operation's already captured source snapshot. The caller must
-/// capture it before this pass reads the source; publication still revalidates it and the
-/// adapter's dynamic read set. Side-store counts remain conditional on cache freshness.
-pub fn stream_counted_with_source(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    source: &crate::source::Snapshot,
-) -> Result<Session> {
-    let (session, counter) = stream_with_counter(adapter, r, opts, sink)?;
-    if let Some((turns, counter, dependencies)) = counter {
-        let source = source.with_reads(&dependencies);
-        if !crate::source::unchanged(r, &source) {
-            return Ok(session);
+    let mut counting = Counting::new(r, sink, pass.every);
+    counting.amortized = pass.amortized;
+    let session = match pass.from {
+        Some(cp) => {
+            let state = cp.get::<CounterState>(COUNTER_LAYER).ok_or(Declined)?;
+            counting.restore(state, cp.offset);
+            counting.space_after(cp);
+            adapter.try_resume(r, opts, &mut counting, cp)?.ok_or(Declined)?
         }
-        note_turns(r, turns);
-        crate::catalog::note_affordances_with_source(r, &source, || {
-            counter.finish(&session, &adapter.store_affordances(r))
-        });
+        None => adapter.try_stream(r, opts, &mut counting)?,
+    };
+    let session = counting.stamp_session(session);
+    // A resumed pass that read too little to take one still passed through `from`.
+    let last = counting
+        .last
+        .take()
+        .or_else(|| pass.from.cloned())
+        .filter(|_| !counting.stopped);
+    let counted = (!counting.stopped).then(|| Counted {
+        turns: counting.turns,
+        dependencies: counting.dependencies,
+        counts: counting.affordances.finish(&session, &adapter.store_affordances(r)),
+    });
+    if let (true, Some(source), Some(counted)) = (pass.record, &source, &counted) {
+        counted.record_with_source(r, source);
     }
-    Ok(session)
+    Ok(Streamed {
+        session,
+        counted,
+        last,
+        guard: guarded.map(|g| g.guard),
+    })
 }
 
 /// What a whole-session read counted: its turns and its affordances.
@@ -837,123 +818,14 @@ pub struct Counted {
 }
 
 impl Counted {
-    /// Legacy compatibility entry point. Without a before-read source snapshot, it cannot
-    /// safely publish cached turn or affordance counts, and therefore does nothing.
-    /// Use [`Self::record_with_source`] to publish counts against the source that was read.
-    #[deprecated(note = "no-op without a before-read source snapshot; use record_with_source")]
-    pub fn record(self, _r: &SessionRef) {}
-
     /// Publish against the dependencies captured before this pass, including any side-store rows.
-    pub fn record_with_source(self, r: &SessionRef, source: &crate::source::Snapshot) {
+    pub fn record_with_source(&self, r: &SessionRef, source: &crate::source::Snapshot) {
         let source = source.with_reads(&self.dependencies);
         if crate::source::unchanged(r, &source) {
             note_turns(r, self.turns);
-            crate::catalog::note_affordances_with_source(r, &source, || self.counts);
+            crate::catalog::note_affordances_with_source(r, &source, || self.counts.clone());
         }
     }
-}
-
-/// [`stream_counted`] without the catalog writes: what the pass counted comes back (`None` when the
-/// sink stopped early) for the caller to publish through [`Counted::record_with_source`] with a
-/// before-read snapshot. A sweep that parses on many threads keeps its catalog writes on one. Reads the adapter's side store every time (the
-/// recording path reads it only when a write is due).
-pub fn stream_counting(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-) -> Result<(Session, Option<Counted>)> {
-    let (session, counter) = stream_with_counter(adapter, r, opts, sink)?;
-    let counted = counter.map(|(turns, counter, dependencies)| Counted {
-        turns,
-        dependencies,
-        counts: counter.finish(&session, &adapter.store_affordances(r)),
-    });
-    Ok((session, counted))
-}
-
-/// What a [`stream_resumable`] pass gives back.
-pub struct Resumed {
-    pub session: Session,
-    /// What the whole session counted (the resumed part added to the checkpoint's), `None` when
-    /// the sink stopped early.
-    pub counted: Option<Counted>,
-    /// The last checkpoint the pass took, or else the one it resumed from (`None` when it has
-    /// neither, or stopped early): the mark the next pass over the grown file resumes from.
-    pub last: Option<Checkpoint>,
-}
-
-/// [`stream_counting`] for a pass that can be continued: it takes a [`Checkpoint`] each time the
-/// file has advanced `every` bytes past the last one (where the adapter and every sink allow), and
-/// given `from` it starts there instead of at byte 0, with the counts restored from it. The
-/// caller restores its own sinks from `from` and checks that `from` still describes the file.
-/// `Ok(None)`: the adapter cannot resume from `from` and touched nothing — read the session
-/// whole instead.
-pub fn stream_resumable(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    every: u64,
-    from: Option<&Checkpoint>,
-) -> Result<Option<Resumed>> {
-    stream_resumable_inner(adapter, r, opts, sink, (every, false), from)
-}
-
-/// A resumable pass whose checkpoint work is amortized against new transcript bytes.
-/// `every` is the minimum spacing; after a snapshot, the next one also waits for at least
-/// that snapshot's encoded size in new bytes. All layers still retain their exact owned state.
-/// Large growing replay histories therefore take fewer snapshots, at the cost of a larger
-/// suffix to reread on the next append. Fixed-boundary consumers use [`stream_resumable`].
-pub fn stream_resumable_amortized(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    every: u64,
-    from: Option<&Checkpoint>,
-) -> Result<Option<Resumed>> {
-    stream_resumable_inner(adapter, r, opts, sink, (every, true), from)
-}
-
-fn stream_resumable_inner(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    schedule: (u64, bool),
-    from: Option<&Checkpoint>,
-) -> Result<Option<Resumed>> {
-    let (every, amortized) = schedule;
-    let mut counting = Counting::new(r, sink, Some(every));
-    counting.amortized = amortized;
-    let session = match from {
-        Some(cp) => {
-            let Some(state) = cp.get::<CounterState>(COUNTER_LAYER) else {
-                return Ok(None);
-            };
-            counting.restore(state, cp.offset);
-            counting.space_after(cp);
-            match adapter.try_resume(r, opts, &mut counting, cp)? {
-                Some(s) => s,
-                None => return Ok(None),
-            }
-        }
-        None => adapter.try_stream(r, opts, &mut counting)?,
-    };
-    let session = counting.stamp_session(session);
-    // A resumed pass that read too little to take one still passed through `from`.
-    let last = counting
-        .last
-        .take()
-        .or_else(|| from.cloned())
-        .filter(|_| !counting.stopped);
-    let counted = (!counting.stopped).then(|| Counted {
-        turns: counting.turns,
-        dependencies: counting.dependencies,
-        counts: counting.affordances.finish(&session, &adapter.store_affordances(r)),
-    });
-    Ok(Some(Resumed { session, counted, last }))
 }
 
 /// The [`Checkpoint`] layer an adapter keeps its own state under.
@@ -1148,25 +1020,6 @@ impl MessageSink for Counting<'_> {
     }
 }
 
-type CompletedCounter = (usize, crate::affordance::Counter, crate::source::ReadSet);
-
-/// `adapter.stream` with every message counted: the turns and the affordance [`Counter`]
-/// (`None` when the sink stopped early, so the counts would be partial).
-///
-/// [`Counter`]: crate::affordance::Counter
-fn stream_with_counter(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-) -> Result<(Session, Option<CompletedCounter>)> {
-    let mut counting = Counting::new(r, sink, None);
-    let session = adapter.try_stream(r, opts, &mut counting)?;
-    let session = counting.stamp_session(session);
-    let counted = (!counting.stopped).then_some((counting.turns, counting.affordances, counting.dependencies));
-    Ok((session, counted))
-}
-
 /// A whole-session read of `r` counted `turns`: fill a "not counted" catalog row (see
 /// [`stream_counted`]).
 fn note_turns(r: &SessionRef, turns: usize) {
@@ -1177,38 +1030,6 @@ fn note_turns(r: &SessionRef, turns: usize) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn checked_reader_latches_underlying_read_errors_even_when_consumer_ignores_them() {
-        struct Failing;
-        impl std::io::Read for Failing {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "source read failed",
-                ))
-            }
-        }
-        impl std::io::BufRead for Failing {
-            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "source read failed",
-                ))
-            }
-            fn consume(&mut self, _: usize) {}
-        }
-        let error = with_read_check(Failing, &mut || Ok(()), |mut reader| {
-            let _ = std::io::Read::read(&mut reader, &mut [0; 1]);
-            assert_eq!(std::io::Read::read(&mut reader, &mut [0; 1]).unwrap(), 0);
-        })
-        .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::BrokenPipe
-        );
-        assert_eq!(error.to_string(), "source read failed");
-    }
-
     #[test]
     fn metadata_projection_preserves_existing_modes_and_complete_precedence() {
         for opts in [
@@ -1399,7 +1220,7 @@ mod tests {
 
     #[test]
     fn wrappers_forward_read_sets_and_counter_checkpoints_keep_the_prefix() {
-        let w = cv_testkit::World::in_process("read-set-wrappers");
+        let w = crate::test_world("read-set-wrappers");
         let path = w.base.join("session.jsonl");
         std::fs::write(&path, "primary").unwrap();
         let extra = w.base.join("external.txt");
@@ -1574,7 +1395,7 @@ mod tests {
 
     #[test]
     fn failed_streams_never_finish_counts_or_publish_cache_or_marks() {
-        let w = cv_testkit::World::in_process("fallible-stream-publication");
+        let w = crate::test_world("fallible-stream-publication");
         let path = w.base.join("session.jsonl");
         std::fs::write(&path, "scratch primary").unwrap();
         let r = transcript(crate::Harness::Codex, path);
@@ -1596,9 +1417,20 @@ mod tests {
                 };
                 let mut failing = FailingSink::new(at, ended);
                 let result = if resumable {
-                    stream_resumable(&adapter, &r, &ParseOptions::lazy(), &mut failing, 1, None).map(|_| ())
+                    stream_counted(
+                        &adapter,
+                        &r,
+                        &ParseOptions::lazy(),
+                        &mut failing,
+                        crate::stream::Pass {
+                            every: Some(1),
+                            amortized: false,
+                            ..Default::default()
+                        },
+                    )
+                    .map(|_| ())
                 } else {
-                    stream_counted(&adapter, &r, &ParseOptions::lazy(), &mut failing).map(|_| ())
+                    stream_counted(&adapter, &r, &ParseOptions::lazy(), &mut failing, Pass::RECORD).map(|_| ())
                 };
                 assert!(
                     result
@@ -1662,7 +1494,7 @@ mod tests {
 
     #[test]
     fn built_in_stream_boundary_and_nested_guard_return_the_original_error() {
-        let w = cv_testkit::World::in_process("built-in-fallible-stream");
+        let w = crate::test_world("built-in-fallible-stream");
         let dir = w.base.join("projects/group/chats");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("q.jsonl");
@@ -1725,9 +1557,19 @@ mod tests {
     fn pass(r: &SessionRef, from: Option<&Checkpoint>) -> (Keep, serde_json::Value, Counted) {
         let adapter = crate::harness::for_harness(r.harness).unwrap();
         let mut keep = Keep::default();
-        let done = stream_resumable(&*adapter, r, &ParseOptions::lazy(), &mut keep, 1, from)
-            .unwrap()
-            .unwrap_or_else(|| panic!("{} declined to resume", r.path.display()));
+        let done = stream_counted(
+            &*adapter,
+            r,
+            &ParseOptions::lazy(),
+            &mut keep,
+            crate::stream::Pass {
+                from,
+                every: Some(1),
+                amortized: false,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{}: {e:#}", r.path.display()));
         let session = serde_json::to_value(&done.session).unwrap();
         (keep, session, done.counted.expect("a whole pass counts"))
     }
@@ -1763,7 +1605,7 @@ mod tests {
     /// state. Compression and rewind remain IR markers; legacy Gemini replay declines resume.
     #[test]
     fn qwen_record_checkpoints_preserve_state_and_partial_eof_records() {
-        let w = cv_testkit::World::in_process("qwen-record-resume");
+        let w = crate::test_world("qwen-record-resume");
         let dir = w.base.join("projects/group/chats");
         std::fs::create_dir_all(&dir).unwrap();
         let r = transcript(crate::Harness::Qwen, dir.join("s1.jsonl"));
@@ -1914,15 +1756,18 @@ mod tests {
             // so the next pass still has a mark to resume from.
             let final_cp = full.cps.last().unwrap();
             let adapter = crate::harness::for_harness(r.harness).unwrap();
-            let done = stream_resumable(
+            let done = stream_counted(
                 &*adapter,
                 &r,
                 &ParseOptions::lazy(),
                 &mut Keep::default(),
-                1,
-                Some(final_cp),
+                crate::stream::Pass {
+                    from: Some(final_cp),
+                    every: Some(1),
+                    amortized: false,
+                    ..Default::default()
+                },
             )
-            .unwrap()
             .unwrap();
             assert_eq!(done.last.as_ref(), Some(final_cp));
         }

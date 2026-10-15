@@ -1,0 +1,6 @@
+{
+"drop": {"transcript":[48270,"98201bf6764f784075b7169cfccb05ebce71c586d947a297bf570e3fac01f8c2"],"index":[182,"c07c17f959186bec045ab949d80031c2435bb2b184f5716f0ae776a0c83199db"],"new_id":"fixed","resume_hint":"openclaw agent --session-id fixed --message \"<your prompt>\" --local"},
+"native": {"transcript":[62469,"35956d6d9ce4f02e3d779aceac2737daa809f621d97398a06b757a818cd4bfed"],"index":[182,"c07c17f959186bec045ab949d80031c2435bb2b184f5716f0ae776a0c83199db"],"new_id":"fixed","resume_hint":"openclaw agent --session-id fixed --message \"<your prompt>\" --local"},
+"portable": {"transcript":[62487,"3dc1f56bc2eaab0e92e4b98bf08280c757c88b4ba342d97432fbcc8867962669"],"index":[182,"c07c17f959186bec045ab949d80031c2435bb2b184f5716f0ae776a0c83199db"],"new_id":"fixed","resume_hint":"openclaw agent --session-id fixed --message \"<your prompt>\" --local"},
+"text": {"transcript":[62487,"3dc1f56bc2eaab0e92e4b98bf08280c757c88b4ba342d97432fbcc8867962669"],"index":[182,"c07c17f959186bec045ab949d80031c2435bb2b184f5716f0ae776a0c83199db"],"new_id":"fixed","resume_hint":"openclaw agent --session-id fixed --message \"<your prompt>\" --local"}
+}

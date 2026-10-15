@@ -267,11 +267,25 @@ pub fn read_document(path: &Path) -> Result<Session> {
     Ok(session)
 }
 
-/// Traverse the document's IR messages without retaining a complete Session. Shape validation
-/// finishes before the first callback, preserving the former all-or-error document boundary.
+/// Traverse the document's IR messages without retaining a complete Session.
 fn stream_document(path: &Path, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
     let source = JsonSource::capture(path)?;
-    source.read_document(|view| {
+    source.read_document(|view| read(view, Some((path, &source)), opts, sink))
+}
+
+/// The document codec, the only decoder of this format: the session envelope through the IR's own
+/// `Deserialize`, messages and blocks projected so text follows [`JsonView::lazy_text`]. Shape
+/// validation finishes before the first callback, so a document is all-or-error. `file` is the
+/// document and its capture, which a source-backed message is rechecked against; None for an
+/// owned view.
+fn read(
+    view: JsonView<'_>,
+    file: Option<(&Path, &JsonSource)>,
+    opts: &ParseOptions,
+    sink: &mut dyn MessageSink,
+) -> Result<Session> {
+    let check = || file.map_or(Ok(()), |(_, source)| source.check());
+    {
         let keys = SESSION_FIELDS
             .iter()
             .copied()
@@ -290,7 +304,7 @@ fn stream_document(path: &Path, opts: &ParseOptions, sink: &mut dyn MessageSink)
             messages.is_array()?,
             "not an OpenSession 0.3 document: messages must be an array"
         );
-        session.source_path = Some(path.to_path_buf());
+        session.source_path = file.map(|(path, _)| path.to_path_buf());
         for view in messages.array()?.unwrap() {
             ir_message(view?, true)?;
         }
@@ -309,21 +323,21 @@ fn stream_document(path: &Path, opts: &ParseOptions, sink: &mut dyn MessageSink)
             });
             has_sources |= sourced;
             if sourced {
-                source.check()?;
+                check()?;
             }
             let flow = sink.try_message(message)?;
             if sourced {
-                source.check()?;
+                check()?;
             }
             if flow == Flow::Stop {
                 break;
             }
         }
         if has_sources {
-            source.check()?;
+            check()?;
         }
         Ok(session)
-    })
+    }
 }
 
 fn ir_message(view: JsonView<'_>, spans: bool) -> Result<Message> {
@@ -394,7 +408,7 @@ fn ir_block(view: JsonView<'_>, spans: bool) -> Result<Block> {
     let mut selected_text = None;
     if let Some(key) = text_key {
         if let Some(view) = record.get(key) {
-            let value = if let Some(text) = view.text(spans)? {
+            let value = if let Some(text) = view.lazy_text(spans)? {
                 // Keep the authoritative Block deserializer for metadata/required fields,
                 // without serializing a Source leaf back into an owned payload first.
                 selected_text = Some(text);
@@ -417,16 +431,15 @@ fn ir_block(view: JsonView<'_>, spans: bool) -> Result<Block> {
     Ok(block)
 }
 
-/// Read an OpenSession document from text: check and strip the version marker, then the IR's own
-/// `Deserialize`. A document with no marker is read as a bare session (what `cv show --json`
-/// prints); a marker other than [`VERSION`] is an error that names the version and where the
-/// renames are documented.
+/// Read an OpenSession document from text through the same codec as a file, over an owned view.
+/// A document with no marker is read as a bare session (what `cv show --json` prints); a marker
+/// other than [`VERSION`] is an error that names the version and where the renames are documented.
 pub fn from_str(text: &str) -> Result<Session> {
     let v: Value = serde_json::from_str(text).context("not JSON")?;
-    let Value::Object(o) = v else {
-        bail!("an OpenSession document is a JSON object");
-    };
-    from_object(o)
+    let mut sink = crate::stream::CollectSink::default();
+    let mut session = read((&v).into(), None, &ParseOptions::full(), &mut sink)?;
+    session.messages = sink.messages;
+    Ok(session)
 }
 
 fn from_object(mut o: serde_json::Map<String, Value>) -> Result<Session> {

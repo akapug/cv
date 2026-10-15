@@ -1,5 +1,5 @@
 //! Zed editor agent-panel adapter — `threads.db` (SQLite, zstd-compressed JSON blobs).
-//! **sqlite feature only** (rusqlite + ruzstd).
+//! **sqlite feature only** (rusqlite + `store::zst`).
 //!
 //! Zed keeps every agent thread in one SQLite DB under its data dir:
 //!   * **macOS:**   `~/Library/Application Support/Zed/threads/threads.db`
@@ -52,10 +52,9 @@
 //!   `cumulative_token_usage` is kept (in `extra["zed"]`). A subagent's `parent_thread_id` is
 //!   first-class [`Lineage::parent`]; the `Compaction` summary becomes a `CompactionSummary` turn.
 
-mod blob;
-mod source;
+mod record;
 
-use super::store::sqlite::{columns, open_ro};
+use super::store::sqlite::{columns, open_ro, Cell, Cells};
 use super::wire::anthropic;
 use super::Adapter;
 use crate::ir::*;
@@ -90,16 +89,16 @@ impl Zed {
 fn threads_db() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     // XDG override first (portable, and what Zed's `paths::data_dir` honours on Linux).
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+    if let Some(xdg) = crate::env::var_os("XDG_DATA_HOME") {
         candidates.push(PathBuf::from(xdg).join("zed/threads/threads.db"));
     }
-    if let Some(h) = dirs::home_dir() {
+    if let Some(h) = crate::env::home_dir() {
         candidates.push(h.join("Library/Application Support/Zed/threads/threads.db"));
         candidates.push(h.join(".local/share/zed/threads/threads.db"));
         // Flatpak install keeps the same layout under the app sandbox.
         candidates.push(h.join(".var/app/dev.zed.Zed/data/zed/threads/threads.db"));
     }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+    if let Some(local) = crate::env::var_os("LOCALAPPDATA") {
         candidates.push(PathBuf::from(local).join("Zed").join("threads").join("threads.db"));
     }
     candidates.into_iter().find(|p| p.exists())
@@ -125,22 +124,18 @@ impl Adapter for Zed {
         let Some(db) = &self.db else {
             return Ok(vec![]);
         };
-        let conn = open_ro(db)?;
-        conn.read(|conn| discover_db(conn, db))
+        super::store::sqlite::cached_discover(db, || {
+            let conn = open_ro(db)?;
+            conn.read(|conn| discover_db(conn, db))
+        })
     }
 
     fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             let conn = open_ro(&r.path)?;
             conn.read(|conn| {
-                if opts.spans {
-                    let source = crate::json::JsonSource::capture_with_reads(&r.path, conn.reads())?;
-                    let result = stream_thread_with_source(conn, r, sink, Some(&source));
-                    source.check()?;
-                    result
-                } else {
-                    stream_thread(conn, r, sink)
-                }
+                let cells = Cells::new(conn, &r.path, conn.reads(), "threads")?;
+                stream_thread(conn, r, sink, &cells, opts.spans)
             })
         })
     }
@@ -148,27 +143,23 @@ impl Adapter for Zed {
 
 fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
     let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
-    let rowid = conn.prepare("SELECT _rowid_ FROM threads LIMIT 0").is_ok();
     let cols = columns(conn, "threads");
     let has = |c: &str| cols.contains(c);
+    let sel = |c: &'static str| if has(c) { c } else { "NULL" };
+    // Sorting only metadata keeps every complete blob out of SQLite's temporary sorter; each
+    // thread's cell is then read by key.
     let sql = format!(
-        "SELECT id, summary, updated_at, {created}, {folders}, {order}, data_type, {rowid}, typeof(data) \
-         FROM threads ORDER BY updated_at DESC",
-        rowid = if rowid { "_rowid_" } else { "NULL" },
-        created = if has("created_at") { "created_at" } else { "NULL" },
-        folders = if has("folder_paths") { "folder_paths" } else { "NULL" },
-        order = if has("folder_paths_order") {
-            "folder_paths_order"
-        } else {
-            "NULL"
-        },
+        "SELECT id, summary, updated_at, {}, {}, {}, data_type FROM threads ORDER BY updated_at DESC",
+        sel("created_at"),
+        sel("folder_paths"),
+        sel("folder_paths_order"),
     );
+    let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "threads")?;
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        // One unreadable row never fails the harness. Borrow the SQLite cell only while its
-        // row is current; no Rust copy of the complete compressed source is needed.
+        // One unreadable row never fails the harness.
         let Ok(id) = row.get::<_, String>(0) else { continue };
         let summary = row.get::<_, Option<String>>(1).ok().flatten();
         let updated = row.get::<_, Option<String>>(2).ok().flatten();
@@ -176,22 +167,16 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
         let folders = row.get::<_, Option<String>>(4).ok().flatten();
         let order = row.get::<_, Option<String>>(5).ok().flatten();
         let data_type = row.get::<_, Option<String>>(6).ok().flatten();
-        // Sorting only metadata avoids putting every complete blob in SQLite's temporary
-        // sorter. Native rowid stores can read the payload in fixed-size pages; older or
-        // WITHOUT ROWID stores retain a point-lookup borrowed-cell fallback.
-        let rowid = row.get::<_, Option<i64>>(7).ok().flatten();
-        let is_blob = row.get::<_, String>(8).is_ok_and(|kind| kind == "blob");
-        let thread = is_blob
-            .then(|| thread_header(conn, &id, rowid, data_type.as_deref(), true, None))
-            .flatten();
-        let count = thread.as_ref().map(|t| t.message_count).unwrap_or(0);
-        let cwd = thread.as_ref().and_then(|t| snapshot_cwd(&t.metadata));
-        let cwd = cwd.or_else(|| first_folder_path(folders.as_deref(), order.as_deref()));
+        let thread = thread_cell(conn, &cells, &id, data_type.as_deref())
+            .ok()
+            .flatten()
+            .and_then(|cell| cells.read(cell, |view| listing(view, cells.out().0)).ok().flatten());
+        let (cwd, count) = thread.unwrap_or_default();
         out.push(SessionRef {
             id,
             harness: Harness::Zed,
             path: db.to_path_buf(),
-            cwd,
+            cwd: cwd.or_else(|| first_folder_path(folders.as_deref(), order.as_deref())),
             title: summary
                 .filter(|s| !s.trim().is_empty())
                 .map(|t| crate::ir::truncate(&t, 80)),
@@ -203,33 +188,64 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
     Ok(out)
 }
 
-fn stream_thread(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
-    stream_thread_with_source(conn, r, sink, None)
+/// What a listing reads from a thread: its cwd and `message_count`, counted by the one decoder
+/// under the counting demand (user and assistant turns it emits).
+fn listing(view: crate::json::JsonView<'_>, source: &crate::json::JsonSource) -> Result<(Option<PathBuf>, usize)> {
+    let (metadata, messages) = record::header(view)?;
+    let mut count = 0;
+    if let Some(messages) = messages {
+        let demand = record::Demand {
+            spans: true,
+            count: true,
+        };
+        record::messages(messages, source, demand, &mut |m| {
+            count += usize::from(matches!(m.role, Role::User | Role::Assistant));
+            Flow::Continue
+        })?;
+    }
+    Ok((snapshot_cwd(&metadata), count))
 }
 
-fn stream_thread_with_source(
+/// The thread's `data` cell, decompressed into the cells' arena: `data_type` `"zstd"` is one
+/// zstd frame, `"json"` is raw, anything else is sniffed by the zstd magic. None when the row has
+/// no nonempty BLOB; an error when it would not decompress.
+fn thread_cell(conn: &Connection, cells: &Cells, id: &str, data_type: Option<&str>) -> Result<Option<Cell>> {
+    let mut stmt = conn.prepare_cached(&format!("SELECT {} FROM threads WHERE id = ?1", cells.select("data")))?;
+    let mut rows = stmt.query([id])?;
+    let Some(row) = rows.next()? else { return Ok(None) };
+    cells.blob(conn, "threads", "data", row, 0, |input, out| {
+        let compressed = match data_type {
+            Some("zstd") => true,
+            Some("json") => false,
+            _ => input.fill_buf()?.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]),
+        };
+        if compressed {
+            std::io::copy(&mut super::store::zst::decoder(input)?, out)?;
+        } else {
+            std::io::copy(input, out)?;
+        }
+        Ok(())
+    })
+}
+
+fn stream_thread(
     conn: &Connection,
     r: &SessionRef,
     sink: &mut dyn MessageSink,
-    source: Option<&crate::json::JsonSource>,
+    cells: &Cells,
+    spans: bool,
 ) -> Result<Session> {
     let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
-    let rowid = conn.prepare("SELECT _rowid_ FROM threads LIMIT 0").is_ok();
     let cols = columns(conn, "threads");
     let has = |c: &str| cols.contains(c);
+    let sel = |c: &'static str| if has(c) { c } else { "NULL" };
     let sql = format!(
-        "SELECT summary, updated_at, {created}, {parent}, {folders}, {order}, data_type, {rowid}, \
-         CASE WHEN typeof(data) = 'blob' THEN length(data) ELSE 0 END, typeof(data), {branch} FROM threads WHERE id = ?1",
-        rowid = if rowid { "_rowid_" } else { "NULL" },
-        created = if has("created_at") { "created_at" } else { "NULL" },
-        parent = if has("parent_id") { "parent_id" } else { "NULL" },
-        branch = if has("worktree_branch") { "worktree_branch" } else { "NULL" },
-        folders = if has("folder_paths") { "folder_paths" } else { "NULL" },
-        order = if has("folder_paths_order") {
-            "folder_paths_order"
-        } else {
-            "NULL"
-        },
+        "SELECT summary, updated_at, {}, {}, {}, {}, data_type, {} FROM threads WHERE id = ?1",
+        sel("created_at"),
+        sel("parent_id"),
+        sel("folder_paths"),
+        sel("folder_paths_order"),
+        sel("worktree_branch"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([&r.id])?;
@@ -241,19 +257,16 @@ fn stream_thread_with_source(
     let folders = row.get::<_, Option<String>>(4).ok().flatten();
     let order = row.get::<_, Option<String>>(5).ok().flatten();
     let data_type = row.get::<_, Option<String>>(6).ok().flatten();
-    let rowid = row.get::<_, Option<i64>>(7).ok().flatten();
-    let data_len = row.get::<_, i64>(8).unwrap_or(0);
-    let branch = row
-        .get::<_, Option<String>>(10)
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty());
-    // Both passes read the same SQLite cell under one read snapshot. Validate the complete
-    // document before emitting any message, including malformed ignored fields.
-    let is_blob = row.get::<_, String>(9).is_ok_and(|kind| kind == "blob");
-    let mut thread = is_blob
-        .then(|| thread_header(conn, &r.id, rowid, data_type.as_deref(), false, source))
-        .flatten();
+    let branch = row.get::<_, Option<String>>(7).ok().flatten().filter(|s| !s.is_empty());
+    // The whole document is validated before any message is emitted, ignored fields included.
+    let cell = thread_cell(conn, cells, &r.id, data_type.as_deref());
+    let thread = match &cell {
+        Ok(Some(cell)) => cells.read(*cell, |view| {
+            let (metadata, messages) = record::header(view)?;
+            Ok((metadata, messages.map(|v| v.to_json()).transpose()?))
+        })?,
+        _ => None,
+    };
 
     let mut zed = serde_json::Map::new();
     let mut model = None;
@@ -264,10 +277,7 @@ fn stream_thread_with_source(
     // The parent thread of a subagent: from the 0.3.0 blob's `subagent_context`, overridden by the
     // `parent_id` column when both name one. First-class [`Lineage`], not an extra key.
     let mut parent_thread_id: Option<String> = None;
-    if let Some(header) = &mut thread {
-        // Release parsed metadata before replay. Owned reads retain the final messages-member
-        // ordinal; lazy reads retain its checked messages child and immutable decoded backing.
-        let t = std::mem::take(&mut header.metadata);
+    if let Some((t, _)) = &thread {
         // `title` (0.3.0) / `summary` (legacy) — same meaning, renamed across generations.
         blob_title = t
             .get("title")
@@ -276,12 +286,12 @@ fn stream_thread_with_source(
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
         blob_updated = t.get("updated_at").and_then(super::ts_from_value);
-        cwd = snapshot_cwd(&t);
-        git = snapshot_git(&t);
+        cwd = snapshot_cwd(t);
+        git = snapshot_git(t);
         model = t.get("model").and_then(model_string);
-        thread_extras(&t, &mut zed, &mut parent_thread_id);
-    } else if data_len > 0 {
-        // The row exists but its blob wouldn't decode — surface that instead of erroring, so one
+        thread_extras(t, &mut zed, &mut parent_thread_id);
+    } else if !matches!(cell, Ok(None)) {
+        // The row has a blob that wouldn't decode — surface that instead of erroring, so one
         // corrupt thread never breaks listings or bulk exports.
         zed.insert("undecodable_blob".into(), Value::Bool(true));
     }
@@ -326,94 +336,12 @@ fn stream_thread_with_source(
     }
     // All session metadata is known up front; hand it to the sink before the body.
     sink.meta(&s);
-
-    if let Some(t) = &thread {
-        if let (Some(view), Some(source)) = (&t.checked, source) {
-            view.with_view(|view| source::replay(view, source, &mut |m| sink.message(m)))?;
-        } else {
-            thread_replay(conn, &r.id, rowid, data_type.as_deref(), t, &mut |m| sink.message(m));
-        }
+    if let Some((_, Some(messages))) = &thread {
+        let demand = record::Demand { spans, count: false };
+        messages.with_view(|view| record::messages(view, cells.out().0, demand, &mut |m| sink.message(m)))?;
     }
     Ok(s)
 }
-
-/// The native rowid table supports truly incremental read-only I/O. A schema variant or a
-/// blob-open failure falls back to one indexed cell lookup, preserving unreadable/nonblob
-/// behavior without changing the source database or introducing compressed-byte spans.
-fn thread_header(
-    conn: &Connection,
-    id: &str,
-    rowid: Option<i64>,
-    data_type: Option<&str>,
-    count: bool,
-    source: Option<&crate::json::JsonSource>,
-) -> Option<blob::Header> {
-    if let Some(rowid) = rowid {
-        if let Ok(data) = conn.blob_open(rusqlite::DatabaseName::Main, "threads", "data", rowid, true) {
-            return if count {
-                blob::header_reader(data_type, data, count)
-            } else if let Some(source) = source {
-                blob::prepare_checked_reader(data_type, data, source)
-            } else {
-                blob::prepare_reader(data_type, data)
-            };
-        }
-    }
-    with_cell(conn, id, rowid, |data| {
-        if count {
-            blob::header(data_type, data, count)
-        } else if let Some(source) = source {
-            blob::prepare_checked_reader(data_type, data, source)
-        } else {
-            blob::prepare_reader(data_type, data)
-        }
-    })
-    .flatten()
-}
-
-fn thread_replay(
-    conn: &Connection,
-    id: &str,
-    rowid: Option<i64>,
-    data_type: Option<&str>,
-    header: &blob::Header,
-    f: &mut dyn FnMut(Message) -> Flow,
-) {
-    if blob::replay_prepared(header, f) {
-        return;
-    }
-    if let Some(rowid) = rowid {
-        if let Ok(data) = conn.blob_open(rusqlite::DatabaseName::Main, "threads", "data", rowid, true) {
-            blob::replay_reader(data_type, data, header, f);
-            return;
-        }
-    }
-    let _ = with_cell(conn, id, rowid, |data| blob::replay(data_type, data, header, f));
-}
-
-fn with_cell<T>(conn: &Connection, id: &str, rowid: Option<i64>, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
-    let sql = if rowid.is_some() {
-        "SELECT data FROM threads WHERE _rowid_ = ?1"
-    } else {
-        "SELECT data FROM threads WHERE id = ?1"
-    };
-    let mut stmt = conn.prepare(sql).ok()?;
-    let key: &dyn rusqlite::ToSql = match &rowid {
-        Some(rowid) => rowid,
-        None => &id,
-    };
-    let mut rows = stmt.query([key]).ok()?;
-    let row = rows.next().ok()??;
-    let data = match row.get_ref(0) {
-        Ok(rusqlite::types::ValueRef::Blob(data)) => data,
-        _ => &[],
-    };
-    Some(f(data))
-}
-
-// ---------------------------------------------------------------------------
-// Blob decoding
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Thread-level metadata
@@ -515,315 +443,17 @@ fn thread_extras(t: &Value, extra: &mut serde_json::Map<String, Value>, parent: 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Messages — one walker for both generations (sniffed per message, not per thread,
-// so a hand-migrated or mixed blob still parses)
-// ---------------------------------------------------------------------------
-
-/// Convert every thread message to IR and feed it to `f`, stopping on [`Flow::Stop`]. This is the
-/// single conversion both `discover` (counting) and `stream` (emitting) run, so the
-/// `message_count` contract holds by construction.
-#[cfg(test)]
-fn each_ir_message(t: &Value, f: &mut dyn FnMut(Message) -> Flow) {
-    let Some(messages) = t.get("messages").and_then(Value::as_array) else {
-        return;
-    };
-    // Tool-call ids → names, so legacy tool_results (which carry no name) get labeled.
-    let mut tool_names: HashMap<String, String> = HashMap::new();
-    for m in messages {
-        if legacy_message(m, &mut tool_names, f) == Flow::Stop {
-            return;
-        }
-        if modern_message(m, f) == Flow::Stop {
-            return;
-        }
-    }
-}
-
-/// Legacy (agent1) message: an object with a string `role`. Emits the main turn, then its
-/// `tool_results` as a separate [`Role::Tool`] turn. Non-legacy shapes are ignored.
-fn legacy_message(m: &Value, tool_names: &mut HashMap<String, String>, f: &mut dyn FnMut(Message) -> Flow) -> Flow {
-    let Some(role) = m.get("role").and_then(Value::as_str) else {
-        return Flow::Continue;
-    };
-    let role = match role {
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        "system" => Role::System,
-        _ => Role::User,
-    };
-    let mut msg = Message::new(role);
-    // A legacy `system` role carries the system prompt (rare; Zed's is normally app-level).
-    if role == Role::System {
-        msg.kind = MessageKind::SystemPrompt;
-    }
-    msg.id = m.get("id").and_then(Value::as_i64).map(|i| i.to_string());
-
-    // segments[] (0.1.0+) or a plain `text` field (the oldest, versionless shape).
-    if let Some(segments) = m.get("segments").and_then(Value::as_array) {
-        for seg in segments {
-            if let Some(b) = anthropic::block_from(seg, &anthropic::ZED) {
-                msg.content.push(b);
-            }
-        }
-    } else if let Some(text) = m.get("text").and_then(Value::as_str) {
-        if !text.is_empty() {
-            msg.content.push(Block::Text {
-                text: text.to_string().into(),
-            });
-        }
-    }
-
-    for tu in m.get("tool_uses").and_then(Value::as_array).into_iter().flatten() {
-        let id = tu.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-        let name = tu.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-        if !id.is_empty() && !name.is_empty() {
-            tool_names.insert(id.clone(), name.clone());
-        }
-        msg.content.push(Block::ToolUse {
-            id,
-            name,
-            input: tu.get("input").cloned().unwrap_or(Value::Null).into(),
-            namespace: None,
-        });
-    }
-
-    // `context` is the rendered attached-files preamble Zed prepends to the request. When it's the
-    // *only* content (an attachment-only user turn), surface it as the text (mirroring Zed's own
-    // 0.2.0→0.3.0 upgrade); otherwise preserve it in extra.
-    if let Some(ctx) = m.get("context").and_then(Value::as_str).filter(|c| !c.is_empty()) {
-        if msg.content.is_empty() {
-            msg.content.push(Block::Text {
-                text: ctx.to_string().into(),
-            });
-        } else {
-            // Embedded attached-files preamble on an otherwise-real turn: the turn stays a Prompt;
-            // the preamble is noted in `extra["zed"]`.
-            msg.harness_extra_mut(Harness::Zed)
-                .insert("context".into(), Value::String(ctx.to_string()));
-        }
-    }
-    if m.get("is_hidden").and_then(Value::as_bool) == Some(true) {
-        msg.harness_extra_mut(Harness::Zed)
-            .insert("is_hidden".into(), Value::Bool(true));
-        // Hidden user turns are Zed's auto-injected "Continue where you left off" continuations.
-        if role == Role::User {
-            msg.kind = MessageKind::InjectedContext;
-            msg.origin = Origin::Harness;
-        }
-    }
-    if let Some(creases) = m.get("creases").and_then(Value::as_array).filter(|c| !c.is_empty()) {
-        msg.harness_extra_mut(Harness::Zed)
-            .insert("creases".into(), Value::Array(creases.clone()));
-    }
-
-    if !msg.content.is_empty() && f(msg) == Flow::Stop {
-        return Flow::Stop;
-    }
-
-    // tool_results → one Role::Tool turn (0.2.0 keeps them on the assistant message; 0.1.0 put
-    // them on the next user message — either way they become the same Tool turn here).
-    let results = m.get("tool_results").and_then(Value::as_array);
-    let blocks: Vec<Block> = results
-        .into_iter()
-        .flatten()
-        .filter_map(|tr| tool_result_block(tr, tool_names))
-        .collect();
-    if !blocks.is_empty() {
-        let mut tm = Message::new(Role::Tool);
-        tm.content = blocks;
-        return f(tm);
-    }
-    Flow::Continue
-}
-
-/// One legacy/modern tool result → a [`Block::ToolResult`]. The legacy shape has no `tool_name`;
-/// we recover it from the paired `tool_uses` entry. `output` (the tool's structured return)
-/// rides in `details`.
-fn tool_result_block(tr: &Value, tool_names: &HashMap<String, String>) -> Option<Block> {
-    let id = tr.get("tool_use_id").and_then(Value::as_str)?.to_string();
-    let tool_name = tr
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| tool_names.get(&id).cloned());
-    Some(Block::ToolResult {
-        content: tool_result_content(tr.get("content")).into(),
-        is_error: tr.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-        tool_use_id: id,
-        tool_name,
-        status: None,
-        details: tr.get("output").filter(|o| !o.is_null()).cloned(),
-    })
-}
-
-/// `LanguageModelToolResultContent`: a plain string, `{"Text": "…"}` (case-tolerant), or
-/// `{"Image": {…}}` (flattened to a marker; the IR doesn't inline image bytes).
-fn tool_result_content(v: Option<&Value>) -> String {
-    let Some(v) = v else { return String::new() };
-    if let Some(s) = v.as_str() {
-        return s.to_string();
-    }
-    if let Some(s) = v.get("Text").or_else(|| v.get("text")).and_then(Value::as_str) {
-        return s.to_string();
-    }
-    if v.get("Image").or_else(|| v.get("image")).is_some() {
-        return "[image]".to_string();
-    }
-    if v.is_null() {
-        return String::new();
-    }
-    v.to_string()
-}
-
-/// Modern (agent2 / 0.3.0) message: the externally tagged `Message` enum. `"Resume"` markers are
-/// skipped; `Compaction` summaries become a flagged system turn. Non-modern shapes are ignored.
-fn modern_message(m: &Value, f: &mut dyn FnMut(Message) -> Flow) -> Flow {
-    if let Some(user) = m.get("User") {
-        let mut msg = Message::new(Role::User);
-        msg.id = user.get("id").and_then(Value::as_str).map(str::to_string);
-        for item in user.get("content").and_then(Value::as_array).into_iter().flatten() {
-            if let Some(b) = user_content_block(item) {
-                msg.content.push(b);
-            }
-        }
-        if !msg.content.is_empty() {
-            return f(msg);
-        }
-        return Flow::Continue;
-    }
-    if let Some(agent) = m.get("Agent") {
-        let mut msg = Message::new(Role::Assistant);
-        let mut tool_names: HashMap<String, String> = HashMap::new();
-        for item in agent.get("content").and_then(Value::as_array).into_iter().flatten() {
-            if let Some(b) = agent_content_block(item) {
-                if let Block::ToolUse { id, name, .. } = &b {
-                    if !id.is_empty() && !name.is_empty() {
-                        tool_names.insert(id.clone(), name.clone());
-                    }
-                }
-                msg.content.push(b);
-            }
-        }
-        if let Some(rd) = agent.get("reasoning_details").filter(|v| !v.is_null()) {
-            msg.harness_extra_mut(Harness::Zed)
-                .insert("reasoning_details".into(), rd.clone());
-        }
-        if (!msg.content.is_empty() || !msg.extra.is_empty()) && f(msg) == Flow::Stop {
-            return Flow::Stop;
-        }
-        // tool_results is an id-keyed map ({"<tool_use_id>": {…}}), ordered by insertion.
-        let blocks: Vec<Block> = agent
-            .get("tool_results")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flat_map(|m| m.values())
-            .filter_map(|tr| tool_result_block(tr, &tool_names))
-            .collect();
-        if !blocks.is_empty() {
-            let mut tm = Message::new(Role::Tool);
-            tm.content = blocks;
-            return f(tm);
-        }
-        return Flow::Continue;
-    }
-    if let Some(comp) = m.get("Compaction") {
-        // CompactionInfo::Summary(text) — the context-compaction summary that replaced history.
-        if let Some(text) = comp
-            .get("Summary")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-        {
-            let mut msg = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
-            msg.content.push(Block::Text {
-                text: text.to_string().into(),
-            });
-            return f(msg);
-        }
-    }
-    // "Resume" markers and unknown variants carry no transcript content.
-    Flow::Continue
-}
-
-fn user_content_block(item: &Value) -> Option<Block> {
-    if let Some(text) = item.get("Text").and_then(Value::as_str) {
-        return (!text.is_empty()).then(|| Block::Text {
-            text: text.to_string().into(),
-        });
-    }
-    if let Some(mention) = item.get("Mention") {
-        // The mention's resolved `content` (an attached file's whole body) is dropped — the URI is
-        // the durable reference.
-        let uri = match mention.get("uri") {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-            None => return None,
-        };
-        return Some(Block::File {
-            mime: None,
-            path: None,
-            source: Some(uri),
-        });
-    }
-    if let Some(img) = item.get("Image") {
-        // LanguageModelImage: {source: <base64>, size}.
-        return Some(Block::Image {
-            media_type: None,
-            data_ref: img
-                .get("source")
-                .and_then(Value::as_str)
-                .map(|s| crate::ir::truncate(s, 120)),
-        });
-    }
-    None
-}
-
-fn agent_content_block(item: &Value) -> Option<Block> {
-    if let Some(text) = item.get("Text").and_then(Value::as_str) {
-        return (!text.is_empty()).then(|| Block::Text {
-            text: text.to_string().into(),
-        });
-    }
-    if let Some(th) = item.get("Thinking") {
-        return Some(Block::Thinking {
-            text: th.get("text").and_then(Value::as_str).unwrap_or("").to_string().into(),
-            signature: th
-                .get("signature")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            encrypted: None,
-            redacted: false,
-        });
-    }
-    if let Some(data) = item.get("RedactedThinking").and_then(Value::as_str) {
-        return Some(Block::Thinking {
-            text: String::new().into(),
-            signature: None,
-            encrypted: Some(data.to_string()),
-            redacted: true,
-        });
-    }
-    if let Some(tu) = item.get("ToolUse") {
-        return Some(Block::ToolUse {
-            id: tu.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-            name: tu.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
-            input: tu.get("input").cloned().unwrap_or(Value::Null).into(),
-            namespace: None,
-        });
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------------
-
 /// Whole-`Session` convenience over [`stream_thread`] for tests: stream into a CollectSink.
 #[cfg(test)]
 fn parse_thread(conn: &Connection, r: &SessionRef) -> Result<Session> {
     let mut sink = crate::stream::CollectSink::default();
-    let mut s = stream_thread(conn, r, &mut sink)?;
+    let cells = Cells::new(
+        conn,
+        &tests::db_path(conn),
+        &crate::source::ReadSet::default(),
+        "threads",
+    )?;
+    let mut s = stream_thread(conn, r, &mut sink, &cells, false)?;
     s.messages = sink.messages;
     Ok(s)
 }
@@ -860,15 +490,36 @@ mod tests {
         );
     ";
 
-    fn mk(schema: &str) -> Connection {
-        let c = Connection::open_in_memory().unwrap();
+    /// A file-backed store (a cell's byte source is a file) that lives as long as the value.
+    struct Db {
+        conn: Connection,
+        _world: cv_testkit::World,
+    }
+    impl std::ops::Deref for Db {
+        type Target = Connection;
+        fn deref(&self) -> &Connection {
+            &self.conn
+        }
+    }
+
+    fn mk(schema: &str) -> Db {
+        let world = cv_testkit::World::new("zed-db");
+        let c = Connection::open(world.base.join("threads.db")).unwrap();
         c.execute_batch(schema).unwrap();
-        c
+        Db { conn: c, _world: world }
+    }
+
+    pub(super) fn db_path(conn: &Connection) -> PathBuf {
+        PathBuf::from(conn.path().expect("a file-backed test store"))
+    }
+
+    fn discover(conn: &Connection) -> Vec<SessionRef> {
+        discover_db(conn, &db_path(conn)).unwrap()
     }
 
     fn zstd_blob(json: &Value) -> Vec<u8> {
         let bytes = serde_json::to_vec(json).unwrap();
-        ruzstd::encoding::compress_to_vec(bytes.as_slice(), ruzstd::encoding::CompressionLevel::Fastest)
+        zstd::encode_all(bytes.as_slice(), 1).unwrap()
     }
 
     fn sref(id: &str) -> SessionRef {
@@ -998,7 +649,7 @@ mod tests {
         )
         .unwrap();
 
-        let refs = discover_db(&c, Path::new(":memory:")).unwrap();
+        let refs = discover(&c);
         assert_eq!(refs.len(), 2);
         // Ordered by updated_at DESC.
         assert_eq!(refs[0].id, "t2");
@@ -1214,7 +865,7 @@ mod tests {
                 .unwrap()
                 .collect::<rusqlite::Result<_>>()
                 .unwrap();
-            let actual = discover_db(&c, Path::new(":memory:")).unwrap();
+            let actual = discover(&c);
             assert_eq!(
                 actual.iter().map(|r| &r.id).collect::<Vec<_>>(),
                 expected.iter().collect::<Vec<_>>()
@@ -1241,11 +892,7 @@ mod tests {
                 let unreadable = parse_thread(&c, &sref("a")).unwrap();
                 assert!(unreadable.messages.is_empty());
                 assert!(unreadable.harness_extra(Harness::Zed).is_none());
-                let listed = discover_db(&c, Path::new(":memory:"))
-                    .unwrap()
-                    .into_iter()
-                    .find(|r| r.id == "a")
-                    .unwrap();
+                let listed = discover(&c).into_iter().find(|r| r.id == "a").unwrap();
                 assert_eq!(listed.message_count, 0);
                 assert_eq!(listed.cwd, None);
             }
@@ -1289,13 +936,16 @@ mod tests {
             writer: &writer,
             messages: Vec::new(),
         };
-        let session = stream_thread(&reader, &sref("t"), &mut sink).unwrap();
+        let cells = Cells::new(&reader, &path, &crate::source::ReadSet::default(), "threads").unwrap();
+        let session = stream_thread(&reader, &sref("t"), &mut sink, &cells, false).unwrap();
         assert_eq!(session.model.as_deref(), Some("zed.dev/claude-sonnet-4-thinking"));
         assert_eq!(sink.messages.len(), 4);
         assert_eq!(sink.messages[0].text().as_deref(), Some("why is test_foo flaky?"));
+        // A live WAL store is read through a private snapshot (cv never touches its -shm), so
+        // even an unchecked second pass sees the snapshot, not the writer's later commit.
         assert_eq!(
             parse_thread(&reader, &sref("t")).unwrap().model.as_deref(),
-            Some("openai/gpt-5-mini")
+            Some("zed.dev/claude-sonnet-4-thinking")
         );
         // The internal SQLite snapshot remains consistent, but publication through the real
         // adapter must reject a source changed by a callback rather than recapture its identity.
@@ -1325,7 +975,7 @@ mod tests {
         insert(&c, "good", "fine one", "zstd", &zstd_blob(&legacy_thread()));
 
         // discover lists both; the corrupt one just has no count/cwd.
-        let refs = discover_db(&c, Path::new(":memory:")).unwrap();
+        let refs = discover(&c);
         assert_eq!(refs.len(), 2);
         let bad = refs.iter().find(|r| r.id == "bad").unwrap();
         assert_eq!(bad.message_count, 0);
@@ -1341,6 +991,93 @@ mod tests {
         assert_eq!(s.title.as_deref(), Some("corrupt one"));
     }
 
+    /// A document that is not exactly one JSON value (invalid UTF-8 in an ignored field, a
+    /// truncated zstd frame, trailing bytes) is undecodable as a whole: no prefix is emitted.
+    #[test]
+    fn invalid_documents_never_emit_a_prefix() {
+        let c = mk(SCHEMA);
+        let json = b"{\"messages\":[{\"role\":\"user\",\"text\":\"ok\"}],\"ignored\":\"\xff\"}";
+        let valid = br#"{"messages":[{"role":"user","text":"ok"}]}"#;
+        let truncated = zstd::encode_all(valid.as_slice(), 1).unwrap();
+        let cases: [(&str, &str, Vec<u8>); 4] = [
+            ("utf8", "json", json.to_vec()),
+            ("utf8z", "zstd", zstd::encode_all(json.as_slice(), 1).unwrap()),
+            ("cut", "zstd", truncated[..truncated.len() - 1].to_vec()),
+            (
+                "trailing",
+                "json",
+                br#"{"messages":[{"role":"user","text":"ok"}]} { }"#.to_vec(),
+            ),
+        ];
+        for (id, data_type, data) in &cases {
+            insert(&c, id, id, data_type, data);
+        }
+        for r in discover(&c) {
+            assert_eq!(r.message_count, 0, "{}", r.id);
+            let s = parse_thread(&c, &sref(&r.id)).unwrap();
+            assert!(s.messages.is_empty(), "{}", r.id);
+            assert_eq!(
+                s.harness_extra(Harness::Zed).and_then(|b| b.get("undecodable_blob")),
+                Some(&Value::Bool(true))
+            );
+        }
+    }
+
+    /// Long text, thinking, tool arguments and a generated result stay in the decoded cell when
+    /// spans are demanded, outlive the read and are rejected once the store changes.
+    #[test]
+    fn long_payloads_stay_in_the_cell_and_the_store_guards_them() {
+        let world = cv_testkit::World::new("zed-cell-guard");
+        let path = world.base.join("threads.db");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        writer.execute_batch(SCHEMA).unwrap();
+        let large = "雪\n\"\\".repeat(2 * crate::lazy::INLINE_MAX);
+        let value = serde_json::json!({"messages":[
+            {"role":"user","text":large},
+            {"Agent":{"content":[{"Thinking":{"text":large}},{"ToolUse":{"id":"t","name":"shell","input":{"body":large}}}],
+                "tool_results":{"t":{"tool_use_id":"t","content":{"b":large,"a":1}}}}},
+        ]});
+        insert(&writer, "t", "t", "zstd", &zstd_blob(&value));
+        let zed = Zed::with_root(&world.base);
+        let mut reference = sref("t");
+        reference.path = path;
+        let full = crate::stream::collect_with(&zed, &reference, &ParseOptions::full()).unwrap();
+        let lazy = crate::stream::collect_with(&zed, &reference, &ParseOptions::lazy()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::to_value(&lazy).unwrap()
+        );
+        let resolver = crate::lazy::Resolver::new(None);
+        let Block::Text { text } = &lazy.messages[0].content[0] else {
+            panic!("text")
+        };
+        let Block::Thinking { text: thinking, .. } = &lazy.messages[1].content[0] else {
+            panic!("thinking")
+        };
+        let Block::ToolUse { input, .. } = &lazy.messages[1].content[1] else {
+            panic!("tool input")
+        };
+        let Block::ToolResult { content, .. } = &lazy.messages[2].content[0] else {
+            panic!("result")
+        };
+        assert!(matches!(text, crate::lazy::Text::Source(_)));
+        assert!(matches!(thinking, crate::lazy::Text::Source(_)));
+        assert!(matches!(input, crate::json::Json::Source(_)));
+        assert!(matches!(content, crate::lazy::Text::Source(_)));
+        assert_eq!(text.try_resolve(&resolver).unwrap().as_ref(), large);
+        assert_eq!(
+            content.try_resolve(&resolver).unwrap().as_ref(),
+            value["messages"][1]["Agent"]["tool_results"]["t"]["content"].to_string()
+        );
+        writer
+            .execute("UPDATE threads SET summary = 'changed' WHERE id = 't'", [])
+            .unwrap();
+        assert!(text.try_resolve(&resolver).is_err());
+        assert!(input.resolve().is_err());
+        assert!(content.try_resolve(&resolver).is_err());
+    }
+
     #[test]
     fn empty_thread_parses_to_zero_messages() {
         let thread = serde_json::json!({
@@ -1351,7 +1088,7 @@ mod tests {
         });
         let c = mk(SCHEMA);
         insert(&c, "t", "New Thread", "zstd", &zstd_blob(&thread));
-        let refs = discover_db(&c, Path::new(":memory:")).unwrap();
+        let refs = discover(&c);
         assert_eq!(refs[0].message_count, 0);
         let s = parse_thread(&c, &sref("t")).unwrap();
         assert!(s.messages.is_empty());
@@ -1367,7 +1104,7 @@ mod tests {
             [zstd_blob(&legacy_thread())],
         )
         .unwrap();
-        let refs = discover_db(&c, Path::new(":memory:")).unwrap();
+        let refs = discover(&c);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].message_count, 3);
         assert!(refs[0].created_at.is_none(), "no created_at column in old schema");
@@ -1484,7 +1221,7 @@ mod tests {
 
     #[test]
     fn stream_equals_parse_on_synthetic_db() {
-        let _world = cv_testkit::World::in_process("zed-stream-parse");
+        let _world = crate::test_world("zed-stream-parse");
         // The corpus-wide invariant, asserted here on a fixture so it runs without real data:
         // parse() and collect(stream()) are the same bytes.
         let dir = std::env::temp_dir().join(format!("cv-zed-test-{}", uuid::Uuid::new_v4()));
@@ -1522,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_stream_matches_owned_modes_and_without_rowid() {
+    fn every_demand_resolves_the_same_thread_with_and_without_rowid() {
         let world = cv_testkit::World::new("zed-checked-stream");
         let path = world.base.join("threads.db");
         for without_rowid in [false, true] {

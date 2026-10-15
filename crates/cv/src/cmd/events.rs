@@ -19,7 +19,7 @@ pub(crate) fn cmd_events(
 
     // Ensure this one session's events are current (cheap: a single streamed pass); a session
     // already cataloged at this mtime is a no-op.
-    if events::needs_ingest(&r, events::file_mtime_ns(&r.path)) {
+    if events::needs_ingest(&r) {
         events::ingest_ref(&r)?;
     }
 

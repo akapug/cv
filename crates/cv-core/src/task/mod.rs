@@ -48,8 +48,9 @@ pub use views::TaskRow;
 /// string (law 2, no authority machinery); it only stops a forgotten flag from silently
 /// detaching an agent from its own inbox and misattributing the durable record forever.
 pub fn default_endpoint() -> Option<String> {
-    let v = std::env::var("CV_ENDPOINT").ok()?;
+    let v = crate::env::var("CV_ENDPOINT").ok()?;
     let v = v.trim();
+
     (!v.is_empty()).then(|| v.to_string())
 }
 
@@ -163,9 +164,8 @@ use std::path::PathBuf;
 
 /// Root dir for the task log: `$CLUSTERVISION_HOME/tasks` (or `~/.clustervision/tasks`).
 pub fn tasks_dir() -> PathBuf {
-    std::env::var_os("CLUSTERVISION_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".clustervision")))
+    crate::env::Env::current()
+        .cv_home()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("tasks")
 }
@@ -258,25 +258,21 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
-    /// All env cases live in ONE test: `set_var` is process-global and lib tests run in
-    /// parallel threads, so sequencing inside a single test is the serialization.
     #[test]
     fn default_endpoint_reads_cv_endpoint_trimmed_nonempty() {
-        std::env::remove_var("CV_ENDPOINT");
+        let env = crate::env::Env::from_vars::<&str, &str>([]).enter();
         assert_eq!(default_endpoint(), None, "unset → no identity");
 
-        std::env::set_var("CV_ENDPOINT", "agent:demo");
+        env.set("CV_ENDPOINT", "agent:demo");
         assert_eq!(default_endpoint().as_deref(), Some("agent:demo"));
 
-        std::env::set_var("CV_ENDPOINT", "  agent:padded \n");
+        env.set("CV_ENDPOINT", "  agent:padded \n");
         assert_eq!(default_endpoint().as_deref(), Some("agent:padded"), "trimmed");
 
-        std::env::set_var("CV_ENDPOINT", "   ");
+        env.set("CV_ENDPOINT", "   ");
         assert_eq!(default_endpoint(), None, "whitespace-only → no identity");
 
-        std::env::set_var("CV_ENDPOINT", "");
+        env.set("CV_ENDPOINT", "");
         assert_eq!(default_endpoint(), None, "empty → no identity");
-
-        std::env::remove_var("CV_ENDPOINT");
     }
 }

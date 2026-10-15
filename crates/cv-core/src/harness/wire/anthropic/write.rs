@@ -235,7 +235,7 @@ mod source_failure_tests {
                 &Resolver::new(None)
             ))
             .is_err());
-        assert!(stage.publish(&destination).is_err());
+        assert!(stage.publish(&destination, crate::publish::Claim::Replace).is_err());
         assert_eq!(std::fs::read(destination)?, b"existing destination");
         Ok(())
     }

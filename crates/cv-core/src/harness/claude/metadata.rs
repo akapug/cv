@@ -1,158 +1,9 @@
-//! Discovery reads only titles, cwd, timestamps and whether an assistant is synthetic. Avoid
-//! constructing conversation bodies and sidecars while retaining the owned codec's acceptance.
+//! Discovery reads only titles, cwd, timestamps and whether an assistant is synthetic: the
+//! record codec's metadata demand, over the same byte source as every other Claude read.
 
 use super::*;
-use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
-use std::borrow::Cow;
-use std::fmt;
-
-#[derive(Default)]
-struct Fields<'a> {
-    kind: Option<&'a RawValue>,
-    cwd: Option<&'a RawValue>,
-    timestamp: Option<&'a RawValue>,
-    custom_title: Option<&'a RawValue>,
-    ai_title: Option<&'a RawValue>,
-    api_error: Option<&'a RawValue>,
-    message: Body<'a>,
-}
-
-#[derive(Default)]
-struct Body<'a> {
-    model: Option<&'a RawValue>,
-}
-
-#[derive(Deserialize)]
-#[serde(field_identifier)]
-enum Key {
-    #[serde(rename = "type")]
-    Kind,
-    #[serde(rename = "cwd")]
-    Cwd,
-    #[serde(rename = "timestamp")]
-    Timestamp,
-    #[serde(rename = "customTitle")]
-    CustomTitle,
-    #[serde(rename = "aiTitle")]
-    AiTitle,
-    #[serde(rename = "isApiErrorMessage")]
-    ApiError,
-    #[serde(rename = "message")]
-    Message,
-    #[serde(rename = "model")]
-    Model,
-    #[serde(other)]
-    Other,
-}
-
-// Value accepts scalars and arrays too. These contain no demanded metadata; duplicate object
-// fields overwrite earlier values, including null or a non-object replacing the message.
-macro_rules! ignored_shapes {
-    ($output:ty) => {
-        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-            Ok(<$output>::default())
-        }
-        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
-            Ok(<$output>::default())
-        }
-        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
-            Ok(<$output>::default())
-        }
-        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
-            Ok(<$output>::default())
-        }
-        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
-            Ok(<$output>::default())
-        }
-        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
-            Ok(<$output>::default())
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            while seq.next_element::<IgnoredAny>()?.is_some() {}
-            Ok(<$output>::default())
-        }
-    };
-}
-
-impl<'de> Deserialize<'de> for Fields<'de> {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Fields<'de>;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a record value")
-            }
-            ignored_shapes!(Fields<'de>);
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut out = Fields::default();
-                while let Some(key) = map.next_key::<Key>()? {
-                    match key {
-                        Key::Kind => out.kind = Some(map.next_value()?),
-                        Key::Cwd => out.cwd = Some(map.next_value()?),
-                        Key::Timestamp => out.timestamp = Some(map.next_value()?),
-                        Key::CustomTitle => out.custom_title = Some(map.next_value()?),
-                        Key::AiTitle => out.ai_title = Some(map.next_value()?),
-                        Key::ApiError => out.api_error = Some(map.next_value()?),
-                        Key::Message => out.message = map.next_value()?,
-                        _ => {
-                            map.next_value::<IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(out)
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
-
-impl<'de> Deserialize<'de> for Body<'de> {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Body<'de>;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a message value")
-            }
-            ignored_shapes!(Body<'de>);
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut out = Body::default();
-                while let Some(key) = map.next_key::<Key>()? {
-                    match key {
-                        Key::Model => out.model = Some(map.next_value()?),
-                        _ => {
-                            map.next_value::<IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(out)
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
-
-fn string(raw: Option<&RawValue>) -> Option<Cow<'_, str>> {
-    let text = raw?.get();
-    if !text.starts_with('"') {
-        return None;
-    }
-    if !text.as_bytes().contains(&b'\\') {
-        Some(Cow::Borrowed(&text[1..text.len() - 1]))
-    } else {
-        serde_json::from_str::<String>(text).ok().map(Cow::Owned)
-    }
-}
-
-struct Facts<'a> {
-    ty: &'a str,
-    custom_title: Option<Cow<'a, str>>,
-    ai_title: Option<Cow<'a, str>>,
-    cwd: Option<Cow<'a, str>>,
-    at: Option<DateTime<Utc>>,
-    synthetic: bool,
-}
+use crate::harness::store::document::Fields;
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 thread_local! { pub(super) static FRAMED: std::cell::RefCell<Vec<(u64,u64)>> = const { std::cell::RefCell::new(Vec::new()) }; }
@@ -170,7 +21,6 @@ pub(super) struct Scan {
     session: SessionRef,
     custom_title: bool,
     prefix: Option<(u64, State)>,
-    readable: bool,
 }
 
 impl Scan {
@@ -183,7 +33,6 @@ impl Scan {
             ),
             custom_title: false,
             prefix: None,
-            readable: true,
         }
     }
 
@@ -216,241 +65,93 @@ impl Scan {
     }
 
     pub(super) fn checkpoint(&self) -> Option<Checkpoint> {
-        if !self.readable {
-            return None;
-        }
         let (offset, state) = self.prefix.as_ref()?;
         let mut checkpoint = Checkpoint::new(*offset);
         checkpoint.put(LAYER, state);
         Some(checkpoint)
     }
 
-    pub(super) fn line(&mut self, bytes: &[u8]) {
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return;
-        };
-        let text = text.trim();
-        if text.is_empty() {
-            return;
+    /// Fold lines `offset..` of the captured transcript. The continuation is the state after the
+    /// last finished line; a partial last line is folded but re-read next time.
+    pub(super) fn read(&mut self, source: &JsonSource, file: &fs::File, offset: u64) -> Result<()> {
+        let mut finished = offset;
+        let mut partial = false;
+        crate::harness::store::jsonl::for_each_line(source, file, offset, source.len(), |line| {
+            if !line.complete {
+                self.save_prefix(finished);
+                partial = true;
+            }
+            if let Some(view) = line.view {
+                self.record(view)?;
+            }
+            if line.complete {
+                finished = line.end;
+            }
+            Ok(Flow::Continue)
+        })?;
+        if !partial {
+            self.save_prefix(finished);
         }
-        let Ok(fields) = serde_json::from_str::<Fields<'_>>(text) else {
-            return;
-        };
-        // Fields validates grammar while skipping unused strings without decoded allocations.
-        // IgnoredAny/RawValue do not enforce Value's Unicode, finite-number or nesting acceptance;
-        // this separate boundary must also reject invalid ignored and overwritten fields.
-        // UTF-8 is already checked above, so reuse it rather than validating the bytes again.
-        if !super::super::store::json::value_compatible_str_at_depth_with(text, 0, |_, _| {}) {
-            return;
-        }
-        let kind = string(fields.kind);
-        let ty = kind.as_deref().unwrap_or("");
-        self.note(Facts {
-            ty,
-            custom_title: if ty == "custom-title" {
-                string(fields.custom_title)
-            } else {
-                None
-            },
-            ai_title: if ty == "ai-title" && !self.custom_title {
-                string(fields.ai_title)
-            } else {
-                None
-            },
-            cwd: if self.session.cwd.is_none() {
-                string(fields.cwd)
-            } else {
-                None
-            },
-            at: string(fields.timestamp).as_deref().and_then(parse_ts),
-            synthetic: ty == "assistant"
-                && (fields.api_error.is_some_and(|v| v.get() == "true")
-                    || string(fields.message.model).as_deref() == Some(SYNTHETIC_MODEL)),
-        });
+        Ok(())
     }
 
-    fn note(&mut self, facts: Facts<'_>) {
-        if facts.ty == "custom-title" {
-            if let Some(title) = facts.custom_title {
-                self.session.title = Some(title.into_owned());
+    fn record(&mut self, view: crate::json::JsonView<'_>) -> Result<()> {
+        let Some(fields) = Fields::parse(
+            view,
+            &[
+                "type",
+                "cwd",
+                "timestamp",
+                "customTitle",
+                "aiTitle",
+                "isApiErrorMessage",
+                "message",
+            ],
+        )?
+        else {
+            return Ok(());
+        };
+        let ty = fields.string("type")?.unwrap_or_default();
+        if ty == "custom-title" {
+            if let Some(title) = fields.string("customTitle")? {
+                self.session.title = Some(title);
                 self.custom_title = true;
             }
         }
-        if facts.ty == "ai-title" && !self.custom_title {
-            if let Some(title) = facts.ai_title {
-                self.session.title = Some(title.into_owned());
+        if ty == "ai-title" && !self.custom_title {
+            if let Some(title) = fields.string("aiTitle")? {
+                self.session.title = Some(title);
             }
         }
         if self.session.cwd.is_none() {
-            self.session.cwd = facts.cwd.map(|cwd| PathBuf::from(cwd.as_ref()));
+            self.session.cwd = fields.string("cwd")?.map(PathBuf::from);
         }
-        if let Some(ts) = facts.at {
+        if let Some(ts) = fields.string("timestamp")?.as_deref().and_then(parse_ts) {
             self.session.created_at = Some(self.session.created_at.map_or(ts, |old| old.min(ts)));
             self.session.updated_at = Some(self.session.updated_at.map_or(ts, |old| old.max(ts)));
         }
-        if matches!(facts.ty, "user" | "assistant") && !facts.synthetic {
-            self.session.message_count += 1;
-        }
-    }
-
-    #[cfg(all(test, not(feature = "mmap")))]
-    pub(super) fn positioned(&mut self, file: &fs::File, source: &JsonSource) -> Result<()> {
-        self.positioned_at(file, source, 0)
-    }
-
-    #[cfg(not(feature = "mmap"))]
-    pub(super) fn positioned_at(&mut self, file: &fs::File, source: &JsonSource, offset: u64) -> Result<()> {
-        use crate::harness::store::{document::Fields, jsonl::ranges};
-        source.check_metadata(file.metadata()?)?;
-        let mut rows = ranges::records(
-            file,
-            ranges::Range {
-                offset,
-                len: source
-                    .len()
-                    .checked_sub(offset)
-                    .context("discovery offset outside source")?,
-            },
-        )?;
-        rows.keep_small_records(64 * 1024);
-        let mut complete_offset = offset;
-        let mut partial = false;
-        while let Some(row) = rows.next() {
-            let (raw, complete) = row?;
-            if complete {
-                complete_offset = rows.offset();
-            } else {
-                self.save_prefix(raw.offset);
-                partial = true;
-            }
-            if let Some(bytes) = rows.small_record() {
-                self.line(bytes);
-                continue;
-            }
-            // Discovery historically uses str::trim, unlike the conversational byte driver.
-            let range = ranges::trim(file, raw)?;
-            if range.len == 0 {
-                continue;
-            }
-            let result = source.read_range_value(range.offset, range.len, |view| {
-                let Some(fields) = Fields::parse(
-                    view,
-                    &[
-                        "type",
-                        "cwd",
-                        "timestamp",
-                        "customTitle",
-                        "aiTitle",
-                        "isApiErrorMessage",
-                        "message",
-                    ],
-                )?
-                else {
-                    return Ok(());
-                };
-                let kind = fields.string("type")?;
-                let ty = kind.as_deref().unwrap_or("");
-                let model = fields
-                    .get("message")
-                    .map(|v| Fields::parse(v, &["model"]))
+        if matches!(ty.as_str(), "user" | "assistant") {
+            let synthetic = ty == "assistant"
+                && (fields
+                    .get("isApiErrorMessage")
+                    .map(|v| v.as_bool())
                     .transpose()?
-                    .flatten();
-                let synthetic = ty == "assistant"
-                    && (fields
-                        .get("isApiErrorMessage")
-                        .map(|v| v.as_bool())
+                    .flatten()
+                    == Some(true)
+                    || match fields
+                        .get("message")
+                        .map(|m| Fields::parse(m, &["model"]))
                         .transpose()?
                         .flatten()
-                        == Some(true)
-                        || model
-                            .as_ref()
-                            .map(|m| m.string("model"))
-                            .transpose()?
-                            .flatten()
-                            .as_deref()
-                            == Some(SYNTHETIC_MODEL));
-                self.note(Facts {
-                    ty,
-                    custom_title: if ty == "custom-title" {
-                        fields.string("customTitle")?.map(Cow::Owned)
-                    } else {
-                        None
-                    },
-                    ai_title: if ty == "ai-title" && !self.custom_title {
-                        fields.string("aiTitle")?.map(Cow::Owned)
-                    } else {
-                        None
-                    },
-                    cwd: if self.session.cwd.is_none() {
-                        fields.string("cwd")?.map(Cow::Owned)
-                    } else {
-                        None
-                    },
-                    at: fields.string("timestamp")?.as_deref().and_then(parse_ts),
-                    synthetic,
-                });
-                Ok(())
-            });
-            match result {
-                Ok(()) => {}
-                Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => {}
-                Err(error) => return Err(error),
+                    {
+                        Some(message) => message.string("model")?.as_deref() == Some(SYNTHETIC_MODEL),
+                        None => false,
+                    });
+            if !synthetic {
+                self.session.message_count += 1;
             }
         }
-        if !partial {
-            self.save_prefix(complete_offset);
-        }
-        source.check_metadata(file.metadata()?)
-    }
-
-    #[cfg(test)]
-    pub(super) fn reader<R: BufRead>(&mut self, reader: R) {
-        self.reader_at(reader, 0);
-    }
-
-    #[cfg(any(feature = "mmap", test))]
-    pub(super) fn reader_at<R: BufRead>(&mut self, mut reader: R, mut offset: u64) {
-        let mut bytes = Vec::new();
-        let mut partial = false;
-        loop {
-            bytes.clear();
-            match reader.read_until(b'\n', &mut bytes) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => {
-                    self.readable = false;
-                    offset += bytes.len() as u64;
-                    continue;
-                }
-            }
-            if bytes.last() != Some(&b'\n') {
-                self.save_prefix(offset);
-                partial = true;
-            }
-            self.line(&bytes);
-            offset += bytes.len() as u64;
-        }
-        if !partial {
-            self.save_prefix(offset);
-        }
-    }
-
-    #[cfg(all(test, feature = "mmap"))]
-    pub(super) fn bytes(&mut self, bytes: &[u8]) {
-        self.bytes_at(bytes, 0);
-    }
-
-    #[cfg(feature = "mmap")]
-    pub(super) fn bytes_at(&mut self, bytes: &[u8], offset: u64) {
-        let mut start = 0;
-        for end in memchr::memchr_iter(b'\n', bytes) {
-            self.line(&bytes[start..end]);
-            start = end + 1;
-        }
-        self.save_prefix(offset + start as u64);
-        if start < bytes.len() {
-            self.line(&bytes[start..]);
-        }
+        Ok(())
     }
 
     pub(super) fn finish(self) -> SessionRef {
@@ -486,7 +187,9 @@ mod tests {
                 out.session.created_at = Some(out.session.created_at.map_or(ts, |c| c.min(ts)));
                 out.session.updated_at = Some(out.session.updated_at.map_or(ts, |u| u.max(ts)));
             }
-            let synthetic = ty == "assistant" && is_synthetic_assistant(&v, v.get("message").unwrap_or(&Value::Null));
+            let synthetic = ty == "assistant"
+                && (v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
+                    || v.pointer("/message/model").and_then(Value::as_str) == Some(SYNTHETIC_MODEL));
             if matches!(ty, "user" | "assistant") && !synthetic {
                 out.session.message_count += 1;
             }
@@ -496,50 +199,20 @@ mod tests {
     }
 
     fn check(path: &Path, bytes: &[u8]) {
-        let expected = serde_json::to_value(owned(path, bytes)).unwrap();
-        let mut buffered = Scan::new(path);
-        buffered.reader(std::io::Cursor::new(bytes));
+        let world = crate::test_world("claude-discovery-oracle");
+        let file = world.base.join(path.file_name().unwrap());
+        fs::write(&file, bytes).unwrap();
         assert_eq!(
-            serde_json::to_value(buffered.finish()).unwrap(),
-            expected,
+            serde_json::to_value(scan(&file).unwrap()).unwrap(),
+            serde_json::to_value(owned(&file, bytes)).unwrap(),
             "{}",
             path.display()
         );
-        #[cfg(not(feature = "mmap"))]
-        {
-            let world = cv_testkit::World::in_process("claude-discovery-positioned-oracle");
-            let captured_path = world.base.join("rows.jsonl");
-            fs::write(&captured_path, bytes).unwrap();
-            let mut positioned = Scan::new(path);
-            positioned
-                .positioned(
-                    &fs::File::open(&captured_path).unwrap(),
-                    &JsonSource::capture(&captured_path).unwrap(),
-                )
-                .unwrap();
-            assert_eq!(
-                serde_json::to_value(positioned.finish()).unwrap(),
-                expected,
-                "{}",
-                path.display()
-            );
-        }
-        #[cfg(feature = "mmap")]
-        {
-            let mut mapped = Scan::new(path);
-            mapped.bytes(bytes);
-            assert_eq!(
-                serde_json::to_value(mapped.finish()).unwrap(),
-                expected,
-                "{}",
-                path.display()
-            );
-        }
     }
 
     #[test]
     fn continuation_replays_partial_and_valid_unterminated_records() {
-        let world = cv_testkit::World::in_process("claude-metadata-resume-tails");
+        let world = crate::test_world("claude-metadata-resume-tails");
         let path = world.base.join("s.jsonl");
         let prefix = "{\"type\":\"summary\",\"cwd\":\"/metadata\",\"timestamp\":\"2026-02-01T00:00:00Z\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"AI\"}\n";
         let tails = [
@@ -603,7 +276,7 @@ mod tests {
     #[test]
     fn cached_continuation_is_persisted_and_rejects_rewrites_replacements_and_corruption() {
         use std::io::Write;
-        let world = cv_testkit::World::in_process("claude-metadata-cache-resume");
+        let world = crate::test_world("claude-metadata-cache-resume");
         let path = world.base.join("s.jsonl");
         let prefix = format!("{{\"type\":\"summary\",\"cwd\":\"/metadata\"}}\n{{\"type\":\"assistant\",\"message\":{{\"content\":\"{}\"}}}}\n", "ignored".repeat(32768));
         fs::write(&path, &prefix).unwrap();
@@ -680,7 +353,7 @@ mod tests {
     #[test]
     fn cached_checkpoint_is_independent_of_counts_and_rejects_invalid_states() {
         use std::io::Write;
-        let world = cv_testkit::World::in_process("claude-metadata-state-guards");
+        let world = crate::test_world("claude-metadata-state-guards");
         let path = world.base.join("s.jsonl");
         let mut text = String::from("{\"type\":\"ai-title\",\"aiTitle\":\"initial\"}\n");
         fs::write(&path, &text).unwrap();
@@ -806,7 +479,6 @@ mod tests {
             r#"{"type":"user","unknown":"\ud800","unknown":0}"#.into(),
             r#"{"type":"user","unknown":{"\ud800":0}}"#.into(),
             r#"{"type":"user","message":{"model":"normal","unknown":"\udc00"}}"#.into(),
-            "\u{a0}{\"type\":\"user\"}\u{a0}".into(),
             "{\"type\":\"user\"} trailing".into(),
         ];
         for depth in 125..=129 {

@@ -361,7 +361,7 @@ fn load_store_metadata(path: &Path) -> Result<(Store, Option<VectorBacking>)> {
 /// compared at query time — query and store vectors must come from the **same** model, or the
 /// cosine ranking is cross-space noise.
 fn model_id() -> String {
-    std::env::var_os("CV_SEARCH_MODEL")
+    cv_core::env::var_os("CV_SEARCH_MODEL")
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string_lossy().into_owned())
         .unwrap_or_else(|| MODEL_REPO.to_string())
@@ -376,7 +376,7 @@ struct ModelSpec {
 }
 fn resolve_model(download: bool) -> Result<Option<ModelSpec>> {
     let id = model_id();
-    let root = if std::env::var_os("CV_SEARCH_MODEL").is_some_and(|v| !v.is_empty()) {
+    let root = if cv_core::env::var_os("CV_SEARCH_MODEL").is_some_and(|v| !v.is_empty()) {
         PathBuf::from(&id)
     } else {
         let repo = hf_hub::Cache::from_env().model(id.clone());

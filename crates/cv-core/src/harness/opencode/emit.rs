@@ -401,9 +401,6 @@ fn tool_state(
 }
 
 #[cfg(all(test, feature = "sqlite"))]
-mod legacy;
-
-#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     #[test]
@@ -458,10 +455,10 @@ mod tests {
     }
 
     #[test]
-    fn checked_transactional_rows_match_legacy_and_roll_back() -> Result<()> {
-        crate::harness::store::sqlite::export_tests::exercise(
+    fn checked_transactional_rows_match_frozen_and_roll_back() -> Result<()> {
+        crate::harness::store::sqlite::export_tests::exercise_frozen(
             crate::Harness::OpenCode,
-            legacy::emit,
+            "opencode-export",
             emit,
             |session, options, connection| {
                 write_database(

@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn checked_first_character_matches_inline_and_preserves_strict_source_errors() -> Result<()> {
-        let world = cv_testkit::World::in_process("thinking-first-character");
+        let world = crate::test_world("thinking-first-character");
         let path = world.base.join("text.json");
         for body in [
             String::new(),

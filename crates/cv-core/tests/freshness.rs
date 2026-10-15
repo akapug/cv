@@ -2,10 +2,9 @@
 //! cold-catalog transparency, new-file / appended-file / vanished-dir detection, and the
 //! staleness-backstop escape hatch.
 //!
-//! These tests mutate process-global env (`HOME`, `CLUSTERVISION_HOME`), so every test holds the
-//! testkit's process lock for its whole body (`cv_testkit::World::in_process`). They also `sleep` past the probe's 2s
-//! watch-fudge window where a test needs recorded (non-zero) watch mtimes to be the thing that
-//! detects a change.
+//! Each test reads its own world's `HOME` and `CLUSTERVISION_HOME` in-process
+//! (`cv_testkit::World::in_process`). They also `sleep` past the probe's 2s watch-fudge window
+//! where a test needs recorded (non-zero) watch mtimes to be the thing that detects a change.
 
 use cv_core::ir::{Harness, SessionRef};
 use cv_testkit::World;
@@ -58,7 +57,7 @@ fn ids(refs: &[SessionRef]) -> Vec<String> {
 /// immediately-following warm read must agree exactly.
 #[test]
 fn cold_catalog_matches_discover_all() {
-    let w = World::in_process("cold");
+    let w = World::in_process("cold", cv_core::env::Env::enter_isolated);
     write_session(&w, "-work-proj", "alphasess", 2);
     write_session(&w, "-work-proj", "betasess", 3);
 
@@ -79,7 +78,7 @@ fn cold_catalog_matches_discover_all() {
 /// A new *project directory* changes the root's mtime → also detected.
 #[test]
 fn new_session_files_detected() {
-    let w = World::in_process("new");
+    let w = World::in_process("new", cv_core::env::Env::enter_isolated);
     write_session(&w, "-work-proj", "alphasess", 2);
     cv_core::discover_all();
     std::thread::sleep(FUDGE); // age past the watch fudge…
@@ -95,7 +94,7 @@ fn new_session_files_detected() {
 /// (against the scan cache's recorded `(mtime, size)`) must catch it.
 #[test]
 fn append_in_top_k_detected() {
-    let w = World::in_process("append");
+    let w = World::in_process("append", cv_core::env::Env::enter_isolated);
     let path = write_session(&w, "-work-proj", "alphasess", 2);
     cv_core::discover_all();
     std::thread::sleep(FUDGE);
@@ -118,7 +117,7 @@ fn append_in_top_k_detected() {
 /// must drop those sessions from the read path.
 #[test]
 fn vanished_sessions_dropped() {
-    let w = World::in_process("vanish");
+    let w = World::in_process("vanish", cv_core::env::Env::enter_isolated);
     let alpha_path = write_session(&w, "-work-proj", "alphasess", 2);
     write_session(&w, "-work-other", "gammasess", 1);
     cv_core::discover_all();
@@ -144,7 +143,7 @@ fn vanished_sessions_dropped() {
 /// full discovery — what `cv ls --fresh` and `CLUSTERVISION_MAX_STALE_SECS=0` do — heals it.
 #[test]
 fn warm_path_reads_catalog_and_full_discovery_heals() {
-    let w = World::in_process("warm");
+    let w = World::in_process("warm", cv_core::env::Env::enter_isolated);
     let alpha = write_session(&w, "-work-proj", "alphasess", 2);
     cv_core::discover_all();
     std::thread::sleep(FUDGE);
@@ -171,9 +170,9 @@ fn warm_path_reads_catalog_and_full_discovery_heals() {
     );
 
     // Staleness backstop at 0 = every read is a full discovery; the replace-sync drops the phantom.
-    std::env::set_var("CLUSTERVISION_MAX_STALE_SECS", "0");
+    w.scope.set("CLUSTERVISION_MAX_STALE_SECS", "0");
     let refs = cv_core::sessions();
-    std::env::remove_var("CLUSTERVISION_MAX_STALE_SECS");
+    w.scope.remove("CLUSTERVISION_MAX_STALE_SECS");
     assert_eq!(ids(&refs), vec!["alphasess"], "full discovery heals phantom rows");
 
     // And discover_all() itself (the `--fresh` path) returns only what's on disk.
@@ -187,8 +186,8 @@ fn warm_path_reads_catalog_and_full_discovery_heals() {
 /// keeps it (a scan-cache hit while the file is unchanged), so `cv ls` shows the real number.
 #[test]
 fn a_full_parse_fills_a_not_counted_catalog_row() {
-    let w = World::in_process("fill");
-    std::env::remove_var("CODEX_HOME");
+    let w = World::in_process("fill", cv_core::env::Env::enter_isolated);
+
     let dir = w.home.join(".codex/sessions/2026/01/01");
     fs::create_dir_all(&dir).unwrap();
     let id = "019a0000-0000-7000-8000-00000000f111";
@@ -227,7 +226,14 @@ fn a_full_parse_fills_a_not_counted_catalog_row() {
     let (r, adapter) = cv_core::find(id, Some(Harness::Codex)).unwrap().expect("resolves");
     // A stream that stops early (`cv show --range 0..1`) read a prefix: it proves nothing.
     let mut head = |_m: cv_core::Message| cv_core::Flow::Stop;
-    cv_core::stream::stream_counted(adapter.as_ref(), &r, &cv_core::ParseOptions::lazy(), &mut head).unwrap();
+    cv_core::stream::stream_counted(
+        adapter.as_ref(),
+        &r,
+        &cv_core::ParseOptions::lazy(),
+        &mut head,
+        cv_core::stream::Pass::RECORD,
+    )
+    .unwrap();
     assert_eq!(
         row(cv_core::sessions()).message_count,
         0,
@@ -235,7 +241,14 @@ fn a_full_parse_fills_a_not_counted_catalog_row() {
     );
     // A stream that reaches the end (`cv show`, `cv index`) fills the row with the parse's count.
     let mut all = |_m: cv_core::Message| cv_core::Flow::Continue;
-    cv_core::stream::stream_counted(adapter.as_ref(), &r, &cv_core::ParseOptions::lazy(), &mut all).unwrap();
+    cv_core::stream::stream_counted(
+        adapter.as_ref(),
+        &r,
+        &cv_core::ParseOptions::lazy(),
+        &mut all,
+        cv_core::stream::Pass::RECORD,
+    )
+    .unwrap();
     assert_eq!(row(cv_core::sessions()).message_count, 5, "the streamed count");
     // `parse` (Codex's whole-text path) agrees, and a filled row is never rewritten.
     let parsed = adapter.parse(&r).unwrap();
@@ -263,7 +276,7 @@ fn a_full_parse_fills_a_not_counted_catalog_row() {
 /// Quiet sessions outside the former top-50 window refresh through the catalog too.
 #[test]
 fn quiet_session_append_refreshes_catalog_and_follower() {
-    let w = World::in_process("follow");
+    let w = World::in_process("follow", cv_core::env::Env::enter_isolated);
     for k in 0..50 {
         write_session(&w, "-work-proj", &format!("busy{k:02}"), 9); // updated 2026-01-09
     }
@@ -306,7 +319,7 @@ fn quiet_session_append_refreshes_catalog_and_follower() {
 /// parse. The query's answer is the same either way.
 #[test]
 fn a_full_read_counts_affordances_for_has() {
-    let w = World::in_process("affordances");
+    let w = World::in_process("affordances", cv_core::env::Env::enter_isolated);
     let planner = write_session(&w, "proj", "planner", 1);
     let todo = serde_json::json!({
         "type": "assistant", "uuid": "planner-a", "sessionId": "planner", "timestamp": "2026-01-02T10:00:00Z",
@@ -355,7 +368,7 @@ fn a_full_read_counts_affordances_for_has() {
 
 #[test]
 fn same_size_restored_mtime_replacement_refreshes_catalog() {
-    let w = World::in_process("replacement");
+    let w = World::in_process("replacement", cv_core::env::Env::enter_isolated);
     let path = write_session(&w, "-work-proj", "replaced", 2);
     cv_core::discover_all();
     std::thread::sleep(FUDGE);
@@ -386,7 +399,7 @@ fn same_size_restored_mtime_replacement_refreshes_catalog() {
 
 #[test]
 fn additive_row_without_captured_source_forces_refresh() {
-    let w = World::in_process("uncaptured");
+    let w = World::in_process("uncaptured", cv_core::env::Env::enter_isolated);
     write_session(&w, "-work-proj", "alphasess", 2);
     cv_core::discover_all();
     let mut unknown = cv_core::catalog::lookup("alphasess", Some(Harness::Claude))
@@ -401,7 +414,7 @@ fn additive_row_without_captured_source_forces_refresh() {
 #[cfg(feature = "sqlite")]
 #[test]
 fn full_discovery_avoids_unchanged_publication_but_enumerates_new_project_paths() {
-    let w = World::in_process("discovery-publication");
+    let w = World::in_process("discovery-publication", cv_core::env::Env::enter_isolated);
     let alpha = write_session(&w, "-project", "alpha", 2);
     let first = cv_core::discover_all();
     let db = rusqlite::Connection::open(w.cv_home.join("catalog.db")).unwrap();

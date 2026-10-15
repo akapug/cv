@@ -76,11 +76,14 @@ mod imp {
     pub(crate) fn db_path() -> Option<PathBuf> {
         // Back-compat: also honor the legacy `$CLAURDVOYANT_HOME` / `claurdvoyant` cache dir so a
         // catalog built before the rename keeps being used.
-        let dir = std::env::var_os("CLUSTERVISION_HOME")
-            .or_else(|| std::env::var_os("CLAURDVOYANT_HOME"))
+        let env = crate::env::Env::current();
+        let dir = env
+            .var_os("CLUSTERVISION_HOME")
+            .or_else(|| env.var_os("CLAURDVOYANT_HOME"))
             .map(PathBuf::from)
             .or_else(|| {
-                let cache = dirs::cache_dir()?;
+                let cache = env.cache_dir()?;
+
                 let new = cache.join("clustervision");
                 let legacy = cache.join("claurdvoyant");
                 Some(if !new.exists() && legacy.exists() { legacy } else { new })
@@ -1053,7 +1056,7 @@ mod imp {
 
         #[test]
         fn search_rows_share_one_exact_catalog_reader_and_keep_first_copy_metadata() {
-            let w = cv_testkit::World::in_process("search-row-catalog-owner");
+            let w = crate::test_world("search-row-catalog-owner");
             let first_path = w.base.join("first");
             let newer_path = w.base.join("newer");
             std::fs::write(&first_path, "old").unwrap();
@@ -1118,7 +1121,7 @@ mod imp {
 
         #[test]
         fn search_projection_omits_overridden_hints_but_keeps_fallback_and_invalid_copy_policy() {
-            let w = cv_testkit::World::in_process("search-row-projection");
+            let w = crate::test_world("search-row-projection");
             let mut first = db_ref(Harness::Claude, w.base.join("first"));
             first.title = Some("catalog custom title".repeat(4096));
             first.cwd = Some(PathBuf::from("/catalog/path".repeat(4096)));
@@ -1179,7 +1182,7 @@ mod imp {
 
         #[test]
         fn primary_inventory_omits_metadata_and_preserves_source_selection() {
-            let w = cv_testkit::World::in_process("catalog-primary-inventory");
+            let w = crate::test_world("catalog-primary-inventory");
             let refs: Vec<_> = crate::harness::all()
                 .into_iter()
                 .enumerate()
@@ -1214,7 +1217,7 @@ mod imp {
 
         #[test]
         fn primary_inventory_preserves_empty_unknown_and_error_fallbacks() {
-            let w = cv_testkit::World::in_process("catalog-primary-errors");
+            let w = crate::test_world("catalog-primary-errors");
             let conn = open().unwrap();
             assert!(primary_refs_in(&conn, None).is_empty());
             let r = db_ref(Harness::Claude, w.base.join("session.jsonl"));
@@ -1238,7 +1241,7 @@ mod imp {
 
         #[test]
         fn lookup_matches_literal_case_sensitive_prefixes() {
-            let w = cv_testkit::World::in_process("catalog-literal-prefix");
+            let w = crate::test_world("catalog-literal-prefix");
             let ids = [
                 "Alpha",
                 "alpha",
@@ -1299,7 +1302,7 @@ mod imp {
 
         #[test]
         fn reader_warm_sessions_initialize_catalog_once() {
-            let w = cv_testkit::World::in_process("reader-warm");
+            let w = crate::test_world("reader-warm");
             let path = w.home.join(".claude/projects/-reader/alpha.jsonl");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "{\"type\":\"user\",\"uuid\":\"u\",\"sessionId\":\"alpha\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n").unwrap();
@@ -1359,7 +1362,7 @@ mod imp {
 
         #[test]
         fn reader_operations_follow_catalog_switch_and_replacement() {
-            let w = cv_testkit::World::in_process("reader-path");
+            let w = crate::test_world("reader-path");
             let a = db_ref(Harness::Claude, w.base.join("first"));
             sync(std::slice::from_ref(&a));
             assert_eq!(Reader::open().unwrap().all_sessions().unwrap()[0].path, a.path);
@@ -1368,16 +1371,15 @@ mod imp {
             sync(std::slice::from_ref(&b));
             assert_eq!(Reader::open().unwrap().all_sessions().unwrap()[0].path, b.path);
             let next = w.base.join("next-catalog");
-            std::env::set_var("CLUSTERVISION_HOME", &next);
+            w.scope.set("CLUSTERVISION_HOME", &next);
             let c = db_ref(Harness::Claude, w.base.join("switched"));
             sync(std::slice::from_ref(&c));
             assert_eq!(Reader::open().unwrap().all_sessions().unwrap()[0].path, c.path);
-            std::env::set_var("CLUSTERVISION_HOME", &w.cv_home);
         }
 
         #[test]
         fn reader_statement_errors_remain_fallbacks_without_held_transactions() {
-            let _w = cv_testkit::World::in_process("reader-errors");
+            let _w = crate::test_world("reader-errors");
             let reader = Reader::open().unwrap();
             let conn = open().unwrap();
             // Another writer can change schema while this operation owner is idle.
@@ -1392,7 +1394,7 @@ mod imp {
 
         #[test]
         fn reader_preload_does_not_capture_primary_identity_early() {
-            let w = cv_testkit::World::in_process("reader-before-source");
+            let w = crate::test_world("reader-before-source");
             let path = w.base.join("session.jsonl");
             std::fs::write(&path, "before").unwrap();
             let r = db_ref(Harness::Claude, path.clone());
@@ -1408,7 +1410,7 @@ mod imp {
 
         #[test]
         fn publication_preserves_full_tie_order_and_failed_harness_rows() {
-            let w = cv_testkit::World::in_process("publication-order");
+            let w = crate::test_world("publication-order");
             let mut a = db_ref(Harness::Claude, w.base.join("a"));
             a.id = "a".into();
             let mut b = db_ref(Harness::Gemini, w.base.join("b"));
@@ -1462,7 +1464,7 @@ mod imp {
 
         #[test]
         fn publication_failure_rolls_back_rows_guards_and_full_sync_stamp() {
-            let w = cv_testkit::World::in_process("publication-abort");
+            let w = crate::test_world("publication-abort");
             let path = w.base.join("session.jsonl");
             std::fs::write(&path, "before").unwrap();
             let a = db_ref(Harness::Claude, path.clone());
@@ -1543,7 +1545,7 @@ mod imp {
 
         #[test]
         fn arbitrary_opencode_database_names_watch_native_wal() {
-            let w = cv_testkit::World::in_process("catalog-opencode-arbitrary-db");
+            let w = crate::test_world("catalog-opencode-arbitrary-db");
             let path = w.base.join("custom-store");
             std::fs::write(&path, b"SQLite format 3\0native database bytes").unwrap();
             let r = db_ref(Harness::OpenCode, path.clone());
@@ -1559,7 +1561,7 @@ mod imp {
 
         #[test]
         fn watches_track_cursor_cli_metadata_without_database_changes() {
-            let world = cv_testkit::World::in_process("catalog-cursor-cli-meta");
+            let world = crate::test_world("catalog-cursor-cli-meta");
             let path = world.base.join("store.db");
             std::fs::write(&path, []).unwrap();
             let mut r = db_ref(Harness::Cursor, path);
@@ -1584,7 +1586,7 @@ mod imp {
 
         #[test]
         fn watches_track_absent_wal_and_its_appearance_and_removal() {
-            let w = cv_testkit::World::in_process("catalog-absent-wal");
+            let w = crate::test_world("catalog-absent-wal");
             let path = w.base.join("openclaw-agent.sqlite");
             std::fs::write(&path, []).unwrap();
             let wal = w.base.join("openclaw-agent.sqlite-wal");
@@ -1622,7 +1624,7 @@ mod imp {
 
         #[test]
         fn wal_only_write_invalidates_database_watch_set() {
-            let w = cv_testkit::World::in_process("catalog-live-wal");
+            let w = crate::test_world("catalog-live-wal");
             let path = w.base.join("sessions.db");
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(

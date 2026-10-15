@@ -76,7 +76,7 @@ impl Archive {
     pub fn resolve(explicit: Option<PathBuf>) -> Result<Self> {
         let home = if let Some(p) = explicit {
             p
-        } else if let Some(env) = std::env::var_os("CLUSTERVISION_HOME") {
+        } else if let Some(env) = cv_core::env::var_os("CLUSTERVISION_HOME") {
             PathBuf::from(env)
         } else {
             let base = crate::util::dirs_home().context("could not determine home directory")?;

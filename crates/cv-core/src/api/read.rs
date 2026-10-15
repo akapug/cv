@@ -503,7 +503,7 @@ mod tests {
                 Ok(Session::new(r.id.clone(), r.harness))
             }
         }
-        let world = cv_testkit::World::in_process("api-staged-mutation");
+        let world = crate::test_world("api-staged-mutation");
         let path = world.home.join("source");
         std::fs::write(&path, b"original").unwrap();
         let r = SessionRef::new("mutating", Harness::Claude, path);
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn native_window_cache_matches_whole_pass_oracles() {
-        let world = cv_testkit::World::in_process("api_native_windows");
+        let world = crate::test_world("api_native_windows");
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
         let mut checked = 0;
         for harness in [
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn pages_resume_and_heads_reuse_only_unchanged_sources() {
-        let world = cv_testkit::World::in_process("api_cache_invalidation");
+        let world = crate::test_world("api_cache_invalidation");
         let r = fixture(&world, 20);
         let inner = crate::harness::claude::Claude::with_config_dir(&world.home.join(".claude"));
         let adapter = Observed::new(&inner);
@@ -665,7 +665,7 @@ mod tests {
                 Ok(shell)
             }
         }
-        let world = cv_testkit::World::in_process("api_catalog_hint_identity");
+        let world = crate::test_world("api_catalog_hint_identity");
         let mut r = fixture(&world, 1);
         let adapter = Hints(AtomicUsize::new(0));
         let cache = Cache::default();
@@ -720,7 +720,7 @@ mod tests {
                 Ok(s)
             }
         }
-        let world = cv_testkit::World::in_process("api_distinct_actual_sources");
+        let world = crate::test_world("api_distinct_actual_sources");
         let r = fixture(&world, 1);
         let old = world.home.join("old-source");
         let new = world.home.join("new-source");
@@ -742,7 +742,7 @@ mod tests {
 
     #[test]
     fn cache_retention_has_entry_and_byte_budgets() {
-        let world = cv_testkit::World::in_process("api_cache_budget");
+        let world = crate::test_world("api_cache_budget");
         let r = fixture(&world, 1);
         let (source, reads) = captured(&r, &crate::source::primary_path(&r));
         let source = source.with_reads(&reads);
@@ -763,7 +763,7 @@ mod tests {
     }
     #[test]
     fn changed_dynamic_reads_and_declined_resume_fall_back_whole() {
-        let world = cv_testkit::World::in_process("api_dependency_invalidation");
+        let world = crate::test_world("api_dependency_invalidation");
         let r = fixture(&world, 20);
         let inner = crate::harness::claude::Claude::with_config_dir(&world.home.join(".claude"));
         let mut adapter = Observed::new(&inner);
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn mutation_during_resume_retries_without_stale_prefix_metadata() {
-        let world = cv_testkit::World::in_process("api_resume_mutation");
+        let world = crate::test_world("api_resume_mutation");
         let r = fixture(&world, 20);
         let old = format!(
             "{{\"type\":\"ai-title\",\"aiTitle\":\"old-title\"}}\n{}",
@@ -805,7 +805,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn same_length_rewrite_with_restored_mtime_invalidates_primary_read() {
-        let world = cv_testkit::World::in_process("api_primary_identity");
+        let world = crate::test_world("api_primary_identity");
         let r = fixture(&world, 20);
         let inner = crate::harness::claude::Claude::with_config_dir(&world.home.join(".claude"));
         let adapter = Observed::new(&inner);
@@ -827,7 +827,7 @@ mod tests {
     #[test]
     #[ignore = "paired callback proof using a frozen scratch transcript"]
     fn sequential_pages_and_repeated_heads_read_work() {
-        let world = cv_testkit::World::in_process("api_cached_read_work");
+        let world = crate::test_world("api_cached_read_work");
         let r = fixture(&world, 20_000);
         let inner = crate::harness::claude::Claude::with_config_dir(&world.home.join(".claude"));
         let adapter = Observed::new(&inner);
@@ -848,7 +848,7 @@ mod tests {
     }
     #[test]
     fn plain_codex_pages_reuse_matching_reader_checkpoints() {
-        let world = cv_testkit::World::in_process("api_plain_codex_pages");
+        let world = crate::test_world("api_plain_codex_pages");
         let path = world.base.join("rollout-pages.jsonl");
         let line = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n";
         std::fs::write(&path, line.repeat(20_000)).unwrap();
@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn directory_pages_reuse_actual_wire_and_invalidate_on_wire_or_state_changes() {
         use std::io::Write as _;
-        let world = cv_testkit::World::in_process("api_kimi_code_pages");
+        let world = crate::test_world("api_kimi_code_pages");
         let dir = world.home.join(".kimi-code/sessions/wd_test/session_pages");
         std::fs::create_dir_all(dir.join("agents/main")).unwrap();
         let wire = dir.join("agents/main/wire.jsonl");
@@ -963,7 +963,7 @@ mod tests {
                 Ok(Session::new(&r.id, r.harness))
             }
         }
-        let world = cv_testkit::World::in_process("api_external_json_dependencies");
+        let world = crate::test_world("api_external_json_dependencies");
         let r = fixture(&world, 1);
         let path = world.home.join("external.json");
         std::fs::write(&path, r#"{"command":"old"}"#).unwrap();
@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn oversized_demanded_metadata_is_returned_without_cache_retention() {
-        let world = cv_testkit::World::in_process("api_large_metadata_budget");
+        let world = crate::test_world("api_large_metadata_budget");
         let r = fixture(&world, 20);
         let title = "x".repeat(MAX_ENTRY_BYTES + 1024);
         let body = format!(
@@ -1011,7 +1011,7 @@ mod tests {
 
     #[test]
     fn discarded_giant_tool_arguments_do_not_enter_continuation_state() {
-        let world = cv_testkit::World::in_process("api_discarded_tool_arguments");
+        let world = crate::test_world("api_discarded_tool_arguments");
         let r = fixture(&world, 20);
         let body = std::fs::read_to_string(&r.path).unwrap();
         let (first, rest) = body.split_once('\n').unwrap();

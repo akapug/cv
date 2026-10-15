@@ -5,8 +5,8 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "chatgpt-export"
-source_files = ["harness/export.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
-# `human` is claude-export vocabulary; harness/export.rs serves both export harnesses.
+source_files = ["harness/export.rs", "harness/export/native.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
+# `human` is claude-export vocabulary; harness/export.rs and export/native.rs serve both export harnesses.
 ignore_literals = ["conversations.json", "human"]
 store = [
   "registered conversations.json (cv config --add-export)",
@@ -28,5 +28,4 @@ date = "2026-05-29"
 "content.execution_output" = { status = "generic", note = "" }
 "content.tether_browsing_display" = { status = "ignored", note = "" }
 "content.user_editable_context" = { status = "ignored", note = "custom instructions" }
-"recipient.all" = { status = "handled", note = "" }
 "recipient.tool" = { status = "generic", note = "recipient ≠ all ⇒ tool call" }

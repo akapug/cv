@@ -25,10 +25,15 @@
 //! Anything else is kept verbatim as a `Carrier` under `complete`, and is counted in
 //! `extra["opencode"]["unknown_message_types"]` on the session otherwise — never silently dropped.
 
+use super::record::{find_signature, get, nonempty, owned, push_extra_array, string, usage, Ctx};
 use crate::ir::*;
+use crate::json::JsonView;
+use crate::lazy::Text;
 use crate::stream::ParseOptions;
+use anyhow::Result;
 use serde_json::{json, Map, Value};
 
+#[cfg(feature = "sqlite")]
 pub(super) fn tag_complete(messages: &mut [Message], id: &str, ty: &str) {
     if let Some(primary) = messages.first_mut() {
         primary
@@ -41,6 +46,7 @@ pub(super) fn tag_complete(messages: &mut [Message], id: &str, ty: &str) {
             .insert("record_owner".into(), json!(id));
     }
 }
+#[cfg(feature = "sqlite")]
 pub(super) fn attach_complete(messages: &mut [Message], id: &str, ty: &str, data: crate::Json) {
     tag_complete(messages, id, ty);
     let mut identity = Map::new();
@@ -49,9 +55,7 @@ pub(super) fn attach_complete(messages: &mut [Message], id: &str, ty: &str, data
     crate::ir::CompleteRecord::attach_replay(messages, Harness::OpenCode, data, identity);
 }
 
-/// Map one `session_message` row to IR messages (0–2: a tool-bearing reply gets a trailing
-/// `ToolResult`, a completed compaction gets its summary). `Err(())` means an unknown `type`, which
-/// the caller tallies; it is still carried under `complete`.
+#[cfg(feature = "sqlite")]
 pub(super) fn known_type(ty: &str) -> bool {
     matches!(
         ty,
@@ -69,62 +73,59 @@ pub(super) fn known_type(ty: &str) -> bool {
     )
 }
 
-pub(super) fn build(id: &str, ty: &str, data: &Value, opts: &ParseOptions) -> Result<Vec<Message>, ()> {
-    build_projected(id, ty, data, opts, None, None, None)
-}
-
-/// Selected ordinary shell payloads; shell metadata remains in its existing owned bag.
-#[derive(Default)]
-pub(super) struct ProjectedShell {
-    pub command: Option<crate::lazy::Text>,
-    pub output: Option<crate::lazy::Text>,
-}
-
-pub(super) fn build_projected(
+/// Map one `session_message` row's `data` view to IR messages (0–2: a tool-bearing reply gets a
+/// trailing `ToolResult`, a completed compaction gets its summary). `None` means an unknown
+/// `type`, which the caller tallies; it is still carried under `complete`.
+pub(super) fn build(
     id: &str,
     ty: &str,
-    data: &Value,
+    data: JsonView<'_>,
     opts: &ParseOptions,
-    text: Option<&crate::lazy::Text>,
-    parts: Option<&[super::ProjectedPart]>,
-    shell: Option<&ProjectedShell>,
-) -> Result<Vec<Message>, ()> {
-    let ts = data.pointer("/time/created").and_then(super::super::ts_from_value);
+    ctx: Ctx<'_>,
+) -> Result<Option<Vec<Message>>> {
+    let ts = owned(get(data.get("time")?, "created")?)?
+        .as_ref()
+        .and_then(super::super::ts_from_value);
     let new = |role: Role, kind: MessageKind, origin: Origin| {
         let mut m = Message::of_kind(role, kind, origin);
         m.id = Some(id.to_string());
         m.timestamp = ts;
         m
     };
-    let text_of = |key: &str| data.get(key).and_then(Value::as_str).filter(|t| !t.is_empty());
+    let text_of = |key: &str| -> Result<Option<Text>> {
+        match data.get(key)? {
+            Some(text) if nonempty(text)? => ctx.text(text),
+            _ => Ok(None),
+        }
+    };
     let mut out = Vec::new();
     match ty {
         "user" => {
             let mut m = new(Role::User, MessageKind::Prompt, Origin::Human);
             let mut bag = Map::new();
-            if let Some(t) = text_of("text") {
-                m.content.push(Block::Text {
-                    text: text.cloned().unwrap_or_else(|| t.to_string().into()),
-                });
+            if let Some(text) = text_of("text")? {
+                m.content.push(Block::Text { text });
             }
-            for f in data.get("files").and_then(Value::as_array).into_iter().flatten() {
-                m.content.push(file_block(f));
+            if let Some(files) = data.get("files")?.map(JsonView::array).transpose()?.flatten() {
+                for file in files {
+                    m.content.push(file_block(file?)?);
+                }
             }
-            if let Some(agents) = data.get("agents").and_then(Value::as_array).filter(|a| !a.is_empty()) {
-                for a in agents {
-                    if let Some(name) = a.get("name").and_then(Value::as_str) {
+            if let Some(agents) = nonempty_array(data.get("agents")?)? {
+                for agent in agents.array()?.into_iter().flatten() {
+                    if let Some(name) = string(agent?.get("name")?)? {
                         m.content.push(Block::Text {
                             text: format!("@{name}").into(),
                         });
                     }
                 }
-                bag.insert("agent_refs".into(), Value::Array(agents.clone()));
+                bag.insert("agent_refs".into(), agents.resolve()?.into_owned());
                 m.kind = MessageKind::SubagentSpawn;
             }
-            if let Some(skills) = data.get("skills").and_then(Value::as_array).filter(|a| !a.is_empty()) {
-                bag.insert("skills".into(), Value::Array(skills.clone()));
+            if let Some(skills) = nonempty_array(data.get("skills")?)? {
+                bag.insert("skills".into(), skills.resolve()?.into_owned());
             }
-            keep(data, &mut bag, &["metadata"]);
+            keep(data, &mut bag, &["metadata"])?;
             finish(&mut m, bag);
             out.push(m);
         }
@@ -133,68 +134,71 @@ pub(super) fn build_projected(
             // A background sub-agent's completion arrives as a `synthetic` row with
             // `metadata.source = "subagent"` (and `childID`): that is the sub-agent's return.
             let mut m =
-                if ty == "synthetic" && data.pointer("/metadata/source").and_then(Value::as_str) == Some("subagent") {
+                if ty == "synthetic" && string(get(data.get("metadata")?, "source")?)?.as_deref() == Some("subagent") {
                     new(role, MessageKind::SubagentReturn, Origin::Subagent)
                 } else {
                     new(role, MessageKind::InjectedContext, Origin::Harness)
                 };
-            if let Some(t) = text_of("text") {
-                m.content.push(Block::Text {
-                    text: text.cloned().unwrap_or_else(|| t.to_string().into()),
-                });
+            if let Some(text) = text_of("text")? {
+                m.content.push(Block::Text { text });
             }
             let mut bag = Map::new();
             bag.insert("message_type".into(), json!(ty));
-            keep(data, &mut bag, &["description", "skill", "name", "metadata"]);
+            keep(data, &mut bag, &["description", "skill", "name", "metadata"])?;
             finish(&mut m, bag);
             out.push(m);
         }
         "shell" => {
             let mut m = new(Role::User, MessageKind::InjectedContext, Origin::Human);
-            if let Some(c) = text_of("command") {
+            if let Some(command) = data.get("command")?.filter(|c| nonempty(*c).unwrap_or(false)) {
                 m.content.push(Block::Text {
-                    text: shell
-                        .and_then(|shell| shell.command.clone())
-                        .unwrap_or_else(|| format!("$ {c}").into()),
+                    text: ctx.generated(|writer| {
+                        writer.push("$ ")?;
+                        anyhow::ensure!(writer.push_string(command)?, "expected shell command string");
+                        Ok(())
+                    })?,
                 });
             }
-            if let Some(shell) = shell {
-                if let Some(text) = &shell.output {
-                    m.content.push(Block::Text { text: text.clone() });
-                }
-            } else if let Some(o) = data.get("output").filter(|o| !o.is_null()) {
-                let t = match o {
-                    Value::String(s) => s.clone(),
-                    // `Shell.Output`: `{output, cursor, size, truncated?}`.
-                    o => o
-                        .get("output")
-                        .or_else(|| o.get("text"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| o.to_string()),
+            if let Some(output) = data.get("output")?.filter(|o| !o.is_null().unwrap_or(true)) {
+                // `Shell.Output`: `{output, cursor, size, truncated?}`. Presence wins before type:
+                // a non-string inner output renders the whole object.
+                let inner = if output.is_string()? {
+                    Some(output)
+                } else {
+                    match output.get("output")? {
+                        Some(inner) => Some(inner),
+                        None => output.get("text")?,
+                    }
+                    .filter(|inner| inner.is_string().unwrap_or(false))
                 };
-                if !t.is_empty() {
-                    m.content.push(Block::Text { text: t.into() });
+                let text = match inner {
+                    Some(inner) if nonempty(inner)? => ctx.text(inner)?,
+                    Some(_) => None,
+                    None => Some(ctx.generated(|writer| writer.push_json(output))?),
+                };
+                if let Some(text) = text {
+                    m.content.push(Block::Text { text });
                 }
             }
             let mut bag = Map::new();
             bag.insert("message_type".into(), json!("shell"));
-            keep(data, &mut bag, &["shellID", "status", "exit", "metadata"]);
+            keep(data, &mut bag, &["shellID", "status", "exit", "metadata"])?;
             finish(&mut m, bag);
             out.push(m);
         }
         "assistant" => out.extend(assistant(
             new(Role::Assistant, MessageKind::Reply, Origin::Model),
             data,
-            parts,
-        )),
+            ctx,
+        )?),
         "compaction" => {
             let mut b = new(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
             let mut bag = Map::new();
-            keep(data, &mut bag, &["status", "reason", "error", "metadata"]);
-            let completed = data.get("status").and_then(Value::as_str) == Some("completed");
-            if data.get("error").is_some_and(|e| !e.is_null()) {
-                if let Some(t) = data.pointer("/error/type").and_then(Value::as_str) {
+            keep(data, &mut bag, &["status", "reason", "error", "metadata"])?;
+            let completed = string(data.get("status")?)?.as_deref() == Some("completed");
+            let error = data.get("error")?;
+            if error.map(JsonView::is_null).transpose()? == Some(false) {
+                if let Some(t) = string(get(error, "type")?)? {
                     bag.insert("error_name".into(), json!(t));
                 }
             }
@@ -203,19 +207,18 @@ pub(super) fn build_projected(
             if completed {
                 let mut s = new(Role::Assistant, MessageKind::CompactionSummary, Origin::Harness);
                 s.id = Some(format!("{id}#summary"));
-                if let Some(t) = text_of("summary") {
-                    s.content.push(Block::Text {
-                        text: text.cloned().unwrap_or_else(|| t.to_string().into()),
-                    });
+                if let Some(text) = text_of("summary")? {
+                    s.content.push(Block::Text { text });
                 }
-                s.model = data.pointer("/model/id").and_then(Value::as_str).map(str::to_string);
-                s.usage = super::parse_usage(data);
+                let model = data.get("model")?;
+                s.model = string(get(model, "id")?)?;
+                s.usage = usage(data.get("tokens")?, data.get("cost")?)?;
                 let mut bag = Map::new();
                 // `recent` is the verbatim tail kept after the summary; `providerContext` the
                 // provider-side state the next request resumes from.
-                keep(data, &mut bag, &["recent", "providerState", "providerContext"]);
-                if let Some(p) = data.pointer("/model/providerID") {
-                    bag.insert("providerID".into(), p.clone());
+                keep(data, &mut bag, &["recent", "providerState", "providerContext"])?;
+                if let Some(p) = owned(get(model, "providerID")?)? {
+                    bag.insert("providerID".into(), p);
                 }
                 finish(&mut s, bag);
                 out.push(s);
@@ -223,21 +226,22 @@ pub(super) fn build_projected(
         }
         "model-switched" => {
             let mut m = new(Role::System, MessageKind::ModelChange, Origin::Harness);
-            m.model = data.pointer("/model/id").and_then(Value::as_str).map(str::to_string);
+            m.model = string(get(data.get("model")?, "id")?)?;
             let mut bag = Map::new();
-            keep(data, &mut bag, &["model", "previous"]);
+            keep(data, &mut bag, &["model", "previous"])?;
             finish(&mut m, bag);
             out.push(m);
         }
         "agent-switched" | "location-switched" => {
             let mut m = new(Role::System, MessageKind::Notice, Origin::Harness);
             let note = if ty == "agent-switched" {
-                data.get("agent").and_then(Value::as_str).map(|a| format!("agent: {a}"))
+                string(data.get("agent")?)?.map(|a| format!("agent: {a}"))
             } else {
-                data.pointer("/location/directory")
-                    .or_else(|| data.get("subpath"))
-                    .and_then(Value::as_str)
-                    .map(|l| format!("location: {l}"))
+                match get(data.get("location")?, "directory")? {
+                    Some(directory) => string(Some(directory))?,
+                    None => string(data.get("subpath")?)?,
+                }
+                .map(|l| format!("location: {l}"))
             };
             if let Some(t) = note {
                 m.content.push(Block::Text { text: t.into() });
@@ -248,59 +252,65 @@ pub(super) fn build_projected(
                 data,
                 &mut bag,
                 &["agent", "location", "projectID", "subpath", "previous"],
-            );
+            )?;
             finish(&mut m, bag);
             out.push(m);
         }
         "idle" => {
             if opts.complete {
-                out.push(carrier(id, ty, data, ts));
+                out.push(carrier(id, ty, data, ts)?);
             }
         }
         _ => {
-            if opts.complete {
-                out.push(carrier(id, ty, data, ts));
-            } else {
-                return Err(());
+            if !opts.complete {
+                return Ok(None);
             }
+            out.push(carrier(id, ty, data, ts)?);
         }
     }
-    crate::affordance::refine_complete_group(Harness::OpenCode, &mut out).map_err(|_| ())?;
-    Ok(out)
+    Ok(crate::affordance::refine_complete_group(Harness::OpenCode, &mut out)
+        .is_ok()
+        .then_some(out))
 }
 
-fn assistant(mut m: Message, data: &Value, projected: Option<&[super::ProjectedPart]>) -> Vec<Message> {
-    m.model = data.pointer("/model/id").and_then(Value::as_str).map(str::to_string);
-    m.usage = super::parse_usage(data);
+fn nonempty_array(view: Option<JsonView<'_>>) -> Result<Option<JsonView<'_>>> {
+    match view {
+        Some(view) if view.array()?.is_some_and(|mut items| items.next().is_some()) => Ok(Some(view)),
+        _ => Ok(None),
+    }
+}
+
+fn assistant(mut m: Message, data: JsonView<'_>, ctx: Ctx<'_>) -> Result<Vec<Message>> {
+    let model = data.get("model")?;
+    m.model = string(get(model, "id")?)?;
+    m.usage = usage(data.get("tokens")?, data.get("cost")?)?;
     let mut results = Vec::new();
-    for (index, c) in data
-        .get("content")
-        .and_then(Value::as_array)
+    for c in data
+        .get("content")?
+        .map(JsonView::array)
+        .transpose()?
+        .flatten()
         .into_iter()
         .flatten()
-        .enumerate()
     {
-        let part = projected.and_then(|parts| parts.get(index));
-        match c.get("type").and_then(Value::as_str).unwrap_or("") {
+        let c = c?;
+        match string(c.get("type")?)?.as_deref().unwrap_or("") {
             "text" => {
-                if let Some(t) = c.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()) {
-                    m.content.push(Block::Text {
-                        text: part
-                            .and_then(|p| p.text.clone())
-                            .unwrap_or_else(|| t.to_string().into()),
-                    });
+                if let Some(text) = c.get("text")?.filter(|t| nonempty(*t).unwrap_or(false)) {
+                    if let Some(text) = ctx.text(text)? {
+                        m.content.push(Block::Text { text });
+                    }
                 }
             }
             "reasoning" => {
-                let t = c.get("text").and_then(Value::as_str).unwrap_or("");
-                let signature = super::find_signature(c.get("state"))
-                    .or_else(|| c.pointer("/state/signature").and_then(Value::as_str))
+                let text = c.get("text")?.filter(|t| t.is_string().unwrap_or(false));
+                let state = owned(c.get("state")?)?;
+                let signature = find_signature(state.as_ref())
+                    .or_else(|| state.as_ref()?.get("signature")?.as_str())
                     .map(str::to_string);
-                if !t.is_empty() || signature.is_some() {
+                if text.map(nonempty).transpose()?.unwrap_or(false) || signature.is_some() {
                     m.content.push(Block::Thinking {
-                        text: part
-                            .and_then(|p| p.text.clone())
-                            .unwrap_or_else(|| t.to_string().into()),
+                        text: text.map(|t| ctx.text(t)).transpose()?.flatten().unwrap_or_default(),
                         signature,
                         encrypted: None,
                         redacted: false,
@@ -308,13 +318,13 @@ fn assistant(mut m: Message, data: &Value, projected: Option<&[super::ProjectedP
                 }
             }
             "tool" => {
-                let (u, r) = tool_blocks(c, part);
+                let (u, r) = tool_blocks(c, ctx)?;
                 m.content.push(u);
                 results.extend(r);
             }
             _ => {
                 let bag = m.harness_extra_mut(Harness::OpenCode);
-                super::push_extra_array(bag, "unknown_content", c.clone());
+                push_extra_array(bag, "unknown_content", c.resolve()?.into_owned());
             }
         }
     }
@@ -332,25 +342,24 @@ fn assistant(mut m: Message, data: &Value, projected: Option<&[super::ProjectedP
             "providerState",
             "metadata",
         ],
-    );
-    if let Some(p) = data.pointer("/model/providerID") {
-        bag.insert("providerID".into(), p.clone());
+    )?;
+    if let Some(p) = owned(get(model, "providerID")?)? {
+        bag.insert("providerID".into(), p);
     }
-    if let Some(v) = data.pointer("/model/variant") {
-        bag.insert("variant".into(), v.clone());
+    if let Some(v) = owned(get(model, "variant")?)? {
+        bag.insert("variant".into(), v);
     }
-    if data.get("error").is_some_and(|e| !e.is_null()) {
+    let error = data.get("error")?;
+    if error.map(JsonView::is_null).transpose()? == Some(false) {
         m.kind = MessageKind::Error;
         m.origin = Origin::Harness;
-        if let Some(t) = data.pointer("/error/type").and_then(Value::as_str) {
+        if let Some(t) = string(get(error, "type")?)? {
             bag.insert("error_name".into(), json!(t));
         }
         // An error turn often carries no content; its message is what the user saw.
         if m.content.is_empty() {
-            if let Some(t) = data.pointer("/error/message").and_then(Value::as_str) {
-                m.content.push(Block::Text {
-                    text: t.to_string().into(),
-                });
+            if let Some(t) = string(get(error, "message")?)? {
+                m.content.push(Block::Text { text: t.into() });
             }
         }
     }
@@ -362,143 +371,196 @@ fn assistant(mut m: Message, data: &Value, projected: Option<&[super::ProjectedP
         tm.content = results;
         out.push(tm);
     }
-    out
+    Ok(out)
 }
 
 /// A 2.x `tool` content item: `{id, name, state{status, input, content[]?, error?, metadata?}, time}`.
 /// `content[]` is `text` and `file` items; a `file` result becomes an Image/File block after the
 /// result, as a 1.x `state.attachments[]` does.
-fn tool_blocks(c: &Value, projected: Option<&super::ProjectedPart>) -> (Block, Vec<Block>) {
-    let id = c.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-    let name = c.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-    let status = c.pointer("/state/status").and_then(Value::as_str).unwrap_or("");
-    let input = match c.pointer("/state/input") {
+fn tool_blocks(c: JsonView<'_>, ctx: Ctx<'_>) -> Result<(Block, Vec<Block>)> {
+    let id = string(c.get("id")?)?.unwrap_or_default();
+    let name = string(c.get("name")?)?.unwrap_or_default();
+    let state = c.get("state")?;
+    let status = string(get(state, "status")?)?.unwrap_or_default();
+    let input = match get(state, "input")? {
         // `streaming` holds the raw, still-partial argument text.
-        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone())),
-        Some(v) => v.clone(),
-        None => Value::Null,
+        Some(input) if input.is_string()? => decoded_input(input, ctx)?,
+        Some(input) => input.argument(ctx.spans())?,
+        None => Value::Null.into(),
     };
     let use_block = Block::ToolUse {
         id: id.clone(),
         name: name.clone(),
-        input: projected.and_then(|p| p.input.clone()).unwrap_or_else(|| input.into()),
+        input,
         namespace: None,
     };
-    let mut text = Vec::new();
+    // The result is its `text` items (and any other non-`file` item as JSON), joined by newlines.
+    let mut parts = Vec::new();
     let mut files = Vec::new();
-    for item in c
-        .pointer("/state/content")
-        .and_then(Value::as_array)
+    for item in get(state, "content")?
+        .map(JsonView::array)
+        .transpose()?
+        .flatten()
         .into_iter()
         .flatten()
     {
-        match item.get("type").and_then(Value::as_str) {
-            Some("text") => text.push(item.get("text").and_then(Value::as_str).unwrap_or("").to_string()),
-            Some("file") => files.push(result_file(item)),
-            _ => text.push(item.to_string()),
+        let item = item?;
+        match string(item.get("type")?)?.as_deref() {
+            Some("text") => parts.push((item, true)),
+            Some("file") => files.push(result_file(item)?),
+            _ => parts.push((item, false)),
         }
     }
     let is_error = status == "error";
-    if is_error {
-        if let Some(msg) = c.pointer("/state/error/message").and_then(Value::as_str) {
-            if text.is_empty() {
-                text.push(msg.to_string());
+    let content = match parts.as_slice() {
+        [] => match is_error {
+            true => string(get(get(state, "error")?, "message")?)?.map(Text::from),
+            false => None,
+        },
+        [(item, true)] => Some(match item.get("text")? {
+            Some(text) => ctx.text(text)?.unwrap_or_default(),
+            None => Text::default(),
+        }),
+        parts => Some(ctx.generated(|writer| {
+            for (index, (item, text)) in parts.iter().enumerate() {
+                if index > 0 {
+                    writer.push("\n")?;
+                }
+                if !text {
+                    writer.push_json(*item)?;
+                } else if let Some(text) = item.get("text")? {
+                    writer.push_string(text)?;
+                }
             }
-        }
-    }
+            Ok(())
+        })?),
+    };
     let mut details = Map::new();
     for (k, v) in [
-        ("metadata", c.pointer("/state/metadata")),
-        ("error", c.pointer("/state/error")),
-        ("time", c.get("time")),
+        ("metadata", get(state, "metadata")?),
+        ("error", get(state, "error")?),
+        ("time", c.get("time")?),
     ] {
-        if let Some(v) = v.filter(|v| !v.is_null() && !v.as_object().is_some_and(|o| o.is_empty())) {
-            details.insert(k.to_string(), v.clone());
+        if let Some(v) = owned(v)?.filter(|v| !v.is_null() && !v.as_object().is_some_and(|o| o.is_empty())) {
+            details.insert(k.to_string(), v);
         }
     }
     for k in ["executed", "providerState", "providerResultState"] {
-        if let Some(v) = c.get(k) {
-            details.insert(k.to_string(), v.clone());
+        if let Some(v) = owned(c.get(k)?)? {
+            details.insert(k.to_string(), v);
         }
     }
     let mut out = Vec::new();
-    if !text.is_empty() || is_error || status == "completed" {
+    if content.is_some() || is_error || status == "completed" {
         out.push(Block::ToolResult {
             tool_use_id: id,
-            content: projected
-                .and_then(|p| p.output.clone())
-                .unwrap_or_else(|| text.join("\n").into()),
+            content: content.unwrap_or_default(),
             is_error,
             tool_name: (!name.is_empty()).then_some(name),
-            status: (!status.is_empty()).then(|| status.to_string()),
-            details: c
-                .pointer("/state/metadata/clustervision.details")
-                .cloned()
-                .or_else(|| (!details.is_empty()).then_some(Value::Object(details))),
+            status: (!status.is_empty()).then_some(status),
+            details: match owned(get(get(state, "metadata")?, "clustervision.details")?)? {
+                Some(details) => Some(details),
+                None => (!details.is_empty()).then_some(Value::Object(details)),
+            },
         });
     }
     out.extend(files);
-    (use_block, out)
+    Ok((use_block, out))
+}
+
+/// A 2.x tool input string: an encoded argument document when it parses (decoded into the arena
+/// by the span rule), else the string itself — empty and partial streaming text included.
+fn decoded_input(view: JsonView<'_>, ctx: Ctx<'_>) -> Result<crate::json::Json> {
+    let Ctx::Spans(source, arena) = ctx else {
+        return Ok(encoded(view)?.into());
+    };
+    if !view
+        .source_range()?
+        .is_some_and(|(_, len)| len > crate::lazy::INLINE_MAX as u64)
+    {
+        return Ok(encoded(view)?.into());
+    }
+    let (offset, len) = arena.append(|writer| {
+        view.for_each_str_chunk(|chunk| {
+            writer.write_all(chunk.as_bytes())?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+    if len != 0 {
+        match source.read_backing_value(arena.clone(), offset, len, |decoded| decoded.argument(true)) {
+            Ok(decoded) => return Ok(decoded),
+            Err(error) if error.is::<crate::json::InvalidJson>() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    view.argument(true)
+}
+
+fn encoded(view: JsonView<'_>) -> Result<Value> {
+    let value = view.resolve()?.into_owned();
+    Ok(serde_json::from_str(value.as_str().unwrap_or_default()).unwrap_or(value))
 }
 
 /// A user `files[]` attachment: `{data (base64), mime, source{type: inline|uri, uri?}, name?}`. The
 /// bytes stay out of the IR; `data_ref`/`source` name the attachment instead.
-fn file_block(f: &Value) -> Block {
-    let mime = f.get("mime").and_then(Value::as_str).filter(|m| !m.is_empty());
-    let uri = f.pointer("/source/uri").and_then(Value::as_str);
-    let name = f.get("name").and_then(Value::as_str);
-    if mime.is_some_and(|m| m.starts_with("image/")) {
+fn file_block(f: JsonView<'_>) -> Result<Block> {
+    let mime = string(f.get("mime")?)?.filter(|m| !m.is_empty());
+    let uri = string(get(f.get("source")?, "uri")?)?;
+    let name = string(f.get("name")?)?;
+    Ok(if mime.as_ref().is_some_and(|m| m.starts_with("image/")) {
         Block::Image {
-            media_type: mime.map(str::to_string),
-            data_ref: uri.or(name).map(str::to_string),
+            media_type: mime,
+            data_ref: uri.or(name),
         }
     } else {
         Block::File {
-            mime: mime.map(str::to_string),
-            path: name.map(str::to_string),
-            source: uri.map(str::to_string),
+            mime,
+            path: name,
+            source: uri,
         }
-    }
+    })
 }
 
 /// A tool result's `file` content item: `{uri, mime, name?}`.
-fn result_file(f: &Value) -> Block {
-    let mime = f.get("mime").and_then(Value::as_str).filter(|m| !m.is_empty());
-    let uri = f.get("uri").and_then(Value::as_str).map(str::to_string);
-    if mime.is_some_and(|m| m.starts_with("image/")) {
+fn result_file(f: JsonView<'_>) -> Result<Block> {
+    let mime = string(f.get("mime")?)?.filter(|m| !m.is_empty());
+    let uri = string(f.get("uri")?)?;
+    Ok(if mime.as_ref().is_some_and(|m| m.starts_with("image/")) {
         Block::Image {
-            media_type: mime.map(str::to_string),
+            media_type: mime,
             data_ref: uri,
         }
     } else {
         Block::File {
-            mime: mime.map(str::to_string),
-            path: f.get("name").and_then(Value::as_str).map(str::to_string),
+            mime,
+            path: string(f.get("name")?)?,
             source: uri,
         }
-    }
+    })
 }
 
-fn carrier(id: &str, ty: &str, data: &Value, ts: Option<chrono::DateTime<chrono::Utc>>) -> Message {
+fn carrier(id: &str, ty: &str, data: JsonView<'_>, ts: Option<chrono::DateTime<chrono::Utc>>) -> Result<Message> {
     let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
     m.id = Some(id.to_string());
     m.timestamp = ts;
     m.harness_extra_mut(Harness::OpenCode)
         .insert("record_type".into(), json!(ty));
-    let mut rec = data.as_object().cloned().unwrap_or_default();
+    let mut rec = data.resolve()?.as_object().cloned().unwrap_or_default();
     rec.insert("id".into(), json!(id));
     rec.insert("type".into(), json!(ty));
     m.extra
         .insert(crate::harness::claude::CARRIER_KEY.into(), Value::Object(rec));
-    m
+    Ok(m)
 }
 
-fn keep(data: &Value, bag: &mut Map<String, Value>, keys: &[&str]) {
+fn keep(data: JsonView<'_>, bag: &mut Map<String, Value>, keys: &[&str]) -> Result<()> {
     for k in keys {
-        if let Some(v) = data.get(*k).filter(|v| !v.is_null()) {
-            bag.insert((*k).to_string(), v.clone());
+        if let Some(v) = owned(data.get(k)?)?.filter(|v| !v.is_null()) {
+            bag.insert((*k).to_string(), v);
         }
     }
+    Ok(())
 }
 
 fn finish(m: &mut Message, bag: Map<String, Value>) {
@@ -511,6 +573,9 @@ fn finish(m: &mut Message, bag: Map<String, Value>) {
 mod tests {
     use super::*;
 
+    fn build(id: &str, ty: &str, data: &Value, opts: &ParseOptions) -> Option<Vec<Message>> {
+        super::build(id, ty, JsonView::owned(data), opts, Ctx::Owned).unwrap()
+    }
     fn one(ty: &str, data: &str) -> Vec<Message> {
         build("msg_1", ty, &serde_json::from_str(data).unwrap(), &ParseOptions::full()).unwrap()
     }
@@ -612,7 +677,7 @@ mod tests {
         assert!(build("i", "idle", &d, &ParseOptions::full()).unwrap().is_empty());
         let c = build("i", "idle", &d, &ParseOptions::complete()).unwrap();
         assert_eq!(c[0].kind, MessageKind::Carrier);
-        assert!(build("x", "from-the-future", &d, &ParseOptions::full()).is_err());
+        assert!(build("x", "from-the-future", &d, &ParseOptions::full()).is_none());
         let c = build("x", "from-the-future", &d, &ParseOptions::complete()).unwrap();
         assert_eq!(c[0].kind, MessageKind::Carrier);
         assert_eq!(c[0].extra[crate::harness::claude::CARRIER_KEY]["outcome"], "succeeded");

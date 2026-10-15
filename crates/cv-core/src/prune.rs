@@ -52,10 +52,10 @@ pub const MARKER_PREFIX: &str = "[PRUNED id=";
 // no tokens is a safe no-op. Composing a security-declassify tool = supply your token file.
 /// Suffix distinguishing a flattened `toolUseResult` mirror entry from its `content` sibling.
 const TUR_SUFFIX: &str = "#tur";
-/// Claude tokenizer ≈ 3.3–3.7 B/tok. Prune estimates over raw records (it never parses to the IR),
-/// so it walks `message.content` itself, with [`crate::ir::est_tokens_bytes`]'s arithmetic and
-/// [`crate::ir::IMAGE_TOKENS`] per image — the same numbers the IR-side estimator produces.
-const TEXT_BYTES_PER_TOKEN: f64 = 3.5;
+/// Prune estimates over raw records (it never parses to the IR), so it walks `message.content`
+/// itself, pricing each field with the shared [`crate::ir::TokenKind`] rates, [`IMAGE_TOKENS`] per
+/// image and [`BLOCK_TOKENS`] per block — the numbers the IR-side estimator produces.
+use crate::ir::{TokenKind, BLOCK_TOKENS, IMAGE_TOKENS};
 const LARGE_RECORD: u64 = 1024 * 1024;
 
 /// Knobs for [`prune_session`].
@@ -67,11 +67,11 @@ pub struct PruneOptions {
     pub keep_last: usize,
     /// Hard-drop payloads (no sidecar, irreversible) instead of stashing them for retrieval.
     pub drop: bool,
-    /// Also flatten assistant **thinking** blocks (extended reasoning). On a long session the
-    /// chain-of-thought often dominates the loaded context, and on resume you rarely need the
-    /// verbatim old reasoning — the conclusions are in the assistant's text. Snips every old block
-    /// regardless of `min_size` (a signature-only block is ~700 bytes on disk but hundreds of tokens
-    /// on the wire). Lossless (stashed in the sidecar like any other payload). Off by default — it
+    /// Also omit old assistant **thinking** blocks (extended reasoning): on resume you rarely need
+    /// the verbatim old reasoning — the conclusions are in the assistant's text. Omits every old
+    /// block regardless of `min_size` (a signature-only block is ~700 bytes on disk but hundreds of
+    /// tokens on the wire), leaving no marker; a record left empty is removed and its children
+    /// relinked. Lossless (stashed in the sidecar like any other payload). Off by default — it
     /// changes more than tool output.
     pub thinking: bool,
     /// Explicit new session id; otherwise a fresh UUIDv4.
@@ -397,10 +397,10 @@ fn select_kept_turns(
     let mut pending = 0u64;
     for v in parsed.iter().flatten().filter(|v| !is_sidechain(v)) {
         if is_main_turn(v) {
-            per_turn.push(fact_est_tokens(v) + pending);
+            per_turn.push(fact_est(v).total() + pending);
             pending = 0;
         } else {
-            pending += fact_est_tokens(v);
+            pending += fact_est(v).total();
         }
     }
     // Trailing rendered reminders still belong to the retained tail even without a following
@@ -486,7 +486,9 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
             if let Some(v) = &value {
                 collect_tool_names(v, range, &mut tool_names);
             }
-            value.as_ref().map(|v| decision_facts(v, opts.window.is_some()))
+            value
+                .as_ref()
+                .map(|v| decision_facts(v, opts.window.is_some() || opts.revive))
         };
         let facts = facts.map(|mut facts| {
             if subagent {
@@ -549,6 +551,9 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         let hint = " (pick another --to, or pass --force to replace it)";
         crate::publish::refuse_existing(&new_path, hint)?;
         crate::publish::refuse_existing(&sidecar_path, hint)?;
+        if opts.copy_resources && resource_dir.join(src_stem).is_dir() {
+            crate::publish::refuse_existing(&dir.join(&new_id), hint)?;
+        }
     }
 
     // Map tool_use_id -> (name, input) from assistant tool_use blocks (which use `id`, not
@@ -588,6 +593,10 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         ));
     }
 
+    // Revive weighs each record's estimate before and after pruning against recorded usage. Records
+    // map one-to-one onto output records unless turns are dropped.
+    let before: Option<Vec<Option<Est>>> =
+        (opts.revive && !windowing).then(|| parsed.iter().map(|f| f.as_ref().map(fact_est)).collect());
     let mut output = std::io::BufWriter::with_capacity(64 * 1024, ByteStage::new());
     let mut output_facts = Vec::new();
     let mut output_pruned = Vec::new();
@@ -688,7 +697,9 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
                     }
                 }
                 if opts.revive {
-                    facts["_prune_est"] = Value::from(plan.estimate);
+                    if let Some(facts) = facts.as_object_mut() {
+                        plan.estimate.store(facts);
+                    }
                 }
             }
             let mut scan = MarkerWriter::new(&mut output);
@@ -763,7 +774,9 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
                 }
                 if opts.revive {
                     let mut facts = facts;
-                    facts["_prune_est"] = Value::from(plan.estimate);
+                    if let Some(facts) = facts.as_object_mut() {
+                        plan.estimate.store(facts);
+                    }
                     output_facts.push(Some(facts));
                     output_pruned.push(true);
                 }
@@ -859,7 +872,6 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
             prune_assistant_thinking(
                 &mut v,
                 opts,
-                &new_id,
                 &line_key,
                 &mut sidecar,
                 &mut pruned_count,
@@ -884,6 +896,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
                 &mut modified,
             );
         }
+        drop_omitted_blocks(&mut v);
 
         // An untouched line is the source's bytes with only its session id replaced
         // ([`crate::restamp_line`]); a snipped line is re-serialized (values preserved; key order
@@ -915,9 +928,23 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     source.check()?;
     let output = output.into_inner().map_err(|e| e.into_error())?.finish()?;
     let (output, usage_rewritten, revive_tokens, revive_old_tokens) = if opts.revive {
-        revive_staged(&source, output, &output_facts, &output_pruned, windowing, window_real)?
+        revive_staged(
+            &source,
+            output,
+            &output_facts,
+            &output_pruned,
+            before.as_deref(),
+            windowing,
+            window_real,
+        )?
     } else {
         (output, 0, None, None)
+    };
+    // `--drop-thinking` empties thinking-only records; they go, their children relinked.
+    let output = if opts.thinking {
+        crate::harness::claude::replay::drop_empty_records(output)?.0.finish()?
+    } else {
+        output
     };
     let new_size = output.len()?;
     let sidecar = sidecar_stage.into_inner().map_err(|e| e.into_error())?.finish()?;
@@ -937,6 +964,10 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         let mode = crate::publish::mode_of(&file);
         let transcript = stage(&new_path, &output, mode)?;
         let sidecar_file = sidecar_out.as_ref().map(|p| stage(p, &sidecar, mode)).transpose()?;
+        let resources = copied
+            .as_ref()
+            .map(|dst| stage_resources(&resource_dir.join(src_stem), dst))
+            .transpose()?;
         source.check_metadata(file.metadata()?)?;
         source.check()?;
         // Serialization and writes complete before publication. The sidecar is published first,
@@ -962,9 +993,9 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
                 _ => {}
             }
         }
-        if let Some(dst) = &copied {
-            copy_dir(&resource_dir.join(src_stem), dst)
-                .with_context(|| format!("copying session resources to {}", dst.display()))?;
+        if let Some((dst, staged)) = copied.as_ref().zip(resources) {
+            // Published whole: an existing directory is replaced (with --force), never merged into.
+            staged.publish(dst, claim)?;
         }
     }
 
@@ -1025,11 +1056,19 @@ fn decision_facts_source(
         "parentUuid",
         "toolUseResult",
         "rendered",
+        "uuid",
+        "logicalParentUuid",
     ];
     let Some(fields) = Fields::parse(view, &keys)? else {
         return Ok(decision_facts(&Value::Null, false));
     };
     let mut facts = fields.project(&keys[..6])?;
+    let (uuid, parent, logical) = (
+        fields.value("uuid")?,
+        fields.value("parentUuid")?,
+        fields.value("logicalParentUuid")?,
+    );
+    link_facts(&mut facts, uuid.as_ref(), parent.as_ref(), logical.as_ref());
     let ty = facts.get("type").and_then(Value::as_str).unwrap_or("");
     let mut message = serde_json::Map::new();
     let mut content = None;
@@ -1077,15 +1116,18 @@ fn decision_facts_source(
     }
     let estimate = if opts.window.is_some() || opts.revive {
         match ty {
-            "user" | "assistant" => content.map(est_tokens_source).transpose()?.unwrap_or(0),
+            "user" | "assistant" => content
+                .map(|c| est_content_source(c, &[]))
+                .transpose()?
+                .unwrap_or_default(),
             "attachment" => {
-                let mut estimate = 0;
+                let mut estimate = Est::default();
                 if let Some(items) = fields.get("rendered").map(|v| v.array()).transpose()?.flatten() {
                     for item in items {
                         if let Some(item) = Fields::parse(item?, &["content"])? {
                             if let Some(text) = item.get("content") {
                                 if text.is_string()? {
-                                    estimate += source_string_tokens(text)?;
+                                    estimate.tokens += BLOCK_TOKENS + source_string_tokens(text)?;
                                 }
                             }
                         }
@@ -1093,10 +1135,10 @@ fn decision_facts_source(
                 }
                 estimate
             }
-            _ => 0,
+            _ => Est::default(),
         }
     } else {
-        0
+        Est::default()
     };
     let parent = fields
         .get("parentUuid")
@@ -1104,7 +1146,7 @@ fn decision_facts_source(
         .transpose()?
         .unwrap_or(false);
     facts.insert("message".into(), Value::Object(message));
-    facts.insert("_prune_est".into(), Value::from(estimate));
+    estimate.store(&mut facts);
     facts.insert("_prune_payload".into(), Value::from(payload));
     facts.insert("_prune_thinking".into(), Value::from(thinking));
     facts.insert("_prune_parent".into(), Value::from(parent));
@@ -1187,13 +1229,17 @@ fn source_usage_total(view: crate::json::JsonView<'_>) -> Result<Option<u64>> {
     Ok(Some(usage_total(&usage)))
 }
 
-fn source_string_tokens(view: crate::json::JsonView<'_>) -> Result<u64> {
-    let mut bytes = 0;
+/// A string view priced at `kind`, read in chunks (prune markers at their own rate).
+fn source_str_tokens(view: crate::json::JsonView<'_>, kind: TokenKind) -> Result<u64> {
+    let mut tokens = crate::ir::StrTokens::new(kind);
     view.for_each_str_chunk(|part| {
-        bytes += part.len();
+        tokens.push(part.as_bytes());
         Ok(())
     })?;
-    Ok(crate::ir::est_tokens_bytes(bytes, TEXT_BYTES_PER_TOKEN))
+    Ok(tokens.tokens())
+}
+fn source_string_tokens(view: crate::json::JsonView<'_>) -> Result<u64> {
+    source_str_tokens(view, TokenKind::Text)
 }
 fn value_byte_size_source(view: crate::json::JsonView<'_>) -> Result<usize> {
     if view.is_null()? {
@@ -1210,39 +1256,116 @@ fn value_byte_size_source(view: crate::json::JsonView<'_>) -> Result<usize> {
         Ok(usize::try_from(view.canonical_len()?)?)
     }
 }
-fn est_tokens_source(view: crate::json::JsonView<'_>) -> Result<u64> {
+/// [`est_content`] over a source view, field for field the same arithmetic, with any node in
+/// `replacements` priced as its replacement.
+fn est_content_source(view: crate::json::JsonView<'_>, replacements: &[(crate::json::Json, Value)]) -> Result<Est> {
+    if let Some(value) = view.replacement(replacements)? {
+        return Ok(est_content(value));
+    }
     if view.is_string()? {
-        return source_string_tokens(view);
+        return Ok(Est {
+            tokens: BLOCK_TOKENS + source_string_tokens(view)?,
+            ..Est::default()
+        });
     }
     let Some(blocks) = view.array()? else {
-        return Ok(crate::ir::est_tokens_bytes(
-            usize::try_from(view.canonical_len()?)?,
-            TEXT_BYTES_PER_TOKEN,
-        ));
+        return Ok(Est {
+            tokens: source_canonical_tokens(view, replacements, TokenKind::ToolResult)?,
+            ..Est::default()
+        });
     };
-    let mut total = 0;
+    let mut total = Est::default();
     for block in blocks {
-        let block = block?;
-        let fields = crate::harness::store::document::Fields::parse(block, &["type", "text"])?;
-        match fields
-            .as_ref()
-            .map(|f| f.string("type"))
-            .transpose()?
-            .flatten()
-            .as_deref()
-        {
-            Some("image") => total += crate::ir::IMAGE_TOKENS,
-            Some("text") => {
-                if let Some(text) = fields.and_then(|f| f.get("text")) {
-                    if text.is_string()? {
-                        total += source_string_tokens(text)?;
-                    }
-                }
-            }
-            _ => total += crate::ir::est_tokens_bytes(usize::try_from(block.canonical_len()?)?, TEXT_BYTES_PER_TOKEN),
-        }
+        total.add(est_block_source(block?, replacements)?);
     }
     Ok(total)
+}
+fn source_canonical_tokens(
+    view: crate::json::JsonView<'_>,
+    replacements: &[(crate::json::Json, Value)],
+    kind: TokenKind,
+) -> Result<u64> {
+    let mut tokens = crate::ir::StrTokens::new(kind);
+    view.write_canonical_replacing(replacements, &mut tokens)?;
+    Ok(tokens.tokens())
+}
+/// [`est_block`] over a source view.
+fn est_block_source(block: crate::json::JsonView<'_>, replacements: &[(crate::json::Json, Value)]) -> Result<Est> {
+    if let Some(value) = block.replacement(replacements)? {
+        return Ok(est_block(value));
+    }
+    let fields = crate::harness::store::document::Fields::parse(
+        block,
+        &["type", "text", "thinking", "signature", "data", "input", "content"],
+    )?;
+    let Some(fields) = fields else {
+        return Ok(Est {
+            tokens: BLOCK_TOKENS + source_canonical_tokens(block, replacements, TokenKind::ToolResult)?,
+            ..Est::default()
+        });
+    };
+    let string = |key: &str, kind: TokenKind| -> Result<u64> {
+        match fields.get(key) {
+            Some(value) if value.is_string()? => source_str_tokens(value, kind),
+            _ => Ok(0),
+        }
+    };
+    let mut est = Est {
+        tokens: BLOCK_TOKENS,
+        ..Est::default()
+    };
+    match fields.string("type")?.as_deref() {
+        Some("image") => est.images += 1,
+        Some("text") => est.tokens += string("text", TokenKind::Text)?,
+        Some("thinking") => {
+            est.tokens += string("thinking", TokenKind::Text)?;
+            est.signature += string("signature", TokenKind::Signature)?;
+        }
+        Some("redacted_thinking") => est.signature += string("data", TokenKind::Signature)?,
+        Some("tool_use") => {
+            if let Some(input) = fields.get("input") {
+                let len = usize::try_from(input.canonical_len()?)?;
+                est.tokens += crate::ir::est_tokens_bytes(len, TokenKind::ToolInput);
+            }
+        }
+        Some("tool_result") => {
+            let Some(content) = fields.get("content") else {
+                return Ok(est);
+            };
+            if let Some(value) = content.replacement(replacements)? {
+                est.add(est_block(&serde_json::json!({"type": "tool_result", "content": value})));
+                est.tokens -= BLOCK_TOKENS;
+            } else if content.is_string()? {
+                est.tokens += source_str_tokens(content, TokenKind::ToolResult)?;
+            } else if let Some(items) = content.array()? {
+                for item in items {
+                    let item = item?;
+                    let item_fields = crate::harness::store::document::Fields::parse(item, &["type", "text"])?;
+                    match item_fields
+                        .as_ref()
+                        .map(|f| f.string("type"))
+                        .transpose()?
+                        .flatten()
+                        .as_deref()
+                    {
+                        Some("image") => est.images += 1,
+                        Some("text") => {
+                            if let Some(text) = item_fields.as_ref().and_then(|f| f.get("text")) {
+                                if text.is_string()? {
+                                    est.tokens += source_str_tokens(text, TokenKind::ToolResult)?;
+                                }
+                            }
+                        }
+                        _ => est.tokens += source_canonical_tokens(item, replacements, TokenKind::ToolResult)?,
+                    }
+                }
+            } else if !content.is_null()? {
+                est.tokens += source_canonical_tokens(content, replacements, TokenKind::ToolResult)?;
+            }
+        }
+        _ => est.tokens += source_canonical_tokens(block, replacements, TokenKind::ToolResult)?,
+    }
+    Ok(est)
 }
 
 /// Sidecar metadata retains a source descriptor rather than its original payload bytes.
@@ -1255,7 +1378,7 @@ struct SourcePrune {
     replacements: Vec<(crate::json::Json, Value)>,
     payloads: Vec<SourcePayload>,
     saved: u64,
-    estimate: u64,
+    estimate: Est,
     images: usize,
 }
 
@@ -1307,6 +1430,8 @@ fn source_turn_prune(
         let mut images = 0;
         let mut mirror_base = None;
         let mut mirror_tuid = None;
+        let mut omitted = HashSet::new();
+        let mut kept_blocks = Vec::new();
         for (index, original_block) in blocks.into_iter().flatten().enumerate() {
             let original_block = original_block?;
             if opts.revive {
@@ -1317,8 +1442,9 @@ fn source_turn_prune(
                 continue;
             };
             let ty = block.string("type")?;
-            let mut projected = None;
+            let mut projected: Option<Value> = None;
             if thinking_old && ty.as_deref() == Some("thinking") {
+                // Omitted, as on the owned path; the array is rewritten once the loop is done.
                 let size = value_byte_size_source(original_block)?;
                 let lines = block
                     .get("thinking")
@@ -1326,19 +1452,19 @@ fn source_turn_prune(
                     .transpose()?
                     .map(|stats| stats.lines())
                     .unwrap_or(1);
-                let id = format!("{key}#think{index}");
-                let marker = build_marker(&id, "thinking", &Value::Null, "text", size, lines, new_id, opts.drop);
-                saved += crate::ir::est_tokens_bytes(size, TEXT_BYTES_PER_TOKEN).saturating_sub(str_tokens(&marker));
+                saved += est_block_source(original_block, &[])?.total();
                 payloads.push(source_payload(
                     original_block.to_json()?,
-                    id,
+                    format!("{key}#think{index}"),
                     "thinking",
                     "thinking",
                     size,
                     lines,
                 ));
-                projected = Some(serde_json::json!({"type":"text", "text":marker}));
+                omitted.insert(index);
+                continue;
             }
+            kept_blocks.push(original_block.to_json()?);
             if opts.declassify {
                 if let Some(value) = projected.as_mut() {
                     // This pass sees the generated thinking marker, as the owned pass does.
@@ -1384,7 +1510,7 @@ fn source_turn_prune(
                             new_id,
                             opts.drop,
                         );
-                        saved += crate::ir::est_tokens_bytes(stats.bytes, TEXT_BYTES_PER_TOKEN)
+                        saved += crate::ir::est_tokens_bytes(stats.bytes, TokenKind::Text)
                             .saturating_sub(str_tokens(&marker));
                         declassified.push(source_payload(
                             original_block.to_json()?,
@@ -1439,7 +1565,7 @@ fn source_turn_prune(
                     "text".into(),
                     stats.lines(),
                     0,
-                    crate::ir::est_tokens_bytes(stats.bytes, TEXT_BYTES_PER_TOKEN),
+                    crate::ir::est_tokens_bytes(stats.bytes, TokenKind::ToolResult),
                 ),
                 None => classify_source(content)?,
             };
@@ -1480,8 +1606,7 @@ fn source_turn_prune(
                     new_id,
                     opts.drop,
                 );
-                saved +=
-                    crate::ir::est_tokens_bytes(stats.bytes, TEXT_BYTES_PER_TOKEN).saturating_sub(str_tokens(&marker));
+                saved += crate::ir::est_tokens_bytes(stats.bytes, TokenKind::Text).saturating_sub(str_tokens(&marker));
                 let original = content.unwrap().to_json()?;
                 declassified.push(source_payload(
                     original.clone(),
@@ -1540,6 +1665,19 @@ fn source_turn_prune(
         if payloads.is_empty() {
             return Ok(None);
         }
+        if !omitted.is_empty() {
+            // Claude Code writes one block per record, so this is usually `[]` (the record is then
+            // removed after staging). A rarer mixed record materializes its kept blocks once.
+            let mut array = Vec::with_capacity(kept_blocks.len());
+            for block in &kept_blocks {
+                let mut bytes = Vec::new();
+                block.with_view(|view| view.write_canonical_replacing(&replacements, &mut bytes))?;
+                array.push(serde_json::from_slice(&bytes)?);
+            }
+            if let Some(content) = content {
+                replacements.push((content.to_json()?, Value::Array(array)));
+            }
+        }
         for key in ["sessionId", "session_id"] {
             if let Some(value) = top.get(key) {
                 if value.is_string()? {
@@ -1549,39 +1687,26 @@ fn source_turn_prune(
         }
         let mut estimate = if opts.revive && !content.map(|value| value.is_array()).transpose()?.unwrap_or(false) {
             match projected_content.as_ref() {
-                Some(value) => est_tokens(value),
-                None => content.map(est_tokens_source).transpose()?.unwrap_or(0),
+                Some(value) => est_content(value),
+                None => content
+                    .map(|c| est_content_source(c, &[]))
+                    .transpose()?
+                    .unwrap_or_default(),
             }
         } else {
-            0
+            Est::default()
         };
         if opts.revive {
             for (index, block) in block_sources.into_iter().enumerate() {
+                if omitted.contains(&index) {
+                    continue;
+                }
                 if let Some(projected) = projected_blocks.get(&index) {
-                    estimate += est_tokens(&Value::Array(vec![projected.clone()]));
+                    estimate.add(est_block(projected));
                     continue;
                 }
                 block.with_view(|view| {
-                    let fields = Fields::parse(view, &["type", "text"])?;
-                    let ty = fields
-                        .as_ref()
-                        .map(|fields| fields.string("type"))
-                        .transpose()?
-                        .flatten();
-                    if ty.as_deref() == Some("image") {
-                        estimate += crate::ir::IMAGE_TOKENS;
-                    } else if ty.as_deref() == Some("text") {
-                        estimate += fields
-                            .as_ref()
-                            .and_then(|fields| fields.get("text"))
-                            .map(source_string_tokens)
-                            .transpose()?
-                            .unwrap_or(0);
-                    } else {
-                        let mut counter = LengthWriter(0);
-                        view.write_canonical_replacing(&replacements, &mut counter)?;
-                        estimate += crate::ir::est_tokens_bytes(counter.0, TEXT_BYTES_PER_TOKEN);
-                    }
+                    estimate.add(est_block_source(view, &replacements)?);
                     Ok(())
                 })?;
             }
@@ -1908,7 +2033,7 @@ fn classify_source(value: crate::json::JsonView<'_>) -> Result<(String, usize, u
             "text".into(),
             stats.lines(),
             0,
-            crate::ir::est_tokens_bytes(stats.bytes, TEXT_BYTES_PER_TOKEN),
+            crate::ir::est_tokens_bytes(stats.bytes, TokenKind::ToolResult),
         ));
     }
     let Some(blocks) = value.array()? else {
@@ -1922,7 +2047,7 @@ fn classify_source(value: crate::json::JsonView<'_>) -> Result<(String, usize, u
         any = true;
         let original = block?;
         let Some(block) = Fields::parse(original, &["type", "text"])? else {
-            tokens += crate::ir::est_tokens_bytes(usize::try_from(original.canonical_len()?)?, TEXT_BYTES_PER_TOKEN);
+            tokens += crate::ir::est_tokens_bytes(usize::try_from(original.canonical_len()?)?, TokenKind::ToolResult);
             continue;
         };
         match block.string("type")?.as_deref() {
@@ -1937,17 +2062,17 @@ fn classify_source(value: crate::json::JsonView<'_>) -> Result<(String, usize, u
                             text.append(chunk);
                             Ok(())
                         })?;
-                        tokens += crate::ir::est_tokens_bytes(text.bytes - before, TEXT_BYTES_PER_TOKEN);
+                        tokens += crate::ir::est_tokens_bytes(text.bytes - before, TokenKind::ToolResult);
                     }
                 }
             }
             Some("image") => {
                 images += 1;
-                tokens += crate::ir::IMAGE_TOKENS;
+                tokens += IMAGE_TOKENS;
             }
             _ => {
                 tokens +=
-                    crate::ir::est_tokens_bytes(usize::try_from(original.canonical_len()?)?, TEXT_BYTES_PER_TOKEN);
+                    crate::ir::est_tokens_bytes(usize::try_from(original.canonical_len()?)?, TokenKind::ToolResult);
             }
         }
     }
@@ -2079,16 +2204,6 @@ fn write_subagent_source(
     Ok(())
 }
 
-struct LengthWriter(usize);
-impl Write for LengthWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 += bytes.len();
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 fn write_source_payload(payload: &SourcePayload, writer: &mut impl Write) -> Result<()> {
     // Serialize the established struct layout, then replace only its own null content slot with
     // the shared canonical source writer. The slot follows input; rfind excludes nested inputs.
@@ -2157,6 +2272,12 @@ fn decision_facts(v: &Value, estimate: bool) -> Value {
             facts.insert(key.into(), value.clone());
         }
     }
+    link_facts(
+        &mut facts,
+        v.get("uuid"),
+        v.get("parentUuid"),
+        v.get("logicalParentUuid"),
+    );
     let mut message = serde_json::Map::new();
     if let Some(model) = v.pointer("/message/model") {
         message.insert("model".into(), model.clone());
@@ -2165,17 +2286,33 @@ fn decision_facts(v: &Value, estimate: bool) -> Value {
         message.insert("usage".into(), serde_json::json!({"input_tokens": usage_total(usage)}));
     }
     facts.insert("message".into(), Value::Object(message));
-    facts.insert(
-        "_prune_est".into(),
-        Value::from(if estimate { line_est_tokens(v) } else { 0 }),
-    );
+    if estimate { line_est(v) } else { Est::default() }.store(&mut facts);
     Value::Object(facts)
 }
 
-fn fact_est_tokens(v: &Value) -> u64 {
-    v.get("_prune_est")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| line_est_tokens(v))
+/// The record's place in the conversation tree (`_uuid`, `_parent`), so revive can tell the
+/// branch Claude Code resumes from abandoned ones.
+fn link_facts(
+    facts: &mut serde_json::Map<String, Value>,
+    uuid: Option<&Value>,
+    parent: Option<&Value>,
+    logical: Option<&Value>,
+) {
+    if let Some(uuid) = uuid.filter(|u| u.is_string()) {
+        facts.insert("_uuid".into(), uuid.clone());
+    }
+    // A root records `parentUuid: null`; a record with no `parentUuid` at all carries no tree.
+    if let Some(parent) = parent {
+        let parent = Some(parent)
+            .filter(|p| p.is_string())
+            .or(logical.filter(|p| p.is_string()));
+        facts.insert("_parent".into(), parent.cloned().unwrap_or(Value::Null));
+    }
+}
+
+/// A record's stored estimate, or one computed from the record itself.
+fn fact_est(v: &Value) -> Est {
+    Est::load(v).unwrap_or_else(|| line_est(v))
 }
 
 /// Rewrite trailing recorded usage using an estimated post-prune prompt size (`--revive`).
@@ -2190,6 +2327,7 @@ fn revive_staged(
     output: ByteSource,
     parsed: &[Option<Value>],
     pruned: &[bool],
+    before: Option<&[Option<Est>]>,
     windowed: bool,
     real_override: Option<u64>,
 ) -> Result<(ByteSource, usize, Option<u64>, Option<u64>)> {
@@ -2206,7 +2344,11 @@ fn revive_staged(
             })
             .map_or(0, |i| i + 1)
     };
-    let honest = honest_window_tokens(parsed, pruned, window, window == 0 && !windowed).max(real_override.unwrap_or(0));
+    let honest = before
+        .filter(|before| before.len() == parsed.len())
+        .and_then(|before| anchored_window_tokens(parsed, before, window))
+        .unwrap_or_else(|| honest_window_tokens(parsed, pruned, window, window == 0 && !windowed))
+        .max(real_override.unwrap_or(0));
     let mut rewritten = 0;
     let mut stale_max = 0;
     let mut stage = std::io::BufWriter::with_capacity(64 * 1024, ByteStage::new());
@@ -2312,12 +2454,169 @@ fn write_source_usage(view: crate::json::JsonView<'_>, total: u64, honest: u64, 
     Ok(())
 }
 
+/// Share of an estimated removal revive credits (measured removals ran up to 1.35× over on the
+/// claude-opus-4-6 tokenizer before [`crate::ir::tokenizer_scale`], 1.1× after).
+const REVIVE_REMOVAL_CREDIT: f64 = 0.8;
+/// Added content (markers, the turns after the last recorded prompt) is charged this much extra.
+const REVIVE_ADDED_MARGIN: f64 = 0.1;
+/// Final margin on the estimate: a pruned session near the window is held back rather than
+/// refused (calibration in the commit that set it).
+const REVIVE_SAFETY_MARGIN: f64 = 0.05;
+/// Models whose resumed requests were measured counting old thinking signatures (claude-opus-4-6,
+/// -4-7, -4-8, -opus-5, -fable-5, all resumed by Claude Code 2.1.299). Removing them frees context
+/// only there; for others (claude-fable-5-1, -opus-5-5, -sonnet-5 measured, and any unknown model)
+/// revive credits nothing, though their recorded usage once counted them.
+const SIGNATURES_COUNTED: [&str; 5] = [
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-fable-5",
+];
+/// Even there the transcript holds more signatures than Claude Code sends (it leaves some out),
+/// so a removed signature is credited at this share on top of [`REVIVE_REMOVAL_CREDIT`].
+const SIGNATURE_CREDIT: f64 = 0.6;
+
+/// The fixed prompt (system prompt, tool definitions) when no trustworthy recorded prompt implies
+/// it: Claude Code 2.1.299 sent 19–36k tokens of it with no MCP servers configured.
+const UNKNOWN_OVERHEAD_TOKENS: u64 = 20_000;
+
+/// The post-prune prompt size, anchored on recorded usage: the last recorded prompt, adjusted by
+/// what pruning changed before it, plus everything after it; floored by an outright estimate of
+/// the resumed branch plus the fixed overhead the recorded prompts imply.
+///
+/// A recorded prompt is not evidence when it is the first after the window's compaction boundary:
+/// it still carries the pre-compaction size revive exists to correct. With no other, only the
+/// outright estimate stands.
+///
+/// Removed thinking signatures are credited only for [`SIGNATURES_COUNTED`] models; everywhere
+/// else they are still counted as present (the estimate errs high). `None` when the window holds
+/// no turns.
+fn anchored_window_tokens(parsed: &[Option<Value>], before: &[Option<Est>], window: usize) -> Option<u64> {
+    // Claude Code resumes the branch ending at the newest turn; records on abandoned branches
+    // (edits, rewinds) are not sent, so their pruning frees nothing.
+    let chain = resumed_branch(parsed, window);
+    let main = |i: usize| {
+        parsed[i]
+            .as_ref()
+            .filter(|v| !is_sidechain(v) && chain.as_ref().is_none_or(|c| c.contains(&i)))
+    };
+    let lines = |lo: usize, hi: usize| (lo..hi).filter(move |i| main(*i).is_some());
+    let pre = |i: usize| before[i].unwrap_or_default();
+    let post = |i: usize| main(i).map(fact_est).unwrap_or_default();
+    lines(window, parsed.len()).next()?;
+    // One entry per provider response: the first record carrying its prompt size.
+    let mut responses: Vec<(usize, u64)> = Vec::new();
+    for i in lines(window, parsed.len()) {
+        let v = main(i)?;
+        let total = v
+            .get("_cv_orig_ctx")
+            .and_then(Value::as_u64)
+            .or_else(|| v.pointer("/message/usage").and_then(Value::as_object).map(usage_total))
+            .unwrap_or(0);
+        if total > 0 && responses.last().is_none_or(|(_, t)| *t != total) {
+            responses.push((i, total));
+        }
+    }
+    if window > 0 && !responses.is_empty() {
+        responses.remove(0);
+    }
+    let model = (window..parsed.len())
+        .rev()
+        .filter_map(main)
+        .find_map(|v| {
+            v.pointer("/message/model")
+                .and_then(Value::as_str)
+                .filter(|m| *m != "<synthetic>")
+        })
+        .unwrap_or("");
+    let scale = crate::ir::tokenizer_scale(model);
+    let size = |e: Est| e.tokens + e.signature + e.images * IMAGE_TOKENS;
+    let signature_credit = if SIGNATURES_COUNTED.contains(&model) {
+        SIGNATURE_CREDIT
+    } else {
+        0.0
+    };
+
+    // Floor: the whole resumed branch, estimated outright, plus the fixed overhead the recorded
+    // prompts imply — the smallest excess of any over the content before it, since a transcript
+    // that began from history held elsewhere implies far more.
+    let mut overhead = None::<u64>;
+    let mut prefix = Est::default();
+    let mut next = window;
+    for &(at, total) in &responses {
+        for i in lines(next, at) {
+            prefix.add(pre(i));
+        }
+        next = at;
+        let implied = total.saturating_sub(size(prefix));
+        overhead = Some(overhead.map_or(implied, |o| o.min(implied)));
+    }
+    let mut whole = Est::default();
+    for i in lines(window, parsed.len()) {
+        whole.add(post(i));
+    }
+    let overhead = overhead.unwrap_or(UNKNOWN_OVERHEAD_TOKENS);
+    let mut estimate = (overhead + size(whole)) as f64 / scale;
+
+    if let Some(&(anchor, recorded)) = responses.last() {
+        let mut anchored = recorded as f64;
+        for i in lines(window, anchor) {
+            let (a, b) = (pre(i), post(i));
+            let images = (b.images as f64 - a.images as f64) * IMAGE_TOKENS as f64;
+            let signature = b.signature as f64 - a.signature as f64;
+            for (delta, credit) in [
+                (b.tokens as f64 - a.tokens as f64, 1.0),
+                (signature, signature_credit),
+                (images, 0.5),
+            ] {
+                anchored += if delta < 0.0 {
+                    delta * credit * REVIVE_REMOVAL_CREDIT / scale
+                } else {
+                    delta * (1.0 + REVIVE_ADDED_MARGIN)
+                };
+            }
+        }
+        for i in lines(anchor, parsed.len()) {
+            anchored += size(post(i)) as f64 * (1.0 + REVIVE_ADDED_MARGIN);
+        }
+        estimate = estimate.max(anchored);
+    }
+    Some((estimate * (1.0 + REVIVE_SAFETY_MARGIN)).ceil() as u64)
+}
+
+/// Record indices on the branch ending at the window's newest turn, walking `parentUuid` (or
+/// `logicalParentUuid`) back. `None` when the newest turn records no `parentUuid` (no tree to walk).
+fn resumed_branch(parsed: &[Option<Value>], window: usize) -> Option<HashSet<usize>> {
+    let id = |i: usize, key: &str| parsed[i].as_ref()?.get(key)?.as_str();
+    let mut by_id = HashMap::new();
+    for i in window..parsed.len() {
+        if let Some(uuid) = id(i, "_uuid") {
+            by_id.insert(uuid, i);
+        }
+    }
+    let leaf = (window..parsed.len()).rev().find(|&i| {
+        parsed[i].as_ref().is_some_and(|v| {
+            !is_sidechain(v)
+                && matches!(v.get("type").and_then(Value::as_str), Some("user" | "assistant"))
+                && v.get("_uuid").is_some()
+        })
+    })?;
+    parsed[leaf].as_ref()?.get("_parent")?;
+    let mut chain = HashSet::new();
+    let mut at = Some(leaf);
+    while let Some(i) = at.filter(|i| chain.insert(*i)) {
+        at = id(i, "_parent").and_then(|p| by_id.get(p).copied());
+    }
+    Some(chain)
+}
+
 /// Honest post-prune token size of `parsed[window..]`, combining recorded-usage deltas with byte
 /// estimates, **span by span** (a span = the lines covered by one usage record, i.e. everything
 /// since the previous record).
 ///
 ///  * A span whose content was NOT touched by pruning: the recorded delta is real evidence of its
-///    cost, usually HIGHER than the 3.5 B/tok estimate — take `max(delta, estimate)` so we never
+///    cost, usually HIGHER than the byte estimate — take `max(delta, estimate)` so we never
 ///    write a figure lower than what the recorded evidence supports.
 ///  * A span holding a `[PRUNED …]` marker: the recorded delta measured the now-snipped payload, so
 ///    only the byte estimate of what's actually left is meaningful.
@@ -2333,7 +2632,7 @@ fn honest_window_tokens(parsed: &[Option<Value>], pruned: &[bool], window: usize
             .iter()
             .flatten()
             .filter(|v| !is_sidechain(v))
-            .map(fact_est_tokens)
+            .map(|v| fact_est(v).total())
             .sum()
     };
     let mut sum = 0u64;
@@ -2519,7 +2818,7 @@ fn prune_user_line(
                 .unwrap_or_else(|| ("unknown".into(), Value::Null));
             let marker = build_marker(&entry_id, &name, &input, &kind, size, line_count, new_id, opts.drop);
 
-            *tokens_saved += est_tokens(&content).saturating_sub(str_tokens(&marker));
+            *tokens_saved += tool_result_tokens(&content).saturating_sub(str_tokens(&marker));
             *images += img;
             if !opts.drop {
                 sidecar.push(SidecarEntry {
@@ -2576,15 +2875,15 @@ fn prune_user_line(
     }
 }
 
-/// Flatten large `thinking` blocks on one (old) assistant line. Each is replaced by a small **text**
-/// block carrying the marker (not a thinking block — keeping the original `signature` against altered
-/// text would fail Claude's validation on resume), with the original block stashed verbatim in the
-/// sidecar under `<line_key>#think<i>` (`line_key` = the line's uuid, or a file-position fallback).
+/// Omit every `thinking` block on one (old) assistant line: a marker would give the model
+/// nothing. The original block is stashed verbatim in the sidecar under `<line_key>#think<i>`
+/// (`line_key` = the line's uuid, or a file-position fallback), where `cv cat` finds it. A record
+/// left empty is removed after staging and its children relinked
+/// ([`crate::harness::claude::replay::drop_empty_records`]).
 #[allow(clippy::too_many_arguments)]
 fn prune_assistant_thinking(
     v: &mut Value,
     opts: &PruneOptions,
-    new_id: &str,
     line_key: &str,
     sidecar: &mut Vec<SidecarEntry>,
     count: &mut usize,
@@ -2594,50 +2893,42 @@ fn prune_assistant_thinking(
     let Some(blocks) = v.pointer_mut("/message/content").and_then(Value::as_array_mut) else {
         return;
     };
-    for (i, block) in blocks.iter_mut().enumerate() {
-        if block.get("type").and_then(Value::as_str) != Some("thinking") {
+    // An omitted block leaves `null` until [`drop_omitted_blocks`], so later passes keep the
+    // source's block indices (their sidecar ids name them).
+    for (i, slot) in blocks.iter_mut().enumerate() {
+        if slot.get("type").and_then(Value::as_str) != Some("thinking") {
             continue;
         }
+        let block = slot.take();
         // Every old thinking block goes, whatever its size — `--min-size` is a payload gate and does
-        // not apply here. Claude usually omits the reasoning text in the transcript but keeps a
-        // ~600-byte cryptographic `signature`, and on the wire that signature-only block still costs
-        // hundreds of tokens (Claude Code's own `thinking_drop` freed ~105k for 236 such blocks), so
-        // a byte gate would skip exactly the blocks that matter. Commit by cloning the block out
-        // (lossless), releasing the borrow before overwriting.
-        let size = value_byte_size(block);
+        // not apply here: a signature-only block still costs hundreds of tokens on the wire.
+        let size = value_byte_size(&block);
         let line_count = block
             .get("thinking")
             .and_then(Value::as_str)
-            .map(|t| t.lines().count().max(1))
-            .unwrap_or(1);
-        let original = block.clone();
-        let id = format!("{line_key}#think{i}");
-        let marker = build_marker(
-            &id,
-            "thinking",
-            &Value::Null,
-            "text",
-            size,
-            line_count,
-            new_id,
-            opts.drop,
-        );
-        *tokens_saved += str_tokens(&original.to_string()).saturating_sub(str_tokens(&marker));
+            .map_or(1, |t| t.lines().count().max(1));
+        *tokens_saved += est_block(&block).total();
         if !opts.drop {
             sidecar.push(SidecarEntry {
-                id,
+                id: format!("{line_key}#think{i}"),
                 slot: "thinking".into(),
                 name: "thinking".into(),
                 input: Value::Null,
-                content: original,
+                content: block,
                 size,
                 line_count,
                 kind: "text".into(),
             });
         }
-        *block = serde_json::json!({ "type": "text", "text": marker });
         *modified = true;
         *count += 1;
+    }
+}
+
+/// Remove the slots [`prune_assistant_thinking`] emptied.
+fn drop_omitted_blocks(v: &mut Value) {
+    if let Some(blocks) = v.pointer_mut("/message/content").and_then(Value::as_array_mut) {
+        blocks.retain(|block| !block.is_null());
     }
 }
 
@@ -3047,45 +3338,138 @@ fn value_byte_size(v: &Value) -> usize {
 }
 
 fn str_tokens(s: &str) -> u64 {
-    crate::ir::est_tokens_bytes(s.len(), TEXT_BYTES_PER_TOKEN)
+    crate::ir::est_str_tokens(s, TokenKind::Text)
 }
 
-/// Estimate the context-token cost of a content value (text + image tiles).
-/// Byte-estimated tokens one line contributes to the loaded prompt: `message.content` for a turn,
+/// One record's estimated prompt contribution, in the parts revive weighs differently: whether
+/// signatures count is decided per session from recorded usage, and removed images are credited
+/// cautiously (one image measured anywhere from 1.4k to 4.2k tokens).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Est {
+    /// Everything but signatures and images.
+    tokens: u64,
+    signature: u64,
+    images: u64,
+}
+impl Est {
+    fn add(&mut self, other: Est) {
+        self.tokens += other.tokens;
+        self.signature += other.signature;
+        self.images += other.images;
+    }
+    fn total(self) -> u64 {
+        self.tokens + self.signature + self.images * IMAGE_TOKENS
+    }
+    fn store(self, facts: &mut serde_json::Map<String, Value>) {
+        facts.insert("_prune_est".into(), Value::from(self.tokens));
+        facts.insert("_prune_sig".into(), Value::from(self.signature));
+        facts.insert("_prune_img".into(), Value::from(self.images));
+    }
+    fn load(facts: &Value) -> Option<Est> {
+        let part = |key: &str| facts.get(key).and_then(Value::as_u64);
+        Some(Est {
+            tokens: part("_prune_est")?,
+            signature: part("_prune_sig").unwrap_or(0),
+            images: part("_prune_img").unwrap_or(0),
+        })
+    }
+}
+
+/// Estimated tokens one line contributes to the loaded prompt: `message.content` for a turn,
 /// `rendered[].content` for a model-visible attachment (Claude Code appends exactly that text to
 /// the prompt; an attachment with nothing rendered costs nothing), zero for bookkeeping. Sidechain
 /// filtering is the caller's job.
-fn line_est_tokens(v: &Value) -> u64 {
+fn line_est(v: &Value) -> Est {
     match v.get("type").and_then(Value::as_str) {
-        Some("user" | "assistant") => v.pointer("/message/content").map(est_tokens).unwrap_or(0),
-        Some("attachment") => v
-            .get("rendered")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|i| i.get("content").and_then(Value::as_str))
-                    .map(str_tokens)
-                    .sum()
-            })
-            .unwrap_or(0),
-        _ => 0,
+        Some("user" | "assistant") => v.pointer("/message/content").map(est_content).unwrap_or_default(),
+        Some("attachment") => Est {
+            tokens: v
+                .get("rendered")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|i| i.get("content").and_then(Value::as_str))
+                        .map(|text| BLOCK_TOKENS + str_tokens(text))
+                        .sum()
+                })
+                .unwrap_or(0),
+            ..Est::default()
+        },
+        _ => Est::default(),
     }
 }
 
-fn est_tokens(content: &Value) -> u64 {
+/// Estimated tokens of a `message.content` value.
+fn est_content(content: &Value) -> Est {
     match content {
-        Value::String(s) => str_tokens(s),
-        Value::Array(arr) => arr
-            .iter()
-            .map(|b| match b.get("type").and_then(Value::as_str) {
-                Some("image") => crate::ir::IMAGE_TOKENS,
-                Some("text") => str_tokens(b.get("text").and_then(Value::as_str).unwrap_or("")),
-                _ => str_tokens(&b.to_string()),
-            })
-            .sum(),
-        other => str_tokens(&other.to_string()),
+        Value::String(s) => Est {
+            tokens: BLOCK_TOKENS + str_tokens(s),
+            ..Est::default()
+        },
+        Value::Array(blocks) => {
+            let mut total = Est::default();
+            for block in blocks {
+                total.add(est_block(block));
+            }
+            total
+        }
+        other => Est {
+            tokens: crate::ir::est_str_tokens(&other.to_string(), TokenKind::ToolResult),
+            ..Est::default()
+        },
     }
+}
+
+/// A tool result's `content`, as [`est_block`] prices it inside its block.
+fn tool_result_tokens(content: &Value) -> u64 {
+    est_block(&serde_json::json!({"type": "tool_result", "content": content}))
+        .total()
+        .saturating_sub(BLOCK_TOKENS)
+}
+
+/// One content block: [`BLOCK_TOKENS`] plus each field at its [`TokenKind`] rate.
+fn est_block(block: &Value) -> Est {
+    use crate::ir::{est_str_tokens, est_tokens_bytes};
+    let field = |key: &str| block.get(key).and_then(Value::as_str).unwrap_or("");
+    let mut est = Est {
+        tokens: BLOCK_TOKENS,
+        ..Est::default()
+    };
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => est.tokens += str_tokens(field("text")),
+        Some("image") => est.images += 1,
+        Some("tool_use") => {
+            est.tokens += est_tokens_bytes(
+                block.get("input").map_or(0, |input| input.to_string().len()),
+                TokenKind::ToolInput,
+            )
+        }
+        Some("tool_result") => match block.get("content") {
+            Some(Value::String(text)) => est.tokens += est_str_tokens(text, TokenKind::ToolResult),
+            Some(Value::Array(items)) => {
+                for item in items {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("image") => est.images += 1,
+                        Some("text") => {
+                            let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                            est.tokens += est_str_tokens(text, TokenKind::ToolResult);
+                        }
+                        _ => est.tokens += est_str_tokens(&item.to_string(), TokenKind::ToolResult),
+                    }
+                }
+            }
+            Some(Value::Null) | None => {}
+            Some(other) => est.tokens += est_str_tokens(&other.to_string(), TokenKind::ToolResult),
+        },
+        Some("thinking") => {
+            est.tokens += str_tokens(field("thinking"));
+            est.signature += est_tokens_bytes(field("signature").len(), TokenKind::Signature);
+        }
+        Some("redacted_thinking") => est.signature += est_tokens_bytes(field("data").len(), TokenKind::Signature),
+        _ => est.tokens += est_str_tokens(&block.to_string(), TokenKind::ToolResult),
+    }
+    est
 }
 
 /// A compact key=value summary of the tool's most telling arguments, for the marker.
@@ -3160,90 +3544,36 @@ fn build_marker(
 }
 
 /// Recursively copy a directory tree (used to carry `subagents/`/`workflows/` into the new session).
-fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
-    reject_resource_symlink(dst)?;
-    if resource_location(dst)?.starts_with(std::fs::canonicalize(src)?) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "resource destination aliases or lies inside source",
-        ));
+/// Copy the session's resource directory into a private staged directory beside `dst`.
+fn stage_resources(src: &Path, dst: &Path) -> Result<crate::publish::StagedDir> {
+    // Replacing `dst` deletes the tree it held; that must never hold the source.
+    if let (Ok(src), Ok(dst)) = (std::fs::canonicalize(src), std::fs::canonicalize(dst)) {
+        anyhow::ensure!(
+            !src.starts_with(dst),
+            "resource destination contains the source resources"
+        );
     }
-    std::fs::create_dir_all(dst)?;
+    let staged = crate::publish::StagedDir::beside(dst, "prune-resources")?;
+    copy_dir(src, staged.path()).with_context(|| format!("copying session resources to {}", dst.display()))?;
+    Ok(staged)
+}
+
+/// Copy `src` into `dst`, a directory this operation just created: every entry is new.
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if entry.file_type()?.is_dir() {
+            std::fs::create_dir(&to)?;
             copy_dir(&from, &to)?;
         } else {
-            copy_resource_file(&from, &to)?;
+            let mut source = std::fs::File::open(&from)?;
+            let mut target = std::fs::OpenOptions::new().write(true).create_new(true).open(&to)?;
+            std::io::copy(&mut source, &mut target)?;
+            target.set_permissions(source.metadata()?.permissions())?;
         }
     }
-    Ok(())
-}
-
-/// Resolve existing ancestors too: a not-yet-created child of the source is still inside it.
-fn resource_location(path: &Path) -> std::io::Result<PathBuf> {
-    match std::fs::canonicalize(path) {
-        Ok(path) => Ok(path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let name = path.file_name().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "resource destination has no filename")
-            })?;
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            Ok(resource_location(parent)?.join(name))
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn reject_resource_symlink(path: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "resource destination is a symlink",
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn copy_resource_file(src: &Path, dst: &Path) -> std::io::Result<()> {
-    reject_resource_symlink(dst)?;
-    let mut source = std::fs::File::open(src)?;
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dst)?;
-    reject_resource_symlink(dst)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let from = source.metadata()?;
-        let to = target.metadata()?;
-        if from.dev() == to.dev() && from.ino() == to.ino() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "resource destination aliases source file",
-            ));
-        }
-    }
-    #[cfg(not(unix))]
-    if std::fs::canonicalize(src)? == std::fs::canonicalize(dst)? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "resource destination aliases source file",
-        ));
-    }
-    target.set_len(0)?;
-    std::io::copy(&mut source, &mut target)?;
-    target.flush()?;
-    target.set_permissions(source.metadata()?.permissions())?;
     Ok(())
 }
 
