@@ -2335,6 +2335,69 @@ fn fmt_age_ns(ns: i64) -> String {
     }
 }
 
+/// Whether an incremental [`index_sessions`] pass at `dir` would find any work — the gate behind
+/// `cv index --if-changed`, meant for timers that fire whether or not the corpus moved.
+/// `Some(false)` only on a measured quiet window: every discovered session's signature still
+/// matches its indexed stamp AND every top-level indexed id still names a live session (a
+/// removal is reap work). With `subagents`, folded sub-agent docs are also checked against
+/// their stored source path — a forest pass owns them; a plain pass leaves them alone, so
+/// their drift is not its work. `None` when the index can't be opened or read: callers should
+/// run the pass, the same way an unmeasurable [`staleness`] keeps the footer silent.
+///
+/// A session counts as drift only when its source is **landable** — readable and nonempty —
+/// because a pass can only stamp what it can read. A permanently-unreadable file (e.g. one
+/// under another user's root) or an empty transcript would fail the same way every pass, so
+/// counting it would pin the gate open forever; its stored doc, if any, keeps serving the
+/// same preview a live read misses.
+///
+/// The inventory is [`cv_core::sessions`] — the catalog's stat-only freshness probe, not a
+/// fleet scan — and each session pays one `stat` for its signature, the same per-call cost
+/// [`staleness`] already spends on every search.
+pub fn pass_needed(dir: &Path, subagents: bool) -> Option<bool> {
+    pass_needed_over(dir, &cv_core::sessions(), subagents)
+}
+
+/// A signature a pass could stamp: the file stats cleanly and is nonempty — the same bar
+/// [`cv_core::offsets::sig_is_fresh`] sets for "already indexed".
+fn landable(sig: (i64, i64)) -> bool {
+    sig.0 != 0 && sig.1 > 0
+}
+
+/// [`pass_needed`] over a caller-supplied inventory — the split that lets a unit test feed
+/// fixture refs rather than a real corpus (`pass_needed` itself goes through the catalog).
+fn pass_needed_over(dir: &Path, refs: &[cv_core::SessionRef], subagents: bool) -> Option<bool> {
+    let (index, f) = open_existing(dir).ok()?;
+    let (sigs, folded, meta, _) = read_indexed_metadata(&index, &f, subagents).ok()?;
+    let live: HashSet<&str> = refs.iter().map(|r| r.id.as_str()).collect();
+    // A live session whose source moved since its stamp — or that no pass has ever seen.
+    if refs.iter().any(|r| {
+        let cur = cv_core::offsets::file_sig(&cv_core::source::primary_path(r));
+        landable(cur) && sigs.get(&r.id).copied() != Some(cur)
+    }) {
+        return Some(true);
+    }
+    // Indexed work the inventory no longer explains: a vanished top-level session is reap
+    // work on any pass; a folded sub-agent doc only when this pass would fold the forest.
+    for (id, &sig) in &sigs {
+        if live.contains(id.as_str()) {
+            continue;
+        }
+        if !folded.contains(id) {
+            return Some(true);
+        }
+        if subagents {
+            let stale = meta.get(id).is_none_or(|m| {
+                let cur = cv_core::offsets::file_sig(Path::new(&m.path));
+                landable(cur) && cur != sig
+            });
+            if stale {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
 /// Whether the index holds any folded-in sub-agent transcripts (the `cv index --subagents` forest,
 /// detected by a stored `parent_id` on a doc). The empty-result path uses this to nudge toward
 /// `--subagents` **only** when the forest is genuinely absent — not when a query simply didn't
@@ -7228,6 +7291,88 @@ mod tests {
 
         let refs = vec![sref("old", "one", p), sref("new", "two", p2)];
         assert_eq!(staleness_over(&dir, &refs).map(|s| s.stale_sessions), Some(1));
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// `cv index --if-changed` is the timer's gate: a measured-quiet corpus must answer "no
+    /// work", and every kind of drift — grown, never-indexed, removed — must answer "run".
+    /// A missing index answers `None` so the caller runs anyway.
+    #[test]
+    fn pass_needed_quiet_then_each_kind_of_drift() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let p = write_claude(&sdir, "s1", "alpha corpus seed");
+        let p2 = write_claude(&sdir, "s2", "beta second session");
+        let r1 = sref("s1", "one", p.clone());
+        let r2 = sref("s2", "two", p2.clone());
+
+        // No index at all → unmeasurable → the caller runs.
+        assert_eq!(pass_needed_over(&dir, &[r1.clone()], false), None);
+
+        index_refs(&dir, &[r1.clone(), r2.clone()], false).unwrap();
+        assert_eq!(
+            pass_needed_over(&dir, &[r1.clone(), r2.clone()], false),
+            Some(false),
+            "a measured-quiet window must skip the pass"
+        );
+
+        // Removal: an indexed id the corpus no longer reports is reap work.
+        assert_eq!(pass_needed_over(&dir, &[r1.clone()], false), Some(true));
+
+        // Arrival: a live session no pass has stamped is work.
+        index_refs(&dir, &[r1.clone()], false).unwrap();
+        assert_eq!(pass_needed_over(&dir, &[r1.clone(), r2.clone()], false), Some(true));
+
+        // Growth: an appended transcript's signature no longer matches its stamp.
+        index_refs(&dir, &[r1.clone(), r2.clone()], false).unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", serde_json::json!({"type":"user","uuid":"u2","sessionId":"s1","message":{"role":"user","content":"gamma appended"}})).unwrap();
+        drop(f);
+        assert_eq!(pass_needed_over(&dir, &[r1.clone(), r2.clone()], false), Some(true));
+
+        // Caught up again → quiet.
+        index_refs_incremental(&dir, &[r1.clone(), r2.clone()]).unwrap();
+        assert_eq!(pass_needed_over(&dir, &[r1, r2], false), Some(false));
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// A folded sub-agent transcript is a forest pass's work, not a plain pass's: its growth
+    /// must open the gate under `--subagents` and stay invisible without it.
+    #[test]
+    fn pass_needed_folded_drift_counts_only_for_forest_passes() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let parent = write_claude(&sdir, "parent1", "alpha parent");
+        let agent = write_subagent(&parent, "agent1", "alpha child");
+        let refs = vec![sref("parent1", "one", parent)];
+
+        index_refs_with_subagents(&dir, &refs, false).unwrap();
+        assert_eq!(pass_needed_over(&dir, &refs, true), Some(false));
+        assert_eq!(pass_needed_over(&dir, &refs, false), Some(false));
+
+        // Grow only the folded transcript.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&agent).unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", serde_json::json!({"type":"user","uuid":"a2","sessionId":"agent-agent1","message":{"role":"user","content":"beta child growth"}})).unwrap();
+        drop(f);
+
+        assert_eq!(
+            pass_needed_over(&dir, &refs, false),
+            Some(false),
+            "a plain pass leaves folded docs alone — their drift is not its work"
+        );
+        assert_eq!(
+            pass_needed_over(&dir, &refs, true),
+            Some(true),
+            "a forest pass owns folded docs — their drift must open the gate"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&sdir).ok();

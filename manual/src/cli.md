@@ -929,6 +929,7 @@ cv index                # full-text (tantivy) index (top-level sessions)
 cv index --semantic     # also build embeddings for `cv search --semantic`
 cv index --subagents    # also fold the sub-agent / workflow forest into the index + events
 cv index --rebuild      # clear and rebuild from scratch
+cv index --if-changed   # skip the pass when nothing changed since the last index
 ```
 
 ```text
@@ -939,6 +940,13 @@ embedded 2245 session(s) → ~/.clustervision/embeddings.bin
 ```
 
 Incremental by default: only changed/new sessions are re-indexed and vanished ones reaped.
+
+`--if-changed` goes one step further for scheduled callers (a systemd timer, cron): before
+touching anything it asks whether a pass would find work at all — every session's on-disk
+signature still matching its indexed stamp and no indexed session gone — through the same
+stat-only staleness probe the `cv search` footer uses. On a quiet window it prints a skip
+line and exits in well under a second instead of paying a whole pass for nothing. An explicit
+bare `cv index` still means "run now", and `--rebuild` refuses the combination outright.
 
 `--semantic` also computes embeddings (a ~30 MB model downloads the first time). `--subagents`
 also indexes the **sub-agent / workflow forest**, tagged with parent session, workflow run and

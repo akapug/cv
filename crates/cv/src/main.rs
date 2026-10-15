@@ -973,6 +973,11 @@ enum Cmd {
         /// hundreds of transcripts to ingest. Without it, only top-level sessions are indexed.
         #[arg(long)]
         subagents: bool,
+        /// Skip the pass when a stat-only probe shows nothing changed since the last index —
+        /// for timers and other scheduled callers that fire whether or not the corpus moved.
+        /// An explicit bare `cv index` still means "run now".
+        #[arg(long, conflicts_with = "rebuild")]
+        if_changed: bool,
     },
     /// View the user config (`~/.config/clustervision/config.toml`) and manage the export-source index.
     /// With no flag, prints the config path + registered export sources. Account data exports
@@ -1241,7 +1246,8 @@ fn run() -> Result<()> {
             semantic,
             rebuild,
             subagents,
-        } => search::cmd_index(semantic, rebuild, subagents),
+            if_changed,
+        } => search::cmd_index(semantic, rebuild, subagents, if_changed),
         Cmd::Events {
             id,
             harness,
