@@ -2262,19 +2262,77 @@ pub fn newest_indexed_mtime(dir: &Path) -> Option<i64> {
     sigs.values().filter(|(_, size)| *size >= 0).map(|&(mt, _)| mt).max()
 }
 
-/// Whole days the index at `dir` lags the newest session file on disk, when ≥ 1 — the note a
-/// search miss prints. The sessions come from the catalog ([`cv_core::sessions`], which probes
-/// its freshness and rescans only what changed), then one stat each; a full `discover_all` here
-/// made every miss pay a fleet scan.
-pub fn days_behind(dir: &Path) -> Option<u64> {
-    const DAY_NS: i64 = 86_400 * 1_000_000_000;
-    let indexed = newest_indexed_mtime(dir)?;
-    let newest_on_disk = cv_core::sessions()
-        .iter()
-        .map(|r| cv_core::offsets::file_sig(&cv_core::source::primary_path(r)).0)
-        .max()?;
-    let days = newest_on_disk.saturating_sub(indexed) / DAY_NS;
-    (days >= 1).then_some(days as u64)
+/// How far the index at `dir` trails the live session corpus — the data the search footer's
+/// staleness disclosure names. `stale_sessions` counts sessions whose primary source signature no
+/// longer matches their indexed stamp (grew, rewrote, or arrived since the last pass); `behind_ns`
+/// is the gap between the index's newest stamp and the newest session file on disk. `None` when
+/// the index can't be opened or holds no meta docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Staleness {
+    pub stale_sessions: usize,
+    pub behind_ns: i64,
+}
+
+/// The staleness probe. The sessions come from the catalog ([`cv_core::sessions`], which probes
+/// its freshness and rescans only what changed), then one stat each — the same cost this call's
+/// miss-path predecessor paid; a full `discover_all` here made every miss pay a fleet scan.
+pub fn staleness(dir: &Path) -> Option<Staleness> {
+    staleness_over(dir, &cv_core::sessions())
+}
+
+/// [`staleness`] over a caller-supplied inventory — the split that lets a unit test feed the
+/// fixture's refs rather than a real corpus discovery.
+fn staleness_over(dir: &Path, refs: &[cv_core::SessionRef]) -> Option<Staleness> {
+    let (index, f) = open_existing(dir).ok()?;
+    let (sigs, _) = read_indexed_sigs(&index, &f).ok()?;
+    let indexed = sigs.values().filter(|(_, size)| *size >= 0).map(|&(mt, _)| mt).max()?;
+    let mut stale_sessions = 0usize;
+    let mut newest_on_disk = 0i64;
+    for r in refs {
+        let cur = cv_core::offsets::file_sig(&cv_core::source::primary_path(r));
+        newest_on_disk = newest_on_disk.max(cur.0);
+        if !sigs
+            .get(&r.id)
+            .is_some_and(|&stored| cv_core::offsets::sig_is_fresh(stored, cur))
+        {
+            stale_sessions += 1;
+        }
+    }
+    Some(Staleness {
+        stale_sessions,
+        behind_ns: newest_on_disk.saturating_sub(indexed),
+    })
+}
+
+/// The one-sentence staleness disclosure every search surface prints — on a hit list it warns the
+/// rows may be behind, on a miss it names the likely reason a recent conversation wasn't found.
+/// `None` when the index is caught up (or unmeasurable).
+pub fn staleness_note(dir: &Path) -> Option<String> {
+    staleness(dir).as_ref().and_then(staleness_line)
+}
+
+/// The note text for a measured [`Staleness`], `None` when caught up — the pure split the unit
+/// test asserts on (`staleness` itself goes through the fleet catalog's discovery).
+fn staleness_line(s: &Staleness) -> Option<String> {
+    if s.stale_sessions == 0 {
+        return None;
+    }
+    Some(format!(
+        "the index is ~{} behind for {} session(s) — run `cv index`",
+        fmt_age_ns(s.behind_ns),
+        s.stale_sessions
+    ))
+}
+
+/// `7s` / `14m` / `9h` / `3d` — the compact age the staleness note carries.
+fn fmt_age_ns(ns: i64) -> String {
+    let secs = (ns / 1_000_000_000).max(0);
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3_599 => format!("{}m", secs / 60),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
+    }
 }
 
 /// Whether the index holds any folded-in sub-agent transcripts (the `cv index --subagents` forest,
@@ -7123,5 +7181,55 @@ mod tests {
         });
         let report_path = std::env::var_os("CV_COMPACTION_CONTROL_REPORT").unwrap();
         std::fs::write(report_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+
+    /// Regression for the live-staleness disclosure: a session that grows after indexing must be
+    /// counted by [`staleness_over`], and a fresh index must report none — the footer `cv search`
+    /// appends is only honest if both directions hold.
+    #[test]
+    fn staleness_counts_grown_sessions_then_goes_quiet() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let p = write_claude(&sdir, "s1", "alpha corpus seed");
+        let refs = vec![sref("s1", "one", p.clone())];
+
+        index_refs(&dir, &refs, false).unwrap();
+        // A fresh index over the same files reports no staleness — the footer stays off.
+        assert_eq!(staleness_over(&dir, &refs).map(|s| s.stale_sessions), Some(0));
+        assert_eq!(staleness_line(&staleness_over(&dir, &refs).unwrap()), None);
+
+        // Grow the transcript on disk: its signature no longer matches its stamp → counted, and
+        // the note names the count and the cure.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        use std::io::Write as _;
+        writeln!(f, "{}", serde_json::json!({"type":"user","uuid":"u2","sessionId":"s1","message":{"role":"user","content":"beta appended"}})).unwrap();
+        let s = staleness_over(&dir, &refs).expect("index present");
+        assert_eq!(s.stale_sessions, 1, "the grown session must count as stale");
+        assert!(s.behind_ns >= 0);
+        let note = staleness_line(&s).expect("a stale session must produce the note");
+        assert!(note.contains("behind for 1 session"), "{note}");
+        assert!(note.contains("cv index"), "{note}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// A session the index has never seen counts as stale too — a hit list that can't contain it
+    /// must disclose the gap.
+    #[test]
+    fn staleness_counts_unindexed_sessions() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let p = write_claude(&sdir, "old", "alpha already indexed");
+        let p2 = write_claude(&sdir, "new", "beta never indexed");
+        index_refs(&dir, &[sref("old", "one", p.clone())], false).unwrap();
+
+        let refs = vec![sref("old", "one", p), sref("new", "two", p2)];
+        assert_eq!(staleness_over(&dir, &refs).map(|s| s.stale_sessions), Some(1));
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
     }
 }
