@@ -1856,10 +1856,16 @@ mod tests {
     #[test]
     fn append_only_log_truncated_or_rewritten_after_capture_is_still_a_source_change() {
         for (label, mutate) in [
-            ("truncate", (|p: &Path| std::fs::write(p, b"{\"a\":1}\n").unwrap()) as fn(&Path)),
+            (
+                "truncate",
+                (|p: &Path| std::fs::write(p, b"{\"a\":1}\n").unwrap()) as fn(&Path),
+            ),
             ("same-length rewrite", |p| {
                 std::fs::write(p, b"{\"z\":9}\n{\"b\":2}\n").unwrap();
-                std::fs::File::open(p).unwrap().set_modified(SystemTime::UNIX_EPOCH).unwrap();
+                std::fs::File::open(p)
+                    .unwrap()
+                    .set_modified(SystemTime::UNIX_EPOCH)
+                    .unwrap();
             }),
             ("replace with a larger file", |p| {
                 let next = p.with_extension("next");
