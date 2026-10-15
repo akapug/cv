@@ -488,6 +488,8 @@ impl Probe {
     fn dependency_entries(&mut self, r: &SessionRef, primary: &Path) -> Option<Vec<Entry>> {
         let mut files = Vec::new();
         let mut directories = Vec::new();
+        // Directories declared by their OWN identity, never expanded file by file.
+        let mut declared_only: Vec<PathBuf> = Vec::new();
         let ext = r.path.extension().and_then(|e| e.to_str());
         let sqlite = is_sqlite_source(r)?;
         if sqlite {
@@ -512,7 +514,15 @@ impl Probe {
                     .find(|p| p.file_name().is_some_and(|n| n == "subagents" || n == "workflows"))
                     .and_then(Path::parent)
                 {
-                    directories.push(session.join("tool-results"));
+                    // A SUB-AGENT's dependency on its parent's spilled tool outputs is the
+                    // DIRECTORY, not a second copy of the parent's own inventory. Expanding it
+                    // wrote the parent's whole listing into every agent's stamp — measured at
+                    // 2,198 files on one row whose parse had read 25 of them, 3.72 GB of this
+                    // consumer's 3.74 GB — and the parent's own row still declares every file.
+                    // The directory's identity catches a file APPEARING, and the files this
+                    // agent actually consumed are in its read set, which `Stamp::matches`
+                    // compares in its own right.
+                    declared_only.push(session.join("tool-results"));
                 }
                 if let Some(config) = r
                     .path
@@ -693,6 +703,9 @@ impl Probe {
                 let state = self.entry(file)?.state;
                 entries.insert(file.clone(), state);
             }
+        }
+        for dir in declared_only {
+            entries.insert(dir.clone(), self.entry(&dir)?.state);
         }
         for file in files {
             // A directory adapter's append file belongs to the primary signature and sampled
@@ -1101,6 +1114,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_folded_agents_stamp_declares_the_parents_tool_results_as_one_directory() {
+        let world = crate::test_world("folded-agent-tool-results");
+        let project = world.base.join("claude").join("projects").join("-slug");
+        let session = project.join("sess");
+        let subs = session.join("subagents");
+        let spilled = session.join("tool-results");
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::create_dir_all(&spilled).unwrap();
+        std::fs::write(session.with_extension("jsonl"), "{}\n").unwrap();
+        for name in ["x.txt", "y.txt", "z.txt"] {
+            std::fs::write(spilled.join(name), "spilled tool output").unwrap();
+        }
+        let agent_path = subs.join("agent-a1.jsonl");
+        std::fs::write(&agent_path, "{}\n").unwrap();
+
+        let parent = SessionRef::new("sess", Harness::Claude, session.with_extension("jsonl"));
+        let agent = SessionRef::new("agent-a1", Harness::Claude, &agent_path);
+        let parent_entries = Probe::default().dependencies(&parent).unwrap().records().unwrap().entries;
+        let agent_entries = Probe::default().dependencies(&agent).unwrap().records().unwrap().entries;
+
+        // The parent declares its own spilled outputs file by file...
+        assert!(
+            parent_entries.iter().any(|e| e.path == spilled.join("x.txt")),
+            "the parent still inventories its own tool-results: {parent_entries:?}"
+        );
+        // ...and the agent declares that DIRECTORY once, and none of its files.
+        assert!(
+            agent_entries.iter().any(|e| e.path == spilled),
+            "the agent declares the parent's tool-results directory: {agent_entries:?}"
+        );
+        assert!(
+            !agent_entries
+                .iter()
+                .any(|e| e.path.starts_with(&spilled) && e.path != spilled),
+            "the agent must not copy the parent's file inventory: {agent_entries:?}"
+        );
+
+        // A file APPEARING there still invalidates the agent: the directory's own identity moves.
+        let before = Probe::default().snapshot(&agent).with_reads(&ReadSet::default());
+        std::fs::write(spilled.join("new.txt"), "later output").unwrap();
+        assert!(!unchanged(&agent, &before), "a new spilled file invalidates the agent");
+        std::fs::remove_file(spilled.join("new.txt")).unwrap();
+
+        // A rewrite of a file the agent READ invalidates it too, carried by the read set rather
+        // than by the inventory the trim removed.
+        let mut reads = ReadSet::default();
+        reads.record(&spilled.join("x.txt"));
+        let read_before = Probe::default().snapshot(&agent).with_reads(&reads);
+        std::fs::write(spilled.join("x.txt"), "rewritten tool output").unwrap();
+        assert!(
+            !unchanged(&agent, &read_before),
+            "a read file's rewrite invalidates the agent"
+        );
     }
 
     #[test]

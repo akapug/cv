@@ -4,6 +4,8 @@
 
 - Incremental passes over the sub-agent forest stat unchanged transcripts instead of re-parsing the whole forest.
 
+- Sub-agent rows stop duplicating their parent's spilled-output inventory, shrinking the catalog and every pass over it.
+
 - SQLite readers cannot create harness WAL sidecars when a rollback-mode database switches to WAL during a read.
 
 - New-name publication fails safely when neither hard links nor exclusive rename are supported, instead of risking overwriting a concurrent writer.
