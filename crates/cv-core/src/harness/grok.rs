@@ -745,7 +745,8 @@ mod tests {
             .iter()
             .flat_map(|m| &m.content)
             .any(|b| matches!(b, Block::ToolUse { id, input: crate::Json::Source(_), .. } if id == "structured")));
-        fs::write(&path, format!("{body}\n")).unwrap();
+        // Truncation, not growth: an append-only log may grow under a retained source.
+        fs::write(&path, "").unwrap();
         assert!(serde_json::to_value(&resumed.messages).is_err());
     }
 

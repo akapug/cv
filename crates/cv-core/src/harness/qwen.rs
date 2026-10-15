@@ -795,7 +795,8 @@ mod tests {
                 .map(|(_, cp)| cp)
                 .collect::<Vec<_>>()
         );
-        std::fs::write(&path, format!("{body}\n")).unwrap();
+        // Truncation, not growth: an append-only log may grow under a retained source.
+        std::fs::write(&path, "").unwrap();
         assert!(serde_json::to_value(&resumed.messages).is_err());
     }
 

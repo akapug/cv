@@ -564,8 +564,8 @@ fn checked_grok_qwen_complete_selected_producer_matches_owned() -> Result<()> {
             )?;
         }
         let wire = adapter.resume_source(&reference);
-        let mut file = std::fs::OpenOptions::new().append(true).open(&wire)?;
-        file.write_all(b"\nchanged source\n")?;
+        // Truncation, not growth: an append-only log may grow under a selected source.
+        std::fs::write(&wire, b"")?;
         let absent = world.base.join(format!("changed-{target}"));
         assert!(emit(&selected, target, &absent, &EmitOptions::default()).is_err());
         assert!(!absent.exists());

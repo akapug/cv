@@ -1599,12 +1599,8 @@ fn retrieve_bounds_available_ids_and_rejects_captured_source_changes() {
     );
     let captured = crate::json::JsonSource::capture(&path).unwrap();
     let file = std::fs::File::open(&path).unwrap();
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap()
-        .write_all(b"\n")
-        .unwrap();
+    // Truncation, not growth: an append-only log may grow under a captured source.
+    std::fs::write(&path, b"").unwrap();
     assert!(retrieve_captured(&captured, &file, &path, "id-0").is_err());
 }
 

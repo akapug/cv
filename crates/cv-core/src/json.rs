@@ -67,6 +67,10 @@ pub(crate) struct JsonSource(Arc<CapturedSource>);
 struct CapturedSource {
     path: PathBuf,
     identity: Identity,
+    /// Line-delimited logs are append-only by contract: a writer may still be adding records
+    /// after capture. Growth of the same file leaves the captured prefix intact, so it is not a
+    /// change; truncation, replacement and same-length rewrites still are.
+    appendable: bool,
     reads: Option<Arc<crate::source::ReadSet>>,
     decoded: std::sync::Mutex<Option<Arc<crate::harness::store::bytes::ByteSource>>>,
 }
@@ -82,6 +86,13 @@ impl std::hash::Hash for CapturedSource {
         self.identity.hash(state);
         self.reads.hash(state);
     }
+}
+/// Extensions of line-delimited logs that harnesses append to while a session is live.
+const APPEND_ONLY_EXTENSIONS: &[&str] = &["jsonl", "ndjson"];
+fn is_append_only_log(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| APPEND_ONLY_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Identity {
@@ -152,6 +163,7 @@ impl JsonSource {
         let path = std::path::absolute(path).context("locating JSON source")?;
         let identity = Identity::read(&path)?;
         Ok(Self(Arc::new(CapturedSource {
+            appendable: is_append_only_log(&path),
             path,
             identity,
             reads,
@@ -160,11 +172,20 @@ impl JsonSource {
     }
     pub(crate) fn check(&self) -> Result<()> {
         anyhow::ensure!(
-            Identity::read(&self.0.path)? == self.0.identity,
+            self.holds(&Identity::read(&self.0.path)?),
             "JSON source changed: {}",
             self.0.path.display()
         );
         self.check_reads()
+    }
+    /// Whether the file as observed now still carries every byte captured: identical, or for an
+    /// append-only log the same file grown.
+    fn holds(&self, now: &Identity) -> bool {
+        if self.0.appendable {
+            self.0.identity.admits(now)
+        } else {
+            *now == self.0.identity
+        }
     }
     fn check_reads(&self) -> Result<()> {
         if let Some(reads) = &self.0.reads {
@@ -195,7 +216,7 @@ impl JsonSource {
     }
     pub(crate) fn check_metadata(&self, metadata: Metadata) -> Result<()> {
         anyhow::ensure!(
-            Identity::from_metadata(metadata)? == self.0.identity,
+            self.holds(&Identity::from_metadata(metadata)?),
             "JSON source changed: {}",
             self.0.path.display()
         );
@@ -1806,6 +1827,60 @@ mod tests {
         value.write_canonical(&mut output).unwrap();
         assert_eq!(value.canonical_len().unwrap(), output.len() as u64);
         output
+    }
+
+    fn log_fixture(name: &str, bytes: &[u8]) -> (Fixture, PathBuf) {
+        let fixture = Fixture::new(b"");
+        let path = fixture.dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        (fixture, path)
+    }
+
+    #[test]
+    fn append_only_log_grown_after_capture_still_reads_its_stable_prefix() {
+        let (_fixture, path) = log_fixture("live.jsonl", b"{\"a\":1}\n{\"b\":2}\n");
+        let source = JsonSource::capture(&path).unwrap();
+        let captured = source.len();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut writer, b"{\"c\":3}\n{\"partial\":").unwrap();
+        source.check().unwrap();
+        source.check_metadata(file.metadata().unwrap()).unwrap();
+        let value = source.validated_range(0, 7).unwrap();
+        assert_eq!(canonical(&value), br#"{"a":1}"#);
+        assert_eq!(source.len(), captured);
+        let range = JsonSource::capture(&path).unwrap();
+        range.check().unwrap();
+    }
+
+    #[test]
+    fn append_only_log_truncated_or_rewritten_after_capture_is_still_a_source_change() {
+        for (label, mutate) in [
+            ("truncate", (|p: &Path| std::fs::write(p, b"{\"a\":1}\n").unwrap()) as fn(&Path)),
+            ("same-length rewrite", |p| {
+                std::fs::write(p, b"{\"z\":9}\n{\"b\":2}\n").unwrap();
+                std::fs::File::open(p).unwrap().set_modified(SystemTime::UNIX_EPOCH).unwrap();
+            }),
+            ("replace with a larger file", |p| {
+                let next = p.with_extension("next");
+                std::fs::write(&next, b"{\"z\":9}\n{\"b\":2}\n{\"c\":3}\n").unwrap();
+                std::fs::rename(&next, p).unwrap();
+            }),
+        ] {
+            let (_fixture, path) = log_fixture("live.jsonl", b"{\"a\":1}\n{\"b\":2}\n");
+            let source = JsonSource::capture(&path).unwrap();
+            mutate(&path);
+            let error = source.check().unwrap_err();
+            assert!(error.to_string().contains("JSON source changed"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn whole_document_growth_is_still_a_source_change() {
+        let (_fixture, path) = log_fixture("doc.json", b"{\"a\":1}");
+        let source = JsonSource::capture(&path).unwrap();
+        std::fs::write(&path, b"{\"a\":1} ").unwrap();
+        assert!(source.check().unwrap_err().to_string().contains("JSON source changed"));
     }
 
     #[test]

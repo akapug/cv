@@ -2037,7 +2037,8 @@ mod tests {
             serde_json::to_value(&session).unwrap(),
             serde_json::to_value(&expected).unwrap()
         );
-        fs::write(&path, format!("{body}\n")).unwrap();
+        // Truncation, not growth: an append-only log may grow under a retained source.
+        fs::write(&path, "").unwrap();
         assert!(serde_json::to_value(retained).is_err());
     }
 
