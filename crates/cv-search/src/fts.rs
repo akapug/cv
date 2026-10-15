@@ -325,10 +325,13 @@ const CHUNK_BYTES: usize = if cfg!(all(test, not(feature = "probe-heap"))) {
 /// marks, and report an incomplete index after the sweep finishes.
 ///
 /// **Sub-agent forest (`subagents`):** after each top-level claude session, also walk its
-/// `cv_core::subagent_tree_of` forest and index/ingest every Task/Workflow agent transcript, tagged
+/// sub-agent forest and index/ingest every Task/Workflow agent transcript, tagged
 /// with provenance (parent id / agent id / workflow run). Off by default — the forest can be
 /// hundreds of transcripts (~900 MB) — and folded-in sub-agent docs carry the provenance fields so
-/// a hit knows which agent of which workflow of which parent it came from.
+/// a hit knows which agent of which workflow of which parent it came from. The walk asks
+/// [`cv_core::subagent_tree_filtered_of`] for [`cv_core::SubagentDemand::Sessions`], whose
+/// unchanged-child path is the stat-keyed discovery cache; [`cv_core::subagent_tree_of`]'s `Rich`
+/// demand re-parses every transcript and reads every sidecar on every pass.
 ///
 /// **Decode once:** discovery runs beside the sweep and hands over each rollout it decodes in
 /// full; [`sweep_decoded`] reads it at once from those bytes, so a cold index decodes every
@@ -846,8 +849,18 @@ impl SweepPlanner<'_> {
         // and provenance stay borrowed until a real Job needs ownership.
         let mut folded_candidates = Vec::new();
         if subagents {
+            // The fold needs each agent's IDENTITY and its workflow and nothing else, so it asks
+            // for `Sessions` — the demand whose unchanged-child path is the stat-keyed discovery
+            // cache. `Rich`, which `subagent_tree_of` hardcodes, re-parses every transcript and
+            // reads every `*.meta.json` and workflow `journal.jsonl` on EVERY pass; on this
+            // corpus that is a 23 GB read per pass, identical whether 26 sessions changed or 800.
             for r in refs {
-                for sub in cv_core::subagent_tree_of(r) {
+                for sub in cv_core::subagent_tree_filtered_of(
+                    r,
+                    cv_core::SubagentDemand::Sessions,
+                    None,
+                    |_, _| true,
+                ) {
                     let prov = cv_core::events::Provenance {
                         parent_id: Some(r.id.clone()),
                         agent_id: Some(sub.agent_id().to_string()),
