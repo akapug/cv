@@ -2674,8 +2674,8 @@ pub fn pass_needed(dir: &Path, subagents: bool) -> Option<bool> {
     pass_needed_over(dir, &cv_core::sessions(), subagents)
 }
 
-/// A signature a pass could stamp: the file stats cleanly and is nonempty — the bar
-/// [`cv_core::offsets::sig_is_fresh_with_source`] sets for "already indexed".
+/// A signature a pass could stamp: the file stats cleanly and is nonempty — stricter than
+/// [`cv_core::offsets::sig_is_fresh_with_source`], whose bar admits a real empty file.
 fn landable(sig: (i64, i64)) -> bool {
     sig.0 != 0 && sig.1 > 0
 }
