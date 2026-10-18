@@ -121,7 +121,9 @@ fn lines(
                 Some((backing, len)) => {
                     source.read_positioned_decoded_value(&context, backing, len, at, range.len, &mut view)
                 }
-                None => source.read_positioned_range_value(&context, at, range.len, &mut view),
+                None => {
+                    source.read_positioned_range(&context, at, range.len, crate::json::Validation::Value, &mut view)
+                }
             });
             match read {
                 Some(Err(error)) if !visited && error.downcast_ref::<crate::json::InvalidJson>().is_some() => None,
@@ -225,10 +227,12 @@ fn mapped_lines(
 /// whose later records replace earlier ones, so selection must reach EOF before decoding.
 /// A small range is read into one buffer. A giant one is mapped for its read alone in mapped
 /// builds and left in place as a positioned view otherwise, so the file is never held mapped.
+/// A record that is not UTF-8 is rejected ([`InvalidJson`](crate::json::InvalidJson)), as
+/// [`for_each_line`] rejects such a line.
 pub(crate) struct Records<'s> {
     source: &'s crate::json::JsonSource,
     file: &'s File,
-    context: Option<document::range::RangeSource>,
+    context: Option<document::range::RangeSource<'static>>,
     buffer: Vec<u8>,
 }
 
@@ -248,6 +252,16 @@ impl<'s> Records<'s> {
         len: u64,
         f: impl FnOnce(crate::json::JsonView<'_>) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        self.read_with(at, len, crate::json::Validation::Value, f)
+    }
+    /// [`Self::read`] under a chosen acceptance.
+    pub(crate) fn read_with<T>(
+        &mut self,
+        at: u64,
+        len: u64,
+        validation: crate::json::Validation,
+        f: impl FnOnce(crate::json::JsonView<'_>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         anyhow::ensure!(
             at.checked_add(len).is_some_and(|end| end <= self.source.len()),
             "record range outside its source"
@@ -263,18 +277,20 @@ impl<'s> Records<'s> {
             };
             #[cfg(test)]
             note_mapped(map.len());
-            return self.source.read_record(at, std::str::from_utf8(&map)?, f);
+            let text = std::str::from_utf8(&map).map_err(|_| crate::json::InvalidJson)?;
+            return self.source.read_record_with(at, text, validation, f);
         }
         if len <= 64 * 1024 {
             self.buffer.resize(len as usize, 0);
             ranges::read_exact_at(self.file, &mut self.buffer, at)?;
-            return self.source.read_record(at, std::str::from_utf8(&self.buffer)?, f);
+            let text = std::str::from_utf8(&self.buffer).map_err(|_| crate::json::InvalidJson)?;
+            return self.source.read_record_with(at, text, validation, f);
         }
         if self.context.is_none() {
             self.context = Some(document::range::RangeSource::from_captured(self.source.clone())?);
         }
         let context = self.context.as_ref().expect("context was just made");
-        self.source.read_positioned_range_value(context, at, len, f)
+        self.source.read_positioned_range(context, at, len, validation, f)
     }
 }
 
@@ -376,5 +392,61 @@ mod tests {
             assert_eq!(output.contains('\u{2003}'), !blank, "prune, {name}");
             assert_eq!(output.lines().count(), lines, "prune, {name}");
         }
+    }
+
+    /// A writer appending half records at a time while passes read: every pass reads to its
+    /// captured length without error, each record it yields is whole, a trailing partial line is
+    /// held back (no view, not complete), and the source still checks at the end. No sleeps.
+    #[test]
+    fn a_pass_beside_a_writer_of_half_records_never_errors_or_yields_a_partial() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let world = cv_testkit::World::new("jsonl-live-writer");
+        let path = world.base.join("live.jsonl");
+        let record = |i: usize| format!("{{\"n\":{i},\"pad\":\"{}\"}}\n", "p".repeat(i % 300));
+        std::fs::write(&path, (0..200).map(record).collect::<String>()).unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+                for i in 200..20_000 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let line = record(i);
+                    let (head, tail) = line.split_at(line.len() / 2);
+                    file.write_all(head.as_bytes()).unwrap();
+                    file.write_all(tail.as_bytes()).unwrap();
+                }
+            });
+            for _ in 0..20 {
+                let source = crate::json::JsonSource::capture(&path).unwrap();
+                let file = std::fs::File::open(&path).unwrap();
+                source.check_metadata(file.metadata().unwrap()).unwrap();
+                let mut records = Vec::new();
+                super::for_each_line(&source, &file, 0, source.len(), |line| {
+                    match line.view {
+                        Some(view) => {
+                            assert!(line.complete, "a record is whole");
+                            records.push(view.source_range()?.unwrap());
+                        }
+                        None => assert!(!line.complete && line.end == source.len(), "only a held-back tail"),
+                    }
+                    Ok(Flow::Continue)
+                })
+                .unwrap();
+                let bytes = std::fs::read(&path).unwrap();
+                for (n, (at, len)) in records.into_iter().enumerate() {
+                    assert_eq!(
+                        &bytes[at as usize..(at + len) as usize],
+                        record(n).trim_end().as_bytes()
+                    );
+                }
+                source.check_metadata(file.metadata().unwrap()).unwrap();
+                source.check().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            writer.join().unwrap();
+        });
     }
 }

@@ -197,6 +197,7 @@ pub struct FidelityReport {
 
 impl FidelityReport {
     /// Any loss the target could have avoided — what `port --strict` fails on.
+    #[cfg(test)]
     pub fn has_unexpected(&self) -> bool {
         self.deltas.iter().any(|d| !d.expected)
     }

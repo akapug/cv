@@ -77,7 +77,7 @@ impl EventSpool {
     pub fn temporary_bytes(&self) -> Result<u64> {
         self.ordered.temporary_bytes()
     }
-    fn push(&mut self, event: Event) -> Result<()> {
+    pub fn push(&mut self, event: Event) -> Result<()> {
         self.ordered.push(event)
     }
     #[cfg(any(test, feature = "sqlite"))]
@@ -91,8 +91,7 @@ impl EventSpool {
 pub struct SpoolingSink {
     inner: EventSink,
     spool: EventSpool,
-    error: Option<anyhow::Error>,
-    failed: bool,
+    latch: crate::stream::Latch,
 }
 
 impl SpoolingSink {
@@ -108,8 +107,7 @@ impl SpoolingSink {
         Self {
             inner,
             spool: EventSpool::default(),
-            error: None,
-            failed: false,
+            latch: Default::default(),
         }
     }
 
@@ -125,17 +123,17 @@ impl SpoolingSink {
 
     /// Observe without copying the message; failures keep the batch unpublished.
     pub fn observe_message(&mut self, message: &Message) -> Flow {
-        if self.failed || self.error.is_some() {
+        if self.latch.failed() {
             return Flow::Stop;
         }
         if self.inner.observe_message(message) == Flow::Stop {
-            self.error = self.inner.take_error();
-            self.failed = true;
+            self.latch.capture(&mut self.inner);
+            self.latch.fail(anyhow::anyhow!("event spool has already failed"));
             return Flow::Stop;
         }
         for event in self.inner.events.drain(..) {
             if let Err(error) = self.spool.push(event) {
-                self.error = Some(error);
+                self.latch.fail(error);
                 return Flow::Stop;
             }
         }
@@ -153,18 +151,16 @@ impl SpoolingSink {
 
 impl MessageSink for SpoolingSink {
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        let error = self.error.take().or_else(|| self.inner.take_error());
-        self.failed |= error.is_some();
-        error.or_else(|| self.failed.then(|| anyhow::anyhow!("event spool has already failed")))
+        self.latch.take_or(&mut self.inner, "event spool")
     }
     fn dependency(&mut self, path: &std::path::Path) {
-        if !self.failed && self.error.is_none() {
+        if !self.latch.failed() {
             self.inner.dependency(path);
         }
     }
 
     fn meta(&mut self, session: &Session) {
-        if !self.failed && self.error.is_none() {
+        if !self.latch.failed() {
             self.inner.meta(session);
         }
     }
@@ -174,11 +170,11 @@ impl MessageSink for SpoolingSink {
     }
 
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
-        !self.failed && self.error.is_none() && self.inner.wants_checkpoint(offset)
+        !self.latch.failed() && self.inner.wants_checkpoint(offset)
     }
 
     fn checkpoint(&mut self, cp: &mut Checkpoint) {
-        if !self.failed && self.error.is_none() {
+        if !self.latch.failed() {
             self.inner.checkpoint(cp);
         }
     }
@@ -212,7 +208,7 @@ mod tests {
     #[test]
     fn drained_spool_error_cannot_resume_delivery_or_publish_staged_rows() {
         let mut sink = SpoolingSink::new(None);
-        sink.error = Some(anyhow::anyhow!("temporary spool write failed"));
+        sink.latch.fail(anyhow::anyhow!("temporary spool write failed"));
         assert_eq!(sink.take_error().unwrap().to_string(), "temporary spool write failed");
         assert_eq!(sink.message(Message::new(crate::Role::User)), Flow::Stop);
         assert_eq!(sink.observe_message(&Message::new(crate::Role::User)), Flow::Stop);
@@ -359,9 +355,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn ordered_publication_preserves_suffix_dedup_and_rolls_back_failures() {
-        use crate::events::{
-            events_for, needs_ingest, record_from_with_source, record_spooled_with_source, Provenance,
-        };
+        use crate::events::{events_for, needs_ingest, record_spooled_with_source, Provenance};
         use crate::{Harness, SessionRef};
         let world = crate::test_world("event-spool-transaction");
         let path = world.proj.join("events.jsonl");
@@ -370,14 +364,15 @@ mod tests {
         let source = crate::source::Probe::default()
             .snapshot(&r)
             .with_reads(&Default::default());
-        // The public slice API accepts arbitrary order and dedups across nonadjacent rows.
-        let prefix = event(0, None);
-        let original = vec![
+        let mut original = EventSpool::default();
+        for row in [
+            event(0, None),
             event(2, Some("old".into())),
-            prefix.clone(),
             event(2, Some("old".into())),
-        ];
-        record_from_with_source(&r, 0, &original, &source, &Provenance::default());
+        ] {
+            original.push(row).unwrap();
+        }
+        record_spooled_with_source(&r, 0, original, &source, &Provenance::default()).unwrap();
         assert_eq!(events_for("claude", "events", None).len(), 2);
         let mut spool = EventSpool::default();
         spool.push(event(2, None)).unwrap();

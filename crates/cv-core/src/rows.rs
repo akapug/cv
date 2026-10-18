@@ -176,6 +176,7 @@ pub fn touched_row(t: &TouchedSession) -> Value {
 }
 
 /// The keys a §3 session row carries, in order — for tests and `cv schema`.
+#[cfg(test)]
 pub const SESSION_ROW_KEYS: [&str; 9] = [
     "id",
     "harness",

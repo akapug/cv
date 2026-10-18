@@ -483,8 +483,7 @@ pub struct AffordanceSink<'a> {
     harness: Harness,
     inner: &'a mut dyn MessageSink,
     open: std::collections::HashMap<String, Returns>,
-    error: Option<anyhow::Error>,
-    failed: bool,
+    latch: crate::stream::Latch,
 }
 
 impl<'a> AffordanceSink<'a> {
@@ -493,8 +492,7 @@ impl<'a> AffordanceSink<'a> {
             harness,
             inner,
             open: Default::default(),
-            error: None,
-            failed: false,
+            latch: Default::default(),
         }
     }
 }
@@ -504,49 +502,38 @@ impl MessageSink for AffordanceSink<'_> {
         self.inner.extra_projection()
     }
     fn dependency(&mut self, path: &std::path::Path) {
-        if !self.failed {
+        if !self.latch.failed() {
             self.inner.dependency(path);
         }
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        if let Some(error) = self.error.take().or_else(|| self.inner.take_error()) {
-            self.failed = true;
-            return Some(error);
-        }
-        self.failed
-            .then(|| anyhow::anyhow!("affordance consumer has already failed"))
+        self.latch.take_or(self.inner, "affordance consumer")
     }
 
     fn message(&mut self, mut m: Message) -> Flow {
-        if self.failed {
+        if self.latch.failed() {
             return Flow::Stop;
         }
         if matches!(self.harness, Harness::Hermes | Harness::OpenClaw) {
             for block in &mut m.content {
                 if let Err(error) = unwrap_deferred(self.harness, block) {
-                    self.failed = true;
-                    self.error = Some(error);
+                    self.latch.fail(error);
                     return Flow::Stop;
                 }
             }
         }
         if let Err(error) = refine_spawn(self.harness, &mut m, &mut self.open) {
-            self.failed = true;
-            self.error = Some(error);
+            self.latch.fail(error);
             return Flow::Stop;
         }
-        match self.inner.try_message(m) {
-            Ok(flow) => flow,
-            Err(error) => {
-                self.failed = true;
-                self.error = Some(error);
-                Flow::Stop
-            }
-        }
+        self.inner.try_message(m).unwrap_or_else(|error| {
+            self.latch.fail(error);
+            Flow::Stop
+        })
     }
 
     fn meta(&mut self, s: &Session) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         self.inner.meta(s);
@@ -555,11 +542,11 @@ impl MessageSink for AffordanceSink<'_> {
     /// Never while a synchronous spawn waits for its result: which result returns it is state no
     /// checkpoint carries.
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
-        !self.failed && self.open.is_empty() && self.inner.wants_checkpoint(offset)
+        !self.latch.failed() && self.open.is_empty() && self.inner.wants_checkpoint(offset)
     }
 
     fn checkpoint(&mut self, cp: &mut crate::stream::Checkpoint) {
-        if !self.failed {
+        if !self.latch.failed() {
             self.inner.checkpoint(cp);
         }
     }

@@ -46,6 +46,7 @@ pub use emit::emit;
 use super::{parse_ts, Adapter};
 use crate::ir::*;
 use crate::json::JsonSource;
+use crate::source::{Dependencies, Probe};
 use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -89,6 +90,19 @@ impl Gemini {
 impl Adapter for Gemini {
     fn harness(&self) -> Harness {
         Harness::Gemini
+    }
+
+    fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        if let Some(project) = r
+            .path
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "chats"))
+            .and_then(Path::parent)
+        {
+            deps.directories.push(project.join(&r.id).join("tracker"));
+            deps.directories.push(project.join(&r.id).join("plans"));
+        }
+        Some(())
     }
 
     fn roots(&self) -> Vec<PathBuf> {

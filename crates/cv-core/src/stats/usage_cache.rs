@@ -1,7 +1,7 @@
 //! Versioned ordered projections. One operation pins a read snapshot, while a separate serial
 //! writer publishes complete source rows and dependency stamps in the same transaction.
 use super::{UsageBatch, UsageHit, UsageRecords};
-use crate::{ir::SessionRef, source::Snapshot, spill::Record};
+use crate::{ir::SessionRef, source::Baseline, spill::Record};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::{
@@ -36,7 +36,7 @@ impl Cache {
         writer.execute_batch(
             "CREATE TABLE IF NOT EXISTS usage_cache(
              harness TEXT NOT NULL,id TEXT NOT NULL,path TEXT NOT NULL,version INTEGER NOT NULL,
-             fallback BLOB NOT NULL,rows INTEGER NOT NULL,bytes INTEGER NOT NULL,updated INTEGER NOT NULL,digest BLOB,
+             fallback BLOB NOT NULL,rows INTEGER NOT NULL,bytes INTEGER NOT NULL,updated INTEGER NOT NULL,
              PRIMARY KEY(harness,id,path));
              CREATE INDEX IF NOT EXISTS usage_cache_updated ON usage_cache(updated);
              CREATE TABLE IF NOT EXISTS usage_chunks(
@@ -78,14 +78,14 @@ impl Cache {
             pending: Arc::new(Mutex::new(Pending::default())),
         })
     }
-    pub(super) fn load(&self, r: &SessionRef, current: &Snapshot) -> Option<UsageBatch> {
+    pub(super) fn load(&self, r: &SessionRef, current: &Baseline) -> Option<UsageBatch> {
         let conn = self.reader.lock().ok()?;
         let path = r.path.to_string_lossy().into_owned();
         // SQL admits bounded header bytes before rusqlite creates the owned buffer.
-        let (fallback, rows, bytes, digest): (Vec<u8>, i64, i64, Vec<u8>) = conn
+        let (fallback, rows, bytes): (Vec<u8>, i64, i64) = conn
             .query_row(
-                "SELECT fallback,rows,bytes,digest FROM usage_cache WHERE harness=?1 AND id=?2 AND path=?3 AND version=?4
-             AND length(fallback)<=?5 AND rows>=0 AND bytes>=length(fallback) AND bytes<=?6 AND length(digest)=64",
+                "SELECT fallback,rows,bytes FROM usage_cache WHERE harness=?1 AND id=?2 AND path=?3 AND version=?4
+             AND length(fallback)<=?5 AND rows>=0 AND bytes>=length(fallback) AND bytes<=?6",
                 params![
                     r.harness.as_str(),
                     r.id,
@@ -94,13 +94,10 @@ impl Cache {
                     CHUNK as i64,
                     SOURCE_LIMIT as i64
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .ok()?;
-        if digest != header_digest(r, &fallback, rows, bytes as u64) {
-            return None;
-        }
-        if !crate::source::fresh_in(&conn, CONSUMER, r, current.primary, &current.dependencies) {
+        if !crate::source::fresh_in(&conn, CONSUMER, r, current, &header(&fallback, rows, bytes as u64)) {
             return None;
         }
         let payload_bytes = bytes as u64 - fallback.len() as u64;
@@ -154,7 +151,7 @@ impl Cache {
         }
         self.finish_chunk();
     }
-    pub(super) fn publisher(&self, r: SessionRef, source: Snapshot, fallback: &str) -> Option<Publisher> {
+    pub(super) fn publisher(&self, r: SessionRef, source: Baseline, fallback: &str) -> Option<Publisher> {
         if fallback.len() > CHUNK {
             return None;
         }
@@ -202,25 +199,20 @@ impl Cache {
         })
     }
 }
-fn identity(harness: &str, id: &str, path: &str) -> crate::digest::Sha256 {
+/// The output row the source baseline is published with.
+fn header(fallback: &[u8], rows: i64, bytes: u64) -> Vec<u8> {
+    let mut out = VERSION.to_le_bytes().to_vec();
+    out.extend(rows.to_le_bytes());
+    out.extend(bytes.to_le_bytes());
+    out.extend(fallback);
+    out
+}
+fn chunk_digest(harness: &str, id: &str, path: &str, index: i64, payload: &[u8]) -> Vec<u8> {
     let mut hash = crate::digest::Sha256::new();
     for value in [harness, id, path] {
         hash.update(&(value.len() as u64).to_le_bytes());
         hash.update(value.as_bytes());
     }
-    hash
-}
-fn header_digest(r: &SessionRef, fallback: &[u8], rows: i64, bytes: u64) -> Vec<u8> {
-    let mut hash = identity(r.harness.as_str(), &r.id, &r.path.to_string_lossy());
-    hash.update(&VERSION.to_le_bytes());
-    hash.update(&rows.to_le_bytes());
-    hash.update(&bytes.to_le_bytes());
-    hash.update(&(fallback.len() as u64).to_le_bytes());
-    hash.update(fallback);
-    hash.finish_hex().into_bytes()
-}
-fn chunk_digest(harness: &str, id: &str, path: &str, index: i64, payload: &[u8]) -> Vec<u8> {
-    let mut hash = identity(harness, id, path);
     hash.update(&index.to_le_bytes());
     hash.update(payload);
     hash.finish_hex().into_bytes()
@@ -331,7 +323,7 @@ fn evict(conn: &Connection, harness: &str, id: &str, path: &str) -> Option<()> {
 pub(super) struct Publisher {
     conn: Shared,
     r: SessionRef,
-    source: Snapshot,
+    source: Baseline,
     buffer: Vec<u8>,
     next: i64,
     rows: i64,
@@ -387,31 +379,28 @@ impl Publisher {
         }
         let Ok(conn) = self.conn.lock() else { return };
         let result = (|| -> Option<()> {
+            let bytes = self.bytes + self.fallback_bytes as u64;
             conn.execute(
-                "UPDATE usage_cache SET rows=?4,bytes=?5,digest=?6 WHERE harness=?1 AND id=?2 AND path=?3",
+                "UPDATE usage_cache SET rows=?4,bytes=?5 WHERE harness=?1 AND id=?2 AND path=?3",
                 params![
                     self.r.harness.as_str(),
                     self.r.id,
                     self.r.path.to_string_lossy(),
                     self.rows,
-                    (self.bytes + self.fallback_bytes as u64) as i64,
-                    header_digest(
-                        &self.r,
-                        &conn
-                            .query_row(
-                                "SELECT fallback FROM usage_cache WHERE harness=?1 AND id=?2 AND path=?3",
-                                params![self.r.harness.as_str(), self.r.id, self.r.path.to_string_lossy()],
-                                |r| r.get::<_, Vec<u8>>(0)
-                            )
-                            .ok()?,
-                        self.rows,
-                        self.bytes + self.fallback_bytes as u64
-                    )
+                    bytes as i64,
                 ],
             )
             .ok()?;
-            crate::source::publish_in(&conn, CONSUMER, &self.r, &self.source)?;
-            if !crate::source::fresh_in(&conn, CONSUMER, &self.r, self.source.primary, &self.source.dependencies) {
+            let fallback: Vec<u8> = conn
+                .query_row(
+                    "SELECT fallback FROM usage_cache WHERE harness=?1 AND id=?2 AND path=?3",
+                    params![self.r.harness.as_str(), self.r.id, self.r.path.to_string_lossy()],
+                    |r| r.get(0),
+                )
+                .ok()?;
+            let output = header(&fallback, self.rows, bytes);
+            crate::source::publish_in(&conn, CONSUMER, &self.r, &self.source, &output).ok()?;
+            if !crate::source::fresh_in(&conn, CONSUMER, &self.r, &self.source, &output) {
                 return None;
             }
             loop {
@@ -485,7 +474,7 @@ impl Write for Publisher {
 mod tests {
     use super::*;
     use crate::ir::{Harness, Usage};
-    fn load(r: &SessionRef, current: &Snapshot) -> Option<UsageBatch> {
+    fn load(r: &SessionRef, current: &Baseline) -> Option<UsageBatch> {
         Cache::new()?.load(r, current)
     }
     fn open() -> Option<Connection> {
@@ -499,7 +488,7 @@ mod tests {
         let r = SessionRef::new("source", Harness::Claude, path);
         (world, r)
     }
-    fn source(r: &SessionRef, dependency: Option<&std::path::Path>) -> Snapshot {
+    fn source(r: &SessionRef, dependency: Option<&std::path::Path>) -> Baseline {
         let source = crate::source::Probe::default().snapshot(r);
         let mut reads = crate::source::ReadSet::default();
         reads.record(&r.path);

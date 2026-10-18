@@ -4,19 +4,39 @@
 //!
 //! OWNED BY the wasm-ingest work. `cv-core::lib` declares this module.
 
-use crate::harness::store::document::{self, Index, Raw, Record};
+use crate::harness::store::document::range::{RangeSource, Validation};
 use crate::harness::{claude, codex, gemini};
 use crate::ir::Session;
+use crate::json::JsonView;
 
 /// Strict borrowed shape inspection: ignored uploaded bodies never become a second Value tree.
-fn inspect<T>(text: &str, f: impl FnOnce(Raw<'_>) -> T) -> Option<T> {
-    let value: &crate::lazy::RawValue = serde_json::from_str(text).ok()?;
-    let index = Index::default();
-    let raw = Raw::new(value.get(), &index);
-    document::accepts_value(raw).then(|| f(raw))
+fn inspect<T>(text: &str, f: impl FnOnce(JsonView<'_>) -> T) -> Option<T> {
+    let source = RangeSource::text(None, text, 0, false);
+    let value = source.accept(source.range(), Validation::Value).ok()??;
+    Some(f(JsonView::of(&source, value)))
 }
-fn fields(raw: Raw<'_>) -> Record<'_> {
-    Record::parse(raw).unwrap_or_else(|| Record::empty(raw))
+/// The fields of an object view; a nonobject (or a read failure) has none.
+struct Fields<'a>(JsonView<'a>);
+fn fields(view: JsonView<'_>) -> Fields<'_> {
+    Fields(view)
+}
+impl<'a> Fields<'a> {
+    fn get(&self, key: &str) -> Option<JsonView<'a>> {
+        self.0.get(key).ok().flatten()
+    }
+    fn string(&self, key: &str) -> Option<String> {
+        let value = self.get(key)?;
+        value
+            .is_string()
+            .ok()?
+            .then(|| value.resolve().ok())??
+            .as_str()
+            .map(str::to_owned)
+    }
+}
+/// An array view's items, in order; a nonarray has none.
+fn items<'a>(view: JsonView<'a>) -> impl Iterator<Item = JsonView<'a>> {
+    view.array().ok().flatten().into_iter().flatten().filter_map(Result::ok)
 }
 
 /// Which single-file harness a given file looks like.
@@ -49,7 +69,7 @@ fn sniff(name: &str, text: &str) -> Sniff {
     if let Some(first) = first_non_empty_line(text) {
         if first.starts_with('[') {
             if inspect(text, |raw| {
-                document::array_iter(raw).into_iter().flatten().take(8).any(|item| {
+                items(raw).take(8).any(|item| {
                     let item = fields(item);
                     (item.get("sessionId").is_some()
                         && item.get("messageId").is_some()
@@ -66,16 +86,10 @@ fn sniff(name: &str, text: &str) -> Sniff {
                 let record = fields(raw);
                 (record.get("messages").is_some()
                     && (record.get("sessionId").is_some() || record.get("projectHash").is_some()))
-                    || record
-                        .get("history")
-                        .and_then(document::array_iter)
-                        .into_iter()
-                        .flatten()
-                        .take(8)
-                        .any(|item| {
-                            let item = fields(item);
-                            item.get("role").is_some() && item.get("parts").is_some()
-                        })
+                    || record.get("history").into_iter().flat_map(items).take(8).any(|item| {
+                        let item = fields(item);
+                        item.get("role").is_some() && item.get("parts").is_some()
+                    })
             })
             .unwrap_or(false)
             {

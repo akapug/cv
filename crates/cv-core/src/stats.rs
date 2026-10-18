@@ -207,7 +207,7 @@ struct UsageBatch {
     hits: UsageRecords,
     fallback_model: String,
     #[cfg(feature = "sqlite")]
-    publication: Option<(SessionRef, crate::source::Snapshot)>,
+    publication: Option<(SessionRef, crate::source::Baseline)>,
 }
 enum UsageRecords {
     Staged(Ordered<UsageHit>),
@@ -614,6 +614,7 @@ impl TokenFold {
 }
 
 /// The keys `cv stats --json` / `GET /api/stats` carry, in order.
+#[cfg(test)]
 pub const STATS_KEYS: [&str; 6] = [
     "sessions",
     "messages",

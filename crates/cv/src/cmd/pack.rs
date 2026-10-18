@@ -325,6 +325,7 @@ fn live_scan_adapters<'a>(
                     parent_id: None,
                     agent_id: None,
                     workflow: None,
+                    session: None,
                 },
             );
             if scored.len() > fetch {
@@ -373,21 +374,9 @@ fn build_source(hit: &cv_search::Hit, task: &str, llm_model: Option<&Option<Stri
     // Optional abstractive pass over just this span (never the whole session).
     let llm_digest = llm_model.and_then(|model| {
         let mut mini = Session {
-            source_stamp: None,
-            id: hit.id.clone(),
-            harness: r.harness,
             cwd: hit.cwd.as_ref().map(PathBuf::from),
             title: hit.title.clone(),
-            created_at: None,
-            updated_at: None,
-            model: None,
-            git: None,
-            messages: Vec::new(),
-            source_path: None,
-            extra: Default::default(),
-            principal: None,
-            system_prompt: None,
-            lineage: cv_core::ir::Lineage::default(),
+            ..Session::new(hit.id.clone(), r.harness)
         };
         for (role, text) in &excerpt {
             let mut m = Message::new(*role);
@@ -893,21 +882,12 @@ fn emit_pack_session(
     });
 
     let session = Session {
-        source_stamp: None,
-        id: format!("pack-{}", now.timestamp()),
-        harness: to_h,
         cwd: std::env::current_dir().ok(),
         title: Some(format!("context pack: {}", cv_core::ir::truncate(task, 60))),
         created_at: Some(now),
         updated_at: Some(now),
-        model: None,
-        git: None,
         messages: vec![user, ack],
-        source_path: None,
-        extra: Default::default(),
-        principal: None,
-        system_prompt: None,
-        lineage: cv_core::ir::Lineage::default(),
+        ..Session::new(format!("pack-{}", now.timestamp()), to_h)
     };
     crate::cmd::port::emit_session(
         &session,
@@ -1382,6 +1362,7 @@ mod tests {
             parent_id: None,
             agent_id: None,
             workflow: None,
+            session: None,
         }
     }
 

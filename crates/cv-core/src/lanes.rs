@@ -235,6 +235,7 @@ pub struct LaneTask {
 /// The first `CV_ENDPOINT=<kind>:<name>` a shell command sets (`export CV_ENDPOINT=lane:x; …`,
 /// `CV_ENDPOINT="lane:x" cv task …`). `<name>` never starts with `/`, so a URL
 /// (`CV_ENDPOINT=https://…`) is not an endpoint.
+#[cfg(test)]
 pub fn endpoint_in(text: &str) -> Option<String> {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {

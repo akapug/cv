@@ -280,8 +280,7 @@ pub trait MessageSink {
 pub fn checked<T>(sink: &mut dyn MessageSink, read: impl FnOnce(&mut dyn MessageSink) -> Result<T>) -> Result<T> {
     let mut guard = ErrorGuard {
         inner: sink,
-        error: None,
-        failed: false,
+        latch: Latch::default(),
     };
     if let Some(error) = guard.take_error() {
         return Err(error);
@@ -299,67 +298,88 @@ pub fn checked<T>(sink: &mut dyn MessageSink, read: impl FnOnce(&mut dyn Message
     }
 }
 
-struct ErrorGuard<'a> {
-    inner: &'a mut dyn MessageSink,
+/// A sink's first error, held until taken, and the failure it leaves: once failed, a sink stops
+/// delivery and, after the error is taken, reports that it "has already failed".
+#[derive(Default)]
+pub struct Latch {
     error: Option<anyhow::Error>,
     failed: bool,
 }
-impl ErrorGuard<'_> {
-    fn capture(&mut self) {
-        if let Some(error) = self.inner.take_error() {
-            self.failed = true;
-            self.error.get_or_insert(error);
+impl Latch {
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+    /// Record a failure; the first error is the one reported.
+    pub fn fail(&mut self, error: anyhow::Error) {
+        self.failed = true;
+        self.error.get_or_insert(error);
+    }
+    /// Latch an error `inner` reports, if any.
+    pub fn capture(&mut self, inner: &mut dyn MessageSink) {
+        if let Some(error) = inner.take_error() {
+            self.fail(error);
         }
     }
+    /// The held error once, then the persistent "`what` has already failed" marker.
+    pub fn take(&mut self, what: &str) -> Option<anyhow::Error> {
+        self.error
+            .take()
+            .or_else(|| self.failed.then(|| anyhow::anyhow!("{what} has already failed")))
+    }
+    /// [`take`](Self::take), asking `inner` for its error only when this latch holds none.
+    pub fn take_or(&mut self, inner: &mut dyn MessageSink, what: &str) -> Option<anyhow::Error> {
+        if self.error.is_none() {
+            self.capture(inner);
+        }
+        self.take(what)
+    }
+}
+
+struct ErrorGuard<'a> {
+    inner: &'a mut dyn MessageSink,
+    latch: Latch,
 }
 impl MessageSink for ErrorGuard<'_> {
     fn extra_projection(&self) -> ExtraProjection {
         self.inner.extra_projection()
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.capture();
-        self.error.take().or_else(|| {
-            self.failed
-                .then(|| anyhow::anyhow!("stream consumer has already failed"))
-        })
+        self.latch.capture(self.inner);
+        self.latch.take("stream consumer")
     }
     fn message(&mut self, m: Message) -> Flow {
-        if self.failed {
+        if self.latch.failed() {
             return Flow::Stop;
         }
-        match self.inner.try_message(m) {
-            Ok(flow) => flow,
-            Err(error) => {
-                self.failed = true;
-                self.error = Some(error);
-                Flow::Stop
-            }
-        }
+        self.inner.try_message(m).unwrap_or_else(|error| {
+            self.latch.fail(error);
+            Flow::Stop
+        })
     }
     fn meta(&mut self, s: &Session) {
-        if !self.failed {
+        if !self.latch.failed() {
             self.inner.meta(s);
-            self.capture();
+            self.latch.capture(self.inner);
         }
     }
     fn dependency(&mut self, path: &std::path::Path) {
-        if !self.failed {
+        if !self.latch.failed() {
             self.inner.dependency(path);
-            self.capture();
+            self.latch.capture(self.inner);
         }
     }
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
-        if self.failed {
+        if self.latch.failed() {
             return false;
         }
         let wants = self.inner.wants_checkpoint(offset);
-        self.capture();
-        wants && !self.failed
+        self.latch.capture(self.inner);
+        wants && !self.latch.failed()
     }
     fn checkpoint(&mut self, cp: &mut Checkpoint) {
-        if !self.failed {
+        if !self.latch.failed() {
             self.inner.checkpoint(cp);
-            self.capture();
+            self.latch.capture(self.inner);
         }
     }
 }
@@ -426,37 +446,28 @@ impl<F: FnMut(Message) -> Flow> MessageSink for F {
 /// this wrapper latches a `Result` error, stops future delivery and exposes it to checked passes.
 pub struct TryFnSink<F> {
     callback: F,
-    error: Option<anyhow::Error>,
-    failed: bool,
+    latch: Latch,
 }
 impl<F: FnMut(Message) -> Result<Flow>> TryFnSink<F> {
     pub fn new(callback: F) -> Self {
         Self {
             callback,
-            error: None,
-            failed: false,
+            latch: Latch::default(),
         }
     }
 }
 impl<F: FnMut(Message) -> Result<Flow>> MessageSink for TryFnSink<F> {
     fn message(&mut self, message: Message) -> Flow {
-        if self.failed {
+        if self.latch.failed() {
             return Flow::Stop;
         }
-        match (self.callback)(message) {
-            Ok(flow) => flow,
-            Err(error) => {
-                self.failed = true;
-                self.error = Some(error);
-                Flow::Stop
-            }
-        }
+        (self.callback)(message).unwrap_or_else(|error| {
+            self.latch.fail(error);
+            Flow::Stop
+        })
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.error.take().or_else(|| {
-            self.failed
-                .then(|| anyhow::anyhow!("message callback has already failed"))
-        })
+        self.latch.take("message callback")
     }
 }
 
@@ -474,8 +485,7 @@ pub struct TeeSink<'a> {
     b: &'a mut dyn MessageSink,
     a_stopped: bool,
     b_stopped: bool,
-    error: Option<anyhow::Error>,
-    failed: bool,
+    latch: Latch,
 }
 
 impl<'a> TeeSink<'a> {
@@ -485,18 +495,15 @@ impl<'a> TeeSink<'a> {
             b,
             a_stopped: false,
             b_stopped: false,
-            error: None,
-            failed: false,
+            latch: Latch::default(),
         }
     }
 }
 
 impl TeeSink<'_> {
     fn capture(&mut self) {
-        let error = self.a.take_error().or_else(|| self.b.take_error());
-        if let Some(error) = error {
-            self.failed = true;
-            self.error.get_or_insert(error);
+        if let Some(error) = self.a.take_error().or_else(|| self.b.take_error()) {
+            self.latch.fail(error);
         }
     }
     fn deliver(sink: &mut dyn MessageSink, m: Message, stopped: &mut bool) -> Result<()> {
@@ -516,54 +523,51 @@ impl MessageSink for TeeSink<'_> {
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.capture();
-        self.error.take().or_else(|| {
-            self.failed
-                .then(|| anyhow::anyhow!("stream consumer has already failed"))
-        })
+        self.latch.take("stream consumer")
     }
     fn dependency(&mut self, path: &std::path::Path) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         self.a.dependency(path);
         self.capture();
-        if !self.failed {
+        if !self.latch.failed() {
             self.b.dependency(path);
             self.capture();
         }
     }
     fn meta(&mut self, s: &Session) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         self.a.meta(s);
         self.capture();
-        if !self.failed {
+        if !self.latch.failed() {
             self.b.meta(s);
             self.capture();
         }
     }
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
-        if self.failed {
+        if self.latch.failed() {
             return false;
         }
         let wants = self.a.wants_checkpoint(offset) && self.b.wants_checkpoint(offset);
         self.capture();
-        wants && !self.failed
+        wants && !self.latch.failed()
     }
     fn checkpoint(&mut self, cp: &mut Checkpoint) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         self.a.checkpoint(cp);
         self.capture();
-        if !self.failed {
+        if !self.latch.failed() {
             self.b.checkpoint(cp);
             self.capture();
         }
     }
     fn message(&mut self, m: Message) -> Flow {
-        if self.failed {
+        if self.latch.failed() {
             return Flow::Stop;
         }
         let result = match (self.a_stopped, self.b_stopped) {
@@ -577,10 +581,9 @@ impl MessageSink for TeeSink<'_> {
             (true, true) => Ok(()),
         };
         if let Err(error) = result {
-            self.failed = true;
-            self.error = Some(error);
+            self.latch.fail(error);
         }
-        if self.failed || (self.a_stopped && self.b_stopped) {
+        if self.latch.failed() || (self.a_stopped && self.b_stopped) {
             Flow::Stop
         } else {
             Flow::Continue
@@ -705,7 +708,7 @@ pub struct Streamed {
 /// Source receipt for an operation that stages output before publication.
 /// Validate after resolving all demanded payloads, before exposing the completed stage.
 pub struct StagedReadGuard {
-    source: crate::source::Snapshot,
+    source: crate::source::Baseline,
     reads: crate::source::ReadSet,
     primary: std::path::PathBuf,
 }
@@ -731,51 +734,22 @@ pub fn stream_counted(
     sink: &mut dyn MessageSink,
     pass: Pass<'_>,
 ) -> Result<Streamed> {
-    struct Guarded<'a> {
-        sink: &'a mut dyn MessageSink,
-        guard: StagedReadGuard,
-    }
-    impl MessageSink for Guarded<'_> {
-        fn extra_projection(&self) -> ExtraProjection {
-            self.sink.extra_projection()
-        }
-        fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.sink.take_error()
-        }
-        fn meta(&mut self, session: &Session) {
-            self.sink.meta(session);
-        }
-        fn dependency(&mut self, path: &std::path::Path) {
-            self.guard.reads.record(path);
-            self.sink.dependency(path);
-        }
-        fn wants_checkpoint(&mut self, offset: u64) -> bool {
-            self.sink.wants_checkpoint(offset)
-        }
-        fn checkpoint(&mut self, cp: &mut Checkpoint) {
-            self.sink.checkpoint(cp);
-        }
-        fn message(&mut self, message: Message) -> Flow {
-            crate::source::record_message_reads(&message, &self.guard.primary, &mut self.guard.reads);
-            self.sink.message(message)
-        }
-    }
     // Captured before the adapter opens anything; a guarded pass's covers the resume source.
-    let mut guarded = None;
-    let (sink, source): (&mut dyn MessageSink, _) = if pass.guard {
+    let guard = pass.guard.then(|| {
         let primary = adapter.resume_source(r);
-        let source = crate::source::Probe::default().snapshot_from(r, &primary);
-        let guard = StagedReadGuard {
-            source: source.clone(),
+        StagedReadGuard {
+            source: crate::source::Probe::default().snapshot_from(r, &primary),
             reads: Default::default(),
             primary,
-        };
-        (guarded.insert(Guarded { sink, guard }), Some(source))
-    } else {
-        (sink, pass.record.then(|| crate::source::Probe::default().snapshot(r)))
+        }
+    });
+    let source = match &guard {
+        Some(guard) => Some(guard.source.clone()),
+        None => pass.record.then(|| crate::source::Probe::default().snapshot(r)),
     };
     let mut counting = Counting::new(r, sink, pass.every);
     counting.amortized = pass.amortized;
+    counting.guard = guard;
     let session = match pass.from {
         Some(cp) => {
             let state = cp.get::<CounterState>(COUNTER_LAYER).ok_or(Declined)?;
@@ -804,7 +778,7 @@ pub fn stream_counted(
         session,
         counted,
         last,
-        guard: guarded.map(|g| g.guard),
+        guard: counting.guard.take(),
     })
 }
 
@@ -819,7 +793,7 @@ pub struct Counted {
 
 impl Counted {
     /// Publish against the dependencies captured before this pass, including any side-store rows.
-    pub fn record_with_source(&self, r: &SessionRef, source: &crate::source::Snapshot) {
+    pub fn record_with_source(&self, r: &SessionRef, source: &crate::source::Baseline) {
         let source = source.with_reads(&self.dependencies);
         if crate::source::unchanged(r, &source) {
             note_turns(r, self.turns);
@@ -873,8 +847,9 @@ struct Counting<'a> {
     affordances: crate::affordance::Counter,
     dependencies: crate::source::ReadSet,
     stopped: bool,
-    failed: bool,
-    error: Option<anyhow::Error>,
+    latch: Latch,
+    /// Records what a guarded pass read, for its [`StagedReadGuard`].
+    guard: Option<StagedReadGuard>,
     /// Take a checkpoint every this many bytes (`None`: never).
     every: Option<u64>,
     last_offset: u64,
@@ -895,8 +870,8 @@ impl<'a> Counting<'a> {
             affordances: crate::affordance::Counter::new(r),
             dependencies: Default::default(),
             stopped: false,
-            failed: false,
-            error: None,
+            latch: Latch::default(),
+            guard: None,
             every,
             last_offset: 0,
             amortized: false,
@@ -944,23 +919,22 @@ impl MessageSink for Counting<'_> {
         self.inner.extra_projection()
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        let error = self.error.take().or_else(|| self.inner.take_error());
-        self.failed |= error.is_some();
-        self.stopped |= self.failed;
-        error.or_else(|| {
-            self.failed
-                .then(|| anyhow::anyhow!("counting stream has already failed"))
-        })
+        let error = self.latch.take_or(self.inner, "counting stream");
+        self.stopped |= self.latch.failed();
+        error
     }
     fn dependency(&mut self, path: &std::path::Path) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         self.dependencies.record(path);
+        if let Some(guard) = &mut self.guard {
+            guard.reads.record(path);
+        }
         self.inner.dependency(path);
     }
     fn meta(&mut self, s: &Session) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         // A sink that builds its resolver from the meta session (`session.resolver()`) holds the
@@ -973,16 +947,18 @@ impl MessageSink for Counting<'_> {
         }
     }
     fn message(&mut self, m: Message) -> Flow {
-        if self.failed {
+        if self.latch.failed() {
             return Flow::Stop;
         }
         self.messages += 1;
         self.turns += usize::from(m.is_turn());
         if let Err(error) = self.affordances.note(&m) {
-            self.error = Some(error);
-            self.failed = true;
+            self.latch.fail(error);
             self.stopped = true;
             return Flow::Stop;
+        }
+        if let Some(guard) = &mut self.guard {
+            crate::source::record_message_reads(&m, &guard.primary, &mut guard.reads);
         }
         let flow = self.inner.message(m);
         self.stopped |= flow == Flow::Stop;
@@ -995,7 +971,7 @@ impl MessageSink for Counting<'_> {
             && self.inner.wants_checkpoint(offset)
     }
     fn checkpoint(&mut self, cp: &mut Checkpoint) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         let counts = self
@@ -1104,8 +1080,7 @@ mod tests {
         assert_eq!(counted.get(&crate::affordance::Kind::Checkpoint), Some(&1));
         let mut guard = ErrorGuard {
             inner: &mut facts,
-            error: None,
-            failed: false,
+            latch: Latch::default(),
         };
         assert_eq!(guard.extra_projection(), ExtraProjection::Facts);
         let affordance = crate::affordance::AffordanceSink::new(crate::Harness::Claude, &mut guard);

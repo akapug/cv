@@ -1578,9 +1578,6 @@ fn session_with_tail(session: &Session, d: &Distilled, keep_last: usize, mut tai
     let mut messages = vec![first];
     messages.append(&mut tail);
     let output = Session {
-        source_stamp: None,
-        id: session.id.clone(),
-        harness: session.harness,
         cwd: session.cwd.clone(),
         title: Some(format!("distilled: {}", d.label)),
         created_at: session.created_at,
@@ -1588,14 +1585,12 @@ fn session_with_tail(session: &Session, d: &Distilled, keep_last: usize, mut tai
         model: session.model.clone(),
         git: session.git.clone(),
         principal: session.principal.clone(),
-        system_prompt: None,
         lineage: crate::ir::Lineage {
             forked_from: Some(session.id.clone()),
             ..Default::default()
         },
         messages,
-        source_path: None,
-        extra: serde_json::Map::new(),
+        ..Session::new(session.id.clone(), session.harness)
     };
     // The selected tail was already materialized; earlier inputs were never demanded.
     output
@@ -2269,21 +2264,8 @@ facts text",
         ));
         msgs.push(msg(Role::Assistant, MessageKind::Reply, vec![call("z1", "ls", "List")]));
         Session {
-            source_stamp: None,
-            id: "agent-test".into(),
-            harness: Harness::Claude,
-            cwd: None,
-            title: None,
-            created_at: None,
-            updated_at: None,
-            model: None,
-            git: None,
-            principal: None,
-            system_prompt: None,
-            lineage: Default::default(),
             messages: msgs,
-            source_path: None,
-            extra: Default::default(),
+            ..Session::new("agent-test", Harness::Claude)
         }
     }
 

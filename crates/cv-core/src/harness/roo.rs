@@ -14,9 +14,10 @@
 //! same bytes for both harnesses, so Roo owns no writer of its own — only the resume hint names the
 //! editor extension to open the task in.
 
-use super::cline::{discover_in, emit_with_harness, stream_task_dir, task_roots, ROO_EXT_IDS};
+use super::cline::{discover_in, emit_with_harness, stream_task_dir, task_dir_dependencies, task_roots, ROO_EXT_IDS};
 use super::Adapter;
 use crate::ir::*;
+use crate::source::{Dependencies, Probe};
 use crate::stream::{MessageSink, ParseOptions};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,11 @@ fn cli_tasks_root(home: &Path) -> Option<PathBuf> {
 impl Adapter for Roo {
     fn harness(&self) -> Harness {
         Harness::Roo
+    }
+
+    fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        task_dir_dependencies(r, deps);
+        Some(())
     }
 
     fn roots(&self) -> Vec<PathBuf> {

@@ -703,21 +703,8 @@ mod tests {
 
     fn session(messages: Vec<Message>) -> Session {
         Session {
-            source_stamp: None,
-            id: "t".into(),
-            harness: Harness::Claude,
-            cwd: None,
-            title: None,
-            created_at: None,
-            updated_at: None,
-            model: None,
-            git: None,
             messages,
-            source_path: None,
-            extra: serde_json::Map::new(),
-            principal: None,
-            system_prompt: None,
-            lineage: crate::ir::Lineage::default(),
+            ..Session::new("t", Harness::Claude)
         }
     }
 

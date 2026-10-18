@@ -4,53 +4,33 @@ mod spool;
 use spool::{FirstUser, Prefix, Spool};
 use std::io::{BufReader, BufWriter, Read};
 
-const STATE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "/archive-full3");
+const STATE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "/archive-full4");
 const STATE_BYTES: u64 = 1024 * 1024;
 
+/// A published archive file: its identity, plus off Unix (where `FileId` has no inode or
+/// ctime) a content digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Artifact {
-    bytes: u64,
-    modified_ns: u64,
-    identity: Option<(u64, u64, i64, i64)>,
+    id: cv_core::source::FileId,
     hash: Option<String>,
 }
 impl Artifact {
     fn of(path: &Path) -> Option<Self> {
-        let md = fs::metadata(path).ok()?;
-        let modified_ns = md
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos() as u64;
-        #[cfg(unix)]
-        let identity = {
-            use std::os::unix::fs::MetadataExt;
-            Some((md.dev(), md.ino(), md.ctime(), md.ctime_nsec()))
-        };
-        #[cfg(not(unix))]
-        let identity = None;
-        let hash = if identity.is_none() {
-            let mut input = fs::File::open(path).ok()?;
-            let mut digest = cv_core::digest::Sha256::new();
-            let mut bytes = [0; 64 * 1024];
-            loop {
-                let n = input.read(&mut bytes).ok()?;
-                if n == 0 {
-                    break;
+        let id = cv_core::source::FileId::of(&fs::metadata(path).ok()?)?;
+        let hash = match cfg!(unix) {
+            true => None,
+            false => {
+                let (mut input, mut digest) = (fs::File::open(path).ok()?, cv_core::digest::Sha256::new());
+                let mut bytes = [0; 64 * 1024];
+                loop {
+                    match input.read(&mut bytes).ok()? {
+                        0 => break Some(digest.finish_hex()),
+                        n => digest.update(&bytes[..n]),
+                    }
                 }
-                digest.update(&bytes[..n]);
             }
-            Some(digest.finish_hex())
-        } else {
-            None
         };
-        Some(Self {
-            bytes: md.len(),
-            modified_ns,
-            identity,
-            hash,
-        })
+        Some(Self { id, hash })
     }
     fn matches(&self, path: &Path) -> bool {
         Self::of(path).as_ref() == Some(self)
@@ -233,7 +213,7 @@ impl Archive {
                 && stored
                     .prefix
                     .as_ref()
-                    .is_some_and(|prefix| prefix.valid(stored.artifact.bytes, pass.prefix))
+                    .is_some_and(|prefix| prefix.valid(stored.artifact.id.len, pass.prefix))
         });
         if pass.resumed && old.is_none() {
             // Older state has no canonical prefix range, or its artifact changed. The existing

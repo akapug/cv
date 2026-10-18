@@ -2744,24 +2744,15 @@ fn the_inbox_records_the_same_events_as_the_cli() {
         let (status, body) = http(&addr, "POST", &format!("/api/task/{a}/note"), Some("not json"));
         assert_eq!(status, 400, "{body}");
 
-        // The closed items show under the page's Resolved filter; reopen brings a NEW task.
+        // The closed items show under the page's Resolved filter; the web-only reopen is a pointer.
         let (status, body) = http(&addr, "GET", "/api/inbox?who=ember", None);
         assert_eq!(status, 200);
         let page: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(page["items"].as_array().unwrap().len(), 0);
         assert_eq!(page["closed"].as_array().unwrap().len(), 2);
         let (status, body) = http(&addr, "POST", &format!("/api/task/{a}/reopen"), Some("{}"));
-        assert_eq!(status, 200, "{body}");
-        let (status, body) = http(&addr, "GET", "/api/inbox?who=ember", None);
-        assert_eq!(status, 200);
-        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let items = page["items"].as_array().unwrap();
-        assert_eq!(items.len(), 1, "{body}");
-        assert_eq!(items[0]["title"], "push dregg-infra");
-        assert!(
-            items[0]["tags"].as_array().unwrap().iter().any(|t| t == "reopened"),
-            "{body}"
-        );
+        assert_eq!(status, 410, "{body}");
+        assert!(body.contains("removed in 0.17"), "{body}");
 
         // One task, with its history; the event feed is the same query as `cv task events`.
         let (status, body) = http(&addr, "GET", &format!("/api/task/{d}?events=1"), None);

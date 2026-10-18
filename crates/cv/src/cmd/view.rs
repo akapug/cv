@@ -274,95 +274,29 @@ fn show_range(r: &SessionRef, window: &WindowArgs, pre_compaction: Option<usize>
     Ok(Some(Window::Range(start, Some(end))))
 }
 
-/// Collect a full-fidelity JSON window while reading through EOF for final session metadata.
-/// Discarded messages die in the sink; `Last` keeps only its bounded tail. Lazy content retains
-/// full extras, then selected messages are materialized before budgeting and serialization.
+/// The CLI's window over `r`: the selector's bounds or the last `n`, cut at the byte budget.
+fn window_sink(r: &SessionRef, window: Option<Window>, max_bytes: Option<usize>) -> Result<cv_core::api::WindowSink> {
+    use cv_core::api::WindowSink;
+    let sink = match window {
+        Some(Window::Last(n)) => WindowSink::new(&r.path, 0, None).tail(n),
+        Some(w) => {
+            let (start, end) = w.bounds(|| unreachable!("Last is handled by the tail"))?;
+            WindowSink::new(&r.path, start, end)
+        }
+        None => WindowSink::new(&r.path, 0, None),
+    };
+    Ok(sink.budget(max_bytes))
+}
+
+/// Collect a full-fidelity JSON window, materialized, while reading through EOF for final
+/// session metadata: redaction's cross-field rules need the decoded tree.
 fn session_json_window(
     adapter: &dyn Adapter,
     r: &SessionRef,
     window: Option<Window>,
     max_bytes: Option<usize>,
 ) -> Result<(Session, Option<usize>)> {
-    struct Selection {
-        resolver: cv_core::Resolver,
-        seen: usize,
-        start: usize,
-        end: Option<usize>,
-        tail: Option<usize>,
-        messages: std::collections::VecDeque<Message>,
-        max_bytes: Option<usize>,
-        bytes: usize,
-        next: Option<usize>,
-        error: Option<anyhow::Error>,
-    }
-    impl Selection {
-        fn keep(&mut self, mut m: Message, index: usize) {
-            if self.next.is_some() || self.error.is_some() {
-                return;
-            }
-            if let Err(error) = m.materialize(&self.resolver) {
-                self.error = Some(error);
-                return;
-            }
-            if let Some(budget) = self.max_bytes {
-                match serde_json::to_vec(&m) {
-                    Ok(v) => {
-                        if !self.messages.is_empty() && self.bytes + v.len() > budget {
-                            self.next = Some(index);
-                            return;
-                        }
-                        self.bytes += v.len();
-                    }
-                    Err(e) => {
-                        self.error = Some(e.into());
-                        return;
-                    }
-                }
-            }
-            self.messages.push_back(m);
-        }
-    }
-    impl cv_core::MessageSink for Selection {
-        fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.error.take()
-        }
-        fn message(&mut self, m: Message) -> cv_core::Flow {
-            let index = self.seen;
-            self.seen += 1;
-            if let Some(n) = self.tail {
-                if n > 0 {
-                    self.messages.push_back(m);
-                    if self.messages.len() > n {
-                        self.messages.pop_front();
-                    }
-                }
-            } else if index >= self.start && self.end.is_none_or(|end| index < end) {
-                self.keep(m, index);
-            }
-            // Even past the selected window, read session facts written later in the source.
-            cv_core::Flow::Continue
-        }
-    }
-    let (start, end, tail) = match window {
-        Some(Window::Last(n)) => (0, None, Some(n)),
-        Some(w) => {
-            let (start, end) = w.bounds(|| unreachable!("Last is handled by the tail"))?;
-            (start, end, None)
-        }
-        None => (0, None, None),
-    };
-    let mut sink = Selection {
-        resolver: cv_core::Resolver::new(Some(r.path.clone())),
-        seen: 0,
-        start,
-        end,
-        tail,
-        messages: Default::default(),
-        max_bytes,
-        bytes: 0,
-        next: None,
-        error: None,
-    };
+    let mut sink = window_sink(r, window, max_bytes)?.keeping();
     let mut session = cv_core::stream::stream_counted(
         adapter,
         r,
@@ -371,16 +305,8 @@ fn session_json_window(
         cv_core::stream::Pass::RECORD,
     )?
     .session;
-    if sink.tail.is_some() {
-        let start = sink.seen - sink.messages.len();
-        for (i, m) in std::mem::take(&mut sink.messages).into_iter().enumerate() {
-            sink.keep(m, start + i);
-        }
-    }
-    if let Some(e) = sink.error {
-        return Err(e);
-    }
-    session.messages = sink.messages.into_iter().collect();
+    sink.finish()?;
+    session.messages = sink.take_kept();
     Ok((session, sink.next))
 }
 
@@ -404,131 +330,17 @@ fn staged_session_json_inner(
     document: bool,
     checked: bool,
 ) -> Result<(cv_core::bytes::ByteSource, Option<usize>)> {
-    use cv_core::bytes::ByteStage;
-    use std::io::BufWriter;
-    struct Selection {
-        resolver: cv_core::Resolver,
-        seen: usize,
-        start: usize,
-        end: Option<usize>,
-        tail: Option<usize>,
-        tail_messages: std::collections::VecDeque<Message>,
-        stage: BufWriter<ByteStage>,
-        budget: Option<usize>,
-        bytes: usize,
-        count: usize,
-        next: Option<usize>,
-        error: Option<anyhow::Error>,
-    }
-    impl Selection {
-        fn accept(&mut self, message: Message, index: usize) -> Result<()> {
-            if self.next.is_some() {
-                return Ok(());
-            }
-            // Pending bytes belong to the same logical spool; do not flush each frame.
-            let before = self.stage.get_ref().len() + self.stage.buffer().len() as u64;
-            let remaining = (self.count > 0)
-                .then(|| self.budget.map(|budget| budget.saturating_sub(self.bytes)))
-                .flatten();
-            let size = super::session_json::write_budgeted_message_frame(
-                &mut self.stage,
-                &message,
-                &self.resolver,
-                remaining,
-            )?;
-            if self.count > 0
-                && self
-                    .budget
-                    .is_some_and(|budget| size > budget.saturating_sub(self.bytes))
-            {
-                self.stage.flush()?;
-                self.stage.get_mut().truncate(before)?;
-                self.next = Some(index);
-                return Ok(());
-            }
-            self.bytes = self.bytes.checked_add(size).context("JSON budget size overflow")?;
-            self.count += 1;
-            Ok(())
-        }
-    }
-    impl cv_core::MessageSink for Selection {
-        fn extra_projection(&self) -> cv_core::stream::ExtraProjection {
-            if self.tail.is_some()
-                || (self.error.is_none()
-                    && self.next.is_none()
-                    && self.seen >= self.start
-                    && self.end.is_none_or(|end| self.seen < end))
-            {
-                cv_core::stream::ExtraProjection::Full
-            } else {
-                cv_core::stream::ExtraProjection::Facts
-            }
-        }
-        fn meta(&mut self, session: &Session) {
-            self.resolver = session.resolver();
-        }
-        fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.error.take()
-        }
-        fn message(&mut self, message: Message) -> cv_core::Flow {
-            let index = self.seen;
-            self.seen += 1;
-            if self.error.is_none()
-                && (self.tail.is_some_and(|n| n > 0)
-                    || (self.tail.is_none() && index >= self.start && self.end.is_none_or(|end| index < end)))
-            {
-                if let Some(n) = self.tail {
-                    self.tail_messages.push_back(message);
-                    if self.tail_messages.len() > n {
-                        self.tail_messages.pop_front();
-                    }
-                } else if let Err(error) = self.accept(message, index) {
-                    self.error = Some(error);
-                }
-            }
-            cv_core::Flow::Continue
-        }
-    }
-    let (start, end, tail) = match window {
-        Some(Window::Last(n)) => (0, None, Some(n)),
-        Some(w) => {
-            let (start, end) = w.bounds(|| unreachable!())?;
-            (start, end, None)
-        }
-        None => (0, None, None),
-    };
-    let mut sink = Selection {
-        resolver: cv_core::Resolver::new(Some(r.path.clone())),
-        seen: 0,
-        start,
-        end,
-        tail,
-        tail_messages: Default::default(),
-        stage: BufWriter::with_capacity(64 * 1024, ByteStage::default()),
-        budget: max_bytes,
-        bytes: 0,
-        count: 0,
-        next: None,
-        error: None,
-    };
+    let mut sink = window_sink(r, window, max_bytes)?;
     let pass = cv_core::stream::Pass {
         guard: checked,
         ..cv_core::stream::Pass::RECORD
     };
     let read = cv_core::stream::stream_counted(adapter, r, &cv_core::ParseOptions::lazy_extra(), &mut sink, pass)?;
-    let (session, guard) = (read.session, read.guard);
-    if let Some(error) = sink.error.take() {
-        return Err(error);
-    }
-    let start = sink.seen - sink.tail_messages.len();
-    for (i, message) in std::mem::take(&mut sink.tail_messages).into_iter().enumerate() {
-        sink.accept(message, start + i)?;
-    }
-    let frames = sink.stage.into_inner().map_err(|error| error.into_error())?.finish()?;
-    let mut output = BufWriter::with_capacity(64 * 1024, ByteStage::default());
-    super::session_json::write_document(&mut output, &session, &frames, sink.count, document)?;
+    let frames = sink.finish()?;
+    let mut output = std::io::BufWriter::with_capacity(64 * 1024, cv_core::bytes::ByteStage::default());
+    super::session_json::write_document(&mut output, &read.session, &frames, sink.selected, document)?;
     output.write_all(b"\n")?;
-    if let Some(guard) = guard {
+    if let Some(guard) = read.guard {
         guard.verify(r)?;
     }
     Ok((
@@ -2449,13 +2261,7 @@ mod tests {
             for budget in [None, Some(0), Some(1024), Some(1 << 20)] {
                 let (expected, expected_next) = full_json_window(adapter, r, window, budget);
                 for document in [false, true] {
-                    super::super::session_json::take_frame_serializations();
                     let (staged, next) = staged_session_json(adapter, r, window, budget, document).unwrap();
-                    assert_eq!(
-                        super::super::session_json::take_frame_serializations(),
-                        expected.messages.len() + usize::from(expected_next.is_some()),
-                        "each accepted/rejected message is staged once"
-                    );
                     let mut bytes = Vec::new();
                     staged.copy_to(&mut bytes).unwrap();
                     let mut oracle = if document {

@@ -34,6 +34,20 @@ pub struct TaskRow {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+    /// The backlog columns (`GET /api/tasks?detail=1`, what the inbox page lists); absent elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<bool>,
+    /// Blocked by a task that has not finished ([`project::is_blocked`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<bool>,
 }
 
 impl TaskRow {
@@ -49,6 +63,12 @@ impl TaskRow {
             last_ts: None,
             tags: t.tags.clone(),
             blocked_by: t.blocked_by.clone(),
+            opened_by: None,
+            issue: None,
+            body: None,
+            notes: None,
+            decision: None,
+            blocked: None,
         }
     }
 
@@ -58,6 +78,19 @@ impl TaskRow {
             opened_at: Some(t.opened_at),
             last_ts: Some(t.last_ts),
             ..TaskRow::brief(t)
+        }
+    }
+
+    /// The timestamped row plus the backlog columns (`GET /api/tasks?detail=1`).
+    pub fn detailed(t: &TaskProjection, model: &super::reduce::TaskReadModel) -> TaskRow {
+        TaskRow {
+            opened_by: Some(t.opened_by.clone()),
+            issue: t.issue.clone(),
+            body: Some(t.body.clone()),
+            notes: Some(t.notes.len()),
+            decision: Some(t.decision.is_some()),
+            blocked: Some(project::is_blocked(model, t)),
+            ..TaskRow::full(t)
         }
     }
 }

@@ -800,9 +800,6 @@ fn stream_session(
         (None, t) => t.or_else(|| r.title.clone()),
     };
     let mut s = Session {
-        source_stamp: None,
-        id: r.id.clone(),
-        harness: Harness::Devin,
         cwd: wd
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
@@ -811,11 +808,8 @@ fn stream_session(
         created_at: created.and_then(ts_from_epoch).or(r.created_at),
         updated_at: head_updated.or_else(|| last.and_then(ts_from_epoch)).or(r.updated_at),
         model,
-        git: None,
-        messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra,
-        principal: None,
         system_prompt: (!prefix.is_empty()).then(|| prefix.join("\n\n")),
         lineage: match agent {
             Some(a) => crate::ir::Lineage {
@@ -826,6 +820,7 @@ fn stream_session(
             },
             None => crate::ir::Lineage::default(),
         },
+        ..Session::new(r.id.clone(), Harness::Devin)
     };
     sink.meta(&s);
 

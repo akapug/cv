@@ -66,7 +66,7 @@ commands have it is in the [reference](reference.md)):
 | `--limit <n>` | how many rows/records |
 | `--all` | include what is hidden by default |
 | `--thinking <mode>` | reasoning policy: `native`, `portable`, `text`, `drop`; rewind accepts native/portable |
-| `--strict` | fail if a loss the target format *could* have carried happens |
+| `--strict` | `port`: fail on unexpected fidelity loss; `index`: fail on any unreadable session |
 | `--skills-policy <p>` | restored skills in a new Claude session: `keep`, `drop-all`, `drop-stale` |
 
 **`--thinking` and replay.** Thinking blocks come in two shapes. A few carry plaintext. Most carry
@@ -152,7 +152,10 @@ Only **one** of `--first`/`--last`/`--range`/`--around` may be given; clap refus
 … continue with --range 4..
 ```
 
-so paging a huge session is a loop of copy-paste with no arithmetic. Messages outside the window are never resolved, so a windowed view of a multi-gigabyte transcript reads only the bytes it shows.
+The byte budget cuts at message boundaries and always admits the first selected message; headers,
+JSON envelopes and continuation hints can add bytes. It is not a hard response-size limit.
+Messages outside the window keep lazy payloads, but validation, metadata and `--last` selection
+can still traverse the source beyond the displayed window.
 
 Two relatives use the same `A..B` grammar without being read-windows: [`cv prune --keep A..B`](#cv-prune) selects the turns to *keep* in a new session, and [`cv splice`](#cv-splice)'s specs are `<id>:A..B`.
 
@@ -207,11 +210,12 @@ stays a catalog-only read.
 
 #### Freshness — what `ls` guarantees
 
-`cv ls` reads the **probed catalog**, not a full fleet scan. On a 7,000-session, 95 GB fleet a warm
-`cv ls` takes 0.2–1 s (it checks every primary source, below). The first read on a new home, or
-after an upgrade that changes how sessions are read, re-discovers the whole fleet: 4.5 minutes and
-14 CPU-minutes on that fleet. cv says so on stderr when an upgrade causes it; run `cv index` right
-after upgrading to pay it up front. The catalog's freshness rests on a staleness probe plus a time backstop (`CLUSTERVISION_MAX_STALE_SECS`, default **900s**):
+`cv ls` reads the **probed catalog**, not a full fleet scan. Measured 2026-10-14 on a frozen copy
+of a 5,421-session, 78 GB fleet (host load 25–200, so the ranges are wide; `docs/design/PERF.md`
+has the conditions), a warm `cv ls` took 0.06–0.09 s (it checks every primary source, below). The
+first read on a new home, or after an upgrade that changes how sessions are read, re-discovers the
+whole fleet: 158–186 s on that fleet. cv says so on stderr when an upgrade causes it; run
+`cv index` right after upgrading to pay it up front. The catalog's freshness rests on a staleness probe plus a time backstop (`CLUSTERVISION_MAX_STALE_SECS`, default **900s**):
 
 - **A new session in a watched directory is seen on the next read.** Creating a session bumps its directory's mtime; the probe re-stats watched directories and re-discovers the affected harness before reading. A first session in a previously empty deeper directory can escape those watches and remain unseen until the time backstop forces full discovery — at most `CLUSTERVISION_MAX_STALE_SECS` after the last full sync, on the next read.
 - **A new storage root is seen too.** When a root appears that the catalog does not watch yet (a new agent under a `*` entry in `claude-roots`, or a line added to that file — see [Harnesses](harnesses.md#claude-code-sessions-outside-claude)), the probe re-discovers that harness.
@@ -403,6 +407,7 @@ cv workflow stark-kill-emit-swarm           # no session id? the name resolves f
 cv workflow 3b829648 wf_ab915970 --script   # print the driving JS instead
 cv workflow 3b829648 wf_ab915970 --results  # each agent's FULL journaled return value
 cv workflow 3b829648 wf_ab915970 --follow   # stream a LIVE run's agent transitions (-f)
+cv workflow 3b829648 wf_ab915970 --for 10m  # follow for ten minutes, then render the run as it stands
 cv workflow 3b829648 wf_ab915970 --revive   # a resume prompt per unfinished lane
 cv workflow 3b829648 wf_ab915970 --json     # the structured Workflow IR
 ```
@@ -413,7 +418,7 @@ Agents that didn't finish (`error`/`progress`) show where they last were — `�
 
 The default agent lines carry ~400-char result *previews* (that's all the state file keeps); `--results` (and `--json`) read the run's `journal.jsonl` and print each agent's **complete** journaled return — the full lane harvest.
 
-`--follow` (`-f`) tails a live run: the harness flushes the state file as agents progress, so cv polls it and prints one line per agent state transition (`18:37:15  ✓ gate1:verify → done (63,198 tok)`), then emits the full render when the run reaches a terminal status. If the run hasn't registered yet it waits.
+`--follow` (`-f`) tails a live run: the harness flushes the state file as agents progress, so cv polls it and prints one line per agent state transition (`18:37:15  ✓ gate1:verify → done (63,198 tok)`), then emits the full render when the run reaches a terminal status. If the run hasn't registered yet it waits. It announces what it is following on stderr within a second; `--for <duration>` (`30s`, `5m`, `2h`; implies `--follow`) stops after that long and renders the run as it stands, so a script never waits on a run that will not end.
 
 `--revive` salvages a dead or interrupted run: it emits a ready-to-paste standalone `Agent` prompt per lane — the FULL original task plus the work that lane already landed (files written, commands run, its own last note) — so lanes come back *resumed* rather than restarted. `--revive-all` includes the lanes that succeeded too.
 
@@ -918,15 +923,25 @@ cv scry
 cv scry --harness claude --cwd clustervision
 cv scry --existing            # also emit sessions already present at startup
 cv scry --interval 1
+cv scry --for 5m              # follow for five minutes, then exit 0
+cv scry | tee feed.txt        # a pipe gets the current state once …
+cv scry --follow | tee feed.txt   # … unless told to follow
 ```
 
 ```text
-✦ scrying for agent activity… (Ctrl-C to stop)
+cv scry: following live agent activity; stop with Ctrl-C or --for <duration>
+cv scry: following 212 sessions
 ✷ new  claude   da9174f4  ~/pug/clustervision  (3 msg)
       user walk the type checker and find where flux is ignored
    +  claude   da9174f4  ~/pug/clustervision  (1 msg)
       assistant found it — the walker drops flux constraints here …
 ```
+
+Blocking is opt-in and announced: on a terminal `scry` follows until Ctrl-C and says so within a
+second, before it reads a single session. With stdout piped (an agent, a script) it prints the
+sessions it would follow once — one `   ·` line each, oldest-touched first — and exits 0, with one
+stderr line saying that `--follow` keeps following and `--for 30s`/`5m`/`2h` bounds it (`--for`
+alone follows for that long). `--existing` on a pipe prints the backlog of messages instead.
 
 This is the CLI face of [`cv watch`](serving.md), which mirrors the same activity into a live feed for your whole fleet (and powers the MCP `await_omen` block-until-match primitive).
 
@@ -999,7 +1014,7 @@ cv schema --commands         # every command, grouped, with its one-line about
 cv schema --commands --json  # the whole tree with every argument — what generates the MCP tools
 ```
 
-`cv schema --json` publishes five shapes: `session_row` (keys, `enrich_keys`, `search_extra_keys`, timestamps), `session` (fields, `lineage`, `extra`), `message` (fields, and the `role`/`kind`/`origin`/`usage` vocabularies), `block` (its `type` tag and every type), and `query`. `cv schema --commands --json` emits, for every visible command and subcommand, `{ name, group, about, args: [{ name, kind, value_type, possible_values?, default?, help, required }] }` — produced from clap itself, which is why [the MCP tools](mcp.md) can be generated rather than hand-maintained and so cannot drift from the CLI.
+`cv schema --json` publishes eight shapes: `session_row` (keys, `enrich_keys`, `search_extra_keys`, timestamps), `session` (fields, `lineage`, `extra`), `message` (fields, and the `role`/`kind`/`origin`/`usage` vocabularies), `block` (its `type` tag and every type), `prompt_row`, `lane`, `deferral`, and `query`. `cv schema --commands --json` emits, for every visible command and subcommand, `{ name, group, about, args: [{ name, kind, value_type, possible_values?, default?, help, required }] }` — produced from clap itself, which is why [the MCP tools](mcp.md) can be generated rather than hand-maintained and so cannot drift from the CLI.
 
 This command used to be called `cv query`, which read like it ran one. It doesn't; it describes the language.
 
@@ -1020,7 +1035,7 @@ Fields, by what they cost to answer:
 - **catalog** (free, no parse): `harness`, `cwd`, `title`, `id`, `msgs`, `created`, `updated` (`before:`/`after:`/`since:`/`until:` are sugar).
 - **parse** (reads the transcript): `model` (any turn's model), `git` (branch/remote).
 - **index** (needs `cv index`): `text` — full-text over content.
-- **events**: `tool` (a tool *this session* ran), `touched` (a file it read/edited), `has` (flags: `subagents`, `errors`, `tools`, `images`, `compacted`, `workflows`).
+- **events**: `tool` (a tool *this session* ran), `touched` (a file it read/edited), `has` (flags: `subagents`, `errors`, `tools`, `images`, `compacted`, `workflows`, and every affordance kind — `plan`, `schedule`, `background_job`, `approval`, … — see [`--kind`](#views)).
 - **forest** (walks the [sub-agent forest / workflows / compaction seams](#cv-workflow) — the priciest): `subtool` (a tool a *sub-agent* ran), `agent` (spawned a sub-agent of this type), `agents` (forest size), `workflow` (ran a matching `Workflow`), `workflows` (run count), `compactions` (boundary count).
 
 Operators: `:` (contains), `=` (exact), and `> >= < <=` for numbers/dates; values can be comma-OR-lists (`a,b`) or ranges (`lo..hi`). A bare word matches title/cwd/id. The evaluator prunes with the catalog-cheap terms **first**, so a forest/parse/index term only ever runs on what survives — always pair one with a `harness:`/`cwd:`/`msgs` term to stay fast.

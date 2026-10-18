@@ -16,6 +16,7 @@
 use crate::http::{Request, Response};
 use anyhow::Result;
 use cv_core::Harness;
+use cv_search::{Note, Source};
 use serde_json::{json, Value};
 use std::io::Read;
 use std::net::TcpListener;
@@ -44,7 +45,7 @@ struct Ctx {
     /// When set, every `/api/*` request must carry `Authorization: Bearer <token>`.
     token: Option<String>,
     default_who: Option<String>,
-    semantic_search: cv_search::SemanticSearch,
+    searcher: cv_search::Searcher,
 }
 
 /// Gatekeep the exposure, then serve until the process is killed: a non-loopback bind serves the
@@ -133,7 +134,7 @@ fn run(
         web_root,
         token,
         default_who: who,
-        semantic_search: cv_search::SemanticSearch::default(),
+        searcher: cv_search::Searcher::default(),
     };
     crate::http::serve(listener, crate::http::Limits::default(), move |request| {
         handle(request, &ctx)
@@ -362,7 +363,7 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
                 }
                 Ok(None) => {}
             }
-            let (status, body, extra) = route(&parts, query, &ctx.semantic_search);
+            let (status, body, extra) = route(&parts, query, &ctx.searcher);
             request.respond(json_response(status, &body, origin.as_deref(), &extra));
         }
     }
@@ -452,10 +453,10 @@ fn allowed_origin(origin: Option<&str>, bind_host: &str) -> Option<String> {
 type Reply = (u16, Value, Vec<(&'static str, String)>);
 
 /// Route a decoded read path + raw query string. Never panics.
-fn route(parts: &[&str], query: &str, semantic_search: &cv_search::SemanticSearch) -> Reply {
+fn route(parts: &[&str], query: &str, searcher: &cv_search::Searcher) -> Reply {
     // Routes that carry extra response headers answer here; everything else is header-free.
     if let ["api", "search"] = parts {
-        return search(query, semantic_search);
+        return search(query, searcher);
     }
     if let ["api", "stats"] = parts {
         let (status, body) = stats(query);
@@ -519,31 +520,28 @@ fn stats(query: &str) -> (u16, Value) {
 /// `semantic` | `live`), with a human sentence in `X-Cv-Search-Note` whenever the answer may be
 /// partial (a stale index, a live scan, a truncation). Both headers are CORS-exposed. The body
 /// stays exactly the CLI's array.
-fn search(query: &str, semantic_search: &cv_search::SemanticSearch) -> Reply {
+fn search(query: &str, searcher: &cv_search::Searcher) -> Reply {
     let params = Query::parse(query);
+    let bad = |status, message: &str| {
+        let (status, body) = err(status, message);
+        (status, body, Vec::new())
+    };
     // An empty query would mean "every session", which is `/api/sessions`' job; searching for
     // nothing is a caller mistake, not an empty result set.
     let Some(q) = params.get("q") else {
-        let (s, v) = err(400, "missing q parameter");
-        return (s, v, Vec::new());
+        return bad(400, "missing q parameter");
     };
     // Validate harness up front so a typo is a clear 400 rather than silently empty.
     let want = match params.get("harness") {
         Some(h) => match Harness::parse(&h) {
             Some(h) => Some(h),
-            None => {
-                let (s, v) = err(400, &format!("unknown harness {h:?}"));
-                return (s, v, Vec::new());
-            }
+            None => return bad(400, &format!("unknown harness {h:?}")),
         },
         None => None,
     };
     let limit = match params.unsigned("limit") {
         Ok(limit) => limit.unwrap_or(SEARCH_LIMIT),
-        Err(error) => {
-            let (status, body) = err(400, &error);
-            return (status, body, Vec::new());
-        }
+        Err(error) => return bad(400, &error),
     };
     let cwd = params.get("cwd");
     let flag = |name| {
@@ -556,180 +554,81 @@ fn search(query: &str, semantic_search: &cv_search::SemanticSearch) -> Reply {
         None => cv_search::Scope::Exchange,
         Some(kind) => match cv_search::Scope::parse(&kind) {
             Some(scope) => scope,
-            None => {
-                let (status, body) = err(400, &format!("unknown kind {kind:?}: exchange, context or all"));
-                return (status, body, Vec::new());
-            }
+            None => return bad(400, &format!("unknown kind {kind:?}: exchange, context or all")),
         },
     };
-
-    if semantic && scope != cv_search::Scope::Exchange {
-        let (status, body) = err(400, "semantic=1 embeds the exchange only: kind= is full-text");
-        return (status, body, Vec::new());
+    if semantic && scan {
+        return bad(400, "semantic=1 conflicts with scan=1");
     }
-    let (mut hits, source, mut note) = if semantic {
-        match semantic_search.search(
-            &q,
-            limit,
-            cv_search::SearchFilter {
-                harness: want.map(|h| h.as_str()),
-                cwd: cwd.as_deref(),
-                ..Default::default()
-            },
-        ) {
-            Ok(hits) => (hits, "semantic", None),
-            Err(e) => {
-                // A live scan cannot stand in for semantic ranking, so this is an error, exactly
-                // as `cv search --semantic` exits non-zero rather than quietly changing mode.
-                let (s, v) = err(
-                    500,
-                    &format!("semantic search failed (run `cv index --semantic` first?): {e:#}"),
-                );
-                return (s, v, Vec::new());
-            }
-        }
+    // The CLI declares --kind as conflicting with --scan and --semantic; the HTTP door keeps the
+    // same rule, so one request shape means one thing on both.
+    if (semantic || scan) && params.get("kind").is_some() {
+        return bad(400, "this mode searches the exchange only; kind= needs the index");
+    }
+    let source = if semantic {
+        Source::Semantic
     } else if scan {
-        (
-            Vec::new(),
-            "live",
-            Some("scan=1: scanned transcripts live, head-capped".into()),
-        )
+        Source::Live
     } else {
-        // The index is authoritative: an empty result means "no match", and a missing or unusable
-        // index is an error naming the cause and the fix, never a silent scan of every transcript.
-        match cv_search::text_search_indexed_filtered(
-            None,
-            &q,
-            limit,
-            cv_search::SearchFilter {
-                harness: want.map(|h| h.as_str()),
-                cwd: cwd.as_deref(),
-                scope,
-            },
-        ) {
-            Ok(hits) => (hits, "index", None),
-            Err(error) if cv_search::is_invalid_text_query(&error) => {
-                let (status, body) = err(400, &format!("invalid search query: {error:#}"));
-                return (status, body, Vec::new());
-            }
-            Err(error) => {
-                let (status, body) = err(
-                    503,
-                    &format!("{error:#} (or add scan=1 for a slow live scan of each session's head)"),
-                );
-                return (status, body, Vec::new());
-            }
+        Source::Index
+    };
+    let filter = cv_search::SearchFilter {
+        harness: want.map(|h| h.as_str()),
+        cwd: cwd.as_deref(),
+        scope,
+    };
+    let found = match searcher.search(&q, filter, limit, source) {
+        Ok(found) => found,
+        // A live scan cannot stand in for semantic ranking, so this is an error, exactly as
+        // `cv search --semantic` exits non-zero rather than quietly changing mode.
+        Err(e) if semantic => {
+            return bad(
+                500,
+                &format!("semantic search failed (run `cv index --semantic` first?): {e:#}"),
+            )
+        }
+        Err(e) if scan => return bad(500, &format!("live scan failed: {e:#}")),
+        Err(e) if cv_search::is_invalid_text_query(&e) => return bad(400, &format!("invalid search query: {e:#}")),
+        // The index is authoritative: a missing or unusable index is an error naming the cause and
+        // the fix, never a silent scan of every transcript.
+        Err(e) => {
+            return bad(
+                503,
+                &format!("{e:#} (or add scan=1 for a slow live scan of each session's head)"),
+            )
         }
     };
+    let context = cv_core::rows::SearchRowContext::new();
+    let rows: Vec<Value> = found.hits.iter().map(|h| cv_search::row(h, &context)).collect();
 
-    if source != "live" {
-        hits.retain(|h| {
-            want.is_none_or(|w| h.harness == w.as_str())
-                && cwd
-                    .as_ref()
-                    .is_none_or(|needle| h.cwd.as_ref().is_some_and(|c| c.contains(needle.as_str())))
+    // The note, in this door's words: the scan, its truncation, then whatever the search itself
+    // could not promise, joined with `; `.
+    let mut note = scan.then(|| "scan=1: scanned transcripts live, head-capped".to_string());
+    if found.truncated {
+        note = Some(format!(
+            "{} (stopped at {limit} hits; raise limit for more)",
+            note.unwrap_or_default()
+        ));
+    }
+    for n in &found.notes {
+        let s = match n {
+            Note::Stale(s) => s.clone(),
+            Note::SnippetsUnavailable(e) => format!("live snippets unavailable ({e}); showing indexed previews"),
+            Note::NoSubagents => "sub-agent transcripts aren't searched yet — rebuild with `cv index --subagents` to \
+                                  include the Agent/Workflow lanes"
+                .to_string(),
+        };
+        note = Some(match note {
+            Some(n) => format!("{n}; {s}"),
+            None => s,
         });
-        hits.truncate(limit);
-        if source == "index" {
-            if let Err(e) = cv_search::enrich_text_snippets(None, &q, scope, &mut hits) {
-                note = Some(format!("live snippets unavailable ({e:#}); showing indexed previews"));
-            }
-        }
     }
 
-    let mut rows: Vec<Value> = if source == "live" {
-        match cv_core::scan::live_search_filtered(&q, want, limit, |reference| {
-            cwd.as_ref().is_none_or(|needle| {
-                reference
-                    .cwd
-                    .as_ref()
-                    .is_some_and(|path| path.to_string_lossy().contains(needle.as_str()))
-            })
-        }) {
-            Ok(found) => {
-                if found.truncated {
-                    note = Some(format!(
-                        "{} (stopped at {limit} hits; raise limit for more)",
-                        note.unwrap_or_default()
-                    ));
-                }
-                found
-                    .hits
-                    .iter()
-                    .map(|h| cv_core::rows::live_search_row(&h.session, &h.title, &h.snippet))
-                    .collect()
-            }
-            Err(e) => {
-                let (s, v) = err(500, &format!("live scan failed: {e:#}"));
-                return (s, v, Vec::new());
-            }
-        }
-    } else {
-        let context = cv_core::rows::SearchRowContext::new();
-        hits.iter()
-            .filter(|h| want.is_none_or(|w| h.harness == w.as_str()))
-            .map(|h| {
-                cv_core::rows::SearchRow {
-                    id: &h.id,
-                    harness: &h.harness,
-                    cwd: h.cwd.as_deref(),
-                    title: h.title.as_deref(),
-                    created_at: h.created_at,
-                    updated_at: h.updated_at,
-                    score: Some(h.score),
-                    snippet: &h.snippet,
-                    agent_id: h.agent_id.as_deref(),
-                    parent_id: h.parent_id.as_deref(),
-                    workflow: h.workflow.as_deref(),
-                }
-                .to_json_with(&context)
-            })
-            .collect()
-    };
-    // `cwd` is the daemon's own filter (the CLI has no `search --cwd`): a substring of the row's
-    // cwd as the caller will see it, matching `/api/sessions?cwd=`. A row with no cwd never matches.
-    if let Some(needle) = &cwd {
-        rows.retain(|r| r["cwd"].as_str().is_some_and(|c| c.contains(needle.as_str())));
-    }
-    rows.truncate(limit);
-
-    // The index is authoritative, so an empty result means "no match" — but the two reasons a real
-    // conversation is unfindable are both about the index, not the query, and `cv search` says so
-    // on a miss. A hit list that may be missing rows says so too: the staleness probe is the
-    // catalog's own metadata (one stat per session), cheap enough to name on every indexed answer.
-    if source == "index" {
-        if let Some(stale) = cv_search::fts::staleness_note(&cv_search::default_tantivy_dir()) {
-            note = Some(match note {
-                Some(n) => format!("{n}; {stale}"),
-                None => stale,
-            });
-        }
-        if rows.is_empty() {
-            if let Some(sub) = subagent_miss_note() {
-                note = Some(match note {
-                    Some(n) => format!("{n}; {sub}"),
-                    None => sub,
-                });
-            }
-        }
-    }
-
-    let mut headers = vec![("X-Cv-Search-Source", source.to_string())];
+    let mut headers = vec![("X-Cv-Search-Source", found.source.as_str().to_string())];
     if let Some(n) = note {
         headers.push(("X-Cv-Search-Note", header_safe(&n)));
     }
     (200, json!(rows), headers)
-}
-
-/// The other reason an indexed search might have come back empty for something that really was
-/// said — it holds no sub-agent transcripts (so nothing an Agent/Workflow lane discussed is
-/// searchable). The index-lag half is [`cv_search::fts::staleness_note`], which serves hits too.
-fn subagent_miss_note() -> Option<String> {
-    (!cv_search::fts::has_subagent_docs(&cv_search::default_tantivy_dir())).then(|| {
-        "sub-agent transcripts aren't searched yet — rebuild with `cv index --subagents` to \
-         include the Agent/Workflow lanes"
-            .to_string()
-    })
 }
 
 /// A header-safe rendering of a note: header values are a byte channel with no escaping, so keep
@@ -983,6 +882,21 @@ mod semantic_service_tests {
     use super::*;
 
     #[test]
+    fn search_rejects_cli_conflicts_before_reading_sources() {
+        let _world = crate::test_world("search-conflicts");
+        for flags in [
+            "scan=1&kind=context",
+            "scan=1&kind=all",
+            "scan=1&kind=exchange",
+            "semantic=1&kind=exchange",
+            "scan=1&semantic=1",
+        ] {
+            let (status, body, _) = search(&format!("q=needle&{flags}"), &cv_search::Searcher::default());
+            assert_eq!(status, 400, "{flags}: {body}");
+        }
+    }
+
+    #[test]
     fn token_comparison_needs_every_byte() {
         assert!(token_matches("opensesame", "opensesame"));
         for wrong in ["", "opensesam", "opensesamee", "Opensesame", "opensesamf", "x"] {
@@ -1003,7 +917,9 @@ mod semantic_service_tests {
         empty.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
         empty.extend_from_slice(metadata);
         std::fs::write(&path, &empty).unwrap();
-        let semantic = cv_search::SemanticSearch::new(Some(path.clone()));
+        let semantic = cv_search::Searcher {
+            semantic: cv_search::SemanticSearch::new(Some(path.clone())),
+        };
         for _ in 0..2 {
             let (status, body, headers) = route(&["api", "search"], "q=anything&semantic=1", &semantic);
             assert_eq!(status, 200);

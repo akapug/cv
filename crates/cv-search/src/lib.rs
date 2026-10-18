@@ -60,6 +60,154 @@ pub struct Hit {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub workflow: Option<String>,
+    /// A live scan's hit is the discovered session itself; its row is exact, scoreless and never
+    /// a sub-agent.
+    #[serde(skip)]
+    pub session: Option<cv_core::SessionRef>,
+}
+
+impl From<cv_core::scan::LiveHit> for Hit {
+    fn from(hit: cv_core::scan::LiveHit) -> Self {
+        let r = hit.session;
+        Hit {
+            id: r.id.clone(),
+            harness: r.harness.as_str().to_string(),
+            cwd: r.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            title: Some(hit.title),
+            score: 0.0,
+            snippet: hit.snippet,
+            created_at: r.created_at.map(|t| t.timestamp()),
+            updated_at: r.updated_at.map(|t| t.timestamp()),
+            parent_id: None,
+            agent_id: None,
+            workflow: None,
+            session: Some(r),
+        }
+    }
+}
+
+/// The §3 search row for a hit, through one operation-owned catalog reader: the index's row with
+/// its score and provenance, or the live scan's exact row ([`cv_core::rows::live_search_row`]).
+pub fn row(hit: &Hit, context: &cv_core::rows::SearchRowContext) -> serde_json::Value {
+    if let Some(session) = &hit.session {
+        return cv_core::rows::live_search_row(session, hit.title.as_deref().unwrap_or_default(), &hit.snippet);
+    }
+    cv_core::rows::SearchRow {
+        id: &hit.id,
+        harness: &hit.harness,
+        cwd: hit.cwd.as_deref(),
+        title: hit.title.as_deref(),
+        created_at: hit.created_at,
+        updated_at: hit.updated_at,
+        score: Some(hit.score),
+        snippet: &hit.snippet,
+        agent_id: hit.agent_id.as_deref(),
+        parent_id: hit.parent_id.as_deref(),
+        workflow: hit.workflow.as_deref(),
+    }
+    .to_json_with(context)
+}
+
+/// Which path answers a search: the index (authoritative; an empty result is "no match"), the
+/// semantic vectors, or a head-capped live scan of every transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Index,
+    Semantic,
+    Live,
+}
+
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Index => "index",
+            Source::Semantic => "semantic",
+            Source::Live => "live",
+        }
+    }
+}
+
+/// Why an answer may be partial. Every door states these in its own words; none is an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Note {
+    /// How far the index trails the corpus right now ([`fts::staleness_note`]).
+    Stale(String),
+    /// Nothing matched, and the index holds no sub-agent transcripts (`cv index --subagents`).
+    NoSubagents,
+    /// Live snippets could not be generated for the shown hits; the indexed previews stand in.
+    SnippetsUnavailable(String),
+}
+
+/// What one search found: the hits in rank order (or discovery order, live), where they came
+/// from, the degradations, and whether a live scan stopped at the limit.
+pub struct Found {
+    pub hits: Vec<Hit>,
+    pub source: Source,
+    pub notes: Vec<Note>,
+    pub truncated: bool,
+}
+
+/// The one search operation every door renders: `cv search` and `GET /api/search` call this with
+/// the same filter and get the same hits, source and notes; a long-lived service keeps one so the
+/// semantic model and store stay resident.
+#[derive(Default)]
+pub struct Searcher {
+    #[cfg(feature = "semantic")]
+    pub semantic: SemanticSearch,
+}
+
+impl Searcher {
+    /// Errors are the path's own (an unusable index, an invalid query, a missing model); the
+    /// caller adds the door's pointer. Filters apply before ranking and once more after it.
+    pub fn search(&self, query: &str, filter: SearchFilter<'_>, limit: usize, source: Source) -> Result<Found> {
+        let mut found = Found {
+            hits: Vec::new(),
+            source,
+            notes: Vec::new(),
+            truncated: false,
+        };
+        let dir = default_tantivy_dir();
+        match source {
+            Source::Live => {
+                let want = filter.harness.and_then(cv_core::Harness::parse);
+                let live = cv_core::scan::live_search_filtered(query, want, limit, |r| {
+                    filter.cwd.is_none_or(|needle| {
+                        r.cwd
+                            .as_ref()
+                            .is_some_and(|path| path.to_string_lossy().contains(needle))
+                    })
+                })?;
+                found.hits = live.hits.into_iter().map(Hit::from).collect();
+                found.truncated = live.truncated;
+                return Ok(found);
+            }
+            Source::Index => found.hits = fts::text_search_indexed_filtered(&dir, query, limit, filter)?,
+            #[cfg(feature = "semantic")]
+            Source::Semantic => found.hits = self.semantic.search(query, limit, filter)?,
+            #[cfg(not(feature = "semantic"))]
+            Source::Semantic => anyhow::bail!("semantic search is not built into this cv"),
+        }
+        found.hits.retain(|h| {
+            filter.harness.is_none_or(|w| h.harness == w)
+                && filter
+                    .cwd
+                    .is_none_or(|needle| h.cwd.as_ref().is_some_and(|c| c.contains(needle)))
+        });
+        found.hits.truncate(limit);
+        if source == Source::Index {
+            if let Err(e) = fts::enrich_text_snippets(&dir, query, filter.scope, &mut found.hits) {
+                found.notes.push(Note::SnippetsUnavailable(format!("{e:#}")));
+            }
+            // Named on hits and misses: a hit list can be missing rows, not only an empty one.
+            if let Some(stale) = fts::staleness_note(&dir) {
+                found.notes.push(Note::Stale(stale));
+            }
+            if found.hits.is_empty() && !fts::has_subagent_docs(&dir) {
+                found.notes.push(Note::NoSubagents);
+            }
+        }
+        Ok(found)
+    }
 }
 
 /// Root directory for cv-search's on-disk state: `$CLUSTERVISION_HOME` or `~/.clustervision`.
@@ -89,7 +237,6 @@ pub fn default_tantivy_dir() -> PathBuf {
 }
 
 /// Default location of the semantic embedding store (binary; see `semantic` module docs).
-/// A legacy `embeddings.json` next to it is migrated on first query.
 pub fn default_embeddings_path() -> PathBuf {
     home_dir().join("embeddings.bin")
 }

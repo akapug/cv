@@ -125,6 +125,7 @@ use super::ts_from_epoch;
 use super::wire::anthropic;
 use super::{parse_ts, ts_from_value, Adapter};
 use crate::ir::*;
+use crate::source::{sqlite_sidecars, Dependencies, Probe};
 use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -175,6 +176,25 @@ impl OpenClaw {
 impl Adapter for OpenClaw {
     fn harness(&self) -> Harness {
         Harness::OpenClaw
+    }
+
+    fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        let Some(state) = r.path.ancestors().nth(4) else {
+            return Some(());
+        };
+        let ext = r.path.extension().and_then(|e| e.to_str());
+        if ext.is_some_and(|e| matches!(e, "db" | "sqlite" | "sqlite3")) {
+            let db = state.join("state/openclaw.sqlite");
+            deps.files.extend(sqlite_sidecars(&db));
+            deps.files.push(db);
+        } else {
+            if let Some(dir) = r.path.parent() {
+                deps.files.push(dir.join("sessions.json"));
+            }
+            deps.files.push(state.join("cron/jobs.json"));
+            deps.files.push(state.join("subagents/runs.json"));
+        }
+        Some(())
     }
 
     fn roots(&self) -> Vec<PathBuf> {

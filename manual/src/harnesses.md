@@ -37,7 +37,7 @@ All paths are the real ones the adapters look at. `~` is your home dir; `<AppSup
 | **Qwen Code** | `~/.qwen/projects/<cwd>/chats/<id>.jsonl` (+ legacy `~/.qwen/tmp/<hash>/chats/session-*.json\|jsonl`) | ✓ | ✓ | Claude-Code-shaped records carrying Gemini parts; sub-agents under `subagents/<parent>/agent-<id>.jsonl`. The legacy gemini-cli shape delegates to the Gemini parser. |
 | **Cursor IDE** | `<AppSupport>/Cursor/User/globalStorage/state.vscdb` (**SQLite**) | ✓ | — | Closed-source, opened read-only. Global DB holds `composerData:`/`bubbleId:` rows; per-workspace DB links composers → cwd. Schema churns (`_v` 1..=10+). |
 | **Goose (Block)** | `<AppSupport>/Block.block.goose/sessions/sessions.db` (**SQLite**) | ✓ | — | `$GOOSE_PATH_ROOT`/`$XDG_DATA_HOME` override. Modern `sessions.db` + **legacy** per-session `<name>.jsonl`. MCP-style tool content; read-only, PRAGMA-probed. |
-| **Zed (agent panel)** | `<data_dir>/Zed/threads/threads.db` (**SQLite**) | ✓ | — | One DB, one row per thread; `data` BLOB = **zstd-compressed JSON** (pure-Rust decode). Three blob generations (versionless / agent1 0.1–0.2 / agent2 0.3 tagged-enum). cwd + git from the project snapshot; **subagents** linked by `parent_id`. |
+| **Zed (agent panel)** | `<data_dir>/Zed/threads/threads.db` (**SQLite**) | ✓ | — | One DB, one row per thread; `data` BLOB = **zstd-compressed JSON** (libzstd on native builds, pure-Rust `ruzstd` on wasm). Three blob generations (versionless / agent1 0.1–0.2 / agent2 0.3 tagged-enum). cwd + git from the project snapshot; **subagents** linked by `parent_id`. |
 | **Devin CLI** (Cognition) | `~/.local/share/devin/cli/sessions.db` (**SQLite**) | ✓ | — | Closed-source, opened read-only (the CLI keeps writing while we read). `message_nodes` is a **forest** of re-prefixed copies — the transcript is the `main_chain_id`→root walk. Thinking + parallel tool calls + `sealed` signatures preserved. |
 | **ChatGPT export** | a `conversations.json` you register with `cv config --add-export <path>` | ✓ | — | The "Export data" archive. One file = many conversations; each is a `mapping` DAG (we walk root→`current_node`). Opt-in (no fixed home); deduped by id. |
 | **OpenSession** | `*.opensession.json` (or a `*.json` with an `open_session` key) under a dir you register with `cv config --add-export <path>` | ✓ | — | cv's own interchange format, written by `cv export --format json` and read back in. 0.3 *is* the IR; a 0.2 document is refused with a pointer. See [OpenSession](conversion.md#the-opensession-standard). |
@@ -110,15 +110,18 @@ as a tree — see [sub-agent trees in the app](viewing-and-sharing.md).
   the 0.3.0 blob, a `subagent_context{parent_thread_id, depth}`); we keep the link in
   `Session::lineage.parent` (with `depth` in `extra["zed"]`).
 
-## The SQLite quartet
+## The SQLite stores
 
-Four harnesses keep everything in a SQLite database rather than per-session files: **Hermes**
-(`state.db`), **Cursor** (`state.vscdb`), **Goose** (`sessions.db`), and **Zed** (`threads.db`,
-whose rows are additionally zstd-compressed JSON blobs). All four are opened
-**read-only**, and because their schemas accrete columns across versions without a clean version gate,
-each adapter probes `PRAGMA table_info` and selects only the columns that actually exist — so an older
-database degrades gracefully instead of failing the whole import. (Codex and Grok also ship SQLite, but
-only as *indexes* alongside their JSONL transcripts, not as the primary store.)
+Five harnesses keep everything in a SQLite database rather than per-session files: **Hermes**
+(`state.db`), **Cursor** (`state.vscdb`), **Goose** (`sessions.db`), **Zed** (`threads.db`, whose
+rows are additionally zstd-compressed JSON blobs) and **Devin** (`sessions.db`); OpenCode 2.x and
+OpenClaw's newer stores are SQLite too, beside their file formats. All are opened **read-only**
+(a WAL database through a private snapshot, so cv never creates or rewrites a harness's `-wal`/`-shm`),
+every cell is read once through `store::sqlite::Cells`, and because their schemas accrete columns
+across versions without a clean version gate, each adapter probes `PRAGMA table_info` and selects
+only the columns that actually exist — so an older database degrades gracefully instead of failing
+the whole import. (Codex and Grok also ship SQLite, but only as *indexes* alongside their JSONL
+transcripts, not as the primary store.)
 
 ## The two desktop apps are not harnesses
 

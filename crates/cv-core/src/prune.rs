@@ -3062,19 +3062,10 @@ pub fn retrieve(sidecar_path: &Path, id: &str) -> Result<Value> {
 fn retrieve_captured(source: &crate::json::JsonSource, file: &std::fs::File, path: &Path, id: &str) -> Result<Value> {
     let result = (|| {
         source.check_metadata(file.metadata()?)?;
-        #[cfg(feature = "mmap")]
-        let mapped = crate::harness::store::document::Source::map_file(file)?;
-        #[cfg(feature = "mmap")]
-        let text = std::str::from_utf8(mapped.bytes())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8"))?;
-        #[cfg(not(feature = "mmap"))]
-        let context = crate::harness::store::document::range::RangeSource::from_captured(source.clone())?;
-        #[cfg(not(feature = "mmap"))]
         let extent = Range {
             offset: 0,
             len: source.len(),
         };
-        #[cfg(not(feature = "mmap"))]
         if !ranges::valid_utf8(&mut ranges::reader(file, extent)?)? {
             return Err(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8").into(),
@@ -3083,24 +3074,15 @@ fn retrieve_captured(source: &crate::json::JsonSource, file: &std::fs::File, pat
         let mut available = Vec::new();
         let mut found = None;
         let mut duplicates = 0usize;
-        #[cfg(feature = "mmap")]
-        for line in text
-            .lines()
-            .filter(|line| !crate::harness::store::json::trim_str(line).is_empty())
-        {
-            let offset = (line.as_ptr() as usize - text.as_ptr() as usize) as u64;
-            let projected = source.read_borrowed_range_syntax(offset, line, |view| {
-                project_sidecar_entry(view, id, available.len() < 20)
-            });
-            accept_sidecar_entry(projected, &mut available, &mut found, &mut duplicates)?;
-        }
-        #[cfg(not(feature = "mmap"))]
+        let mut reader = crate::harness::store::jsonl::Records::new(source, file);
         for row in ranges::records(file, extent)? {
             let (row, _) = row?;
             if row.len == 0 {
                 continue;
             }
-            let projected = source.read_positioned_range_syntax(&context, row.offset, row.len, |view| {
+            // Unknown fields keep derived serde's IgnoredAny acceptance; the entry's Value fields
+            // are checked by the projection.
+            let projected = reader.read_with(row.offset, row.len, crate::json::Validation::Syntax, |view| {
                 project_sidecar_entry(view, id, available.len() < 20)
             });
             accept_sidecar_entry(projected, &mut available, &mut found, &mut duplicates)?;

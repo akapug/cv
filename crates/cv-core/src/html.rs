@@ -753,13 +753,8 @@ mod tests {
         });
 
         Session {
-            source_stamp: None,
-            id: "abc123".into(),
-            harness: Harness::Claude,
             cwd: Some("/home/<user>/proj".into()),
             title: Some("Test & <Session>".into()),
-            created_at: None,
-            updated_at: None,
             model: Some("claude-opus".into()),
             git: Some(GitInfo {
                 branch: Some("dev".into()),
@@ -767,11 +762,7 @@ mod tests {
                 remote: None,
             }),
             messages: vec![system, user, assistant, tool],
-            source_path: None,
-            extra: serde_json::Map::new(),
-            principal: None,
-            system_prompt: None,
-            lineage: crate::ir::Lineage::default(),
+            ..Session::new("abc123", Harness::Claude)
         }
     }
 

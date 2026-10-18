@@ -17,10 +17,7 @@ pub(super) fn stream(name: &str, path: &Path, opts: &ParseOptions, sink: &mut dy
             len: metadata.len(),
         },
     )?;
-    #[cfg(feature = "mmap")]
-    let mapped = crate::harness::store::document::Source::map_file(&file)?;
-    #[cfg(not(feature = "mmap"))]
-    let positioned = crate::harness::store::document::range::RangeSource::from_captured(source.clone())?;
+    let mut reader = crate::harness::store::jsonl::Records::new(&source, &file);
     let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena()?);
     let mut session = Session::new(name, Harness::Goose);
     session.source_path = Some(path.to_path_buf());
@@ -40,19 +37,7 @@ pub(super) fn stream(name: &str, path: &Path, opts: &ParseOptions, sink: &mut dy
                     read_message(view, &mut tools, opts, &source, &arena)
                 }
             };
-            #[cfg(feature = "mmap")]
-            {
-                let start = usize::try_from(range.offset)?;
-                let end = usize::try_from(range.offset + range.len)?;
-                match std::str::from_utf8(&mapped.bytes()[start..end]) {
-                    Ok(text) => source.read_borrowed_range_value(range.offset, text, visit),
-                    Err(_) => Err(InvalidJson.into()),
-                }
-            }
-            #[cfg(not(feature = "mmap"))]
-            {
-                source.read_positioned_range_value(&positioned, range.offset, range.len, visit)
-            }
+            reader.read(range.offset, range.len, visit)
         };
         let message = match result {
             Ok(message) => message,

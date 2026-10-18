@@ -555,50 +555,23 @@ pub(crate) fn normalize_subagent_record(v: &mut Value) -> bool {
     modified
 }
 
-/// What rewind can say about the prefix it copied once the copy is done. If the source has not
-/// grown, its whole identity (device, inode, length, mtime, ctime) must be unchanged, so any
-/// rewrite is caught. If it grew, only the append contract resume marks use is checked: the same
-/// device and inode (unix) and the same hash of the first 4 KiB and the 4 KiB before the old end.
-/// A rewrite in place elsewhere in the prefix that is followed by growth is not detected, and the
-/// copy may then hold bytes from before or after it; the provenance's sha256 is of the bytes
-/// actually copied. Catching that would mean reading the prefix a second time.
+/// The source rewind copies a prefix of, captured before the copy and checked after it: the
+/// same file, unchanged or (an append-only transcript) grown with its sampled prefix intact
+/// ([`crate::source::FileId::admits`], whose sampling limit applies). The provenance's sha256 is
+/// of the bytes actually copied.
 struct PrefixReadGuard {
     source: crate::json::JsonSource,
-    mark: Option<crate::resume::MarkHead>,
-    hash: u64,
 }
 impl PrefixReadGuard {
     fn capture(path: &Path) -> Result<(Self, std::fs::File)> {
         let source = crate::json::JsonSource::capture(path)?;
         let file = std::fs::File::open(path)?;
         source.check_metadata(file.metadata()?)?;
-        let checkpoint = crate::stream::Checkpoint::new(source.len());
-        let mark = crate::resume::MarkHead::of(path, &checkpoint, "rewind-prefix");
-        let hash = match &mark {
-            Some(mark) => mark.hash,
-            None => crate::resume::prefix_hash(path, source.len()).context("reading rewind prefix guard")?,
-        };
-        source.check()?;
-        Ok((Self { source, mark, hash }, file))
+        Ok((Self { source }, file))
     }
     fn verify(&self, file: &std::fs::File) -> Result<()> {
-        let current = std::fs::metadata(self.source.path())?;
-        let size = self.source.len();
-        anyhow::ensure!(
-            file.metadata()?.len() >= size && current.len() >= size,
-            "rewind source was truncated"
-        );
-        if current.len() == size {
-            self.source.check_metadata(file.metadata()?)?;
-            self.source.check()?;
-        } else {
-            let holds = match &self.mark {
-                Some(mark) => mark.holds(self.source.path(), current.len(), "rewind-prefix"),
-                None => crate::resume::prefix_hash(self.source.path(), size) == Some(self.hash),
-            };
-            anyhow::ensure!(holds, "rewind source prefix changed");
-        }
-        Ok(())
+        self.source.check_metadata(file.metadata()?)?;
+        self.source.check()
     }
 }
 

@@ -175,6 +175,7 @@ pub struct WorkflowAgent {
 impl Workflow {
     /// Total agents across all phases (+ any orphans) — the phase-tree count, which matches
     /// `agent_count` for a well-formed run.
+    #[cfg(test)]
     pub fn agents_in_phases(&self) -> usize {
         self.phases.iter().map(|p| p.agents.len()).sum::<usize>() + self.orphan_agents.len()
     }

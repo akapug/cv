@@ -139,7 +139,8 @@ row counted by an older view is "not counted", so adding a kind or a reader neve
   roster is the clap tree.
 - **`has:<kind>`** in the query calculus: `cv ls -q has:plan`, `cv ls -q 'has:schedule harness:hermes'`.
   The fleet question ("which sessions left a cron job behind") is a selector, not a `lanes` flag;
-  `ls`, `search`, MCP `ls` and `cv serve` all take `-q`.
+  `ls`, `stats` and `dataset` take `-q`; MCP `ls` exposes it as `query`. Search uses its own
+  full-text query grammar; HTTP session listing exposes harness/cwd filters.
 - **Hook body**: the `compact` hook (Claude `SessionStart` after compaction) adds the one command
   that reads back the plan, schedules and background jobs the compacted context held.
 
@@ -157,7 +158,10 @@ Then closed (lane `aff-sidefiles`): Qwen `scheduled_tasks.json`; Cline schedule 
 `teams.db` runs; OpenClaw's cron and sub-agent registries; Kimi `state.json` todos; Grok
 `hook_execution`; Claude `--fork-session` and Goose fork lineage, which no store records but the
 copied records imply. A side store is read only when a full read rewrites the session's
-`affordance_counts` row (its signature moved), or for the view itself.
+`affordance_counts` row (its source baseline changed), or for the view itself. Since 0.17 that
+baseline is the one `source::Baseline` record every consumer publishes (the catalog's separate
+`affordance_sig` and the no-op `note_affordances` are gone), and `AffordanceSink` latches errors
+through the one `stream::Latch` the event and spool sinks use.
 
 Leaves (named, not done here): Kimi Code `tools.update_store` (carried records); a Cline
 schedule's maker (no session is recorded); OpenClaw 1.29 completions that are plain user text; Roo's

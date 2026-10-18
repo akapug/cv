@@ -363,6 +363,7 @@ impl ForestTools {
     }
 
     /// Restrict to one workflow's agents (a new view sharing the same histograms).
+    #[cfg(test)]
     pub fn for_workflow(&self, run_id: &str) -> ForestTools {
         ForestTools {
             agents: self
@@ -437,12 +438,8 @@ pub fn forest_tools_selected(
 /// A flat, time-ordered tool-call timeline across the orchestrator + forest — `cv tools --timeline`.
 /// Streams each agent, collects its tool rows tagged with the agent id, then sorts by `(ts,
 /// agent, msg_idx)` so calls interleave in wall-clock order (untimestamped rows sort last, stably).
-pub fn forest_timeline(r: &SessionRef) -> anyhow::Result<Vec<ToolEvent>> {
-    forest_timeline_selected(r, None, None, None)
-}
-
-/// Compose timeline selectors before reading transcripts or decoding call arguments. Workflow
-/// must be a resolved run ID; agent keeps the existing exact-or-prefix timeline semantics.
+/// Selectors compose before reading transcripts or decoding call arguments. Workflow must be a
+/// resolved run ID; agent keeps the existing exact-or-prefix timeline semantics.
 pub fn forest_timeline_selected(
     r: &SessionRef,
     agent: Option<&str>,

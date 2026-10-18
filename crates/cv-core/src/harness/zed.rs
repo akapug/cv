@@ -303,9 +303,6 @@ fn stream_thread(
     }
 
     let mut s = Session {
-        source_stamp: None,
-        id: r.id.clone(),
-        harness: Harness::Zed,
         cwd: cwd
             .or_else(|| first_folder_path(folders.as_deref(), order.as_deref()))
             .or_else(|| r.cwd.clone()),
@@ -318,15 +315,12 @@ fn stream_thread(
             .or(r.updated_at),
         model,
         git,
-        messages: Vec::new(),
         source_path: Some(r.path.clone()),
-        extra: serde_json::Map::new(),
-        principal: None,
-        system_prompt: None,
         lineage: Lineage {
             parent: parent_thread_id,
             ..Lineage::default()
         },
+        ..Session::new(r.id.clone(), Harness::Zed)
     };
     if !zed.is_empty() {
         let bag = s.harness_extra_mut(Harness::Zed);

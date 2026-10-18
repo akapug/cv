@@ -63,6 +63,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_short_source_is_an_error_not_a_partial_final_record() {
+        let bytes = &b"whole\n12"[..];
+        let mut rows = records(bytes, Range { offset: 0, len: 10 }).unwrap();
+        assert!(rows.next().unwrap().unwrap().1);
+        let error = rows.next().unwrap().err().expect("captured bytes disappeared");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        // Reaching the captured end without LF is still an ordinary partial record.
+        let mut rows = records(bytes, Range { offset: 6, len: 2 }).unwrap();
+        assert!(!rows.next().unwrap().unwrap().1);
+        assert!(rows.next().is_none());
+    }
+
+    #[test]
     fn positioned_frames_match_buffered_lines_and_trim_boundary_windows() {
         let world = cv_testkit::World::new("positioned-jsonl-frames");
         let text = format!(
@@ -189,6 +205,9 @@ pub(crate) struct Reader<'a, S: ?Sized = fs::File> {
 }
 impl<S: At + ?Sized> Read for Reader<'_, S> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if bytes.is_empty() || self.at == self.end {
+            return Ok(0);
+        }
         let n = ((self.end - self.at).min(bytes.len() as u64)) as usize;
         let n = loop {
             match self.file.read_at(&mut bytes[..n], self.at) {
@@ -196,6 +215,12 @@ impl<S: At + ?Sized> Read for Reader<'_, S> {
                 result => break result?,
             }
         };
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "JSONL source was truncated",
+            ));
+        }
         self.at += n as u64;
         Ok(n)
     }

@@ -280,9 +280,17 @@ fn pretty_cwd(cwd: Option<&Path>) -> String {
 // commands
 // ---------------------------------------------------------------------------
 
-/// `cv archive sync`: discover and archive every session once, then exit.
+/// `cv archive sync`: archive every session the index sweep inventories, once, then exit. The
+/// sweep is the one corpus walk (compressed rollouts decoded once, the index refreshed on the
+/// way); a home whose index cannot be written falls back to plain discovery.
 pub(crate) fn cmd_sync(archive: &Archive) -> Result<()> {
-    let refs = cv_core::discover_all();
+    let refs = match cv_search::index_all(None, false, false, false) {
+        Ok((_, refs)) => refs,
+        Err(e) => {
+            eprintln!("cv archive: index sweep unavailable ({e:#}); discovering directly");
+            cv_core::discover_all()
+        }
+    };
     let total = refs.len();
     let mut archived = 0usize;
     let mut skipped = 0usize;

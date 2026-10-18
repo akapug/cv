@@ -16,7 +16,9 @@ clustervision fixes all three. It parses [every harness it knows](harnesses.md) 
 - 🧠 **Let running agents read each other's minds** via an MCP server — plus a task substrate: durable dispatch objects and the decisions posed on them, every completion labeled as the agent's own word.
 - 📦 **Pack** your whole history into context for the task you're about to start, so you never explain your codebase to an agent twice.
 
-It's open source (MIT/Apache-2.0) and runs **entirely locally** — nothing is uploaded.
+It's open source (MIT/Apache-2.0). Reading, indexing and browser uploads stay local.
+`splice --generate` and `pack` with `CV_PACK_LLM` send selected context to the configured LLM provider; choose LM Studio
+for local generation. Semantic indexing downloads its model on first use.
 
 ## How to read this manual
 
@@ -37,19 +39,20 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 
 This installs `cv`, the one binary (`cv mcp`, `cv serve`, `cv watch` and `cv archive` are its subcommands).
 
-Or build from source (needs a recent Rust toolchain):
+Or build from source (uses the toolchain pinned in `rust-toolchain.toml`):
 
 ```sh
 git clone https://github.com/emberian/cv && cd cv
 cargo build --release      # → target/release/cv
 make install               # cargo install --path crates/cv --force --target-dir target → ~/.cargo/bin/cv
-cv --version               # cv 0.16.1 (<git sha>) — lags the checkout? run make install again
+cv --version               # cv 0.17.0 (<git sha>) — lags the checkout? run make install again
 ```
 
 ## 60-second tour
 
 ```sh
 cv ls                         # list recent sessions across every harness
+cv index                      # build/refresh the search index
 cv search "retry backoff"     # full-text search
 cv show <id> --last 40        # print the last 40 turns (prefix-match on the id is fine)
 cv show <id> --tree           # the message thread as a tree

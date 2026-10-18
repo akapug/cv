@@ -1,5 +1,5 @@
 //! Ordered, atomic staging without retaining an entire source pass in private memory.
-use super::Temporary;
+use crate::harness::store::bytes::Spill as Owner;
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::fs::File;
@@ -35,7 +35,7 @@ impl<T> Default for Ordered<T> {
 }
 struct Spill {
     writer: Option<BufWriter<File>>,
-    _owner: Temporary,
+    _owner: Owner,
 }
 impl<T: Record> Ordered<T> {
     pub(crate) fn len(&self) -> usize {
@@ -61,7 +61,8 @@ impl<T: Record> Ordered<T> {
             .saturating_add(row.heap_bytes())
             .saturating_add(slots.saturating_mul(std::mem::size_of::<T>()));
         if self.spill.is_none() && estimated > MEMORY_BYTES {
-            let (file, owner) = Temporary::create("ordered-spool")?;
+            let owner = Owner::create(false).context("creating private spill file")?;
+            let file = owner.file.as_ref().unwrap().try_clone()?;
             self.spill = Some(Spill {
                 writer: Some(BufWriter::with_capacity(IO_BYTES, file)),
                 _owner: owner,

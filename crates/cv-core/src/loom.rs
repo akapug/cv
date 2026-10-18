@@ -1,8 +1,8 @@
 //! 🧵 Splice — compose a NEW session from spans of existing ones.
 //!
 //! Because every harness parses into one IR, a transcript is just an ordered list of messages you can
-//! cut and recombine. [`splice`] concatenates message spans from several sessions into a fresh
-//! [`Session`] with provenance; a verbatim prefix (`a:..N`) forks a lane at message N, and two spans
+//! cut and recombine. A [`Composition`] concatenates message windows from several sessions into a
+//! fresh [`Session`] with provenance; a verbatim prefix (`a:..N`) forks a lane at message N, and two spans
 //! (`base:..N other:M..`) graft one continuation onto another's head. The result is a normal session
 //! you `emit` into any harness.
 //!
@@ -11,33 +11,7 @@
 //! parents that still resolve are kept, the cut points are re-linked, a span lifted from a sub-agent
 //! joins the main thread. `cv splice` calls this.
 
-use crate::ir::{Harness, Message, Principal, Session};
-
-/// A contiguous span of messages from a source session: `[start, end)` (None end → through the last).
-pub struct Span<'a> {
-    pub source: &'a Session,
-    pub start: usize,
-    pub end: Option<usize>,
-}
-
-impl<'a> Span<'a> {
-    /// The clamped, panic-free `[start, end)` range into `source.messages`.
-    ///
-    /// Out-of-range indices saturate to the message count; an inverted or empty range
-    /// (`end <= start`) yields an empty range so iteration produces nothing.
-    fn range(&self) -> std::ops::Range<usize> {
-        let len = self.source.messages.len();
-        let start = self.start.min(len);
-        let end = self.end.unwrap_or(len).min(len);
-        // Treat end < start (and end == start) as an empty span.
-        start..end.max(start)
-    }
-
-    /// The messages this span actually selects, in order. Never panics.
-    fn messages(&self) -> &'a [Message] {
-        &self.source.messages[self.range()]
-    }
-}
+use crate::ir::{Harness, Message, Session};
 
 /// Incremental composition of prepared windows. Each source owner is consumed immediately;
 /// selected messages move into the composition without cloning their bodies.
@@ -75,108 +49,50 @@ impl Composition {
         self.first.as_ref().map(|source| source.harness)
     }
     pub fn finish(self, new_id: Option<String>, harness: Harness) -> Session {
-        let principal = self.first.as_ref().and_then(|source| source.principal.clone());
-        assembled(
-            self.first.as_ref(),
-            principal,
-            self.messages,
-            self.provenance,
-            new_id,
-            harness,
-        )
-    }
-}
-
-/// Concatenate `spans` (in order) into a new [`Session`] with `harness` and a fresh id (or
-/// `new_id`). Messages are cloned as they are — ids and parents included — and the first span's
-/// session provides default cwd/title/model.
-pub fn splice(spans: &[Span<'_>], new_id: Option<String>, harness: Harness) -> Session {
-    // Concatenate the selected messages (cloned) in span order, and record provenance per span.
-    let mut messages: Vec<Message> = Vec::new();
-    let mut provenance: Vec<serde_json::Value> = Vec::with_capacity(spans.len());
-    for span in spans {
-        let range = span.range();
-        provenance.push(serde_json::json!({
-            "source_id": span.source.id,
-            "harness": span.source.harness.as_str(),
-            "start": range.start,
-            "end": range.end,
-        }));
-        messages.extend(span.messages().iter().cloned());
-    }
-
-    let principal = spans.first().and_then(|first| {
-        first
-            .source
-            .principal
-            .as_ref()
-            .filter(|principal| {
-                spans
-                    .iter()
-                    .all(|span| span.source.principal.as_ref() == Some(*principal))
-            })
-            .cloned()
-    });
-    assembled(
-        spans.first().map(|s| s.source),
-        principal,
-        messages,
-        provenance,
-        new_id,
-        harness,
-    )
-}
-
-fn assembled(
-    first_source: Option<&Session>,
-    principal: Option<Principal>,
-    messages: Vec<Message>,
-    provenance: Vec<serde_json::Value>,
-    new_id: Option<String>,
-    harness: Harness,
-) -> Session {
-    let id = new_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-    let cwd = first_source.and_then(|s| s.cwd.clone());
-    let title = first_source.and_then(|s| s.title.clone());
-    let model = first_source.and_then(|s| s.model.clone());
-    let git = first_source.and_then(|s| s.git.clone());
-    // created_at = min, updated_at = max of the included messages' timestamps (when present).
-    let created_at = messages.iter().filter_map(|m| m.timestamp).min();
-    let updated_at = messages.iter().filter_map(|m| m.timestamp).max();
-
-    // Provenance is cv's own fact about a session cv synthesized, not something read out of a
-    // harness store, so it lives in the `cv` namespace — `Session::extra` has no flat keys
-    // (docs/INTERFACE-V2.md §4).
-    let mut extra = serde_json::Map::new();
-    extra.insert(
-        crate::ir::CV_NAMESPACE.into(),
-        serde_json::json!({ "loom": serde_json::Value::Array(provenance) }),
-    );
-
-    Session {
-        source_stamp: None,
-        id,
-        harness,
-        cwd,
-        title,
-        created_at,
-        updated_at,
-        model,
-        git,
-        messages,
-        source_path: None,
-        extra,
-        principal,
-        system_prompt: None,
-        lineage: crate::ir::Lineage::default(),
+        let first = self.first.unwrap_or_else(|| Session::new("", harness));
+        let messages = self.messages;
+        // Provenance is cv's own fact about a session cv synthesized, not something read out of a
+        // harness store, so it lives in the `cv` namespace — `Session::extra` has no flat keys
+        // (docs/INTERFACE-V2.md §4).
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            crate::ir::CV_NAMESPACE.into(),
+            serde_json::json!({ "loom": serde_json::Value::Array(self.provenance) }),
+        );
+        Session {
+            // created_at = min, updated_at = max of the included messages' timestamps.
+            created_at: messages.iter().filter_map(|m| m.timestamp).min(),
+            updated_at: messages.iter().filter_map(|m| m.timestamp).max(),
+            messages,
+            extra,
+            cwd: first.cwd,
+            title: first.title,
+            model: first.model,
+            git: first.git,
+            principal: first.principal,
+            ..Session::new(new_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()), harness)
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::ir::{Block, Message, Role};
+    use crate::ir::{Block, Message, Principal, Role};
     use chrono::{TimeZone, Utc};
+
+    /// Compose owned windows `(source, start, end)` the way `cv splice` composes prepared ones.
+    pub(crate) fn compose(spans: &[(&Session, usize, Option<usize>)], id: Option<String>, harness: Harness) -> Session {
+        let mut composition = Composition::default();
+        for &(source, start, end) in spans {
+            let total = source.messages.len();
+            let from = start.min(total);
+            let mut selected = source.clone();
+            selected.messages = source.messages[from..end.unwrap_or(total).min(total).max(from)].to_vec();
+            composition.push(selected, total, start, end);
+        }
+        composition.finish(id, harness)
+    }
 
     /// Build a session with `n` messages, each tagged with a deterministic id, parent chain, text,
     /// and an increasing timestamp so we can assert created/updated bounds.
@@ -196,21 +112,12 @@ mod tests {
             messages.push(m);
         }
         Session {
-            source_stamp: None,
-            id: id.to_string(),
-            harness,
             cwd: Some("/tmp/a".into()),
             title: Some(format!("{id} title")),
-            created_at: None,
-            updated_at: None,
             model: Some("m-1".into()),
-            git: None,
             messages,
             source_path: Some("/tmp/orig.jsonl".into()),
-            extra: serde_json::Map::new(),
-            principal: None,
-            system_prompt: None,
-            lineage: crate::ir::Lineage::default(),
+            ..Session::new(id, harness)
         }
     }
 
@@ -219,50 +126,35 @@ mod tests {
     }
 
     #[test]
-    fn moved_windows_match_owned_splice_without_copying_bodies() {
+    fn composition_moves_selected_bodies_without_copying() {
         let a = session("A", Harness::Claude, 6);
-        let b = session("B", Harness::Codex, 3);
-        let specs = [(&a, 1, Some(4)), (&b, 8, None), (&a, 3, Some(2)), (&a, 2, None)];
-        let spans: Vec<_> = specs
+        let mut builder = Composition::default();
+        let mut selected = a.clone();
+        selected.messages.drain(..1);
+        let pointers: Vec<_> = selected
+            .messages
             .iter()
-            .map(|(source, start, end)| Span {
-                source,
-                start: *start,
-                end: *end,
+            .map(|message| match &message.content[0] {
+                Block::Text {
+                    text: crate::Text::Inline(text),
+                } => text.as_ptr(),
+                _ => unreachable!(),
             })
             .collect();
-        let expected = splice(&spans, Some("fixed".into()), Harness::Gemini);
-        let mut builder = Composition::default();
-        let mut pointers = Vec::new();
-        for span in &spans {
-            let mut selected = span.source.clone();
-            selected.messages = span.messages().to_vec();
-            for message in &selected.messages {
-                if let Block::Text {
-                    text: crate::Text::Inline(text),
-                } = &message.content[0]
-                {
-                    pointers.push(text.as_ptr());
-                }
-            }
-            builder.push(selected, span.source.messages.len(), span.start, span.end);
-        }
+        builder.push(selected, 6, 1, None);
         let actual = builder.finish(Some("fixed".into()), Harness::Gemini);
-        assert_eq!(
-            serde_json::to_value(&actual).unwrap(),
-            serde_json::to_value(&expected).unwrap()
-        );
         for (message, pointer) in actual.messages.iter().zip(pointers) {
-            if let Block::Text {
+            let Block::Text {
                 text: crate::Text::Inline(text),
             } = &message.content[0]
-            {
-                assert_eq!(
-                    text.as_ptr(),
-                    pointer,
-                    "composition must move selected body allocations"
-                );
-            }
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                text.as_ptr(),
+                pointer,
+                "composition must move selected body allocations"
+            );
         }
     }
 
@@ -272,22 +164,7 @@ mod tests {
         let b = session("B", Harness::Codex, 3);
 
         // Take A[1..3] then B[0..2].
-        let spliced = splice(
-            &[
-                Span {
-                    source: &a,
-                    start: 1,
-                    end: Some(3),
-                },
-                Span {
-                    source: &b,
-                    start: 0,
-                    end: Some(2),
-                },
-            ],
-            None,
-            Harness::Gemini,
-        );
+        let spliced = compose(&[(&a, 1, Some(3)), (&b, 0, Some(2))], None, Harness::Gemini);
 
         // (a) count + order.
         assert_eq!(spliced.messages.len(), 4);
@@ -318,19 +195,8 @@ mod tests {
     fn provenance_recorded_in_extra() {
         let a = session("A", Harness::Claude, 4);
         let b = session("B", Harness::Codex, 3);
-        let spliced = splice(
-            &[
-                Span {
-                    source: &a,
-                    start: 1,
-                    end: Some(3),
-                },
-                Span {
-                    source: &b,
-                    start: 0,
-                    end: None,
-                },
-            ],
+        let spliced = compose(
+            &[(&a, 1, Some(3)), (&b, 0, None)],
             Some("fixed-id".into()),
             Harness::Claude,
         );
@@ -361,55 +227,34 @@ mod tests {
     fn out_of_range_spans_clamp_without_panic() {
         let a = session("A", Harness::Claude, 3);
         let empty = session("E", Harness::Claude, 0);
-
-        let spliced = splice(
+        // Start past the end, end before start, end past the end, an empty source.
+        let spliced = compose(
             &[
-                // start past the end → empty.
-                Span {
-                    source: &a,
-                    start: 99,
-                    end: Some(200),
-                },
-                // end < start → empty span, not a panic.
-                Span {
-                    source: &a,
-                    start: 2,
-                    end: Some(1),
-                },
-                // end past the end → clamps to 3, yields A#1, A#2.
-                Span {
-                    source: &a,
-                    start: 1,
-                    end: Some(999),
-                },
-                // splicing from an empty session → nothing.
-                Span {
-                    source: &empty,
-                    start: 0,
-                    end: None,
-                },
+                (&a, 99, Some(200)),
+                (&a, 2, Some(1)),
+                (&a, 1, Some(999)),
+                (&empty, 0, None),
             ],
             None,
             Harness::Claude,
         );
-
         assert_eq!(texts(&spliced), vec!["A#1", "A#2"]);
+        let provenance = &spliced.cv_extra().unwrap()["loom"];
+        assert_eq!(provenance[0]["start"], 3);
+        assert_eq!(provenance[0]["end"], 3);
+        assert_eq!(provenance[1]["start"], 2);
+        assert_eq!(provenance[1]["end"], 2);
 
         // Empty result is fine, too.
-        let none = splice(&[], None, Harness::Claude);
+        let none = compose(&[], None, Harness::Claude);
         assert!(none.messages.is_empty());
         assert_eq!(none.created_at, None);
         assert_eq!(none.updated_at, None);
         assert!(!none.id.is_empty());
     }
-}
-
-#[cfg(test)]
-mod principal_tests {
-    use super::*;
 
     #[test]
-    fn splice_and_composition_require_unanimous_explicit_principals() {
+    fn composition_requires_unanimous_explicit_principals() {
         let mut first = Session::new("first", Harness::OpenSession);
         first.principal = Some(Principal::String("opaque-owner".into()));
         let mut other = first.clone();
@@ -424,36 +269,13 @@ mod principal_tests {
                 .then(|| first.principal.clone())
                 .flatten();
             // Empty spans still name contributing sources; absence never acquires an owner.
-            let spans = [
-                Span {
-                    source: &first,
-                    start: 0,
-                    end: None,
-                },
-                Span {
-                    source: &other,
-                    start: 0,
-                    end: None,
-                },
-            ];
-            let selected = splice(&spans, Some("selected".into()), Harness::OpenSession);
-            assert_eq!(selected.principal, expected);
             let mut moved = Composition::default();
             moved.push(first.clone(), 0, 0, None);
             moved.push(other.clone(), 0, 0, None);
             assert_eq!(moved.finish(None, Harness::OpenSession).principal, expected);
         }
         assert_eq!(
-            splice(
-                &[Span {
-                    source: &first,
-                    start: 0,
-                    end: None
-                }],
-                None,
-                Harness::OpenSession
-            )
-            .principal,
+            compose(&[(&first, 0, None)], None, Harness::OpenSession).principal,
             first.principal
         );
     }

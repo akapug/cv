@@ -271,11 +271,6 @@ pub(crate) fn tool_call_from_view(call: crate::json::JsonView<'_>, spans: bool) 
     })
 }
 
-/// [`part_from_view`] over an owned value, every string inline.
-pub fn part_to_block(p: &Value, q: &Quirks) -> Option<Block> {
-    part_from_view(p.into(), q, &mut |v| v.text(false)).ok().flatten()
-}
-
 /// A tool call's `arguments`: a JSON-encoded **string** on the wire (possibly streamed/partial).
 /// A string goes through [`structured_arguments`]; absent/null is the empty object; an
 /// already-structured value is itself.

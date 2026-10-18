@@ -615,9 +615,6 @@ fn stream_db_opts_with_reads(
     };
 
     let s = Session {
-        source_stamp: None,
-        id: r.id.clone(),
-        harness: Harness::Goose,
         cwd: wd
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
@@ -626,13 +623,10 @@ fn stream_db_opts_with_reads(
         created_at,
         updated_at: updated.as_deref().and_then(parse_ts_text).or(r.updated_at),
         model,
-        git: None,
-        messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra,
-        principal: None,
-        system_prompt: None,
         lineage,
+        ..Session::new(r.id.clone(), Harness::Goose)
     };
     // All session metadata is known up front, so hand it to the sink before the body.
     sink.meta(&s);

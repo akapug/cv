@@ -56,7 +56,11 @@ can decode a whole field first. Each bound must hold across the composed path.
 ## Reader inventory
 
 This describes implementation, not a blanket performance claim. Required navigation state and
-demanded output are not themselves avoidable bloat.
+demanded output are not themselves avoidable bloat. Shared under every row since 0.17: one line
+reader (`store::jsonl::for_each_line`, mapped or positioned; mapped windows start at 8 MiB and
+grow to hold a longer line), one validator
+(`store::json::validate_value`), one string-body codec, one checked span resolver (`lazy`), one
+JSON-whitespace trim rule, and one SQLite cell reader (`store::sqlite::Cells`).
 
 | Store / format | Current traversal and retained state | Remaining costs / limits |
 |---|---|---|
@@ -122,19 +126,24 @@ Key sources: `cv/src/cmd/view.rs`, `cv-core/src/{api,affordance,watch,lazy,strea
    changes can replace an old visible suffix; Kimi usage, Kimi Code unfinished steps and Grok
    reasoning can revise the last pending message. Checkpoint only finalized output/state.
 2. Identity includes dependencies: SQLite WAL, directory children, side metadata, rotation
-   manifests and sidecar output. Existing freshness policies disagree about these dependencies.
-   Catalog DB watches include WAL appearance, modification and disappearance. Counts, events and
-   each search index now keep separate canonical dependency metadata baselines, tied to the primary
-   tuple. SQL output and stamps publish atomically; FTS invalidates its old baseline before changes
-   and publishes a revalidated baseline after commit. Operation-local probes share file stats.
-   Known adapter-local sidecars, directory members and WAL files are covered. Consumers capture
-   conditional Claude fork siblings and resolved external output paths before reading them, including
-   absent files. Complete read sets survive prefix checkpoints and are revalidated at publication.
-   Source records older than version 3 reread once through normal refresh to capture primary identity; that source migration needs no additional index rebuild.
+   manifests and sidecar output. Since 0.17 there is one identity, `source::FileId { len,
+   mtime_ns, dev, ino, ctime_ns }`, stored by the catalog's watches, the scan cache, the archive
+   and watch alike; a captured `.jsonl` admits growth by content (`FileId::admits`: same device
+   and inode, at least as long, the sampled prefix unchanged), never by waiting. Each adapter
+   declares its auxiliary inventory (`Adapter::dependencies`), and each consumer (counts, events,
+   FTS, usage) publishes one `Baseline` record per session, verified on load and carrying its
+   output's freshness; every consumer rereads once after the upgrade. Catalog DB watches include
+   WAL appearance, modification and disappearance. SQL output and stamps publish atomically; FTS
+   invalidates its old baseline before changes and publishes a revalidated one after commit.
+   Operation-local probes share file stats. Consumers capture conditional Claude fork siblings and
+   resolved external output paths before reading them, including absent files. Complete read sets
+   survive prefix checkpoints and are revalidated at publication.
 3. Current resume marks sample the first 4 KiB and the 4 KiB preceding the mark. This is not a
    proof that the entire prefix is unchanged. FTS now requires growth before using a mark, so
    same-size rewrites take a whole pass; inode replacement also rejects reuse. A rewrite followed by
-   growth can still escape the samples. Unix unchanged reuse now additionally checks inode/ctime,
+   growth can still escape the samples, and so can a same-length edit outside them: a captured
+   `.jsonl` admits a changed stat (a writer mid-`write`) by the same samples, never by waiting.
+   Unix unchanged reuse now additionally checks inode/ctime,
    rejecting same-size restored-mtime rewrites; platforms without that identity retain length/mtime guards.
    Unconditional detection of arbitrary prefix edits requires reading that prefix or a trusted
    writer/filesystem change signal; do not promise both zero prefix reads and such detection.
@@ -181,10 +190,16 @@ identifies application state, not a claim that the OS page cache was evicted.
 
 ## Open gaps
 
-- **Per-adapter codecs.** "Never materialize" was built inside each adapter (owned, selected,
-  portable and lean variants, mmap and positioned branches, parity tests between them) instead of
-  one demand-driven projection per wire format over one byte-window type. The CI heap gate and
-  corpus goldens are the invariants a consolidation must keep.
+- **Discovery grammars and heap-gate paths.** Every family reads through one record codec
+  ([`CODEC.md`](CODEC.md)), but Codex, Claude, Grok, Kimi and Kimi Code still discover through a
+  second grammar, and the OpenClaw window-group, Goose fork, Qwen `TaskInventory`, Hermes dedup
+  and export-cache paths are bespoke walks built for one measured lookup each.
+- **Three message windowings.** `api::WindowSink`, the text renderer's own window pass in
+  `cv/src/cmd/view.rs` and `cv/src/cmd/pack.rs`'s relevance sink still select windows separately.
+  CLI and HTTP search now share `cv_search::Searcher::search`, including notes and snippets.
+- **Removed in 0.17**, so they need no gap: `loom::splice`, `spill::Temporary`, the catalog's
+  `affordance_sig` and no-op `note_affordances`, the unordered events publication path, the
+  pre-binary semantic store migration, and the four sink latches (one `stream::Latch`).
 - **Explicit remaining costs.** Grok sibling lineage keeps per-query sibling metadata guards. Kimi
   wire enrichment and Kimi Code's auxiliary session index reread changed prefixes. Claude
   compaction fork inference can inspect sibling prefixes and bodies. External SQLite schemas
@@ -193,7 +208,7 @@ identifies application state, not a claim that the OS page cache was evicted.
   cell's native SQLite allocation. Zed discovery still grows Serde string scratch; Hermes raw
   reasoning/provider extras and native row/FTS allocation remain owned.
 - **Resume-mark sampling** (correctness boundary 3) cannot detect an arbitrary prefix rewrite
-  followed by growth without reading the prefix or a writer/filesystem change signal.
+  followed by growth, or at the same length, without reading the prefix or a change signal.
 - **First-run listing and full live recount** budgets in `PERF.md` are not re-established.
 - **Zed authored-thread capture.** The isolated GUI attempt could not drive the GPUI agent editor
   and produced no threads; see `tools/harness-corpus/zed/README.md`.

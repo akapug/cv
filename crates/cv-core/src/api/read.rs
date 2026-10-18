@@ -1,6 +1,6 @@
 //! Small verified continuations for repeated API reads. No messages are cached.
 use super::{session_meta_json, WindowSink};
-use crate::source::{Probe, ReadSet, Snapshot};
+use crate::source::{Baseline, Probe, ReadSet};
 use crate::stream::{Checkpoint, Flow, ParseOptions};
 use crate::{Adapter, Session, SessionRef};
 use anyhow::Result;
@@ -65,7 +65,7 @@ enum Payload {
 #[derive(Clone, Serialize)]
 struct Entry {
     key: Key,
-    source: Snapshot,
+    source: Baseline,
     payload: Payload,
     #[serde(skip)]
     bytes: usize,
@@ -134,7 +134,7 @@ pub(super) fn note_message_sources(message: &crate::Message, primary: &std::path
     crate::source::record_message_reads(message, primary, reads);
 }
 
-fn captured(r: &SessionRef, primary: &std::path::Path) -> (Snapshot, ReadSet) {
+fn captured(r: &SessionRef, primary: &std::path::Path) -> (Baseline, ReadSet) {
     let before = Probe::default().snapshot_from(r, primary);
     let mut reads = ReadSet::default();
     // Include replacement identity and ctime, even when size and mtime were restored.
@@ -142,38 +142,12 @@ fn captured(r: &SessionRef, primary: &std::path::Path) -> (Snapshot, ReadSet) {
     (before, reads)
 }
 
-fn fresh(r: &SessionRef, before: &Snapshot, primary: &std::path::Path) -> bool {
+fn fresh(r: &SessionRef, before: &Baseline, primary: &std::path::Path) -> bool {
     let mut probe = Probe::default();
     let current = probe.snapshot_from(r, primary);
     before.fresh(&current, &mut probe)
 }
 
-fn window_sink(
-    primary: &std::path::Path,
-    start: usize,
-    end: Option<usize>,
-    capture: bool,
-    reads: ReadSet,
-) -> WindowSink {
-    WindowSink {
-        resolver: crate::Resolver::new(Some(primary.to_path_buf())),
-        primary: primary.to_path_buf(),
-        idx: 0,
-        start,
-        end,
-        msgs: Vec::new(),
-        staged: None,
-        selected: 0,
-        more: false,
-        meta: None,
-        fail: None,
-        capture,
-        checkpoint: None,
-        reads,
-    }
-}
-
-#[cfg(test)]
 pub(super) fn window(
     cache: &Cache,
     adapter: &dyn Adapter,
@@ -181,18 +155,6 @@ pub(super) fn window(
     start: usize,
     end: Option<usize>,
     extra: bool,
-) -> Result<(Session, WindowSink)> {
-    window_output(cache, adapter, r, start, end, extra, false)
-}
-
-pub(super) fn window_output(
-    cache: &Cache,
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    start: usize,
-    end: Option<usize>,
-    extra: bool,
-    staged: bool,
 ) -> Result<(Session, WindowSink)> {
     let opts = ParseOptions {
         extra,
@@ -202,16 +164,14 @@ pub(super) fn window_output(
     let primary = adapter.resume_source(r);
     if version.is_none() {
         let (before, reads) = captured(r, &primary);
-        let mut sink = window_sink(&primary, start, end, false, reads);
-        sink.staged = staged.then(|| std::io::BufWriter::with_capacity(64 * 1024, crate::bytes::ByteStage::default()));
+        let mut sink = WindowSink::page(&primary, start, end, false, reads);
         let shell = adapter.try_stream(r, &opts, &mut sink)?;
         verify(r, &primary, &before, &sink)?;
         return Ok((shell, sink));
     }
     let key = version.and_then(|version| Key::admitted(r, &primary, version, extra));
     let (before, reads) = captured(r, &primary);
-    let mut sink = window_sink(&primary, start, end, key.is_some(), reads);
-    sink.staged = staged.then(|| std::io::BufWriter::with_capacity(64 * 1024, crate::bytes::ByteStage::default()));
+    let mut sink = WindowSink::page(&primary, start, end, key.is_some(), reads);
     let mut resumed = false;
     let mut shell = None;
     if let Some(key) = &key {
@@ -241,8 +201,7 @@ pub(super) fn window_output(
     if shell.is_none() {
         // A declined resume promises no callbacks, but discard its initial state too.
         let (_, reads) = captured(r, &primary);
-        sink = window_sink(&primary, start, end, key.is_some(), reads);
-        sink.staged = staged.then(|| std::io::BufWriter::with_capacity(64 * 1024, crate::bytes::ByteStage::default()));
+        sink = WindowSink::page(&primary, start, end, key.is_some(), reads);
         shell = Some(adapter.try_stream(r, &opts, &mut sink)?);
     }
     let source = before.with_reads(&sink.reads);
@@ -253,8 +212,7 @@ pub(super) fn window_output(
             cache.remove(key);
         }
         let (retry_before, reads) = captured(r, &primary);
-        let mut whole = window_sink(&primary, start, end, false, reads);
-        whole.staged = staged.then(|| std::io::BufWriter::with_capacity(64 * 1024, crate::bytes::ByteStage::default()));
+        let mut whole = WindowSink::page(&primary, start, end, false, reads);
         let shell = adapter.try_stream(r, &opts, &mut whole)?;
         verify(r, &primary, &retry_before, &whole)?;
         return Ok((shell, whole));
@@ -277,7 +235,7 @@ pub(super) fn window_output(
     Ok((shell.expect("a stream or accepted resume returned metadata"), sink))
 }
 
-fn verify(r: &SessionRef, primary: &std::path::Path, before: &Snapshot, sink: &WindowSink) -> Result<()> {
+fn verify(r: &SessionRef, primary: &std::path::Path, before: &Baseline, sink: &WindowSink) -> Result<()> {
     anyhow::ensure!(
         fresh(r, &before.with_reads(&sink.reads), primary) && sink.reads.fresh(&mut Probe::default()),
         "API window source changed before publication"
@@ -444,12 +402,12 @@ mod tests {
             )
         }
     }
-    fn result(shell: &Session, sink: &WindowSink) -> Value {
-        json!({ "messages": sink.msgs, "idx": sink.idx, "more": sink.more,
+    fn result(shell: &Session, sink: &mut WindowSink) -> Value {
+        json!({ "messages": sink.values().unwrap(), "idx": sink.idx, "more": sink.more,
             "meta": sink.meta.clone().unwrap_or_else(|| session_meta_json(shell)) })
     }
     fn oracle(adapter: &dyn Adapter, r: &SessionRef, start: usize, end: Option<usize>, extra: bool) -> Value {
-        let mut sink = window_sink(&adapter.resume_source(r), start, end, false, ReadSet::default());
+        let mut sink = WindowSink::page(&adapter.resume_source(r), start, end, false, ReadSet::default());
         let shell = adapter
             .try_stream(
                 r,
@@ -460,7 +418,7 @@ mod tests {
                 &mut sink,
             )
             .unwrap();
-        result(&shell, &sink)
+        result(&shell, &mut sink)
     }
     fn fixture(world: &cv_testkit::World, count: usize) -> SessionRef {
         use std::io::Write as _;
@@ -508,12 +466,10 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
         let r = SessionRef::new("mutating", Harness::Claude, path);
         for resumable in [false, true] {
-            for staged in [false, true] {
-                std::fs::write(&r.path, b"original").unwrap();
-                let cache = Cache::default();
-                assert!(window_output(&cache, &Mutating(resumable), &r, 0, Some(1), false, staged).is_err());
-                assert!(cache.entries.lock().unwrap().is_empty());
-            }
+            std::fs::write(&r.path, b"original").unwrap();
+            let cache = Cache::default();
+            assert!(window(&cache, &Mutating(resumable), &r, 0, Some(1), false).is_err());
+            assert!(cache.entries.lock().unwrap().is_empty());
         }
         std::fs::write(&r.path, b"original").unwrap();
         let cache = Cache::default();
@@ -586,9 +542,9 @@ mod tests {
                         (1, None),
                     ] {
                         let expected = oracle(adapter.as_ref(), &r, start, end, extra);
-                        let (shell, sink) = window(&cache, adapter.as_ref(), &r, start, end, extra).unwrap();
+                        let (shell, mut sink) = window(&cache, adapter.as_ref(), &r, start, end, extra).unwrap();
                         assert_eq!(
-                            result(&shell, &sink),
+                            result(&shell, &mut sink),
                             expected,
                             "{} {start} {end:?} extra={extra}",
                             file.path().display()
@@ -613,8 +569,8 @@ mod tests {
         let cache = Cache::default();
         for start in [0, 5, 10] {
             let expected = oracle(&inner, &r, start, Some(start + 5), false);
-            let (shell, sink) = window(&cache, &adapter, &r, start, Some(start + 5), false).unwrap();
-            assert_eq!(result(&shell, &sink), expected);
+            let (shell, mut sink) = window(&cache, &adapter, &r, start, Some(start + 5), false).unwrap();
+            assert_eq!(result(&shell, &mut sink), expected);
         }
         assert_eq!(adapter.messages.load(Ordering::Relaxed), 18); // Five selected plus one probe per page.
         let first = head(&cache, &adapter, &r).unwrap();
@@ -630,8 +586,8 @@ mod tests {
         .unwrap();
         assert_eq!(head(&cache, &adapter, &r).unwrap()["total"], 21);
         let before = adapter.messages.load(Ordering::Relaxed);
-        let (shell, sink) = window(&cache, &adapter, &r, 15, Some(20), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 15, Some(20), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 15, Some(20), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 15, Some(20), false));
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 21);
         // Switching extra flavor must read whole rather than reuse a checkpoint built lean.
         let before = adapter.messages.load(Ordering::Relaxed);
@@ -777,8 +733,8 @@ mod tests {
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 11);
         adapter.decline = true;
         let before = adapter.messages.load(Ordering::Relaxed);
-        let (shell, sink) = window(&cache, &adapter, &r, 10, Some(15), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 10, Some(15), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 10, Some(15), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 10, Some(15), false));
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 16);
     }
 
@@ -796,8 +752,8 @@ mod tests {
         let cache = Cache::default();
         window(&cache, &adapter, &r, 0, Some(5), false).unwrap();
         *adapter.rewrite.lock().unwrap() = Some(old.replace("old-title", "new-title"));
-        let (shell, sink) = window(&cache, &adapter, &r, 5, Some(10), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 5, Some(10), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 5, Some(10), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 5, Some(10), false));
         assert_eq!(shell.title.as_deref(), Some("new-title"));
         assert!(cache.entries.lock().unwrap().is_empty());
     }
@@ -819,8 +775,8 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
         let before = adapter.messages.load(Ordering::Relaxed);
-        let (shell, sink) = window(&cache, &adapter, &r, 5, Some(10), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 5, Some(10), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 5, Some(10), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 5, Some(10), false));
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 11);
     }
 
@@ -834,8 +790,8 @@ mod tests {
         let cache = Cache::default();
         for start in (0..20_000).step_by(200) {
             let expected = oracle(&inner, &r, start, Some(start + 200), false);
-            let (shell, sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
-            assert_eq!(result(&shell, &sink), expected);
+            let (shell, mut sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
+            assert_eq!(result(&shell, &mut sink), expected);
         }
         let page_callbacks = adapter.messages.load(Ordering::Relaxed);
         assert_eq!(page_callbacks, 20_099);
@@ -857,12 +813,12 @@ mod tests {
         let adapter = Observed::new(&inner);
         let cache = Cache::default();
         for start in (0..20_000).step_by(200) {
-            let (shell, sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
-            assert_eq!(sink.msgs.len(), 200);
+            let (shell, mut sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
+            assert_eq!(sink.selected, 200);
             assert_eq!(sink.idx, (start + 201).min(20_000));
             if start % 2000 == 0 || start == 19800 {
                 assert_eq!(
-                    result(&shell, &sink),
+                    result(&shell, &mut sink),
                     oracle(&inner, &r, start, Some(start + 200), false)
                 );
             }
@@ -892,12 +848,12 @@ mod tests {
         let adapter = Observed::new(&inner);
         let cache = Cache::default();
         for start in (0..20_000).step_by(200) {
-            let (shell, sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
-            assert_eq!(sink.msgs.len(), 200);
+            let (shell, mut sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
+            assert_eq!(sink.selected, 200);
             assert_eq!(sink.idx, (start + 201).min(20_000));
             if start % 2000 == 0 || start == 19800 {
                 assert_eq!(
-                    result(&shell, &sink),
+                    result(&shell, &mut sink),
                     oracle(&inner, &r, start, Some(start + 200), false)
                 );
             }
@@ -915,13 +871,13 @@ mod tests {
             .unwrap();
         assert_eq!(head(&cache, &adapter, &r).unwrap()["total"], 20_001);
         let before = adapter.messages.load(Ordering::Relaxed);
-        let (shell, sink) = window(&cache, &adapter, &r, 19900, Some(19905), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 19900, Some(19905), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 19900, Some(19905), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 19900, Some(19905), false));
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 19_906);
         std::fs::write(&state, r#"{"id":"session_pages","cwd":"/new"}"#).unwrap();
         let before = adapter.messages.load(Ordering::Relaxed);
-        let (shell, sink) = window(&cache, &adapter, &r, 19905, Some(19910), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 19905, Some(19910), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 19905, Some(19910), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 19905, Some(19910), false));
         assert_eq!(shell.cwd.as_deref(), Some(std::path::Path::new("/new")));
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 19_911);
         assert!(cache
@@ -976,7 +932,7 @@ mod tests {
         head(&cache, &adapter, &r).unwrap();
         assert_eq!(adapter.calls.load(Ordering::Relaxed), 1);
         let (before, reads) = captured(&r, &crate::source::primary_path(&r));
-        let mut sink = window_sink(&crate::source::primary_path(&r), 1, Some(2), false, reads);
+        let mut sink = WindowSink::page(&crate::source::primary_path(&r), 1, Some(2), false, reads);
         adapter.try_stream(&r, &ParseOptions::lazy(), &mut sink).unwrap();
         let source = before.with_reads(&sink.reads);
         assert!(fresh(&r, &source, &crate::source::primary_path(&r)));
@@ -1021,8 +977,8 @@ mod tests {
         std::fs::write(&r.path, format!("{first}\n{giant}\n{rest}")).unwrap();
         let adapter = crate::harness::claude::Claude::with_config_dir(&world.home.join(".claude"));
         let cache = Cache::default();
-        let (shell, sink) = window(&cache, &adapter, &r, 2, Some(4), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&adapter, &r, 2, Some(4), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 2, Some(4), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&adapter, &r, 2, Some(4), false));
         let entries = cache.entries.lock().unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].bytes < 16 * 1024);

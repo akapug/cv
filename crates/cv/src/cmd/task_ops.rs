@@ -28,8 +28,7 @@ pub(crate) struct DecisionSpec {
     pub repo: Option<PathBuf>,
     pub issue: Option<String>,
     pub tags: Vec<String>,
-    /// The note event this decision was posed from (an old log's `cv task split` wrote these; the
-    /// page's `reopen` of such a decision carries it forward).
+    /// The note event this decision was posed from (an old log's `cv task split` wrote these).
     pub source: Option<String>,
     /// Tasks (full ids) this decision blocks.
     pub blocks: Vec<String>,
@@ -54,7 +53,7 @@ pub(crate) fn option_list(default_choice: &str, options: &[String]) -> Vec<Strin
 /// `posed` (the options, the default, the deadline) — one creating event per decision, plus a
 /// `tagged` only for the caller's own tags, one `blocked_by` per task it blocks, and the
 /// provisional `resolved` when `spec.provisional`. Built, not written: [`pose`] appends them as
-/// ONE unit, and the page's `reopen` adds its notes to the same unit.
+/// ONE unit.
 pub(crate) fn pose_events(from: &str, spec: DecisionSpec) -> Result<Vec<TaskEvent>> {
     if spec.default_choice.trim().is_empty() {
         bail!("a decision needs a --default (the option that stands if nobody speaks)");

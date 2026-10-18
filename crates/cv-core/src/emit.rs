@@ -637,9 +637,6 @@ mod tests {
         });
 
         Session {
-            source_stamp: None,
-            id: "orig-id".into(),
-            harness,
             cwd: Some(PathBuf::from("/Users/test/project")),
             title: Some("a test session".into()),
             created_at: Some(Utc::now()),
@@ -651,11 +648,7 @@ mod tests {
                 remote: None,
             }),
             messages: vec![sys, user, asst, tool],
-            source_path: None,
-            extra: serde_json::Map::new(),
-            principal: None,
-            system_prompt: None,
-            lineage: crate::ir::Lineage::default(),
+            ..Session::new("orig-id", harness)
         }
     }
 
@@ -1353,7 +1346,7 @@ mod tests {
     #[test]
     fn reshape_verbs_emit_resumable() {
         use crate::distill::{distill, resumable_session, DistillOptions};
-        use crate::loom::{splice, Span};
+        use crate::loom::tests::compose;
 
         let src = reshape_source();
         // Six turns: the hook attachment is not one (the IR never carries it), so a2's parent `h1`
@@ -1365,31 +1358,8 @@ mod tests {
         };
         let d = distill(&src, &opts).unwrap();
         let distilled = resumable_session(&src, &d, &opts).unwrap();
-        let fork = splice(
-            &[Span {
-                source: &src,
-                start: 0,
-                end: Some(2),
-            }],
-            None,
-            Harness::Claude,
-        );
-        let two = splice(
-            &[
-                Span {
-                    source: &src,
-                    start: 0,
-                    end: Some(3),
-                },
-                Span {
-                    source: &src,
-                    start: 4,
-                    end: None,
-                },
-            ],
-            None,
-            Harness::Claude,
-        );
+        let fork = compose(&[(&src, 0, Some(2))], None, Harness::Claude);
+        let two = compose(&[(&src, 0, Some(3)), (&src, 4, None)], None, Harness::Claude);
         let lane = crate::distill::tests::lane();
         let dl = distill(&lane, &opts).unwrap();
         let lane_distilled = resumable_session(&lane, &dl, &opts).unwrap();
@@ -2018,21 +1988,13 @@ mod tests {
         });
 
         Session {
-            source_stamp: None,
-            id: "img-id".into(),
-            harness: Harness::Grok,
             cwd: Some(PathBuf::from("/Users/test/project")),
             title: Some("image session".into()),
             created_at: Some(Utc::now()),
             updated_at: Some(Utc::now()),
             model: Some("test-model".into()),
-            git: None,
             messages: vec![user, asst],
-            source_path: None,
-            extra: serde_json::Map::new(),
-            principal: None,
-            system_prompt: None,
-            lineage: crate::ir::Lineage::default(),
+            ..Session::new("img-id", Harness::Grok)
         }
     }
 

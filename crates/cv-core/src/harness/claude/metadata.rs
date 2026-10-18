@@ -388,8 +388,8 @@ mod tests {
                 0 => state.head.version = "obsolete".into(),
                 1 => state.checkpoint.offset += 1,
                 2 => {
-                    state.head.offset = text.len() as u64 + 100;
-                    state.checkpoint.offset = state.head.offset;
+                    state.head.prefix.len = text.len() as u64 + 100;
+                    state.checkpoint.offset = state.head.offset();
                 }
                 3 => state.dependencies = crate::source::ReadSet::unrecorded(),
                 4 => state.checkpoint = Checkpoint::new(state.checkpoint.offset),
@@ -397,7 +397,7 @@ mod tests {
                     LAYER,
                     &serde_json::json!({"session": "wrong-type", "custom_title": false}),
                 ),
-                6 => state.head.identity = None,
+                6 => state.head.prefix.ino ^= 1,
                 _ => {
                     let mut reducer = state.checkpoint.get::<State>(LAYER).unwrap();
                     reducer.session.message_count = usize::MAX;

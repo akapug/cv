@@ -80,6 +80,7 @@ use super::Adapter;
 use crate::ir::*;
 use crate::json::{JsonSource, JsonView};
 use crate::lazy::{Text, INLINE_MAX};
+use crate::source::{Dependencies, Probe};
 use crate::stream::{Checkpoint, Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -126,6 +127,25 @@ impl Kimi {
 impl Adapter for Kimi {
     fn harness(&self) -> Harness {
         Harness::Kimi
+    }
+
+    fn dependencies(&self, r: &SessionRef, probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        if let Some(root) = r
+            .path
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "sessions"))
+            .and_then(Path::parent)
+        {
+            deps.files.push(root.join("config.toml"));
+        }
+        deps.files.push(r.path.join("meta.json"));
+        if probe.exists(&r.path.join("context.jsonl"))? {
+            // Includes rotated segments and their membership; no subagent/background recursion.
+            deps.directories.push(r.path.clone());
+        } else {
+            deps.files.push(r.path.join(format!("{}.jsonl", r.id)));
+        }
+        Some(())
     }
 
     fn roots(&self) -> Vec<PathBuf> {
@@ -332,9 +352,6 @@ fn session_header(
     wire: Option<&Path>,
 ) -> (Session, WireEnrich) {
     let mut s = Session {
-        source_stamp: None,
-        id: r.id.clone(),
-        harness: Harness::Kimi,
         cwd: r.cwd.clone(),
         title: r.title.clone(),
         created_at: r.created_at,
@@ -343,13 +360,9 @@ fn session_header(
             .root
             .as_ref()
             .and_then(|root| default_model_from_config(&root.join("config.toml"))),
-        git: None,
-        messages: Vec::new(),
         source_path: Some(r.path.clone()),
-        extra: serde_json::Map::new(),
-        principal: None,
-        system_prompt: None,
         lineage: subagent_lineage(&r.path),
+        ..Session::new(r.id.clone(), Harness::Kimi)
     };
     if let Some(meta) = subagent_meta(&r.path) {
         s.harness_extra_mut(Harness::Kimi).insert("subagent".into(), meta);

@@ -124,8 +124,8 @@ pub(crate) fn data_schema_json() -> Value {
                      "status_source", "last_text", "last_tool", "stranded", "failure_cause", "resets_at", "failure_detail",
                      "endpoint", "endpoint_source", "tasks"],
             "tokens": ["calls", "input", "cache_read", "cache_write", "output", "total"],
-            "status": "running · completed · stopped · failed · killed · or a journaled workflow status (done / partial / …)",
-            "status_source": ["journal", "task_notification", "subagent_stop", "transcript"],
+            "status": "running · returned · completed · stopped · failed · killed · or a journaled workflow status (done / partial / …)",
+            "status_source": ["journal", "task_notification", "subagent_stop", "hook_ledger", "transcript"],
             "stranded": "status completed/stopped AND the last text's final sentences say it is waiting",
             "failure_cause": "failed/killed lanes only, from the transcript's last uncleared API-error notice: rate-limited · context · stopped (absent = undetermined)",
             "endpoint": "the CV_ENDPOINT the lane's own shell commands exported first (lane:<name>; an Agent prompt or a written brief does not count), else with --tasks a lane:<slug> assignee matching the description's leading token",
@@ -419,5 +419,9 @@ mod tests {
         assert_eq!(v["block"]["tag"], "type");
         assert_eq!(v["session_row"]["keys"].as_array().unwrap().len(), 9);
         assert!(v["query"].is_object());
+        assert!(v["lane"]["status_source"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(cv_core::lanes::StatusSource::HookLedger)));
     }
 }

@@ -273,9 +273,9 @@ fn cached_scan_inner<F>(
 where
     F: FnOnce(Option<&crate::stream::Checkpoint>) -> (Vec<SessionRef>, Option<ScanContinuation>),
 {
-    // One capture decides freshness: the path's full identity, inside the read set. Its
-    // `(mtime, size)` only keys the persisted rows.
-    reads.record(path);
+    // One capture decides freshness: the path's full identity, inside the read set (with its
+    // prefix sample when it may grow under a continuation). Its `(mtime, size)` only keys rows.
+    reads.record_as(path, version.is_some());
     #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
     let Some(key @ (_, size)) = reads.signature(path) else {
         return scan(None).0;
@@ -337,15 +337,15 @@ where
         }
     }
     // A continuation may end past its row's size: a pass that raced an append read the bytes
-    // its own capture held. The head's identity and sampled bytes are what admit it.
+    // its own capture held. The head's identity and sampled bytes are what admit it, also at
+    // the row's own size (a writer mid-`write`: new timestamps, old length).
     let prior = previous.and_then(|(old_size, text)| {
-        if old_size >= size {
+        if old_size > size {
             return None;
         }
         let prior: ScanContinuation = serde_json::from_str(&text).ok()?;
-        (prior.checkpoint.offset == prior.head.offset
-            && prior.dependencies.fresh(&mut crate::source::Probe::default())
-            && prior.head.holds(path, size, version?))
+        (prior.dependencies.fresh(&mut crate::source::Probe::default())
+            && prior.head.admit(path, version?, &prior.checkpoint).is_some())
         .then_some(prior)
     });
     if let Some(prior) = &prior {
@@ -358,14 +358,13 @@ where
         }
         reads.merge(&state.dependencies);
     }
-    // A primary that only grew during the pass (`json::same_or_grown`) still holds what it read;
+    // A primary that only grew during the pass (`FileId::admits`) still holds what it read;
     // refusing that state restarted every pass over a live transcript from byte 0.
-    let primary = version.map(|_| path);
     let continuation = continuation
         .filter(|state| {
             Some(state.head.version.as_str()) == version
-                && state.head.offset == state.checkpoint.offset
-                && reads.fresh_or_grown(primary, &mut crate::source::Probe::default())
+                && state.head.offset() == state.checkpoint.offset
+                && reads.fresh_or_grown(&mut crate::source::Probe::default())
                 && state.dependencies.fresh(&mut crate::source::Probe::default())
         })
         .and_then(|state| serde_json::to_string(&state).ok());
@@ -377,7 +376,7 @@ where
         // newer row; its caller still gets its result.
         let mut probe = crate::source::Probe::default();
         let grown = version.is_some() && !reads.fresh(&mut probe);
-        if grown && !reads.fresh_or_grown(primary, &mut probe) {
+        if grown && !reads.fresh_or_grown(&mut probe) {
             return refs;
         }
         let mut entries = cache.entries.write().unwrap();
@@ -854,7 +853,7 @@ mod tests {
         .unwrap();
         conn.execute_batch(
             "INSERT OR REPLACE INTO catalog_meta(key,value) VALUES('last_full_sync','1');
-            INSERT OR REPLACE INTO watched(harness,path,mtime_ns) VALUES('gemini','old-watch',1);",
+            INSERT OR REPLACE INTO watched(harness,path,id) VALUES('gemini','old-watch',X'');",
         )
         .unwrap();
         let conn = crate::catalog::open_db().unwrap();

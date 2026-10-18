@@ -15,7 +15,7 @@
 use super::replay::{copy, rows};
 use crate::harness::store::{
     bytes::{ByteSource, ByteStage},
-    document::range::{Range, RangeSource},
+    document::range::{Range, RangeSource, Validation},
 };
 use anyhow::Result;
 use serde_json::Value;
@@ -106,7 +106,7 @@ pub(crate) fn apply(
         return Ok((bytes, report));
     }
     let bytes = Arc::new(bytes);
-    let source = RangeSource::private(bytes.clone())?;
+    let source = RangeSource::private(&bytes)?;
     let mut output = ByteStage::new();
     rows(&bytes, |row| {
         if !restore_record(&source, row)? {
@@ -162,7 +162,7 @@ pub fn rewrite_file(path: &Path, policy: SkillsPolicy, config: Option<&Path>) ->
 fn restore_record(source: &RangeSource, row: Range) -> Result<bool> {
     let mut cursor = source.cursor(row)?;
     cursor.whitespace()?;
-    if cursor.position() == row.offset + row.len || !source.validate(row)? {
+    if cursor.position() == row.offset + row.len || source.accept(row, Validation::Value)?.is_none() {
         return Ok(false);
     }
     let is = |range: Option<Range>, want: &str| -> Result<bool> {

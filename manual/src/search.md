@@ -111,9 +111,9 @@ home the process may not write (a sandbox's deny-write rule, a read-only copy) i
 listed and shown from the index and catalog already there.
 
 `--scan` asks for the live scan instead, and says so on stderr: case-insensitive substring
-matching over only the first 256 KiB of searchable content per session, in discovery order,
+matching over only the first 256 KiB of exchange content per session, in discovery order,
 with no Tantivy operators and no BM25 ranking. Invalid query syntax is an error, never a
-reason to scan.
+reason to scan. `--kind` requires indexed full-text search; it cannot be combined with `--scan`.
 
 > Older releases also kept a SQLite full-text index as a middle tier; it's
 > retired (tantivy is canonical). If a stale `index.sqlite` lingers in your
@@ -169,7 +169,7 @@ transformer forward pass and no ONNX runtime: text is tokenized, per-token
 vectors are looked up in a distilled table and mean-pooled. It's tiny and
 CPU-fast, so clustervision just embeds every session up front and does a
 brute-force in-memory cosine scan at query time — no approximate-nearest-neighbor
-index needed at the ~1k-session scale.
+index needed at a few thousand sessions (one 256-float vector per session).
 
 A session's vector embeds the head of its own exchange, as the full-text index
 matches it: never the injected instructions, system prompts or hook output around

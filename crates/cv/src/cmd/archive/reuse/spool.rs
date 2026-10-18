@@ -1,9 +1,10 @@
 //! Message frames and canonical artifact prefix ranges. JSON is serialized by serde; framing
 //! only uses ASCII RS, which cannot occur unescaped in valid JSON. Backing storage is shared.
 use super::*;
-use crate::cmd::session_json::Counted;
-pub(super) use crate::cmd::session_json::{write_session, Prefix};
+pub(super) use crate::cmd::session_json::write_session;
 use cv_core::bytes::{ByteSource, ByteStage};
+use cv_core::projection::Counted;
+pub(super) use cv_core::projection::Prefix;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -68,7 +69,7 @@ impl cv_core::MessageSink for Spool {
                 }
             }
             let stage = self.stage.as_mut().unwrap();
-            crate::cmd::session_json::write_message_frame(stage, &message, &self.resolver)?;
+            cv_core::projection::write_frame(stage, &message, &self.resolver, None)?;
             self.messages += 1;
             Ok(())
         })();

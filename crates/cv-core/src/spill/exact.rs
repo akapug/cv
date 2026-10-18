@@ -1,5 +1,5 @@
 //! Exact equality with a bounded in-memory fast path and a portable disk hash table.
-use super::Temporary;
+use crate::harness::store::bytes::Spill as Owner;
 use anyhow::{bail, Context, Result};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -251,12 +251,13 @@ struct Page {
 }
 struct Index {
     file: File,
-    _owner: Temporary,
+    _owner: Owner,
     pages: Vec<Page>,
 }
 impl Index {
     fn new(capacity: u64) -> Result<Self> {
-        let (file, owner) = Temporary::create("exact-index")?;
+        let owner = Owner::create(false).context("creating private spill file")?;
+        let file = owner.file.as_ref().unwrap().try_clone()?;
         let count = capacity.div_ceil(SLOTS_PER_PAGE);
         file.set_len(count.checked_mul(PAGE_BYTES as u64).context("spill index overflow")?)?;
         let mut pages = Vec::with_capacity(CACHE_PAGES);
@@ -303,7 +304,7 @@ impl Index {
 struct Disk {
     data: File,
     index: Index,
-    _data_owner: Temporary,
+    _data_owner: Owner,
     capacity: u64,
     len: u64,
     end: u64,
@@ -313,7 +314,8 @@ struct Disk {
 }
 impl Disk {
     fn new(len: usize) -> Result<Self> {
-        let (data, data_owner) = Temporary::create("exact-data")?;
+        let data_owner = Owner::create(false).context("creating private spill file")?;
+        let data = data_owner.file.as_ref().unwrap().try_clone()?;
         let capacity = (len as u64)
             .checked_mul(2)
             .context("spill capacity overflow")?

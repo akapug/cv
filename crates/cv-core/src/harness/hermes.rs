@@ -795,9 +795,6 @@ fn stream_conn_with_demand(
     }
 
     let s = Session {
-        source_stamp: None,
-        id: r.id.clone(),
-        harness: Harness::Hermes,
         cwd: cwd
             .filter(|c| !c.is_empty())
             .map(PathBuf::from)
@@ -813,12 +810,11 @@ fn stream_conn_with_demand(
             branch: Some(branch),
             ..Default::default()
         }),
-        messages: Vec::new(),
         source_path: Some(r.path.clone()),
-        principal: None,
         extra,
         system_prompt,
         lineage,
+        ..Session::new(r.id.clone(), Harness::Hermes)
     };
 
     let cols = columns(conn, "messages");

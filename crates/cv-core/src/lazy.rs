@@ -789,6 +789,7 @@ fn complete_utf8_prefix(raw: &[u8], limit: usize) -> usize {
 /// The span covers the string *body* (between the quotes); `escaped` is set if it contains a
 /// backslash. `None` if `raw` isn't a JSON string or doesn't lie within `within`. Used by adapters'
 /// span-producing parse paths (claude, codex).
+#[cfg(test)]
 pub fn json_string_span(raw: &RawValue, within: &[u8], base_off: u64) -> Option<Span> {
     let b = raw.get().as_bytes();
     if b.len() < 2 || b.first() != Some(&b'"') || b.last() != Some(&b'"') {

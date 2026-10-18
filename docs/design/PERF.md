@@ -34,7 +34,12 @@ partly controls runner speed. Passing it is a regression check, not evidence of 
 
 ## Measured
 
-2026-10-14, 0eea676f -> v17-perf. Release builds, `/usr/bin/time -l`, instructions retired
+Every number below carries its date and conditions; a wall time measured on a loaded host is
+reported with the load and is not a budget verdict. The 0.17 release tree (c7aa0c22, 2026-10-16)
+was not timed: the host sat at load 100-175 all day, so only load-independent facts about it are
+recorded (counts, instructions retired, memory, sizes) under "0.17 facts" below.
+
+**2026-10-14, 0eea676f -> v17-perf.** Release builds, `/usr/bin/time -l`, instructions retired
 (repeat to ~1%; the host's load was 25-200, so wall times are wide). Frozen: APFS clone under a
 fake HOME, 5,421 sessions (claude 38 GB; codex 40 GB, 3,923 of 4,483 rollouts `.jsonl.zst`,
 ~89 GB decoded). Live: the real HOME read-only, ~7,000 sessions, scratch `CLUSTERVISION_HOME`.
@@ -59,9 +64,36 @@ A full build from an empty home, frozen: 21.6 T, 737 s -> 12.9 T, 866 s, footpri
 Live: 13.5 T, 966 s, RSS 3.4 GB, footprint 759 MB. `has:` now pays for the Claude tool-results
 inventory (a stat per file), which 0.16.1 did not check.
 
-Not reproducible on today's fleet, so removed: perf-2's recount 41-44 s / 140 MB, unchanged
+Not reproducible on the 2026-10-14 fleet, so removed: perf-2's recount 41-44 s / 140 MB, unchanged
 index 0.03-0.05 s, first listing 7.5-7.8 s, and the 421.5 s live index of 2026-10-13. All
 were measured before most codex rollouts were compressed.
+
+**0.17 facts (c7aa0c22, 2026-10-16, release build, live HOME read-only, fresh scratch
+`CLUSTERVISION_HOME`, host load 100-175: no wall times).** The fleet is 7,374 top-level sessions
+(1,435 Claude transcripts, 4,872 Codex rollouts of which 4,091 `.jsonl.zst`; 39 GB + 42 GB on
+disk). Instructions retired, `/usr/bin/time -l`:
+
+| operation | 0.17 | the 2026-10-14 figure |
+|---|---|---|
+| `ls`, first run on an empty home | 2.36 T; RSS 850 MB, footprint 101 MB | 5.18 T frozen (5,421 sessions) |
+| `ls`, warm | 0.61-0.62 G; footprint 16 MB (the first warm read after discovery: 3.4 G) | 0.50 G |
+| `ls -q has:plan`, first ever (builds the counts for every session) | 2.81 T; footprint 140 MB | |
+| `ls -q has:plan`, after `cv index` | 2.8-3.2 G; footprint 46 MB | 1.7 G frozen |
+| `cv index`, first pass on the discovered home | 3.35 T; RSS 3.6 GB, footprint 891 MB | 12.9 T frozen full build |
+| `cv index`, second pass | re-read 4,893 of 7,374 sessions, 1.94 T, footprint 538 MB | |
+| `cv index`, third pass | 11 changed (live appends), 7,362 unchanged, 17.6 G, footprint 145 MB | 6.7-12.3 G live |
+| `show --last 20`, Claude 190 MB | 3.34-3.38 G | 3.7 G |
+| `show --last 20`, Codex 708 MB plain | 10.3-11.7 G | 12.6 G |
+| `show --last 20`, Codex 227 MB `.jsonl.zst` | 11.3-11.65 G | (412 MB rollout: 28.0 G) |
+
+The index of that home is 2.4 GB of tantivy segments and a 193 MB `catalog.db` (7,374 session
+rows, 6,828 scan-cache rows, 1,513,943 events, 7,374 affordance-count rows, 22,120 source
+dependencies, 389 watched paths). The second index pass is a defect, not a cost: 4,893 is the
+Codex rollout count, so that snapshot's first-pass Codex baselines did not hold. This is historical
+evidence; verify the present tree with repeated unchanged passes, including compressed rollouts. The one-time 0.17 upgrade costs on a home built by 0.16.1 (catalog reread
+for the new identity, the index rebuild for the `context` field and the title rule, the semantic
+re-embed) were **not measured**: the upgrade run was stopped for load. Expect one full reread of
+every session by the catalog and one by the indexer, and one re-embed of every session's exchange.
 
 Peak requested Rust heap, before -> after the datapaths pass (2026-10-12..14; not re-measured
 here, the CI heap gates that bound them pass; compressed Codex now also gated, 6.4 MB flat):
@@ -88,7 +120,9 @@ A resume mark (`resume.rs`) is checked by device and inode, length, and a hash o
 and the 4 KiB before the mark. An in-place edit outside those samples that is followed by growth
 is not detected: index and watch resume past it, and the edited bytes keep the docs, events and
 counts they were read with until a whole pass (`cv index --rebuild`, a same-size rewrite, or a new
-inode). Rewind's prefix receipt has the same limit.
+inode). Rewind's prefix receipt has the same limit, and so does the append admission of a captured
+`.jsonl` (`source::FileId::admits`): a stat that changed at the captured length (a writer
+mid-`write`) is admitted when the samples match, so a same-length edit outside them is not caught.
 
 Hashing the whole prefix on each resume would close the gap, and was rejected. On the largest
 local transcript (189,759,498 bytes), the mark's FNV-1a took 1.03 s and 1.22 s (0.16 to 0.19

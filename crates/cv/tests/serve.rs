@@ -1057,6 +1057,27 @@ fn serve_tasks_routes() {
         "HTTP rows carry timestamps: {v}"
     );
     assert!(v["warnings"].as_array().is_some_and(|w| w.is_empty()), "{v}");
+    // `detail=1` adds the inbox page's backlog columns; the plain row keeps its shape.
+    assert!(row.get("notes").is_none() && row.get("body").is_none(), "{v}");
+    let (status, v) = get_json(port, "/api/tasks?detail=1");
+    assert_eq!(status, 200, "{v}");
+    let row = v["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(id))
+        .unwrap();
+    assert_eq!(row["opened_by"], "human", "{v}");
+    assert_eq!(
+        (
+            row["notes"].as_u64(),
+            row["decision"].as_bool(),
+            row["blocked"].as_bool()
+        ),
+        (Some(0), Some(false), Some(false)),
+        "{v}"
+    );
+    assert_eq!(row["body"], "", "{v}");
 
     // State filter hits and misses.
     let (_, v) = get_json(port, "/api/tasks?state=claimed");
@@ -1264,7 +1285,14 @@ fn serve_search() {
     // CLI's --semantic conflicts with --kind.
     let (status, v) = get_json(port, "/api/search?semantic=1&kind=context&q=zebrafish");
     assert_eq!(status, 400, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("embeds the exchange only"), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("exchange only"), "{v}");
+
+    // Live scan has no context projection; never silently search the exchange instead.
+    for kind in ["context", "all"] {
+        let (status, v) = get_json(port, &format!("/api/search?scan=1&kind={kind}&q=zebrafish"));
+        assert_eq!(status, 400, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("exchange only"), "{v}");
+    }
 
     // harness: a filter, and a typo is a clear 400 (same as /api/sessions).
     let (status, v) = get_json(port, "/api/search?scan=1&q=zebrafish&harness=claude");
@@ -1714,8 +1742,18 @@ fn serve_carries_the_inbox_and_guards_its_writes() {
     assert_eq!(status, 200, "{v}");
     assert_eq!(v["who"], "ember", "the server's --who is the default inbox: {v}");
     let (status, v) = get_json(port, "/api/backlog");
-    assert_eq!(status, 200, "{v}");
-    assert_eq!(v["count"], 1, "{v}");
+    assert_eq!(status, 410, "{v}");
+    assert!(
+        v["error"].as_str().unwrap_or_default().contains("/api/tasks?detail=1"),
+        "{v}"
+    );
+    let raw = raw_post(
+        port,
+        &format!("/api/task/{id}/reopen"),
+        "{}",
+        &[("Content-Type", "application/json")],
+    );
+    assert_eq!(raw_status(&raw), 410, "{raw}");
 
     let path = format!("/api/task/{id}/note");
     let body = r#"{"who":"ember","text":"a little flat"}"#;
@@ -1885,6 +1923,19 @@ fn malformed_header_fields_fail_before_routing() {
     }
     let response = raw_request(port, "GET", "/api/health", &[("X-Valid_Token", "\tvalid\tvalue\t")]);
     assert_eq!(raw_status(&response), 200, "{response}");
+}
+
+#[test]
+fn duplicate_host_fields_are_rejected_before_routing() {
+    let w = world("duplicate-host");
+    let (port, _server) = spawn_serve(&w);
+    for hosts in [
+        [("Host", "localhost"), ("host", "evil.example")],
+        [("Host", "localhost"), ("Host", "localhost")],
+    ] {
+        let response = raw_request(port, "GET", "/api/health", &hosts);
+        assert_eq!(raw_status(&response), 400, "{response}");
+    }
 }
 
 #[test]

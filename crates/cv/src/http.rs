@@ -359,6 +359,9 @@ fn read_head(src: &mut BufReader<Conn>) -> Result<Head, Option<u16>> {
         framing: Framing::Length(0),
         expect_continue: false,
     };
+    if head.values("Host").count() > 1 {
+        return Err(Some(400));
+    }
     head.framing = framing(&head).ok_or(Some(400))?;
     let expect_continue = match head.values("Expect").next() {
         None => false,

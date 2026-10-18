@@ -23,6 +23,10 @@ try {
   await page.route('**/api/**', async route => {
     const url = new URL(route.request().url());
     if (url.pathname === '/api/inbox') return route.fulfill(inboxDown ? { status: 500, json: { error: 'inbox unavailable' } } : { json: inbox });
+    if (url.pathname === '/api/tasks') {
+      assert.equal(url.searchParams.get('detail'), '1', 'backlog requests detailed task rows');
+      return route.fulfill({ json: { tasks: [{ id: 'task-backlog', title: 'Backlog fixture', body: 'Detailed task body', effective_state: 'open', opened_by: 'human', notes: 3, tags: ['review'], last_ts: '2026-10-17T10:00:00+00:00' }], warnings: [] } });
+    }
     if (url.pathname === '/api/lanes') {
       if (url.searchParams.get('session') === 'slow') { held = route; return; }
       if (mode === 'network') return route.abort('failed');
@@ -57,8 +61,14 @@ try {
   inboxDown = true; await page.locator('#refresh').click();
   await page.waitForFunction(() => document.querySelector('#counter')?.textContent === 'inbox unavailable');
   assert.equal(await page.locator('table.lanes').count(), 1, 'lane facts remain useful when task inbox fails');
+  inboxDown = false;
+  await page.locator('[data-pane="backlog"]').click();
+  await page.locator('table.lanes td').filter({ hasText: 'Backlog fixture' }).waitFor();
+  assert.match(await page.locator('table.lanes').textContent(), /open.*Backlog fixture.*human.*3/s);
+  await page.locator('table.lanes td').filter({ hasText: 'Backlog fixture' }).click();
+  await page.getByText('Detailed task body', { exact: true }).waitFor();
   assert.deepEqual(errors, [], 'page has no uncaught errors');
-  console.log('inbox selftest: lane errors, retries, warnings and stale responses passing');
+  console.log('inbox selftest: lanes and detailed task backlog passing');
 } finally {
   try { await browser?.close(); }
   finally {

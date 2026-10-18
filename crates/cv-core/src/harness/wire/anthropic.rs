@@ -354,6 +354,7 @@ fn coerce_selected_array(content: crate::json::JsonView<'_>) -> anyhow::Result<T
 
 /// Every block of a `content` array; a bare string is one text block. (Claude's lazy reader spans
 /// the bare-string case itself, so it walks the array with [`block_from_with`] instead.)
+#[cfg(test)]
 pub fn blocks_from(content: Option<&Value>, q: &Quirks) -> Vec<Block> {
     match content {
         Some(Value::String(s)) => vec![Block::Text { text: s.clone().into() }],
@@ -378,6 +379,7 @@ pub fn assistant_blocks(content: &[Block], q: &Quirks) -> anyhow::Result<Vec<Val
 /// `document` attachment the reader turns back into a File (stores with flat media get the text
 /// marker), a stray tool result (mixed user content) as a `tool_result` block; thinking and tool
 /// invocations do not occur on user turns but map to their native shapes rather than vanishing.
+#[cfg(test)]
 pub fn user_blocks(content: &[Block], q: &Quirks) -> anyhow::Result<Vec<Value>> {
     blocks_to(content, q, true)
 }

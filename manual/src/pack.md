@@ -27,7 +27,7 @@ cv pack "migrate the daemon" --limit 3                  # draw from at most 3 pa
    session actually **did** — which files it edited, which commands it ran.
    The digest is **extractive by default**: every line comes from a real
    transcript or the catalog, so nothing is hallucinated, and no network is
-   touched and no model is loaded.
+   touched for extractive summarization and no generative model is called (semantic recall can load its cached embedding model).
 3. **Emit** in the requested `--format`:
    - `md` (default) — a CLAUDE.md-style bundle: the task, one section per
      source (title, harness, date, cwd → digest, key excerpt, files touched,

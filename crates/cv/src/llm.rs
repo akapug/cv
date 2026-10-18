@@ -595,24 +595,11 @@ mod tests {
 
     fn sample_session() -> Session {
         Session {
-            source_stamp: None,
-            id: "test-session".to_string(),
-            harness: Harness::Claude,
-            cwd: None,
-            title: None,
-            created_at: None,
-            updated_at: None,
-            model: None,
-            git: None,
             messages: vec![
                 msg(Role::User, "How do I fix the build?"),
                 msg(Role::Assistant, "The bug lives in src/lib.rs; pin reqwest to 0.12."),
             ],
-            source_path: None,
-            extra: Default::default(),
-            principal: None,
-            system_prompt: None,
-            lineage: cv_core::ir::Lineage::default(),
+            ..Session::new("test-session", Harness::Claude)
         }
     }
 

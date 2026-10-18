@@ -3,7 +3,7 @@
 //! goes too, its children relinked to its parent), and illegal tool IDs are remapped.
 use crate::harness::store::{
     bytes::{ByteSource, ByteStage},
-    document::range::{Range, RangeSource},
+    document::range::{Range, RangeSource, Validation},
 };
 use anyhow::Result;
 use std::{
@@ -151,7 +151,7 @@ fn empty_content(source: &RangeSource, row: Range) -> Result<bool> {
 
 fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) -> Result<(ByteStage, Changes)> {
     let bytes = Arc::new(bytes);
-    let source = RangeSource::private(bytes.clone())?;
+    let source = RangeSource::private(&bytes)?;
     let mut reserved = HashSet::new();
     let mut invalid = Vec::new();
     let mut seen = HashSet::new();
@@ -166,7 +166,7 @@ fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) ->
         if cursor.position() == row.offset + row.len {
             return Ok(());
         }
-        if !source.validate(row)? {
+        if source.accept(row, Validation::Value)?.is_none() {
             // A transform's pass-through keeps malformed lines verbatim; replay refuses them.
             anyhow::ensure!(empties, "portable Claude replay encountered invalid JSON");
             return Ok(());
@@ -219,7 +219,10 @@ fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) ->
         ..Changes::default()
     };
     rows(&bytes, |row| {
-        if empties && !removed_rows.contains(&row.offset) && (removed.is_empty() || !source.validate(row)?) {
+        if empties
+            && !removed_rows.contains(&row.offset)
+            && (removed.is_empty() || source.accept(row, Validation::Value)?.is_none())
+        {
             return copy(&source, row, &mut output);
         }
         let mut patches = Vec::new();

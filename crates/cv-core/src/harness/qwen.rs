@@ -18,6 +18,7 @@
 
 use super::{parse_ts, Adapter};
 use crate::ir::*;
+use crate::source::{Dependencies, Probe};
 use crate::stream::{Checkpoint, Flow, MessageSink, ParseOptions, ADAPTER_LAYER};
 use anyhow::{Context, Result};
 use record::Demand;
@@ -69,6 +70,23 @@ impl Qwen {
 impl Adapter for Qwen {
     fn harness(&self) -> Harness {
         Harness::Qwen
+    }
+
+    fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        deps.files.push(r.path.with_extension("meta.json"));
+        if let Some(chats) = r.path.parent().filter(|p| p.file_name().is_some_and(|n| n == "chats")) {
+            if let (Some(root), Some(cwd)) = (
+                chats.parent().and_then(Path::parent).and_then(Path::parent),
+                r.cwd.as_ref().and_then(|p| p.to_str()),
+            ) {
+                deps.files.push(
+                    root.join("tmp")
+                        .join(crate::digest::sha256_hex(cwd.as_bytes()))
+                        .join("scheduled_tasks.json"),
+                );
+            }
+        }
+        Some(())
     }
 
     fn roots(&self) -> Vec<PathBuf> {

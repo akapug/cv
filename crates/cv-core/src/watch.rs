@@ -9,7 +9,6 @@ use crate::harness;
 use crate::ir::{Harness, Message, SessionRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 mod read;
 pub use read::{read as read_tail, read_session, read_session_into, ReadPass, ReadState};
@@ -285,13 +284,24 @@ impl Watcher {
 
     /// [`Watcher::new`] over another session source (see [`Watcher::discover`]).
     pub fn with_discovery(filter: Filter, emit_existing: bool, discover: fn() -> Vec<SessionRef>) -> Self {
+        Self::with_discovery_until(filter, emit_existing, discover, || false)
+    }
+
+    /// [`Watcher::with_discovery`] whose baseline read stops once `expired` says so, for a
+    /// follower bounded by a deadline; [`Watcher::following`] tells how far it got.
+    pub fn with_discovery_until(
+        filter: Filter,
+        emit_existing: bool,
+        discover: fn() -> Vec<SessionRef>,
+        mut expired: impl FnMut() -> bool,
+    ) -> Self {
         let mut w = Watcher {
             filter,
             seen: BTreeMap::new(),
             discover,
         };
         if !emit_existing {
-            w.prime();
+            w.prime(&mut expired);
         }
         w
     }
@@ -382,13 +392,21 @@ impl Watcher {
         format!("{}:{}", r.harness.as_str(), r.id)
     }
 
+    /// How many sessions hold a position (the count a follower announces once primed).
+    pub fn following(&self) -> usize {
+        self.seen.len()
+    }
+
     fn trigger_of(r: &SessionRef) -> (usize, Option<i64>) {
         (r.message_count, r.updated_at.map(|t| t.timestamp_millis()))
     }
 
     /// Record current state without emitting anything.
-    fn prime(&mut self) {
+    fn prime(&mut self, expired: &mut impl FnMut() -> bool) {
         for r in self.discover() {
+            if expired() {
+                return;
+            }
             // The cheap discover `message_count` is NOT the parsed IR length for several harnesses
             // (codex/hermes/claude add reasoning/tool/system turns), so seeding from it makes the
             // first `Updated` poll re-emit messages that predate the watcher. Record the true
@@ -408,8 +426,9 @@ impl Watcher {
 
     /// The sessions to follow, oldest-touched first, so a bounded poll yields a chronological
     /// slice. Followers use full discovery independently of catalog synchronization. The
-    /// identity-aware per-file scan cache avoids reparsing unchanged transcripts.
-    fn discover(&self) -> Vec<SessionRef> {
+    /// identity-aware per-file scan cache avoids reparsing unchanged transcripts. Public as the
+    /// one-shot form of a follower: its current state is this list.
+    pub fn discover(&self) -> Vec<SessionRef> {
         let mut refs: Vec<SessionRef> = (self.discover)()
             .into_iter()
             .filter(|r| self.filter.matches(r))
@@ -739,16 +758,6 @@ impl Watcher {
             accepted += 1;
         }
         accepted
-    }
-
-    /// Poll forever, invoking `on_event` for each event. Blocks the calling thread.
-    pub fn run<F: FnMut(SessionEvent)>(&mut self, interval: Duration, mut on_event: F) -> ! {
-        loop {
-            for ev in self.poll() {
-                on_event(ev);
-            }
-            std::thread::sleep(interval);
-        }
     }
 }
 

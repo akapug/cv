@@ -538,7 +538,7 @@ pub fn matches_streamed(
 
 struct StreamedMatch {
     decision: anyhow::Result<bool>,
-    source: crate::source::Snapshot,
+    source: crate::source::Baseline,
     counted: Option<crate::stream::Counted>,
 }
 

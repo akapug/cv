@@ -19,206 +19,213 @@ pub(crate) fn trim_str(text: &str) -> &str {
     text.trim_matches(|c: char| c.is_ascii() && is_whitespace(&(c as u8)))
 }
 
-/// RawValue validates JSON syntax but deliberately skips finite-number and surrogate checks,
-/// and its ignored containers do not consume Value's recursion budget. Match Value acceptance
-/// before applying replay controls, without decoding or allocating the potentially giant strings.
-pub(crate) fn value_compatible(b: &[u8]) -> bool {
-    value_compatible_with(b, |_, _| {})
+/// The bytes a validation pass reads: a slice in memory, or a positioned source read in windows
+/// (`document::range::Windowed`). Indexes are relative to the pass's first byte.
+pub(crate) trait Bytes {
+    fn get(&mut self, i: usize) -> Option<u8>;
+    /// `len` bytes from `i`; None past the end (never at a window boundary).
+    fn slice(&mut self, i: usize, len: usize) -> Option<&[u8]>;
+    /// Whether `i..end` is UTF-8 (a pass over `str` bytes knows it is).
+    fn utf8(&mut self, i: usize, end: usize) -> bool;
+    /// Whether the number token at `i..end` is accepted: as a finite `serde_json::Number`
+    /// (`strict`), or by JSON grammar alone.
+    fn number(&mut self, i: usize, end: usize, strict: bool) -> bool;
 }
-
-/// As `value_compatible`, reporting validated string boundaries for source-slice indexes.
-pub(crate) fn value_compatible_with(b: &[u8], mut string: impl FnMut(usize, usize)) -> bool {
-    value_compatible_at_depth_with(b, 0, &mut string)
-}
-
-pub(crate) fn value_compatible_at_depth_with(b: &[u8], depth: usize, string: impl FnMut(usize, usize)) -> bool {
-    let Ok(text) = std::str::from_utf8(b) else {
-        return false;
-    };
-    value_compatible_str_at_depth_with(text, depth, string)
-}
-
-/// The source view already owns a UTF-8-validated str. Keep byte-slice entry points strict,
-/// without rescanning the whole borrowed document at this stronger boundary. `span` sees the
-/// bounds of every string and of every container closed within `text`.
-pub(crate) fn value_compatible_str_at_depth_with(
-    text: &str,
-    mut depth: usize,
-    mut span: impl FnMut(usize, usize),
-) -> bool {
-    let b = text.as_bytes();
-    let mut opened = [usize::MAX; 128];
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'"' => {
-                let start = i;
-                let Some(end) = string_end(b, i) else {
-                    return false;
-                };
-                if !valid_unicode_escapes(&b[start + 1..end - 1]) {
-                    return false;
-                }
-                span(start, end);
-                i = end;
-                continue;
-            }
-            b'{' | b'[' => {
-                opened[depth] = i;
-                depth += 1;
-                if depth >= 128 {
-                    return false;
-                }
-            }
-            b'}' | b']' => {
-                let Some(next) = depth.checked_sub(1) else {
-                    return false;
-                };
-                depth = next;
-                if opened[depth] != usize::MAX {
-                    span(opened[depth], i + 1);
-                    opened[depth] = usize::MAX;
-                }
-            }
-            b'-' | b'0'..=b'9' => {
-                let start = i;
-                while b.get(i).is_some_and(|c| !is_whitespace(c) && !b",]}".contains(c)) {
-                    i += 1;
-                }
-                if serde_json::from_slice::<serde_json::Number>(&b[start..i]).is_err() {
-                    return false;
-                }
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
+impl Bytes for &[u8] {
+    #[inline]
+    fn get(&mut self, i: usize) -> Option<u8> {
+        (**self).get(i).copied()
     }
-    true
+    #[inline]
+    fn slice(&mut self, i: usize, len: usize) -> Option<&[u8]> {
+        (**self).get(i..i.checked_add(len)?)
+    }
+    fn utf8(&mut self, i: usize, end: usize) -> bool {
+        std::str::from_utf8(&self[i..end]).is_ok()
+    }
+    fn number(&mut self, i: usize, end: usize, strict: bool) -> bool {
+        number_accepted(&self[i..end], strict)
+    }
+}
+/// `str` bytes: UTF-8 is known.
+pub(crate) struct Text<'a>(pub &'a [u8]);
+impl Bytes for Text<'_> {
+    #[inline]
+    fn get(&mut self, i: usize) -> Option<u8> {
+        self.0.get(i).copied()
+    }
+    #[inline]
+    fn slice(&mut self, i: usize, len: usize) -> Option<&[u8]> {
+        self.0.get(i..i.checked_add(len)?)
+    }
+    fn utf8(&mut self, _: usize, _: usize) -> bool {
+        true
+    }
+    fn number(&mut self, i: usize, end: usize, strict: bool) -> bool {
+        number_accepted(&self.0[i..end], strict)
+    }
+}
+pub(crate) fn number_accepted(token: &[u8], strict: bool) -> bool {
+    if strict {
+        serde_json::from_slice::<serde_json::Number>(token).is_ok()
+    } else {
+        serde_json::from_slice::<&serde_json::value::RawValue>(token)
+            .is_ok_and(|raw| matches!(raw.get().as_bytes().first(), Some(b'-' | b'0'..=b'9')))
+    }
 }
 
-/// One pass that accepts exactly what `serde_json::from_str::<Value>` accepts: JSON grammar,
-/// strings without control characters or invalid escapes (including lone surrogates), finite
-/// numbers, Value's nesting limit, nothing after the value. `span` sees the bounds of every
-/// string and container, so a caller can index them for later structural selection. Replaces
-/// a serde syntax pass followed by [`value_compatible`] for a record a codec will select from.
-pub(crate) fn validate_value(text: &str, mut span: impl FnMut(usize, usize)) -> bool {
-    let b = text.as_bytes();
-    // Open containers: (start, is_object). Value rejects the 128th level, as value_compatible does.
+/// One pass over a JSON value from any byte source, accepting exactly what
+/// `serde_json::from_str::<Value>` accepts when `strict` (JSON grammar, strings without control
+/// characters or invalid escapes including lone surrogates, finite numbers, Value's nesting
+/// limit, nothing after the value), and what `RawValue` accepts otherwise (lone UTF-16 escapes
+/// and infinite numbers pass; grammar, control characters, nesting and UTF-8 still apply).
+/// `depth` levels are already open around the value. `span` sees the bounds of every string
+/// and container, so a caller can index them for later structural selection.
+/// Returns the value's bounds, or None when it is not accepted.
+pub(crate) fn validate_value(
+    b: &mut impl Bytes,
+    strict: bool,
+    depth: usize,
+    mut span: impl FnMut(u8, usize, usize),
+) -> Option<(usize, usize)> {
+    // Open containers: (start, is_object). Value rejects the 128th level; grammar alone has no
+    // limit, so deeper levels spill to the heap only when a document actually nests that far.
     let mut open = [(0usize, false); 128];
+    let mut deep: Vec<(usize, bool)> = Vec::new();
+    let base = depth;
     let mut depth = 0;
-    let mut i = 0;
+    let mut i = skip_ws(b, 0);
+    let first = i;
     loop {
         // A value starts here.
         i = skip_ws(b, i);
         match b.get(i) {
             Some(b'{' | b'[') => {
-                let object = b[i] == b'{';
-                open[depth] = (i, object);
+                let object = b.get(i) == Some(b'{');
+                match open.get_mut(depth) {
+                    Some(slot) => *slot = (i, object),
+                    None => deep.push((i, object)),
+                }
                 depth += 1;
-                if depth >= 128 {
-                    return false;
+                if strict && base + depth >= 128 {
+                    return None;
                 }
                 i = skip_ws(b, i + 1);
-                if b.get(i) == Some(if object { &b'}' } else { &b']' }) {
+                if b.get(i) == Some(if object { b'}' } else { b']' }) {
                     depth -= 1;
-                    span(open[depth].0, i + 1);
+                    let start = match open.get(depth) {
+                        Some(open) => open.0,
+                        None => deep.pop()?.0,
+                    };
+                    span(if object { b'{' } else { b'[' }, start, i + 1);
                     i += 1;
                 } else {
                     if object {
-                        let Some(next) = key(b, i, &mut span) else {
-                            return false;
-                        };
-                        i = next;
+                        i = key(b, i, strict, &mut span)?;
                     }
                     continue;
                 }
             }
             Some(b'"') => {
-                let Some(end) = string(b, i) else {
-                    return false;
-                };
-                span(i, end);
+                let end = string(b, i, strict)?;
+                span(b'"', i, end);
                 i = end;
             }
-            Some(b't') if b[i..].starts_with(b"true") => i += 4,
-            Some(b'f') if b[i..].starts_with(b"false") => i += 5,
-            Some(b'n') if b[i..].starts_with(b"null") => i += 4,
+            Some(b't') if b.slice(i, 4) == Some(b"true") => i += 4,
+            Some(b'f') if b.slice(i, 5) == Some(b"false") => i += 5,
+            Some(b'n') if b.slice(i, 4) == Some(b"null") => i += 4,
             Some(b'-' | b'0'..=b'9') => {
                 let start = i;
-                while b.get(i).is_some_and(|c| !is_whitespace(c) && !b",]}".contains(c)) {
+                while b.get(i).is_some_and(|c| !is_whitespace(&c) && !b",]}".contains(&c)) {
                     i += 1;
                 }
-                if serde_json::from_slice::<serde_json::Number>(&b[start..i]).is_err() {
-                    return false;
+                if !b.number(start, i, strict) {
+                    return None;
                 }
             }
-            _ => return false,
+            _ => return None,
         }
         // A value ended: close containers until another value is due.
         loop {
+            let end = i;
             i = skip_ws(b, i);
             if depth == 0 {
-                return i == b.len();
+                return b.get(i).is_none().then_some((first, end));
             }
-            let (start, object) = open[depth - 1];
+            let (start, object) = *open.get(depth - 1).unwrap_or_else(|| &deep[depth - 1 - open.len()]);
             match b.get(i) {
                 Some(b',') => {
-                    i += 1;
-                    if object {
-                        let Some(next) = key(b, skip_ws(b, i), &mut span) else {
-                            return false;
-                        };
-                        i = next;
-                    }
+                    i = skip_ws(b, i + 1);
+                    i = key_or_value(b, i, object, strict, &mut span)?;
                     break;
                 }
                 Some(b'}') if object => {}
                 Some(b']') if !object => {}
-                _ => return false,
+                _ => return None,
             }
             depth -= 1;
-            span(start, i + 1);
+            deep.truncate(depth.saturating_sub(open.len()));
+            span(if object { b'{' } else { b'[' }, start, i + 1);
             i += 1;
         }
     }
 }
 
-fn skip_ws(b: &[u8], mut i: usize) -> usize {
-    while b.get(i).is_some_and(is_whitespace) {
+/// After a comma: an object's next key and colon, or an array's next value start.
+fn key_or_value(
+    b: &mut impl Bytes,
+    i: usize,
+    object: bool,
+    strict: bool,
+    span: &mut impl FnMut(u8, usize, usize),
+) -> Option<usize> {
+    if object {
+        key(b, i, strict, span)
+    } else {
+        Some(i)
+    }
+}
+
+fn skip_ws(b: &mut impl Bytes, mut i: usize) -> usize {
+    while b.get(i).is_some_and(|c| is_whitespace(&c)) {
         i += 1;
     }
     i
 }
 
 /// An object key and its colon; the offset after the colon.
-fn key(b: &[u8], i: usize, span: &mut impl FnMut(usize, usize)) -> Option<usize> {
-    if b.get(i) != Some(&b'"') {
+fn key(b: &mut impl Bytes, i: usize, strict: bool, span: &mut impl FnMut(u8, usize, usize)) -> Option<usize> {
+    if b.get(i) != Some(b'"') {
         return None;
     }
-    let end = string(b, i)?;
-    span(i, end);
+    let end = string(b, i, strict)?;
+    span(b'"', i, end);
     let i = skip_ws(b, end);
-    (b.get(i) == Some(&b':')).then_some(i + 1)
+    (b.get(i) == Some(b':')).then_some(i + 1)
 }
 
 /// The end of a valid JSON string starting at the quote `i`.
-fn string(b: &[u8], i: usize) -> Option<usize> {
+fn string(b: &mut impl Bytes, i: usize, strict: bool) -> Option<usize> {
     let mut j = i + 1;
     loop {
         j = special(b, j);
-        match *b.get(j)? {
-            b'"' => return Some(j + 1),
-            b'\\' => match *b.get(j + 1)? {
+        match b.get(j)? {
+            b'"' => {
+                return b.utf8(i + 1, j).then_some(j + 1);
+            }
+            b'\\' => match b.get(j + 1)? {
                 b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => j += 2,
                 b'u' => {
-                    let code = hex_quad(b.get(j + 2..j + 6))?;
+                    let code = hex_quad(b.slice(j + 2, 4))?;
                     j += 6;
+                    if !strict {
+                        continue;
+                    }
                     if (0xd800..=0xdbff).contains(&code) {
-                        if b.get(j..j + 2) != Some(b"\\u") {
+                        if b.slice(j, 2) != Some(b"\\u") {
                             return None;
                         }
-                        let low = hex_quad(b.get(j + 2..j + 6))?;
+                        let low = hex_quad(b.slice(j + 2, 4))?;
                         if !(0xdc00..=0xdfff).contains(&low) {
                             return None;
                         }
@@ -235,11 +242,11 @@ fn string(b: &[u8], i: usize) -> Option<usize> {
 }
 
 /// The first quote, backslash or control byte at or after `j`, eight bytes at a time.
-fn special(b: &[u8], mut j: usize) -> usize {
+fn special(b: &mut impl Bytes, mut j: usize) -> usize {
     const ONES: u64 = u64::from_ne_bytes([1; 8]);
     const HIGH: u64 = u64::from_ne_bytes([0x80; 8]);
     let zero = |x: u64| x.wrapping_sub(ONES) & !x & HIGH;
-    while let Some(chunk) = b.get(j..j + 8) {
+    while let Some(chunk) = b.slice(j, 8) {
         let w = u64::from_le_bytes(chunk.try_into().unwrap());
         let found = zero(w ^ (ONES * b'"' as u64))
             | zero(w ^ (ONES * b'\\' as u64))
@@ -249,67 +256,15 @@ fn special(b: &[u8], mut j: usize) -> usize {
         }
         j += 8;
     }
-    while b.get(j).is_some_and(|&c| c != b'"' && c != b'\\' && c >= 0x20) {
+    while b.get(j).is_some_and(|c| c != b'"' && c != b'\\' && c >= 0x20) {
         j += 1;
     }
     j
 }
 
-fn valid_unicode_escapes(b: &[u8]) -> bool {
-    let mut i = 0;
-    while let Some(off) = memchr::memmem::find(&b[i..], b"\\u") {
-        i += off;
-        let mut slash = i;
-        while slash > 0 && b[slash - 1] == b'\\' {
-            slash -= 1;
-        }
-        if !(i - slash).is_multiple_of(2) {
-            i += 2;
-            continue; // A literal backslash followed by 'u', rather than a JSON Unicode escape.
-        }
-        let Some(code) = hex_quad(b.get(i + 2..i + 6)) else {
-            return false;
-        };
-        i += 6;
-        if (0xd800..=0xdbff).contains(&code) {
-            if b.get(i..i + 2) != Some(b"\\u") {
-                return false;
-            }
-            let Some(low) = hex_quad(b.get(i + 2..i + 6)) else {
-                return false;
-            };
-            if !(0xdc00..=0xdfff).contains(&low) {
-                return false;
-            }
-            i += 6;
-        } else if (0xdc00..=0xdfff).contains(&code) {
-            return false;
-        }
-    }
-    true
-}
-
 fn hex_quad(b: Option<&[u8]>) -> Option<u16> {
     b?.iter()
         .try_fold(0u16, |value, c| Some(value * 16 + char::from(*c).to_digit(16)? as u16))
-}
-
-pub(crate) fn string_end(b: &[u8], mut i: usize) -> Option<usize> {
-    if b.get(i) != Some(&b'"') {
-        return None;
-    }
-    i += 1;
-    loop {
-        i += memchr::memchr(b'"', b.get(i..)?)?;
-        let mut slash = i;
-        while slash > 0 && b[slash - 1] == b'\\' {
-            slash -= 1;
-        }
-        if (i - slash).is_multiple_of(2) {
-            return Some(i + 1);
-        }
-        i += 1;
-    }
 }
 
 // The one JSON string-body codec: a body is the bytes between a string's quotes, read through
@@ -636,16 +591,22 @@ mod tests {
             cases.push(format!("{{\"a\":{}0{}}}", "[".repeat(depth), "]".repeat(depth)));
         }
         for input in cases {
-            let raw: &crate::lazy::RawValue = serde_json::from_str(&input).unwrap();
+            let expected = serde_json::from_str::<serde_json::Value>(&input).is_ok();
             assert_eq!(
-                value_compatible(raw.get().as_bytes()),
-                serde_json::from_str::<serde_json::Value>(&input).is_ok(),
-                "{input}"
+                validate_value(&mut input.as_bytes(), true, 0, |_, _, _| {}).is_some(),
+                expected,
+                "bytes: {input}"
             );
             assert_eq!(
-                value_compatible_str_at_depth_with(raw.get(), 0, |_, _| {}),
-                serde_json::from_str::<serde_json::Value>(&input).is_ok(),
-                "validated str: {input}"
+                validate_value(&mut Text(input.as_bytes()), true, 0, |_, _, _| {}).is_some(),
+                expected,
+                "text: {input}"
+            );
+            // Grammar alone accepts what RawValue accepts.
+            assert_eq!(
+                validate_value(&mut Text(input.as_bytes()), false, 0, |_, _, _| {}).is_some(),
+                serde_json::from_str::<&crate::lazy::RawValue>(&input).is_ok(),
+                "syntax: {input}"
             );
         }
     }
@@ -744,16 +705,25 @@ mod tests {
             }
         }
         for input in cases {
+            let oracle = serde_json::from_str::<serde_json::Value>(&input).is_ok();
+            let bounds = validate_value(&mut Text(input.as_bytes()), true, 0, |_, _, _| {});
+            assert_eq!(bounds.is_some(), oracle, "{input:?}");
+            if let Some((start, end)) = bounds {
+                assert_eq!(&input[start..end], trim_str(&input), "{input:?}");
+            }
+            // A child value validated with its parents' levels open sees the same limit.
+            let nested = format!("[{input}]");
             assert_eq!(
-                validate_value(&input, |_, _| {}),
-                serde_json::from_str::<serde_json::Value>(&input).is_ok(),
-                "{input:?}"
+                validate_value(&mut Text(input.as_bytes()), true, 1, |_, _, _| {}).is_some(),
+                serde_json::from_str::<serde_json::Value>(&nested).is_ok() && oracle,
+                "nested {input:?}"
             );
         }
     }
 
     #[test]
     fn rejects_non_utf8_ignored_text() {
-        assert!(!value_compatible(b"{\"ignored\":\"\xff\"}"));
+        assert!(validate_value(&mut &b"{\"ignored\":\"\xff\"}"[..], true, 0, |_, _, _| {}).is_none());
+        assert!(validate_value(&mut &b"{\"ignored\":\"\xff\"}"[..], false, 0, |_, _, _| {}).is_none());
     }
 }

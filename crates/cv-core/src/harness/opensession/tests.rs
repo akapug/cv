@@ -4,7 +4,7 @@
 use super::*;
 use crate::harness::Parse;
 use crate::harness::{claude, codex, Adapter};
-use serde_json::{json, Map};
+use serde_json::json;
 
 fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("cv-opensession-{tag}-{}", uuid::Uuid::new_v4()));
@@ -277,9 +277,6 @@ fn every_field_session() -> Session {
     }];
 
     let mut s = Session {
-        source_stamp: None,
-        id: "s1".into(),
-        harness: Harness::Claude,
         cwd: Some(PathBuf::from("/work/proj")),
         title: Some("every field".into()),
         created_at: Some(
@@ -311,8 +308,7 @@ fn every_field_session() -> Session {
             agent_path: Some("agent-1".into()),
         },
         messages: vec![user, asst, tool, notice],
-        source_path: None,
-        extra: Map::new(),
+        ..Session::new("s1", Harness::Claude)
     };
     s.harness_extra_mut(Harness::Claude)
         .insert("custom_title".into(), json!("x"));

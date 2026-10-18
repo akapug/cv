@@ -7,6 +7,7 @@
 //! threaded via `uuid`/`parentUuid`.
 
 use super::{parse_ts, Adapter};
+use crate::source::{Dependencies, Probe};
 
 /// `cv adopt`: move a sub-agent stranded by a dead session into a live one — Claude-only byte
 /// surgery on this store's layout, so it lives beside the adapter that knows it.
@@ -172,6 +173,34 @@ fn projects_dir(entry: PathBuf) -> Option<PathBuf> {
 impl Adapter for Claude {
     fn harness(&self) -> Harness {
         Harness::Claude
+    }
+
+    fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        if r.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("agent-"))
+        {
+            deps.files.push(r.path.with_extension("meta.json"));
+        }
+        deps.directories.push(r.path.with_extension("").join("tool-results"));
+        if let Some(session) = r
+            .path
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "subagents" || n == "workflows"))
+            .and_then(Path::parent)
+        {
+            deps.directories.push(session.join("tool-results"));
+        }
+        if let Some(config) = r
+            .path
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "projects"))
+            .and_then(Path::parent)
+        {
+            deps.directories.push(config.join("tasks").join(&r.id));
+        }
+        Some(())
     }
 
     fn roots(&self) -> Vec<PathBuf> {

@@ -1,8 +1,8 @@
 # Cross-harness conversion
 
 Every agent harness stores its sessions a little differently — Claude Code threads JSONL
-by `parentUuid`, Codex writes dated `rollout-*.jsonl` files, OpenCode shards messages and
-parts across directories, Cline buries the working directory inside the first user message.
+by `parentUuid`, Codex writes dated `rollout-*.jsonl` files, OpenCode keeps messages in SQLite (older stores shard messages and
+parts across directories), Cline buries the working directory inside the first user message.
 clustervision's trick is that it never converts harness-A-format *directly* into
 harness-B-format. Instead, **every harness parses _into_ one unified IR**, and conversion
 is just:
@@ -38,7 +38,7 @@ These are the harnesses `emit()` can currently write — the authoritative list 
 | Claude Code | `claude` | threaded JSONL under an encoded project dir |
 | Codex | `codex` | dated `rollout-*.jsonl` |
 | Grok | `grok` | `summary.json` + `chat_history.jsonl` |
-| OpenCode | `opencode` | sharded session / message / part files |
+| OpenCode | `opencode` | SQLite `opencode.db`: fresh stores use 2.x rows; existing 1.x database layouts are preserved |
 | OpenClaw | `openclaw` | parent-linked `agents/<id>/sessions/*.jsonl` |
 | Gemini CLI | `gemini` | legacy `ConversationRecord` JSON |
 | Hermes | `hermes` | SQLite `state.db` *(requires the `sqlite` build feature)* |
@@ -195,7 +195,7 @@ a parsed session, see [the OpenSession standard](#the-opensession-standard) belo
 
 ## The OpenSession standard
 
-After reverse-engineering seventeen different transcript formats, one thing was obvious: they're all
+After reverse-engineering twenty-one different transcript formats, one thing was obvious: they're all
 *almost the same thing* underneath. **OpenSession** is the format they should have agreed on — a
 small, honest, harness-neutral interchange format, written down as a proposal for harness authors.
 clustervision's internal [IR](architecture.md#the-unified-ir) is its reference implementation: the

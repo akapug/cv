@@ -331,6 +331,19 @@ pub trait Adapter: Send + Sync {
         r.path.clone()
     }
 
+    /// The session-local inputs a read of `r` consults besides its primary: side files (recorded
+    /// even when absent) and directories (each enumerated one level). Consumers stat them before
+    /// and after a read; a change rereads. `probe` answers stat-only questions once per operation.
+    /// `None` when they cannot be determined, which no consumer then certifies. Default: none.
+    fn dependencies(
+        &self,
+        _r: &SessionRef,
+        _probe: &mut crate::source::Probe,
+        _deps: &mut crate::source::Dependencies,
+    ) -> Option<()> {
+        Some(())
+    }
+
     /// Continue a [`stream`](Adapter::stream) of `r` from `from`, a checkpoint an earlier stream of
     /// the same file (then shorter) took: read from `from.offset` on with the adapter state it
     /// kept, so `sink` sees exactly the messages the whole stream would deliver after that point,

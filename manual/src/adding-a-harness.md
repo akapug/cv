@@ -1,9 +1,13 @@
 # Adding a harness
 
 Got a coding agent we don't support yet? An adapter is three things — where the harness keeps its
-sessions, how to list them cheaply, and how to read one as a stream of messages — and usually
-150–400 lines. [Grok's](https://github.com/emberian/clustervision/blob/main/crates/cv-core/src/harness/grok.rs)
-is the model to copy. The steps:
+sessions, how to list them cheaply, and how to read one as a stream of messages. Its size is the
+store description (60–150 lines, plus about 25 per SQL table), the format's genuine quirks (0–400),
+the codec (none when the store writes the Anthropic or OpenAI content shape, which the shared wire
+codecs read; 500–1,000 for a record grammar of its own), a few dozen lines of glue, and an emitter
+if it is a port target (150–450). [Grok's](https://github.com/emberian/cv/blob/main/crates/cv-core/src/harness/grok.rs),
+1,068 lines with its emitter, is the model to copy; Roo, 132 lines over Cline, is the smallest.
+The steps:
 
 1. **Name it.** One line in the `harnesses!` list in `crates/cv-core/src/ir.rs`
    (`Yours => "yours",`) gives the `Harness` variant, its canonical spelling on every door, and
@@ -17,7 +21,7 @@ is the model to copy. The steps:
    impl Yours {
        /// Resolve the store from `$HOME` / the env (existing paths only).
        pub fn detect() -> Self {
-           Yours { root: dirs::home_dir().map(|h| h.join(".yours/sessions")).filter(|p| p.exists()) }
+           Yours { root: crate::env::home_dir().map(|h| h.join(".yours/sessions")).filter(|p| p.exists()) }
        }
    }
 
@@ -26,7 +30,7 @@ is the model to copy. The steps:
        fn roots(&self) -> Vec<PathBuf> { self.root.clone().into_iter().collect() }
        fn discover(&self) -> Result<Vec<SessionRef>> { /* walk the root, `scan` each file */ }
        fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
-           /* `for_each_json_line` over the file, `match record_type`, sink each Message */
+           /* `store::jsonl::for_each_line` over the file, one `record(view, demand)`, sink each Message */
        }
    }
    ```
@@ -37,10 +41,13 @@ is the model to copy. The steps:
      cheap to know filled in by struct update (`SessionRef { cwd, title, message_count,
      ..SessionRef::new(id, h, path) }`). `message_count` is user + assistant turns only.
    - **`stream`**: read records one at a time and hand each `Message` to the sink, so a 1 GB
-     transcript costs one record of memory. Start the session with `Session::new(id, h)`; use
-     `harness::for_each_json_line` (a corrupt line never fails a session) and
-     `note_skipped_lines` (and the skip is never silent). A store that can only be read whole
-     parses it and calls `stream::replay`.
+     transcript costs one record of memory. Start the session with `Session::new(id, h)`; read
+     lines with `store::jsonl::for_each_line` (each line validated once into a `JsonView`; a
+     corrupt line never fails a session) and count the skips with `note_skipped_lines` (the skip
+     is never silent). One `record(view, demand)` function decodes every record kind, resolving
+     only what the demand asks for ([`docs/design/CODEC.md`](https://github.com/emberian/cv/blob/main/docs/design/CODEC.md));
+     a SQLite store reads its cells through `store::sqlite::Cells`. A store that can only be read
+     whole parses it and calls `stream::replay`.
    - There is no `parse`: `adapter.parse(&r)` is `stream::collect` over your `stream`, so the
      whole-session and streaming readers cannot diverge.
 
@@ -53,13 +60,13 @@ is the model to copy. The steps:
    the mapping. `wire::coerce_text` / `text_parts` flatten a string-or-parts field. A SQLite store
    opens through `store::sqlite::open_ro` (read-only, never a lock on a live database) and probes
    its schema with `columns` / `table_exists`; an XDG store finds itself with `store::xdg_data_dir`.
-4. **Register it** in `harness::all()` (`harness/mod.rs`).
+4. **Register it**: one arm in `harness::for_harness` and one entry in `ORDER` (`harness/mod.rs`).
 5. **Add `formats/yours.toml`** (below).
 6. *(Optional)* **Make it a port target**: `harness/yours/emit.rs` with
    `pub fn emit(&Session, &Path, &EmitOptions) -> Result<EmitResult>` — the codec run backwards
    (`anthropic::assistant_blocks`, …) plus a store writer — re-exported as `yours::emit` and
-   added to `emitter_for` in `emit.rs`. That one arm is the whole registration: the `--to` list
-   and `round_trip_all_supported_targets` are derived from it, so the round trip runs the moment
+   added to `emitter_for` in `emit.rs`. That one arm is the whole registration: `supported_targets()`, the
+   `--harness` target list and `round_trip_all_supported_targets` are derived from it, so the round trip runs the moment
    the arm exists. Tell `target_holds` in `emit/fidelity.rs` what your store can carry, so `port --strict`
    knows an expected loss from an unexpected one.
 

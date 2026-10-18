@@ -244,13 +244,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_prompt_cutoffs_match_owned_and_early_stop_keeps_identity_checks() -> Result<()> {
+    fn source_prompt_cutoffs_and_early_stop_keep_identity_checks() -> Result<()> {
         let world = crate::test_world("cline-prompt-cutoffs");
         let path = world.base.join("prompt.json");
         for chars in [79, 80, 81, 82] {
             for padding in [0, 65_530, 65_536] {
                 // Leading whitespace places the title across decoder windows without
-                // changing the owned codec's trimmed first line.
+                // changing the trimmed first line.
                 let text = format!("{}{}  \nignored", " ".repeat(padding), "é".repeat(chars));
                 for wire in [
                     serde_json::to_string(&text)?,
@@ -260,10 +260,11 @@ mod tests {
                     let source = crate::json::JsonSource::capture(&path)?;
                     let summary =
                         source.read_document(|view| summarize(|feed| view.for_each_str_chunk(feed).map(|_| ())))?;
-                    assert_eq!(
-                        summary.title,
-                        crate::harness::cline::clean_user_title(&text).map(|s| crate::ir::truncate(&s, 80))
-                    );
+                    let title = match chars {
+                        ..=80 => "é".repeat(chars),
+                        _ => "é".repeat(79) + "…",
+                    };
+                    assert_eq!(summary.title, Some(title));
                 }
             }
         }
@@ -292,21 +293,43 @@ mod tests {
     }
 
     #[test]
-    fn bounded_prompt_scan_matches_the_owned_metadata_codec_at_every_split() {
+    fn bounded_prompt_scan_is_the_same_at_every_split() {
+        // (text, title, cwd), frozen from the retired owned metadata codec.
+        let late = "x".repeat(100) + "  \n<task>late title</task>";
+        let wide = "x".to_string() + &" ".repeat(200) + "end";
+        let wide_title = "x".to_string() + &" ".repeat(78) + "…";
         let cases = [
-            "plain\nsecond".to_string(),
-            "雪  \r\n# Current Working Directory (/a b) Files".to_string(),
-            "before\n<task>  \nexplicit é  \nsecond</task>after".to_string(),
-            "pre<environment_details>hidden\nmore</environment_details>suffix".to_string(),
-            "</environment_details>before<environment_details>hidden".to_string(),
-            "<task>  </task>\nplain".to_string(),
-            "# Current Working Directory missing\n# Current Working Directory (/late)".to_string(),
-            "# Current Working Directory (  )\n# Current Working Directory (/later)".to_string(),
-            "<task>".to_string(),
-            "x".repeat(100) + "  \n<task>late title</task>",
-            "x".to_string() + &" ".repeat(200) + "end",
+            ("plain\nsecond", "plain", None),
+            (
+                "<task>do x</task>\n<environment_details>\n# Current Working Directory (/Users/me/proj) Files\na.rs\n</environment_details>",
+                "do x",
+                Some("/Users/me/proj"),
+            ),
+            ("Just do the thing\n<environment_details>noise</environment_details>", "Just do the thing", None),
+            ("雪  \r\n# Current Working Directory (/a b) Files", "雪", Some("/a b")),
+            ("before\n<task>  \nexplicit é  \nsecond</task>after", "explicit é", None),
+            ("pre<environment_details>hidden\nmore</environment_details>suffix", "presuffix", None),
+            (
+                "</environment_details>before<environment_details>hidden",
+                "</environment_details>before<environment_details>hidden",
+                None,
+            ),
+            ("<task>  </task>\nplain", "<task>  </task>", None),
+            (
+                "# Current Working Directory missing\n# Current Working Directory (/late)",
+                "# Current Working Directory missing",
+                None,
+            ),
+            (
+                "# Current Working Directory (  )\n# Current Working Directory (/later)",
+                "# Current Working Directory (  )",
+                Some("/later"),
+            ),
+            ("<task>", "<task>", None),
+            (late.as_str(), "late title", None),
+            (wide.as_str(), wide_title.as_str(), None),
         ];
-        for text in cases {
+        for (text, title, cwd) in cases {
             for at in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
                 let result = summarize(|feed| {
                     feed(&text[..at])?;
@@ -314,14 +337,10 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+                assert_eq!(result.title.as_deref(), Some(title), "at {at}: {text:?}");
                 assert_eq!(
-                    result.title,
-                    crate::harness::cline::clean_user_title(&text).map(|s| crate::ir::truncate(&s, 80)),
-                    "at {at}: {text:?}"
-                );
-                assert_eq!(
-                    result.cwd,
-                    crate::harness::cline::extract_cwd(&text),
+                    result.cwd.as_deref(),
+                    cwd.map(std::path::Path::new),
                     "at {at}: {text:?}"
                 );
                 assert_eq!(result.task, text.contains("<task>"));
@@ -332,12 +351,20 @@ mod tests {
     #[test]
     fn second_pass_stops_only_after_late_title_and_path_are_settled() -> Result<()> {
         let padding = "x".repeat(8192);
-        for text in [
-            format!("plain\n{padding}"),
-            format!("plain\n{padding}\n# Current Working Directory (/late-path) Files"),
-            format!("plain\n{padding}<task>late title</task>"),
-            format!("<environment_details>{padding}</environment_details>after"),
-            format!("<task> \n </task>\nplain\n{padding}"),
+        for (text, title, cwd) in [
+            (format!("plain\n{padding}"), "plain", None),
+            (
+                format!("plain\n{padding}\n# Current Working Directory (/late-path) Files"),
+                "plain",
+                Some("/late-path"),
+            ),
+            (format!("plain\n{padding}<task>late title</task>"), "late title", None),
+            (
+                format!("<environment_details>{padding}</environment_details>after"),
+                "after",
+                None,
+            ),
+            (format!("<task> \n </task>\nplain\n{padding}"), "<task>", None),
         ] {
             let mut visits = 0;
             let mut bytes = [0usize; 2];
@@ -353,11 +380,8 @@ mod tests {
                 Ok(())
             })?;
             assert_eq!(bytes[0], text.len());
-            assert_eq!(
-                result.title,
-                crate::harness::cline::clean_user_title(&text).map(|s| crate::ir::truncate(&s, 80))
-            );
-            assert_eq!(result.cwd, crate::harness::cline::extract_cwd(&text));
+            assert_eq!(result.title.as_deref(), Some(title));
+            assert_eq!(result.cwd.as_deref(), cwd.map(std::path::Path::new));
             if text == format!("plain\n{padding}") {
                 assert_eq!(bytes[1], 64);
             }

@@ -74,7 +74,8 @@ cv watch --cwd clustervision       # only sessions whose cwd contains this subst
 
 `cv watch` is the resident counterpart to `sync` (`cv scry` is the same live feed printed, without the archive). On its first poll it archives whatever already
 exists (so it's self-sufficient — no need to `sync` first), then it follows live activity and
-re-archives each session as it changes. It runs until you kill it.
+re-archives each session as it changes. It runs until you kill it, and like every daemon prints
+its ready line (the line below) to stderr within a second, before its first poll.
 
 Every time it archives a changed session it logs the delta to stderr:
 
@@ -100,8 +101,9 @@ read API [the app](viewing-and-sharing.md)'s dashboard polls (and the desktop ap
 [task inbox](tasks.md) page with the routes its buttons use, and with `--web` hosts the dashboard. It binds
 `127.0.0.1:7777` by default and runs until killed.
 
-`--port 0` binds an **ephemeral port**, and the startup banner always carries the *real* bound
-port — so a script or test harness can parse the address instead of racing to guess a free one:
+`--port 0` binds an **ephemeral port**, and the startup banner — printed to stderr within a second
+of starting, before any request is served — always carries the *real* bound port, so a script or
+test harness can parse the address instead of racing to guess a free one:
 
 ```text
 cv serve on http://127.0.0.1:54573 — inbox at /, API at /api/* (no --web)
@@ -176,19 +178,23 @@ curl 'http://127.0.0.1:7777/api/sessions?harness=claude&limit=2'
   {
     "id": "a1b2c3d4-5e6f-7890-abcd-ef0123456789",
     "harness": "claude",
+    "path": "/Users/you/.claude/projects/-Users-you-code-clustervision/a1b2c3d4-5e6f-7890-abcd-ef0123456789.jsonl",
+    "size_bytes": 412998,
     "cwd": "/Users/you/code/clustervision",
     "title": "wire up the fleet dashboard",
-    "updated_at": "2026-05-30T18:42:10Z",
-    "created_at": "2026-05-30T17:05:01Z",
+    "updated_at": "2026-05-30T18:42:10+00:00",
+    "created_at": "2026-05-30T17:05:01+00:00",
     "message_count": 87
   },
   {
     "id": "9f8e7d6c-1234-5678-9abc-def012345678",
     "harness": "claude",
+    "path": "/Users/you/.claude/projects/-Users-you-code-other-project/9f8e7d6c-1234-5678-9abc-def0123456789.jsonl",
+    "size_bytes": 15342,
     "cwd": "/Users/you/code/other-project",
     "title": "debug the retry backoff",
-    "updated_at": "2026-05-30T16:20:44Z",
-    "created_at": "2026-05-30T15:58:12Z",
+    "updated_at": "2026-05-30T16:20:44+00:00",
+    "created_at": "2026-05-30T15:58:12+00:00",
     "message_count": 31
   }
 ]
@@ -200,7 +206,8 @@ Full-text (or `semantic=1`) search over the whole corpus, as the array of rows `
 emits: the session row plus `score`, `snippet` and the sub-agent provenance trio. Params: `q`
 (required, non-empty), `limit`, `harness`, `cwd`, `kind` (`exchange`, `context` or `all`, as `cv search --kind`), `semantic=1`, `scan=1`. With no usable index it is
 a `503` naming the cause and the fix, as `cv search` errors; `scan=1` asks for the same head-capped
-live scan `cv search --scan` runs. The response header `X-Cv-Search-Source` is `index` | `semantic`
+live scan `cv search --scan` runs. Both semantic and live searches cover only the exchange;
+`kind=context` or `kind=all` with either mode returns 400. The response header `X-Cv-Search-Source` is `index` | `semantic`
 | `live`, with a human sentence in `X-Cv-Search-Note` whenever the answer may be partial (a stale
 index, a live scan, a truncation).
 
@@ -338,8 +345,10 @@ records the same event the CLI would, stamped `web:<who>` (`who` from the body, 
   `cv task events`.
 - **`GET /api/lanes?session=<id>`** — a session's sub-agent forest joined to the tasks each lane
   holds (`cv lanes --tasks`).
-- **`GET /api/backlog?repo=&state=&tag=&all=1`** — every open task, newest activity first.
-- **`POST /api/task/{id}/{resolve,done,note,discuss,claim,release,reopen}`** — `{choice}` |
+- **`GET /api/tasks?detail=1&repo=&state=&tag=&all=1`** — every task with the backlog columns
+  (owner, blockers, age), newest activity first; the inbox page's Backlog pane reads it.
+  `GET /api/backlog` is gone (410 with this pointer).
+- **`POST /api/task/{id}/{resolve,done,note,discuss,claim,release}`** — `{choice}` |
   `{accept_default: true}` | `{confirm: true}` for `resolve` (with an optional `note`),
   `{observed}` for `done`, `{text}` for `note`/`discuss`.
 

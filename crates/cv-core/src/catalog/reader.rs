@@ -49,18 +49,18 @@ impl Reader {
     pub(crate) fn counts_with_probe(
         &self,
         r: &SessionRef,
-        source: &crate::source::Snapshot,
+        source: &crate::source::Baseline,
         probe: &mut crate::source::Probe,
     ) -> Option<crate::affordance::Counts> {
         #[cfg(feature = "sqlite")]
         {
             #[cfg(test)]
             self.counts_lookups.set(self.counts_lookups.get() + 1);
-            let (a, b, counts, mtime, size, stamp) = {
+            let (counts, record) = {
                 let conn = self.conn.lock().ok()?;
                 let mut stmt = conn
                     .prepare_cached(
-                        "SELECT a.sig_a,a.sig_b,a.counts,d.mtime,d.size,d.stamp
+                        "SELECT a.counts,d.record
                      FROM affordance_counts AS a JOIN source_dependencies AS d
                      ON d.consumer='counts' AND d.harness=a.harness AND d.id=a.id AND d.path=a.path
                      WHERE a.harness=?1 AND a.id=?2 AND a.path=?3",
@@ -69,14 +69,7 @@ impl Reader {
                 stmt.query_row(
                     rusqlite::params![r.harness.as_str(), r.id, r.path.to_string_lossy()],
                     |row| {
-                        let record = (
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, String>(5)?,
-                        );
+                        let record = (row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?);
                         #[cfg(test)]
                         self.counts_rows.set(self.counts_rows.get() + 1);
                         Ok(record)
@@ -84,12 +77,10 @@ impl Reader {
                 )
                 .ok()?
             }; // Reset the SQL statement before filesystem provenance checks or body reads.
-            if (a, b) != source.primary
-                || a == 0
-                || !crate::source::fresh_record((mtime, size), stamp, source.primary, &source.dependencies, probe)
-            {
-                return None;
-            }
+            crate::source::Published::decode(&record)?
+                .of(counts.as_bytes())?
+                .fresh(source, probe)
+                .then_some(())?;
             super::imp::counts_of(&counts)
         }
         #[cfg(not(feature = "sqlite"))]
@@ -192,7 +183,7 @@ impl Reader {
         &mut self,
         h: Harness,
         refs: &[SessionRef],
-        watches: &[(std::path::PathBuf, i64)],
+        watches: &[(std::path::PathBuf, super::Watched)],
         before: &super::PrimaryReads,
     ) {
         #[cfg(feature = "sqlite")]

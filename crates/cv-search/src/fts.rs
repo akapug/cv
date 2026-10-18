@@ -389,7 +389,7 @@ const CHUNK_BYTES: usize = if cfg!(all(test, not(feature = "probe-heap"))) {
 ///
 /// **Event ride-along:** the same single adapter pass also feeds the event catalog
 /// ([`cv_core::events`] — file edits/reads, commands, errors → `cv events` / `cv touched`) via a
-/// [`cv_core::TeeSink`]. Events keep their own `(mtime, size)` skip-table (`event_sync`), so an FTS-only
+/// [`cv_core::TeeSink`]. Events keep their own published baselines, so an FTS-only
 /// `--rebuild` doesn't force an event re-ingest and a tantivy-fresh session whose events are
 /// missing gets an events-only catch-up pass; when both are stale the session is read exactly once.
 /// Failed parses or event publications keep successful independent work, clear unsafe resume
@@ -461,7 +461,7 @@ fn sweep_decoded(dir: &Path, rebuild: bool, decoded: cv_core::handoff::Receiver)
     }
     let mut state = PlanState::load(&index, &f, dir, rebuild)?;
     let consumer = state.consumer.clone();
-    let ran = run_fed(&mut writer, &f, &consumer, available_workers(), move |feed| {
+    let mut ran = run_fed(&mut writer, &f, &consumer, available_workers(), move |feed| {
         let top = cv_core::events::Provenance::default();
         let mut ids = HashSet::new();
         let mut next = Some(first);
@@ -487,7 +487,7 @@ fn sweep_decoded(dir: &Path, rebuild: bool, decoded: cv_core::handoff::Receiver)
     })?;
     writer.commit().context("committing index")?;
     cv_core::resume::update(&ran.marks);
-    cv_core::source::update(&consumer, &ran.dependencies);
+    publish_dependencies(&mut ran, &consumer);
     Ok(Some(ran))
 }
 
@@ -536,7 +536,7 @@ fn report(swept: Swept, rebuild: bool, strict: bool) -> Result<Indexed> {
     let unread = swept.unreadable.len();
     anyhow::ensure!(
         swept.errors == unread,
-        "index incomplete: {} session(s) failed: {}; retry cv index",
+        "index incomplete: {} publication(s) failed: {}; retry cv index",
         swept.errors - unread,
         swept.first_error.as_deref().unwrap_or("unknown error")
     );
@@ -578,9 +578,10 @@ pub(crate) struct Swept {
     pub changed: usize,
     /// Requested logical sessions whose FTS documents were already fresh.
     pub unchanged: usize,
-    /// Sessions whose parse or event publication failed (successful independent work is kept).
+    /// Parses and event or search baseline publications that failed (successful independent
+    /// work is kept).
     pub errors: usize,
-    /// The first event publication failure.
+    /// The first publication failure.
     first_error: Option<String>,
     /// Sessions that could not be read, of [`Self::errors`].
     pub unreadable: Vec<Unreadable>,
@@ -673,7 +674,7 @@ struct Job {
     /// Only growth relative to the indexed source can be an append. Equal-size timestamp changes
     /// and truncations require a whole pass, even if a sampled mark still matches.
     grew: bool,
-    source: cv_core::source::Snapshot,
+    source: cv_core::source::Baseline,
     dependencies_fresh: bool,
     prov: cv_core::events::Provenance,
     /// Where the last pass over this file left off, if it left a mark.
@@ -822,7 +823,7 @@ fn preferred_index_copies(refs: Vec<cv_core::SessionRef>) -> Vec<cv_core::Sessio
 /// **Resumption:** a claude or plain-`.jsonl` codex transcript that has grown since the last pass
 /// is read only from that pass's last [`cv_core::stream::Checkpoint`] (its mark, one per file in
 /// the catalog, taken every [`CHECKPOINT_EVERY`] bytes) when the mark's sampled guards match
-/// ([`cv_core::resume::MarkHead::holds`]) and covers everything this pass feeds: the docs from the
+/// ([`cv_core::resume::MarkHead::admit`]) and covers everything this pass feeds: the docs from the
 /// mark's message on are replaced, the events from there on, and the counts continue from the
 /// mark's. This relies on the adapter's immutable-prefix append contract, not a proof of the
 /// whole prefix's contents. Otherwise the session is read whole. New marks are stored only after the commit that
@@ -877,7 +878,7 @@ fn sweep_refs(dir: &Path, refs: &[cv_core::SessionRef], rebuild: bool, subagents
         missing,
         consumer,
     } = plan;
-    let ran = run_jobs(&mut writer, &f, jobs, &consumer)?;
+    let mut ran = run_jobs(&mut writer, &f, jobs, &consumer)?;
 
     // Reap sessions that disappeared from disk since the last index (incremental only). A plain
     // refresh never reaps the folded sub-agent forest — see [`missing_ids`].
@@ -891,7 +892,7 @@ fn sweep_refs(dir: &Path, refs: &[cv_core::SessionRef], rebuild: bool, subagents
     };
     writer.commit().context("committing index")?;
     cv_core::resume::update(&ran.marks);
-    cv_core::source::update(&consumer, &ran.dependencies);
+    publish_dependencies(&mut ran, &consumer);
     compact(dir, &index, &mut writer)?;
     Ok(Swept {
         total,
@@ -992,6 +993,11 @@ impl SweepPlanner<'_> {
     }
 }
 
+/// The `(mtime_ns, size)` a doc is stamped with for `primary`; `(0, 0)`, never fresh, when absent.
+fn sig(primary: Option<cv_core::source::FileId>) -> (i64, i64) {
+    primary.map_or((0, 0), |id| (id.mtime_ns as i64, id.len as i64))
+}
+
 /// What planning compares each candidate with: the index's docs and the catalog's tables, read
 /// once per plan.
 struct PlanState {
@@ -1049,16 +1055,18 @@ impl PlanState {
             ..
         } = self;
         let source = probe.snapshot(r);
-        let (mtime, size) = source.primary;
-        let dependencies_fresh = dependencies.auxiliary_fresh_with_probe(
-            r,
-            existing.get(&r.id).copied().unwrap_or(source.primary),
-            &source.dependencies,
-            probe,
-        );
-        let fts_fresh = fts_is_fresh(r, existing.get(&r.id), mtime, size, || {
-            dependencies_fresh && dependencies.primary_fresh(r, &source.dependencies)
-        }) && metadata.get(&r.id) == Some(&DiscoveryMetadata::new(r, prov));
+        let (mtime, size) = sig(source.primary);
+        // Auxiliary inputs are judged across primary growth, against the tuple the docs were
+        // indexed at; the adapter's checkpoint then decides whether the growth resumes.
+        let baseline = dependencies.get(r);
+        let indexed = existing.get(&r.id).copied().unwrap_or((mtime, size));
+        let dependencies_fresh =
+            baseline.is_some_and(|old| sig(old.primary) == indexed && old.dependencies_fresh(&source, probe));
+        // The docs' stamp is the current tuple, then the captured source authority holds.
+        let fts_fresh = mtime != 0
+            && existing.get(&r.id) == Some(&(mtime, size))
+            && dependencies.fresh(r, &source, b"", probe)
+            && metadata.get(&r.id) == Some(&DiscoveryMetadata::new(r, prov));
         let events = event_sync.needs_ingest(r, &source, prov, probe);
         // Unchanged on every axis → skip entirely (no re-parse beyond the metadata scan).
         if fts_fresh
@@ -1206,7 +1214,7 @@ fn body_hash(mut hash: u64, bytes: &[u8]) -> u64 {
 struct Ran {
     #[cfg(test)]
     work: SweepWork,
-    /// Event publications that failed: the catalog could not be written.
+    /// Event and search baseline publications that failed: the catalog could not be written.
     errors: usize,
     first_error: Option<String>,
     /// Sessions whose read failed: each stays out of the index until a later pass reads it.
@@ -1220,6 +1228,18 @@ struct Ran {
     dependencies: Vec<cv_core::source::Update>,
     #[cfg(all(test, feature = "probe-heap"))]
     bodies: HashMap<String, BodySummary>,
+}
+
+/// Publish the committed docs' baselines; a row that fails is an error of the pass (its session
+/// is read again next pass) and the rest stick.
+fn publish_dependencies(ran: &mut Ran, consumer: &str) {
+    for (r, why) in cv_core::source::update(consumer, &std::mem::take(&mut ran.dependencies)) {
+        let message = format!("search baseline publication failed for {} ({}): {why}", r.id, r.harness);
+        eprintln!("cv-search: {message}");
+        ran.errors += 1;
+        ran.first_error
+            .get_or_insert_with(|| cv_core::ir::truncate(&message, 512));
+    }
 }
 
 fn available_workers() -> usize {
@@ -1486,7 +1506,7 @@ fn run_fed(
                 if open.is_empty() {
                     writer.commit().context("interim commit")?;
                     cv_core::resume::update(&std::mem::take(&mut ran.marks));
-                    cv_core::source::update(consumer, &std::mem::take(&mut ran.dependencies));
+                    publish_dependencies(&mut ran, consumer);
                     since_commit = 0;
                     let mut q = queue.lock().unwrap();
                     q.draining = false;
@@ -1622,10 +1642,8 @@ fn resumable_from(job: &Job, version: &str) -> Option<cv_core::stream::Checkpoin
         return None;
     }
     let head = job.mark.as_ref()?;
-    if !head.holds(&cv_core::source::primary_path(&job.r), job.size.max(0) as u64, version) {
-        return None;
-    }
     let cp = cv_core::resume::state(&job.r, head)?;
+    head.admit(&cv_core::source::primary_path(&job.r), version, &cp)?;
     cp.messages()?;
     if job.fts {
         let state: FtsState = cp.get(FTS_LAYER)?;
@@ -1872,7 +1890,7 @@ fn index_session(
 ///
 /// A large session flushes chunk docs into the writer *while* streaming, so a mid-stream parse
 /// error would otherwise leave a truncated head behind — and since every chunk doc is stamped with
-/// the full current `(mtime, size)`, [`fts_is_fresh`] would then skip the session forever, freezing
+/// the full current `(mtime, size)`, the skip-set would then skip the session forever, freezing
 /// the truncation in. Deleting by the shared id term on the error path removes those partial docs
 /// (tantivy applies operations in opstamp order, so this cannot touch docs added by a later pass);
 /// the id drops out of the skip-set entirely and is retried on the next run.
@@ -2504,20 +2522,6 @@ impl cv_core::MessageSink for ChunkSink<'_> {
     }
 }
 
-/// Whether an indexed session is FTS-fresh given its stored `(mtime, size)` and the current file
-/// signature. Both must match, including for append logs: a same-size edit is still a change.
-/// A real empty file requires fresh captured source authority. Unreadable `(0, 0)` tuples
-/// and missing/legacy guards still miss. Pre-`size` indexes rebuild in [`open_or_create`].
-fn fts_is_fresh(
-    _r: &cv_core::SessionRef,
-    stored: Option<&(i64, i64)>,
-    mtime: i64,
-    size: i64,
-    source_fresh: impl FnOnce() -> bool,
-) -> bool {
-    stored.is_some_and(|&stored| cv_core::offsets::sig_is_fresh_with_source(stored, (mtime, size), source_fresh))
-}
-
 /// `id → (mtime, size)` for every live doc (the incremental skip-set), plus the set of ids that
 /// are folded-in sub-agent docs (those tagged with a `parent_id`), which a plain refresh's reap
 /// must leave alone.
@@ -2745,12 +2749,9 @@ fn staleness_over(dir: &Path, refs: &[cv_core::SessionRef]) -> Option<Staleness>
     let mut stale_sessions = 0usize;
     let mut newest_on_disk = 0i64;
     for r in refs {
-        let cur = cv_core::offsets::file_sig(&cv_core::source::primary_path(r));
+        let cur = sig(cv_core::source::FileId::at(&cv_core::source::primary_path(r)));
         newest_on_disk = newest_on_disk.max(cur.0);
-        if !sigs
-            .get(&r.id)
-            .is_some_and(|&stored| cv_core::offsets::sig_is_fresh_with_source(stored, cur, || true))
-        {
+        if cur.0 == 0 || sigs.get(&r.id) != Some(&cur) {
             stale_sessions += 1;
         }
     }
@@ -2830,8 +2831,8 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
             continue;
         };
         let source = probe.snapshot(r);
-        let (mtime, size) = source.primary;
-        let mut es = catalog.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
+        let (mtime, size) = sig(source.primary);
+        let mut es = catalog.then(|| cv_core::events::SpoolingSink::new(r.cwd.clone()));
         let (_, reads) = index_session_clean(
             &mut writer,
             &f,
@@ -2844,18 +2845,15 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
         )
         .with_context(|| format!("indexing {}", r.id))?;
         if let Some(es) = es {
-            cv_core::events::record_from_with_source(
-                r,
-                0,
-                es.events(),
-                &source.with_reads(es.dependencies()),
-                &Default::default(),
-            );
+            let source = source.with_reads(es.inner().dependencies());
+            cv_core::events::record_spooled_with_source(r, 0, es.into_spool()?, &source, &Default::default())?;
         }
         dependencies.push((r.clone(), source.with_reads(&reads)));
     }
     writer.commit().context("committing index")?;
-    cv_core::source::update(&consumer, &dependencies);
+    if let Some((r, why)) = cv_core::source::update(&consumer, &dependencies).first() {
+        anyhow::bail!("publishing the search baseline of {}: {why}", r.id);
+    }
     Ok(refs.len())
 }
 
@@ -3105,6 +3103,7 @@ fn ranked_search(
             parent_id: get_str(f.parent_id),
             agent_id: get_str(f.agent_id),
             workflow: get_str(f.workflow),
+            session: None,
         });
     }
     Ok(hits)
@@ -3294,7 +3293,7 @@ mod tests {
 
     fn ingest_job(r: cv_core::SessionRef) -> Job {
         let source = cv_core::source::Probe::default().snapshot(&r);
-        let (mtime, size) = source.primary;
+        let (mtime, size) = sig(source.primary);
         Job {
             r,
             mtime,
@@ -3544,16 +3543,17 @@ mod tests {
             let catalog = rusqlite::Connection::open(w.cv_home.join("catalog.db")).unwrap();
             let source: String = catalog
                 .query_row(
-                    "SELECT source_path FROM event_sessions WHERE session_id='zqa'",
+                    "SELECT path FROM source_dependencies WHERE consumer='events' AND id='zqa'",
                     [],
                     |row| row.get(0),
                 )
                 .unwrap();
             assert_eq!(Path::new(&source), preferred);
+            let again = sweep_all(dir, false, false).unwrap().0;
             assert_eq!(
-                sweep_all(dir, false, false).unwrap().0.changed,
-                0,
-                "then nothing is stale"
+                (again.changed, again.work.callbacks),
+                (0, 0),
+                "then nothing is stale and nothing is read"
             );
         };
         let dir = tmpdir();
@@ -3933,8 +3933,8 @@ mod tests {
             &fields,
             &adapter,
             &r,
-            source.primary.0,
-            source.primary.1,
+            sig(source.primary).0,
+            sig(source.primary).1,
             Some(&mut events),
             Default::default(),
             None,
@@ -4347,6 +4347,7 @@ mod tests {
                 parent_id: get_str(f.parent_id),
                 agent_id: get_str(f.agent_id),
                 workflow: get_str(f.workflow),
+                session: None,
             });
         }
         Ok(hits)
@@ -5111,9 +5112,7 @@ mod tests {
         .unwrap();
         let marks = cv_core::resume::MarkTable::load();
         let head = marks.get(&r).unwrap();
-        let adapter = cv_core::harness::for_harness(r.harness).unwrap();
-        let version = cv_core::resume::version(adapter.as_ref(), RESUME_TAG).unwrap();
-        assert!(head.holds(&r.path, std::fs::metadata(&r.path).unwrap().len(), &version));
+        assert!(head.prefix.holds(&r.path));
         assert!(cv_core::resume::state(&r, head)
             .unwrap()
             .get::<FtsState>(FTS_LAYER)
@@ -5202,9 +5201,7 @@ mod tests {
         .unwrap();
         let marks = cv_core::resume::MarkTable::load();
         let head = marks.get(&r).unwrap();
-        let adapter = cv_core::harness::for_harness(r.harness).unwrap();
-        let version = cv_core::resume::version(adapter.as_ref(), RESUME_TAG).unwrap();
-        assert!(head.holds(&r.path, std::fs::metadata(&r.path).unwrap().len(), &version));
+        assert!(head.prefix.holds(&r.path));
         let replay = sweep(&dir, vec![r.clone()], false, false).unwrap();
         assert_eq!((replay.changed, replay.resumed, replay.errors), (1, 0, 0));
         let events = || {
@@ -5243,37 +5240,6 @@ mod tests {
         std::fs::remove_dir_all(oracle).unwrap();
     }
 
-    /// Every source requires both mtime and size to match. Unknown or empty sources are stale.
-    #[test]
-    fn fts_is_fresh_requires_mtime_and_size_for_every_source() {
-        let append_only = sref("append", "append", "/tmp/append.jsonl".into());
-        let non_append = cv_core::SessionRef {
-            id: "cline-task".into(),
-            harness: cv_core::Harness::Cline,
-            path: "/tmp/task/api_conversation_history.json".into(),
-            cwd: Some("/home/u/proj".into()),
-            title: Some("task".into()),
-            created_at: None,
-            updated_at: None,
-            message_count: 1,
-        };
-
-        assert!(fts_is_fresh(&append_only, Some(&(111, 4096)), 111, 4096, || true));
-        assert!(!fts_is_fresh(&append_only, Some(&(111, 4096)), 222, 4096, || true));
-        assert!(!fts_is_fresh(&append_only, Some(&(111, 4096)), 222, 4096, || panic!(
-            "tuple miss must not check primary identity"
-        )));
-        assert!(!fts_is_fresh(&append_only, Some(&(111, 4096)), 111, 8192, || true));
-        assert!(!fts_is_fresh(&append_only, Some(&(111, 0)), 111, 0, || false));
-        assert!(fts_is_fresh(&append_only, Some(&(111, 0)), 111, 0, || true));
-        assert!(!fts_is_fresh(&append_only, Some(&(111, 4096)), 111, 4096, || false));
-        assert!(!fts_is_fresh(&append_only, None, 111, 4096, || true));
-
-        assert!(fts_is_fresh(&non_append, Some(&(111, 4096)), 111, 4096, || true));
-        assert!(!fts_is_fresh(&non_append, Some(&(111, 4096)), 222, 4096, || true));
-        assert!(!fts_is_fresh(&non_append, Some(&(111, 4096)), 111, 8192, || true));
-    }
-
     #[test]
     fn auxiliary_directory_changes_refresh_search_events_and_counts() {
         let _home = IsolatedHome::new();
@@ -5292,7 +5258,7 @@ mod tests {
         };
         sweep(&dir, vec![r.clone()], false, false).unwrap();
         assert_eq!(sweep(&dir, vec![r.clone()], false, false).unwrap().changed, 0);
-        let primary = cv_core::offsets::file_sig(&sdir);
+        let primary = cv_core::source::FileId::at(&sdir);
         let line = serde_json::json!({"type":"assistant","content":"zqafterchild",
             "tool_calls":[{"id":"call","name":"read_file","arguments":"{\"path\":\"/repo/new.rs\"}"}]});
         use std::io::Write as _;
@@ -5302,7 +5268,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            cv_core::offsets::file_sig(&sdir),
+            cv_core::source::FileId::at(&sdir),
             primary,
             "child append leaves directory signature unchanged"
         );
@@ -5327,13 +5293,13 @@ mod tests {
         let r = sref("agent-meta", "agent", agent.to_string_lossy().into_owned());
         sweep(&dir, vec![r.clone()], false, false).unwrap();
         assert_eq!(sweep(&dir, vec![r.clone()], false, false).unwrap().changed, 0);
-        let primary = cv_core::offsets::file_sig(&agent);
+        let primary = cv_core::source::FileId::at(&agent);
         std::fs::write(
             agent.with_extension("meta.json"),
             r#"{"agentType":"reviewer","description":"new role","toolUseId":"spawn"}"#,
         )
         .unwrap();
-        assert_eq!(cv_core::offsets::file_sig(&agent), primary);
+        assert_eq!(cv_core::source::FileId::at(&agent), primary);
         assert!(cv_core::events::needs_ingest(&r));
         assert!(cv_core::catalog::AffordanceTable::load().stale(&r));
         cv_core::events::ingest_ref(&r).unwrap();
@@ -5372,10 +5338,10 @@ mod tests {
         };
         sweep(&dir, vec![r.clone()], false, false).unwrap();
         assert_eq!(sweep(&dir, vec![r.clone()], false, false).unwrap().changed, 0);
-        let primary = cv_core::offsets::file_sig(&db);
+        let primary = cv_core::source::FileId::at(&db);
         writer.execute_batch("INSERT INTO messages(session_id,role,content,timestamp) VALUES('wal-session','user','zqafterwal',1002);
             INSERT INTO messages(session_id,role,tool_calls,timestamp) VALUES('wal-session','assistant','[{\"id\":\"c\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"/repo/new.rs\\\"}\"}}]',1003);").unwrap();
-        assert_eq!(cv_core::offsets::file_sig(&db), primary, "write stayed in WAL");
+        assert_eq!(cv_core::source::FileId::at(&db), primary, "write stayed in WAL");
         assert!(cv_core::events::needs_ingest(&r));
         assert!(cv_core::catalog::AffordanceTable::load().stale(&r));
         assert_eq!(sweep(&dir, vec![r.clone()], false, false).unwrap().changed, 1);
@@ -5778,7 +5744,7 @@ mod tests {
 
     /// Regression for the truncated-fresh hole (B1): a parse error *after* chunk docs were already
     /// flushed into the writer must not leave those docs behind — they carry the full current
-    /// `(mtime, size)` stamp, so a later `fts_is_fresh` would skip the session forever and freeze
+    /// `(mtime, size)` stamp, so a later `sig_is_fresh_with_source` would skip the session forever and freeze
     /// the truncated head into the index. [`index_session_clean`] (the path both `index_all` and
     /// the sub-agent fold drive) deletes the partial docs on error, dropping the id from the
     /// skip-set so the session is retried next run.
@@ -6130,11 +6096,8 @@ mod tests {
         // Invalidate only the event catalog. Keep the independent FTS dependency baselines:
         // losing those would correctly require a whole-source FTS reread too.
         let conn = rusqlite::Connection::open(h.home.join("catalog.db")).unwrap();
-        conn.execute_batch(
-            "DELETE FROM events; DELETE FROM event_sync;
-            DELETE FROM source_dependencies WHERE consumer='events';",
-        )
-        .unwrap();
+        conn.execute_batch("DELETE FROM events; DELETE FROM source_dependencies WHERE consumer='events';")
+            .unwrap();
         assert!(cv_core::events::needs_ingest(&parent));
         let child = cv_core::subagent_tree_of(&parent).remove(0).session;
         assert!(cv_core::events::needs_ingest(&child));
@@ -6939,6 +6902,60 @@ mod tests {
         }
     }
 
+    /// One row's baseline publication failing loses that row only: the other sessions' baselines
+    /// commit, and the next pass reads the one session whose baseline is missing.
+    #[test]
+    fn one_failed_baseline_publication_rereads_only_its_session() {
+        let home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let fleet = resumable_fleet(&sdir, 3);
+        let refs: Vec<_> = fleet.iter().map(|(r, _)| r.clone()).collect();
+        write_heads(&fleet, 1, 1);
+        let cold = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!((cold.changed, cold.errors), (refs.len(), 0));
+        let consumer = source_consumer(&dir).unwrap();
+        let conn = rusqlite::Connection::open(home.home.join("catalog.db")).unwrap();
+        conn.execute("DELETE FROM source_dependencies WHERE consumer=?1", [&consumer])
+            .unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER reject_baseline BEFORE INSERT ON source_dependencies
+             WHEN NEW.consumer='{consumer}' AND NEW.id='{}' BEGIN SELECT RAISE(ABORT, 'test'); END;",
+            refs[1].id
+        ))
+        .unwrap();
+        let reread = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!(
+            (reread.changed, reread.errors),
+            (refs.len(), 1),
+            "the docs committed; one row's baseline did not"
+        );
+        let first = reread.first_error.as_deref().unwrap();
+        assert!(
+            first.contains("search baseline publication failed")
+                && first.contains(&refs[1].id)
+                && first.contains("test"),
+            "{first}"
+        );
+        assert!(
+            report(reread, false, false).is_err(),
+            "a lost publication is the pass's failure"
+        );
+        conn.execute_batch("DROP TRIGGER reject_baseline;").unwrap();
+        let retry = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!(
+            (retry.changed, retry.errors),
+            (1, 0),
+            "only the unpublished session is read again"
+        );
+        let again = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!((again.changed, again.work.callbacks), (0, 0));
+        let words = some_words(&refs);
+        assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
+        for d in [dir, sdir] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
     #[test]
     fn discovery_metadata_schema_migration_is_indexing_only() {
         let dir = tmpdir();
@@ -7131,7 +7148,7 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
-        assert!(head.holds(&path, body.len() as u64, &head.version));
+        assert!(head.prefix.holds(&path));
         let swept = sweep(&dir, vec![r.clone()], false, false).unwrap();
         assert_eq!((swept.changed, swept.resumed, swept.errors), (1, 0, 0));
         assert!(text_search(&dir, "oldneedle", 10).unwrap().is_empty());
@@ -7343,7 +7360,10 @@ mod tests {
         assert!(!replacement.exists(), "the hook replaced the transcript");
         let head = cv_core::resume::MarkTable::load().get(&r).unwrap().clone();
         let at = body("zqoldword").find("zqoldword").unwrap() as u64;
-        assert!(at > 4096 && at + 4096 < head.offset, "the edit is outside both samples");
+        assert!(
+            at > 4096 && at + 4096 < head.offset(),
+            "the edit is outside both samples"
+        );
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -7383,17 +7403,14 @@ mod tests {
         let head = cv_core::resume::MarkTable::load().get(&r).unwrap().clone();
         let at = body.find("zqoldone").unwrap() as u64;
         assert!(
-            at > 4096 && at + 4096 < head.offset,
+            at > 4096 && at + 4096 < head.offset(),
             "edit is outside both sampled ranges"
         );
         let edited = body.replace("zqoldone", "zqnewone");
         assert_eq!(body.len(), edited.len());
         std::fs::write(&path, edited).unwrap();
         bump_mtime(path.to_str().unwrap());
-        assert!(
-            head.holds(&path, body.len() as u64, &head.version),
-            "sampled mark cannot detect this edit"
-        );
+        assert!(head.prefix.holds(&path), "sampled mark cannot detect this edit");
 
         let swept = sweep(&dir, vec![r], false, false).unwrap();
         assert_eq!((swept.changed, swept.resumed), (1, 0));
@@ -7421,7 +7438,7 @@ mod tests {
         // 0: a byte before its mark changes (a letter inside the line before it), then it grows.
         let (r0, b0) = &fleet[0];
         let mut bytes = b0.clone();
-        let at = (0..head(0).offset as usize - 1)
+        let at = (0..head(0).offset() as usize - 1)
             .rev()
             .find(|&i| bytes[i].is_ascii_lowercase())
             .unwrap();
@@ -7429,7 +7446,7 @@ mod tests {
         std::fs::write(&r0.path, &bytes).unwrap();
         // 1: cut short of its mark.
         let (r1, b1) = &fleet[1];
-        std::fs::write(&r1.path, &b1[..head(1).offset as usize - 1]).unwrap();
+        std::fs::write(&r1.path, &b1[..head(1).offset() as usize - 1]).unwrap();
         // 2: grown, but its mark was written by another version.
         let (r2, b2) = &fleet[2];
         std::fs::write(&r2.path, b2).unwrap();

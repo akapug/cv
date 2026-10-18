@@ -21,6 +21,8 @@ SLACK = 0.05
 DOC_MAX_LINES = 250
 CFG_TEST = re.compile(r"#\[(cfg\((test|all\(test\b[^\]]*)\)|test)\]")  # cfg(test) items and #[test] fns
 MOD_DECL = re.compile(r"\bmod\s+(\w+)\s*;")
+RAW_STRING = re.compile(r'b?r(#*)"')
+CHAR_LITERAL = re.compile(r"'(\\.[^']*|[^\\'])'")
 PATH_ATTR = re.compile(r'#\[path\s*=\s*"([^"]+)"\]')
 
 
@@ -42,17 +44,17 @@ def code_mask(text: str) -> list[bool]:
                     depth, j = depth - 1, j + 2
                 else:
                     j += 1
-        elif (m := re.match(r'b?r(#*)"', text[i:])) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+        elif (m := RAW_STRING.match(text, i)) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
             close = '"' + m.group(1)
-            j = text.find(close, i + m.end())
+            j = text.find(close, m.end())
             j = n if j < 0 else j + len(close)
         elif c == '"' or text.startswith('b"', i) and (i == 0 or not text[i - 1].isalnum()):
             j = i + (2 if c == "b" else 1)
             while j < n and text[j] != '"':
                 j += 2 if text[j] == "\\" else 1
             j += 1
-        elif c == "'" and (m := re.match(r"'(\\.[^']*|[^\\'])'", text[i:])):
-            j = i + m.end()  # a char literal; a lifetime has no closing quote and stays code
+        elif c == "'" and (m := CHAR_LITERAL.match(text, i)):
+            j = m.end()  # a char literal; a lifetime has no closing quote and stays code
         else:
             i += 1
             continue

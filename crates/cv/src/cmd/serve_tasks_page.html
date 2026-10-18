@@ -82,7 +82,7 @@
   .tag.decision { color: var(--accent); border-color: var(--accent); }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em;
-    padding: 4px 6px; border-bottom: 1px solid var(--line); position: sticky; top: 92px; background: var(--bg); }
+    padding: 4px 6px; border-bottom: 1px solid var(--line); background: var(--bg); }
   td { padding: 4px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
   tr.sel td { background: var(--sel); }
   tr.row { cursor: pointer; }
@@ -106,7 +106,7 @@
     padding: 6px 12px; border-radius: 8px; font-size: 12.5px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 9; }
   .toast.on { opacity: .95; }
   footer { color: var(--muted); font-size: 11.5px; margin-top: 24px; text-align: center; }
-  @media (max-width: 640px) { body { padding: 0 10px; } th { top: 110px; } .tabs input.filter { width: 100%; } }
+  @media (max-width: 640px) { body { padding: 0 10px; } .tabs input.filter { width: 100%; } }
 </style>
 </head>
 <body>
@@ -195,11 +195,11 @@
     if (!response.ok || body.error) throw new Error(body.error || 'cv serve ' + response.status);
     return body;
   }
-  function loadJson(slot, url, valid) {
+  function loadJson(slot, url, valid, shape) {
     const token = S.requests[slot] = (S.requests[slot] || 0) + 1;
     return jget(url).then((body) => {
       if (!valid(body)) throw new Error('invalid ' + slot + ' response');
-      if (S.requests[slot] === token) S[slot] = body;
+      if (S.requests[slot] === token) S[slot] = shape ? shape(body) : body;
     }).catch((error) => {
       if (S.requests[slot] === token) S[slot] = { error: String(error.message || error) };
     });
@@ -216,10 +216,17 @@
     return loadJson('lanes', '/api/lanes?session=' + encodeURIComponent(S.lanesSession),
       (body) => body.counts && Array.isArray(body.lanes));
   }
+  const ageShort = (iso) => { const s = Math.max(0, Math.floor((Date.now() - new Date(iso)) / 1000)); return s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm' : s < 86400 ? Math.floor(s / 3600) + 'h' : Math.floor(s / 86400) + 'd'; };
   function loadBacklog() {
-    const q = new URLSearchParams();
+    const q = new URLSearchParams(); q.set('detail', '1');
     if (S.backlogRepo) q.set('repo', S.backlogRepo); if (S.backlogState) q.set('state', S.backlogState); if (S.backlogAll) q.set('all', '1');
-    return loadJson('backlog', '/api/backlog?' + q.toString(), (body) => Array.isArray(body.tasks));
+    // The read API lists oldest first; the backlog reads newest activity first.
+    return loadJson('backlog', '/api/tasks?' + q.toString(), (body) => Array.isArray(body.tasks), (body) => {
+      const tasks = body.tasks.map((t) => ({ id: t.id, short: t.id.slice(0, 13), title: t.title, state: t.effective_state, assignee: t.assignee, opened_by: t.opened_by, repo: t.repo, issue: t.issue, tags: t.tags || [], blocked: t.blocked, decision: t.decision, notes: t.notes, last_ts: t.last_ts, age: ageShort(t.last_ts), body: t.body }))
+        .sort((a, b) => (a.last_ts < b.last_ts ? 1 : a.last_ts > b.last_ts ? -1 : 0));
+      const repos = [...new Set(tasks.map((t) => t.repo).filter(Boolean))].sort();
+      return { count: tasks.length, repos, tasks, warnings: body.warnings };
+    });
   }
   function loadEvents() {
     const q = new URLSearchParams(); q.set('since', '48h'); if (S.eventsMine && S.who) q.set('by', S.who);
@@ -326,7 +333,6 @@
     else if (!closed) kids.push(actionBlock(i));
     if (!closed && S.discussOpen[i.id]) kids.push(inlineBox(i, 'discuss', 'what needs discussing? (⌘⏎ sends)', 'Park for discussion'));
     if (!closed && S.doneOpen[i.id]) kids.push(inlineBox(i, 'done', 'observed where? a path, url, or a word (⌘⏎ sends)', 'Mark done'));
-    if (closed) kids.push(el('div', { class: 'actions' }, [el('button', { class: 'btn quiet', text: 'Reopen as a new task', onclick: () => act(i, 'reopen', {}) })]));
     kids.push(el('div', { class: 'err', id: 'err-' + i.id }));
     if (i.notes.length) {
       const open = S.expanded['n:' + i.id];
@@ -491,7 +497,7 @@
     const chips = el('div', { class: 'chips' }, [el('button', { class: S.backlogRepo ? '' : 'on', text: 'all repos', onclick: () => { S.backlogRepo = ''; load(); } })]);
     (S.backlog.repos || []).forEach((r) => chips.appendChild(el('button', { class: S.backlogRepo === r ? 'on' : '', text: base(r), title: r, onclick: () => { S.backlogRepo = S.backlogRepo === r ? '' : r; load(); } })));
     chips.appendChild(el('span', { text: ' · ' }));
-    ['open', 'claimed', 'ready', 'landed'].forEach((st) => chips.appendChild(el('button', { class: S.backlogState === st ? 'on' : '', text: st, onclick: () => { S.backlogState = S.backlogState === st ? '' : st; load(); } })));
+    ['open', 'claimed', 'resolved', 'done'].forEach((st) => chips.appendChild(el('button', { class: S.backlogState === st ? 'on' : '', text: st, onclick: () => { S.backlogState = S.backlogState === st ? '' : st; load(); } })));
     chips.appendChild(el('button', { class: S.backlogAll ? 'on' : '', text: 'incl. closed', onclick: () => { S.backlogAll = !S.backlogAll; load(); } }));
     chips.appendChild(el('span', { class: 'counter', text: ' ' + tasks.length + ' of ' + S.backlog.count }));
     main.appendChild(chips);

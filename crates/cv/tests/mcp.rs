@@ -793,3 +793,63 @@ fn cancellation_targets_one_typed_request_and_preserves_connection() {
         .unwrap()
         .contains("MCP request cancelled"));
 }
+
+#[test]
+fn windowed_show_matches_cli_bytes_and_http_message_frames() {
+    let mut server = Server::spawn("window-doors");
+    let scope = (*cv_core::env::Env::current()).clone().enter();
+    for key in cv_testkit::CLEARED_ENV {
+        scope.remove(key);
+    }
+    for (key, value) in server.world.env() {
+        scope.set(key, value);
+    }
+    for (flag, value, args, query) in [
+        ("first", json!(0), vec!["--first", "0"], "start=0&end=0&extra=1"),
+        ("first", json!(1), vec!["--first", "1"], "start=0&end=1&extra=1"),
+        ("last", json!(1), vec!["--last", "1"], "start=1&end=2&extra=1"),
+        ("last", json!(0), vec!["--last", "0"], "start=2&end=2&extra=1"),
+        ("last", json!(100), vec!["--last", "100"], "start=0&end=2&extra=1"),
+        ("range", json!("1.."), vec!["--range", "1.."], "start=1&extra=1"),
+        ("range", json!("..1"), vec!["--range", "..1"], "start=0&end=1&extra=1"),
+        ("max_bytes", json!(0), vec!["--max-bytes", "0"], "start=0&end=1&extra=1"),
+        ("range", json!("1..2"), vec!["--range", "1..2"], "start=1&end=2&extra=1"),
+        (
+            "range",
+            json!("9..10"),
+            vec!["--range", "9..10"],
+            "start=9&end=10&extra=1",
+        ),
+        (
+            "around",
+            json!(0),
+            vec!["--around", "0", "--context", "0"],
+            "start=0&end=1&extra=1",
+        ),
+    ] {
+        let mut cli = vec!["show", "alphasess", "--json"];
+        cli.extend(args);
+        let (expected, _) = server.world.cv_ok(&cli);
+        let mut arguments = json!({"id":"alphasess"});
+        if flag == "around" {
+            arguments["context"] = json!(0);
+        }
+        arguments[flag] = value;
+        let (actual, error) = server.call_tool(100, "show", arguments);
+        assert!(!error, "{actual}");
+        assert_eq!(actual.as_bytes(), expected.as_bytes(), "{cli:?}");
+        let session: Value = serde_json::from_str(&expected).unwrap();
+        let staged = cv_core::api::route_staged(&["api", "session", "claude", "alphasess", "messages"], query)
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.status, 200);
+        let mut body = Vec::new();
+        staged.body.copy_to(&mut body).unwrap();
+        let http: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&session["messages"]).unwrap(),
+            serde_json::to_vec(&http["messages"]).unwrap(),
+            "{query}"
+        );
+    }
+}

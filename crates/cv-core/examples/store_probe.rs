@@ -305,8 +305,13 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
                 let mut sink = cv_core::events::EventSink::new(r.cwd.clone());
                 adapter.try_stream(r, &opts, &mut cv_core::TeeSink::new(&mut count, &mut sink))?;
                 let source = source.with_reads(sink.dependencies());
+                // The retained control: every event collected before one ordered publication.
                 let events = sink.into_events()?;
-                cv_core::events::record_from_with_source(r, 0, &events, &source, &Default::default());
+                let mut spool = cv_core::events::EventSpool::default();
+                for event in events.iter().cloned() {
+                    spool.push(event)?;
+                }
+                cv_core::events::record_spooled_with_source(r, 0, spool, &source, &Default::default())?;
                 (events.len(), 0)
             };
             out.detail = json!({ "events": events, "temporary_bytes_written": temporary_bytes,

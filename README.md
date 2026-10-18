@@ -38,6 +38,7 @@ Restarting from scratch is the most expensive thing you do all day. **clustervis
 
 ```sh
 # 🔎 find that session from last week by what it was ABOUT, not where it lived
+cv index                                     # build/refresh the search index first
 cv search "the flux inference refactor"        # full-text, instant
 cv search --semantic "formalizing proofs"      # by meaning — no keyword overlap needed
 
@@ -124,7 +125,7 @@ Or from source:
 ```sh
 cargo build --release          # → target/release/cv
 make install                   # = cargo install --path crates/cv --force --target-dir target  → ~/.cargo/bin/cv
-cv --version                   # cv 0.16.1 (<git sha>) — compare against `git rev-parse --short=12 HEAD`
+cv --version                   # cv 0.17.0 (<git sha>) — compare against `git rev-parse --short=12 HEAD`
 ```
 
 `cv --version` prints the commit the binary was built from (`-dirty` when the tree had edits), so
@@ -179,7 +180,7 @@ cv task sweep --repo ~/proj                            # what git says is probab
 
 Same substrate over MCP (`task_open` … `task_inbox`, generated from `cv task`) and `cv serve`
 (`/api/tasks`, `/api/tasks/inbox/{who}`, and the inbox page's `/api/inbox`, `/api/task/<id>/{resolve,
-done,note,discuss,claim,release,reopen}`, `/api/events` — the same query as `cv task events`). State lives in
+done,note,discuss,claim,release}`, `/api/events` — the same query as `cv task events`). State lives in
 a replayed event log (`~/.clustervision/tasks/events.jsonl`) that refuses events its own reducer
 would reject; every append is one event, never an edit.
 
@@ -197,7 +198,7 @@ After staring into seven different transcript formats, we wrote down the one the
 
 ## 🏗️ Under the hood
 
-One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|File|Image}`), one `Adapter` per harness (`discover` + `parse` + `emit`), plus `loom` / `redact` / `prune` / `watch` / `ingest` modules — and small crates on top: **`cv`** (the one binary: the CLI, `cv mcp`, `cv serve`, `cv watch`, and the LLM digests for `pack` and `splice --generate`) · **`cv-search`** (tantivy + `model2vec`) · **`cv-web`** (WASM) · **`app/`** (Tauri desktop).
+One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|File|Image}`), one `Adapter` per harness (`roots` + `discover` + `stream`, reading through one record codec per wire format) with an emitter beside the twelve that are port targets, plus `loom` / `redact` / `prune` / `watch` / `ingest` modules — and small crates on top: **`cv`** (the one binary: the CLI, `cv mcp`, `cv serve`, `cv watch`, and the LLM digests for `pack` and `splice --generate`) · **`cv-search`** (tantivy + `model2vec`) · **`cv-web`** (WASM) · **`app/`** (Tauri desktop).
 
 ```
 parse(any harness) → 🔮 unified IR → search · port · prune · loom · pack · archive · view
@@ -208,7 +209,7 @@ parse(any harness) → 🔮 unified IR → search · port · prune · loom · pa
 Built in a wild few sessions, much of it by a swarm of agents working disjoint files. ✨ Honest about the edges:
 
 - **21 harnesses parse**; 12 also **emit** (N-way conversion). The rest — Cursor, Goose, Zed, Devin CLI, Kimi CLI (frozen store), Kimi Code, OpenSession, and the ChatGPT/Claude.ai **account data exports** (`chatgpt-export`/`claude-export` — register their location with `cv config --add-export <path>`) — are parse-only for now.
-- **Robustness:** 2000+ real sessions parse with **0 panics**; parsers are fuzz-tested against hostile input.
+- **Robustness:** the maintainer's fleet (about 7,000 sessions, 95 GB, every harness above) lists and indexes without a panic; a committed per-version corpus of real harness output is golden-tested, and the parsers are checked against malformed input (`crates/cv-core/tests/robustness.rs`).
 - The full-text index trades disk for speed; Gemini's protobuf `.pb` is opaque; a few sidecar tool-call streams aren't merged yet.
 - Historical format variants are an explicit goal — see [Adding a harness](manual/src/adding-a-harness.md), and **please send your own harness logs** (we can only test what we can see).
 

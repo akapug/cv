@@ -34,11 +34,11 @@ fn demand_counts_match_batch_baselines_and_reject_stale_pairs() {
         "UPDATE affordance_counts SET counts='{}'",         // missing view version
         "UPDATE affordance_counts SET counts='{\"_v\":0}'", // old view version
         "UPDATE affordance_counts SET counts='malformed'",
-        "UPDATE affordance_counts SET sig_b=sig_b+1",
-        "UPDATE source_dependencies SET size=size+1 WHERE consumer='counts'",
-        "UPDATE source_dependencies SET stamp='{}' WHERE consumer='counts'",
-        "UPDATE source_dependencies SET stamp='{\"version\":1}' WHERE consumer='counts'",
-        "UPDATE source_dependencies SET stamp=REPLACE(stamp,'\"reads\":[]','\"reads\":null') WHERE consumer='counts'",
+        "UPDATE affordance_counts SET counts=counts||' '", // the published output, not this text
+        "UPDATE source_dependencies SET record=substr(record,1,13)||X'01'||substr(record,15) WHERE consumer='counts'",
+        "UPDATE source_dependencies SET record=substr(record,1,53)||'{}' WHERE consumer='counts'",
+        "UPDATE source_dependencies SET record=substr(record,1,53)||'{\"version\":1}' WHERE consumer='counts'",
+        "UPDATE source_dependencies SET record=substr(record,1,53)||REPLACE(CAST(substr(record,54) AS TEXT),'\"reads\":[]','\"reads\":null') WHERE consumer='counts'",
         "DELETE FROM source_dependencies WHERE consumer='counts'",
         "DELETE FROM affordance_counts",
     ] {
@@ -92,16 +92,17 @@ fn demand_counts_decode_only_selected_rows_as_inventory_grows() {
     for inventory in [8, 1024] {
         conn.execute(
             "WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<?1)
-             INSERT OR REPLACE INTO affordance_counts(harness,id,path,sig_a,sig_b,counts)
-             SELECT 'codex','irrelevant-'||n,'unused-'||n,1,1,'malformed unrelated counts' FROM numbers",
+             INSERT OR REPLACE INTO affordance_counts(harness,id,path,counts)
+             SELECT 'codex','irrelevant-'||n,'unused-'||n,'malformed unrelated counts' FROM numbers",
             [inventory],
         )
         .unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO source_dependencies(consumer,harness,id,path,mtime,size,stamp)
-             SELECT 'counts',harness,id,path,1,1,'malformed unrelated stamp' FROM affordance_counts WHERE id LIKE 'irrelevant-%'",
+            "INSERT OR REPLACE INTO source_dependencies(consumer,harness,id,path,record)
+             SELECT 'counts',harness,id,path,X'00' FROM affordance_counts WHERE id LIKE 'irrelevant-%'",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let reader = Reader::open().unwrap();
         compare(&reader, &r, Some(1));
         assert_eq!(reader.counts_work(), (1, 1));

@@ -395,7 +395,6 @@ def events(binary, root, env):
             # process; extraction success alone cannot conceal a failed best-effort SQL write.
             with sqlite3.connect(f"file:{catalog / 'catalog.db'}?mode=ro", uri=True) as conn:
                 assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == records, "event publication incomplete"
-                assert conn.execute("SELECT count(*) FROM event_sync").fetchone()[0] == 1, "event stamp missing"
                 assert conn.execute("SELECT count(*) FROM source_dependencies WHERE consumer='events'").fetchone()[0] == 1, "source baseline missing"
                 digest = hashlib.sha256()
                 query = "SELECT e.msg_idx,e.kind,t.target FROM events e LEFT JOIN event_targets t ON t.id=e.target_id ORDER BY e.msg_idx"

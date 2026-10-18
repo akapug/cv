@@ -51,7 +51,8 @@ use super::wire::anthropic;
 use super::Adapter;
 use crate::ir::*;
 use crate::json::{InvalidJson, JsonSource, JsonView};
-use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
+use crate::source::{sqlite_sidecars, Dependencies, Probe};
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -90,9 +91,46 @@ impl Cline {
     }
 }
 
+/// The side files of a Cline-family task directory, every one a freshness dependency.
+pub(super) fn task_dir_dependencies(r: &SessionRef, deps: &mut Dependencies) {
+    deps.files.extend(
+        [
+            "api_conversation_history.json",
+            "ui_messages.json",
+            "task_metadata.json",
+            "history_item.json",
+        ]
+        .map(|name| r.path.join(name)),
+    );
+}
+
 impl Adapter for Cline {
     fn harness(&self) -> Harness {
         Harness::Cline
+    }
+
+    fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        if r.path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with(".messages.json"))
+        {
+            let sid = r.id.split('/').next().unwrap_or(&r.id);
+            if let Some(dir) = r.path.parent() {
+                deps.files.push(dir.join(format!("{sid}.json")));
+                if !r.id.contains('/') {
+                    if let Some(data) = dir.parent().and_then(Path::parent) {
+                        for name in ["sessions.db", "cron.db", "teams.db"] {
+                            let db = data.join("db").join(name);
+                            deps.files.extend(sqlite_sidecars(&db));
+                            deps.files.push(db);
+                        }
+                    }
+                }
+            }
+            return Some(());
+        }
+        task_dir_dependencies(r, deps);
+        Some(())
     }
 
     fn roots(&self) -> Vec<PathBuf> {
@@ -274,15 +312,10 @@ fn scan(dir: &Path, id: &str, harness: Harness) -> Option<SessionRef> {
 // Parsing
 // ---------------------------------------------------------------------------
 
-/// Read a task dir (`api_conversation_history.json` + sidecars) into a `Session`. Tolerant: a
-/// missing/empty/corrupt history yields an empty-message session rather than an error. Shared by
-/// Cline and Roo.
-///
-/// This is the materializing twin of [`stream_task_dir`]: it streams into a [`CollectSink`] and
-/// reattaches the messages, so it stays byte-identical with the streaming path (and never builds a
-/// whole-document `Value`). Kept as a `pub` entry point because `roo.rs`'s emit round-trip test and
-/// other callers re-parse a task dir directly.
-pub fn parse_task_dir(dir: &Path, id: &str, harness: Harness) -> Result<Session> {
+/// Test helper: [`stream_task_dir`] collected into a whole `Session`.
+#[cfg(test)]
+pub(crate) fn parse_task_dir(dir: &Path, id: &str, harness: Harness) -> Result<Session> {
+    use crate::stream::CollectSink;
     let mut sink = CollectSink::default();
     let mut session = stream_task_dir(dir, id, harness, &ParseOptions::full(), &mut sink)?;
     session.messages = sink.messages;
@@ -473,10 +506,10 @@ pub fn stream_task_dir(
     Ok(session)
 }
 
-/// Pure parser: an `api_conversation_history.json` *array* text → `Session`. No filesystem access,
-/// so it's unit-testable with a small fixture string. Shared by Cline and Roo. Each item goes through
-/// the same record codec as [`stream_task_dir`], over an owned view.
-pub fn parse_history_str(id: &str, text: &str, harness: Harness, source_path: Option<PathBuf>) -> Session {
+/// Test helper: an `api_conversation_history.json` array text through the same record codec as
+/// [`stream_task_dir`], over an owned view.
+#[cfg(test)]
+pub(crate) fn parse_history_str(id: &str, text: &str, harness: Harness, source_path: Option<PathBuf>) -> Session {
     let mut session = Session {
         source_path,
         ..Session::new(id.to_string(), harness)
@@ -747,7 +780,7 @@ fn condense_boundary(v: &Value, harness: Harness) -> Option<Message> {
 ///   task_metadata.json              # {cwd, files_in_context[], model_usage[]} hints
 /// ```
 ///
-/// This is the faithful inverse of [`parse_history_str`]: every IR [`Block`] maps back to the
+/// This is the faithful inverse of [`stream_task_dir`]: every IR [`Block`] maps back to the
 /// Anthropic content block the parser expects (`text`, `thinking`, `tool_use`, `tool_result`,
 /// `image`). A [`Role::Tool`] turn is written as a `user` message whose content is *only*
 /// `tool_result` blocks, which the parser reclassifies back to [`Role::Tool`].
@@ -841,61 +874,6 @@ pub fn emit_with_harness(
 // ---------------------------------------------------------------------------
 // cwd / title / timestamp helpers
 // ---------------------------------------------------------------------------
-
-/// Pull the cwd out of Cline's `<environment_details>` block. The relevant line looks like:
-/// `# Current Working Directory (/Users/me/proj) Files`. We take the text inside the parens.
-pub fn extract_cwd(text: &str) -> Option<PathBuf> {
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("# Current Working Directory") {
-            let rest = rest.trim_start();
-            let inner = rest.strip_prefix('(')?;
-            let end = inner.find(')')?;
-            let path = inner[..end].trim();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
-        }
-    }
-    None
-}
-
-/// Strip Cline's `<task>…</task>` / `<environment_details>…</environment_details>` wrappers to get a
-/// clean human title from the first user message. Returns the first non-empty line of the remaining
-/// prose, or `None` if nothing usable is left.
-pub fn clean_user_title(text: &str) -> Option<String> {
-    // Prefer the explicit `<task>…</task>` payload if present.
-    if let Some(inner) = between(text, "<task>", "</task>") {
-        let t = inner.trim();
-        if !t.is_empty() {
-            return first_line(t);
-        }
-    }
-    // Otherwise drop the environment_details block and take the first prose line.
-    let stripped = strip_block(text, "<environment_details>", "</environment_details>");
-    first_line(stripped.trim())
-}
-
-fn between<'a>(hay: &'a str, open: &str, close: &str) -> Option<&'a str> {
-    let start = hay.find(open)? + open.len();
-    let end = hay[start..].find(close)? + start;
-    Some(&hay[start..end])
-}
-
-fn strip_block(hay: &str, open: &str, close: &str) -> String {
-    if let (Some(s), Some(e)) = (hay.find(open), hay.find(close)) {
-        if e >= s {
-            let mut out = String::from(&hay[..s]);
-            out.push_str(&hay[e + close.len()..]);
-            return out;
-        }
-    }
-    hay.to_string()
-}
-
-fn first_line(text: &str) -> Option<String> {
-    text.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
-}
 
 /// `<taskId>` is a millisecond epoch timestamp string. Convert it to a UTC time, when it parses.
 fn task_id_to_time(id: &str) -> Option<DateTime<Utc>> {
@@ -1040,6 +1018,7 @@ fn ui_message_times(dir: &Path) -> Result<UiTimes> {
 mod tests {
     use super::*;
     use crate::harness::Parse;
+    use crate::stream::CollectSink;
 
     #[test]
     fn editor_roots_do_not_repeat_default_xdg_stores() {
@@ -1330,22 +1309,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_cwd_from_env_details() {
-        let text = "<task>do x</task>\n<environment_details>\n# Current Working Directory (/Users/me/proj) Files\na.rs\n</environment_details>";
-        assert_eq!(extract_cwd(text), Some(PathBuf::from("/Users/me/proj")));
-        assert_eq!(extract_cwd("no cwd here"), None);
-    }
-
-    #[test]
-    fn clean_title_prefers_task_block() {
-        let text = "<task>Refactor the IR\nmore detail</task>\n<environment_details>noise</environment_details>";
-        assert_eq!(clean_user_title(text).as_deref(), Some("Refactor the IR"));
-        // Without a <task> block, fall back to first prose line after stripping env details.
-        let text2 = "Just do the thing\n<environment_details>noise</environment_details>";
-        assert_eq!(clean_user_title(text2).as_deref(), Some("Just do the thing"));
-    }
-
-    #[test]
     fn tolerates_corrupt_and_non_array() {
         assert!(parse_history_str("x", "not json", Harness::Cline, None)
             .messages
@@ -1365,7 +1328,7 @@ mod tests {
             created_at: DateTime::<Utc>::from_timestamp_millis(1717000000000),
             updated_at: DateTime::<Utc>::from_timestamp_millis(1717000005000),
             model: Some("claude-x".to_string()),
-            ..Session::new("src".to_string(), Harness::Cline)
+            ..Session::new("src", Harness::Cline)
         };
 
         let mut user = Message::new(Role::User);

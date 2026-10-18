@@ -327,7 +327,8 @@ impl StagedDir {
     /// [`Claim::New`] refuses an existing name. [`Claim::Replace`] swaps the directories in one
     /// step where the platform can (`RENAME_SWAP`, `RENAME_EXCHANGE`); elsewhere it moves the old
     /// one aside first, so the name is briefly absent but never half merged, and a failed claim
-    /// puts the old tree back. If even that fails, both trees are kept and the error names them.
+    /// puts the old tree back. Every fallback move refuses an existing name, preserving concurrent
+    /// claims. If restoration fails, both trees are kept and the error names them.
     /// The replaced tree is then deleted.
     pub fn publish(self, destination: &Path, claim: Claim) -> Result<()> {
         #[cfg(target_vendor = "apple")]
@@ -336,7 +337,7 @@ impl StagedDir {
         let swap = |from: &Path, to: &Path| rename_with(from, to, libc::RENAME_EXCHANGE);
         #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
         let swap = |_: &Path, _: &Path| None;
-        self.publish_using(destination, claim, swap, |from, to| std::fs::rename(from, to))
+        self.publish_using(destination, claim, swap, |_, _| Ok(()))
     }
 
     fn publish_using(
@@ -344,8 +345,12 @@ impl StagedDir {
         destination: &Path,
         claim: Claim,
         swap: impl FnOnce(&Path, &Path) -> Option<io::Result<()>>,
-        mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+        mut before_move: impl FnMut(&Path, &Path) -> io::Result<()>,
     ) -> Result<()> {
+        let mut rename = |from: &Path, to: &Path| {
+            before_move(from, to)?;
+            rename_no_replace(from, to)
+        };
         let context = || format!("publishing {}", destination.display());
         let exists = std::fs::symlink_metadata(destination).is_ok();
         let staged = std::mem::take(&mut self.path);
@@ -465,6 +470,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn move_aside_replacement_preserves_a_concurrent_directory_claim() {
+        let world = cv_testkit::World::new("publish-directory-race");
+        let destination = world.base.join("tree");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("old"), "old").unwrap();
+        let staged = StagedDir::beside(&destination, "test").unwrap();
+        std::fs::write(staged.path().join("new"), "new").unwrap();
+        let mut calls = 0;
+        let result = staged.publish_using(
+            &destination,
+            Claim::Replace,
+            |_, _| None,
+            |_, _| {
+                calls += 1;
+                if calls == 2 {
+                    std::fs::create_dir(&destination)?;
+                }
+                Ok(())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a concurrent claim must block publication and restoration"
+        );
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        let kept = std::fs::read_dir(&world.base)
+            .unwrap()
+            .filter_map(|e| {
+                let path = e.unwrap().path();
+                (path.join("old").exists() || path.join("new").exists()).then_some(path)
+            })
+            .count();
+        assert_eq!(kept, 2, "both trees must survive a blocked restoration");
+    }
+
     fn staged(dir: &Path, bytes: &[u8]) -> Staged {
         let mut staged = Staged::create(dir, "test", 0o644).unwrap();
         staged.write_all(bytes).unwrap();
@@ -579,11 +620,11 @@ mod tests {
             let staged = StagedDir::beside(&destination, "test").unwrap();
             std::fs::write(staged.path().join("which"), "new").unwrap();
             let mut calls = 0;
-            let rename = |from: &Path, to: &Path| {
+            let rename = |_: &Path, _: &Path| {
                 calls += 1;
                 match failing.contains(&calls) {
                     true => Err(io::Error::other(format!("injected failure {calls}"))),
-                    false => std::fs::rename(from, to),
+                    false => Ok(()),
                 }
             };
             let result = staged.publish_using(&destination, Claim::Replace, |_, _| None, rename);

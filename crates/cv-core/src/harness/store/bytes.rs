@@ -26,12 +26,12 @@ impl std::io::Write for AppendWriter<'_> {
 
 #[derive(Debug)]
 pub(crate) struct Spill {
-    file: Option<std::fs::File>,
+    pub(crate) file: Option<std::fs::File>,
     path: std::path::PathBuf,
     linked: bool,
 }
 impl Spill {
-    fn create(append: bool) -> std::io::Result<Self> {
+    pub(crate) fn create(append: bool) -> std::io::Result<Self> {
         let path = std::env::temp_dir().join(format!("cv-byte-source-{}", uuid::Uuid::new_v4()));
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).append(append).create_new(true);
@@ -281,7 +281,6 @@ impl ByteSource {
         }
     }
     /// Publish only after the owning operation has validated its successful completion.
-    #[allow(dead_code)] // Publication consumers land separately from SQLite byte-source extraction.
     pub fn copy_to(&self, out: &mut (impl std::io::Write + ?Sized)) -> std::io::Result<u64> {
         match &self.bytes {
             Bytes::Memory(bytes) => {
@@ -336,6 +335,21 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), b"different owner");
             std::fs::remove_file(path).unwrap();
         }
+    }
+    #[test]
+    fn private_spill_permissions_and_owned_cleanup() {
+        let owner = Spill::create(false).unwrap();
+        let file = owner.file.as_ref().unwrap().try_clone().unwrap();
+        let path = owner.path.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            assert!(!path.exists());
+        }
+        drop(file);
+        drop(owner);
+        assert!(!path.exists());
     }
     #[test]
     fn unpublished_stage_rollback_preserves_memory_and_spilled_prefixes() {

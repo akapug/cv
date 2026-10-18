@@ -58,14 +58,10 @@ pub struct ReadState {
     path: PathBuf,
     #[serde(default)]
     primary: Option<PathBuf>,
-    pub source: source::Snapshot,
+    pub source: source::Baseline,
     anchor: Option<Anchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completed: Option<Completed>,
-    // Primary inode/ctime is separate from append dependencies: growth invalidates EOF metadata,
-    // while the immutable-prefix checkpoint may remain useful.
-    #[serde(default)]
-    identity: Option<source::ReadSet>,
 }
 
 impl ReadState {
@@ -78,7 +74,6 @@ impl ReadState {
             source: source::Probe::default().snapshot(r),
             anchor: None,
             completed: None,
-            identity: None,
         }
     }
 
@@ -94,7 +89,6 @@ impl ReadState {
         self.version == state_version(adapter)
             && self.path == r.path
             && self.primary.as_ref() == Some(&adapter.resume_source(r))
-            && self.identity.as_ref().is_some_and(|guard| guard.fresh(&mut probe))
             && self.source.fresh(&now, &mut probe)
     }
 
@@ -103,10 +97,6 @@ impl ReadState {
             && self.path == r.path
             && self.primary.as_ref() == Some(&source::primary_path(r))
             && source::unchanged(r, &self.source)
-            && self
-                .identity
-                .as_ref()
-                .is_none_or(|guard| guard.fresh(&mut source::Probe::default()))
     }
 
     /// Number of old messages covered by the accepted stable checkpoint, when available.
@@ -124,38 +114,30 @@ impl ReadState {
         &'a self,
         adapter: &dyn Adapter,
         r: &SessionRef,
-        current: &source::Snapshot,
+        current: &source::Baseline,
         skip: usize,
     ) -> Option<&'a stream::Checkpoint> {
         if self.version != state_version(adapter)
             || self.path != r.path
             || self.primary.as_ref() != Some(&adapter.resume_source(r))
-            || current.primary.1 < self.source.primary.1
+            || current.primary_len() < self.source.primary_len()
+            || !self.source.dependencies_fresh(current, &mut source::Probe::default())
         {
             return None;
         }
-        let same = current.primary == self.source.primary;
-        if same
-            && !self
-                .identity
-                .as_ref()
-                .is_some_and(|guard| guard.fresh(&mut source::Probe::default()))
+        // A source that did not grow is held to its whole identity, not only the anchor's sample.
+        if current.primary_len() == self.source.primary_len()
+            && !self.source.fresh(current, &mut source::Probe::default())
         {
-            return None;
-        }
-        if !same && current.primary.1 <= self.source.primary.1 {
-            return None;
-        }
-        if !self.source.dependencies_fresh(current, &mut source::Probe::default()) {
             return None;
         }
         let anchor = self.anchor.as_ref()?;
-        let version = crate::resume::version(adapter, CONSUMER)?;
-        (anchor.checkpoint.messages()? <= skip
-            && anchor
-                .head
-                .holds(&adapter.resume_source(r), current.primary.1 as u64, &version))
-        .then_some(&anchor.checkpoint)
+        (anchor.checkpoint.messages()? <= skip).then_some(())?;
+        anchor.head.admit(
+            &adapter.resume_source(r),
+            &crate::resume::version(adapter, CONSUMER)?,
+            &anchor.checkpoint,
+        )
     }
 }
 
@@ -176,13 +158,12 @@ pub struct ReadPass {
     /// Primary bytes from the admitted checkpoint to captured EOF, excluding auxiliary reads
     /// and guard samples. A bounded unchanged read may stop before traversing this whole suffix.
     pub suffix_bytes: u64,
-    source: source::Snapshot,
+    source: source::Baseline,
     path: PathBuf,
     primary: PathBuf,
     before: Option<Anchor>,
     last: Option<Anchor>,
     completed: Option<Completed>,
-    identity: source::ReadSet,
 }
 
 impl ReadPass {
@@ -204,7 +185,6 @@ impl ReadPass {
             source: self.source.clone(),
             anchor,
             completed: self.completed.clone(),
-            identity: Some(self.identity.clone()),
         }
     }
 }
@@ -489,9 +469,9 @@ fn read_inner<'a>(
         .filter(|state| !session_output && state.fresh_with(adapter, r))
         .and_then(|state| state.completed.as_ref());
     let stop_after_selection = cached.is_some_and(|complete| skip.saturating_add(keep) < complete.total);
-    let mut primary_reads = source::ReadSet::default();
-    primary_reads.record(&primary);
-    let metadata_guard = primary_reads;
+    // The primary's whole identity, for a pass whose dependency inventory was unavailable.
+    let mut metadata_guard = source::ReadSet::default();
+    metadata_guard.record(&primary);
     let from = previous.and_then(|state| state.from(adapter, r, &captured, skip));
     if session_output {
         skip = from.and_then(stream::Checkpoint::messages).unwrap_or(0);
@@ -596,7 +576,7 @@ fn read_inner<'a>(
     let before = sink.before.as_ref().and_then(anchor);
     let last = done.last.as_ref().or(sink.last.as_ref()).and_then(anchor);
     anyhow::ensure!(
-        if source.dependencies.is_some() {
+        if source.stamp.is_some() {
             source::unchanged_from(r, &primary, &source)
         } else {
             source::Probe::default().snapshot_from(r, &primary).primary == source.primary
@@ -638,11 +618,9 @@ fn read_inner<'a>(
         total,
         reached_eof: complete,
         parsed_messages: sink.total - first,
-        suffix_bytes: (captured.primary.1.max(0) as u64).saturating_sub(if resumed {
-            from.map_or(0, |cp| cp.offset)
-        } else {
-            0
-        }),
+        suffix_bytes: captured
+            .primary_len()
+            .saturating_sub(if resumed { from.map_or(0, |cp| cp.offset) } else { 0 }),
         messages: sink.messages,
         resumed,
         prefix: first,
@@ -652,7 +630,6 @@ fn read_inner<'a>(
         before,
         last,
         completed,
-        identity: metadata_guard,
     })
 }
 
@@ -735,7 +712,10 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
-        assert_eq!(crate::offsets::file_sig(&a), crate::offsets::file_sig(&b));
+        assert_eq!(
+            source::FileId::at(&a).map(|id| (id.len, id.mtime_ns)),
+            source::FileId::at(&b).map(|id| (id.len, id.mtime_ns))
+        );
         let r = SessionRef::new("foreign", Harness::Codex, dir.join("logical"));
         let first = read(&Foreign(a), &r, None, 0, 0).unwrap();
         let state = first.accepted(first.total);
@@ -1037,11 +1017,13 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
-        assert_eq!(source::Probe::default().snapshot(&r).primary, complete.source.primary);
+        let tuple = |source: &source::Baseline| source.primary.map(|id| (id.len, id.mtime_ns));
+        assert_eq!(tuple(&source::Probe::default().snapshot(&r)), tuple(&complete.source));
         let anchor = complete.anchor.as_ref().unwrap();
         assert!(anchor
             .head
-            .holds(&adapter.resume_source(&r), body.len() as u64, &anchor.head.version));
+            .admit(&adapter.resume_source(&r), &anchor.head.version, &anchor.checkpoint)
+            .is_some());
         assert!(!complete.fresh_with(adapter.as_ref(), &r));
         let mut rewritten = read_session(adapter.as_ref(), &r, Some(&complete), next.total).unwrap();
         assert!(!rewritten.resumed);

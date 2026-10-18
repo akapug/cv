@@ -1275,7 +1275,7 @@ mod tests {
             created_at: DateTime::from_timestamp_millis(1_754_425_094_719),
             model: Some("openai/gpt-oss-120b".to_string()),
             messages: vec![user, assistant],
-            ..Session::new("orig".to_string(), Harness::LmStudio)
+            ..Session::new("orig", Harness::LmStudio)
         };
 
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
