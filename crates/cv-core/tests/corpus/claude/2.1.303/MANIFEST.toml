@@ -1,0 +1,10 @@
+# Written by tools/harness-corpus. Never regenerate a committed version in place.
+harness = "claude"
+version = "2.1.303"
+generated = "2026-10-19"
+model = "devin/glm-5-2 via this host's local Anthropic-compatible proxy, through key_proxy.py"
+model_calls = 39
+scenarios = ["chat","resume","session_name","skill_slash_command","skill_tool","compaction","fork_session","autocompact_tiny_window","claude_md","hooks","tools","tool_error","permission_denied","file_history","task_list","background_bash","task_notification","cron","schedule_wakeup","subagent","custom_agent_type","background_agent","agent_notification"]
+skipped = ["image","plan_mode","mcp","workflow","worktree","web_fetch","structured_output","interrupt"]
+generator_commit = "57db8a01"
+differs_from_generate_sh = "generate.sh needs ~/.zai-key and points the harness at Z.ai; this host has no such key, so the upstream is this host's local Anthropic-compatible proxy, whose token key_proxy.py alone reads from a 0600 file - the harness still gets only $PROXY_URL and a dummy token. The model is devin/glm-5-2. The skill session and its compaction run in ONE process (stream-json input) because Claude Code's invoked-skills registry is in-memory per process and a --resume rebuilds it only from an existing invoked_skills attachment. $TMPDIR is /tmp/<lane>, not under the real home, so Claude Code does not load an ancestor ~/.claude/CLAUDE.md as project memory."
