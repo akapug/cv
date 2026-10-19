@@ -446,7 +446,7 @@ fn without_the_unreadable_record_the_attachment_rides_along() {
 #[test]
 fn end_refuses_invalid_json_tail_in_native_and_staged_copies() {
     for thinking in [crate::emit::ThinkingMode::Native, crate::emit::ThinkingMode::Portable] {
-        for tail in ["{\"type\":\"cost-state\"", "not-json\n", "{\"type\":}\n"] {
+        for tail in ["{\"type\":\"cost-state\"", "not-json\n", "{\"type\":}\n", "\u{000c}\n"] {
             let dir = tmpdir();
             let src = session_tailed(&dir);
             std::fs::OpenOptions::new()
