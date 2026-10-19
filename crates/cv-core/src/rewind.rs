@@ -387,7 +387,9 @@ pub enum CutAt {
     Message(usize),
     /// Through the tool result that shows this commit being made ([`CommitEvidence`]).
     Commit(String),
-    /// Through the last message.
+    /// Through the last message AND the records after it, to the end of the source: the tail
+    /// (`cost-state`, `history-suppression`, `bridge-session`, titles, attachments) is part of the
+    /// session, so nothing after the last message is dropped.
     End,
 }
 
@@ -668,6 +670,10 @@ fn rewind_session_after_scan(
         _ => total - 1,
     };
     let cut_off = scan.offsets[cut_idx];
+    // `End` cuts at the end of the FILE, not at the last message's record: the records after the
+    // last message are part of the session and ride along. An explicit `--at`/`--commit` is a
+    // deliberate truncation and still stops at that message's record.
+    let to_eof = matches!(opts.at, CutAt::End);
 
     // Start: the last compaction boundary at or before the cut, moved back to its preserved
     // segment's head when that sits earlier; `--full` (or no boundary) starts at the top.
@@ -781,6 +787,20 @@ fn rewind_session_after_scan(
                     omitted_bytes += n as u64;
                     continue;
                 }
+                // A record the codec reads nothing out of — a conversation record with no `message`
+                // body (`cv show` counts it as no message at all). Copying past it would drop it
+                // silently, so refuse and say which record; nothing is published (the staged copy
+                // is dropped), so the well-formed records before it are never written either.
+                if let Some(ty) = unreadable_record(&v) {
+                    drop(writer.take());
+                    bail!(
+                        "{}: line {line_no} is a `{ty}` record with no `message` body (uuid {}) — cv \
+                         cannot read it, and a copy that walked past it would drop it silently; \
+                         repair or remove that record, or cut before it with `--at <MSG_IDX>`",
+                        r.path.display(),
+                        v.get("uuid").and_then(Value::as_str).unwrap_or("(none)"),
+                    );
+                }
                 track_tool_calls(
                     &v,
                     &mut open,
@@ -818,7 +838,11 @@ fn rewind_session_after_scan(
         end_line = line_no;
         if at == cut_off {
             cut_line = line_no;
-            phase = Phase::Closing;
+            // Past an explicit cut the copy keeps only what closes the cut's open calls; an `End`
+            // rewind copies to EOF, so its cut never closes the phase.
+            if !to_eof {
+                phase = Phase::Closing;
+            }
         }
         if phase == Phase::Closing && open.is_empty() {
             phase = Phase::Done;
@@ -1044,6 +1068,16 @@ fn closes_open_call(v: &Value) -> bool {
                     .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
             }),
     }
+}
+
+/// The `type` of a record the Claude codec cannot read: a conversation record (`user`/`assistant`)
+/// with no `message` body, which [`crate::harness::claude::record`] drops without a word. Every
+/// other shape is one cv knows how to place — a known bookkeeping type is carried, an unknown type
+/// without a body is a meta record, and a `system` row without content is a bodyless notice — so
+/// only a record that *claims* to be a turn and has no turn in it is unreadable.
+fn unreadable_record(v: &Value) -> Option<&str> {
+    let ty = v.get("type")?.as_str()?;
+    (matches!(ty, "user" | "assistant") && v.get("message").is_none()).then_some(ty)
 }
 
 #[cfg(test)]

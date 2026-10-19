@@ -282,14 +282,18 @@ pub(crate) fn cmd_rewind(
     } else {
         String::new()
     };
+    // An `End` rewind copies the whole source, so there is usually nothing to say about a tail.
+    let omitted = match res.omitted_lines {
+        0 => String::new(),
+        n => format!(" · omitted the {n} line(s) after it"),
+    };
     let _ = writeln!(
         h,
-        "  copied:  lines {}..={} — {} line(s), {}{closed} · omitted the {} line(s) after it",
+        "  copied:  lines {}..={} — {} line(s), {}{closed}{omitted}",
         res.start_line,
         res.end_line,
         res.lines_written,
         human_bytes(res.bytes_written),
-        res.omitted_lines,
     );
     let _ = writeln!(h, "  thinking: {}", res.thinking);
     for w in &res.warnings {
