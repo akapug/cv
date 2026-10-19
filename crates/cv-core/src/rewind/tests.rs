@@ -444,6 +444,93 @@ fn without_the_unreadable_record_the_attachment_rides_along() {
 }
 
 #[test]
+fn end_refuses_invalid_json_tail_in_native_and_staged_copies() {
+    for thinking in [crate::emit::ThinkingMode::Native, crate::emit::ThinkingMode::Portable] {
+        for tail in ["{\"type\":\"cost-state\"", "not-json\n", "{\"type\":}\n"] {
+            let dir = tmpdir();
+            let src = session_tailed(&dir);
+            std::fs::OpenOptions::new().append(true).open(&src).unwrap().write_all(tail.as_bytes()).unwrap();
+            let before = std::fs::read(&src).unwrap();
+            let out = dir.join("out");
+            let options = RewindOptions {
+                thinking: Some(thinking),
+                ..opts(CutAt::End, &out)
+            };
+            let result = rewind_session(&sref(&src, SID), &options);
+            assert!(result.is_err(), "invalid tail published under {thinking:?}: {tail:?}");
+            assert!(std::fs::read_dir(&out).unwrap().next().is_none());
+            assert_eq!(std::fs::read(&src).unwrap(), before);
+            // A deliberate cut need not validate the bytes it omits.
+            let cut = rewind_session(&sref(&src, SID), &RewindOptions { at: CutAt::Message(1), ..options }).unwrap();
+            assert_eq!(cut.lines_written, 2);
+            assert_eq!(cut.omitted_lines, 4);
+            cleanup(&dir);
+        }
+    }
+}
+
+#[test]
+fn present_message_body_variants_remain_parser_compatible() {
+    for body in [json!(null), json!(false), json!(7), json!("bad"), json!([]), json!({}), json!({"content": null}), json!({"content": 7}), json!({"content": {}})] {
+        for ty in ["user", "assistant"] {
+            let dir = tmpdir();
+            let src = session_tailed(&dir);
+            let bad = rec(ty, "invalid-body", Some("a0"), body.clone());
+            std::fs::OpenOptions::new().append(true).open(&src).unwrap().write_all((bad.to_string() + "\n").as_bytes()).unwrap();
+            let before = std::fs::read(&src).unwrap();
+            let out = dir.join("out");
+            let parsed = crate::harness::claude::parse_str("synthetic", std::str::from_utf8(&before).unwrap(), None);
+            assert_eq!(parsed.messages.len(), 3, "present body produces a message: {body}");
+            let result = rewind_session(&sref(&src, SID), &opts(CutAt::End, &out)).unwrap();
+            assert_eq!(read_lines(&result.new_path)[5]["message"], body);
+            assert_eq!((result.lines_written, result.omitted_lines), (6, 0));
+            assert_eq!(std::fs::read(&src).unwrap(), before);
+            cleanup(&dir);
+        }
+    }
+}
+
+#[test]
+fn valid_empty_content_and_unknown_tail_survive_all_copy_paths() {
+    for thinking in [crate::emit::ThinkingMode::Native, crate::emit::ThinkingMode::Portable] {
+        let dir = tmpdir();
+        let src = session_attachment_and_bad_tail(&dir, false);
+        let extra = [rec("user", "empty", Some("a0"), json!({"role":"user", "content":[]})),
+                     json!({"type":"future-state", "sessionId":SID, "payload":{"untouched":true}})];
+        for v in extra {
+            std::fs::OpenOptions::new().append(true).open(&src).unwrap().write_all((v.to_string() + "\n").as_bytes()).unwrap();
+        }
+        let options = RewindOptions {
+            thinking: Some(thinking),
+            ..opts(CutAt::End, &dir.join("out"))
+        };
+        let res = rewind_session(&sref(&src, SID), &options).unwrap();
+        let got = read_lines(&res.new_path);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[4]["payload"]["untouched"], true);
+        assert_eq!(got[4]["sessionId"], res.new_id);
+        assert_eq!((res.end_line, res.omitted_lines), (5, 0));
+        assert_eq!(got[2]["attachment"]["skills"].as_array().unwrap().len(), 1);
+        cleanup(&dir);
+    }
+}
+
+#[test]
+fn empty_and_metadata_only_sources_refuse_without_publication() {
+    for body in ["", "\n", "{\"type\":\"cost-state\",\"sessionId\":\"synthetic\"}\n"] {
+        let dir = tmpdir();
+        let src = dir.join(format!("{SID}.jsonl"));
+        std::fs::write(&src, body).unwrap();
+        let out = dir.join("out");
+        let err = rewind_session(&sref(&src, SID), &opts(CutAt::End, &out)).unwrap_err();
+        assert!(err.to_string().contains("no messages"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(std::fs::read_to_string(src).unwrap(), body);
+        cleanup(&dir);
+    }
+}
+
+#[test]
 fn a_cut_between_parallel_results_runs_on_until_the_calls_close() {
     let dir = tmpdir();
     let src = session(&dir);
