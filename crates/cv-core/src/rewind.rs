@@ -780,9 +780,18 @@ fn rewind_session_after_scan(
             omitted_bytes += n as u64;
             continue;
         }
-        let parsed: Option<Value> = serde_json::from_slice(&buf[..n]).ok();
+        let parsed: Option<Value> = if buf[..n].iter().all(u8::is_ascii_whitespace) {
+            None
+        } else {
+            Some(serde_json::from_slice(&buf[..n]).with_context(|| {
+                format!(
+                    "{}: line {line_no} is not a complete JSON record; repair it or cut before it with `--at <MSG_IDX>`",
+                    r.path.display()
+                )
+            })?)
+        };
         let out_line: Vec<u8> = match parsed {
-            None => buf[..n].to_vec(), // non-JSON line: verbatim
+            None => buf[..n].to_vec(), // blank line: verbatim
             Some(mut v) => {
                 if source_session_id.is_none() {
                     source_session_id = v.get("sessionId").and_then(Value::as_str).map(String::from);
