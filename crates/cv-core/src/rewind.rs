@@ -1031,29 +1031,41 @@ fn read_line_at(file: &std::fs::File, off: u64) -> Result<Option<Value>> {
     Ok(serde_json::from_slice(&line).ok())
 }
 
-/// Update the open tool-call set from one record: an assistant's `tool_use` blocks open calls, a
-/// user record's `tool_result` blocks close them (counted into `closed` past the cut).
+/// Update the open tool-call set from one record: a TOP-LEVEL assistant record's `tool_use`
+/// blocks open calls, a top-level user record's `tool_result` blocks close them (counted into
+/// `closed` past the cut). TOP-LEVEL `type` is the authority, matching the conversation decoder:
+/// a request-snapshot record (`api-request-blob`) embeds the same message shape verbatim — it is
+/// physical evidence to preserve, not a new event, so its nested blocks never open or close a
+/// call (task/10455: 151 closed calls reopened on a managed-restore rewind). Sidechain records
+/// carry the same top-level types and still count — `prune::turn_kind` is NOT reused here
+/// because it excludes them.
 fn track_tool_calls(v: &Value, open: &mut HashSet<String>, mut closed: Option<&mut usize>) {
     let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
         return;
     };
-    for b in blocks {
-        match b.get("type").and_then(Value::as_str) {
-            Some("tool_use") => {
-                if let Some(id) = b.get("id").and_then(Value::as_str) {
-                    open.insert(id.to_string());
-                }
-            }
-            Some("tool_result") => {
-                let id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-                if open.remove(id) {
-                    if let Some(c) = closed.as_deref_mut() {
-                        *c += 1;
+    match v.get("type").and_then(Value::as_str) {
+        Some("assistant") => {
+            for b in blocks {
+                if b.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    if let Some(id) = b.get("id").and_then(Value::as_str) {
+                        open.insert(id.to_string());
                     }
                 }
             }
-            _ => {}
         }
+        Some("user") => {
+            for b in blocks {
+                if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    let id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+                    if open.remove(id) {
+                        if let Some(c) = closed.as_deref_mut() {
+                            *c += 1;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 

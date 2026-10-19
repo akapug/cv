@@ -599,3 +599,88 @@ fn rewind_rejects_output_ids_that_escape_the_output_directory() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     cleanup(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// task/10455 — the request-snapshot is physical evidence, never a tool event
+// ---------------------------------------------------------------------------
+
+/// A top-level `api-request-blob` record embedding a verbatim message — the
+/// shape the homelab scorer's snapshots carry (measured on the 7336 frozen
+/// transcript: the same `message.content` blocks a conversation record has,
+/// under a `type` the conversation decoder does not know).
+fn blob(uuid: &str, message: Value) -> Value {
+    json!({"type": "api-request-blob", "sessionId": SID, "uuid": uuid,
+           "parentUuid": null, "isSidechain": false, "message": message})
+}
+
+fn sidechain_rec(ty: &str, uuid: &str, parent: Option<&str>, message: Value) -> Value {
+    let mut v = rec(ty, uuid, parent, message);
+    v["isSidechain"] = json!(true);
+    v
+}
+
+#[test]
+fn a_snapshot_replaying_a_closed_use_reopens_nothing() {
+    // Opposed arm 1: use + result + snapshot replaying the use -> 0 open.
+    // Mutant bait: any read of the blob's nested blocks reopens it.
+    let mut open = HashSet::new();
+    track_tool_calls(&rec("assistant", "a1", None, bash("toolu_x", "ls")), &mut open, None);
+    track_tool_calls(&rec("user", "r1", Some("a1"), result("toolu_x", "ok")), &mut open, None);
+    track_tool_calls(&blob("snap1", bash("toolu_x", "ls")), &mut open, None);
+    assert!(open.is_empty(), "{open:?}");
+}
+
+#[test]
+fn a_real_assistant_use_after_the_pair_opens_one() {
+    // Opposed arm 2: the same pair followed by a REAL new assistant use of a
+    // fresh id -> 1 open. This is the control that keeps the snapshot arm
+    // honest: only the record's TOP type decides, never its payload shape.
+    let mut open = HashSet::new();
+    track_tool_calls(&rec("assistant", "a1", None, bash("toolu_x", "ls")), &mut open, None);
+    track_tool_calls(&rec("user", "r1", Some("a1"), result("toolu_x", "ok")), &mut open, None);
+    track_tool_calls(&rec("assistant", "a2", Some("r1"), bash("toolu_y", "pwd")), &mut open, None);
+    assert_eq!(open, HashSet::from(["toolu_y".to_string()]));
+}
+
+#[test]
+fn a_snapshot_result_neither_closes_nor_counts() {
+    // Opposed arm 3: a snapshot carrying a result cannot close a real
+    // unmatched call — and on the Closing leg it cannot increment `closed`
+    // either, while a genuine result does both.
+    let mut open = HashSet::new();
+    let mut closed = 0usize;
+    track_tool_calls(&rec("assistant", "a1", None, bash("toolu_x", "ls")), &mut open, None);
+    track_tool_calls(&blob("snap1", result("toolu_x", "ok")), &mut open, Some(&mut closed));
+    assert!(open.contains("toolu_x"), "{open:?}");
+    assert_eq!(closed, 0);
+    track_tool_calls(&rec("user", "r1", Some("a1"), result("toolu_x", "ok")), &mut open, Some(&mut closed));
+    assert!(open.is_empty(), "{open:?}");
+    assert_eq!(closed, 1);
+}
+
+#[test]
+fn a_same_id_snapshot_replay_stays_closed_but_a_real_reissue_reopens() {
+    // The decisive hostile arm (arc-codex): assistant-use(A), user-result(A),
+    // snapshot-use(A) stays 0 — then a REAL assistant reissue of A opens 1
+    // even though a historical result exists, because the tracker pairs
+    // temporally, never by global id coverage.
+    let mut open = HashSet::new();
+    track_tool_calls(&rec("assistant", "a1", None, bash("toolu_a", "ls")), &mut open, None);
+    track_tool_calls(&rec("user", "r1", Some("a1"), result("toolu_a", "ok")), &mut open, None);
+    track_tool_calls(&blob("snap1", bash("toolu_a", "ls")), &mut open, None);
+    assert!(open.is_empty(), "{open:?}");
+    track_tool_calls(&rec("assistant", "a2", Some("r1"), bash("toolu_a", "ls")), &mut open, None);
+    assert_eq!(open, HashSet::from(["toolu_a".to_string()]));
+}
+
+#[test]
+fn sidechain_records_still_count_as_conversation() {
+    // The mutant the design note names: `turn_kind` excludes sidechains, so
+    // gating on it would silently stop tracking sub-agent calls. A sidechain
+    // assistant opens and a sidechain user result closes.
+    let mut open = HashSet::new();
+    track_tool_calls(&sidechain_rec("assistant", "a1", None, bash("toolu_s", "ls")), &mut open, None);
+    assert!(open.contains("toolu_s"), "{open:?}");
+    track_tool_calls(&sidechain_rec("user", "r1", Some("a1"), result("toolu_s", "ok")), &mut open, None);
+    assert!(open.is_empty(), "{open:?}");
+}
