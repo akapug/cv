@@ -23,6 +23,15 @@ fn write_jsonl(path: &Path, lines: &[Value]) {
     std::fs::write(path, body).unwrap();
 }
 
+fn append(path: &Path, bytes: &[u8]) {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
+}
+
 fn rec(ty: &str, uuid: &str, parent: Option<&str>, message: Value) -> Value {
     json!({"type": ty, "sessionId": SID, "uuid": uuid, "parentUuid": parent, "isSidechain": false,
            "cwd": "/work/proj", "timestamp": "2026-06-16T00:00:00Z", "message": message})
@@ -478,6 +487,99 @@ fn end_refuses_invalid_json_tail_in_native_and_staged_copies() {
             assert_eq!(cut.omitted_lines, 4);
             cleanup(&dir);
         }
+    }
+}
+
+/// An explicit cut whose message leaves a call open scans on past the cut (`Closing`) for the
+/// result. A malformed line on the way is a future record the cut never meant to copy: it is
+/// omitted, and the result after it still closes the call. The same bytes under `End` sit inside
+/// the copied window and refuse, so the omission is the cut's, not a relaxed parse.
+#[test]
+fn an_explicit_cut_omits_a_malformed_line_while_it_closes_an_open_call() {
+    let dir = tmpdir();
+    let src = dir.join(format!("{SID}.jsonl"));
+    write_jsonl(
+        &src,
+        &[
+            rec("user", "u0", None, text("user", "read it")),
+            rec("assistant", "a0", Some("u0"), bash("t1", "cat notes")),
+        ],
+    );
+    let mut tail = b"not-json\n".to_vec();
+    for v in [
+        rec("user", "t1r", Some("a0"), result("t1", "notes")),
+        rec("assistant", "a1", Some("t1r"), text("assistant", "read")),
+    ] {
+        tail.extend(v.to_string().into_bytes());
+        tail.push(b'\n');
+    }
+    append(&src, &tail);
+    let cut = idx_of(&src, "a0");
+
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::Message(cut), &dir.join("out"))).unwrap();
+    assert_eq!(uuids(&read_lines(&res.new_path)), ["u0", "a0", "t1r"]);
+    assert_eq!((res.cut_line, res.end_line), (2, 4));
+    assert_eq!((res.closed_tool_calls, res.open_tool_calls), (1, 0));
+    assert_eq!(res.omitted_lines, 2, "the malformed line and the turn after the close");
+
+    let err = rewind_session(&sref(&src, SID), &opts(CutAt::End, &dir.join("end"))).unwrap_err();
+    assert!(
+        err.to_string().contains("line 3 is not a complete JSON record"),
+        "{err}"
+    );
+    cleanup(&dir);
+}
+
+/// The same, with the call never closed: the scan reaches EOF, the open call is reported, and a
+/// live session's half-written last line (no newline) is omitted rather than refused.
+#[test]
+fn an_explicit_cut_left_open_omits_a_half_written_last_line() {
+    let dir = tmpdir();
+    let src = dir.join(format!("{SID}.jsonl"));
+    write_jsonl(
+        &src,
+        &[
+            rec("user", "u0", None, text("user", "read it")),
+            rec("assistant", "a0", Some("u0"), bash("t1", "cat notes")),
+        ],
+    );
+    let cut = idx_of(&src, "a0");
+    append(&src, b"{\"type\":\"user\"");
+    let before = std::fs::read(&src).unwrap();
+
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::Message(cut), &dir.join("out"))).unwrap();
+    assert_eq!(uuids(&read_lines(&res.new_path)), ["u0", "a0"]);
+    assert_eq!((res.closed_tool_calls, res.open_tool_calls), (0, 1));
+    assert_eq!(res.omitted_lines, 1);
+    assert_eq!(std::fs::read(&src).unwrap(), before, "the source must never change");
+    cleanup(&dir);
+}
+
+/// Under `End` the last line of the captured prefix is copied, so a half-written one refuses; with
+/// no newline the session may still be appending it, and the refusal says to rerun before it says
+/// to repair. The same bytes WITH a newline are a finished bad record: no rerun is offered.
+#[test]
+fn end_names_a_rerun_for_an_unterminated_last_line_only() {
+    for (tail, rerun) in [
+        ("{\"type\":\"cost-state\"", true),
+        ("{\"type\":\"cost-state\"\n", false),
+    ] {
+        let dir = tmpdir();
+        let src = session_tailed(&dir);
+        append(&src, tail.as_bytes());
+        let out = dir.join("out");
+        let msg = rewind_session(&sref(&src, SID), &opts(CutAt::End, &out))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("line 6"), "{msg}");
+        assert_eq!(
+            msg.contains("unterminated") && msg.contains("rerun the rewind"),
+            rerun,
+            "{msg}"
+        );
+        assert_eq!(msg.contains("not a complete JSON record"), !rerun, "{msg}");
+        assert!(std::fs::read_dir(&out).unwrap().next().is_none(), "nothing published");
+        cleanup(&dir);
     }
 }
 

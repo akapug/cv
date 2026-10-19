@@ -776,12 +776,31 @@ fn rewind_session_after_scan(
         let parsed: Option<Value> = if buf[..n].iter().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n')) {
             None
         } else {
-            Some(serde_json::from_slice(&buf[..n]).with_context(|| {
-                format!(
-                    "{}: line {line_no} is not a complete JSON record; repair it or cut before it with `--at <MSG_IDX>`",
-                    r.path.display()
-                )
-            })?)
+            match serde_json::from_slice(&buf[..n]) {
+                Ok(v) => Some(v),
+                // Past an explicit cut only a record that closes an open call is copied, and a
+                // line that does not parse closes nothing: it is omitted like any other.
+                Err(_) if phase == Phase::Closing => {
+                    omitted_lines += 1;
+                    omitted_bytes += n as u64;
+                    continue;
+                }
+                Err(e) => {
+                    // The captured prefix can end inside a record the session is still appending.
+                    let why = if off == size && buf[n - 1] != b'\n' {
+                        format!(
+                            "is unterminated at the end of the {size} bytes captured; if the session is still \
+                             being written, rerun the rewind; if it was cut short, repair it"
+                        )
+                    } else {
+                        "is not a complete JSON record; repair it".into()
+                    };
+                    let path = r.path.display();
+                    return Err(e).with_context(|| {
+                        format!("{path}: line {line_no} {why} or cut before it with `--at <MSG_IDX>`")
+                    });
+                }
+            }
         };
         let out_line: Vec<u8> = match parsed {
             None => buf[..n].to_vec(), // blank line: verbatim

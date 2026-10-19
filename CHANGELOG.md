@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- `cv rewind` refuses incomplete or invalid JSON in its copied window without publishing; explicit cuts still omit malformed future records.
+- `cv rewind` refuses incomplete or invalid JSON in its copied window without publishing (an unterminated last line, which a live session may still be writing, asks for a rerun); explicit cuts still omit malformed future records, including while they copy on to close a cut's open tool calls.
+
+
 - **Breaking:** `cv scry` with stdout piped prints the sessions it would follow once and exits 0; `--follow` keeps following, `--for 30s|5m|2h` bounds it.
 - Every waiting command announces what it waits for on stderr within a second, before its first discovery; daemons print their ready line first.
 - `cv workflow --follow` gains `--for <duration>`: stop after that long and render the run as it stands.
