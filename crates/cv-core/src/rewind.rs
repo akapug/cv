@@ -788,9 +788,13 @@ fn rewind_session_after_scan(
                     continue;
                 }
                 // A record the codec reads nothing out of — a conversation record with no `message`
-                // body (`cv show` counts it as no message at all). Copying past it would drop it
-                // silently, so refuse and say which record; nothing is published (the staged copy
-                // is dropped), so the well-formed records before it are never written either.
+                // body (`cv show` counts it as no message at all). The refusal is deliberate
+                // validation, not a claim that the copy would drop these bytes: on the default
+                // path the record would be written verbatim, and only a re-emitted copy (`staged`)
+                // goes back through a reader that takes nothing out of it. The contract is a
+                // complete captured physical end with a malformed tail refused, so cv never mints
+                // a session it cannot read back. Nothing is published either way — the staged copy
+                // is dropped, so the well-formed records before it are never written.
                 if let Some(ty) = unreadable_record(&v) {
                     drop(writer.take());
                     bail!(
