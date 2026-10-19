@@ -145,9 +145,14 @@ impl FileId {
 /// How many bytes a [`Prefix`] samples at the head of the file and again just before its end.
 pub(crate) const SAMPLE_SPAN: u64 = 4096;
 
+/// How many bytes one read of [`prefix_sha256`] takes at a time: a bounded buffer over a prefix
+/// that can be gigabytes.
+const PREFIX_READ_SPAN: u64 = 64 * 1024;
+
 /// The bytes `0..len` of one file (device, inode), sampled: FNV-1a over the first
 /// [`SAMPLE_SPAN`] bytes, the [`SAMPLE_SPAN`] bytes before `len` (overlapping on a short file)
-/// and `len` itself. A sample, not a digest of the whole prefix.
+/// and `len` itself. A sample, not a digest of the whole prefix: a caller whose claim covers
+/// every byte of the prefix compares `prefix_sha256` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Prefix {
     pub len: u64,
@@ -183,6 +188,24 @@ impl Prefix {
     pub fn holds(&self, path: &Path) -> bool {
         std::fs::File::open(path).is_ok_and(|file| Self::of(&file, self.len) == Some(*self))
     }
+}
+
+/// SHA-256 over the whole `0..len` bytes of `file` as they are now — the comparison [`Prefix`]
+/// only samples, so a same-length edit of the prefix's middle is visible here and invisible there.
+/// Positioned reads in bounded windows, so the handle's own position never moves and no prefix is
+/// ever held in memory; `None` when the file is shorter than `len` or unreadable.
+pub(crate) fn prefix_sha256(file: &std::fs::File, len: u64) -> Option<String> {
+    use crate::harness::store::jsonl::ranges::read_exact_at;
+    let mut hasher = crate::digest::Sha256::new();
+    let mut buf = vec![0u8; len.min(PREFIX_READ_SPAN) as usize];
+    let mut at = 0u64;
+    while at < len {
+        let n = (len - at).min(PREFIX_READ_SPAN) as usize;
+        read_exact_at(file, &mut buf[..n], at).ok()?;
+        hasher.update(&buf[..n]);
+        at += n as u64;
+    }
+    Some(hasher.finish_hex())
 }
 
 /// One recorded path: its identity, or `None` when absent. A pass's append-only primary also
@@ -1106,6 +1129,43 @@ mod tests {
 
     fn tuple(baseline: &Baseline) -> Option<(u64, u64)> {
         baseline.primary.map(|id| (id.len, id.mtime_ns))
+    }
+
+    /// A `Prefix` samples; the whole-prefix digest is what a claim about every copied byte needs.
+    /// The sample's blindness here is the premise, asserted rather than assumed.
+    #[test]
+    fn whole_prefix_digest_sees_the_middle_a_sample_cannot_and_ignores_growth() {
+        let w = crate::test_world("source-prefix-digest");
+        let path = w.base.join("session.jsonl");
+        let body = |marker: &str| format!("{}{}{}", "x".repeat(6000), marker, "y".repeat(6000));
+        std::fs::write(&path, body("original")).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        let at = body("original").find("original").unwrap();
+        assert!(
+            at as u64 >= SAMPLE_SPAN && at as u64 + 8 <= len - SAMPLE_SPAN,
+            "the marker must sit outside both {SAMPLE_SPAN}-byte samples"
+        );
+        let captured = prefix_sha256(&file, len).unwrap();
+        assert_eq!(prefix_sha256(&file, len).unwrap(), captured, "an unchanged prefix");
+        assert!(
+            prefix_sha256(&file, len + 1).is_none(),
+            "a file shorter than the prefix"
+        );
+        let prefix = Prefix::of(&file, len).unwrap();
+        std::fs::write(&path, body("modified")).unwrap();
+        assert!(
+            prefix.holds(&path),
+            "the sample is blind to a same-length middle rewrite"
+        );
+        let rewritten = prefix_sha256(&file, len).unwrap();
+        assert_ne!(rewritten, captured, "the whole-prefix digest is not");
+        std::fs::write(&path, format!("{}tail\n", body("modified"))).unwrap();
+        assert_eq!(
+            prefix_sha256(&file, len).unwrap(),
+            rewritten,
+            "growth past the captured length leaves the captured prefix's digest alone"
+        );
     }
 
     #[cfg(unix)]

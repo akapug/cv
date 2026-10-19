@@ -557,21 +557,37 @@ pub(crate) fn normalize_subagent_record(v: &mut Value) -> bool {
 
 /// The source rewind copies a prefix of, captured before the copy and checked after it: the
 /// same file, unchanged or (an append-only transcript) grown with its sampled prefix intact
-/// ([`crate::source::FileId::admits`], whose sampling limit applies). The provenance's sha256 is
-/// of the bytes actually copied.
+/// ([`crate::source::FileId::admits`]), and the bytes the copy read still hashing as the source's
+/// whole prefix did at capture ([`crate::source::prefix_sha256`]). The sample is the cheap
+/// pre-check; the digest is what a 4 KiB sample cannot see. The provenance's sha256 is of the
+/// bytes actually copied.
 struct PrefixReadGuard {
     source: crate::json::JsonSource,
+    /// sha256 of the source's `0..len` bytes at capture.
+    prefix_sha256: String,
 }
 impl PrefixReadGuard {
     fn capture(path: &Path) -> Result<(Self, std::fs::File)> {
         let source = crate::json::JsonSource::capture(path)?;
         let file = std::fs::File::open(path)?;
         source.check_metadata(file.metadata()?)?;
-        Ok((Self { source }, file))
+        let prefix_sha256 = crate::source::prefix_sha256(&file, source.len())
+            .with_context(|| format!("digesting the prefix of {}", path.display()))?;
+        Ok((Self { source, prefix_sha256 }, file))
     }
     fn verify(&self, file: &std::fs::File) -> Result<()> {
         self.source.check_metadata(file.metadata()?)?;
         self.source.check()
+    }
+    /// The bytes the copy read are the source's bytes as captured: a source perturbed while it was
+    /// read, by anything the samples above cannot see, is refused rather than copied.
+    fn verify_copied(&self, copied_sha256: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.prefix_sha256 == copied_sha256,
+            "JSON source changed while it was copied: {}",
+            self.source.path().display()
+        );
+        Ok(())
     }
 }
 
@@ -840,6 +856,7 @@ fn rewind_session_after_scan(
     }
     source_guard.verify(&file)?;
     let source_sha256 = hasher.finish_hex();
+    source_guard.verify_copied(&source_sha256)?;
 
     // The launch dir: among the cwds the window recorded (plus the owning session's first one — a
     // sub-agent's records may all sit in a worktree), the one Claude would file this session under.

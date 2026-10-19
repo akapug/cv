@@ -569,6 +569,115 @@ fn rewind_prefix_receipt_accepts_appends_and_rejects_source_mutations() {
     }
 }
 
+/// The new id `opts()` pins.
+const NEW: &str = "22222222-2222-4222-8222-222222222222";
+
+/// A session whose records are long enough that a same-length rewrite of its middle falls outside
+/// **both** 4 KiB prefix samples ([`crate::source::SAMPLE_SPAN`]): the head sample `0..4096` and
+/// the tail sample `len-4096..len` do not overlap (the file is well over 2x4096). `original`
+/// appears twice — once inside the head sample, once in the unsampled middle.
+fn long_session(dir: &Path) -> PathBuf {
+    let path = dir.join(format!("{SID}.jsonl"));
+    let filler = |c: char| c.to_string().repeat(6000);
+    write_jsonl(
+        &path,
+        &[
+            rec(
+                "user",
+                "u0",
+                None,
+                text("user", &format!("original {} original {}", filler('x'), filler('y'))),
+            ),
+            rec("assistant", "a1", Some("u0"), text("assistant", "done")),
+        ],
+    );
+    path
+}
+
+/// Where each `original` sits in `body`, asserted to be the two the fixture places: one inside the
+/// head sample and one in the unsampled middle. The premise is checked, not assumed.
+fn markers(body: &[u8]) -> [usize; 2] {
+    let at: Vec<usize> = body
+        .windows(8)
+        .enumerate()
+        .filter(|(_, w)| *w == b"original")
+        .map(|(i, _)| i)
+        .collect();
+    let span = crate::source::SAMPLE_SPAN as usize;
+    let (head, middle) = (at[0], at[1]);
+    assert!(
+        head < span && middle >= span && middle + 8 <= body.len() - span,
+        "{at:?} of {} is not one sampled and one unsampled",
+        body.len()
+    );
+    [head, middle]
+}
+
+/// The other direction: a same-length rewrite *inside* a sample is a rewrite the guard has always
+/// seen, and growth that leaves the copied prefix byte-identical is still admitted.
+#[test]
+fn rewind_refuses_a_sampled_rewrite_and_admits_a_growth() {
+    let dir = tmpdir();
+    let src = long_session(&dir);
+    let original = std::fs::read(&src).unwrap();
+    let out = dir.join("out");
+    let inside = markers(&original)[0];
+    let sampled = rewind_session_after_scan(&sref(&src, SID), &opts(CutAt::End, &out), || {
+        let mut changed = original.clone();
+        changed[inside..inside + 8].copy_from_slice(b"modified");
+        std::fs::write(&src, changed)?;
+        Ok(())
+    });
+    assert!(sampled.is_err(), "a rewrite inside a sample is still a rewrite");
+    // Restore the fixture: the growth arm must capture the source as it was, not arm 1's rewrite.
+    std::fs::write(&src, &original).unwrap();
+    let grown = rewind_session_after_scan(&sref(&src, SID), &opts(CutAt::End, &out), || {
+        let mut changed = original.clone();
+        changed.extend_from_slice(b"\n");
+        std::fs::write(&src, changed)?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(grown.source_bytes, original.len() as u64);
+    assert_eq!(grown.source_sha256, {
+        let mut hash = crate::digest::Sha256::new();
+        hash.update(&original);
+        hash.finish_hex()
+    });
+    assert_eq!(
+        std::fs::read_to_string(grown.new_path).unwrap(),
+        crate::restamp::restamp(std::str::from_utf8(&original).unwrap(), NEW).body
+    );
+    cleanup(&dir);
+}
+
+/// The guard's claim is that the source was unperturbed while it was read. A rewrite whose bytes
+/// the 4 KiB samples miss is still a rewrite: the copy must not be derived from it.
+#[test]
+fn rewind_refuses_a_same_length_middle_rewrite_the_prefix_samples_miss() {
+    let dir = tmpdir();
+    let src = long_session(&dir);
+    let original = std::fs::read(&src).unwrap();
+    let middle = markers(&original)[1];
+    let out = dir.join("out");
+    let result = rewind_session_after_scan(&sref(&src, SID), &opts(CutAt::End, &out), || {
+        let mut changed = original.clone();
+        changed[middle..middle + 8].copy_from_slice(b"modified");
+        std::fs::write(&src, changed)?;
+        Ok(())
+    });
+    assert!(
+        result.is_err(),
+        "a same-length rewrite of the copied prefix's middle must not derive a rewind: {result:?}"
+    );
+    assert!(!out.join(format!("{NEW}.jsonl")).exists());
+    assert!(std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .all(|entry| !entry.file_name().to_string_lossy().starts_with(".cv-rewind-")));
+    cleanup(&dir);
+}
+
 #[test]
 fn rewind_rejects_output_ids_that_escape_the_output_directory() {
     let dir = tmpdir();
