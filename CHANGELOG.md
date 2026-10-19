@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `cv rewind` refuses incomplete or invalid JSON in its copied window without publishing; explicit cuts still omit malformed future records.
+
 - `cv prune`, `rewind` and `port` take `--skills-policy keep|drop-all|drop-stale`: the new session restores no skills, or none whose SKILL.md changed or vanished.
 
 - **Breaking:** `cv scry` with stdout piped prints the sessions it would follow once and exits 0; `--follow` keeps following, `--for 30s|5m|2h` bounds it.
