@@ -449,7 +449,12 @@ fn end_refuses_invalid_json_tail_in_native_and_staged_copies() {
         for tail in ["{\"type\":\"cost-state\"", "not-json\n", "{\"type\":}\n"] {
             let dir = tmpdir();
             let src = session_tailed(&dir);
-            std::fs::OpenOptions::new().append(true).open(&src).unwrap().write_all(tail.as_bytes()).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&src)
+                .unwrap()
+                .write_all(tail.as_bytes())
+                .unwrap();
             let before = std::fs::read(&src).unwrap();
             let out = dir.join("out");
             let options = RewindOptions {
@@ -461,7 +466,14 @@ fn end_refuses_invalid_json_tail_in_native_and_staged_copies() {
             assert!(std::fs::read_dir(&out).unwrap().next().is_none());
             assert_eq!(std::fs::read(&src).unwrap(), before);
             // A deliberate cut need not validate the bytes it omits.
-            let cut = rewind_session(&sref(&src, SID), &RewindOptions { at: CutAt::Message(1), ..options }).unwrap();
+            let cut = rewind_session(
+                &sref(&src, SID),
+                &RewindOptions {
+                    at: CutAt::Message(1),
+                    ..options
+                },
+            )
+            .unwrap();
             assert_eq!(cut.lines_written, 2);
             assert_eq!(cut.omitted_lines, 4);
             cleanup(&dir);
@@ -471,12 +483,27 @@ fn end_refuses_invalid_json_tail_in_native_and_staged_copies() {
 
 #[test]
 fn present_message_body_variants_remain_parser_compatible() {
-    for body in [json!(null), json!(false), json!(7), json!("bad"), json!([]), json!({}), json!({"content": null}), json!({"content": 7}), json!({"content": {}})] {
+    for body in [
+        json!(null),
+        json!(false),
+        json!(7),
+        json!("bad"),
+        json!([]),
+        json!({}),
+        json!({"content": null}),
+        json!({"content": 7}),
+        json!({"content": {}}),
+    ] {
         for ty in ["user", "assistant"] {
             let dir = tmpdir();
             let src = session_tailed(&dir);
             let bad = rec(ty, "invalid-body", Some("a0"), body.clone());
-            std::fs::OpenOptions::new().append(true).open(&src).unwrap().write_all((bad.to_string() + "\n").as_bytes()).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&src)
+                .unwrap()
+                .write_all((bad.to_string() + "\n").as_bytes())
+                .unwrap();
             let before = std::fs::read(&src).unwrap();
             let out = dir.join("out");
             let parsed = crate::harness::claude::parse_str("synthetic", std::str::from_utf8(&before).unwrap(), None);
@@ -495,10 +522,17 @@ fn valid_empty_content_and_unknown_tail_survive_all_copy_paths() {
     for thinking in [crate::emit::ThinkingMode::Native, crate::emit::ThinkingMode::Portable] {
         let dir = tmpdir();
         let src = session_attachment_and_bad_tail(&dir, false);
-        let extra = [rec("user", "empty", Some("a0"), json!({"role":"user", "content":[]})),
-                     json!({"type":"future-state", "sessionId":SID, "payload":{"untouched":true}})];
+        let extra = [
+            rec("user", "empty", Some("a0"), json!({"role":"user", "content":[]})),
+            json!({"type":"future-state", "sessionId":SID, "payload":{"untouched":true}}),
+        ];
         for v in extra {
-            std::fs::OpenOptions::new().append(true).open(&src).unwrap().write_all((v.to_string() + "\n").as_bytes()).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&src)
+                .unwrap()
+                .write_all((v.to_string() + "\n").as_bytes())
+                .unwrap();
         }
         let options = RewindOptions {
             thinking: Some(thinking),
@@ -511,6 +545,36 @@ fn valid_empty_content_and_unknown_tail_survive_all_copy_paths() {
         assert_eq!(got[4]["sessionId"], res.new_id);
         assert_eq!((res.end_line, res.omitted_lines), (5, 0));
         assert_eq!(got[2]["attachment"]["skills"].as_array().unwrap().len(), 1);
+        cleanup(&dir);
+    }
+}
+
+#[test]
+fn full_changes_start_but_end_still_includes_compacted_tail() {
+    for full in [false, true] {
+        let dir = tmpdir();
+        let src = session(&dir);
+        for tail in tail_records() {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&src)
+                .unwrap()
+                .write_all((tail.to_string() + "\n").as_bytes())
+                .unwrap();
+        }
+        let res = rewind_session(
+            &sref(&src, SID),
+            &RewindOptions {
+                full,
+                ..opts(CutAt::End, &dir.join("out"))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (res.start_line, res.end_line, res.omitted_lines),
+            (if full { 1 } else { 8 }, 20, 0)
+        );
+        assert_eq!(read_lines(&res.new_path).last().unwrap()["type"], "cost-state");
         cleanup(&dir);
     }
 }
