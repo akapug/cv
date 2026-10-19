@@ -98,7 +98,8 @@ verbatim carrier record under `ParseOptions::complete`) and `cv_byte_offset`.
   `total_tokens_reminder`, `batching_reminder_sent`, `bash_output_audience_note`, `queued_command`
   (task notifications / queued prompts — the biggest by bytes), `silent_turn_reminder`,
   `edited_text_file` (`{filename, snippet}`), `task_reminder`, `deferred_tools_delta`,
-  `agent_listing_delta`, `mcp_instructions_delta`, `skill_listing`, `command_permissions`,
+  `agent_listing_delta`, `mcp_instructions_delta`, `skill_listing`, `invoked_skills`,
+  `command_permissions`,
   `environment`, `date`/`date_change`, `model`, `instructions` (CLAUDE.md files), `session_context`,
   `remote_session_change`, `prompt_snapshot` (the whole system prompt + tool schemas; not re-sent),
   `auto_mode`, `goal_status`, `task_status`, `file` (an `@`-mentioned file), `compact_file_reference`,
@@ -110,6 +111,20 @@ verbatim carrier record under `ParseOptions::complete`) and `cv_byte_offset`.
   `extra["claude"]["attachment_type"]`. `prompt_snapshot` is the exception: its
   `attachment.systemPrompt[]` sections are joined into **`Session::system_prompt`** (the latest
   snapshot wins — a resume re-snapshots), and it is a session fact, never a message.
+- **`invoked_skills` is the restore set, not a prompt delta.** Its payload is
+  `attachment.skills[]`, one `{name, path, content}` per skill the session invoked, with `content` the
+  text as it was rendered then (a `Base directory for this skill: …` header, the body, and — for a
+  skill invoked with arguments — the invocation's `ARGUMENTS:` tail; a skill over the per-skill cap
+  ends with the truncation marker). Claude Code writes ALL of them back as one attachment at every
+  compaction, and `--resume` rebuilds the store from the records after the last compact boundary.
+  Nothing else forgets an entry, so a skill invoked once returns at every later compaction with its
+  old text, even after its file changed or the skill was removed. `path` is `<source>:<name>`, source
+  `userSettings` (the config dir), `projectSettings` (the recorded `cwd`'s `.claude`) or
+  `bundled`/`plugin:<plugin>`; a user or project skill's file is `skills/<name>/SKILL.md`, else the
+  legacy `commands/<name>.md` a slash command became (a nested `a:b` name is `commands/a/b.md`).
+  `cv prune`, `cv rewind` and `cv port` (to Claude) take `--skills keep|drop|drop-stale` and rewrite
+  those records in the session they write — `drop-stale` drops an entry whose file is gone at every
+  root or no longer matches the stored text — never the source.
 - **Synthetic assistant notices:** `assistant` lines with `message.model == "<synthetic>"` are Claude
   Code's own client-side rows, never sent to the API: `isApiErrorMessage:true` + `error`
   (`invalid_request`/`rate_limit`/…) for "Prompt is too long" (with `errorDetails` ONLY when it came from

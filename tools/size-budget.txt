@@ -1,12 +1,12 @@
 # Product lines per crate and per module, and test lines per crate (tools/check-size.py).
 # Raise a number only as a reviewed decision; the gate ratchets each one down as code shrinks.
 cv 18715
-cv-core 78864
+cv-core 78880
 cv-search 4901
 cv-testkit 450
 cv-web 15
 cv:tests 15515
-cv-core:tests 64661
+cv-core:tests 64715
 cv-search:tests 7394
 cv-testkit:tests 39
 cv-web:tests 0
@@ -25,7 +25,7 @@ cv-core:env 235
 cv-core:events 1500
 cv-core:formats 617
 cv-core:handoff 132
-cv-core:harness/claude 4338
+cv-core:harness/claude 4354
 cv-core:harness/claude_workflow 934
 cv-core:harness/cline 1285
 cv-core:harness/cline_sdk 680

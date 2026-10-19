@@ -1,4 +1,4 @@
-//! What a derived Claude session restores of the skills its source invoked (`--skills-policy`).
+//! What a derived Claude session restores of the skills its source invoked (`--skills`).
 //!
 //! Claude Code (traced in 2.1.302) records each skill a session invokes with its text as it was
 //! rendered then. Every compaction writes all of them back as one `invoked_skills` attachment, and
@@ -6,11 +6,12 @@
 //! Nothing else forgets an entry, so a skill invoked once is restored at every later compaction
 //! with its old text, even after its SKILL.md changed or the skill was removed.
 //!
-//! A prune, rewind or port can drop those entries from the session it writes: `drop-all` drops
-//! every one, `drop-stale` the ones whose SKILL.md is gone or no longer matches the stored text.
-//! A rewritten record loses its stored `rendered*` fields, so Claude Code renders it again from
-//! the kept list (an empty list renders nothing). A dropped skill stays invocable: the model gets
-//! its current text when it uses it again. Only the new session is rewritten, never the source.
+//! A prune, rewind or port can drop those entries from the session it writes: `drop` drops every
+//! one, `drop-stale` the ones whose file (the skill's `SKILL.md`, or the legacy `commands/<name>.md`
+//! a slash command became) is gone or no longer matches the stored text. A rewritten record loses
+//! its stored `rendered*` fields, so Claude Code renders it again from the kept list (an empty list
+//! renders nothing). A dropped skill stays invocable: the model gets its current text when it uses
+//! it again. Only the new session is rewritten, never the source.
 
 use super::replay::{copy, rows};
 use crate::harness::store::{
@@ -32,9 +33,10 @@ pub enum SkillsPolicy {
     #[default]
     Keep,
     /// No entry: the resumed session restores no skill.
-    DropAll,
-    /// Entries whose SKILL.md is gone or differs from the stored text. Bundled and plugin skills
-    /// have no file to compare and are kept.
+    Drop,
+    /// Entries whose file is gone or differs from the stored text: `skills/<name>/SKILL.md`, or the
+    /// legacy `commands/<name>.md` a slash command became. Bundled and plugin skills have no file
+    /// to compare and are kept.
     DropStale,
 }
 
@@ -42,7 +44,7 @@ impl SkillsPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
             SkillsPolicy::Keep => "keep",
-            SkillsPolicy::DropAll => "drop-all",
+            SkillsPolicy::Drop => "drop",
             SkillsPolicy::DropStale => "drop-stale",
         }
     }
@@ -53,9 +55,9 @@ impl std::str::FromStr for SkillsPolicy {
     fn from_str(s: &str) -> Result<Self> {
         Ok(match s {
             "keep" => SkillsPolicy::Keep,
-            "drop-all" => SkillsPolicy::DropAll,
+            "drop" => SkillsPolicy::Drop,
             "drop-stale" => SkillsPolicy::DropStale,
-            _ => anyhow::bail!("skills policy {s:?}: expected keep, drop-all or drop-stale"),
+            _ => anyhow::bail!("skills policy {s:?}: expected keep, drop or drop-stale"),
         })
     }
 }
@@ -204,7 +206,9 @@ fn current(entry: &Value, config: Option<&Path>, cwd: Option<&Path>) -> bool {
     was == now || was.strip_prefix(now).is_some_and(|rest| rest.starts_with('\n'))
 }
 
-/// The SKILL.md a user (`userSettings:`) or project (`projectSettings:`) skill is read from.
+/// The SKILL.md a user (`userSettings:`) or project (`projectSettings:`) skill is read from: the
+/// skill directory when it is there, else the legacy `commands/<name>.md` a skill kept from the
+/// slash-command era still lives in (Claude Code reads both under one name).
 fn skill_file(entry: &Value, config: Option<&Path>, cwd: Option<&Path>) -> Option<PathBuf> {
     let (source, name) = entry.get("path")?.as_str()?.split_once(':')?;
     let name = Some(name)
@@ -213,18 +217,31 @@ fn skill_file(entry: &Value, config: Option<&Path>, cwd: Option<&Path>) -> Optio
     if name.contains(['/', '\\']) || name.starts_with('.') {
         return None;
     }
-    let rel = Path::new("skills").join(name).join("SKILL.md");
     match source {
-        "userSettings" => Some(config?.join(rel)),
+        "userSettings" => Some(under(config?, name)),
         "projectSettings" => {
             let cwd = cwd?;
-            let found = cwd
-                .ancestors()
-                .map(|d| d.join(".claude").join(&rel))
-                .find(|p| p.exists());
-            Some(found.unwrap_or_else(|| cwd.join(".claude").join(&rel)))
+            let at = |d: &Path| under(&d.join(".claude"), name);
+            Some(cwd.ancestors().map(at).find(|p| p.exists()).unwrap_or_else(|| at(cwd)))
         }
         _ => None,
+    }
+}
+
+/// The file one root holds this skill's text in: `skills/<name>/SKILL.md` when it is there, else
+/// the legacy `commands/<name>.md` (a nested `a:b` name is `commands/a/b.md`), else the skill path
+/// itself. A name with no command file to look for (an empty, `.` or `..` path segment) has only
+/// the skill path; a skill whose file is gone at every root is the STALE case, not the
+/// unjudgeable one, which is why the primary candidate comes back whether or not it exists.
+fn under(root: &Path, name: &str) -> PathBuf {
+    let skill = root.join("skills").join(name).join("SKILL.md");
+    let command = name
+        .split(':')
+        .all(|p| !p.is_empty() && p != "." && p != "..")
+        .then(|| root.join("commands").join(format!("{}.md", name.replace(':', "/"))));
+    match command {
+        Some(command) if !skill.exists() && command.exists() => command,
+        _ => skill,
     }
 }
 

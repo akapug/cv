@@ -570,8 +570,8 @@ enum Cmd {
         declassify_tokens_file: Option<PathBuf>,
         /// Which restored skills the new session keeps. Claude Code restores every skill a session
         /// ever invoked, with its text as of then, at each compaction and resume: keep copies that
-        /// record, drop-all empties it, drop-stale drops skills whose SKILL.md changed or is gone.
-        #[arg(long, value_parser = ["keep", "drop-all", "drop-stale"], default_value = "keep")]
+        /// record, drop empties it, drop-stale drops skills whose file changed or is gone.
+        #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
         skills_policy: String,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
@@ -622,8 +622,8 @@ enum Cmd {
         thinking: Option<String>,
         /// Which restored skills the new session keeps. Claude Code restores every skill a session
         /// ever invoked, with its text as of then, at each compaction and resume: keep copies that
-        /// record, drop-all empties it, drop-stale drops skills whose SKILL.md changed or is gone.
-        #[arg(long, value_parser = ["keep", "drop-all", "drop-stale"], default_value = "keep")]
+        /// record, drop empties it, drop-stale drops skills whose file changed or is gone.
+        #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
         skills_policy: String,
         /// Report the window that would be written without writing anything.
         #[arg(long)]
@@ -806,8 +806,8 @@ enum Cmd {
         thinking: Option<String>,
         /// Which restored skills a Claude target keeps. Claude Code restores every skill a session
         /// ever invoked, with its text as of then, at each compaction and resume: keep copies that
-        /// record, drop-all empties it, drop-stale drops skills whose SKILL.md changed or is gone.
-        #[arg(long, value_parser = ["keep", "drop-all", "drop-stale"], default_value = "keep")]
+        /// record, drop empties it, drop-stale drops skills whose file changed or is gone.
+        #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
         skills_policy: String,
     },
     /// Print (or with --launch, run) the resume incantation for a session in its native harness.

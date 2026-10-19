@@ -47,7 +47,7 @@ pub(crate) fn cmd_port(
     };
     if skills_policy != SkillsPolicy::Keep && to_h != Harness::Claude {
         return usage(format!(
-            "--skills-policy {}: only a Claude target restores invoked skills (target: {to_h})",
+            "--skills {}: only a Claude target restores invoked skills (target: {to_h})",
             skills_policy.as_str()
         ));
     }
