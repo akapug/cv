@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `cv rewind` refuses incomplete or invalid JSON in its copied window without publishing; explicit cuts still omit malformed future records.
+- `cv rewind` refuses incomplete or invalid JSON in its copied window without publishing (an unterminated last line, which a live session may still be writing, asks for a rerun); explicit cuts still omit malformed future records, including while they copy on to close a cut's open tool calls.
 
 - `cv prune`, `rewind` and `port` take `--skills-policy keep|drop-all|drop-stale`: the new session restores no skills, or none whose SKILL.md changed or vanished.
 
