@@ -780,7 +780,7 @@ fn rewind_session_after_scan(
             omitted_bytes += n as u64;
             continue;
         }
-        let parsed: Option<Value> = if buf[..n].iter().all(u8::is_ascii_whitespace) {
+        let parsed: Option<Value> = if buf[..n].iter().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n')) {
             None
         } else {
             Some(serde_json::from_slice(&buf[..n]).with_context(|| {

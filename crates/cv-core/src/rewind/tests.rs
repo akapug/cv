@@ -451,7 +451,7 @@ fn end_refuses_invalid_json_tail_in_native_and_staged_copies() {
         (crate::emit::ThinkingMode::Native, SkillsPolicy::DropAll),
         (crate::emit::ThinkingMode::Portable, SkillsPolicy::Keep),
     ] {
-        for tail in ["{\"type\":\"cost-state\"", "not-json\n", "{\"type\":}\n"] {
+        for tail in ["{\"type\":\"cost-state\"", "not-json\n", "{\"type\":}\n", "\u{000c}\n"] {
             let dir = tmpdir();
             let src = session_tailed(&dir);
             std::fs::OpenOptions::new()
