@@ -380,7 +380,7 @@ fn latest_of(stamps: [Option<f64>; 3]) -> Option<DateTime<Utc>> {
 /// user-visible conversations and stay listed. An untitled compression tip takes its root's title,
 /// as Hermes's listing does (`COALESCE(tip.title, s.title)`, `hermes_state_sessions.py:1137`).
 fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
-    refs_conn(conn, path, None)
+    Ok(refs_conn(conn, path, false)?.into_iter().map(|(_, r)| r).collect())
 }
 
 /// The delegate sub-agent runs of one conversation (`model_config._delegate_from` naming it, or any
@@ -390,21 +390,63 @@ fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
 /// them from their parent. Empty when the db cannot be opened.
 pub fn subagent_refs(parent: &SessionRef) -> Result<Vec<SessionRef>> {
     let conn = open_ro(&parent.path)?;
-    conn.read(|conn, _| {
-        let chain: HashSet<String> = if Select::of(conn, "sessions").has("parent_session_id") {
-            session_lineage_root_to_tip(conn, &parent.id).into_iter().collect()
+    conn.read(|conn, reads| {
+        let chain = if Select::of(conn, "sessions").has("parent_session_id") {
+            session_lineage_root_to_tip(conn, &parent.id)
         } else {
-            HashSet::from([parent.id.clone()])
+            vec![parent.id.clone()]
         };
-        let mut out = refs_conn(conn, &parent.path, Some(&chain))?;
+        let by_parent = delegates_by_parent(conn, &parent.path, reads)?;
+        let mut out: Vec<SessionRef> = chain
+            .iter()
+            .filter_map(|id| by_parent.get(id))
+            .flatten()
+            .cloned()
+            .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
     })
 }
 
-/// Session refs in one db: with `delegates_of` unset, every listed conversation (see
-/// [`discover_conn`]); with it set, only the delegate runs whose `_delegate_from` is in the set.
-fn refs_conn(conn: &Connection, path: &Path, delegates_of: Option<&HashSet<String>>) -> Result<Vec<SessionRef>> {
+/// Every delegate run in one db, by the session its `_delegate_from` names.
+type Delegates = std::collections::HashMap<String, Vec<SessionRef>>;
+
+/// [`subagent_refs`]'s scan of one db, kept while the db and its WAL and journal stat as they did
+/// when it ran. A forest fold asks for every conversation's delegates, and the scan walks the
+/// whole `sessions` table, overflow pages included: one scan per parent made a `--subagents` pass
+/// over a 4 GB store with ~7,000 conversations read ~4 GB per conversation.
+fn delegates_by_parent(
+    conn: &Connection,
+    path: &Path,
+    reads: &crate::source::ReadSet,
+) -> Result<std::sync::Arc<Delegates>> {
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    type Memo = std::collections::HashMap<PathBuf, (crate::source::ReadSet, Arc<Delegates>)>;
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    let hit = memo
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(path)
+        .filter(|(seen, _)| seen.fresh(&mut crate::source::Probe::default()))
+        .map(|(_, by)| Arc::clone(by));
+    if let Some(by) = hit {
+        return Ok(by);
+    }
+    let mut by = Delegates::new();
+    for (from, r) in refs_conn(conn, path, true)? {
+        by.entry(from.unwrap_or_default()).or_default().push(r);
+    }
+    let by = Arc::new(by);
+    memo.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(path.to_path_buf(), (reads.clone(), Arc::clone(&by)));
+    Ok(by)
+}
+
+/// Session refs in one db, each with the session its `_delegate_from` names: with `delegates`
+/// unset, every listed conversation (see [`discover_conn`]); with it set, only the delegate runs.
+fn refs_conn(conn: &Connection, path: &Path, delegates: bool) -> Result<Vec<(Option<String>, SessionRef)>> {
     // Older schemas may lack `title`, `parent_session_id`, …: select what exists, NULL for the rest.
     let select = Select::of(conn, "sessions")
         .always(&["id"])
@@ -444,25 +486,25 @@ fn refs_conn(conn: &Connection, path: &Path, delegates_of: Option<&HashSet<Strin
         let delegate_from = lineage_markers(model_config.as_deref())
             .get("_delegate_from")
             .map(|v| v.as_str().unwrap_or_default().to_string());
-        match (delegates_of, &delegate_from) {
-            (None, Some(_)) => continue,
-            (Some(set), Some(from)) if set.contains(from) => {}
-            (Some(_), _) => continue,
-            (None, None) => {}
+        if delegates != delegate_from.is_some() {
+            continue;
         }
         let title = title.filter(|t| !t.is_empty()).or_else(|| {
             has_parent
                 .then(|| inherited_title(conn, &session_lineage_root_to_tip(conn, &id)))
                 .flatten()
         });
-        out.push(SessionRef {
-            cwd: cwd.filter(|c| !c.is_empty()).map(PathBuf::from),
-            title: title.map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE)),
-            created_at: started.and_then(ts_from_epoch),
-            updated_at: latest_of([ended, last, started]),
-            message_count: None,
-            ..SessionRef::new(id, Harness::Hermes, path.to_path_buf())
-        });
+        out.push((
+            delegate_from,
+            SessionRef {
+                cwd: cwd.filter(|c| !c.is_empty()).map(PathBuf::from),
+                title: title.map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE)),
+                created_at: started.and_then(ts_from_epoch),
+                updated_at: latest_of([ended, last, started]),
+                message_count: None,
+                ..SessionRef::new(id, Harness::Hermes, path.to_path_buf())
+            },
+        ));
     }
     // Counts stay unknown here; complete reads/indexing count canonical turns and certify them.
     Ok(out)
@@ -2954,6 +2996,20 @@ mod tests {
         // a child parses as its own conversation that names its parent
         let d1 = Hermes::with_db(db.clone()).parse(&kids[0]).unwrap();
         assert_eq!(d1.lineage.parent.as_deref(), Some("r"));
+        // The delegate scan is kept per db state: a delegate written after it is still seen.
+        let live = Connection::open(&db).unwrap();
+        insert_session(&live, "d3", Some("t"), Some("agent_close"), 1160.0, Some(1161.0));
+        live.execute(
+            "UPDATE sessions SET model_config = json_object('_delegate_from', 't'), source = 'subagent' WHERE id = 'd3'",
+            [],
+        )
+        .unwrap();
+        drop(live);
+        let kids = subagent_refs(tip).unwrap();
+        assert_eq!(
+            kids.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["d1", "d2", "d3"]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
