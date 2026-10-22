@@ -33,11 +33,12 @@
 //! Every message carries a precise `kind`/`origin` (INTERFACE-V2 §4): a human prompt vs. Codex's
 //! injected preambles, swarm `agent_message`s from `Origin::Subagent`, `item_completed` notes,
 //! compaction boundaries, model/effort changes, rollbacks (`Branch`), persisted errors, and — under
-//! `ParseOptions::complete` — verbatim `Carrier`s for every record with no conversational shape.
+//! `stream::Demand::COMPLETE` — verbatim `Carrier`s for every record with no conversational shape.
 //! Harness-specific facts (rate limits, turn ids, the structured `item`, swarm routing) live in
 //! `extra["codex"]`, the only bag this adapter writes; images become `Block::Image` references.
 
 mod emit;
+mod hook;
 mod legacy;
 mod record;
 pub use emit::emit;
@@ -48,13 +49,13 @@ use super::{parse_ts, Adapter};
 use crate::ir::*;
 use crate::json::{JsonSource, JsonView};
 use crate::lazy::Text;
-use crate::stream::{Checkpoint, Flow, MessageSink, ParseOptions};
-use anyhow::{Context, Result};
+use crate::stream::{self, Flow, MessageSink, Start, Tier};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use record::{Demand, Reader};
 use serde_json::{Map, Value};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::WalkDir;
@@ -105,6 +106,10 @@ pub struct Codex {
     roots: Vec<PathBuf>,
 }
 
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Codex = Codex { roots: Vec::new() };
+
 impl Codex {
     pub fn detect() -> Self {
         // Codex resolves its home as `$CODEX_HOME`, else `~/.codex` (codex-rs/utils/home-dir/src/lib.rs
@@ -129,19 +134,101 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    /// An MCP call Codex refused because the approval policy could not ask (`never`).
+    fn record_affordance(
+        &self,
+        m: &Message,
+        first: &crate::affordance::FirstText<'_>,
+    ) -> Result<Option<crate::affordance::RecordHit>> {
+        let mcp = m
+            .harness_extra(Harness::Codex)
+            .and_then(|bag| bag.get("item_type"))
+            .and_then(Value::as_str)
+            == Some("McpToolCall");
+        Ok(
+            (mcp && first.contains("requires approval")?).then_some(crate::affordance::RecordHit {
+                kind: crate::affordance::Kind::Approval,
+                action: "deny",
+                tool: "McpToolCall",
+            }),
+        )
+    }
+
     fn harness(&self) -> Harness {
         Harness::Codex
+    }
+
+    fn hook_event(&self, payload: &serde_json::Value) -> Result<Option<crate::hooks::Event>> {
+        hook::hook_event(payload)
+    }
+
+    fn capabilities(&self) -> super::Capabilities {
+        super::Capabilities {
+            denials: &[],
+            edit_guard: Some(crate::hooks::EditGuard::Deny),
+            // A descendant's hook row names its own parent, so a stop counts by forest membership.
+            lane_stops: Some(crate::lanes::StopScope::Forest),
+            deferred_wrapper: None,
+            // Native spans retain the same full-extra metadata.
+            rich_spans: true,
+            // Tiny native transcripts cost less to parse than to validate and replay a ledger.
+            usage_cache_floor: 64 * 1024,
+        }
+    }
+
+    fn hook_lineage(&self, transcript: &Path) -> Result<Option<Lineage>> {
+        Ok(hook_header(transcript)?.map(|s| s.lineage))
+    }
+
+    /// An app-server `FileChange` item, completed, records its edit in the Codex bag (code mode
+    /// applies patches without an `apply_patch` call the transcript shows).
+    fn native_edit<'m>(&self, m: &'m crate::ir::Message) -> Option<crate::events::NativeEdit<'m>> {
+        let item = m.extra.get("codex")?.get("item")?;
+        if item["type"] != "FileChange" || item["status"] != "completed" {
+            return None;
+        }
+        let mut paths = Vec::new();
+        for (path, change) in item.get("changes").and_then(Value::as_object).into_iter().flatten() {
+            paths.push(path.as_str());
+            paths.extend(change.get("move_path").and_then(Value::as_str));
+        }
+        Some(crate::events::NativeEdit {
+            id: item.get("id").and_then(Value::as_str),
+            tool: "apply_patch",
+            paths,
+        })
+    }
+
+    /// A plain `.jsonl` rollout only grows by appended lines; a compressed `.jsonl.zst` one's
+    /// byte prefix is not a logical prefix.
+    fn append_only(&self, r: &SessionRef) -> bool {
+        r.path.extension().is_some_and(|e| e == "jsonl")
+    }
+
+    /// Membership comes from installed hooks, each child verified against its own header.
+    fn forest(
+        &self,
+        r: &SessionRef,
+        _demand: crate::SubagentDemand,
+        workflow: Option<&str>,
+        select: &(dyn Fn(&str, Option<&str>) -> bool + Sync),
+    ) -> Result<Vec<crate::AgentRef>> {
+        Ok(super::select_forest(hook_forest(r)?, workflow, select))
     }
 
     fn roots(&self) -> Vec<PathBuf> {
         self.roots.clone()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         // Walk (cheap) to collect candidate paths, then scan (file read + parse) them in parallel.
         let mut paths = Vec::new();
+        let mut walk_errors = Vec::new();
         for root in &self.roots {
-            for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(root)
+                .into_iter()
+                .filter_map(|e| e.map_err(|e| walk_errors.extend(crate::Skipped::walk(&e))).ok())
+            {
                 let path = entry.path();
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if !name.starts_with("rollout-") {
@@ -157,89 +244,87 @@ impl Adapter for Codex {
                 paths.push(path.to_path_buf());
             }
         }
-        Ok(crate::par_discovery_filter_map(paths, |path| {
+        // An unreadable dir, and a rollout whose scan fails, are skipped and reported.
+        let mut found: crate::Discovered = crate::par_discovery_filter_map(paths, |path| {
             let scanned = || match is_zst_path(&path) {
                 // Decoded in full: an index running beside discovery streams these same bytes.
-                true => crate::handoff::decode_and_offer(
+                true => crate::codex_handoff::decode_and_offer(
                     || super::store::zst::content_size(&path),
                     || scan_rollout(&path, FULL_SCAN_CAP),
                 ),
                 false => scan(&path),
             };
-            crate::discover_cache::cached_scan(&path, || match scanned() {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    eprintln!("cv: skipping {}: {e:#}", path.display());
-                    None
-                }
-            })
-        }))
-    }
-
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
-        crate::stream::checked(sink, |sink| {
-            if !is_jsonl_path(&r.path) {
-                return legacy::stream(r, opts, sink);
-            }
-            // Modern `.jsonl` rollout. `has_events` is a whole-file property (do NL text come from
-            // `event_msg`s or `response_item`s?), decided by a bounded pass over the head first.
-            let rollout = Rollout::open(&r.path)?;
-            let has_events = rollout.events(rollout.len)?;
-            let state = ResumeState::new(Some(r.path.clone()), has_events, opts);
-            read(&rollout, &r.id, state, 0, rollout.len, opts, sink, &mut || Ok(()))
+            crate::Skipped::listed(
+                &path,
+                crate::discover_cache::cached_scan_checked(&path, || scanned().map(Some)),
+            )
         })
+        .into_iter()
+        .collect();
+        found.skipped.extend(walk_errors);
+        Ok(found)
     }
 
-    fn resume_format(&self) -> Option<u32> {
-        Some(RESUME_FORMAT)
+    fn stream(&self, r: &SessionRef, opts: &stream::Demand, sink: &mut dyn MessageSink) -> Result<Session> {
+        use anyhow::Context;
+        self.transcript(r, opts, Start::Whole, sink)?
+            .context("a whole read never declines")
     }
 
-    /// Plain JSONL resumes from a physical record boundary with the same option flavor as its
-    /// checkpoint. Compressed and legacy documents have no physical JSONL seek position. The
-    /// whole-file `has_events` decision is revalidated before any callbacks.
-    fn resume(
+    /// A modern `.jsonl` rollout through the driver. `has_events` is a whole-file property (do NL
+    /// texts come from `event_msg`s or `response_item`s?), decided by a bounded pass over the
+    /// head of the bytes read; a resume revalidates it before any callback. Only a plain file
+    /// resumes: a compressed one's decoded offsets are not file positions, and the 2025 legacy
+    /// document has no record boundaries.
+    fn transcript(
         &self,
         r: &SessionRef,
-        opts: &ParseOptions,
+        opts: &stream::Demand,
+        from: Start<'_>,
         sink: &mut dyn MessageSink,
-        from: &Checkpoint,
     ) -> Result<Option<Session>> {
         crate::stream::checked(sink, |sink| {
-            if is_zst_path(&r.path) || !is_jsonl_path(&r.path) {
+            if !is_jsonl_path(&r.path) {
+                return match from {
+                    Start::Whole => legacy::stream(r, opts, sink).map(Some),
+                    _ => Ok(None),
+                };
+            }
+            if is_zst_path(&r.path) && !matches!(from, Start::Whole) {
                 return Ok(None);
             }
-            let Some(state) = from.get::<ResumeState>(crate::stream::ADAPTER_LAYER) else {
-                return Ok(None);
+            let restored = match from {
+                Start::Checkpoint(cp) => {
+                    match jsonl::restore::<ResumeState>(cp, <Transcript as jsonl::Codec>::VERSION) {
+                        Some(state) if state.session.source_path.as_deref() == Some(r.path.as_path()) => Some(state),
+                        _ => return Ok(None),
+                    }
+                }
+                _ => None,
             };
-            if state.reading.flavor != Flavor::of(opts)
-                || state.ctx.complete != opts.complete
-                || (opts.complete && opts.spans && state.reading.complete_projection != 1)
-                || state.session.source_path.as_deref() != Some(r.path.as_path())
-            {
-                return Ok(None);
-            }
             let rollout = Rollout::open(&r.path)?;
-            if from.offset > rollout.len || rollout.events(rollout.len)? != state.has_events {
-                return Ok(None);
-            }
-            read(
-                &rollout,
-                &r.id,
+            let len = rollout.input.len();
+            let state = match (from, restored) {
+                (Start::Checkpoint(cp), Some(state)) => {
+                    if cp.offset > len || rollout.events(len)? != state.has_events {
+                        return Ok(None);
+                    }
+                    state
+                }
+                (Start::Prefix(to), _) => ResumeState::new(Some(r.path.clone()), rollout.events(to.min(len))?, opts),
+                _ => ResumeState::new(Some(r.path.clone()), rollout.events(len)?, opts),
+            };
+            let codec = Transcript {
                 state,
-                from.offset,
-                rollout.len,
+                id: &r.id,
                 opts,
-                sink,
-                &mut || Ok(()),
-            )
-            .map(Some)
+                input: &rollout.input,
+                held: Vec::new(),
+            };
+            jsonl::drive(&rollout.input, from, codec, sink)
         })
     }
 }
-
-/// What a checkpoint's adapter state means: bump when [`ResumeState`], [`CodexCtx`], or what a
-/// record parses to, changes.
-const RESUME_FORMAT: u32 = 3;
 
 /// Whole state between records, when no message awaits a following usage record.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -248,39 +333,10 @@ struct ResumeState {
     ctx: CodexCtx,
     has_events: bool,
     meta_sent: bool,
-    skipped: u64,
-    reading: Reading,
-}
-
-#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-struct Flavor {
-    extra: bool,
-    spans: bool,
-    offsets: bool,
-    complete: bool,
-}
-
-impl Flavor {
-    fn of(opts: &ParseOptions) -> Self {
-        Self {
-            extra: opts.extra,
-            spans: opts.spans,
-            offsets: opts.offsets,
-            complete: opts.complete,
-        }
-    }
-}
-
-#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
-struct Reading {
-    flavor: Flavor,
-    // Older complete+spans readers could omit native carriers or truncate portable late events.
-    #[serde(default)]
-    complete_projection: u8,
 }
 
 impl ResumeState {
-    fn new(source_path: Option<PathBuf>, has_events: bool, opts: &ParseOptions) -> Self {
+    fn new(source_path: Option<PathBuf>, has_events: bool, opts: &stream::Demand) -> Self {
         Self {
             session: Session {
                 source_path,
@@ -289,11 +345,6 @@ impl ResumeState {
             ctx: CodexCtx::for_opts(opts),
             has_events,
             meta_sent: false,
-            skipped: 0,
-            reading: Reading {
-                flavor: Flavor::of(opts),
-                complete_projection: u8::from(opts.complete && opts.spans),
-            },
         }
     }
 }
@@ -301,7 +352,7 @@ impl ResumeState {
 /// A `rollout-*.jsonl.zst`: Codex's in-place compression of cold rollouts (readable only with the
 /// `sqlite` feature, which brings the `store::zst` decoder).
 fn is_zst_rollout(name: &str) -> bool {
-    cfg!(feature = "sqlite") && name.ends_with(".jsonl.zst")
+    cfg!(feature = "zstd") && name.ends_with(".jsonl.zst")
 }
 
 fn is_zst_path(path: &Path) -> bool {
@@ -311,18 +362,6 @@ fn is_zst_path(path: &Path) -> bool {
 /// Modern JSONL rollout (plain or zstd-compressed), as opposed to the 2025 single-JSON layout.
 fn is_jsonl_path(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("jsonl") || is_zst_path(path)
-}
-
-/// Open a rollout for line-oriented reading, transparently decoding a `.jsonl.zst`.
-fn open_rollout(path: &Path) -> Result<Box<dyn BufRead>> {
-    let f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    #[cfg(feature = "sqlite")]
-    if is_zst_path(path) {
-        let dec = super::store::zst::decoder(BufReader::new(f))
-            .map_err(|e| anyhow::anyhow!("zstd header of {}: {e}", path.display()))?;
-        return Ok(Box::new(BufReader::new(dec)));
-    }
-    Ok(Box::new(BufReader::new(f)))
 }
 
 /// Per-parse state every reader carries between records (the record codec reads and updates it).
@@ -337,12 +376,19 @@ struct CodexCtx {
     inherit_before: Option<u64>,
     /// This thread's own `agent_path` (from `session_meta`), to attribute `agent_message` authorship.
     agent_path: Option<String>,
+    /// The first `session_meta`'s `cli_version`, under the metadata demand (discovery's writer
+    /// version sensor).
+    writer_version: Option<String>,
     /// `inter_agent_communication_metadata.trigger_turn` seen, waiting for the `agent_message`
     /// record it immediately precedes.
     pending_trigger_turn: Option<bool>,
     /// The canonical (first) `session_meta` has been applied — a fork embeds the parent's as a
     /// second line, whose thread-level fields must not overwrite the child's.
     meta_seen: bool,
+    /// That `session_meta` names cv as the writer ([`CV_ORIGINATOR`]): only then is a tool
+    /// output's [`ERROR_PREFIX`] cv's sentinel.
+    #[serde(default)]
+    cv_wrote: bool,
     /// Usage from the last `token_usage_record`, until its `token_count` twin (same numbers, a few
     /// records later) has been seen — so the twin never double-counts as a second carrier.
     pending_record_usage: Option<Usage>,
@@ -353,12 +399,90 @@ struct CodexCtx {
 }
 
 impl CodexCtx {
-    fn for_opts(opts: &ParseOptions) -> Self {
+    fn for_opts(opts: &stream::Demand) -> Self {
         CodexCtx {
-            complete: opts.complete,
+            complete: opts.tier == Tier::Complete,
             ..Default::default()
         }
     }
+}
+
+/// Codex hook membership is a native UUID/parent relation, verified against each child's header.
+/// This also makes the registered forest available to tools and query consumers of the one API.
+fn hook_forest(parent: &SessionRef) -> Result<Vec<crate::AgentRef>> {
+    let rows = crate::lanes::read_ledger();
+    let mut known = std::collections::HashSet::from([parent.id.clone()]);
+    let mut out = Vec::new();
+    loop {
+        let before = known.len();
+        for row in &rows {
+            if !known.contains(&row.session_id) || known.contains(&row.agent_id) {
+                continue;
+            }
+            let Some(path) = row.agent_transcript_path.as_deref() else {
+                continue;
+            };
+            // A child whose transcript cannot be read yet is not listed (the ledger keeps it).
+            let Some(head) = (match hook_header(path) {
+                Ok(head) => head,
+                Err(error) if super::is_not_found(&error) => None,
+                Err(error) => return Err(error),
+            }) else {
+                continue;
+            };
+            if head.id != row.agent_id || head.lineage.parent.as_deref() != Some(row.session_id.as_str()) {
+                continue;
+            }
+            known.insert(head.id.clone());
+            let mut session = SessionRef::new(head.id, Harness::Codex, path);
+            session.cwd = head.cwd;
+            session.created_at = head.created_at.or(Some(row.ts));
+            session.updated_at = Some(row.ts);
+            out.push(crate::AgentRef {
+                session,
+                agent_type: row.agent_type.clone(),
+                description: None,
+                tool_use_id: None,
+                workflow: None,
+                result_status: None,
+                result_summary: None,
+            });
+        }
+        if known.len() == before {
+            break;
+        }
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.session.created_at));
+    Ok(out)
+}
+
+/// Canonical header for a live hook's rollout: its first record, through the same captured
+/// reader and codec as every other read. Hooks never scan history; a blank, rejected, oversized
+/// (over 1 MiB) or incomplete first record has no usable identity (`None`). Read and codec
+/// errors are the caller's.
+pub fn hook_header(path: &Path) -> Result<Option<Session>> {
+    let read = jsonl::Read::open(path)?;
+    let mut s = Session {
+        source_path: Some(path.to_path_buf()),
+        ..Session::new(String::new(), Harness::Codex)
+    };
+    let mut ctx = CodexCtx::default();
+    let mut out = Vec::new();
+    let mut reader = Reader {
+        session: &mut s,
+        ctx: &mut ctx,
+        out: &mut out,
+        has_events: false,
+        demand: Demand::from(&stream::Demand::LEAN),
+        source: None,
+    };
+    read.prefix(1024 * 1024, |line| {
+        if let Some(view) = line.view {
+            reader.record(view)?;
+        }
+        Ok(Flow::Stop)
+    })?;
+    Ok((!s.id.is_empty()).then_some(s))
 }
 
 /// Parse a Codex transcript from its text contents into a [`Session`].
@@ -376,13 +500,17 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
     };
     let mut ctx = CodexCtx::default();
     let mut out: Vec<Message> = Vec::new();
-    let demand = Demand::of(&ParseOptions::full());
+    let demand = Demand::from(&stream::Demand::LEAN);
     if is_jsonl {
         let mut det = EventDetector::default();
-        super::for_each_json_line_str(text, |v| match nl_flags((&v).into()) {
-            Ok(flags) => det.feed(flags),
-            Err(_) => Flow::Continue,
+        let detected = super::store::jsonl::slice(text.as_bytes(), |line| {
+            Ok(line
+                .view
+                .map(nl_flags)
+                .transpose()?
+                .map_or(Flow::Continue, |flags| det.feed(flags)))
         });
+        super::note_read_error(&mut s, detected);
         let mut reader = Reader {
             session: &mut s,
             ctx: &mut ctx,
@@ -391,11 +519,17 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
             demand,
             source: None,
         };
-        let skipped = super::for_each_json_line_str(text, |v| {
-            let _ = reader.record((&v).into());
-            Flow::Continue
+        let mut skipped = 0;
+        let read = super::store::jsonl::slice(text.as_bytes(), |line| {
+            if let Some(view) = line.view {
+                reader.record(view)?;
+            } else {
+                skipped += u64::from(!line.blank);
+            }
+            Ok(Flow::Continue)
         });
-        super::note_skipped_lines(&mut s, skipped);
+        super::note_read_error(&mut s, read);
+        super::Unparsed(skipped).note(&mut s);
     } else if let Ok(root) = serde_json::from_str::<Value>(text) {
         let root = JsonView::from(&root);
         let mut reader = Reader {
@@ -406,7 +540,10 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
             demand,
             source: None,
         };
-        let _ = legacy::items(&mut reader, root);
+        let read = legacy::items(&mut reader, root);
+        super::note_read_error(&mut s, read);
+    } else {
+        super::Unparsed(u64::from(!text.trim().is_empty())).note(&mut s);
     }
     s.messages = out;
     if s.id.is_empty() {
@@ -418,23 +555,19 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
 /// What [`EventDetector`] reads of a record: whether it carries natural-language text as an
 /// `event_msg` (modern) or as a `response_item` message (old format).
 fn nl_flags(v: JsonView<'_>) -> Result<(bool, bool)> {
-    let string = |v: Option<JsonView<'_>>| -> Result<Option<String>> {
-        match v {
-            Some(v) if v.is_string()? => Ok(v.resolve()?.as_str().map(str::to_owned)),
-            _ => Ok(None),
-        }
+    let head = record::Head::of(v)?;
+    let Some(payload) = head.payload else {
+        return Ok((false, false));
     };
-    let payload = v.get("payload")?;
-    let field = |key| -> Result<Option<String>> { string(payload.map(|p| p.get(key)).transpose()?.flatten()) };
-    Ok(match string(v.get("type")?)?.as_deref() {
+    let payload = record::Payload::of(payload)?;
+    Ok(match head.ty.as_deref() {
         Some("event_msg") => (
-            matches!(field("type")?.as_deref(), Some("user_message" | "agent_message")),
+            matches!(payload.ty.as_deref(), Some("user_message" | "agent_message")),
             false,
         ),
         Some("response_item") => (
             false,
-            field("type")?.as_deref() == Some("message")
-                && matches!(field("role")?.as_deref(), Some("user" | "assistant")),
+            payload.ty.as_deref() == Some("message") && matches!(payload.role.as_deref(), Some("user" | "assistant")),
         ),
         _ => (false, false),
     })
@@ -505,36 +638,11 @@ fn flush_all_but_held(scratch: &mut Vec<Message>, sink: &mut dyn MessageSink) ->
     Flow::Continue
 }
 
-/// How many messages a parse of a plain `.jsonl` rollout's first `len` bytes yields — the count a
-/// parse would have returned when the file was `len` bytes long, since a live rollout only grows by
-/// appending. Both passes read only the prefix, so `has_events` is decided exactly as it was then.
-/// Not for `.jsonl.zst` (a byte prefix of a zstd stream is not a prefix of the rollout).
-pub(crate) fn count_prefix(r: &SessionRef, len: u64) -> Result<usize> {
-    count_prefix_checked(r, len, &mut || Ok(()))
-}
-
-pub(crate) fn count_prefix_checked(r: &SessionRef, len: u64, check: &mut dyn FnMut() -> Result<()>) -> Result<usize> {
-    let rollout = Rollout::open(&r.path)?;
-    let len = len.min(rollout.len);
-    let opts = ParseOptions::full();
-    let state = ResumeState::new(Some(r.path.clone()), rollout.events(len)?, &opts);
-    let mut n = 0usize;
-    let mut count = |_: Message| {
-        n += 1;
-        Flow::Continue
-    };
-    read(&rollout, &r.id, state, 0, len, &opts, &mut count, check)?;
-    Ok(n)
-}
-
 /// A rollout's bytes for one read: the plain file, or a `.jsonl.zst` decoded once into one
 /// private arena whose lazy children keep the compressed original's provenance.
 #[derive(Clone)]
 pub(crate) struct Rollout {
-    source: JsonSource,
-    file: Arc<fs::File>,
-    decoded: Option<Arc<ByteSource>>,
-    len: u64,
+    input: Arc<jsonl::Read>,
 }
 
 thread_local! {
@@ -557,42 +665,39 @@ pub(crate) fn with_decoded<T>(rollout: &Rollout, f: impl FnOnce() -> T) -> T {
 
 impl Rollout {
     fn open(path: &Path) -> Result<Self> {
-        let source = JsonSource::capture(path)?;
-        let decoded = DECODED.with(|decoded| decoded.borrow().as_ref().filter(|r| r.source == source).cloned());
+        let input = jsonl::Read::open(path)?;
+        let source = input.source().clone();
+        let decoded = DECODED.with(|decoded| {
+            decoded
+                .borrow()
+                .as_ref()
+                .filter(|r| r.input.source() == &source)
+                .cloned()
+        });
         if let Some(rollout) = decoded {
             return Ok(rollout);
         }
-        let file = Arc::new(fs::File::open(path).with_context(|| format!("opening {}", path.display()))?);
-        source.check_metadata(file.metadata()?)?;
         if !is_zst_path(path) {
-            return Ok(Self {
-                len: source.len(),
-                source,
-                file,
-                decoded: None,
-            });
+            return Ok(Self { input: Arc::new(input) });
         }
         let backing = Arc::new(ByteSource::arena()?);
         let (offset, len) = backing.append(|writer| {
-            std::io::copy(&mut open_rollout(path)?, &mut { writer })?;
+            let bytes = input.reader()?;
+            let mut bytes = super::store::zst::decoder(bytes)
+                .map_err(|e| anyhow::anyhow!("zstd header of {}: {e}", path.display()))?;
+            std::io::copy(&mut bytes, &mut { writer })?;
             Ok(())
         })?;
         source.check()?;
         debug_assert_eq!(offset, 0);
         Ok(Self {
-            source,
-            file,
-            decoded: Some(backing),
-            len,
+            input: Arc::new(input.decoded(backing, len)),
         })
     }
 
-    /// Every line `from..to` through the shared JSONL byte source.
+    /// Every line `from..to` through the shared JSONL byte source (a decoded copy reads to its end).
     fn lines(&self, from: u64, to: u64, visit: impl FnMut(jsonl::Line<'_>) -> Result<Flow>) -> Result<()> {
-        match &self.decoded {
-            Some(backing) => jsonl::for_each_decoded_line(&self.source, backing, self.len, from, visit),
-            None => jsonl::for_each_line(&self.source, &self.file, from, to, visit),
-        }
+        self.input.snapshot(from, to, visit)
     }
 
     /// The bounded `has_events` pass over records `0..to` (see [`EventDetector`]).
@@ -617,123 +722,96 @@ fn sourced(m: &Message) -> bool {
     })
 }
 
-/// The one Codex read: records `from..to` of the rollout, each through the record codec,
-/// accumulating into `state` (a checkpoint's, or a fresh one at 0). A trailing assistant message
-/// is held until the usage record that may follow it; after every finished line that leaves
-/// nothing held the sink may take a [`Checkpoint`] (plain files only: decoded offsets are not
-/// file positions). A record that published a source descriptor makes the reader recheck the
-/// source's identity before going on, and once more at the end.
-#[allow(clippy::too_many_arguments)] // One read: source, resume state, window, demand, sink, check.
-fn read(
-    rollout: &Rollout,
-    id: &str,
+/// The Codex record codec over one rollout: each record accumulates into the session and context
+/// (a checkpoint's, or fresh at 0). A trailing assistant message is held until the usage record
+/// that may follow it, so the codec is settled only when nothing is held. A record that published
+/// a source descriptor makes the reader recheck the source's identity before going on.
+struct Transcript<'r> {
     state: ResumeState,
-    from: u64,
-    to: u64,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<Session> {
-    let ResumeState {
-        session: mut s,
-        mut ctx,
-        has_events,
-        mut meta_sent,
-        mut skipped,
-        reading,
-    } = state;
-    let mut scratch: Vec<Message> = Vec::new();
-    let mut stopped = false;
-    let mut published = false;
-    let plain = rollout.decoded.is_none();
-    rollout.lines(from, to, |line| {
-        check()?;
-        let Some(view) = line.view else {
-            skipped += u64::from(!line.blank);
-            return Ok(Flow::Continue);
-        };
-        let before = scratch.len();
-        Reader {
-            session: &mut s,
-            ctx: &mut ctx,
-            out: &mut scratch,
+    id: &'r str,
+    opts: &'r stream::Demand,
+    input: &'r jsonl::Read,
+    held: Vec<Message>,
+}
+
+impl jsonl::Codec for Transcript<'_> {
+    /// The adapter state ([`ResumeState`], [`CodexCtx`], what a record parses to) is versioned by
+    /// the one stored-format version: bump [`crate::source::VERSION`] when it changes.
+    const VERSION: u32 = crate::source::VERSION;
+
+    fn record(&mut self, view: JsonView<'_>, at: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
+        let ResumeState {
+            session: s,
+            ctx,
             has_events,
-            demand: Demand::of(opts),
-            source: Some(&rollout.source),
+            meta_sent,
+        } = &mut self.state;
+        let before = self.held.len();
+        Reader {
+            session: s,
+            ctx,
+            out: &mut self.held,
+            has_events: *has_events,
+            demand: self.opts.into(),
+            source: Some(self.input.source()),
         }
         .record(view)?;
-        if opts.offsets && plain {
+        if self.opts.offsets && !self.input.is_decoded() {
             // Stamp this record's byte offset on the message(s) it produced (see
             // [`crate::offsets::OFFSET_KEY`]). Messages a later record amends (token_count usage)
             // keep their creating record's offset.
-            for m in &mut scratch[before..] {
-                m.extra.insert(crate::offsets::OFFSET_KEY.into(), line.at.into());
+            for m in &mut self.held[before..] {
+                m.extra.insert(crate::offsets::OFFSET_KEY.into(), at.into());
             }
         }
-        if scratch[before..].iter().any(sourced) {
-            published = true;
-            rollout.source.check()?;
+        if self.held[before..].iter().any(sourced) {
+            self.input.check()?;
         }
         // Hand the session metadata to the sink as soon as the model is known (session_meta /
         // turn_context land in the first records, before any message), so header-rendering sinks
         // have it ahead of the body.
-        if !meta_sent && s.model.is_some() {
-            sink.meta(&s);
-            meta_sent = true;
+        if !*meta_sent && s.model.is_some() {
+            sink.meta(s);
+            *meta_sent = true;
         }
-        if flush_all_but_held(&mut scratch, sink) == Flow::Stop {
-            stopped = true;
-            return Ok(Flow::Stop);
-        }
-        // A trailing assistant is provisional until its usage arrives; a partial EOF record is
-        // provisional until a newline arrives. Neither belongs in a reusable immutable prefix.
-        if plain && scratch.is_empty() && line.complete && sink.wants_checkpoint(line.end) {
-            let mut cp = Checkpoint::new(line.end);
-            cp.put(
-                crate::stream::ADAPTER_LAYER,
-                &StateRef {
-                    session: &s,
-                    ctx: &ctx,
-                    has_events,
-                    meta_sent,
-                    skipped,
-                    reading,
-                },
-            );
-            sink.checkpoint(&mut cp);
-        }
-        Ok(Flow::Continue)
-    })?;
-    if published {
-        rollout.source.check_metadata(rollout.file.metadata()?)?;
-        rollout.source.check()?;
+        Ok(flush_all_but_held(&mut self.held, sink))
     }
-    super::note_skipped_lines(&mut s, skipped);
-    if !stopped {
-        // EOF: emit the held trailing message, if any (no token_count followed it).
-        for m in scratch.drain(..) {
-            if sink.message(m) == Flow::Stop {
-                break;
+
+    /// A trailing assistant is provisional until its usage arrives.
+    fn settled(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    fn demand(&self) -> stream::Demand {
+        *self.opts
+    }
+
+    fn session(&mut self) -> &mut Session {
+        &mut self.state.session
+    }
+
+    fn state(&self) -> impl serde::Serialize + '_ {
+        &self.state
+    }
+
+    fn finish(mut self, stopped: bool, sink: &mut dyn MessageSink) -> Result<Session> {
+        if !stopped {
+            // EOF: emit the held trailing message, if any (no token_count followed it).
+            for m in self.held.drain(..) {
+                if sink.message(m) == Flow::Stop {
+                    break;
+                }
             }
         }
+        let s = &mut self.state.session;
+        if s.id.is_empty() {
+            s.id = self.id.to_string();
+        }
+        if !self.state.meta_sent {
+            sink.meta(s);
+        }
+        Ok(self.state.session)
     }
-    if s.id.is_empty() {
-        s.id = id.to_string();
-    }
-    if !meta_sent {
-        sink.meta(&s);
-    }
-    Ok(s)
-}
-
-#[derive(serde::Serialize)]
-struct StateRef<'a> {
-    session: &'a Session,
-    ctx: &'a CodexCtx,
-    has_events: bool,
-    meta_sent: bool,
-    skipped: u64,
-    reading: Reading,
 }
 
 /// `session_meta` fields with no first-class IR home, stashed verbatim (wire names) into
@@ -819,231 +897,36 @@ const USAGE_FROM_RECORD: &str = "token_usage_record";
 /// cv's emitter writes a failed tool result as the string `"[error] <content>"`: Codex's
 /// `FunctionCallOutputPayload` persists only a string or a content-item array — never an error
 /// bit (models.rs:2252-2275) — so this prefix is the one form that both decodes in Codex and
-/// round-trips `is_error` through cv. Recognized on parse and stripped from the content.
+/// round-trips `is_error` through cv. Recognized on parse and stripped from the content only in a
+/// rollout cv wrote ([`CV_ORIGINATOR`]): a tool's own output that happens to start `[error] ` is
+/// the tool's text, not cv's sentinel.
 const ERROR_PREFIX: &str = "[error] ";
 
-/// Accumulates the cheap metadata `discover` needs, one record at a time. Factored out of [`scan`]
-/// so it can be fed either the whole file (small sessions) or just a head+tail sample (huge ones).
-#[derive(Default)]
-#[cfg_attr(test, derive(Debug, PartialEq))]
-struct CodexScan {
-    id: String,
-    cwd: Option<PathBuf>,
-    title: Option<String>,
-    created_at: Option<DateTime<Utc>>,
-    updated_at: Option<DateTime<Utc>>,
-    message_count: usize,
-    /// `subagent_history_start_ordinal` of the first `session_meta`: records below it are the
-    /// parent's embedded history, not this thread's (they'd title every subagent with the parent's
-    /// first prompt and count its turns).
-    inherit_before: Option<u64>,
-    /// This thread's `agent_path`, to tell a task handed TO it (title-worthy) from its own sends.
-    agent_path: Option<String>,
-    meta_seen: bool,
-}
+/// `session_meta.originator` of a rollout cv's emitter wrote: the provenance [`ERROR_PREFIX`]
+/// is read under.
+const CV_ORIGINATOR: &str = "clustervision";
 
-impl CodexScan {
-    /// A title candidate, already trimmed and truncated ([`title_of`]).
-    fn consider_title(&mut self, title: String) {
-        // Skip Codex's injected preambles — they aren't the user's first words (see
-        // [`is_injected_text`]).
-        if self.title.is_none() && !title.is_empty() && !is_injected_text(&title) {
-            self.title = Some(title);
-        }
-    }
-
-    /// Ingest one `.jsonl` record.
-    fn feed(&mut self, v: JsonView<'_>) -> Result<()> {
-        let string = |v: Option<JsonView<'_>>| -> Result<Option<String>> {
-            match v {
-                Some(v) if v.is_string()? => Ok(v.resolve()?.as_str().map(str::to_owned)),
-                _ => Ok(None),
-            }
-        };
-        let ty = string(v.get("type")?)?;
-        if let Some(ts) = string(v.get("timestamp")?)?.as_deref().and_then(parse_ts) {
-            self.created_at.get_or_insert(ts);
-            self.updated_at = Some(ts);
-        }
-        // Inherited prefix of a fork/subagent rollout: not this thread's turns (see the codec).
-        let ordinal = v.get("ordinal")?.map(JsonView::as_number).transpose()?.flatten();
-        if matches!(
-            (ordinal.and_then(|n| n.as_u64()), self.inherit_before),
-            (Some(o), Some(cut)) if o < cut
-        ) && ty.as_deref() != Some("session_meta")
-        {
-            return Ok(());
-        }
-        let p = v.get("payload")?;
-        let field = |key| -> Result<Option<JsonView<'_>>> { Ok(p.map(|p| p.get(key)).transpose()?.flatten()) };
-        match ty.as_deref() {
-            None => {
-                if self.id.is_empty() {
-                    if let Some(i) = string(v.get("id")?)? {
-                        self.id = i;
-                    }
-                }
-            }
-            Some("session_meta") => {
-                if self.id.is_empty() {
-                    if let Some(i) = string(field("id")?)? {
-                        self.id = i;
-                    }
-                }
-                if self.cwd.is_none() {
-                    self.cwd = string(field("cwd")?)?.map(PathBuf::from);
-                }
-                if !self.meta_seen {
-                    self.meta_seen = true;
-                    self.inherit_before = field("subagent_history_start_ordinal")?
-                        .map(JsonView::as_number)
-                        .transpose()?
-                        .flatten()
-                        .and_then(|n| n.as_u64());
-                    self.agent_path = string(field("agent_path")?)?;
-                }
-            }
-            _ if self.title.is_some() => {}
-            Some("event_msg") => {
-                if string(field("type")?)?.as_deref() == Some("user_message") {
-                    if let Some(message) = field("message")?.filter(|m| m.is_string().unwrap_or(false)) {
-                        self.consider_title(title_of(Some(message), None)?);
-                    }
-                }
-            }
-            Some("response_item") => match string(field("type")?)?.as_deref() {
-                // An absent role is `user`, as in the codec.
-                Some("message") if string(field("role")?)?.as_deref().unwrap_or("user") == "user" => {
-                    self.consider_title(title_of(field("content")?, None)?);
-                }
-                // A task handed to this thread by another agent is its prompt — the only one a
-                // subagent thread usually gets (its `user`-role messages are the developer preamble).
-                Some("agent_message") if string(field("author")?)? != self.agent_path => {
-                    self.consider_title(title_of(field("content")?, Some("input_text"))?);
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-        Ok(())
+/// A listing title candidate, already trimmed and truncated ([`title_of`]): the first that is
+/// not one of Codex's injected preambles ([`is_injected_text`]) wins.
+fn consider_title(title: &mut Option<String>, candidate: String) {
+    if title.is_none() && !candidate.is_empty() && !is_injected_text(&candidate) {
+        *title = Some(candidate);
     }
 }
 
-/// A listing title from a body: `text_parts(v).trim()` truncated to 80 characters, where only
-/// parts of type `only` count when given. A body can carry arbitrarily long whitespace, so this
-/// keeps the first 81 characters and the last nonwhite position until the answer is determined.
+/// A listing title from a body: the trimmed [`Head`](crate::projection::Head) of its joined text, where
+/// only parts of type `only` count when given.
 fn title_of(v: Option<JsonView<'_>>, only: Option<&str>) -> Result<String> {
-    let mut head = String::new();
-    let mut chars = 0usize;
-    let mut last_nonwhite = 0usize;
-    record::for_each_joined_char_of(v, only, |ch| {
-        if head.is_empty() && ch.is_whitespace() {
-            return true;
-        }
-        if chars < 81 {
-            head.push(ch);
-            chars += 1;
-        }
-        if !ch.is_whitespace() {
-            last_nonwhite = chars;
-        }
-        last_nonwhite < 81
-    })?;
-    let trimmed: String = head.chars().take(last_nonwhite).collect();
-    Ok(crate::ir::truncate(&trimmed, 80))
-}
-
-/// Discovery's turn count: the record codec's own messages, counted, under its heads demand.
-/// Until the bounded detector decides `has_events`, both grammars run on the same records; once
-/// it is fixed, the other candidate is dropped, including for mixed-era late events. A pass keeps
-/// only the trailing message, the one a later usage record may attach to.
-#[derive(Default)]
-struct Turns {
-    detector: EventDetector,
-    decided: bool,
-    responses: Option<TurnPass>,
-    events: Option<TurnPass>,
-}
-
-struct TurnPass {
-    session: Session,
-    ctx: CodexCtx,
-    trailing: Vec<Message>,
-    count: usize,
-}
-
-impl Default for TurnPass {
-    fn default() -> Self {
-        Self {
-            session: Session::new(String::new(), Harness::Codex),
-            ctx: CodexCtx::default(),
-            trailing: Vec::new(),
-            count: 0,
-        }
-    }
-}
-
-impl TurnPass {
-    fn feed(&mut self, v: JsonView<'_>, has_events: bool) -> Result<()> {
-        let before = self.trailing.len();
-        Reader {
-            session: &mut self.session,
-            ctx: &mut self.ctx,
-            out: &mut self.trailing,
-            has_events,
-            demand: Demand {
-                spans: false,
-                heads: true,
-            },
-            source: None,
-        }
-        .record(v)?;
-        self.count += self.trailing[before..].iter().filter(|m| m.is_turn()).count();
-        if self.trailing.len() > 1 {
-            self.trailing.drain(..self.trailing.len() - 1);
-        }
-        Ok(())
-    }
-}
-
-impl Turns {
-    fn feed(&mut self, v: JsonView<'_>) -> Result<()> {
-        if !self.decided {
-            self.responses.get_or_insert_with(TurnPass::default);
-            self.events.get_or_insert_with(TurnPass::default);
-            if self.detector.feed(nl_flags(v)?) == Flow::Stop {
-                self.decided = true;
-                if self.detector.found {
-                    self.responses = None;
-                } else {
-                    self.events = None;
-                }
-            }
-        }
-        if let Some(pass) = &mut self.responses {
-            pass.feed(v, false)?;
-        }
-        if let Some(pass) = &mut self.events {
-            pass.feed(v, true)?;
-        }
-        Ok(())
-    }
-
-    fn count(&self) -> usize {
-        let pass = if self.detector.found {
-            &self.events
-        } else {
-            &self.responses
-        };
-        pass.as_ref().map_or(0, |pass| pass.count)
-    }
+    let mut head = crate::projection::Head::trimmed(crate::projection::Head::TITLE);
+    record::for_each_joined_char_of(v, only, |ch| !head.push_char(ch))?;
+    Ok(head.finish())
 }
 
 /// Files up to this size are scanned in full by [`scan`]; larger ones are sampled head+tail.
 const FULL_SCAN_CAP: u64 = 8 << 20; // 8 MiB
 
-/// Cheap metadata scan for `discover`: the record codec's heads demand counts turns, bodies are
-/// never resolved past a title. Files up to [`FULL_SCAN_CAP`] (and every `.jsonl.zst`) are scanned
+/// Metadata-only scan for `discover`: bodies are never resolved past a title and counts are
+/// deferred until a full read or index pass. Files up to [`FULL_SCAN_CAP`] (and every `.jsonl.zst`) are scanned
 /// in full; larger plain ones (Codex rollout logs can be hundreds of MB) are sampled head+tail so
 /// discovery never reads gigabytes just to list sessions. Exact content is parsed on actual open.
 fn scan(path: &Path) -> Result<SessionRef> {
@@ -1059,50 +942,51 @@ fn scan_capped(path: &Path, full_scan_cap: u64) -> Result<SessionRef> {
 fn scan_rollout(path: &Path, full_scan_cap: u64) -> Result<(SessionRef, Option<Rollout>)> {
     const SAMPLE: u64 = 1 << 20; // 1 MiB head, 1 MiB tail
 
-    let mut s = CodexScan::default();
+    let mut s = Session::new(String::new(), Harness::Codex);
+    let mut ctx = CodexCtx::default();
+    let mut out = Vec::new();
     let mut decoded = None;
     if !is_jsonl_path(path) {
         s = legacy::scan(path)?;
     } else {
+        let mut s = Reader {
+            session: &mut s,
+            ctx: &mut ctx,
+            out: &mut out,
+            has_events: false,
+            demand: (&stream::Demand::DISCOVERY).into(),
+            source: None,
+        };
         let rollout = Rollout::open(path)?;
-        if rollout.decoded.is_some() || rollout.len <= full_scan_cap {
-            let mut turns = Turns::default();
-            rollout.lines(0, rollout.len, |line| {
+        let len = rollout.input.len();
+        if rollout.input.is_decoded() || len <= full_scan_cap {
+            rollout.lines(0, len, |line| {
                 if let Some(view) = line.view {
-                    s.feed(view)?;
-                    turns.feed(view)?;
+                    s.record(view)?;
                 }
                 Ok(Flow::Continue)
             })?;
-            s.message_count = turns.count();
         } else {
             // Head: id / cwd / title / created_at all live near the top; its partial last line is
             // not read.
-            rollout.lines(0, SAMPLE.min(rollout.len), |line| {
+            rollout.lines(0, SAMPLE.min(len), |line| {
                 if let (Some(view), true) = (line.view, line.complete) {
-                    s.feed(view)?;
+                    s.record(view)?;
                 }
                 Ok(Flow::Continue)
             })?;
             // Tail: the last record carries the real updated_at. Skip the (likely partial) first line.
             let mut first = true;
-            rollout.lines(rollout.len.saturating_sub(SAMPLE), rollout.len, |line| {
+            rollout.lines(len.saturating_sub(SAMPLE), len, |line| {
                 if let (Some(view), false) = (line.view, std::mem::take(&mut first)) {
-                    s.feed(view)?;
+                    s.record(view)?;
                 }
                 Ok(Flow::Continue)
             })?;
-            // The middle was never read, so the turn count is unknown, and `message_count` is a
-            // contract (`SessionRef::message_count`: user + assistant turns, never a proxy). The
-            // head+tail extrapolation that used to stand here was measured 35× low on one real
-            // rollout and 50% high on another. Reading every byte is not the cheap alternative it
-            // looks: one real `~/.codex` holds 1,353 rollouts over this cap (80 GB; 283 over 64 MiB,
-            // the largest 700 MB), and a live one would be re-parsed on every `cv ls`. So a file
-            // over the cap reports 0 — "not counted" — rather than a number that is wrong.
-            s.message_count = 0;
+            // Keep the existing metadata sampling policy; all discovery defers exact counts.
         }
-        rollout.source.check()?;
-        decoded = rollout.decoded.is_some().then_some(rollout);
+        rollout.input.check()?;
+        decoded = rollout.input.is_decoded().then_some(rollout);
     }
 
     if s.id.is_empty() {
@@ -1116,22 +1000,296 @@ fn scan_rollout(path: &Path, full_scan_cap: u64) -> Result<(SessionRef, Option<R
     }
 
     let r = SessionRef {
-        id: s.id,
-        harness: Harness::Codex,
-        path: path.to_path_buf(),
         cwd: s.cwd,
         title: s.title,
         created_at: s.created_at,
         updated_at: s.updated_at,
-        message_count: s.message_count,
+        message_count: None,
+        ..SessionRef::new(s.id, Harness::Codex, path.to_path_buf())
     };
+    crate::discover_cache::read::Context::current().observe_writer(&r, ctx.writer_version.as_deref());
     Ok((r, decoded))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::Checkpoint;
+
+    #[test]
+    fn hook_forest_verifies_native_parents_and_follows_descendants() {
+        let world = crate::test_world("codex-hook-forest");
+        let parent = SessionRef::new("root", crate::Harness::Codex, world.base.join("root.jsonl"));
+        let row = |id: &str, parent: &str, actual_parent: &str| {
+            let path = world.base.join(format!("{id}.jsonl"));
+            std::fs::write(
+                &path,
+                serde_json::json!({"type":"session_meta", "payload":{"id":id,"parent_thread_id":actual_parent}})
+                    .to_string()
+                    + "\n",
+            )
+            .unwrap();
+            crate::lanes::LaneEvent {
+                ts: chrono::Utc::now(),
+                event: crate::lanes::LaneEventKind::Start,
+                session_id: parent.into(),
+                agent_id: id.into(),
+                agent_type: Some("default".into()),
+                transcript_path: None,
+                agent_transcript_path: Some(path),
+                cwd: None,
+                last_text: None,
+            }
+        };
+        // Descendant first; duplicated stop; wrong native parent must never become membership.
+        crate::lanes::append_lane_event(&row("grandchild", "child", "child")).unwrap();
+        let mut child = row("child", "root", "root");
+        crate::lanes::append_lane_event(&child).unwrap();
+        child.event = crate::lanes::LaneEventKind::Stop;
+        crate::lanes::append_lane_event(&child).unwrap();
+        crate::lanes::append_lane_event(&row("foreign", "root", "another-parent")).unwrap();
+        let forest = crate::subagent_tree_of(&parent).unwrap();
+        let ids: std::collections::HashSet<_> = forest.iter().map(|s| s.session.id.as_str()).collect();
+        assert_eq!(ids, std::collections::HashSet::from(["child", "grandchild"]));
+        assert!(forest.iter().all(|s| s.session.harness == crate::Harness::Codex));
+    }
+
     use crate::harness::Parse;
+
+    #[test]
+    fn legacy_title_early_stop_still_validates_the_whole_document() -> Result<()> {
+        let world = crate::test_world("codex-legacy-tail");
+        let path = world.proj.join("rollout-legacy.json");
+        let start = r#"{"session":{"id":"legacy","timestamp":"2026-01-01T00:00:00Z"},"items":[{"type":"message","content":"first title"},"#;
+        fs::write(
+            &path,
+            format!("{start}{{\"type\":\"reasoning\",\"ignored\":[true,null]}}]}}"),
+        )?;
+        assert_eq!(scan(&path)?.title.as_deref(), Some("first title"));
+        fs::write(
+            &path,
+            format!("{start}{{\"type\":\"reasoning\",\"ignored\":[true,]}}]}}"),
+        )?;
+        let rejected = legacy::scan(&path)?;
+        assert!(
+            rejected.id.is_empty() && rejected.title.is_none(),
+            "a useful title cannot hide a malformed tail"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn historical_count_prefix_accepts_its_unterminated_snapshot_end() -> Result<()> {
+        let world = crate::test_world("codex-count-snapshot");
+        let path = world.proj.join("rollout-prefix.jsonl");
+        let first =
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":"snapshot question"}}"#;
+        fs::write(&path, format!("{first}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":\"later question\"}}}}\n"))?;
+        let r = SessionRef::new("prefix", Harness::Codex, &path);
+        assert_eq!(crate::watch::count_prefix(&r, first.len() as u64, &mut || Ok(()))?, 1);
+        assert_eq!(adapter().parse(&r)?.messages.iter().filter(|m| m.is_turn()).count(), 2);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn callback_truncation_stops_before_resuming_mapped_records() -> Result<()> {
+        if !crate::harness::store::jsonl::tests::in_child(
+            "harness::codex::tests::callback_truncation_stops_before_resuming_mapped_records",
+        ) {
+            return Ok(());
+        }
+        struct Truncate {
+            path: PathBuf,
+            stage: u8,
+            mutated: bool,
+        }
+        impl Truncate {
+            fn at(&mut self, stage: u8) {
+                if self.stage == stage && !self.mutated {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&self.path)
+                        .unwrap()
+                        .set_len(0)
+                        .unwrap();
+                    self.mutated = true;
+                    // A callback that changed the file is a slow one by construction; the reader
+                    // checks the backing after a slow callback, before touching the mapping again.
+                    std::thread::sleep(crate::harness::store::jsonl::Read::SLOW_CALLBACK * 10);
+                }
+            }
+        }
+        impl MessageSink for Truncate {
+            fn message(&mut self, _: Message) -> Flow {
+                self.at(0);
+                Flow::Continue
+            }
+            fn meta(&mut self, _: &Session) {
+                self.at(1);
+            }
+            fn wants_checkpoint(&mut self, _: u64) -> bool {
+                self.at(2);
+                self.at(3);
+                self.stage != 2
+            }
+            fn checkpoint(&mut self, _: &mut Checkpoint) {
+                self.at(4);
+            }
+        }
+        let world = crate::test_world("codex-callback-shrink");
+        let path = world.proj.join("rollout-shrink.jsonl");
+        let prompt = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"owned prompt\"}}\n";
+        let raw = format!(
+            "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"test-model\"}}}}\n{}",
+            prompt.repeat(1024)
+        );
+        let reference = SessionRef::new("shrink", Harness::Codex, &path);
+        for stage in 0..5 {
+            fs::write(&path, &raw)?;
+            let mut sink = Truncate {
+                path: path.clone(),
+                stage,
+                mutated: false,
+            };
+            assert!(
+                adapter().stream(&reference, &stream::Demand::RICH, &mut sink).is_err(),
+                "callback stage {stage}"
+            );
+            assert!(sink.mutated, "the intended callback must actually run");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn held_final_assistant_verifies_source_after_delivery() -> Result<()> {
+        let world = crate::test_world("codex-held-completion");
+        let path = world.proj.join("rollout-held.jsonl");
+        let raw = r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"held answer"}]}}"#;
+        let reference = SessionRef::new("held", Harness::Codex, &path);
+        for stop in [Flow::Stop, Flow::Continue] {
+            fs::write(&path, raw)?;
+            let mut calls = 0;
+            adapter().stream(&reference, &stream::Demand::RICH, &mut |_: Message| {
+                calls += 1;
+                stop
+            })?;
+            assert_eq!(calls, 1, "unchanged source accepts either callback outcome");
+            let mut retained = None;
+            let result = adapter().stream(&reference, &stream::Demand::RICH, &mut |m: Message| {
+                retained = Some(m);
+                fs::remove_file(&path).unwrap();
+                stop
+            });
+            assert!(result.is_err(), "held EOF output must not bypass verification");
+            assert_eq!(retained.unwrap().text().as_deref(), Some("held answer"));
+        }
+        struct RemoveAtFinalMeta(PathBuf);
+        impl MessageSink for RemoveAtFinalMeta {
+            fn message(&mut self, _: Message) -> Flow {
+                Flow::Continue
+            }
+            fn meta(&mut self, _: &Session) {
+                fs::remove_file(&self.0).unwrap();
+            }
+        }
+        fs::write(&path, raw)?;
+        assert!(
+            adapter()
+                .stream(&reference, &stream::Demand::RICH, &mut RemoveAtFinalMeta(path))
+                .is_err(),
+            "the last metadata callback is inside completion verification too"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_classification_preserves_missing_role_and_canonical_meta() -> Result<()> {
+        let raw = [
+            r#"{"type":"session_meta","payload":{"id":"child","cwd":"/child","cli_version":"0.163","subagent_history_start_ordinal":5,"agent_path":"child"}}"#,
+            r#"{"ordinal":1,"type":"session_meta","payload":{"id":"parent","cwd":"/parent","cli_version":"99","subagent_history_start_ordinal":0}}"#,
+            r#"{"ordinal":2,"type":"response_item","payload":{"type":"message","content":"parent prompt"}}"#,
+            r#"{"ordinal":6,"type":"response_item","payload":{"type":"message","content":"own prompt"}}"#,
+        ].join("\n");
+        let mut scan = Session::new(String::new(), Harness::Codex);
+        let mut ctx = CodexCtx::default();
+        let mut out = Vec::new();
+        let mut reader = Reader {
+            session: &mut scan,
+            ctx: &mut ctx,
+            out: &mut out,
+            has_events: false,
+            demand: (&stream::Demand::DISCOVERY).into(),
+            source: None,
+        };
+        jsonl::slice(raw.as_bytes(), |line| {
+            if let Some(v) = line.view {
+                reader.record(v)?;
+            }
+            Ok(Flow::Continue)
+        })?;
+        assert!(out.is_empty(), "the metadata demand builds no message");
+        assert_eq!(scan.id, "child");
+        assert_eq!(scan.cwd.as_deref(), Some(Path::new("/child")));
+        assert_eq!(ctx.writer_version.as_deref(), Some("0.163"));
+        assert_eq!(scan.title.as_deref(), Some("own prompt"));
+        let session = parse_str("child", &raw, true, None);
+        assert_eq!(
+            session.messages.iter().filter_map(Message::text).collect::<Vec<_>>(),
+            ["own prompt"]
+        );
+        // An absent role is title/message compatible but does not certify an NL event twin.
+        let v: Value =
+            serde_json::from_str(r#"{"type":"response_item","payload":{"type":"message","content":"own prompt"}}"#)?;
+        assert_eq!(nl_flags(JsonView::from(&v))?, (false, false));
+        Ok(())
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn deferred_discovery_counts_refill_and_invalidate_on_source_change() -> Result<()> {
+        let world = crate::test_world("codex-count-publication");
+        let home = world.base.join("codex");
+        let dir = home.join("sessions");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("rollout-count.jsonl");
+        let first = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"count\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"question\"}}\n";
+        fs::write(&path, first)?;
+        let adapter = Codex::with_home(&home);
+        let context = crate::discover_cache::read::Context::current();
+        let _scope = context.enter();
+        let r = adapter.discover()?.remove(0);
+        assert_eq!(r.message_count, None);
+        crate::catalog::sync(std::slice::from_ref(&r));
+        crate::discover_cache::persist(false);
+        let mut sink = crate::stream::CollectSink::default();
+        let done = crate::stream::stream_counted(
+            &adapter,
+            &r,
+            &stream::Demand::FACTS.with_spans(),
+            &mut sink,
+            crate::stream::Pass::RECORD,
+        )?;
+        assert_eq!(done.counted.unwrap().turns, 1);
+        assert_eq!(adapter.discover()?[0].message_count, Some(1));
+        drop(_scope);
+        let next = crate::discover_cache::read::Context::current();
+        let _next_scope = next.enter();
+        assert_eq!(adapter.discover()?[0].message_count, Some(1));
+        fs::write(&path, format!("{first}{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":\"next\"}}}}\n"))?;
+        let changed = adapter.discover()?.remove(0);
+        assert_eq!(changed.message_count, None, "changed sources lose certified counts");
+        crate::catalog::sync(std::slice::from_ref(&changed));
+        crate::stream::stream_counted(
+            &adapter,
+            &changed,
+            &stream::Demand::FACTS.with_spans(),
+            &mut sink,
+            crate::stream::Pass::RECORD,
+        )?;
+        assert_eq!(adapter.discover()?[0].message_count, Some(2));
+        Ok(())
+    }
 
     #[derive(Default)]
     struct BufferedKept {
@@ -1164,12 +1322,12 @@ mod tests {
         Codex { roots: Vec::new() }
     }
 
-    fn buffered_pass(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Session {
+    fn buffered_pass(r: &SessionRef, opts: &stream::Demand, sink: &mut dyn MessageSink) -> Session {
         adapter().stream(r, opts, sink).unwrap()
     }
 
     /// The whole stream of `r`, messages collected.
-    fn whole(r: &SessionRef, opts: &ParseOptions) -> Session {
+    fn whole(r: &SessionRef, opts: &stream::Demand) -> Session {
         let mut sink = crate::stream::CollectSink::default();
         let mut s = buffered_pass(r, opts, &mut sink);
         s.messages = sink.messages;
@@ -1177,7 +1335,7 @@ mod tests {
     }
 
     /// `text` as a rollout file streamed under `opts`, resolved before the file goes.
-    fn stream_text(id: &str, text: &str, opts: &ParseOptions) -> Session {
+    fn stream_text(id: &str, text: &str, opts: &stream::Demand) -> Session {
         let dir = cv_testkit::temp_dir("codex-stream-text");
         let path = dir.join("rollout-text.jsonl");
         fs::write(&path, text).unwrap();
@@ -1205,7 +1363,7 @@ mod tests {
 
     // Independent old buffered transport/collector: preserve .lines(), trim, lean/full fallback,
     // held-message EOF handling, and corruption counts while the production driver tracks bytes.
-    #[cfg(feature = "sqlite")]
+    #[cfg(feature = "zstd")]
     #[test]
     fn portable_decoded_text_keeps_source_identity_and_rejects_mid_read_changes() {
         let world = crate::test_world("codex-portable-source-change");
@@ -1221,7 +1379,7 @@ mod tests {
             std::fs::write(&path, &bytes).unwrap();
             let r = SessionRef::new("source", Harness::Codex, &path);
             let mut sink = crate::stream::CollectSink::default();
-            let session = buffered_pass(&r, &ParseOptions::lazy(), &mut sink);
+            let session = buffered_pass(&r, &stream::Demand::LEAN.with_spans(), &mut sink);
             assert_eq!(session.source_path.as_deref(), Some(path.as_path()));
             let Block::ToolResult { content, .. } = &sink.messages[0].content[0] else {
                 panic!("missing result")
@@ -1230,7 +1388,7 @@ mod tests {
             let resolver = session.resolver();
             assert_eq!(content.try_resolve(&resolver).unwrap(), text);
             let mut owned = crate::stream::CollectSink::default();
-            buffered_pass(&r, &ParseOptions::full(), &mut owned);
+            buffered_pass(&r, &stream::Demand::RICH, &mut owned);
             let Block::ToolResult {
                 content: owned_text, ..
             } = &owned.messages[0].content[0]
@@ -1247,7 +1405,9 @@ mod tests {
                 std::fs::write(&path, b"changed during read").unwrap();
                 Flow::Stop
             };
-            assert!(adapter().stream(&r, &ParseOptions::lazy(), &mut mutate).is_err());
+            assert!(adapter()
+                .stream(&r, &stream::Demand::LEAN.with_spans(), &mut mutate)
+                .is_err());
         }
     }
 
@@ -1265,18 +1425,21 @@ mod tests {
             files += 1;
             let r = SessionRef::new("oracle", Harness::Codex, entry.path().to_path_buf());
             for opts in [
-                ParseOptions::lazy(),
-                ParseOptions::lazy_extra(),
-                ParseOptions::full(),
-                ParseOptions::bulk(),
-                ParseOptions::complete(),
+                stream::Demand::LEAN.with_spans(),
+                stream::Demand::RICH.with_spans(),
+                stream::Demand::RICH,
+                stream::Demand::LEAN,
+                stream::Demand::COMPLETE,
             ] {
                 let mut full = BufferedKept::default();
                 let mut shell = buffered_pass(&r, &opts, &mut full);
                 shell.messages = full.messages.clone();
                 for (index, (count, cp)) in full.checkpoints.iter().enumerate() {
                     let mut suffix = BufferedKept::default();
-                    let mut resumed = adapter.try_resume(&r, &opts, &mut suffix, cp).unwrap().unwrap();
+                    let mut resumed = adapter
+                        .transcript(&r, &opts, crate::stream::Start::Checkpoint(cp), &mut suffix)
+                        .unwrap()
+                        .unwrap();
                     assert_eq!(
                         serde_json::to_value(&suffix.messages).unwrap(),
                         serde_json::to_value(&full.messages[*count..]).unwrap()
@@ -1316,37 +1479,36 @@ mod tests {
         .unwrap();
         let r = SessionRef::new("s", Harness::Codex, path);
         let adapter = Codex::with_home(&world.home.join(".codex"));
-        let opts = ParseOptions {
+        let opts = stream::Demand {
             spans: true,
-            ..ParseOptions::complete()
+            ..stream::Demand::COMPLETE
         };
         let mut prefix = BufferedKept::default();
         buffered_pass(&r, &opts, &mut prefix);
         let (count, checkpoint) = prefix.checkpoints.last().unwrap();
         assert!(*count > 0);
-        assert_eq!(
-            checkpoint
-                .get::<ResumeState>(crate::stream::ADAPTER_LAYER)
-                .unwrap()
-                .reading
-                .complete_projection,
-            1
-        );
+        assert!(checkpoint.state[crate::stream::ADAPTER_LAYER]["demand"]["spans"] == Value::Bool(true));
         writeln!(fs::OpenOptions::new().append(true).open(&r.path).unwrap(), "{}",
             serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"appended"}]}})).unwrap();
         for old_native in [false, true] {
             let mut old = checkpoint.clone();
             let layer = old.state.get_mut(crate::stream::ADAPTER_LAYER).unwrap();
-            layer["reading"].as_object_mut().unwrap().remove("complete_projection");
+            layer["demand"]["spans"] = Value::Bool(false);
             if old_native {
-                layer["ctx"]["complete"] = Value::Bool(false);
+                layer["state"]["ctx"]["complete"] = Value::Bool(false);
             }
             let mut sink = BufferedKept::default();
-            assert!(adapter.try_resume(&r, &opts, &mut sink, &old).unwrap().is_none());
+            assert!(adapter
+                .transcript(&r, &opts, crate::stream::Start::Checkpoint(&old), &mut sink)
+                .unwrap()
+                .is_none());
             assert!(sink.messages.is_empty());
         }
         let mut suffix = BufferedKept::default();
-        let mut resumed = adapter.try_resume(&r, &opts, &mut suffix, checkpoint).unwrap().unwrap();
+        let mut resumed = adapter
+            .transcript(&r, &opts, crate::stream::Start::Checkpoint(checkpoint), &mut suffix)
+            .unwrap()
+            .unwrap();
         resumed.messages = prefix.messages[..*count]
             .iter()
             .cloned()
@@ -1377,12 +1539,16 @@ mod tests {
         fs::write(&path, &prefix).unwrap();
         let r = SessionRef::new("fallback", Harness::Codex, path);
         let adapter = Codex::with_home(&world.home.join(".codex"));
-        let opts = ParseOptions::full();
+        let opts = stream::Demand::RICH;
         let mut first = BufferedKept::default();
         buffered_pass(&r, &opts, &mut first);
         let (count, cp) = first.checkpoints.last().unwrap();
         assert_eq!(*count, 1, "held EOF reply is not part of the immutable prefix");
-        assert_eq!(cp.offset as usize, prefix.find("bad json").unwrap());
+        // The rejected line is a boundary too: its checkpoint carries the skipped count.
+        assert_eq!(
+            cp.offset as usize,
+            prefix.find("bad json\n").unwrap() + "bad json\n".len()
+        );
         let state = serde_json::to_string(cp).unwrap();
         assert!(state.len() < 2048 && !state.contains("held_sentinel"));
         writeln!(
@@ -1395,7 +1561,10 @@ mod tests {
         bytes.extend_from_slice("\u{2003}{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"escaped \\\" \\u263a\"}}\u{2003}\r\n".as_bytes());
         fs::write(&r.path, bytes).unwrap();
         let mut suffix = BufferedKept::default();
-        let mut resumed = adapter.try_resume(&r, &opts, &mut suffix, cp).unwrap().unwrap();
+        let mut resumed = adapter
+            .transcript(&r, &opts, crate::stream::Start::Checkpoint(cp), &mut suffix)
+            .unwrap()
+            .unwrap();
         resumed.messages = first.messages[..*count]
             .iter()
             .cloned()
@@ -1409,27 +1578,35 @@ mod tests {
 
         let mut untouched = BufferedKept::default();
         assert!(adapter
-            .try_resume(&r, &ParseOptions::complete(), &mut untouched, cp)
+            .transcript(
+                &r,
+                &stream::Demand::COMPLETE,
+                crate::stream::Start::Checkpoint(cp),
+                &mut untouched
+            )
             .unwrap()
             .is_none());
         let mut elsewhere = r.clone();
         elsewhere.path = world.base.join("rollout-other.jsonl");
         assert!(adapter
-            .try_resume(&elsewhere, &opts, &mut untouched, cp)
+            .transcript(&elsewhere, &opts, crate::stream::Start::Checkpoint(cp), &mut untouched)
             .unwrap()
             .is_none());
         elsewhere.path = world.base.join("rollout.json");
         assert!(adapter
-            .try_resume(&elsewhere, &opts, &mut untouched, cp)
+            .transcript(&elsewhere, &opts, crate::stream::Start::Checkpoint(cp), &mut untouched)
             .unwrap()
             .is_none());
         elsewhere.path = world.base.join("rollout.jsonl.zst");
         assert!(adapter
-            .try_resume(&elsewhere, &opts, &mut untouched, cp)
+            .transcript(&elsewhere, &opts, crate::stream::Start::Checkpoint(cp), &mut untouched)
             .unwrap()
             .is_none());
         fs::write(&r.path, b"").unwrap();
-        assert!(adapter.try_resume(&r, &opts, &mut untouched, cp).unwrap().is_none());
+        assert!(adapter
+            .transcript(&r, &opts, crate::stream::Start::Checkpoint(cp), &mut untouched)
+            .unwrap()
+            .is_none());
         assert!(untouched.messages.is_empty() && untouched.checkpoints.is_empty());
         assert_eq!((untouched.metadata, untouched.dependencies), (0, 0));
     }
@@ -1443,7 +1620,7 @@ mod tests {
         fs::write(&path, line.repeat(20_000)).unwrap();
         let r = SessionRef::new("fallback", Harness::Codex, path);
         let adapter = Codex::with_home(&world.home.join(".codex"));
-        let opts = ParseOptions::full();
+        let opts = stream::Demand::RICH;
         let mut first = BufferedKept::default();
         buffered_pass(&r, &opts, &mut first);
         let (count, cp) = first.checkpoints.last().unwrap();
@@ -1455,7 +1632,10 @@ mod tests {
             .write_all(line.repeat(200).as_bytes())
             .unwrap();
         let mut suffix = BufferedKept::default();
-        let resumed = adapter.try_resume(&r, &opts, &mut suffix, cp).unwrap().unwrap();
+        let resumed = adapter
+            .transcript(&r, &opts, crate::stream::Start::Checkpoint(cp), &mut suffix)
+            .unwrap()
+            .unwrap();
         let mut all = whole(&r, &opts);
         assert_eq!(
             serde_json::to_value(&suffix.messages).unwrap(),
@@ -1483,7 +1663,10 @@ mod tests {
             .write_all(line.as_bytes())
             .unwrap();
         let mut untouched = BufferedKept::default();
-        assert!(adapter.try_resume(&r, &opts, &mut untouched, cp).unwrap().is_none());
+        assert!(adapter
+            .transcript(&r, &opts, crate::stream::Start::Checkpoint(cp), &mut untouched)
+            .unwrap()
+            .is_none());
         assert!(untouched.messages.is_empty() && untouched.checkpoints.is_empty());
         assert_eq!((untouched.metadata, untouched.dependencies), (0, 0));
     }
@@ -1560,7 +1743,7 @@ mod tests {
         let m = &s.messages[0];
         match &m.content[0] {
             Block::Thinking { text, encrypted, .. } => {
-                assert_eq!(text, "raw thoughts");
+                assert_eq!(text.inline_str(), Some("raw thoughts"));
                 assert_eq!(encrypted.as_deref(), Some("ENC"));
             }
             other => panic!("expected thinking, got {other:?}"),
@@ -1590,7 +1773,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(tool_use_id, "c1");
-                assert_eq!(content, "boom");
+                assert_eq!(content.inline_str(), Some("boom"));
                 assert!(is_error);
             }
             _ => unreachable!(),
@@ -1646,7 +1829,7 @@ mod tests {
         let s = parse_fixture("tool_search_call_and_output.jsonl");
         assert!(matches!(&s.messages[0].content[0], Block::ToolUse { name, .. } if name == "tool_search"));
         assert!(
-            matches!(&s.messages[1].content[0], Block::ToolResult { tool_use_id, content, .. } if tool_use_id == "t1" && content == "[]")
+            matches!(&s.messages[1].content[0], Block::ToolResult { tool_use_id, content, .. } if tool_use_id == "t1" && content.matches_str("[]") == Some(true))
         );
     }
 
@@ -1654,7 +1837,7 @@ mod tests {
     fn user_message_with_input_image() {
         let s = parse_fixture("user_message_with_input_image.jsonl");
         let m = &s.messages[0];
-        assert!(matches!(&m.content[0], Block::Text { text } if text == "see this"));
+        assert!(matches!(&m.content[0], Block::Text { text } if text.matches_str("see this") == Some(true)));
         match &m.content[1] {
             Block::Image { media_type, data_ref } => {
                 assert_eq!(media_type.as_deref(), Some("image/png"));
@@ -1695,7 +1878,7 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         let s = whole(
             &SessionRef::new("fallback", Harness::Codex, &path),
-            &ParseOptions::lazy(),
+            &stream::Demand::LEAN.with_spans(),
         );
 
         let content = s
@@ -1708,7 +1891,7 @@ mod tests {
                 })
             })
             .expect("tool result present");
-        assert!(content.is_span(), "giant fco output should be a span");
+        assert!(content.is_lazy(), "giant fco output should be a span");
         let resolver = s.resolver();
         assert_eq!(
             content.try_resolve(&resolver).unwrap(),
@@ -1740,7 +1923,7 @@ mod tests {
         std::fs::write(&path, text).unwrap();
         let mut lazy = whole(
             &SessionRef::new("fallback", Harness::Codex, &path),
-            &ParseOptions::lazy(),
+            &stream::Demand::LEAN.with_spans(),
         );
         lazy.materialize().unwrap();
         let full = parse_str("fallback", text, true, Some(path));
@@ -1813,7 +1996,7 @@ mod tests {
         fs::write(&path, &data).unwrap();
         let s = whole(
             &SessionRef::new("fb", Harness::Codex, &path),
-            &ParseOptions::lazy_offsets(),
+            &stream::Demand::LEAN.with_spans().with_offsets(),
         );
         let full = s.messages.clone();
         assert_eq!(s.model.as_deref(), Some("gpt-test"));
@@ -1823,7 +2006,7 @@ mod tests {
         assert!(full[3]
             .content
             .iter()
-            .any(|b| matches!(b, Block::ToolResult { content, .. } if content.is_span())));
+            .any(|b| matches!(b, Block::ToolResult { content, .. } if content.is_lazy())));
         let offs: Vec<u64> = full
             .iter()
             .map(|m| {
@@ -1913,7 +2096,7 @@ mod tests {
         let text = lines.join("\n");
         let parsed = parse_str("s", &text, true, None);
 
-        let streamed = stream_text("s", &text, &ParseOptions::full());
+        let streamed = stream_text("s", &text, &stream::Demand::RICH);
 
         assert_eq!(
             serde_json::to_value(&parsed).unwrap(),
@@ -1930,6 +2113,16 @@ mod tests {
                 (Some(90), Some(20), Some(10))
             );
         }
+        let usage_notice = parsed
+            .messages
+            .iter()
+            .find(|m| bag_get(m, "codex_event").and_then(Value::as_str) == Some("token_count"))
+            .unwrap();
+        assert_eq!(
+            (usage_notice.kind, usage_notice.origin),
+            (MessageKind::Notice, Origin::Harness)
+        );
+        assert!(usage_notice.content.is_empty());
         // function_call ToolUse msg attached nothing (it has its own pending usage slot untouched);
         // the stale snapshot became a carrier; the trailing assistant survived the EOF flush.
         assert_eq!(parsed.messages.last().unwrap().text().as_deref(), Some("bye"));
@@ -2026,7 +2219,7 @@ mod tests {
             "the diagnostic is namespaced, never flat"
         );
 
-        let streamed = stream_text("s", &text, &ParseOptions::full());
+        let streamed = stream_text("s", &text, &stream::Demand::RICH);
         assert_eq!(
             serde_json::to_value(&parsed).unwrap(),
             serde_json::to_value(&streamed).unwrap(),
@@ -2121,7 +2314,7 @@ mod tests {
         assert!(s
             .messages
             .iter()
-            .any(|m| matches!(m.content.first(), Some(Block::ToolResult { content, .. }) if content == "ok")));
+            .any(|m| matches!(m.content.first(), Some(Block::ToolResult { content, .. }) if content.matches_str("ok") == Some(true))));
     }
 
     /// Developer smoke test against the real on-disk corpus (run with `--ignored`). Parses every
@@ -2157,7 +2350,7 @@ mod tests {
 
     /// Stream a `.jsonl` transcript's lines under explicit options, collecting messages like
     /// `parse_jsonl` does.
-    fn stream_jsonl_with(lines: &[impl std::borrow::Borrow<str>], opts: &ParseOptions) -> Session {
+    fn stream_jsonl_with(lines: &[impl std::borrow::Borrow<str>], opts: &stream::Demand) -> Session {
         stream_text("fallback-id", &lines.join("\n"), opts)
     }
 
@@ -2215,7 +2408,7 @@ mod tests {
         assert_eq!(m.timestamp.map(|t| t.timestamp()), Some(1789845000));
         assert_eq!(m.extra["codex"]["turn_id"], "t1");
 
-        let complete = stream_jsonl_with(&lines, &ParseOptions::complete());
+        let complete = stream_jsonl_with(&lines, &stream::Demand::COMPLETE);
         let texts: Vec<_> = complete.messages.iter().filter_map(|m| m.text()).collect();
         assert_eq!(texts, vec!["parent's original prompt", "child's own reply"]);
         assert_eq!(complete.messages[0].extra["codex"]["inherited"], true);
@@ -2227,7 +2420,7 @@ mod tests {
         assert!(bag_get(&complete.messages[1], "inherited").is_none());
 
         // parse == stream for the lean pass too
-        let streamed = stream_jsonl_with(&lines, &ParseOptions::full());
+        let streamed = stream_jsonl_with(&lines, &stream::Demand::RICH);
         assert_eq!(
             serde_json::to_value(&lean).unwrap(),
             serde_json::to_value(&streamed).unwrap()
@@ -2273,7 +2466,7 @@ mod tests {
         assert_eq!(outbound.extra["codex"]["trigger_turn"], false);
         assert!(outbound.extra["codex"].get("encrypted").is_none());
         // identical on the streaming path (the pairing lives in parser state, not the sink)
-        let streamed = stream_jsonl_with(&lines, &ParseOptions::full());
+        let streamed = stream_jsonl_with(&lines, &stream::Demand::RICH);
         assert_eq!(
             serde_json::to_value(&s).unwrap(),
             serde_json::to_value(&streamed).unwrap()
@@ -2379,7 +2572,7 @@ mod tests {
         );
         assert_eq!(m.extra["codex"]["model_context_window"], 258400);
         // and the streaming path (which holds the message across the two records) agrees
-        let streamed = stream_jsonl_with(&lines, &ParseOptions::full());
+        let streamed = stream_jsonl_with(&lines, &stream::Demand::RICH);
         assert_eq!(
             serde_json::to_value(&s).unwrap(),
             serde_json::to_value(&streamed).unwrap()
@@ -2420,31 +2613,40 @@ mod tests {
         assert_eq!(s.messages[2].extra["codex"]["num_turns"], 2);
     }
 
-    #[test]
-    fn error_prefix_marks_tool_failure_and_is_stripped() {
-        let s = parse_fixture("error_prefix_marks_tool_failure_and_is_stripped.jsonl");
-        let results: Vec<(&str, bool, Option<&str>)> = s
-            .messages
+    /// `(content, is_error)` of every tool result in `s`.
+    fn results(s: &Session) -> Vec<(String, bool)> {
+        s.messages
             .iter()
             .flat_map(|m| &m.content)
             .filter_map(|b| match b {
-                Block::ToolResult {
-                    content,
-                    is_error,
-                    status,
-                    ..
-                } => Some((&**content, *is_error, status.as_deref())),
+                Block::ToolResult { content, is_error, .. } => Some((content.to_string(), *is_error)),
                 _ => None,
             })
-            .collect();
-        assert_eq!(
-            results,
+            .collect()
+    }
+
+    #[test]
+    fn error_prefix_marks_tool_failure_and_is_stripped() {
+        // In a rollout cv wrote, `[error] ` is cv's sentinel: the failure bit, stripped.
+        let meta = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"x","originator":"clustervision"}}"#;
+        let mut lines = vec![meta.to_string()];
+        lines.extend(fixture_lines("error_prefix_marks_tool_failure_and_is_stripped.jsonl"));
+        let expected = |plain: bool| {
+            let p = |t: &str| if plain { format!("[error] {t}") } else { t.to_string() };
             vec![
-                ("command not found: frobnicate", true, Some("error")),
-                ("is only a marker at the very start", true, Some("error")),
-                ("[error] inside an array is plain text", false, Some("completed")),
+                (p("command not found: frobnicate"), !plain),
+                (p("is only a marker at the very start"), !plain),
+                ("[error] inside an array is plain text".to_string(), false),
             ]
+        };
+        assert_eq!(results(&parse_jsonl(&lines)), expected(false));
+        // Anywhere else it is the tool's own text: no provenance, or another writer's.
+        assert_eq!(
+            results(&parse_fixture("error_prefix_marks_tool_failure_and_is_stripped.jsonl")),
+            expected(true)
         );
+        lines[0] = meta.replace("clustervision", "codex_cli_rs");
+        assert_eq!(results(&parse_jsonl(&lines)), expected(true));
     }
 
     #[cfg(feature = "mmap")]
@@ -2452,9 +2654,11 @@ mod tests {
     fn error_prefix_survives_the_giant_span_path() {
         use std::io::Write;
         let body = format!("[error] {}", "boom line\n".repeat(600)); // > INLINE_MAX
-        let line = serde_json::json!({"timestamp":"2026-01-01T00:00:01Z","type":"response_item",
-            "payload":{"type":"function_call_output","call_id":"c1","output":body}})
-        .to_string();
+        let meta = serde_json::json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta",
+            "payload":{"id":"x","originator":CV_ORIGINATOR}});
+        let output = serde_json::json!({"timestamp":"2026-01-01T00:00:01Z","type":"response_item",
+            "payload":{"type":"function_call_output","call_id":"c1","output":body}});
+        let line = format!("{meta}\n{output}");
         let dir = std::env::temp_dir().join(format!("cv-codex-err-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rollout-2026-01-01T00-00-00-err.jsonl");
@@ -2462,7 +2666,10 @@ mod tests {
             .unwrap()
             .write_all(line.as_bytes())
             .unwrap();
-        let s = whole(&SessionRef::new("x", Harness::Codex, &path), &ParseOptions::lazy());
+        let s = whole(
+            &SessionRef::new("x", Harness::Codex, &path),
+            &stream::Demand::LEAN.with_spans(),
+        );
         let m = &s.messages[0];
         let Block::ToolResult { content, is_error, .. } = &m.content[0] else {
             panic!()
@@ -2478,7 +2685,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[cfg(feature = "sqlite")]
+    #[cfg(not(feature = "zstd"))]
+    #[test]
+    fn zst_without_decoder_is_an_error_not_jsonl() {
+        let world = crate::test_world("codex-no-decoder");
+        let path = world.base.join("rollout.jsonl.zst");
+        std::fs::write(&path, b"\x28\xb5\x2f\xfd").unwrap();
+        let error = match Rollout::open(&path) {
+            Ok(_) => panic!("compressed input must require a decoder"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("zstd"));
+    }
+
+    #[cfg(feature = "zstd")]
     #[test]
     fn zstd_compressed_rollouts_are_discovered_scanned_and_parsed() {
         let _world = crate::test_world("codex-zstd");
@@ -2500,7 +2720,7 @@ mod tests {
         let r = &refs[0];
         assert_eq!(r.id, "cold-1");
         assert_eq!(r.title.as_deref(), Some("cold storage question"));
-        assert_eq!(r.message_count, 2);
+        assert_eq!(r.message_count, None);
 
         let s = cx.parse(r).unwrap();
         assert_eq!(s.model.as_deref(), Some("gpt-6-astra"));
@@ -2510,7 +2730,7 @@ mod tests {
         );
         // Resolved lazy streaming matches the full compressed parse.
         let mut sink = crate::stream::CollectSink::default();
-        let mut st = cx.stream(r, &ParseOptions::lazy(), &mut sink).unwrap();
+        let mut st = cx.stream(r, &stream::Demand::LEAN.with_spans(), &mut sink).unwrap();
         st.messages = sink.messages;
         assert_eq!(serde_json::to_value(&s).unwrap(), serde_json::to_value(&st).unwrap());
         std::fs::remove_dir_all(&root).ok();
@@ -2518,7 +2738,7 @@ mod tests {
 
     /// Discovery under a handoff hands each rollout it decoded over once, never a plain one; a
     /// read of the same unchanged source on that thread uses those bytes, a changed one decodes.
-    #[cfg(feature = "sqlite")]
+    #[cfg(feature = "zstd")]
     #[test]
     fn discovery_hands_decoded_rollouts_to_the_reads_of_the_same_source() {
         let _world = crate::test_world("codex-handoff");
@@ -2536,14 +2756,14 @@ mod tests {
         let cx = Codex {
             roots: vec![root.join("sessions")],
         };
-        let (handoff, decoded) = crate::handoff::channel(1);
-        let refs = crate::handoff::within(&Some(handoff), || cx.discover().unwrap());
+        let (handoff, decoded) = crate::codex_handoff::channel(1);
+        let refs = crate::codex_handoff::within(&Some(handoff), || cx.discover().unwrap());
         assert_eq!(refs.len(), 2);
         let (r, bytes) = decoded.recv().expect("the compressed rollout is handed over");
         assert!(decoded.recv().is_none(), "once, and never the plain rollout");
-        assert_eq!((r.path.as_path(), r.message_count), (cold.as_path(), 2));
+        assert_eq!((r.path.as_path(), r.message_count), (cold.as_path(), None));
 
-        let arena = |rollout: Rollout| rollout.decoded.unwrap();
+        let arena = |rollout: Rollout| rollout.input;
         let handed = bytes.run(|| arena(Rollout::open(&cold).unwrap()));
         assert!(Arc::ptr_eq(
             &handed,
@@ -2553,13 +2773,13 @@ mod tests {
             !Arc::ptr_eq(&handed, &arena(Rollout::open(&cold).unwrap())),
             "only inside run"
         );
-        let read = |opts: &ParseOptions| {
+        let read = |opts: &stream::Demand| {
             let mut sink = crate::stream::CollectSink::default();
             let mut session = cx.stream(&r, opts, &mut sink).unwrap();
             session.messages = sink.messages;
             serde_json::to_value(session).unwrap()
         };
-        assert_eq!(bytes.run(|| read(&ParseOptions::full())), read(&ParseOptions::full()));
+        assert_eq!(bytes.run(|| read(&stream::Demand::RICH)), read(&stream::Demand::RICH));
 
         std::fs::write(
             &cold,
@@ -2588,10 +2808,7 @@ mod tests {
             r.title.as_deref(),
             Some("Message Type: NEW_TASK Task name: build the client")
         );
-        assert_eq!(
-            r.message_count, 2,
-            "the inherited parent prompt and the injected developer message are not counted"
-        );
+        assert_eq!(r.message_count, None, "discovery defers exact turn counts");
 
         // Over the full-scan cap the middle is never read: the metadata still comes from the head
         // and tail, and the turn count is 0 ("not counted") rather than an extrapolation
@@ -2602,7 +2819,7 @@ mod tests {
         assert_eq!(sampled.title, r.title);
         assert_eq!(sampled.updated_at, r.updated_at);
         assert_eq!(
-            sampled.message_count, 0,
+            sampled.message_count, None,
             "over the cap the count is unknown, not estimated"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -2650,7 +2867,7 @@ mod tests {
             let r = scan(&path).unwrap();
             let parsed = cx.parse(&r).unwrap();
             let mut sink = crate::stream::CollectSink::default();
-            let mut streamed = cx.stream(&r, &ParseOptions::full(), &mut sink).unwrap();
+            let mut streamed = cx.stream(&r, &stream::Demand::RICH, &mut sink).unwrap();
             streamed.messages = sink.messages;
             assert_eq!(
                 serde_json::to_value(&parsed).unwrap(),
@@ -2689,7 +2906,7 @@ mod tests {
                 parsed.id,
                 r.title,
                 parsed.messages.len(),
-                r.message_count,
+                r.message_count.map_or("-".to_string(), |n| n.to_string()),
                 notes,
                 agent_msgs,
                 with_usage,
@@ -2711,9 +2928,7 @@ mod tests {
             // The v2 shape holds on real files: nothing flat, every kind precise.
             for m in &parsed.messages {
                 assert!(
-                    m.extra
-                        .keys()
-                        .all(|k| k == "codex" || k == super::super::claude::CARRIER_KEY),
+                    m.extra.keys().all(|k| k == "codex" || k == crate::ir::CARRIER_KEY),
                     "flat extra key on {}: {:?}",
                     path.display(),
                     m.extra.keys().collect::<Vec<_>>()
@@ -2731,7 +2946,9 @@ mod tests {
     fn structured_output_with_image() {
         let s = parse_fixture("structured_output_with_image.jsonl");
         let m = &s.messages[0];
-        assert!(matches!(&m.content[0], Block::ToolResult { content, .. } if content == "here"));
+        assert!(
+            matches!(&m.content[0], Block::ToolResult { content, .. } if content.matches_str("here") == Some(true))
+        );
         assert!(
             matches!(&m.content[1], Block::Image { media_type, .. } if media_type.as_deref() == Some("image/jpeg"))
         );
@@ -2977,7 +3194,7 @@ mod tests {
         assert_eq!(keys(11), vec!["codex_event", "num_turns"]);
         assert_eq!(keys(12), vec!["codex_event", "error"]);
         // parse == stream
-        let streamed = stream_jsonl_with(&every_arm(), &ParseOptions::full());
+        let streamed = stream_jsonl_with(&every_arm(), &stream::Demand::RICH);
         assert_eq!(
             serde_json::to_value(&s).unwrap(),
             serde_json::to_value(&streamed).unwrap()
@@ -2988,13 +3205,13 @@ mod tests {
     fn complete_mode_carries_lifecycle_and_unknown_records_verbatim() {
         let lean = parse_jsonl(&every_arm());
         assert!(lean.messages.iter().all(|m| m.kind != MessageKind::Carrier));
-        let complete = stream_jsonl_with(&every_arm(), &ParseOptions::complete());
+        let complete = stream_jsonl_with(&every_arm(), &stream::Demand::COMPLETE);
         let carriers: Vec<(&str, &str)> = complete
             .messages
             .iter()
             .filter(|m| m.kind == MessageKind::Carrier)
             .map(|m| {
-                let record = &m.extra[super::super::claude::CARRIER_KEY];
+                let record = &m.extra[crate::ir::CARRIER_KEY];
                 (
                     m.extra["codex"]["record_type"].as_str().unwrap(),
                     record
@@ -3015,10 +3232,10 @@ mod tests {
         );
         assert_eq!(complete.messages.len(), lean.messages.len() + carriers.len());
         for m in &complete.messages {
-            let allowed = |k: &String| k == "codex" || k == super::super::claude::CARRIER_KEY;
+            let allowed = |k: &String| k == "codex" || k == crate::ir::CARRIER_KEY;
             assert!(m.extra.keys().all(allowed), "{:?}", m.extra.keys().collect::<Vec<_>>());
             assert_eq!(
-                m.extra.contains_key(super::super::claude::CARRIER_KEY),
+                m.extra.contains_key(crate::ir::CARRIER_KEY),
                 m.kind == MessageKind::Carrier,
                 "`_record` marks exactly the carriers"
             );
@@ -3029,10 +3246,7 @@ mod tests {
             .find(|m| bag_get(m, "record_type").and_then(Value::as_str) == Some("world_state"))
             .unwrap();
         assert_eq!((ws.role, ws.origin), (Role::System, Origin::Harness));
-        assert_eq!(
-            ws.extra[super::super::claude::CARRIER_KEY]["payload"]["agents_md"],
-            "# AGENTS.md"
-        );
+        assert_eq!(ws.extra[crate::ir::CARRIER_KEY]["payload"]["agents_md"], "# AGENTS.md");
         assert!(ws.content.is_empty());
     }
 }

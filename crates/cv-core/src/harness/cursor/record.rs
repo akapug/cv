@@ -153,22 +153,19 @@ fn lexical(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<Option<Text
         }
         Ok(children.is_some())
     }
-    #[derive(Debug, thiserror::Error)]
-    #[error("nonblank text found")]
-    struct Nonblank;
     let build = |view: JsonView<'_>| -> Result<Option<Text>> {
         let Some(root) = view.get("root")? else { return Ok(None) };
         let text = built(cells, spans, |out| walk(root, out).map(|_| ()))?;
         // Stop at the first nonblank chunk; a source mutation still takes precedence.
         let check = text.try_for_each_chunk(&crate::lazy::Resolver::new(None), 1024, |part| {
             if part.chars().any(|c| !c.is_whitespace()) {
-                return Err(Nonblank.into());
+                return Err(crate::stream::Stop.into());
             }
             Ok(())
         });
         match check {
             Ok(()) => Ok(None),
-            Err(error) if error.downcast_ref::<Nonblank>().is_some() => Ok(Some(text)),
+            Err(error) if error.downcast_ref::<crate::stream::Stop>().is_some() => Ok(Some(text)),
             Err(error) => Err(error),
         }
     };
@@ -193,7 +190,9 @@ fn result_text(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<Option<
 }
 
 /// One bubble: `type` 1 is the user, anything else the assistant. None for an empty bubble.
-pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<Option<Message>> {
+/// `ordinal` is the bubble's place in its composer's conversation: a tool record naming no call id
+/// gets one derived from it (`cv:cursor:<ordinal>`; a bubble holds at most one call).
+pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool, ordinal: usize) -> Result<Option<Message>> {
     let Some(fields) = Fields::parse(
         view,
         &[
@@ -274,7 +273,10 @@ pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<O
         let name = text("name")?.unwrap_or_else(|| "tool".into());
         let id = match text("toolCallId")? {
             Some(id) => id,
-            None => text("modelCallId")?.unwrap_or_default(),
+            None => match text("modelCallId")? {
+                Some(id) => id,
+                None => crate::ir::derived_call_id("cursor", ordinal),
+            },
         };
         // The model-issued `rawArgs`, else the normalized `params` (decoded, or as stored).
         let mut input = None;

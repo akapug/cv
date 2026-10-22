@@ -85,7 +85,7 @@ fn parts(w: &mut dyn Write, block: &Block, resolver: &Resolver) -> Result<()> {
     Ok(())
 }
 fn blocks<'a>(msg: &'a Message, mode: ThinkingMode, resolver: &Resolver) -> Result<Vec<(Cow<'a, Block>, bool)>> {
-    let blocks = msg
+    let mut blocks = msg
         .content
         .iter()
         .filter_map(|b| match projected(b, mode, resolver) {
@@ -94,7 +94,6 @@ fn blocks<'a>(msg: &'a Message, mode: ThinkingMode, resolver: &Resolver) -> Resu
             Err(e) => Some(Err(e)),
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut blocks = blocks;
     blocks.retain(|(b, _)| {
         !matches!(b.as_ref(), Block::File { .. } | Block::Image { .. }) || emit_file_part(b).is_some()
     });
@@ -130,6 +129,7 @@ fn write_version(
             "singleStep"
         },
     )?;
+    // LM Studio has no tool role: tool results use a user turn with bracketed text parts.
     version.field(
         "role",
         if msg.role == Role::Assistant {
@@ -197,8 +197,7 @@ fn write_version(
             for (i, (b, _)) in blocks.iter().enumerate() {
                 if i != 0 {
                     w.write_all(b",")?;
-                } // one part per represented block
-                  // Strip the single-part array by directly writing its content to a wrapper.
+                }
                 part(w, b, resolver)?;
             }
             w.write_all(b"]")?;
@@ -230,8 +229,7 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOp
         out_dir.join("conversations")
     };
     let file_path = conversations.join(format!("{new_id}.conversation.json"));
-    let title = super::super::wire::write::fallback_title(session, Harness::LmStudio, opts.thinking, &resolver)?
-        .unwrap_or_else(|| "Untitled".into());
+    let title = super::super::wire::write::fallback_title(session, &resolver)?.unwrap_or_else(|| "Untitled".into());
     let mut stage = BufWriter::with_capacity(64 * 1024, ByteStage::new());
     {
         let mut pretty = PrettyJson::new(&mut stage, 0);
@@ -308,7 +306,8 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOp
             w.write_all(b"]")?;
             Ok(())
         })?;
-        root.field("tokenCount", 0)?;
+        // No `tokenCount`: LM Studio records the last generation's prompt token count there, a
+        // fact the IR does not hold, and writing 0 claimed an empty context.
         root.field("pinned", false)?;
         if let Some(sp) = &session.system_prompt {
             root.field("systemPrompt", sp)?;
@@ -327,7 +326,7 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::grok_qwen_tests::Frozen;
+    use crate::emit::frozen::Frozen;
 
     /// One emitted conversation, frozen: its length and SHA-256.
     fn digest(bytes: &[u8]) -> Value {
@@ -392,7 +391,7 @@ mod tests {
         )?;
         let adapter = LmStudio::with_root(&world.home);
         let reference = SessionRef::new("source", Harness::LmStudio, &path);
-        let complete = crate::stream::collect_with(&adapter, &reference, &ParseOptions::complete())?;
+        let complete = crate::stream::collect_with(&adapter, &reference, &Demand::COMPLETE)?;
         assert_eq!(complete.messages.len(), 3);
         assert_eq!(complete.model.as_deref(), Some("selected"));
         let selected = &complete.messages[1];
@@ -405,7 +404,7 @@ mod tests {
         assert_eq!(alternate.model.as_deref(), Some("alternate"));
         assert!(alternate.content.is_empty());
         assert_eq!(alternate.usage.as_ref().unwrap().output_tokens, Some(2));
-        for options in [ParseOptions::full(), ParseOptions::default()] {
+        for options in [Demand::RICH, Demand::LEAN] {
             let visible = crate::stream::collect_with(&adapter, &reference, &options)?;
             assert_eq!(visible.messages.len(), 2);
             assert!(visible.messages[1].content.is_empty());
@@ -427,7 +426,7 @@ mod tests {
         let reparsed = crate::stream::collect_with(
             &adapter,
             &SessionRef::new("copy", Harness::LmStudio, &emitted.path),
-            &ParseOptions::complete(),
+            &Demand::COMPLETE,
         )?;
         assert_eq!(reparsed.model, complete.model);
         assert_eq!(
@@ -472,9 +471,9 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&doc)?)?;
         let adapter = LmStudio::with_root(&world.home);
         let r = SessionRef::new("source", Harness::LmStudio, &path);
-        let opts = ParseOptions {
+        let opts = Demand {
             spans: true,
-            ..ParseOptions::complete()
+            ..Demand::COMPLETE
         };
         let session = crate::stream::collect_with(&adapter, &r, &opts)?;
         assert_eq!(session.messages.len(), 5);
@@ -501,7 +500,7 @@ mod tests {
             "invalid selection fell back to the last version"
         );
         let copied = SessionRef::new("copy", Harness::LmStudio, &emitted.path);
-        let reparsed = crate::stream::collect_with(&adapter, &copied, &ParseOptions::complete())?;
+        let reparsed = crate::stream::collect_with(&adapter, &copied, &Demand::COMPLETE)?;
         let mut expected = session.clone();
         expected.materialize()?;
         assert_eq!(
@@ -509,7 +508,7 @@ mod tests {
             serde_json::to_value(&expected.messages)?
         );
         assert_eq!(reparsed.model, expected.model);
-        let visible = crate::stream::collect_with(&adapter, &copied, &ParseOptions::full())?;
+        let visible = crate::stream::collect_with(&adapter, &copied, &Demand::RICH)?;
         assert_eq!(visible.messages.len(), 2);
         assert_eq!(visible.messages[0].text().as_deref(), Some(payload.as_str()));
         assert_eq!(visible.messages[1].text().as_deref(), Some(payload.as_str()));
@@ -543,7 +542,7 @@ mod tests {
         let session = crate::stream::collect_with(
             &adapter,
             &SessionRef::new("source", Harness::LmStudio, &path),
-            &ParseOptions::complete(),
+            &Demand::COMPLETE,
         )?;
         assert_eq!(session.messages.len(), 3);
         assert_eq!(

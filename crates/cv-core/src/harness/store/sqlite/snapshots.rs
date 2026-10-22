@@ -53,6 +53,7 @@ impl Namespace {
         // namespace remains private and identity checked; this hash is a name, not authority.
         let home = crate::env::home_dir().unwrap_or_default();
 
+        // FNV-1a gives this namespace a stable spelling; DefaultHasher does not promise that.
         let hash = home
             .as_os_str()
             .to_string_lossy()
@@ -226,7 +227,9 @@ pub(super) fn remove_snapshot_directory(path: &Path, identity: Identity) {
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        let Ok(Some(_gate)) = self.namespace.gate(false, true) else {
+        // A contended namespace can be reaped after this owner's lease is released.
+        // Dropping a reader must not wait for another process's snapshot publication.
+        let Ok(Some(_gate)) = self.namespace.gate(false, false) else {
             return;
         };
         let Some(lease) = self.lease.as_ref() else { return };

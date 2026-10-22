@@ -141,14 +141,14 @@ pub trait Adapter: Send + Sync {
 
 `discover` + `stream` are the read path. A whole-session parse is not a fifth method:
 `adapter.parse(&r)` is `stream::collect` over `stream`, so the streaming and the materializing
-readers cannot diverge. The trait's other methods all have defaults: `try_stream`/`try_resume`
-(a read that may continue from a verified checkpoint), `dependencies` (the side files a read of
+readers cannot diverge. The trait's other methods all have defaults: `try_stream`, `transcript`
+(a read whole, from a verified checkpoint, or as an append-only file's past prefix), `dependencies` (the side files a read of
 one session consults, so freshness can watch them), `store_affordances` (plans, goals and
 schedules that live only in a side store) and `copied_before` (the turns a fork copied from its
 source). The shared pieces an adapter imports instead of retyping live beside the trait:
 `harness/wire/{anthropic,openai}` (the two content shapes most stores persist, read into blocks
-and written back) and `harness/store` (`jsonl::for_each_line`, the one line reader in both
-builds; `json::validate_value`; `sqlite::Cells` and `open_ro`, which opens every database
+and written back) and `harness/store` (`jsonl::Read`, the one line reader in both builds, and
+`jsonl::drive`, the one transcript lifecycle over it; `json::validate_value`; `sqlite::Cells` and `open_ro`, which opens every database
 read-only; `write_jsonl`, `xdg_data_dir`). Every family reads through one record codec over one
 byte source; `docs/design/CODEC.md` is the rule.
 
@@ -200,11 +200,11 @@ Some careful properties make it safe to lean on:
 
 One more guard keeps discovery fast on pathological inputs. Some transcripts are *enormous* — Codex rollout logs can run to hundreds of megabytes. Fully parsing those during a *listing* would defeat the point of the cheap-`SessionRef` design.
 
-So the file-based adapters cap how much they read during discovery. The Codex adapter is the clearest example: plain files up to a `FULL_SCAN_CAP` (8 MiB) are parsed in full; larger plain files are **sampled head + tail** (1 MiB each). The head carries `id` / `cwd` / `title` / `created_at`; the tail's last record carries the real `updated_at`. The middle of a sampled plain rollout is never read, so `message_count` is 0 (not counted), not an extrapolation. Compressed `.jsonl.zst` rollouts are decoded and counted in full, regardless of size. A subsequent index pass can populate exact catalog counts.
+So the file-based adapters cap how much they read during discovery. The Codex adapter is the clearest example: plain files up to a `FULL_SCAN_CAP` (8 MiB) are parsed in full; larger plain files are **sampled head + tail** (1 MiB each). The head carries `id` / `cwd` / `title` / `created_at`; the tail's last record carries the real `updated_at`. Codex discovery leaves `message_count` as `null` (not counted), including compressed `.jsonl.zst` rollouts; zero is reserved for a counted session with no turns. Compressed metadata still requires decoding the source. A full read or index pass certifies exact catalog counts.
 
 ### Sub-agents
 
-Sub-agent sessions (currently Claude Code's `Task` sub-agents) are **not** in the main pool — there can be thousands of them, so pulling them all into every listing would be wasteful. They're fetched lazily per parent via `subagents_of(&SessionRef)`, which is what powers the sub-agent trees in the app.
+Sub-agent sessions (each adapter's `forest`: Claude, Codex, Devin, Kimi, Kimi Code, Hermes) are **not** in the main pool — there can be thousands of them, so pulling them all into every listing would be wasteful. They're fetched lazily per parent via `subagent_tree_of(&SessionRef)`, which is what powers the sub-agent trees in the app.
 
 ### Finding one session
 

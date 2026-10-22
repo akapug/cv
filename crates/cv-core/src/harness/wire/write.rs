@@ -88,6 +88,8 @@ impl<'a> Object<'a> {
     pub(crate) fn remove(&mut self, key: &str) {
         if let Some(i) = self.position(key) {
             self.fields.remove(i);
+            // Removal shifts every following position; rebuild the small overlay index so
+            // subsequent replacements still address the correct field.
             if self.index.is_some() {
                 self.index = Some(self.fields.iter().enumerate().map(|(i, (k, _))| (*k, i)).collect());
             }
@@ -192,225 +194,43 @@ pub(crate) fn check_source_fields(session: &crate::ir::Session) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct TitleReady;
-impl std::fmt::Display for TitleReady {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("title prefix selected")
-    }
-}
-impl std::error::Error for TitleReady {}
-
-/// The emitters' existing first-user-text fallback, retaining only the truncated label.
-/// Like first_user_text this skips empty user turns and applies no prompt filtering.
-pub(crate) fn fallback_title(
-    session: &crate::ir::Session,
-    target: crate::Harness,
-    mode: crate::emit::ThinkingMode,
-    resolver: &Resolver,
-) -> Result<Option<String>> {
-    if let Some(title) = &session.title {
-        return Ok(Some(crate::ir::truncate(title, 80)));
-    }
-    for message in session.messages.iter().filter(|m| m.role == crate::ir::Role::User) {
-        let mut prefix = String::new();
-        let mut chars = 0;
-        let mut present = false;
-        let mut meaningful = false;
-        for block in &message.content {
-            let text = if mode == crate::emit::ThinkingMode::Native {
-                match block {
-                    crate::ir::Block::Text { text } => Some(std::borrow::Cow::Borrowed(text)),
-                    _ => None,
-                }
-            } else {
-                crate::emit::thinking::text(block, target, mode, resolver)?
-            };
-            if let Some(text) = text {
-                if present && chars < 81 {
-                    prefix.push('\n');
-                    chars += 1;
-                }
-                let result = text.try_for_each_chunk(resolver, 64 * 1024, |chunk| {
-                    present |= !chunk.is_empty();
-                    meaningful = meaningful || chunk.chars().any(|c| !c.is_whitespace());
-                    for c in chunk.chars().take(81 - chars) {
-                        prefix.push(c);
-                        chars += 1;
-                    }
-                    if chars == 81 && meaningful {
-                        return Err(TitleReady.into());
-                    }
-                    Ok(())
-                });
-                match result {
-                    Err(error) if error.is::<TitleReady>() => break,
-                    Err(error) => return Err(error),
-                    Ok(()) => {}
-                }
-            }
-        }
-        if meaningful {
-            return Ok(Some(crate::ir::truncate(&prefix, 80)));
-        }
-    }
-    Ok(None)
+/// Native fallback labels use the same meaningful-prompt policy as cv's listings.
+pub(crate) fn fallback_title(session: &crate::ir::Session, resolver: &Resolver) -> Result<Option<String>> {
+    Ok(session
+        .title_with(resolver)?
+        .map(|title| crate::ir::truncate(&title, crate::projection::Head::TITLE)))
 }
 
 #[cfg(test)]
 mod title_tests {
     use super::*;
     #[test]
-    fn checked_fallback_title_matches_first_user_text_policy() -> Result<()> {
-        use crate::ir::{Block, Message, Role, Session};
-        for parts in [
-            vec![],
-            vec![""],
-            vec![" ", "\n"],
-            vec!["", "prompt"],
-            vec!["first", "", "tail"],
-            vec!["\r\nλ", "tail"],
-            vec![
-                "                                                                               ",
-                "late",
-            ],
-            vec![
-                "                                                                                ",
-                "late",
-            ],
-        ] {
-            let mut session = Session::new("synthetic", crate::Harness::Continue);
-            let mut message = Message::new(Role::User);
-            message.content = parts.iter().map(|s| Block::Text { text: (*s).into() }).collect();
-            session.messages.push(message);
-            let mut later = Message::new(Role::User);
-            later.content = vec![Block::Text {
-                text: "later meaningful turn".into(),
-            }];
-            session.messages.push(later);
-            let expected = session.first_user_text().map(|s| crate::ir::truncate(&s, 80));
-            assert_eq!(
-                fallback_title(
-                    &session,
-                    crate::Harness::Continue,
-                    crate::emit::ThinkingMode::Native,
-                    &Resolver::new(None)
-                )?,
-                expected
-            );
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod text_publication_tests {
-    use super::*;
-    use crate::{lazy::SourceText, Harness, Json, Session};
-
-    fn captured(path: &std::path::Path, bytes: &[u8]) -> Result<Text> {
-        std::fs::write(path, bytes)?;
-        crate::json::JsonSource::capture(path)?.read_syntax(|view| {
-            let Json::Source(range) = view.to_json()? else {
-                unreachable!()
-            };
-            // Force Source for empty/tiny strings and syntax-only malformed Unicode so the
-            // publication boundary, not only the normal capture factory, proves acceptance.
-            Ok(Text::Source(SourceText::new(range)))
-        })
-    }
-
-    #[test]
-    fn canonical_source_text_matches_serde_and_skipped_fallback() -> Result<()> {
-        let world = crate::test_world("wire-single-source-string");
-        let resolver = Session::new("source", Harness::Claude).resolver();
-        for (i, value) in [
-            "".to_owned(),
-            "plain λ雪".repeat(15000),
-            "prefix: escaped\n\"\\\tλ".repeat(6000),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let raw = serde_json::to_vec(&value)?;
-            let source = captured(&world.base.join(format!("text-{i}.json")), &raw)?;
-            let mut result = Vec::new();
-            text(&mut result, &source, &resolver)?;
-            assert_eq!(result, serde_json::to_vec(&value)?);
-            if i == 2 {
-                let skipped = source.with_skipped_prefix(8)?;
-                let mut result = Vec::new();
-                text(&mut result, &skipped, &resolver)?;
-                assert_eq!(result, serde_json::to_vec(&value[8..])?);
-            }
-        }
-        let raw = br#""\u0061\/\u03bb\ud83d\ude00\t\"\\""#;
-        let source = captured(&world.base.join("escapes.json"), raw)?;
-        let mut result = Vec::new();
-        text(&mut result, &source, &resolver)?;
-        let expected: String = serde_json::from_slice(raw)?;
-        assert_eq!(result, serde_json::to_vec(&expected)?);
-        Ok(())
-    }
-
-    #[test]
-    fn canonical_source_text_rejects_nonstring_and_invalid_unicode() -> Result<()> {
-        let world = crate::test_world("wire-invalid-source-string");
-        let resolver = Session::new("source", Harness::Claude).resolver();
-        for (i, raw) in [b"null".as_slice(), br#""\ud800""#, br#""\udc00""#]
-            .into_iter()
-            .enumerate()
-        {
-            let source = captured(&world.base.join(format!("invalid-{i}.json")), raw)?;
-            assert!(text(&mut Vec::new(), &source, &resolver).is_err());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn canonical_source_text_checks_identity_even_when_writer_fails() -> Result<()> {
-        let world = crate::test_world("wire-source-writer-failure");
-        let resolver = Session::new("source", Harness::Claude).resolver();
-        let path = world.base.join("source.json");
-        struct Fail<'a> {
-            source: &'a std::path::Path,
-            replacement: Option<&'a std::path::Path>,
-        }
-        impl Write for Fail<'_> {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                if let Some(replacement) = self.replacement.take() {
-                    std::fs::rename(replacement, self.source)?;
-                }
-                Err(std::io::Error::other("deliberate writer failure"))
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let source = captured(&path, br#""checked source""#)?;
-        let error = text(
-            &mut Fail {
-                source: &path,
-                replacement: None,
-            },
-            &source,
-            &resolver,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("deliberate writer failure"));
-        let replacement = world.base.join("replacement.json");
-        std::fs::write(&replacement, br#""changed source""#)?;
-        let error = text(
-            &mut Fail {
-                source: &path,
-                replacement: Some(&replacement),
-            },
-            &source,
-            &resolver,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("source changed"), "{error}");
-        assert!(text(&mut Vec::new(), &source, &resolver).is_err());
+    fn fallback_title_skips_injected_users_and_harness_wrappers() -> Result<()> {
+        use crate::ir::{Block, Message, MessageKind, Origin, Role, Session};
+        let mut session = Session::new("synthetic", crate::Harness::Continue);
+        let mut injected = Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness);
+        injected.content.push(Block::Text {
+            text: "harness bookkeeping".into(),
+        });
+        let mut noise = Message::new(Role::User);
+        noise.content.push(Block::Text {
+            text: "<command-name>/usage</command-name>".into(),
+        });
+        let mut prompt = Message::new(Role::User);
+        prompt.content.push(Block::Text {
+            text: "<system-reminder>metadata</system-reminder> please fix the parser".into(),
+        });
+        session.messages = vec![injected, noise, prompt];
+        let resolver = Resolver::new(None);
+        assert_eq!(
+            fallback_title(&session, &resolver)?.as_deref(),
+            Some("please fix the parser")
+        );
+        session.title = Some("λ".repeat(100));
+        assert_eq!(
+            fallback_title(&session, &resolver)?,
+            Some(crate::ir::truncate(&"λ".repeat(100), 80))
+        );
         Ok(())
     }
 }

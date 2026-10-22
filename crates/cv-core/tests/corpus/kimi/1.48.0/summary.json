@@ -102,7 +102,7 @@
         "assistant/reply"
       ],
       "blocks": {
-        "text": 65,
+        "text": 63,
         "thinking": 10,
         "tool_result": 16,
         "tool_use": 16
@@ -126,6 +126,7 @@
         "Agent"
       ],
       "usage_messages": 35,
+      "model_messages": 0,
       "compaction_boundaries": [
         84
       ],
@@ -144,6 +145,103 @@
         "question/ask": 1,
         "subagent_return/return": 1,
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "Agent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "AskUserQuestion": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "EnterPlanMode": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "ExitPlanMode": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "FetchURL": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "ReadFile": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 2,
+            "commands": 0,
+            "errors": 0
+          },
+          "ReadMediaFile": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 1,
+            "commands": 0,
+            "errors": 0
+          },
+          "SetTodoList": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "Shell": {
+            "calls": 3,
+            "edits": 0,
+            "reads": 0,
+            "commands": 3,
+            "errors": 1
+          },
+          "StrReplaceFile": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "TaskOutput": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "WriteFile": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "add": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 16,
+        "total_errors": 1
       },
       "lineage": {},
       "model": null,
@@ -166,11 +264,17 @@
           },
           "tools": [],
           "usage_messages": 2,
+          "model_messages": 0,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {
             "checkpoint/state": 1
+          },
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
           },
           "lineage": {
             "parent": "01533176-23de-4b73-8a2a-79a105793240",

@@ -11,7 +11,7 @@
 //! abstractive digest; without it, `cv pack` does zero network and loads zero models.
 //!
 //! Streaming discipline: recall works off the index (or a head-capped live scan), excerpts are
-//! pulled with a windowed streaming sink under [`ParseOptions::lazy`], and events come from
+//! pulled with a windowed streaming sink under [`Demand::with_spans`], and events come from
 //! catalog queries — whole sessions are never materialized.
 
 use crate::util::{home_rel, short_id};
@@ -20,7 +20,7 @@ use chrono::Utc;
 use cv_core::ir::{Block, Harness, Message, Role, Session};
 use cv_core::lazy::Resolver;
 use cv_core::scan::{ceil_char, floor_char, CapSink};
-use cv_core::stream::{Flow, MessageSink, ParseOptions};
+use cv_core::stream::{Demand, Flow, MessageSink};
 use cv_core::EmitOptions;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -39,18 +39,28 @@ const MAX_FILES_PER_SOURCE: usize = 8;
 /// Rows of the cross-source file rollup.
 const MAX_ROLLUP: usize = 12;
 
-pub(crate) fn cmd_pack(
-    task: &str,
-    format: &str,
-    harness: Option<String>,
-    limit: usize,
-    out: Option<PathBuf>,
-    force: bool,
-    thinking: cv_core::emit::ThinkingMode,
-) -> Result<()> {
-    if !matches!(format, "md" | "prompt" | "session") {
-        bail!("unknown format {format:?} (use md, prompt, or session)");
-    }
+pub(crate) struct PackArgs<'a> {
+    pub task: &'a str,
+    pub format: &'a str,
+    pub harness: Option<String>,
+    pub limit: usize,
+    pub out: Option<PathBuf>,
+    pub force: bool,
+    pub thinking: cv_core::emit::ThinkingMode,
+    pub json: bool,
+}
+
+pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
+    let PackArgs {
+        task,
+        format,
+        harness,
+        limit,
+        out,
+        force,
+        thinking,
+        json,
+    } = args;
     if let (Some(path), "md" | "prompt") = (&out, format) {
         crate::util::user_file_claim(path, force)?;
     }
@@ -65,7 +75,14 @@ pub(crate) fn cmd_pack(
     // 1. RECALL — the most relevant past sessions for the task.
     let hits = recall(task, limit)?;
     if hits.is_empty() {
-        println!("no relevant past sessions for {task:?} — nothing to pack");
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"task": task, "format": format, "sources": [], "content": null, "path": null})
+            );
+        } else {
+            println!("no relevant past sessions for {task:?} — nothing to pack");
+        }
         return Ok(());
     }
 
@@ -86,7 +103,7 @@ pub(crate) fn cmd_pack(
     // 2. DISTILL — one structured digest per recalled span.
     let mut sources: Vec<PackSource> = Vec::with_capacity(hits.len());
     for hit in hits {
-        match build_source(&hit, task, llm_model.as_ref()) {
+        match build_source(&hit, task, llm_model.as_ref().map(|model| model.as_deref())) {
             Ok(s) => sources.push(s),
             Err(e) => eprintln!("cv pack: skipping {} ({}): {e:#}", short_id(&hit.id), hit.harness),
         }
@@ -98,9 +115,23 @@ pub(crate) fn cmd_pack(
 
     // 3. EMIT.
     match format {
-        "md" => write_text(&md_bundle(task, &sources, &rollup), out, force, "context pack"),
-        "prompt" => write_text(&prompt_bundle(task, &sources, &rollup), out, force, "context prompt"),
-        _ => emit_pack_session(task, &sources, &rollup, to_h.expect("validated above"), out, thinking),
+        "md" => write_text(&md_bundle(task, &sources, &rollup), out, force, "context pack", json),
+        "prompt" => write_text(
+            &prompt_bundle(task, &sources, &rollup),
+            out,
+            force,
+            "context prompt",
+            json,
+        ),
+        _ => emit_pack_session(
+            task,
+            &sources,
+            &rollup,
+            to_h.expect("validated above"),
+            out,
+            thinking,
+            json,
+        ),
     }
 }
 
@@ -268,6 +299,10 @@ fn live_scan(task: &str, fetch: usize) -> Result<Vec<cv_search::Hit>> {
     live_scan_adapters(task, fetch, adapters.iter().map(|adapter| adapter.as_ref()))
 }
 
+fn lexical_score<'a>(text: &str, needle: &str, words: impl Iterator<Item = &'a str>) -> i64 {
+    words.filter(|word| text.contains(word)).count() as i64 + if text.contains(needle) { 5 } else { 0 }
+}
+
 fn live_scan_adapters<'a>(
     task: &str,
     fetch: usize,
@@ -288,13 +323,10 @@ fn live_scan_adapters<'a>(
         for r in adapter.discover()? {
             let mut sink = CapSink::new(&r.path);
             let meta = adapter
-                .try_stream(&r, &ParseOptions::lazy(), &mut sink)
+                .try_stream(&r, &Demand::LEAN.with_spans(), &mut sink)
                 .with_context(|| format!("scanning {}:{} for pack", r.harness, r.id))?;
             let low = sink.hay.as_str().to_lowercase();
-            let mut score = words.iter().filter(|w| low.contains(**w)).count() as i64;
-            if low.contains(&needle) {
-                score += 5;
-            }
+            let score = lexical_score(&low, &needle, words.iter().copied());
             if score == 0 {
                 continue;
             }
@@ -361,14 +393,14 @@ struct PackSource {
     llm_digest: Option<String>,
 }
 
-fn build_source(hit: &cv_search::Hit, task: &str, llm_model: Option<&Option<String>>) -> Result<PackSource> {
+fn build_source(hit: &cv_search::Hit, task: &str, llm_model: Option<Option<&str>>) -> Result<PackSource> {
     let want = Harness::parse(&hit.harness);
     let (r, adapter) =
         cv_core::find(&hit.id, want)?.with_context(|| format!("session {} no longer on disk", short_id(&hit.id)))?;
 
     // Stale events ride the excerpt pass; event failure remains best effort.
     let (excerpt, excerpt_range) = best_window_and_ingest(adapter.as_ref(), &r, task)?;
-    let rows = cv_core::events::events_for(r.harness.as_str(), &r.id, None);
+    let rows = cv_core::events::events_for(r.harness.as_str(), &r.id, None)?;
     let EventFacts { edits, reads, commands } = event_facts(&rows);
 
     // Optional abstractive pass over just this span (never the whole session).
@@ -386,7 +418,7 @@ fn build_source(hit: &cv_search::Hit, task: &str, llm_model: Option<&Option<Stri
             mini.messages.push(m);
         }
         let opts = crate::llm::DigestOptions {
-            model: model.clone(),
+            model: model.map(str::to_owned),
             project: false,
         };
         match crate::llm::digest(&mini, &opts) {
@@ -466,9 +498,13 @@ fn best_window_and_ingest(
     let mut events = cv_core::events::SpoolingSink::new(r.cwd.clone());
     let result = best_window_observing(adapter, r, task, Some(&mut events))?;
     let source = source.with_reads(events.inner().dependencies());
+    // The ingest rides the read the pack needed anyway; failing it costs only a later re-ingest.
     if cv_core::source::unchanged(r, &source) {
-        if let Ok(spool) = events.into_spool() {
-            let _ = cv_core::events::record_spooled_with_source(r, 0, spool, &source, &Default::default());
+        let recorded = events
+            .into_spool()
+            .and_then(|spool| cv_core::events::record_spooled_with_source(r, 0, spool, &source, &Default::default()));
+        if let Err(error) = recorded {
+            cv_core::env::warn_once("the event catalog", format_args!("{error:#}"));
         }
     }
     Ok(result)
@@ -501,14 +537,7 @@ fn best_window_observing(
         words: Vec<String>,
         needle: String,
         resolver: Resolver,
-        idx: usize,
-        /// Last non-empty conversational message seen: `(idx, role, trimmed text)`.
-        prev: Option<(usize, Role, String)>,
-        best_score: i64,
-        window: Vec<(Role, String)>,
-        range: Option<(usize, usize)>,
-        /// How many more following messages the current best window still wants.
-        pending: usize,
+        window: cv_core::api::MessageWindow<(Role, String)>,
         error: Option<anyhow::Error>,
     }
     impl MessageSink for WindowSink<'_> {
@@ -535,9 +564,8 @@ fn best_window_observing(
                     self.events_failed = events.observe_message(&m) == Flow::Stop;
                 }
             }
-            let i = self.idx;
-            self.idx += 1;
             if m.role == Role::Tool {
+                self.window.skip();
                 return Flow::Continue;
             }
             let text = match capped_text(&m, &self.resolver) {
@@ -548,32 +576,12 @@ fn best_window_observing(
                 }
             };
             if text.trim().is_empty() {
+                self.window.skip();
                 return Flow::Continue;
             }
             let low = text.to_lowercase();
-            let mut score = self.words.iter().filter(|w| low.contains(w.as_str())).count() as i64;
-            if low.contains(&self.needle) {
-                score += 5;
-            }
-            if score > self.best_score {
-                self.best_score = score;
-                self.window.clear();
-                let mut lo = i;
-                if let Some((pi, pr, pt)) = self.prev.take() {
-                    self.window.push((pr, pt));
-                    lo = pi;
-                }
-                self.window.push((m.role, text.clone()));
-                self.range = Some((lo, i + 1));
-                self.pending = 1;
-            } else if self.pending > 0 {
-                self.window.push((m.role, text.clone()));
-                if let Some((_, hi)) = &mut self.range {
-                    *hi = i + 1;
-                }
-                self.pending -= 1;
-            }
-            self.prev = Some((i, m.role, text));
+            let score = lexical_score(&low, &self.needle, self.words.iter().map(String::as_str));
+            self.window.scored((m.role, text), score);
             Flow::Continue
         }
     }
@@ -584,16 +592,16 @@ fn best_window_observing(
         words,
         needle,
         resolver: Resolver::new(Some(r.path.clone())),
-        idx: 0,
-        prev: None,
-        best_score: -1, // any non-empty message seeds a window, even with zero lexical overlap
-        window: Vec::new(),
-        range: None,
-        pending: 0,
+        window: cv_core::api::MessageWindow::best(),
         error: None,
     };
-    adapter.try_stream(r, &ParseOptions::lazy(), &mut sink)?;
-    Ok((sink.window, sink.range))
+    adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
+    let selected = sink.window.finish();
+    let range = selected
+        .first()
+        .zip(selected.last())
+        .map(|((lo, _), (hi, _))| (*lo, hi + 1));
+    Ok((selected.into_iter().map(|(_, value)| value).collect(), range))
 }
 
 /// A message's text blocks, span-aware (head-resolved) and trimmed to excerpt size with code
@@ -842,7 +850,7 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
 /// The `session` format: a synthetic resumable session in the target harness — one user message
 /// framing the task with the full bundle, plus a short assistant acknowledgment so the resumed
 /// harness opens on a clean turn boundary. Emitted through the same `cv_core::emit` path
-/// `cv convert` uses (prints the written path + resume hint).
+/// `cv port` uses (prints the written path + resume hint).
 fn emit_pack_session(
     task: &str,
     sources: &[PackSource],
@@ -850,6 +858,7 @@ fn emit_pack_session(
     to_h: Harness,
     out: Option<PathBuf>,
     thinking: cv_core::emit::ThinkingMode,
+    json: bool,
 ) -> Result<()> {
     let bundle = md_bundle(task, sources, rollup);
     let now = Utc::now();
@@ -889,7 +898,7 @@ fn emit_pack_session(
         messages: vec![user, ack],
         ..Session::new(format!("pack-{}", now.timestamp()), to_h)
     };
-    crate::cmd::port::emit_session(
+    crate::cmd::port::emit_session_output(
         &session,
         to_h,
         out,
@@ -897,17 +906,23 @@ fn emit_pack_session(
             thinking,
             ..Default::default()
         },
+        json,
     )
     .map(drop)
 }
 
 /// Write a text bundle to `--out` (with a stderr note) or stdout.
-fn write_text(text: &str, out: Option<PathBuf>, force: bool, what: &str) -> Result<()> {
+fn write_text(text: &str, out: Option<PathBuf>, force: bool, what: &str, json: bool) -> Result<()> {
     match out {
         Some(path) => {
             crate::util::write_user_file(&path, text.as_bytes(), force)?;
-            eprintln!("✦ wrote {what} → {}", path.display());
+            if json {
+                println!("{}", serde_json::json!({"path": path, "content": null}));
+            } else {
+                eprintln!("✦ wrote {what} → {}", path.display());
+            }
         }
+        None if json => println!("{}", serde_json::json!({"path": null, "content": text})),
         None => print!("{text}"),
     }
     Ok(())
@@ -932,15 +947,10 @@ mod tests {
         fn roots(&self) -> Vec<PathBuf> {
             Vec::new()
         }
-        fn discover(&self) -> Result<Vec<cv_core::SessionRef>> {
-            Ok(Vec::new())
+        fn discover(&self) -> Result<cv_core::Discovered> {
+            Ok(Default::default())
         }
-        fn stream(
-            &self,
-            r: &cv_core::SessionRef,
-            options: &ParseOptions,
-            sink: &mut dyn MessageSink,
-        ) -> Result<Session> {
+        fn stream(&self, r: &cv_core::SessionRef, options: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
             struct Counter<'a> {
                 sink: &'a mut dyn MessageSink,
                 calls: &'a AtomicUsize,
@@ -988,7 +998,7 @@ mod tests {
             .unwrap();
     }
     fn rows(r: &cv_core::SessionRef) -> Vec<cv_core::events::EventRow> {
-        cv_core::events::events_for(r.harness.as_str(), &r.id, None)
+        cv_core::events::events_for(r.harness.as_str(), &r.id, None).unwrap()
     }
 
     #[test]
@@ -1037,7 +1047,7 @@ mod tests {
         // The old independent ingestion traversal, through the same real adapter.
         let source = cv_core::source::Probe::default().snapshot(&r);
         let mut events = cv_core::events::SpoolingSink::new(r.cwd.clone());
-        adapter.try_stream(&r, &ParseOptions::lazy(), &mut events)?;
+        adapter.try_stream(&r, &Demand::LEAN.with_spans(), &mut events)?;
         let source = source.with_reads(events.inner().dependencies());
         cv_core::events::record_spooled_with_source(&r, 0, events.into_spool()?, &source, &Default::default())?;
         assert_eq!(adapter.calls.load(Ordering::Relaxed), 2 * session.messages.len());
@@ -1151,10 +1161,10 @@ mod tests {
         fn roots(&self) -> Vec<PathBuf> {
             Vec::new()
         }
-        fn discover(&self) -> Result<Vec<cv_core::SessionRef>> {
-            Ok(Vec::new())
+        fn discover(&self) -> Result<cv_core::Discovered> {
+            Ok(Default::default())
         }
-        fn stream(&self, r: &cv_core::SessionRef, _: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+        fn stream(&self, r: &cv_core::SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
             for message in &self.0 {
                 if sink.message(message.clone()) == Flow::Stop {
                     break;
@@ -1221,7 +1231,7 @@ mod tests {
         fn roots(&self) -> Vec<PathBuf> {
             vec![PathBuf::from("recall-fixture")]
         }
-        fn discover(&self) -> Result<Vec<cv_core::SessionRef>> {
+        fn discover(&self) -> Result<cv_core::Discovered> {
             Ok(self
                 .0
                 .iter()
@@ -1232,7 +1242,7 @@ mod tests {
                 })
                 .collect())
         }
-        fn stream(&self, r: &cv_core::SessionRef, _: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+        fn stream(&self, r: &cv_core::SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
             let (_, text) = self.0.iter().find(|(id, _)| id == &r.id).unwrap();
             let mut message = Message::new(Role::User);
             message.content.push(Block::Text {

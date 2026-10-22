@@ -2,10 +2,11 @@
 use super::*;
 use crate::harness::store::{document::Fields, jsonl::ranges};
 use crate::json::{InvalidJson, JsonSource, JsonView};
+use crate::stream::Tier;
 
 /// The first physical record is always the header, including when it is malformed or empty.
-/// Rich fields follow ParseOptions demand; unrelated legacy fields never become owned trees.
-pub(super) fn stream(name: &str, path: &Path, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+/// Rich fields follow Demand demand; unrelated legacy fields never become owned trees.
+pub(super) fn stream(name: &str, path: &Path, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
     let source = JsonSource::capture(path)?;
     let file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
@@ -23,6 +24,8 @@ pub(super) fn stream(name: &str, path: &Path, opts: &ParseOptions, sink: &mut dy
     session.source_path = Some(path.to_path_buf());
     let mut tools = HashMap::new();
     let mut header = true;
+    // A line that is not one JSON value (header or message) is counted.
+    let mut unparsed = crate::harness::Unparsed::default();
     for record in records {
         let (range, _) = record?;
         // Empty lines are still headers when first; subsequent empty lines are ignored.
@@ -41,7 +44,10 @@ pub(super) fn stream(name: &str, path: &Path, opts: &ParseOptions, sink: &mut dy
         };
         let message = match result {
             Ok(message) => message,
-            Err(error) if error.downcast_ref::<InvalidJson>().is_some() => None,
+            Err(error) if error.downcast_ref::<InvalidJson>().is_some() => {
+                unparsed.count();
+                None
+            }
             Err(error) => return Err(error),
         };
         if header {
@@ -58,6 +64,7 @@ pub(super) fn stream(name: &str, path: &Path, opts: &ParseOptions, sink: &mut dy
     }
     source.check_metadata(file.metadata()?)?;
     source.check()?;
+    unparsed.note(&mut session);
     Ok(session)
 }
 
@@ -86,7 +93,7 @@ fn read_header(view: JsonView<'_>, session: &mut Session) -> Result<()> {
 fn read_message(
     view: JsonView<'_>,
     tools: &mut HashMap<String, String>,
-    opts: &ParseOptions,
+    opts: &Demand,
     source: &JsonSource,
     arena: &std::sync::Arc<crate::harness::store::bytes::ByteSource>,
 ) -> Result<Option<Message>> {
@@ -106,19 +113,16 @@ fn read_message(
         Some(content) => record::content(content, tools, opts, Some((source, arena)))?,
         None => Decoded::default(),
     };
-    let Some(mut message) = build_message(&role, id, timestamp, None, decoded) else {
+    let Some(mut message) = build_message(&role, id, timestamp, decoded) else {
         return Ok(None);
     };
-    if !opts.wants_full_extra() {
+    if opts.tier < Tier::Rich {
         omit_rich_details(&mut message);
     }
     Ok(Some(message))
 }
 
-pub(super) fn discover(name: &str, path: &Path) -> Option<SessionRef> {
-    discover_checked(name, path).ok()
-}
-fn discover_checked(name: &str, path: &Path) -> Result<SessionRef> {
+pub(super) fn discover(name: &str, path: &Path) -> Result<SessionRef> {
     let source = JsonSource::capture(path)?;
     let file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
@@ -138,12 +142,24 @@ fn discover_checked(name: &str, path: &Path) -> Result<SessionRef> {
         let result = if let Some(bytes) = records.small_record() {
             // read_to_string rejected invalid UTF-8 in malformed and ignored records too.
             let text = std::str::from_utf8(bytes)?;
-            match serde_json::from_str::<Value>(text) {
-                Ok(value) => note((&value).into(), header, &mut session),
-                Err(_) => Ok(()),
+            if header {
+                match serde_json::from_str::<Value>(text) {
+                    Ok(value) => note_header((&value).into(), &mut session),
+                    Err(_) => Ok(()),
+                }
+            } else {
+                Ok(())
             }
+        } else if header {
+            source.read_range_value(range.offset, range.len, |view| note_header(view, &mut session))
         } else {
-            source.read_range_value(range.offset, range.len, |view| note(view, header, &mut session))
+            // Legacy discovery has always rejected invalid UTF-8 anywhere in the file. Keep
+            // that inclusion contract without decoding undemanded message JSON or bodies.
+            anyhow::ensure!(
+                ranges::valid_utf8(&mut ranges::reader(&file, range)?)?,
+                "invalid Goose legacy UTF-8"
+            );
+            Ok(())
         };
         match result {
             Ok(()) => {}
@@ -162,52 +178,40 @@ fn discover_checked(name: &str, path: &Path) -> Result<SessionRef> {
     source.check()?;
     Ok(session)
 }
-fn note(view: JsonView<'_>, header: bool, session: &mut SessionRef) -> Result<()> {
-    if header {
-        let Some(fields) = Fields::parse(view, &["description", "working_dir", "created_at", "updated_at"])? else {
-            return Ok(());
-        };
-        if let Some(description) = fields.get("description") {
-            if description.is_string()? {
-                let mut prefix = String::new();
-                let mut chars = 0;
-                let mut nonwhite = false;
-                description.for_each_str_chunk(|part| {
-                    nonwhite |= part.chars().any(|c| !c.is_whitespace());
-                    for c in part.chars().take(81 - chars) {
-                        prefix.push(c);
-                        chars += 1;
-                    }
-                    Ok(())
-                })?;
-                session.title = nonwhite.then(|| crate::ir::truncate(&prefix, 80));
-            }
-        }
-        session.cwd = fields
-            .string("working_dir")?
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
-        for (key, output) in [
-            ("created_at", &mut session.created_at),
-            ("updated_at", &mut session.updated_at),
-        ] {
-            if let Some(value) = fields.get(key) {
-                if value.is_string()? || value.as_number()?.is_some() {
-                    *output = parse_ts_value(value.resolve()?.as_ref());
+fn note_header(view: JsonView<'_>, session: &mut SessionRef) -> Result<()> {
+    let Some(fields) = Fields::parse(view, &["description", "working_dir", "created_at", "updated_at"])? else {
+        return Ok(());
+    };
+    if let Some(description) = fields.get("description") {
+        if description.is_string()? {
+            let mut prefix = String::new();
+            let mut chars = 0;
+            let mut nonwhite = false;
+            description.for_each_str_chunk(|part| {
+                nonwhite |= part.chars().any(|c| !c.is_whitespace());
+                for c in part.chars().take(81 - chars) {
+                    prefix.push(c);
+                    chars += 1;
                 }
+                Ok(())
+            })?;
+            session.title = nonwhite.then(|| crate::ir::truncate(&prefix, crate::projection::Head::TITLE));
+        }
+    }
+    session.cwd = fields
+        .string("working_dir")?
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    for (key, output) in [
+        ("created_at", &mut session.created_at),
+        ("updated_at", &mut session.updated_at),
+    ] {
+        if let Some(value) = fields.get(key) {
+            if value.is_string()? || value.as_number()?.is_some() {
+                *output = parse_ts_value(value.resolve()?.as_ref());
             }
         }
-        return Ok(());
     }
-    let Some(fields) = Fields::parse(view, &["role", "content"])? else {
-        return Ok(());
-    };
-    let role = fields.string("role")?.unwrap_or_else(|| "user".into());
-    let decoded = match fields.get("content") {
-        Some(content) => record::content(content, &mut HashMap::new(), &ParseOptions::lazy(), None)?,
-        None => Decoded::default(),
-    };
-    session.message_count += usize::from(is_turn(role, None, decoded));
     Ok(())
 }
 
@@ -215,10 +219,18 @@ fn note(view: JsonView<'_>, header: bool, session: &mut SessionRef) -> Result<()
 mod tests {
     use super::*;
     #[test]
-    fn projected_discovery_preserves_header_count_and_whole_utf8_policy() {
+    fn metadata_discovery_preserves_header_and_whole_utf8_policy() {
         let world = crate::test_world("goose-legacy-discovery");
         let path = world.base.join("legacy.jsonl");
-        let observe = |r: Option<SessionRef>| serde_json::to_value(r).unwrap();
+        // Frozen from the retired whole-file `Value` reader (decision 11: goldens, not oracles).
+        let mut frozen = crate::emit::frozen::Frozen::new("goose-legacy-discovery");
+        let mut observe = |label: String| {
+            let mut r = serde_json::to_value(discover("legacy", &path).ok()).unwrap();
+            if let Some(r) = r.as_object_mut() {
+                r.remove("path");
+            }
+            frozen.insert(label, r);
+        };
         let cases: Vec<Vec<u8>> = vec![
   vec![], b"\n".to_vec(), b"{bad}\nnull\n[1]\n3\ntrue\n{}\n".to_vec(),
   br#"{"description":"old","description":"new","working_dir":"/repo","created_at":1704067200,"updated_at":"2024-01-01 12:00:00"}
@@ -244,12 +256,9 @@ mod tests {
         let mut cases = cases;
         cases.push([b"{}\n{bad".as_slice(), &vec![b'x'; 70_000], b"\xff\n{}\n"].concat());
         cases.push([b"{}\n{bad".as_slice(), &vec![b'x'; 70_000], b"\n{}\n"].concat());
-        for bytes in cases {
+        for (i, bytes) in cases.into_iter().enumerate() {
             std::fs::write(&path, bytes).unwrap();
-            assert_eq!(
-                observe(discover("legacy", &path)),
-                observe(legacy_oracle("legacy", &path))
-            );
+            observe(format!("case {i}"));
         }
         for escaped in [false, true] {
             let body = if escaped { "\\n雪" } else { "x雪" }.repeat(100_000);
@@ -257,31 +266,26 @@ mod tests {
             let row = serde_json::json!({"role":"user","content":[{"type":"text","text":body}]});
             let text = format!("{header}\n{row}\n{{\"role\":\"assistant\",\"content\":[]}}");
             std::fs::write(&path, text).unwrap();
-            assert_eq!(
-                observe(discover("legacy", &path)),
-                observe(legacy_oracle("legacy", &path))
-            );
+            observe(format!("body escaped={escaped}"));
         }
-        for title in [
+        for (j, title) in [
             " ".repeat(100_000),
             format!("{}Meaning", " \u{2003}".repeat(100_000)),
             "雪\n".repeat(100_000),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             std::fs::write(&path, serde_json::json!({"description":title}).to_string()).unwrap();
-            assert_eq!(
-                observe(discover("legacy", &path)),
-                observe(legacy_oracle("legacy", &path))
-            );
+            observe(format!("title {j}"));
         }
         let deep = format!("{{}}\n{}0{}\n{{\"role\":\"user\"}}\n", "[".repeat(129), "]".repeat(129));
         std::fs::write(&path, deep).unwrap();
-        assert_eq!(
-            observe(discover("legacy", &path)),
-            observe(legacy_oracle("legacy", &path))
-        );
+        observe("deep".to_string());
+        frozen.check().unwrap();
     }
 
-    fn collected(path: &Path, opts: &ParseOptions) -> Session {
+    fn collected(path: &Path, opts: &Demand) -> Session {
         let mut sink = crate::stream::CollectSink::default();
         let mut session = stream("legacy", path, opts, &mut sink).unwrap();
         session.messages = sink.messages;
@@ -305,11 +309,9 @@ mod tests {
                 let timestamp = value.get("created").and_then(Value::as_i64).and_then(ts_from_epoch);
                 let decoded = value
                     .get("content")
-                    .map(|c| {
-                        record::content(c.into(), &mut tools, &ParseOptions::full(), Some((&source, &arena))).unwrap()
-                    })
+                    .map(|c| record::content(c.into(), &mut tools, &Demand::RICH, Some((&source, &arena))).unwrap())
                     .unwrap_or_default();
-                build_message(role, id, timestamp, None, decoded)
+                build_message(role, id, timestamp, decoded)
             })
             .collect()
     }
@@ -345,11 +347,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let expected = owned_messages(&path);
         let observe = |messages: Vec<Message>| serde_json::to_value(messages).unwrap();
-        for opts in [
-            ParseOptions::full(),
-            ParseOptions::complete(),
-            ParseOptions::lazy_extra(),
-        ] {
+        for opts in [Demand::RICH, Demand::COMPLETE, Demand::RICH.with_spans()] {
             let actual = collected(&path, &opts);
             assert_eq!(actual.title.as_deref(), Some("old"));
             assert_eq!(actual.cwd.as_deref(), Some(Path::new("/repo")));
@@ -365,10 +363,10 @@ mod tests {
             }
         }
         for opts in [
-            ParseOptions::lazy(),
-            ParseOptions::bulk(),
-            ParseOptions::facts(),
-            ParseOptions::usage(),
+            Demand::LEAN.with_spans(),
+            Demand::LEAN,
+            Demand::FACTS.with_spans(),
+            Demand::USAGE.with_spans(),
         ] {
             assert_eq!(
                 observe(collected(&path, &opts).messages),
@@ -399,7 +397,7 @@ mod tests {
             }
         }
         let mut stop = Stop(None);
-        let session = stream("legacy", &path, &ParseOptions::lazy(), &mut stop).unwrap();
+        let session = stream("legacy", &path, &Demand::LEAN.with_spans(), &mut stop).unwrap();
         assert_eq!(session.title.as_deref(), Some("before"));
         let mut message = stop.0.unwrap();
         assert!(matches!(
@@ -439,36 +437,12 @@ mod tests {
                 Flow::Stop
             }
         }
-        assert!(stream("legacy", &path, &ParseOptions::lazy(), &mut ChangeAtStop(path.clone())).is_err());
-    }
-
-    fn legacy_oracle(name: &str, path: &Path) -> Option<SessionRef> {
-        let text = std::fs::read_to_string(path).ok()?;
-        let mut lines = text.lines();
-        let header: Value = lines
-            .next()
-            .and_then(|l| serde_json::from_str(l).ok())
-            .unwrap_or(Value::Null);
-        let count = owned_messages(path).iter().filter(|m| m.is_turn()).count();
-        let title = header
-            .get("description")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| crate::ir::truncate(s, 80));
-        let cwd = header
-            .get("working_dir")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
-        Some(SessionRef {
-            id: name.to_string(),
-            harness: Harness::Goose,
-            path: path.to_path_buf(),
-            cwd,
-            title,
-            created_at: header.get("created_at").and_then(parse_ts_value),
-            updated_at: header.get("updated_at").and_then(parse_ts_value),
-            message_count: count,
-        })
+        assert!(stream(
+            "legacy",
+            &path,
+            &Demand::LEAN.with_spans(),
+            &mut ChangeAtStop(path.clone())
+        )
+        .is_err());
     }
 }

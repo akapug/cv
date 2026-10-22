@@ -20,15 +20,8 @@ pub struct Config {
 }
 
 /// `$XDG_CONFIG_HOME/clustervision` (or `~/.config/clustervision`). `None` only if there's no home.
-///
-/// Back-compat: if the legacy `…/claurdvoyant` dir still exists and the new one hasn't been created,
-/// keep using it — so registered export sources survive the rename without a manual move.
 pub fn config_dir() -> Option<PathBuf> {
-    let base = crate::env::Env::current().config_home()?;
-
-    let new = base.join("clustervision");
-    let legacy = base.join("claurdvoyant");
-    Some(if !new.exists() && legacy.exists() { legacy } else { new })
+    Some(crate::env::Env::current().config_home()?.join("clustervision"))
 }
 
 /// The config file path.
@@ -36,17 +29,18 @@ pub fn config_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.toml"))
 }
 
-/// Load the config, tolerantly: a missing or malformed file yields [`Config::default`].
+/// Load the config, tolerantly: a missing file yields [`Config::default`]; an unreadable or
+/// malformed one does too, said once per process ([`crate::env::warn_once`]).
 pub fn load() -> Config {
-    let Some(p) = config_path() else {
+    if config_path().is_none() {
         return Config::default();
-    };
-    match std::fs::read_to_string(&p) {
-        Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-            eprintln!("cv: ignoring malformed {}: {e}", p.display());
+    }
+    match load_for_update() {
+        Ok(config) => config,
+        Err(error) => {
+            crate::env::warn_once("the config file", format!("{error:#}"));
             Config::default()
-        }),
-        Err(_) => Config::default(),
+        }
     }
 }
 
@@ -63,6 +57,7 @@ pub fn load_for_update() -> Result<Config> {
 
 /// Persist the config (creating the dir). Returns the path written.
 pub fn save(cfg: &Config) -> Result<PathBuf> {
+    anyhow::ensure!(!crate::env::frozen(), "--frozen forbids writing config");
     let p = config_path().context("no home directory for the config file")?;
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -110,6 +105,8 @@ mod tests {
         assert!(load_for_update().is_err());
         assert!(save(&cfg).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), malformed);
+        // The tolerant read degrades to the defaults (said once on stderr).
+        assert!(load().exports.is_empty());
     }
 
     /// The config is replaced whole; a symlinked config (dotfiles) is replaced at its target and

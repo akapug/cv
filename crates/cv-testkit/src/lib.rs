@@ -18,6 +18,7 @@
 //! a path-only dev-dependency.
 
 pub mod heap;
+pub mod http;
 
 use serde_json::Value;
 use std::ffi::{OsStr, OsString};
@@ -33,6 +34,7 @@ use std::process::{Command, Stdio};
 /// tokens (a token in the shell must not gate a test's requests).
 pub const CLEARED_ENV: &[&str] = &[
     "CV_ENDPOINT",
+    "CV_FROZEN",
     "CLAUDE_CONFIG_DIR",
     "CLUSTERVISION_CLAUDE_ROOTS",
     "CLUSTERVISION_MAX_STALE_SECS",
@@ -50,6 +52,7 @@ pub const CLEARED_ENV: &[&str] = &[
     "CLINE_DATA_DIR",
     "CLINE_DIR",
     "CV_EXPORTS",
+    "CLAURDVOYANT_HOME",
     "CLAURDVOYANT_MAX_STALE_SECS",
     "CV_PACK_LLM",
     "CV_SERVE_TOKEN",
@@ -78,11 +81,15 @@ pub fn cv_bin() -> PathBuf {
 
 /// A fresh, unique directory under the system temp dir.
 pub fn temp_dir(tag: &str) -> PathBuf {
+    // The clock alone is not unique: macOS ticks in microseconds, so parallel tests with one tag
+    // shared a directory. The per-process sequence number is.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("cv-test-{tag}-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("cv-test-{tag}-{}-{nanos}-{seq}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -140,7 +147,7 @@ impl World {
     /// the guard that keeps the first entered on this thread. The process is never mutated.
     pub fn in_process<S>(tag: &str, enter: impl FnOnce(Vars, Vars) -> S) -> InProcess<S> {
         let world = World::new(tag);
-        let nowhere = std::env::temp_dir().join(format!("cv-test-unscoped-{}", std::process::id()));
+        let nowhere = world.base.join("unscoped");
         let outside = inherited_with(world_env(&nowhere.join("home"), &nowhere.join("cvhome")));
         let scope = enter(inherited_with(world.env()), outside);
         InProcess { scope, world }
@@ -248,6 +255,8 @@ impl World {
     pub fn seed_task_log(&self, lines: &[Value]) {
         let dir = self.cv_home.join("tasks");
         fs::create_dir_all(&dir).unwrap();
+        // Mirrors cv-core/src/task/store.rs LOG_FORMAT/LOG_VERSION. The dependency fence
+        // keeps testkit independent of core, so format changes must update both spellings.
         let body = format!("{{\"format\":\"cv-task-log\",\"v\":1}}\n{}", jsonl(lines));
         fs::write(dir.join("events.jsonl"), body).unwrap();
     }
@@ -256,12 +265,11 @@ impl World {
     /// the CLI no longer writes.
     pub fn append_task_log(&self, lines: &[Value]) {
         let dir = self.cv_home.join("tasks");
-        fs::create_dir_all(&dir).unwrap();
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("events.jsonl"))
-            .unwrap();
+        let path = dir.join("events.jsonl");
+        if !path.exists() {
+            self.seed_task_log(&[]);
+        }
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
         f.write_all(jsonl(lines).as_bytes()).unwrap();
     }
 }
@@ -320,7 +328,9 @@ fn output_with_stdin(mut cmd: Command, text: &str) -> std::process::Output {
 }
 
 /// Claude Code transcript records, in the shapes the real harness writes. Every record carries
-/// `sessionId: "s"`; [`with`] adds or overrides fields.
+/// `sessionId: "s"`; [`with`] adds or overrides fields. The reference grammar is
+/// cv-core/src/harness/claude/record.rs and the harness-written cv-core/tests/corpus/claude data;
+/// the dependency fence prevents these independent builders from importing the codec.
 pub mod claude {
     use serde_json::{json, Value};
 

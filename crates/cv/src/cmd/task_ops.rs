@@ -273,10 +273,43 @@ pub(crate) struct EventFilter {
     pub task: Option<String>,
 }
 
+/// Every wire tag an event can carry: the kinds cv writes, then the retired ones a log may hold.
+const LIVE_KIND_TAGS: [&str; 12] = [
+    "opened",
+    "claimed",
+    "released",
+    "noted",
+    "done",
+    "abandoned",
+    "superseded",
+    "tagged",
+    "blocked_by",
+    "posed",
+    "resolved",
+    "status_set",
+];
+
+/// The wire tags of a comma-separated `--kind` list (`kind_tag` on each). An unknown spelling is a
+/// usage error naming the known tags, never an empty result.
+pub(crate) fn kind_tags(list: &str) -> Result<Vec<String>> {
+    list.split(',')
+        .map(|spelling| {
+            let tag = kind_tag(spelling);
+            if LIVE_KIND_TAGS.contains(&tag.as_str()) || cv_core::task::RETIRED_TAGS.contains(&tag.as_str()) {
+                Ok(tag)
+            } else {
+                crate::util::usage(format!(
+                    "unknown event kind {spelling:?} (known: {}; `note`, `resolve`, `open`, `claim`, … also spell)",
+                    LIVE_KIND_TAGS.join(", ")
+                ))
+            }
+        })
+        .collect()
+}
+
 /// The wire tag for a kind spelling a person would type: `note`→`noted`, `resolve`→`resolved`,
-/// `open`→`opened`, `claim`→`claimed`, … Unknown spellings pass through (and match nothing,
-/// loudly empty rather than wrong).
-pub(crate) fn kind_tag(s: &str) -> String {
+/// `open`→`opened`, `claim`→`claimed`, … Any other spelling is returned lowercased and trimmed.
+fn kind_tag(s: &str) -> String {
     let s = s.trim().to_lowercase();
     match s.as_str() {
         "note" | "notes" => "noted",
@@ -851,7 +884,16 @@ mod tests {
         assert_eq!(kind_tag("note"), "noted");
         assert_eq!(kind_tag("Resolve"), "resolved");
         assert_eq!(kind_tag("done"), "done");
-        assert_eq!(kind_tag("bogus"), "bogus");
+        assert_eq!(
+            kind_tags("note,Resolve,landed").unwrap(),
+            ["noted", "resolved", "landed"]
+        );
+        let err = kind_tags("note,bogus").unwrap_err();
+        assert!(err.downcast_ref::<crate::util::UsageError>().is_some());
+        assert!(
+            err.to_string().contains("\"bogus\"") && err.to_string().contains("status_set"),
+            "{err}"
+        );
     }
 
     #[test]

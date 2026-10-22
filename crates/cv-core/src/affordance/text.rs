@@ -6,42 +6,11 @@ use anyhow::Result;
 const CHUNK: usize = 64 * 1024;
 const SUMMARY_CHARS: usize = 120;
 
-/// Keep enough of a fully trimmed string to reproduce `truncate(trim(text), 120)` exactly.
-/// A long whitespace tail must not turn a 120-character summary into an ellipsis.
-#[derive(Default)]
-struct Trimmed {
-    prefix: String,
-    chars: usize,
-    started: bool,
-    later_content: bool,
-}
-
-impl Trimmed {
-    fn push(&mut self, mut text: &str) {
-        if !self.started {
-            text = text.trim_start();
-            self.started = !text.is_empty();
-        }
-        if self.chars <= SUMMARY_CHARS {
-            let mut end = 0;
-            for (offset, ch) in text.char_indices().take(SUMMARY_CHARS + 1 - self.chars) {
-                self.prefix.push(ch);
-                self.chars += 1;
-                end = offset + ch.len_utf8();
-            }
-            text = &text[end..];
-        }
-        self.later_content |= !text.trim().is_empty();
-    }
-
-    fn summary(&self) -> String {
-        let prefix = if self.later_content {
-            self.prefix.as_str()
-        } else {
-            self.prefix.trim_end()
-        };
-        crate::ir::truncate(prefix, SUMMARY_CHARS)
-    }
+/// A summary is the trimmed [`Head`](crate::projection::Head) of `SUMMARY_CHARS`: exactly
+/// `truncate(trim(text), 120)`, a long whitespace tail never turning it into an ellipsis.
+type Trimmed = crate::projection::Head;
+fn trimmed() -> Trimmed {
+    crate::projection::Head::trimmed(SUMMARY_CHARS)
 }
 
 /// The longest suffix that could continue an ASCII delimiter in the next decoded chunk.
@@ -71,7 +40,7 @@ impl Tag {
             complete: false,
             pending: String::new(),
             scratch: String::new(),
-            text: Trimmed::default(),
+            text: trimmed(),
         }
     }
 
@@ -148,22 +117,14 @@ pub(super) struct Facts {
     plain: Trimmed,
     summary: Tag,
     reminder: Tag,
-    #[cfg(test)]
-    denied: Contains,
-    #[cfg(test)]
-    approval: Contains,
 }
 
 impl Default for Facts {
     fn default() -> Self {
         Self {
-            plain: Trimmed::default(),
+            plain: trimmed(),
             summary: Tag::new("<summary>", "</summary>"),
             reminder: Tag::new("<system-reminder>", "</system-reminder>"),
-            #[cfg(test)]
-            denied: Contains::new(" denied"),
-            #[cfg(test)]
-            approval: Contains::new("requires approval"),
         }
     }
 }
@@ -173,51 +134,16 @@ impl Facts {
         self.plain.push(chunk);
         self.summary.push(chunk);
         self.reminder.push(chunk);
-        #[cfg(test)]
-        {
-            self.denied.push(chunk);
-            self.approval.push(chunk);
-        }
-    }
-
-    #[cfg(test)]
-    fn starts_with(&self, prefix: &str) -> bool {
-        self.plain.prefix.starts_with(prefix)
-    }
-
-    #[cfg(test)]
-    fn requires_approval(&self) -> bool {
-        self.approval.found
-    }
-
-    #[cfg(test)]
-    fn denied(&self, harness: Harness) -> bool {
-        match harness {
-            Harness::Claude => {
-                (self.starts_with("Permission to use ") && self.denied.found)
-                    || self.starts_with("The user doesn't want to proceed with this tool use")
-            }
-            Harness::OpenCode => {
-                self.starts_with("The user has specified a rule which prevents you from using this specific tool call")
-                    || self.starts_with("The user rejected permission to use this specific tool call")
-            }
-            _ => false,
-        }
     }
 
     pub(super) fn summary(&self) -> String {
         if self.summary.complete {
-            self.summary.text.summary()
+            self.summary.text.finish()
         } else if self.reminder.complete {
-            self.reminder.text.summary()
+            self.reminder.text.finish()
         } else {
-            self.plain.summary()
+            self.plain.finish()
         }
-    }
-
-    #[cfg(test)]
-    fn plain_summary(&self) -> String {
-        self.plain.summary()
     }
 }
 
@@ -228,29 +154,16 @@ fn chunks(text: &Text, resolver: &Resolver, mut visit: impl FnMut(&str)) -> Resu
     })
 }
 
-#[derive(Debug)]
-struct Complete;
-impl std::fmt::Display for Complete {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("text reduction complete")
-    }
-}
-impl std::error::Error for Complete {}
-
 // Checked readers validate the captured source even when the callback stops traversal.
 fn until(text: &Text, resolver: &Resolver, mut done: impl FnMut(&str) -> bool) -> Result<()> {
-    match text.try_for_each_chunk(
-        resolver,
-        CHUNK,
-        |part| {
-            if done(part) {
-                Err(Complete.into())
-            } else {
-                Ok(())
-            }
-        },
-    ) {
-        Err(error) if error.is::<Complete>() => Ok(()),
+    match text.try_for_each_chunk(resolver, CHUNK, |part| {
+        if done(part) {
+            Err(crate::stream::Stop.into())
+        } else {
+            Ok(())
+        }
+    }) {
+        Err(error) if error.is::<crate::stream::Stop>() => Ok(()),
         result => result,
     }
 }
@@ -266,25 +179,6 @@ pub(super) fn facts(text: &Text, resolver: &Resolver) -> Result<Facts> {
 pub(super) fn starts_with(text: &Text, resolver: &Resolver, wanted: &str) -> Result<bool> {
     if let Text::Inline(text) = text {
         return Ok(text.trim_start().starts_with(wanted));
-    }
-    if let Text::Span(span) = text {
-        let prefix = text.try_resolve_prefix(resolver, 256)?;
-        if span.len <= 256 {
-            return Ok(prefix.trim_start().starts_with(wanted));
-        }
-        let decoded = prefix_decision(&prefix, wanted, span.escaped);
-        // Malformed escaped bodies fall back to their entire raw text. An early answer must
-        // agree with both interpretations, even if malformed data occurs beyond this prefix.
-        let raw = crate::lazy::Span {
-            escaped: false,
-            ..span.clone()
-        };
-        let raw_prefix = resolver.try_resolve_prefix(&raw, 256)?;
-        if let Some(answer) = decoded {
-            if prefix_decision(&raw_prefix, wanted, false) == Some(answer) {
-                return Ok(answer);
-            }
-        }
     }
     let mut head = String::with_capacity(wanted.len());
     let mut remaining = wanted.chars().count();
@@ -306,24 +200,6 @@ pub(super) fn starts_with(text: &Text, resolver: &Resolver, wanted: &str) -> Res
     Ok(head.starts_with(wanted))
 }
 
-fn prefix_decision(prefix: &str, wanted: &str, escaped: bool) -> Option<bool> {
-    // A UTF-8 cut can produce a replacement character; a failed prefix unescape can expose
-    // backslashes. The text before that uncertainty can still prove an answer.
-    let uncertain = prefix
-        .find('\u{fffd}')
-        .into_iter()
-        .chain(escaped.then(|| prefix.find('\\')).flatten())
-        .min();
-    let known = prefix[..uncertain.unwrap_or(prefix.len())].trim_start();
-    if known.starts_with(wanted) {
-        Some(true)
-    } else if !wanted.starts_with(known) {
-        Some(false)
-    } else {
-        None
-    }
-}
-
 pub(super) fn contains(text: &Text, resolver: &Resolver, needle: &'static str) -> Result<bool> {
     if let Text::Inline(text) = text {
         return Ok(text.contains(needle));
@@ -336,31 +212,28 @@ pub(super) fn contains(text: &Text, resolver: &Resolver, needle: &'static str) -
     Ok(search.found)
 }
 
+/// Whether an error result reads as one of `harness`'s denials
+/// ([`crate::harness::Capabilities::denials`]), tried in order.
 pub(super) fn denied(text: &Text, resolver: &Resolver, harness: Harness) -> Result<bool> {
-    Ok(match harness {
-        Harness::Claude => {
-            (starts_with(text, resolver, "Permission to use ")? && contains(text, resolver, " denied")?)
-                || starts_with(text, resolver, "The user doesn't want to proceed with this tool use")?
+    let denials = crate::harness::rootless(harness).map_or(&[][..], |adapter| adapter.capabilities().denials);
+    for denial in denials {
+        if starts_with(text, resolver, denial.prefix)?
+            && denial
+                .also
+                .map_or(Ok(true), |needle| contains(text, resolver, needle))?
+        {
+            return Ok(true);
         }
-        Harness::OpenCode => {
-            starts_with(
-                text,
-                resolver,
-                "The user has specified a rule which prevents you from using this specific tool call",
-            )? || starts_with(
-                text,
-                resolver,
-                "The user rejected permission to use this specific tool call",
-            )?
-        }
-        _ => false,
-    })
+    }
+    Ok(false)
 }
 
 pub(super) fn plain_summary(text: &Text, resolver: &Resolver) -> Result<String> {
-    let mut summary = Trimmed::default();
-    chunks(text, resolver, |chunk| summary.push(chunk))?;
-    Ok(summary.summary())
+    let mut summary = trimmed();
+    chunks(text, resolver, |chunk| {
+        summary.push(chunk);
+    })?;
+    Ok(summary.finish())
 }
 
 #[cfg(test)]
@@ -471,19 +344,20 @@ mod tests {
                     rest = &rest[end..];
                 }
                 assert_eq!(facts.summary(), original_summary(&text), "chunk={chunk}, text={text:?}");
-                assert_eq!(facts.plain_summary(), crate::ir::truncate(text.trim(), 120));
+                assert_eq!(facts.plain.finish(), crate::ir::truncate(text.trim(), 120));
+                let (whole, resolver) = (Text::Inline(text.clone()), Resolver::new(None));
                 assert_eq!(
-                    facts.requires_approval(),
+                    contains(&whole, &resolver, "requires approval").unwrap(),
                     text.trim_start().contains("requires approval")
                 );
                 let t = text.trim_start();
                 assert_eq!(
-                    facts.denied(Harness::Claude),
+                    denied(&whole, &resolver, Harness::Claude).unwrap(),
                     (t.starts_with("Permission to use ") && t.contains(" denied"))
                         || t.starts_with("The user doesn't want to proceed with this tool use")
                 );
                 assert_eq!(
-                    facts.denied(Harness::OpenCode),
+                    denied(&whole, &resolver, Harness::OpenCode).unwrap(),
                     t.starts_with(
                         "The user has specified a rule which prevents you from using this specific tool call"
                     ) || t.starts_with("The user rejected permission to use this specific tool call")
@@ -519,73 +393,36 @@ mod tests {
         for (i, body) in examples.iter().enumerate() {
             for escaped in [false, true] {
                 let path = dir.join(format!("{i}-{escaped}"));
-                let raw = if escaped {
-                    serde_json::to_string(body).unwrap()
-                } else {
-                    body.clone()
-                };
+                // A span covers a JSON string's body; `escaped` is only the body's own flag.
+                let raw = serde_json::to_string(body).unwrap();
                 std::fs::write(&path, &raw).unwrap();
                 let resolver = Resolver::new(Some(path));
                 let span = Text::Span(crate::lazy::Span {
                     source: None,
-                    offset: u64::from(escaped),
-                    len: raw.len() as u64 - 2 * u64::from(escaped),
+                    offset: 1,
+                    len: raw.len() as u64 - 2,
                     escaped,
                 });
                 let reduced = facts(&span, &resolver).unwrap();
                 assert_eq!(reduced.summary(), original_summary(body));
-                assert_eq!(reduced.plain_summary(), crate::ir::truncate(body.trim(), 120));
-                assert_eq!(reduced.requires_approval(), body.contains("requires approval"));
-                let full = facts(&Text::Inline(body.clone()), &resolver).unwrap();
-                assert_eq!(reduced.denied(Harness::Claude), full.denied(Harness::Claude));
+                assert_eq!(reduced.plain.finish(), crate::ir::truncate(body.trim(), 120));
                 assert_eq!(
-                    reduced.starts_with("<task-notification>"),
-                    full.starts_with("<task-notification>")
+                    contains(&span, &resolver, "requires approval").unwrap(),
+                    body.contains("requires approval")
+                );
+                let full = Text::Inline(body.clone());
+                assert_eq!(
+                    denied(&span, &resolver, Harness::Claude).unwrap(),
+                    denied(&full, &resolver, Harness::Claude).unwrap()
+                );
+                assert_eq!(
+                    starts_with(&span, &resolver, "<task-notification>").unwrap(),
+                    body.trim_start().starts_with("<task-notification>")
                 );
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
-    #[test]
-    fn malformed_escaped_tail_uses_the_full_resolution_fallback_for_heads() {
-        let dir = std::env::temp_dir().join(format!("cv-affordance-malformed-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let examples = [
-            format!("\\n<task-notification>{}\\q", "x".repeat(70000)),
-            format!("\\n<task-notification>{}\\uD800", "x".repeat(70000)),
-            format!("\\nPermission to use Bash {} denied\\q", "x".repeat(70000)),
-            format!(
-                "\\nThe user rejected permission to use this specific tool call{}\\q",
-                "x".repeat(70000)
-            ),
-            format!("\\n<task-notification>{}", "x".repeat(70000)),
-        ];
-        for (i, raw) in examples.iter().enumerate() {
-            let path = dir.join(i.to_string());
-            std::fs::write(&path, raw).unwrap();
-            let resolver = Resolver::new(Some(path));
-            let span = Text::Span(crate::lazy::Span {
-                source: None,
-                offset: 0,
-                len: raw.len() as u64,
-                escaped: true,
-            });
-            let full = span.try_resolve(&resolver).unwrap();
-            let inline = Text::Inline(full.to_string());
-            assert_eq!(
-                starts_with(&span, &resolver, "<task-notification>").unwrap(),
-                full.trim_start().starts_with("<task-notification>")
-            );
-            for harness in [Harness::Claude, Harness::OpenCode] {
-                assert_eq!(
-                    denied(&span, &resolver, harness).unwrap(),
-                    denied(&inline, &resolver, harness).unwrap()
-                );
-            }
-        }
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
     #[test]
     fn unicode_whitespace_across_prefix_cap_keeps_the_late_ascii_head() {
         let dir = std::env::temp_dir().join(format!("cv-affordance-unicode-head-{}", uuid::Uuid::new_v4()));
@@ -595,12 +432,12 @@ mod tests {
             "\u{2003}".repeat(10000)
         );
         let path = dir.join("body");
-        std::fs::write(&path, &full).unwrap();
+        std::fs::write(&path, format!("\"{full}\"")).unwrap();
         let resolver = Resolver::new(Some(path));
         for escaped in [false, true] {
             let span = Text::Span(crate::lazy::Span {
                 source: None,
-                offset: 0,
+                offset: 1,
                 len: full.len() as u64,
                 escaped,
             });

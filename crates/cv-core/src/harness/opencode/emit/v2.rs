@@ -1,4 +1,5 @@
 //! Native 2.0.25 schema; one checked, contiguous TEXT row at a time.
+use super::super::v2::DETAILS_KEY;
 use crate::{
     emit::*,
     harness::wire::write::{self, ObjectWriter},
@@ -8,7 +9,7 @@ use crate::{
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::{collections::HashMap, io::Write};
+use std::{borrow::Cow, collections::HashMap, io::Write};
 use uuid::Uuid;
 
 /// Native empty-store bootstrap: install the complete schema and record its migration frontier.
@@ -185,17 +186,11 @@ pub(super) fn write_database(
                     {
                         Some(record.projection.len())
                     }
-                    crate::Json::Owned(data) => owned_replay_data(
-                        original_id,
-                        ty,
-                        data,
-                        &session.messages[index..],
-                        session.model.as_ref(),
-                    ),
+                    crate::Json::Owned(data) => owned_replay_data(original_id, ty, data, &session.messages[index..]),
                     _ => None,
                 };
                 if let Some(group) = group {
-                    if !msg.extra.contains_key(crate::harness::claude::CARRIER_KEY)
+                    if !msg.extra.contains_key(crate::ir::CARRIER_KEY)
                         && session.messages[index..index + group]
                             .iter()
                             .filter_map(|m| m.id.as_deref())
@@ -224,8 +219,8 @@ pub(super) fn write_database(
         }
 
         if session.harness == Harness::OpenCode && msg.id.as_deref().is_some_and(|id| identities.get(id) == Some(&1)) {
-            if let Some(raw) = msg.extra.get(crate::harness::claude::CARRIER_KEY) {
-                if let Some((ty, group)) = owned_replay(raw, &session.messages[index..], session.model.as_ref()) {
+            if let Some(raw) = msg.extra.get(crate::ir::CARRIER_KEY) {
+                if let Some((ty, group)) = owned_replay(raw, &session.messages[index..]) {
                     if session.messages[index..index + group]
                         .iter()
                         .filter_map(|m| m.id.as_deref())
@@ -269,7 +264,7 @@ pub(super) fn write_database(
         } else {
             "user"
         };
-        let ty = {
+        {
             row.field("time", json!({"created":ts,"completed":ts}))?;
             if ty == "assistant" {
                 row.field(
@@ -308,11 +303,11 @@ pub(super) fn write_database(
                     let mut values = Vec::new();
                     for block in &msg.content {
                         match block {
-                            Block::Text { text } => values.push(text.clone()),
+                            Block::Text { text } => values.push(Cow::Borrowed(text)),
                             Block::Thinking { .. } => {
                                 let fate = thinking::fate(block, Harness::OpenCode, opts.thinking, &resolver)?;
                                 if let Some(text) = thinking::text_with_fate(block, fate) {
-                                    values.push(text.into_owned());
+                                    values.push(text);
                                 }
                             }
                             _ => {}
@@ -339,10 +334,10 @@ pub(super) fn write_database(
                             _ => None,
                         };
                         if let Some(text) = unavailable {
-                            values.push(text.into());
+                            values.push(Cow::Owned(text.into()));
                         }
                     }
-                    write::joined_text(w, values.iter(), &resolver)
+                    write::joined_text(w, values.iter().map(|text| text.as_ref()), &resolver)
                 })?;
                 if let Some(metadata) = extra.and_then(|b| b.get("metadata")) {
                     row.field("metadata", metadata)?;
@@ -362,8 +357,7 @@ pub(super) fn write_database(
                     row.field("files", files)?;
                 }
             }
-            ty
-        };
+        }
         row.finish()?;
         insert
             .execute(params![mid, id, ty, seq, ts, String::from_utf8(bytes)?])
@@ -524,30 +518,21 @@ fn remap_references(value: &mut Value, ids: &HashMap<&str, &str>, source_session
     }
 }
 
-fn owned_replay<'a>(raw: &'a Value, current: &[Message], model: Option<&String>) -> Option<(&'a str, usize)> {
+fn owned_replay<'a>(raw: &'a Value, current: &[Message]) -> Option<(&'a str, usize)> {
     let id = raw.get("id")?.as_str()?;
     let ty = raw.get("type")?.as_str()?;
-    owned_replay_data(id, ty, raw, current, model).map(|count| (ty, count))
+    owned_replay_data(id, ty, raw, current).map(|count| (ty, count))
 }
-fn owned_replay_data(id: &str, ty: &str, data: &Value, current: &[Message], model: Option<&String>) -> Option<usize> {
+fn owned_replay_data(id: &str, ty: &str, data: &Value, current: &[Message]) -> Option<usize> {
     let mut original = super::super::v2::build(
         id,
         ty,
         crate::json::JsonView::owned(data),
-        &crate::stream::ParseOptions::complete(),
+        &crate::stream::Demand::COMPLETE,
         super::super::record::Ctx::Owned,
     )
     .ok()??;
     super::super::v2::tag_complete(&mut original, id, ty);
-    let mut model = model.cloned();
-    for message in &mut original {
-        if model.is_none() {
-            model = message.model.clone();
-        }
-        if message.model.is_some() && message.model == model {
-            message.model = None;
-        }
-    }
     let text_overlay = matches!(ty, "user")
         && data
             .get("text")
@@ -684,6 +669,8 @@ fn tool_metadata(item: &mut ObjectWriter<'_>, result: Option<&Block>, ts: i64) -
     }
     Ok(())
 }
+// V2 keeps details in its clustervision envelope rather than the v1 state title/time fields;
+// the v2 reader unwraps that envelope when reconstructing the tool result.
 fn tool_state(
     w: &mut dyn Write,
     input: Option<&crate::Json>,
@@ -740,14 +727,14 @@ fn tool_state(
                 let mut metadata = ObjectWriter::new(w)?;
                 if let Some(native) = details.get("metadata").and_then(Value::as_object) {
                     for (key, value) in native {
-                        if key != "clustervision.details" {
+                        if key != DETAILS_KEY {
                             metadata.field(key, value)?;
                         }
                     }
                 }
                 if details.get("metadata").is_some() || details.get("title").is_some() || details.get("time").is_some()
                 {
-                    metadata.field("clustervision.details", details)?;
+                    metadata.field(DETAILS_KEY, details)?;
                 } else if let Some(fields) = details.as_object() {
                     for (key, value) in fields {
                         metadata.field(key, value)?;

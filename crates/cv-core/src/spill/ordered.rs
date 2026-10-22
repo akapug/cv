@@ -17,6 +17,26 @@ pub(crate) trait Record: Sized {
     fn read(reader: &mut impl BufRead, state: &mut Self::ReadState) -> Result<Self>;
 }
 
+impl Record for String {
+    type ReadState = ();
+    fn heap_bytes(&self) -> usize {
+        self.capacity()
+    }
+    fn write(&self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
+        writer.write_all(&(self.len() as u64).to_le_bytes())?;
+        writer.write_all(self.as_bytes())?;
+        Ok(())
+    }
+    fn read(reader: &mut impl std::io::BufRead, _: &mut ()) -> anyhow::Result<Self> {
+        let mut len = [0; 8];
+        reader.read_exact(&mut len)?;
+        let len = usize::try_from(u64::from_le_bytes(len))?;
+        let mut bytes = vec![0; len];
+        reader.read_exact(&mut bytes)?;
+        Ok(String::from_utf8(bytes)?)
+    }
+}
+
 pub(crate) struct Ordered<T> {
     memory: VecDeque<T>,
     heap_bytes: usize,
@@ -41,7 +61,7 @@ impl<T: Record> Ordered<T> {
     pub(crate) fn len(&self) -> usize {
         self.len
     }
-    pub(crate) fn temporary_bytes(&self) -> Result<u64> {
+    pub(crate) fn spilled_bytes(&self) -> Result<u64> {
         match &self.spill {
             None => Ok(0),
             Some(spill) => {

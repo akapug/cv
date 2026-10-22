@@ -390,7 +390,7 @@ impl TaskReducer {
         let Some(task) = self.model.tasks.get_mut(&event.task_id) else {
             return Err(ReduceError::UnknownTask {
                 task_id: event.task_id.clone(),
-                event: kind.tag_static(),
+                event: kind.tag(),
             });
         };
 
@@ -514,7 +514,7 @@ impl TaskReducer {
                 let Some(decision) = task.decision.as_mut() else {
                     return Err(ReduceError::MissingDecision {
                         task_id,
-                        event: kind.tag_static(),
+                        event: kind.tag(),
                     });
                 };
                 if *provisional && *choice != decision.default_choice {
@@ -589,13 +589,6 @@ impl TaskReducer {
     }
 }
 
-impl TaskEventKind {
-    /// `tag()` but usable in `ReduceError`'s `&'static str` fields.
-    fn tag_static(&self) -> &'static str {
-        self.tag()
-    }
-}
-
 fn require_base(task: &TaskProjection, kind: &TaskEventKind, allowed: &[TaskState]) -> Result<(), ReduceError> {
     if allowed.contains(&task.state) {
         Ok(())
@@ -603,7 +596,7 @@ fn require_base(task: &TaskProjection, kind: &TaskEventKind, allowed: &[TaskStat
         Err(ReduceError::InvalidTransition {
             task_id: task.task_id.clone(),
             state: task.state.as_str().to_string(),
-            event: kind.tag_static(),
+            event: kind.tag(),
         })
     }
 }

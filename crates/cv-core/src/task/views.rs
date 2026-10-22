@@ -51,6 +51,27 @@ pub struct TaskRow {
 }
 
 impl TaskRow {
+    /// Every key a row can carry, in emitted order (`cv schema --json` publishes it as
+    /// `task_row`): the lean row omits the timestamps and the backlog columns, and `tags` /
+    /// `blocked_by` ride only when non-empty.
+    pub const KEYS: &'static [&'static str] = &[
+        "id",
+        "title",
+        "effective_state",
+        "assignee",
+        "repo",
+        "opened_at",
+        "last_ts",
+        "tags",
+        "blocked_by",
+        "opened_by",
+        "issue",
+        "body",
+        "notes",
+        "decision",
+        "blocked",
+    ];
+
     /// The lean row (MCP `task_list`): no timestamps on the wire.
     pub fn brief(t: &TaskProjection) -> TaskRow {
         TaskRow {
@@ -156,5 +177,20 @@ mod tests {
                 "last_ts"
             ],
         );
+    }
+
+    /// A detailed row with every optional column set emits exactly `TaskRow::KEYS`, in order.
+    #[test]
+    fn keys_are_the_serde_key_set() {
+        let (model, id) = model_with_claimed_task();
+        let row = TaskRow {
+            issue: Some("#1".into()),
+            tags: vec!["t".into()],
+            blocked_by: vec!["b".into()],
+            ..TaskRow::detailed(&model.tasks[&id], &model)
+        };
+        let value = serde_json::to_value(row).unwrap();
+        let keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, TaskRow::KEYS);
     }
 }

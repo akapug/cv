@@ -1,9 +1,8 @@
 # Store probe
 
 This diagnostic example performs one operation per process without modifying harness stores.
-It supports Claude, Codex, Gemini, OpenClaw, Continue, LM Studio, Cline, Kimi, Kimi Code, Grok, Qwen,
-OpenSession, ChatGPT/Claude account exports and (with SQLite enabled) Cursor, OpenCode, Devin,
-Hermes, Goose and Zed through explicit-root constructors. Direct stream operations never update
+It supports every harness (the SQLite ones with SQLite enabled) through the registry's
+explicit-root constructor, `harness::for_harness_with_root`. Direct stream operations never update
 the catalog or detect installed homes to resolve IDs. The `sessions` operation follows production
 fleet detection from `HOME`/XDG and may perform a scoped or full discovery.
 
@@ -29,11 +28,10 @@ Run `OP HARNESS ID PATH`, optionally `--root DIR`, `--mode lazy|lazy-extra|facts
 `--mode facts` requests the shared reducer metadata projection; adapters without a projection
 implementation retain full extras. Compare reducer outputs rather than Message JSON across these
 two modes. The default mode is lazy. The root defaults to the input's parent; for discovery
-pass the config/runtime root explicitly (`projects/`, `sessions/`, or `tmp/` lives beneath it).
-Continue expects its global directory containing `sessions/`; LM Studio expects the conversations
-directory containing `*.conversation.json` itself. OpenClaw expects its state directory.
-Cline expects a home containing `.cline/`; Kimi, Kimi Code and Grok expect their native homes
-containing `sessions/`. Devin/Zed expect the directory containing `sessions.db`/`threads.db`. Directory session
+pass the root explicitly: what `for_harness_with_root` documents for the harness (Claude's config
+dir, Codex's home, Continue's global dir, LM Studio's conversations dir, OpenClaw's state dir, a
+user home for Cline and Roo, the dir holding `sessions.db`/`threads.db` for Devin/Zed, a Cursor
+`User` dir or CLI home, …). Directory session
 paths (Kimi, Kimi Code and Grok) report directory metadata size, not total transcript/sidecar bytes;
 use the generator manifest for total generated physical source sizes.
 OpenSession and account exports scan only the explicit root, excluding configured exports and
@@ -243,11 +241,12 @@ heap and clean timing runs, and state whether the scratch catalog is new or alre
 
 `tools/check-heap-budget.py MMAP_HEAP_PROBE --no-mmap-probe RANGED_HEAP_PROBE --only events`
 is the event retention gate run in CI. It generates 20,000 and 200,000
-small Claude Edit records with distinct targets, verifies every persisted row and the source stamp,
-checks temporary-file cleanup and I/O accounting, and bounds Rust heap at 1 MiB with 256 KiB growth.
-The retained `events-collected` oracle must produce identical rows and demonstrate growing heap.
-The focused event case uses only the mmap binary. Native SQLite memory, giant tool arguments and
-crash cleanup remain outside this heap guarantee.
+calls per case: unfinished Claude Edits, open-many/close-in-reverse/reopen, and Codex visible patches
+with native completions adding another path. Both mmap and positioned probes (with `sqlite`) verify
+every persisted row and source stamp, temporary-file cleanup and I/O accounting, with unchanged
+1 MiB Rust heap and 256 KiB growth limits. The retained `events-collected` control must produce
+identical rows and demonstrate growing heap. Native SQLite memory, giant native diffs/tool
+arguments and crash cleanup remain outside this heap guarantee.
 
 `hash --raw-order` resolves content but preserves IR map insertion order in message and metadata
 digests. It detects serialization-order drift that the default canonical digest deliberately

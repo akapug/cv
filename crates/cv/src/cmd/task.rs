@@ -560,17 +560,17 @@ fn replay_loud() -> Result<cv_core::task::ReplayOutcome> {
     Ok(outcome)
 }
 
-/// Append an agent event through the shared core path, print a one-line confirmation.
-fn append_and_report(task_id: Option<&str>, from: &str, kind: TaskEventKind) -> Result<()> {
-    append_event(task_id, from, kind).map(|_| ())
+/// Resolve one mutation target after reporting replay warnings.
+fn resolve_target(id: &str) -> Result<String> {
+    let outcome = replay_loud()?;
+    Ok(resolve(&outcome.model, id)?.to_string())
 }
 
-/// [`append_and_report`], returning the event's task id (what `open` needs to attach its tags
-/// and relations to the task it just created).
+/// Append an agent event, print confirmation and return its task id for follow-up events.
 fn append_event(task_id: Option<&str>, from: &str, kind: TaskEventKind) -> Result<String> {
     let store = TaskStore::default_store();
     let report = task::append(&store, task_id, from, kind, Vec::new())?;
-    for w in report.replay_warnings.iter().chain(&report.warnings) {
+    for w in &report.warnings {
         eprintln!("⚠ {}", sanitize_line(w));
     }
     let state = report.effective_state.unwrap_or_else(|| "?".into());
@@ -586,14 +586,18 @@ fn append_event(task_id: Option<&str>, from: &str, kind: TaskEventKind) -> Resul
     Ok(report.event.task_id)
 }
 
+/// Read explicit text (including `-` for stdin), otherwise the selected file.
+fn text_arg(text: Option<String>, file: Option<PathBuf>) -> Result<Option<String>> {
+    match (text, file) {
+        (Some(text), _) => text_or_stdin(text).map(Some),
+        (None, Some(file)) => read_text_arg(&file).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
 /// `--note TEXT` (`-` = stdin) or `--note-file PATH`, whichever was given.
 fn note_arg(note: Option<String>, note_file: Option<PathBuf>) -> Result<Option<String>> {
-    let text = match (note, note_file) {
-        (Some(n), _) => text_or_stdin(n)?,
-        (None, Some(f)) => read_text_arg(&f)?,
-        (None, None) => return Ok(None),
-    };
-    Ok(Some(text).filter(|t| !t.trim().is_empty()))
+    Ok(text_arg(note, note_file)?.filter(|text| !text.trim().is_empty()))
 }
 
 /// Append several events after validating the whole batch ([`task::append_events`]). One
@@ -620,11 +624,11 @@ fn append_batch(events: Vec<TaskEvent>) -> Result<()> {
     Ok(())
 }
 
-/// Close with an optional note first. Validate both candidates before writing either, so a
-/// refused close leaves the log unchanged and evidence precedes completion when appended.
+/// Close with an optional note first. task::append_events validates the complete batch before
+/// writing it, so a refused close leaves the log unchanged and evidence precedes completion.
 fn close_with_note(id: &str, from: &str, note: Option<String>, close: TaskEventKind) -> Result<()> {
     let Some(text) = note else {
-        return append_and_report(Some(id), from, close);
+        return append_event(Some(id), from, close).map(|_| ());
     };
     let note = task::new_event(
         Some(id),
@@ -703,10 +707,8 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 None => None,
             };
             let issue = absolutize_issue(issue, repo.as_deref());
-            let body = match &body_file {
-                Some(p) => read_text_arg(p)?,
-                None => text_or_stdin(body)?,
-            };
+            let body = text_arg(body_file.is_none().then_some(body), body_file)?
+                .expect("body has a default when no file is supplied");
             let tags = tags.as_deref().map(parse_tags).unwrap_or_default();
             // Relations name other tasks: resolve every prefix BEFORE the open, so a typo refuses
             // the whole command instead of leaving a task opened with half its relations.
@@ -883,16 +885,14 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         TaskCmd::Claim { id, from, token } => {
             refuse_token(token)?;
             let from = require_from(from)?;
-            let outcome = replay_loud()?;
-            let id = resolve(&outcome.model, &id)?.to_string();
-            append_and_report(Some(&id), &from, TaskEventKind::Claimed { assignee: from.clone() })
+            let id = resolve_target(&id)?;
+            append_event(Some(&id), &from, TaskEventKind::Claimed { assignee: from.clone() }).map(|_| ())
         }
         TaskCmd::Release { id, from, token } => {
             refuse_token(token)?;
             let from = require_from(from)?;
-            let outcome = replay_loud()?;
-            let id = resolve(&outcome.model, &id)?.to_string();
-            append_and_report(Some(&id), &from, TaskEventKind::Released {})
+            let id = resolve_target(&id)?;
+            append_event(Some(&id), &from, TaskEventKind::Released {}).map(|_| ())
         }
         TaskCmd::Note {
             id,
@@ -901,14 +901,9 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             session_ref,
             from,
         } => {
-            let outcome = replay_loud()?;
-            let id = resolve(&outcome.model, &id)?.to_string();
-            let text = match (text, file) {
-                (Some(t), _) => text_or_stdin(t)?,
-                (None, Some(f)) => read_text_arg(&f)?,
-                (None, None) => unreachable!("clap requires text or --file"),
-            };
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Noted { text, session_ref })
+            let id = resolve_target(&id)?;
+            let text = text_arg(text, file)?.expect("clap requires text or --file");
+            append_event(Some(&id), &from_or_cv(from), TaskEventKind::Noted { text, session_ref }).map(|_| ())
         }
         TaskCmd::Done {
             id,
@@ -927,8 +922,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 );
             }
             let note = note_arg(note, note_file)?;
-            let outcome = replay_loud()?;
-            let id = resolve(&outcome.model, &id)?.to_string();
+            let id = resolve_target(&id)?;
             close_with_note(
                 &id,
                 &from_or_cv(from),
@@ -945,15 +939,10 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         } => {
             refuse_token(token)?;
             let from = require_from(from)?;
-            let outcome = replay_loud()?;
-            let id = resolve(&outcome.model, &id)?.to_string();
-            let text = match (text, file) {
-                (Some(t), _) => text_or_stdin(t)?,
-                (None, Some(f)) => read_text_arg(&f)?,
-                (None, None) => unreachable!("clap requires text or --file"),
-            };
+            let id = resolve_target(&id)?;
+            let text = text_arg(text, file)?.expect("clap requires text or --file");
             let text = text.trim_end().to_string();
-            append_and_report(Some(&id), &from, TaskEventKind::StatusSet { text })
+            append_event(Some(&id), &from, TaskEventKind::StatusSet { text }).map(|_| ())
         }
         TaskCmd::Abandon {
             id,
@@ -963,30 +952,28 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             from,
         } => {
             let note = note_arg(note, note_file)?;
-            let outcome = replay_loud()?;
-            let id = resolve(&outcome.model, &id)?.to_string();
+            let id = resolve_target(&id)?;
             close_with_note(&id, &from_or_cv(from), note, TaskEventKind::Abandoned { reason })
         }
         TaskCmd::Supersede { id, by_task, from } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             let by_task = resolve(&outcome.model, &by_task)?.to_string();
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Superseded { by_task })
+            append_event(Some(&id), &from_or_cv(from), TaskEventKind::Superseded { by_task }).map(|_| ())
         }
         TaskCmd::Tag { id, tags, from } => {
-            let outcome = replay_loud()?;
-            let id = resolve(&outcome.model, &id)?.to_string();
+            let id = resolve_target(&id)?;
             let tags = parse_tags(&tags);
             if tags.is_empty() {
                 bail!("no tags given (comma-separated, e.g. `deploy,lean`)");
             }
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Tagged { tags })
+            append_event(Some(&id), &from_or_cv(from), TaskEventKind::Tagged { tags }).map(|_| ())
         }
         TaskCmd::Block { id, by_task, from } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             let by_task = resolve(&outcome.model, &by_task)?.to_string();
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::BlockedBy { task: by_task })
+            append_event(Some(&id), &from_or_cv(from), TaskEventKind::BlockedBy { task: by_task }).map(|_| ())
         }
         TaskCmd::Sweep { repo, main, json } => cmd_sweep(&repo, main, json),
         TaskCmd::Inbox {
@@ -1045,10 +1032,8 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 ),
                 None => None,
             };
-            let body = match &body_file {
-                Some(p) => read_text_arg(p)?,
-                None => text_or_stdin(body)?,
-            };
+            let body = text_arg(body_file.is_none().then_some(body), body_file)?
+                .expect("body has a default when no file is supplied");
             let now = Utc::now();
             let deadline = match by {
                 Some(b) => Some(task::parse_deadline(&b, now).map_err(|e| anyhow::anyhow!(e))?),
@@ -1145,7 +1130,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             let store = TaskStore::default_store();
             let answer = task_ops::Answer::from_flags(choice, accept_default, confirm)?;
             let report = task_ops::resolve(&store, &outcome.model, &from, &id, answer, note, provisional)?;
-            for w in report.replay_warnings.iter().chain(&report.warnings) {
+            for w in &report.warnings {
                 eprintln!("⚠ {}", sanitize_line(w));
             }
             if let TaskEventKind::Resolved {
@@ -1189,7 +1174,8 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 since: Since::parse(since.as_deref(), now)?,
                 kinds: kind
                     .as_deref()
-                    .map(|k| k.split(',').map(task_ops::kind_tag).collect())
+                    .map(task_ops::kind_tags)
+                    .transpose()?
                     .unwrap_or_default(),
                 by,
                 not_by,

@@ -1,8 +1,9 @@
 //! Borrow the existing IR, stream checked leaves, and preserve the legacy ordered pretty wire.
 use super::*;
+use crate::harness::wire::genai;
 use crate::{
     harness::{
-        store::{bytes::ByteStage, publish_stage},
+        store::{bytes::ByteStage, stage_into},
         wire::write::{self, ObjectWriter},
     },
     ir::Message,
@@ -33,7 +34,7 @@ fn parts(writer: &mut dyn Write, message: &Message, fates: &[ThinkingFate], reso
         first = false;
         let mut object = ObjectWriter::new(writer)?;
         match block {
-            Block::Text { text } => object.field_with("text", |w| write::text(w, text, resolver))?,
+            Block::Text { text } => genai::text_fields(&mut object, text, false, None, resolver)?,
             Block::Thinking {
                 text,
                 signature,
@@ -46,29 +47,10 @@ fn parts(writer: &mut dyn Write, message: &Message, fates: &[ThinkingFate], reso
                         thinking_placeholder(signature.as_deref(), encrypted.as_deref(), *redacted),
                     )?;
                 } else {
-                    object.field_with("text", |w| write::text(w, text, resolver))?;
-                    if projection == ThinkingFate::Keep {
-                        object.field("thought", true)?;
-                    }
+                    genai::text_fields(&mut object, text, projection == ThinkingFate::Keep, None, resolver)?;
                 }
             }
-            Block::Image { media_type, .. } => object.field_with("inlineData", |w| {
-                let mut data = ObjectWriter::new(w)?;
-                if let Some(mt) = media_type {
-                    data.field("mimeType", mt)?;
-                }
-                data.finish()
-            })?,
-            Block::File { mime, path, source } => object.field_with("fileData", |w| {
-                let mut data = ObjectWriter::new(w)?;
-                if let Some(mt) = mime {
-                    data.field("mimeType", mt)?;
-                }
-                if let Some(uri) = source.as_deref().or(path.as_deref()) {
-                    data.field("fileUri", uri)?;
-                }
-                data.finish()
-            })?,
+            block @ (Block::Image { .. } | Block::File { .. }) => genai::media_fields(&mut object, block)?,
             Block::ToolUse { .. } | Block::ToolResult { .. } => unreachable!(),
         }
         object.finish()?;
@@ -148,7 +130,22 @@ fn calls(
     Ok(())
 }
 
-fn messages(writer: &mut dyn Write, session: &Session, mode: ThinkingMode, resolver: &Resolver) -> Result<()> {
+/// A message's id: name-based (UUID v5) from the session id and the message's index in the IR,
+/// so emitting one session twice under one id writes the same ids.
+fn message_id(session_id: &str, index: usize) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("urn:cv:gemini:{session_id}:{index}").as_bytes(),
+    )
+}
+
+fn messages(
+    writer: &mut dyn Write,
+    session: &Session,
+    session_id: &str,
+    mode: ThinkingMode,
+    resolver: &Resolver,
+) -> Result<()> {
     let mut results = Results::new();
     for message in &session.messages {
         if message.role == Role::Tool {
@@ -168,7 +165,7 @@ fn messages(writer: &mut dyn Write, session: &Session, mode: ThinkingMode, resol
     let called = called_tool_ids(session);
     writer.write_all(b"[")?;
     let mut first = true;
-    for message in &session.messages {
+    for (index, message) in session.messages.iter().enumerate() {
         let has_calls = message.content.iter().any(|block| match block {
             Block::ToolUse { .. } => message.role == Role::Assistant,
             Block::ToolResult { tool_use_id, .. } => {
@@ -193,7 +190,7 @@ fn messages(writer: &mut dyn Write, session: &Session, mode: ThinkingMode, resol
         }
         first = false;
         let mut record = ObjectWriter::new(writer)?;
-        record.field("id", Uuid::new_v4().to_string())?;
+        record.field("id", message_id(session_id, index).to_string())?;
         record.field(
             "type",
             match message.role {
@@ -295,19 +292,26 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
         if let Some(cwd) = &cwd {
             record.field("directories", [cwd.to_string_lossy()])?;
         }
-        record.field_with("messages", |w| messages(w, session, opts.thinking, &resolver))?;
+        record.field_with("messages", |w| messages(w, session, &new_id, opts.thinking, &resolver))?;
         record.finish()?;
     }
-    // Checked serialization completes before registry/transcript publication. Preserve the
-    // legacy registry layout and fs::write-compatible links/permissions on the transcript.
+    // Checked serialization completes before anything is published. The transcript and its
+    // project registration publish as one set, the transcript first: a crash between them leaves
+    // a session Gemini re-registers from its directory, never a registration with no session.
     let stage = stage.into_inner().map_err(|error| error.into_error())?;
-    let chats = match gemini_register_project(out_dir, &cwd_str)? {
+    let slug = project_slug(out_dir, &cwd_str);
+    let chats = match &slug {
         Some(slug) => out_dir.join(slug).join("chats"),
         None => out_dir.join("chats"),
     };
     fs::create_dir_all(&chats).with_context(|| format!("creating {}", chats.display()))?;
     let path = chats.join(format!("session-{new_id}.json"));
-    publish_stage(stage, &path, opts.claim())?;
+    let mut set = crate::publish::Set::new();
+    stage_into(&mut set, stage, &path, opts.claim())?;
+    if let Some(slug) = &slug {
+        stage_project(out_dir, slug, &cwd_str, &mut set)?;
+    }
+    set.publish()?;
     Ok(EmitResult {
         path,
         new_id: new_id.clone(),

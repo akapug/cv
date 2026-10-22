@@ -25,11 +25,17 @@
       },
       "tools": [],
       "usage_messages": 3,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gpt-6-luna",
@@ -50,7 +56,7 @@
         "assistant/reply",
         "tool/tool_result",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "assistant/reply",
         "assistant/reply",
@@ -59,34 +65,34 @@
         "tool/tool_result",
         "system/notice",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "user/prompt",
         "assistant/reply",
         "assistant/reply",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
-        "assistant/reply",
-        "assistant/reply",
-        "system/notice",
-        "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
+        "assistant/notice",
         "assistant/reply",
+        "system/notice",
+        "tool/tool_result",
+        "assistant/notice",
         "assistant/reply",
         "user/prompt",
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply"
       ],
       "blocks": {
@@ -108,11 +114,32 @@
         "functions/exec"
       ],
       "usage_messages": 11,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "apply_patch": {
+            "calls": 0,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "exec": {
+            "calls": 10,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 10,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gpt-6-luna",
@@ -136,11 +163,17 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gpt-6-luna",
@@ -161,7 +194,7 @@
         "assistant/reply",
         "system/compaction_boundary",
         "system/compaction_summary",
-        "assistant/reply",
+        "assistant/notice",
         "user/prompt",
         "assistant/reply",
         "assistant/reply"
@@ -172,6 +205,7 @@
       },
       "tools": [],
       "usage_messages": 3,
+      "model_messages": 0,
       "compaction_boundaries": [
         8
       ],
@@ -179,6 +213,11 @@
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gpt-6-luna",
@@ -198,36 +237,36 @@
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "assistant/reply",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "assistant/reply",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
-        "assistant/reply",
-        "assistant/reply",
-        "system/notice",
-        "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
+        "assistant/notice",
         "assistant/reply",
+        "system/notice",
+        "tool/tool_result",
+        "assistant/notice",
         "assistant/reply",
         "assistant/reply"
       ],
@@ -248,12 +287,26 @@
         "functions/exec"
       ],
       "usage_messages": 9,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/deny": 4,
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "exec": {
+            "calls": 8,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 8,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gpt-6-luna",
@@ -273,22 +326,22 @@
         "assistant/reply",
         "system/subagent_spawn",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "system/subagent_return",
         "system/notice",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "user/prompt",
         "assistant/reply",
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "assistant/reply",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "assistant/reply"
       ],
@@ -305,6 +358,7 @@
         "collaboration/list_agents"
       ],
       "usage_messages": 5,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 1,
@@ -312,6 +366,33 @@
         "approval/state": 1,
         "subagent_return/return": 1,
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "list_agents": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "spawn_agent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "wait_agent": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 4,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gpt-6-luna",
@@ -330,15 +411,15 @@
         "assistant/reply",
         "assistant/reply",
         "tool/tool_result",
-        "assistant/reply",
-        "assistant/reply",
-        "system/notice",
-        "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
+        "assistant/notice",
         "assistant/reply",
+        "system/notice",
+        "tool/tool_result",
+        "assistant/notice",
         "assistant/reply"
       ],
       "blocks": {
@@ -353,11 +434,25 @@
         "functions/exec"
       ],
       "usage_messages": 4,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "exec": {
+            "calls": 3,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 3,
+        "total_errors": 0
       },
       "lineage": {
         "parent": "01a12c67-d6ee-74e3-a296-8c936b563a50",
@@ -379,11 +474,11 @@
         "assistant/reply",
         "assistant/reply",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply",
         "system/notice",
         "tool/tool_result",
-        "assistant/reply",
+        "assistant/notice",
         "assistant/reply"
       ],
       "blocks": {
@@ -397,11 +492,25 @@
         "functions/exec"
       ],
       "usage_messages": 3,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "exec": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gpt-6-luna",

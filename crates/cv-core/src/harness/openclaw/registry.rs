@@ -25,75 +25,76 @@
 
 use crate::affordance::{Affordance, Kind};
 use crate::ir::{truncate, SessionRef};
+use anyhow::Result;
 use serde_json::Value;
-use std::fs;
 use std::path::Path;
 
 /// Every registry row that belongs to `r`.
-pub(super) fn affordances(r: &SessionRef) -> Vec<Affordance> {
+pub(super) fn affordances(r: &SessionRef) -> Result<Vec<Affordance>> {
     // `<state>/agents/<agent>/sessions/<sid>.jsonl` and `<state>/agents/<agent>/agent/<db>.sqlite`
     // sit at the same depth.
     let Some(state) = r.path.ancestors().nth(4) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let Some(key) = session_key(r) else {
-        return Vec::new();
+    let Some(key) = session_key(r)? else {
+        return Ok(Vec::new());
     };
     let (jobs, runs) = if super::is_sqlite_store_path(&r.path) {
-        sqlite_registries(state, &key)
+        sqlite_registries(state, &key)?
     } else {
-        (jsonl_jobs(state), jsonl_runs(state, &key))
+        (jsonl_jobs(state)?, jsonl_runs(state, &key)?)
     };
     let mut out: Vec<Affordance> = jobs.iter().filter(|j| job_belongs(j, &key)).map(job_row).collect();
     out.extend(runs.iter().filter(|(by, _)| by.contains(&key)).map(|(_, p)| run_row(p)));
-    out
+    Ok(out)
 }
 
 /// The session's key: the `sessions.json` entry naming it, or its `session_windows` row.
-fn session_key(r: &SessionRef) -> Option<String> {
+fn session_key(r: &SessionRef) -> Result<Option<String>> {
     if super::is_sqlite_store_path(&r.path) {
         return sqlite_session_key(r);
     }
-    let text = fs::read_to_string(r.path.parent()?.join("sessions.json")).ok()?;
-    let Ok(Value::Object(index)) = serde_json::from_str::<Value>(&text) else {
-        return None;
+    let Some(parent) = r.path.parent() else { return Ok(None) };
+    let Some(index) = crate::affordance::side_json(&parent.join("sessions.json"))? else {
+        return Ok(None);
     };
-    index
+    let index = index
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("sessions.json is not an object"))?;
+    Ok(index
         .iter()
         .find(|(_, e)| e.get("sessionId").and_then(Value::as_str) == Some(r.id.as_str()))
-        .map(|(k, _)| k.clone())
+        .map(|(k, _)| k.clone()))
 }
 
 #[cfg(feature = "sqlite")]
-fn sqlite_session_key(r: &SessionRef) -> Option<String> {
-    let conn = super::open_ro(&r.path).ok()?;
-    conn.read(|conn| {
-        Ok(conn.query_row(
-            "SELECT session_key FROM session_windows WHERE session_id = ?1",
-            [&r.id],
-            |row| row.get(0),
-        )?)
+fn sqlite_session_key(r: &SessionRef) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension as _;
+    let conn = super::open_ro(&r.path)?;
+    conn.read(|conn, _| {
+        Ok(conn
+            .query_row(
+                "SELECT session_key FROM session_windows WHERE session_id = ?1",
+                [&r.id],
+                |row| row.get(0),
+            )
+            .optional()?)
     })
-    .ok()
 }
 
 #[cfg(not(feature = "sqlite"))]
-fn sqlite_session_key(_r: &SessionRef) -> Option<String> {
-    None
+fn sqlite_session_key(_r: &SessionRef) -> Result<Option<String>> {
+    anyhow::bail!("SQLite support is required for the session registry")
 }
 
-fn read_json(path: &Path) -> Option<Value> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
-}
-
-fn jsonl_jobs(state: &Path) -> Vec<Value> {
-    let Some(mut registry) = read_json(&state.join("cron").join("jobs.json")) else {
-        return Vec::new();
+fn jsonl_jobs(state: &Path) -> Result<Vec<Value>> {
+    let Some(mut registry) = crate::affordance::side_json(&state.join("cron").join("jobs.json"))? else {
+        return Ok(Vec::new());
     };
-    match registry.get_mut("jobs").map(Value::take) {
+    Ok(match registry.get_mut("jobs").map(Value::take) {
         Some(Value::Array(jobs)) => jobs,
         _ => Vec::new(),
-    }
+    })
 }
 
 /// A sub-agent run: the keys it belongs to (requester, controller) and its record.
@@ -106,12 +107,12 @@ fn run_keys(p: &Value) -> Vec<String> {
         .collect()
 }
 
-fn jsonl_runs(state: &Path, key: &str) -> Vec<Run> {
-    let Some(mut registry) = read_json(&state.join("subagents").join("runs.json")) else {
-        return Vec::new();
+fn jsonl_runs(state: &Path, key: &str) -> Result<Vec<Run>> {
+    let Some(mut registry) = crate::affordance::side_json(&state.join("subagents").join("runs.json"))? else {
+        return Ok(Vec::new());
     };
     let Some(Value::Object(runs)) = registry.get_mut("runs").map(Value::take) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     // Only this session's runs need ordering. Filtering before sorting avoids ordering
     // the full global registry again for every requested session.
@@ -125,69 +126,54 @@ fn jsonl_runs(state: &Path, key: &str) -> Vec<Run> {
         })
         .collect();
     out.sort_by_key(|(_, p)| p.get("createdAt").and_then(Value::as_i64).unwrap_or(0));
-    out
+    Ok(out)
 }
 
 #[cfg(feature = "sqlite")]
-fn sqlite_registries(state: &Path, key: &str) -> (Vec<Value>, Vec<Run>) {
+fn sqlite_registries(state: &Path, key: &str) -> Result<(Vec<Value>, Vec<Run>)> {
     use super::super::store::sqlite::table_exists;
-    let Ok(conn) = super::open_ro(&state.join("state").join("openclaw.sqlite")) else {
-        return Default::default();
-    };
-    conn.read(|conn| {
-        let parse = |t: String| serde_json::from_str::<Value>(&t).ok();
-        let jobs = if table_exists(conn, "cron_jobs") {
-            // Decode and filter each row before retaining it. Payload ownership remains authoritative:
-            // migrated projections can disagree, and SQLite's JSON duplicate-key rules differ from
-            // serde_json's. Unrelated bodies live only until the next cursor row.
-            conn.prepare("SELECT job_json, state_json FROM cron_jobs ORDER BY sort_order, updated_at, job_id")
-                .and_then(|mut st| {
-                    st.query_map([], |row| {
-                        let job: String = row.get(0)?;
-                        let state: String = row.get(1)?;
-                        let Some(mut job) = parse(job).filter(|job| job_belongs(job, key)) else {
-                            return Ok(None);
-                        };
-                        // The runtime state rides in its own column; fold it back where the 1.29
-                        // entry kept it, but only decode state for matching jobs.
-                        if let (Some(o), Some(state)) = (job.as_object_mut(), parse(state)) {
-                            o.insert("state".into(), state);
-                        }
-                        Ok(Some(job))
-                    })?
-                    .filter_map(|row| row.transpose())
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let runs = if table_exists(conn, "subagent_runs") {
-            conn.prepare("SELECT payload_json FROM subagent_runs ORDER BY created_at, run_id")
-                .and_then(|mut st| {
-                    st.query_map([], |row| {
-                        let payload: String = row.get(0)?;
-                        let Some(payload) = parse(payload) else {
-                            return Ok(None);
-                        };
-                        let keys = run_keys(&payload);
-                        Ok(keys.iter().any(|by| by == key).then_some((keys, payload)))
-                    })?
-                    .filter_map(|row| row.transpose())
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+    let path = state.join("state").join("openclaw.sqlite");
+    if !path.try_exists()? {
+        return Ok(Default::default());
+    }
+    let conn = super::open_ro(&path)?;
+    conn.read(|conn, _| {
+        let mut jobs = Vec::new();
+        if table_exists(conn, "cron_jobs") {
+            let mut stmt =
+                conn.prepare("SELECT job_json, state_json FROM cron_jobs ORDER BY sort_order, updated_at, job_id")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let mut job: Value = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
+                if !job_belongs(&job, key) {
+                    continue;
+                }
+                let state: Value = serde_json::from_str(row.get_ref(1)?.as_str()?)?;
+                if let Some(object) = job.as_object_mut() {
+                    object.insert("state".into(), state);
+                }
+                jobs.push(job);
+            }
+        }
+        let mut runs = Vec::new();
+        if table_exists(conn, "subagent_runs") {
+            let mut stmt = conn.prepare("SELECT payload_json FROM subagent_runs ORDER BY created_at, run_id")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let payload: Value = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
+                let keys = run_keys(&payload);
+                if keys.iter().any(|by| by == key) {
+                    runs.push((keys, payload));
+                }
+            }
+        }
         Ok((jobs, runs))
     })
-    .unwrap_or_default()
 }
 
 #[cfg(not(feature = "sqlite"))]
-fn sqlite_registries(_state: &Path, _key: &str) -> (Vec<Value>, Vec<Run>) {
-    Default::default()
+fn sqlite_registries(_state: &Path, _key: &str) -> Result<(Vec<Value>, Vec<Run>)> {
+    anyhow::bail!("SQLite support is required for the side registries")
 }
 
 fn str_at<'a>(v: &'a Value, ptr: &str) -> Option<&'a str> {
@@ -209,9 +195,15 @@ fn job_belongs(job: &Value, key: &str) -> bool {
     owner || run || main
 }
 
-/// The public summary is 120 characters; retain one lookahead for truncate's ellipsis.
+/// The public summary's bound.
+const SUMMARY: usize = 120;
+/// What a [`Head`](crate::projection::Head) of the summary keeps: its bound and one lookahead.
 fn summary_prefix<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
-    parts.into_iter().flat_map(str::chars).take(121).collect()
+    parts
+        .into_iter()
+        .flat_map(str::chars)
+        .take(crate::projection::Head::kept(SUMMARY))
+        .collect()
 }
 
 /// `corpus-ping · at 2026-10-11T20:48:42Z · Reply with the word pong. · last ok`.
@@ -247,7 +239,7 @@ fn job_row(job: &Value) -> Affordance {
             .enumerate()
             .flat_map(|(i, part)| [if i == 0 { "" } else { " · " }, *part]),
     );
-    Affordance::store(Kind::Schedule, "cron", truncate(&prefix, 120), Vec::new())
+    Affordance::store(Kind::Schedule, "cron", truncate(&prefix, SUMMARY), Vec::new())
 }
 
 /// `ok-reply-check · Reply with the single word ok. · ok → ok`.
@@ -271,7 +263,12 @@ fn run_row(p: &Value) -> Affordance {
         .and_then(chrono::DateTime::from_timestamp_millis);
     Affordance {
         timestamp,
-        ..Affordance::store(Kind::SubagentSpawn, "subagents", truncate(&summary, 120), Vec::new())
+        ..Affordance::store(
+            Kind::SubagentSpawn,
+            "subagents",
+            truncate(&summary, SUMMARY),
+            Vec::new(),
+        )
     }
 }
 
@@ -279,6 +276,7 @@ fn run_row(p: &Value) -> Affordance {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
 
     /// The three ways a job belongs to a session: it made the job, it is one of the job's runs, or
     /// the job fires into it.
@@ -330,7 +328,7 @@ mod tests {
         expected.sort_by_key(|(_, p)| p.get("createdAt").and_then(Value::as_i64).unwrap_or(0));
         expected.retain(|(keys, _)| keys.iter().any(|by| by == key));
         fs::write(world.base.join("subagents/runs.json"), json!({"runs":runs}).to_string())?;
-        let actual = jsonl_runs(&world.base, key);
+        let actual = jsonl_runs(&world.base, key).unwrap();
         assert_eq!(actual, expected);
         assert_eq!(actual.len(), 5);
         Ok(())
@@ -438,6 +436,11 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO subagent_runs VALUES ('malformed', 99, 'bad', '', '')", [])
             .unwrap();
+        assert!(sqlite_registries(&state, "agent:main:explicit:s1").is_err());
+        conn.execute("DELETE FROM cron_jobs WHERE job_id = 'bad'", []).unwrap();
+        assert!(sqlite_registries(&state, "agent:main:explicit:s1").is_err());
+        conn.execute("DELETE FROM subagent_runs WHERE run_id = 'bad'", [])
+            .unwrap();
         for key in [
             "agent:main:explicit:s1",
             "agent:main:main",
@@ -446,7 +449,7 @@ mod tests {
             "1",
             "",
         ] {
-            let (actual_jobs, actual_runs) = sqlite_registries(&state, key);
+            let (actual_jobs, actual_runs) = sqlite_registries(&state, key).unwrap();
             let expected_jobs: Vec<Value> = jobs
                 .iter()
                 .filter(|j| job_belongs(j, key))

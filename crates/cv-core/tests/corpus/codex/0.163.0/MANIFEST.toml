@@ -1,0 +1,17 @@
+# Written by tools/harness-corpus. Never regenerate a committed version in place.
+harness = "codex"
+version = "0.163.0"
+generated = "2026-10-18"
+model = "glm-5.3-flash via Z.ai coding endpoint, through key_proxy.py --translate responses"
+codex_model_profile = "gpt-6-luna (the slug Codex recorded; it picks Codex's tool set, not the model)"
+model_calls = 16
+scenarios = ["hooks"]
+skipped = []
+generator_commit = "61d5a477"
+generator_dirty = true
+# This version was produced by the hooks scenario while it was still uncommitted on top of
+# 61d5a477 (the sandbox had Codex 0.163.0 and the key proxy; this repo's committed
+# `generate.sh --only hooks` is that scenario cleaned up and has not regenerated this version).
+# A rerun goes into a new version directory, never here; its `hooks.json` was written by
+# `cv hooks install codex` and run under `--dangerously-bypass-hook-trust`, so the trust gate
+# a user meets is not part of this fixture (see `codex_trust_matches_the_real_binary`).

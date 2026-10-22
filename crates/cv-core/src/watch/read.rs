@@ -1,23 +1,17 @@
 //! Full-fidelity tail reads continued only from the adapters' existing verified checkpoints.
-use crate::{harness::Adapter, source, stream, Harness, Message, Session, SessionRef};
+use crate::{harness::Adapter, source, stream, Message, Session, SessionRef};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const CONSUMER: &str = "watch-full1";
-const STATE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "/watch-full1");
 const CHECKPOINT_EVERY: u64 = 256 * 1024;
 const ANCHOR_BYTES: usize = 64 * 1024;
 const METADATA_BYTES: usize = 16 * 1024;
 
+/// The state's version: the mark version ([`crate::resume::version`]). Never the cv release.
 fn state_version(adapter: &dyn Adapter) -> String {
-    crate::resume::version(adapter, CONSUMER).unwrap_or_else(|| {
-        format!(
-            "{STATE_VERSION}/view{}/{}",
-            crate::affordance::VIEW_VERSION,
-            adapter.harness().as_str()
-        )
-    })
+    crate::resume::version(adapter, CONSUMER)
 }
 
 fn fits(value: &impl Serialize, limit: usize) -> bool {
@@ -53,10 +47,8 @@ struct Completed {
 /// state, not a second source index. Unsupported adapters transparently read whole.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadState {
-    #[serde(default)]
     version: String,
     path: PathBuf,
-    #[serde(default)]
     primary: Option<PathBuf>,
     pub source: source::Baseline,
     anchor: Option<Anchor>,
@@ -64,7 +56,60 @@ pub struct ReadState {
     completed: Option<Completed>,
 }
 
+/// A [`ReadState`] without its baseline, for a store whose [`source::Record`] carries the
+/// baseline: [`ReadState::split`] and [`ReadState::join`] keep one copy of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Held {
+    version: String,
+    path: PathBuf,
+    primary: Option<PathBuf>,
+    anchor: Option<Anchor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed: Option<Completed>,
+}
+
 impl ReadState {
+    /// The baseline, and everything else.
+    pub fn split(self) -> (source::Baseline, Held) {
+        let ReadState {
+            version,
+            path,
+            primary,
+            source,
+            anchor,
+            completed,
+        } = self;
+        (
+            source,
+            Held {
+                version,
+                path,
+                primary,
+                anchor,
+                completed,
+            },
+        )
+    }
+
+    /// The state [`Self::split`] took apart.
+    pub fn join(source: source::Baseline, held: Held) -> Self {
+        let Held {
+            version,
+            path,
+            primary,
+            anchor,
+            completed,
+        } = held;
+        ReadState {
+            version,
+            path,
+            primary,
+            source,
+            anchor,
+            completed,
+        }
+    }
+
     pub(crate) fn baseline(r: &SessionRef) -> Self {
         Self {
             version: crate::harness::for_harness(r.harness)
@@ -135,7 +180,7 @@ impl ReadState {
         (anchor.checkpoint.messages()? <= skip).then_some(())?;
         anchor.head.admit(
             &adapter.resume_source(r),
-            &crate::resume::version(adapter, CONSUMER)?,
+            &crate::resume::version(adapter, CONSUMER),
             &anchor.checkpoint,
         )
     }
@@ -193,6 +238,9 @@ struct Tail<'a> {
     check: Option<&'a mut dyn FnMut() -> Result<()>>,
     output: Option<&'a mut dyn stream::MessageSink>,
     resolver_source: Option<PathBuf>,
+    // Streaming output can resolve implicit-path spans during callbacks. Retained/owned tails
+    // instead materialize under the final source and dependency checks before returning.
+    // Tool input Json carries its own source identity and is recorded via record_message_reads.
     used_implicit_source: bool,
     primary: PathBuf,
     materialized_reads: source::ReadSet,
@@ -313,56 +361,7 @@ pub fn read(
     skip: usize,
     keep: usize,
 ) -> Result<ReadPass> {
-    read_inner(
-        adapter,
-        r,
-        previous,
-        skip,
-        keep,
-        ReadMode::OwnedTail,
-        ReadControl::default(),
-    )
-}
-
-/// Checked selected messages retaining source-backed payloads for bounded projections.
-pub(super) fn read_retained(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    previous: Option<&ReadState>,
-    skip: usize,
-    keep: usize,
-) -> Result<ReadPass> {
-    read_inner(
-        adapter,
-        r,
-        previous,
-        skip,
-        keep,
-        ReadMode::RetainedTail,
-        ReadControl::default(),
-    )
-}
-
-pub(super) fn read_retained_checked(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    previous: Option<&ReadState>,
-    skip: usize,
-    keep: usize,
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<ReadPass> {
-    read_inner(
-        adapter,
-        r,
-        previous,
-        skip,
-        keep,
-        ReadMode::RetainedTail,
-        ReadControl {
-            output: None,
-            check: Some(check),
-        },
-    )
+    pass(adapter, r, previous, skip, keep, Demand::default())
 }
 
 /// Full session output: on a verified append retain only the checkpoint's stable old prefix,
@@ -373,15 +372,11 @@ pub fn read_session(
     previous: Option<&ReadState>,
     previous_count: usize,
 ) -> Result<ReadPass> {
-    read_inner(
-        adapter,
-        r,
-        previous,
-        previous_count,
-        usize::MAX,
-        ReadMode::OwnedSession,
-        ReadControl::default(),
-    )
+    let demand = Demand {
+        session: true,
+        ..Demand::default()
+    };
+    pass(adapter, r, previous, previous_count, usize::MAX, demand)
 }
 
 /// Full-fidelity views through one bounded consumer, preserving final metadata and verified
@@ -395,74 +390,44 @@ pub fn read_session_into(
     previous_count: usize,
     output: &mut dyn stream::MessageSink,
 ) -> Result<ReadPass> {
-    read_inner(
-        adapter,
-        r,
-        previous,
-        previous_count,
-        usize::MAX,
-        ReadMode::StreamSession,
-        ReadControl {
-            output: Some(output),
-            check: None,
-        },
-    )
+    let demand = Demand {
+        session: true,
+        output: Some(output),
+        ..Demand::default()
+    };
+    pass(adapter, r, previous, previous_count, usize::MAX, demand)
 }
 
-/// Deliver newly observed retained messages directly. Early consumer stop returns a checked
-/// partial read without claiming EOF metadata; the caller must preserve its pending position.
-pub(super) fn read_tail_into(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    previous: Option<&ReadState>,
-    skip: usize,
-    output: &mut dyn stream::MessageSink,
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<ReadPass> {
-    read_inner(
-        adapter,
-        r,
-        previous,
-        skip,
-        usize::MAX,
-        ReadMode::StreamTail,
-        ReadControl {
-            output: Some(output),
-            check: Some(check),
-        },
-    )
-}
-
-enum ReadMode {
-    OwnedTail,
-    RetainedTail,
-    OwnedSession,
-    StreamSession,
-    StreamTail,
-}
-
+/// What one watch read asks for. The tail past `skip` (or, with `session`, the whole session
+/// resumed from its stable checkpoint prefix); payloads owned, or left in the source when
+/// `retained` or when `output` streams them; an `output` that receives messages as they stream
+/// (an early stop on a tail returns a checked partial read without claiming EOF metadata, so
+/// the caller keeps its pending position); and a cooperative `check` at read boundaries.
 #[derive(Default)]
-struct ReadControl<'a> {
-    output: Option<&'a mut dyn stream::MessageSink>,
-    check: Option<&'a mut dyn FnMut() -> Result<()>>,
+pub(super) struct Demand<'a> {
+    pub session: bool,
+    pub retained: bool,
+    pub output: Option<&'a mut dyn stream::MessageSink>,
+    pub check: Option<&'a mut dyn FnMut() -> Result<()>>,
 }
 
-fn read_inner<'a>(
+/// One watch read under its [`Demand`].
+pub(super) fn pass(
     adapter: &dyn Adapter,
     r: &SessionRef,
     previous: Option<&ReadState>,
     mut skip: usize,
     keep: usize,
-    mode: ReadMode,
-    control: ReadControl<'a>,
+    demand: Demand<'_>,
 ) -> Result<ReadPass> {
-    let ReadControl { output, check } = control;
-    let session_output = matches!(mode, ReadMode::OwnedSession | ReadMode::StreamSession);
-    let retained = matches!(
-        mode,
-        ReadMode::RetainedTail | ReadMode::StreamSession | ReadMode::StreamTail
-    );
-    let streaming_tail = matches!(mode, ReadMode::StreamTail);
+    let Demand {
+        session: session_output,
+        retained,
+        output,
+        check,
+    } = demand;
+    let streaming_tail = !session_output && output.is_some();
+    let retained = retained || output.is_some();
     let primary = adapter.resume_source(r);
     let captured = source::Probe::default().snapshot_from(r, &primary);
     let cached = previous
@@ -476,12 +441,12 @@ fn read_inner<'a>(
     if session_output {
         skip = from.and_then(stream::Checkpoint::messages).unwrap_or(0);
     }
-    // Native Claude/Codex spans retain the same full-extra metadata. Exact materialized parity
-    // is checked against the independent full collector; discarded payloads remain unowned.
-    let opts = if matches!(r.harness, Harness::Claude | Harness::Codex) {
-        stream::ParseOptions::lazy_extra()
+    // Exact materialized parity is checked against the independent full collector; discarded
+    // payloads remain unowned.
+    let opts = if adapter.capabilities().rich_spans {
+        stream::Demand::RICH.with_spans()
     } else {
-        stream::ParseOptions::full()
+        stream::Demand::RICH
     };
     let mut sink = Tail {
         check,
@@ -569,7 +534,7 @@ fn read_inner<'a>(
             return None;
         }
         Some(Anchor {
-            head: crate::resume::MarkHead::of(&primary, cp, version.as_deref()?)?,
+            head: crate::resume::MarkHead::of(&primary, cp, &version)?,
             checkpoint: cp.clone(),
         })
     };
@@ -637,6 +602,7 @@ fn read_inner<'a>(
 mod tests {
     use super::*;
     use crate::harness;
+    use crate::Harness;
 
     #[test]
     fn materialized_read_sets_keep_original_text_and_argument_guards() {
@@ -679,8 +645,8 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn resume_source(&self, _: &SessionRef) -> PathBuf {
                 self.0.clone()
@@ -688,7 +654,7 @@ mod tests {
             fn stream(
                 &self,
                 r: &SessionRef,
-                _: &stream::ParseOptions,
+                _: &stream::Demand,
                 sink: &mut dyn stream::MessageSink,
             ) -> Result<Session> {
                 let mut session = Session::new(&r.id, r.harness);
@@ -741,13 +707,13 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &SessionRef,
-                _: &stream::ParseOptions,
+                _: &stream::Demand,
                 sink: &mut dyn stream::MessageSink,
             ) -> Result<Session> {
                 let mut message = Message::new(crate::Role::Assistant);
@@ -1010,6 +976,8 @@ mod tests {
         let modified = std::fs::metadata(&r.path).unwrap().modified().unwrap();
         let middle = body.len() / 2;
         let changed = middle + body[middle..].find("xxx").unwrap();
+        // Edit the unsampled middle: outside the first and checkpoint-adjacent 4096-byte
+        // guards. The timestamp-preserving rewrite exercises the additional identity check.
         assert!(changed > 4096 && changed + 4096 < complete.anchor.as_ref().unwrap().checkpoint.offset as usize);
         body.replace_range(changed..changed + 1, "y");
         std::fs::write(&r.path, &body).unwrap();

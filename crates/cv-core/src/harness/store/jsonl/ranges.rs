@@ -27,6 +27,7 @@ pub(crate) fn records<S: At + ?Sized>(file: &S, range: Range) -> Result<Records<
         small: Vec::new(),
         small_limit: 0,
         small_complete: false,
+        digest: None,
     })
 }
 
@@ -266,33 +267,15 @@ pub(crate) fn read_exact_at<S: At + ?Sized>(file: &S, mut bytes: &mut [u8], mut 
 /// Whole-range UTF-8 validates ignored/discarded fields too. At most one incomplete scalar is
 /// carried over a window boundary; JSON callers independently validate their grammar.
 pub(crate) fn valid_utf8(cursor: &mut impl BufRead) -> io::Result<bool> {
-    let mut pending = [0; 4];
-    let mut len = 0;
+    let mut chunks = crate::utf8::Chunks::new(crate::utf8::Verdict::Reject);
+    let mut ignore = |_: &str| Ok::<(), io::Error>(());
     loop {
         let bytes = cursor.fill_buf()?;
         if bytes.is_empty() {
-            return Ok(len == 0);
+            return chunks.finish(&mut ignore);
         }
-        let mut start = 0;
-        while len > 0 && start < bytes.len() {
-            pending[len] = bytes[start];
-            len += 1;
-            start += 1;
-            match std::str::from_utf8(&pending[..len]) {
-                Ok(_) => len = 0,
-                Err(e) if e.error_len().is_none() && len < 4 => {}
-                Err(_) => return Ok(false),
-            }
-        }
-        if start < bytes.len() {
-            if let Err(e) = std::str::from_utf8(&bytes[start..]) {
-                if e.error_len().is_some() {
-                    return Ok(false);
-                }
-                let tail = &bytes[start + e.valid_up_to()..];
-                pending[..tail.len()].copy_from_slice(tail);
-                len = tail.len();
-            }
+        if !chunks.feed(bytes, &mut ignore)? {
+            return Ok(false);
         }
         let n = bytes.len();
         cursor.consume(n);
@@ -305,11 +288,23 @@ pub(crate) struct Records<'a, S: ?Sized = fs::File> {
     small: Vec<u8>,
     small_limit: usize,
     small_complete: bool,
+    digest: Option<crate::digest::Sha256>,
 }
 impl<S: ?Sized> Records<'_, S> {
+    /// Hash every byte the framer reads, in order, so a consumer that walks the whole range has
+    /// its digest from this one read ([`Self::finish_digest`]).
+    pub(crate) fn hashing(mut self) -> Self {
+        self.digest = Some(crate::digest::Sha256::new());
+        self
+    }
+    /// The SHA-256 of every byte framed so far (all of them once iteration returned `None`).
+    pub(crate) fn finish_digest(self) -> Option<String> {
+        self.digest.map(crate::digest::Sha256::finish_hex)
+    }
     /// Optionally retain small physical records during framing, avoiding a second positioned
     /// read. Above this fixed cap the scratch is cleared; giant records remain only ranges.
-    /// The scratch grows with the records it holds, never past the cap.
+    /// The scratch grows with the records it holds, never past the cap. Set this before iteration;
+    /// changing it cannot retroactively retain a record already returned by next().
     pub(crate) fn keep_small_records(&mut self, limit: usize) {
         self.small_limit = limit;
     }
@@ -342,6 +337,9 @@ impl<S: At + ?Sized> Iterator for Records<'_, S> {
             }
             let newline = memchr::memchr(b'\n', bytes);
             let n = newline.map_or(bytes.len(), |i| i + 1);
+            if let Some(digest) = &mut self.digest {
+                digest.update(&bytes[..n]);
+            }
             if self.small_complete {
                 let payload = n - usize::from(newline.is_some());
                 if payload <= self.small_limit - self.small.len() {

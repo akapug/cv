@@ -8,32 +8,74 @@
 use super::*;
 use crate::json::{Json, JsonView};
 
+/// Shared wire classification for metadata, grammar detection and message projection.
+pub(super) struct Head<'v> {
+    pub view: JsonView<'v>,
+    pub ty: Option<String>,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub ordinal: Option<u64>,
+    pub payload: Option<JsonView<'v>>,
+}
+
+impl<'v> Head<'v> {
+    pub fn of(view: JsonView<'v>) -> Result<Self> {
+        Ok(Self {
+            view,
+            ty: str_at(Some(view), "type")?,
+            timestamp: str_at(Some(view), "timestamp")?.as_deref().and_then(parse_ts),
+            ordinal: number(view.get("ordinal")?)?.and_then(|n| n.as_u64()),
+            payload: view.get("payload")?,
+        })
+    }
+
+    pub fn inherited(&self, cutoff: Option<u64>) -> bool {
+        matches!((self.ordinal, cutoff), (Some(o), Some(cut)) if o < cut)
+    }
+}
+
+pub(super) struct Payload<'v> {
+    pub view: JsonView<'v>,
+    pub ty: Option<String>,
+    pub role: Option<String>,
+}
+
+impl<'v> Payload<'v> {
+    pub fn of(view: JsonView<'v>) -> Result<Self> {
+        let ty = str_at(Some(view), "type")?;
+        let role = if ty.as_deref() == Some("message") {
+            str_at(Some(view), "role")?
+        } else {
+            None
+        };
+        Ok(Self { view, ty, role })
+    }
+}
+
 /// What the reader wants from each record.
 #[derive(Clone, Copy)]
 pub(super) struct Demand {
     /// Large bodies stay in the source ([`JsonView::lazy_text`]) and large tool arguments become
     /// checked source JSON.
     pub spans: bool,
-    /// Discovery's turn count: a body is only its classification head (see [`count_head`]); tool
-    /// arguments, outputs and rich extras are not resolved.
-    pub heads: bool,
+    /// [`Tier::Discovery`]: only the listing facts (id, cwd, title, timestamps, the writer's
+    /// version) are read; no message, session bag or system prompt is built.
+    pub metadata: bool,
+}
+
+impl From<&stream::Demand> for Demand {
+    fn from(demand: &stream::Demand) -> Self {
+        Demand {
+            spans: demand.spans,
+            metadata: demand.tier == Tier::Discovery,
+        }
+    }
 }
 
 impl Demand {
-    pub(super) fn of(opts: &ParseOptions) -> Self {
-        Demand {
-            spans: opts.spans,
-            heads: false,
-        }
-    }
-
     /// A body string by the demand's text rule; None for a nonstring.
     fn text(self, v: JsonView<'_>) -> Result<Option<Text>> {
         if !v.is_string()? {
             return Ok(None);
-        }
-        if self.heads {
-            return Ok(Some(Text::Inline(count_head(Some(v))?)));
         }
         v.lazy_text(self.spans)
     }
@@ -42,27 +84,12 @@ impl Demand {
     /// newlines) by the demand's text rule. Several parts under spans are joined into the
     /// source's private decoded backing, never owned.
     fn joined(self, v: Option<JsonView<'_>>, source: Option<&crate::json::JsonSource>) -> Result<Text> {
-        if self.heads {
-            return Ok(Text::Inline(count_head(v)?));
-        }
-        super::super::wire::joined_text(v, source.filter(|_| self.spans), &mut |v| self.text(v))
+        use crate::harness::wire;
+        let backing = source
+            .filter(|_| self.spans)
+            .map_or(wire::Backing::Inline, wire::Backing::Source);
+        wire::joined(v, wire::TEXT, backing, &mut |v| self.text(v))
     }
-}
-
-/// A body reduced to what classification and counting read: its first 96 characters after
-/// leading whitespace, or one space for a nonempty all-whitespace body.
-pub(super) fn count_head(v: Option<JsonView<'_>>) -> Result<String> {
-    let mut head = String::new();
-    let mut any = false;
-    for_each_joined_char(v, |c| {
-        any = true;
-        if head.is_empty() && c.is_whitespace() {
-            return true;
-        }
-        head.push(c);
-        head.chars().count() < 96
-    })?;
-    Ok(if head.is_empty() && any { " ".into() } else { head })
 }
 
 /// Visit the characters of `text_parts(v)` (a string, or the string `text` of each part joined by
@@ -198,28 +225,28 @@ pub(super) struct Reader<'s> {
 impl Reader<'_> {
     /// One rollout record: fold its facts into the session and push its messages.
     pub(super) fn record(&mut self, v: JsonView<'_>) -> Result<()> {
-        let top = |key| v.get(key);
-        let ty = string(top("type")?)?;
-        let ts = string(top("timestamp")?)?.as_deref().and_then(parse_ts);
+        let head = Head::of(v)?;
+        let ty = &head.ty;
+        let ts = head.timestamp;
         if let Some(ts) = ts {
             self.session.created_at.get_or_insert(ts);
             self.session.updated_at = Some(ts);
+        }
+        if self.demand.metadata {
+            return self.listing(&head);
         }
         // Inherited prefix (fork/subagent rollouts embed the parent's history before
         // `subagent_history_start_ordinal`): those records still shape the thread's metadata — the
         // child inherits the parent's model/cwd — but they are the parent's turns, not this
         // thread's, so the lean passes emit no messages for them; `complete` keeps them, tagged.
-        let inherited = matches!(
-            (number(top("ordinal")?)?.and_then(|n| n.as_u64()), self.ctx.inherit_before),
-            (Some(o), Some(cut)) if o < cut
-        );
+        let inherited = head.inherited(self.ctx.inherit_before);
         let before = self.out.len();
-        let payload = top("payload")?;
+        let payload = head.payload;
         match ty.as_deref() {
             None => {
                 // bare {id,timestamp} header
                 if self.session.id.is_empty() {
-                    if let Some(id) = string(top("id")?)? {
+                    if let Some(id) = str_at(Some(head.view), "id")? {
                         self.session.id = id;
                     }
                 }
@@ -266,7 +293,7 @@ impl Reader<'_> {
         Ok(())
     }
 
-    /// Under `ParseOptions::complete`, a record with no conversational shape — one no arm knows, or
+    /// Under `stream::Demand::COMPLETE`, a record with no conversational shape — one no arm knows, or
     /// a lifecycle marker the lean passes drop — becomes a [`MessageKind::Carrier`]: the verbatim
     /// record under the top-level `_record` key and its type in `extra["codex"]["record_type"]`, so
     /// a same-harness round-trip loses nothing and `cv formats` can count what the adapter does not
@@ -282,9 +309,72 @@ impl Reader<'_> {
             _ => ty,
         };
         bag(&mut m).insert("record_type".into(), Value::String(ty));
-        m.extra
-            .insert(super::super::claude::CARRIER_KEY.into(), v.resolve()?.into_owned());
+        m.extra.insert(crate::ir::CARRIER_KEY.into(), v.resolve()?.into_owned());
         self.out.push(m);
+        Ok(())
+    }
+
+    /// The metadata demand: what a listing shows. The id and cwd come from the header or the
+    /// first `session_meta` like the full read's; the title is this thread's first user words
+    /// (an `event_msg` `user_message`, a user-role `message`, or a task another agent handed it),
+    /// never an injected preamble or the parent history a subagent rollout embeds.
+    fn listing(&mut self, head: &Head<'_>) -> Result<()> {
+        let ty = head.ty.as_deref();
+        if head.inherited(self.ctx.inherit_before) && ty != Some("session_meta") {
+            return Ok(());
+        }
+        let p = head.payload;
+        let s = &mut *self.session;
+        match ty {
+            None => {
+                if s.id.is_empty() {
+                    if let Some(id) = str_at(Some(head.view), "id")? {
+                        s.id = id;
+                    }
+                }
+            }
+            Some("session_meta") => {
+                if s.id.is_empty() {
+                    if let Some(id) = str_at(p, "id")? {
+                        s.id = id;
+                    }
+                }
+                if s.cwd.is_none() {
+                    s.cwd = str_at(p, "cwd")?.map(PathBuf::from);
+                }
+                if !self.ctx.meta_seen {
+                    self.ctx.meta_seen = true;
+                    self.ctx.writer_version = str_at(p, "cli_version")?;
+                    self.ctx.inherit_before = u64_at(p, "subagent_history_start_ordinal")?;
+                    self.ctx.agent_path = str_at(p, "agent_path")?;
+                }
+            }
+            _ if s.title.is_some() => {}
+            Some("event_msg") => {
+                let payload = p.map(Payload::of).transpose()?;
+                if payload.and_then(|p| p.ty).as_deref() == Some("user_message") {
+                    if let Some(message) = get(p, "message")?.filter(|m| m.is_string().unwrap_or(false)) {
+                        consider_title(&mut s.title, title_of(Some(message), None)?);
+                    }
+                }
+            }
+            Some("response_item") => {
+                let payload = p.map(Payload::of).transpose()?;
+                match payload.as_ref().and_then(|p| p.ty.as_deref()) {
+                    // An absent role is `user`, as in the full read.
+                    Some("message") if payload.as_ref().and_then(|p| p.role.as_deref()).unwrap_or("user") == "user" => {
+                        consider_title(&mut s.title, title_of(get(p, "content")?, None)?);
+                    }
+                    // A task handed to this thread by another agent is its prompt — the only one a
+                    // subagent thread usually gets (its `user`-role messages are the developer preamble).
+                    Some("agent_message") if str_at(p, "author")? != self.ctx.agent_path => {
+                        consider_title(&mut s.title, title_of(get(p, "content")?, Some("input_text"))?);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -313,6 +403,7 @@ impl Reader<'_> {
             s.system_prompt = str_at(p.get("base_instructions")?, "text")?.filter(|t| !t.trim().is_empty());
             self.ctx.inherit_before = u64_at(Some(p), "subagent_history_start_ordinal")?;
             self.ctx.agent_path = s.lineage.agent_path.clone();
+            self.ctx.cv_wrote = str_at(Some(p), "originator")?.as_deref() == Some(CV_ORIGINATOR);
         }
         if s.cwd.is_none() {
             s.cwd = str_at(Some(p), "cwd")?.map(PathBuf::from);
@@ -383,11 +474,13 @@ impl Reader<'_> {
     /// the items don't — except the last agent message, which is stashed session-level as a preview.
     ///
     /// Returns whether the record is represented in the IR (as a message, merged usage or session
-    /// metadata); `false` lets the record carry verbatim under `ParseOptions::complete`.
+    /// metadata); `false` lets the record carry verbatim under `stream::Demand::COMPLETE`.
     fn event(&mut self, payload: Option<JsonView<'_>>, ts: Option<DateTime<Utc>>) -> Result<bool> {
         let Some(p) = payload else { return Ok(false) };
         let has_events = self.has_events;
-        match str_at(Some(p), "type")?.as_deref() {
+        let head = Payload::of(p)?;
+        let p = head.view;
+        match head.ty.as_deref() {
             Some("user_message") if has_events => {
                 let body = p.get("message")?;
                 if let Some(text) = body.map(|b| self.demand.text(b)).transpose()?.flatten() {
@@ -698,8 +791,7 @@ impl Reader<'_> {
                 }
             }
         }
-        // Discovery only counts: the structured item (a command's whole output) is not resolved.
-        let item = match item.filter(|_| !self.demand.heads) {
+        let item = match item {
             Some(item) => item.resolve()?.into_owned(),
             None => Value::Null,
         };
@@ -737,7 +829,8 @@ impl Reader<'_> {
             .last()
             .is_some_and(|m| m.role == Role::Assistant && m.usage.is_none());
         if !attach {
-            let mut nm = Message::new(Role::Assistant);
+            // A native usage event belongs to the assistant's accounting, but is not a reply.
+            let mut nm = Message::of_kind(Role::Assistant, MessageKind::Notice, Origin::Harness);
             nm.timestamp = ts;
             bag(&mut nm).insert("codex_event".into(), Value::String(USAGE_FROM_RECORD.into()));
             self.out.push(nm);
@@ -808,7 +901,8 @@ impl Reader<'_> {
                 .last()
                 .is_some_and(|m| m.role == Role::Assistant && m.usage.is_none());
         if !attach {
-            let mut nm = Message::new(Role::Assistant);
+            // A native usage event belongs to the assistant's accounting, but is not a reply.
+            let mut nm = Message::of_kind(Role::Assistant, MessageKind::Notice, Origin::Harness);
             nm.timestamp = ts;
             bag(&mut nm).insert("codex_event".into(), Value::String("token_count".into()));
             self.out.push(nm);
@@ -871,7 +965,8 @@ impl Reader<'_> {
     pub(super) fn item(&mut self, payload: Option<JsonView<'_>>, ts: Option<DateTime<Utc>>) -> Result<bool> {
         let Some(p) = payload else { return Ok(false) };
         let d = self.demand;
-        let ty = str_at(Some(p), "type")?.unwrap_or_default();
+        let head = Payload::of(p)?;
+        let ty = head.ty.as_deref().unwrap_or_default();
         let field = |k: &str| -> Result<String> { Ok(str_at(Some(p), k)?.unwrap_or_default()) };
         let passthrough = p.get("internal_chat_message_metadata_passthrough")?;
         let ts = passthrough_ts(passthrough)?.or(ts);
@@ -879,9 +974,9 @@ impl Reader<'_> {
         let before = self.out.len();
         let out = &mut *self.out;
 
-        match ty.as_str() {
+        match ty {
             "message" => {
-                let role = str_at(Some(p), "role")?.unwrap_or_else(|| "user".into());
+                let role = head.role.as_deref().unwrap_or("user");
                 // Natural-language user/assistant text is taken from event_msg when present.
                 if self.has_events && (role == "user" || role == "assistant") {
                     return Ok(true);
@@ -890,7 +985,7 @@ impl Reader<'_> {
                 let content = p.get("content")?;
                 let blocks = openai::blocks_from_view(content, &openai::CODEX, &mut |v| d.text(v))?;
                 if !blocks.is_empty() {
-                    let mut m = match role.as_str() {
+                    let mut m = match role {
                         "assistant" => Message::new(Role::Assistant),
                         // `developer`/`system` messages are instructions the harness injected
                         // (`<user_instructions>`, AGENTS.md); never the user's own words.
@@ -916,20 +1011,14 @@ impl Reader<'_> {
                 // `encrypted_content` carries the opaque replay blob.
                 let summary_view = p.get("summary")?;
                 let raw = d.joined(p.get("content")?, self.source)?;
-                let encrypted = match p.get("encrypted_content")? {
-                    // Discovery reads only that a replay blob is there.
-                    Some(blob) if d.heads => blob.is_string()?.then(String::new),
-                    blob => string(blob)?,
-                };
+                let encrypted = string(p.get("encrypted_content")?)?;
                 // When we surfaced raw content but a distinct summary also exists, keep the summary.
                 let (text, summary) = if raw.is_empty() {
                     (d.joined(summary_view, self.source)?, None)
-                } else if d.heads {
-                    (raw, None)
                 } else {
                     let inline = Demand {
                         spans: false,
-                        heads: false,
+                        metadata: false,
                     };
                     let summary = match inline.joined(summary_view, None)? {
                         Text::Inline(summary) => summary,
@@ -1011,7 +1100,7 @@ impl Reader<'_> {
                     // {status, action:{type:"exec", command:[...], ...}}
                     let mut obj = Map::new();
                     for key in ["action", "status"] {
-                        if let Some(v) = p.get(key)?.filter(|_| !d.heads) {
+                        if let Some(v) = p.get(key)? {
                             obj.insert(key.into(), v.resolve()?.into_owned());
                         }
                     }
@@ -1024,7 +1113,6 @@ impl Reader<'_> {
                         _ => p.get("input")?,
                     };
                     let input = match args {
-                        _ if d.heads => Json::Owned(Value::Null),
                         None => Json::Owned(Value::Null),
                         Some(args) if args.is_string()? && d.spans => args.encoded_argument()?,
                         Some(args) if args.is_string()? => Json::Owned(openai::structured_arguments(
@@ -1052,30 +1140,28 @@ impl Reader<'_> {
             }
             "function_call_output" | "custom_tool_call_output" => {
                 let call_id = field("call_id")?;
-                // Error-ness: cv's own `[error] ` string convention (see [`ERROR_PREFIX`]), or the
-                // legacy object form `{success:false}` / `{metadata:{exit_code≠0}}` some older
-                // recorders wrote. Real Codex 0.147+ files carry neither — a failed command's exit
-                // code lives only in the `item_completed CommandExecution` note.
+                // Error-ness: cv's own `[error] ` string convention (see [`ERROR_PREFIX`]) in a
+                // rollout cv wrote, or the legacy object form `{success:false}` /
+                // `{metadata:{exit_code≠0}}` some older recorders wrote. Real Codex 0.147+ files
+                // carry neither — a failed command's exit code lives only in the `item_completed
+                // CommandExecution` note.
                 let output = p.get("output")?;
                 let (content, images, is_error) = match output {
-                    Some(o) if o.is_string()? && !d.heads => {
+                    Some(o) if o.is_string()? => {
                         let mut prefix = String::new();
-                        o.for_each_char(|c| {
-                            prefix.push(c);
-                            prefix.len() < ERROR_PREFIX.len()
-                        })?;
+                        if self.ctx.cv_wrote {
+                            o.for_each_char(|c| {
+                                prefix.push(c);
+                                prefix.len() < ERROR_PREFIX.len()
+                            })?;
+                        }
                         let mut text = d.text(o)?.unwrap_or_default();
                         let is_error = prefix == ERROR_PREFIX;
                         if is_error {
-                            // An escaped span cannot skip a decoded prefix; checked source text can.
-                            if matches!(&text, Text::Span(span) if span.escaped) {
-                                text = o.source_text()?.unwrap_or_default();
-                            }
                             text = text.with_skipped_prefix(ERROR_PREFIX.len())?;
                         }
                         (text, Vec::new(), is_error)
                     }
-                    _ if d.heads => (Text::default(), Vec::new(), false),
                     _ => {
                         let (content, images) = coerce_output(output)?;
                         (Text::Inline(content), images, output_is_error(output)?)
@@ -1093,7 +1179,9 @@ impl Reader<'_> {
                     content,
                     is_error,
                     tool_name,
-                    status: Some(if is_error { "error" } else { "completed" }.into()),
+                    // The record's own status when it has one (none through 0.163: `call_id`,
+                    // `output`, `id`); `is_error` already carries what cv can tell.
+                    status: str_at(Some(p), "status")?,
                     details: None,
                 });
                 // Structured outputs can return image content items alongside text.
@@ -1119,7 +1207,6 @@ impl Reader<'_> {
             }
             "tool_search_output" => {
                 let content = match p.get("tools")? {
-                    _ if d.heads => String::new(),
                     Some(tools) => tools.resolve()?.to_string(),
                     None => "[]".into(),
                 };
@@ -1182,7 +1269,7 @@ impl Reader<'_> {
                     .unwrap_or(false);
                 let mut m = note(MessageKind::CompactionBoundary, ts, "[history compacted]".into());
                 let b = bag(&mut m);
-                b.insert("codex_event".into(), Value::String(ty.clone()));
+                b.insert("codex_event".into(), Value::String(ty.to_owned()));
                 if encrypted {
                     b.insert("encrypted".into(), Value::Bool(true));
                 }

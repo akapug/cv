@@ -7,6 +7,7 @@ use super::*;
 use crate::harness::store::{document::Fields, text};
 use crate::json::JsonView;
 use crate::lazy::Text;
+use crate::stream::Tier;
 
 /// Array text joined from several strings stays in the source above this many bytes when spans
 /// are demanded, as Claude's tool-result arrays do.
@@ -116,10 +117,7 @@ fn non_blank(view: Option<JsonView<'_>>) -> Result<bool> {
 /// depends on `sessions.json` and sibling transcripts (prompt origin, lineage), and only a source
 /// descriptor carries those dependencies to the reader that resolves it. None for a nonstring.
 fn text_of(view: JsonView<'_>, spans: bool) -> Result<Option<Text>> {
-    match view.lazy_text(spans)? {
-        Some(Text::Span(_)) => view.source_text(),
-        text => Ok(text),
-    }
+    view.lazy_text(spans)
 }
 /// [`text_of`] a string field; "" for a missing or nonstring one.
 fn lazy(view: Option<JsonView<'_>>, spans: bool) -> Result<Text> {
@@ -164,37 +162,9 @@ fn joined(container: JsonView<'_>, spans: bool, pieces: &[Piece<'_>]) -> Result<
 /// `content` as text: a string whole, an array's string `text` fields joined by newlines,
 /// anything else "".
 fn text_parts(content: Option<JsonView<'_>>, spans: bool) -> Result<Text> {
-    let Some(content) = content else {
-        return Ok(Text::default());
-    };
-    if content.is_string()? {
-        return lazy(Some(content), spans);
-    }
-    let Some(items) = content.array()? else {
-        return Ok(Text::default());
-    };
-    let mut parts = Vec::new();
-    for item in items {
-        if let Some(text) = item?.get("text")? {
-            if text.is_string()? {
-                parts.push(text);
-            }
-        }
-    }
-    match parts.as_slice() {
-        [] => Ok(Text::default()),
-        [one] => lazy(Some(*one), spans),
-        _ => {
-            let mut pieces = Vec::with_capacity(parts.len() * 2);
-            for (i, part) in parts.into_iter().enumerate() {
-                if i > 0 {
-                    pieces.push(Piece::Literal("\n"));
-                }
-                pieces.push(Piece::String(part));
-            }
-            joined(content, spans, &pieces)
-        }
-    }
+    use crate::harness::wire;
+    let backing = wire::Backing::Over(if spans { JOINED_OVER } else { u64::MAX });
+    wire::joined(content, wire::TEXT, backing, &mut |v| text_of(v, spans))
 }
 
 /// One `(TextContent|ThinkingContent|ToolCall|ImageContent)` item: the Anthropic shape under
@@ -301,10 +271,10 @@ impl Common {
 }
 
 /// One entry → its session facts and messages.
-pub(super) fn record(view: JsonView<'_>, opts: &ParseOptions) -> Result<Record> {
+pub(super) fn record(view: JsonView<'_>, opts: &Demand) -> Result<Record> {
     // A complete read keeps text in the source too: its reader materializes each turn whole,
     // together with the record it carries, never a second inline copy beside it.
-    let spans = opts.spans || opts.complete;
+    let spans = opts.spans || opts.tier == Tier::Complete;
     let top = Fields::parse(view, TOP)?;
     let ty = top
         .as_ref()
@@ -324,8 +294,7 @@ pub(super) fn record(view: JsonView<'_>, opts: &ParseOptions) -> Result<Record> 
             cwd: top.string("cwd")?,
             created_at: top.string("timestamp")?.as_deref().and_then(parse_ts),
             forked_from: top.string("parentSession")?,
-            record: opts
-                .complete
+            record: (opts.tier == Tier::Complete)
                 .then(|| view.resolve())
                 .transpose()?
                 .map(|v| v.into_owned()),
@@ -362,34 +331,34 @@ pub(super) fn record(view: JsonView<'_>, opts: &ParseOptions) -> Result<Record> 
         // newer: bookkeeping, carried only under `complete`.
         _ => carrier(view, &ty, &common, opts)?,
     };
-    if opts.complete && out.messages.is_empty() {
+    if opts.tier == Tier::Complete && out.messages.is_empty() {
         out.messages = carrier(view, &ty, &common, opts)?;
     }
-    if opts.complete && view.is_object()? {
+    if opts.tier == Tier::Complete && view.is_object()? {
         out.native = Some(view.to_json()?);
     }
     Ok(out)
 }
 
-/// Under [`ParseOptions::complete`], a bookkeeping entry (`custom`, `leaf`, …) rides along verbatim
+/// Under [`Demand::COMPLETE`], a bookkeeping entry (`custom`, `leaf`, …) rides along verbatim
 /// as a `Carrier` turn: the raw record at the top-level `_record`, its type in
 /// `extra["openclaw"]["record_type"]`. The lean passes drop it.
-fn carrier(view: JsonView<'_>, ty: &str, common: &Common, opts: &ParseOptions) -> Result<Vec<Message>> {
-    if !opts.complete {
+fn carrier(view: JsonView<'_>, ty: &str, common: &Common, opts: &Demand) -> Result<Vec<Message>> {
+    if opts.tier != Tier::Complete {
         return Ok(Vec::new());
     }
     let mut m = common.message(Role::System, MessageKind::Carrier, Origin::Harness);
     m.harness_extra_mut(Harness::OpenClaw)
         .insert("record_type".into(), Value::from(ty));
     m.extra
-        .insert(crate::harness::claude::CARRIER_KEY.into(), view.resolve()?.into_owned());
+        .insert(crate::ir::CARRIER_KEY.into(), view.resolve()?.into_owned());
     Ok(vec![m])
 }
 
-/// Under [`ParseOptions::complete`], a session-fact entry the user saw as a notice (`session_info`,
+/// Under [`Demand::COMPLETE`], a session-fact entry the user saw as a notice (`session_info`,
 /// `label`) rides along as a `Notice` turn with `text`, the raw record at `_record` and its type in
 /// the bag. Lean passes keep only the fact's first-class home.
-fn notice(view: JsonView<'_>, ty: &str, common: &Common, opts: &ParseOptions, text: String) -> Result<Vec<Message>> {
+fn notice(view: JsonView<'_>, ty: &str, common: &Common, opts: &Demand, text: String) -> Result<Vec<Message>> {
     let mut out = carrier(view, ty, common, opts)?;
     if let Some(m) = out.first_mut() {
         m.kind = MessageKind::Notice;
@@ -400,12 +369,12 @@ fn notice(view: JsonView<'_>, ty: &str, common: &Common, opts: &ParseOptions, te
 
 /// A non-`message` canonical entry that carries context or a boundary the reader should see, as
 /// the kinds vocabulary has it: `compaction` → a `CompactionBoundary` (the entry's own fields:
-/// `first_kept_entry_id`, `tokens_before`, `from_hook`, `details`) followed by the
+/// `firstKeptEntryId`, `tokensBefore`, `fromHook`, `details`) followed by the
 /// `CompactionSummary` that replaced the compacted span; `reset` → `Branch`; `model_change` /
 /// `thinking_level_change` → `ModelChange`; `branch_summary` / `custom_message` (extension text
 /// that IS in model context) → `Notice`. All origin Harness. In the harness bag: `record_type`
 /// plus every field the entry carries besides the structural ones and the `summary`/`content`
-/// that become the turn's text, snake_cased.
+/// that become the turn's text, under its native camelCase key.
 fn control(view: JsonView<'_>, top: &Fields<'_>, ty: &str, common: &Common, spans: bool) -> Result<Vec<Message>> {
     let kind = match ty {
         "compaction" => MessageKind::CompactionBoundary,
@@ -413,17 +382,25 @@ fn control(view: JsonView<'_>, top: &Fields<'_>, ty: &str, common: &Common, span
         "model_change" | "thinking_level_change" => MessageKind::ModelChange,
         _ => MessageKind::Notice,
     };
-    let mut m = common.message(Role::System, kind, Origin::Harness);
+    let mut m = if ty == "compaction" {
+        let mut m = Message::synthesized(kind, Origin::Harness);
+        m.id = common.id.clone();
+        m.parent_id = common.parent.clone();
+        m.timestamp = common.timestamp;
+        m
+    } else {
+        common.message(Role::System, kind, Origin::Harness)
+    };
     let bag = m.harness_extra_mut(Harness::OpenClaw);
     bag.insert("record_type".into(), Value::from(ty));
     view.for_each_entry(|key, value| {
         if !matches!(key, "type" | "id" | "parentId" | "timestamp" | "summary" | "content") && !value.is_null()? {
-            bag.insert(snake(key), value.resolve()?.into_owned());
+            bag.insert(key.into(), value.resolve()?.into_owned());
         }
         Ok(())
     })?;
     let text: Text = match ty {
-        "compaction" => "[conversation compacted]".into(),
+        "compaction" => Text::default(),
         "branch_summary" => lazy(top.get("summary"), spans)?,
         "reset" => format!(
             "[session reset: {}]",
@@ -586,7 +563,7 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
             let from_id = body.string("fromId")?;
             let bag = custom_role_bag(&mut m, "branchSummary", &body, &[])?;
             if let Some(from_id) = from_id {
-                bag.insert("branch_from_id".into(), Value::from(from_id));
+                bag.insert("fromId".into(), Value::from(from_id));
             }
         }
         "compactionSummary" => {
@@ -609,14 +586,16 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
             let details = present(body.get("details"))?;
             let bag = custom_role_bag(&mut m, "custom", &body, &["display"])?;
             if let Some(ct) = custom_type {
-                bag.insert("custom_type".into(), Value::from(ct));
+                bag.insert("customType".into(), Value::from(ct));
             }
             if let Some(details) = details {
-                bag.insert("custom_details".into(), details);
+                bag.insert("details".into(), details);
             }
         }
     }
 
+    // An empty old-form compactionSummary also drops its boundary: it carries neither
+    // summary content nor metadata from which to construct a meaningful boundary.
     if m.content.is_empty() && m.extra.is_empty() {
         return Ok(Vec::new());
     }
@@ -625,14 +604,11 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
     }
     // The old single-record form: the record IS the compaction. The boundary keeps the entry's id
     // (what a later `firstKeptEntryId` / label points at) and counts; the summary hangs off it.
-    let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
+    let mut boundary = Message::synthesized(MessageKind::CompactionBoundary, Origin::Harness);
     boundary.id = m.id.take();
     boundary.parent_id = m.parent_id.take();
     boundary.timestamp = m.timestamp;
-    boundary.extra = std::mem::take(&mut m.extra);
-    boundary.content.push(Block::Text {
-        text: "[conversation compacted]".into(),
-    });
+    boundary.extra.extend(std::mem::take(&mut m.extra));
     m.parent_id = boundary.id.clone();
     m.harness_extra_mut(Harness::OpenClaw)
         .insert("message_role".into(), Value::from(role_str));
@@ -677,7 +653,7 @@ fn assistant_meta(m: &mut Message, body: &Fields<'_>) -> Result<()> {
         "diagnostics",
     ] {
         if let Some(val) = present(body.get(key))? {
-            bag.insert(snake(key), val);
+            bag.insert(key.into(), val);
         }
     }
     if let Some(usage) = usage {
@@ -688,7 +664,7 @@ fn assistant_meta(m: &mut Message, body: &Fields<'_>) -> Result<()> {
         let mut err = serde_json::Map::new();
         for key in ["errorMessage", "errorCode", "errorType"] {
             if let Some(val) = present(body.get(key))? {
-                err.insert(snake(key), val);
+                err.insert(key.into(), val);
             }
         }
         bag.insert("error".into(), Value::Object(err));
@@ -731,22 +707,8 @@ fn custom_role_bag<'m>(
     bag.insert("message_role".into(), Value::from(role));
     for key in keys {
         if let Some(val) = present(body.get(key))? {
-            bag.insert(snake(key), val);
+            bag.insert((*key).into(), val);
         }
     }
     Ok(bag)
-}
-
-/// camelCase → snake_case for `extra` keys (ASCII only; OpenClaw keys are all ASCII).
-fn snake(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
-    for c in s.chars() {
-        if c.is_ascii_uppercase() {
-            out.push('_');
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }

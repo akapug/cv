@@ -2,13 +2,12 @@
 //! builds use libzstd, already linked into the shipped binary through tantivy and about 4x
 //! ruzstd's decode rate (`show` of a 412 MB rollout: 28 G -> 14 G instructions); wasm keeps ruzstd.
 //! Both decode exactly one frame, streaming, with a bounded window.
-#[cfg(feature = "sqlite")]
 use std::io;
 use std::io::Read;
 
 /// A reader over the first zstd frame of `input`. A malformed header fails here, as ruzstd's
 /// constructor did, so callers keep telling "not zstd" apart from a failure mid-stream.
-#[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
+#[cfg(all(feature = "zstd", not(target_family = "wasm")))]
 pub(crate) fn decoder<R: Read>(input: R) -> io::Result<impl Read> {
     use std::io::BufRead;
     let mut decoded = io::BufReader::with_capacity(64 * 1024, zstd::stream::read::Decoder::new(input)?.single_frame());
@@ -16,12 +15,22 @@ pub(crate) fn decoder<R: Read>(input: R) -> io::Result<impl Read> {
     Ok(decoded)
 }
 
-#[cfg(all(feature = "sqlite", target_family = "wasm"))]
+#[cfg(all(feature = "zstd", target_family = "wasm"))]
 pub(crate) fn decoder<R: Read>(input: R) -> io::Result<impl Read> {
     ruzstd::decoding::StreamingDecoder::new(input).map_err(io::Error::other)
 }
 
+/// A disabled decoder is an explicit failed demand, never compressed bytes presented as JSONL.
+#[cfg(not(feature = "zstd"))]
+pub(crate) fn decoder<R: Read>(_: R) -> io::Result<std::io::Empty> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "compressed sources require the `zstd` feature",
+    ))
+}
+
 /// The decoded size the first frame header of `path` declares (RFC 8878 §3.1.1.1), if any.
+/// An unverified size hint only; callers must capture/check the source before trusting its data.
 pub(crate) fn content_size(path: &std::path::Path) -> Option<u64> {
     let mut head = [0u8; 18];
     let mut file = std::fs::File::open(path).ok()?;
@@ -54,7 +63,7 @@ fn frame_content_size(head: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(value) + if size == 2 { 256 } else { 0 })
 }
 
-#[cfg(all(test, feature = "sqlite", not(target_family = "wasm")))]
+#[cfg(all(test, feature = "zstd", not(target_family = "wasm")))]
 mod tests {
     /// Every header layout the encoder writes declares the size it was given; a stream of unknown
     /// size and a non-zstd file declare none.

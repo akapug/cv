@@ -44,6 +44,10 @@ cv archive path   # print the archive location
 cv archive ls     # list archived sessions, newest activity first
 ```
 
+`cv archive ls` reports user/assistant turns like `cv ls`. `catalog.jsonl` retains the raw
+record count separately as `messages_written`; rows written by 0.17 show an unknown turn count
+(a dash) until resynced. Unreadable resume state warns once on stderr and causes a full reread.
+
 ## `cv archive sync` — snapshot everything once
 
 ```sh
@@ -76,6 +80,10 @@ cv watch --cwd clustervision       # only sessions whose cwd contains this subst
 exists (so it's self-sufficient — no need to `sync` first), then it follows live activity and
 re-archives each session as it changes. It runs until you kill it, and like every daemon prints
 its ready line (the line below) to stderr within a second, before its first poll.
+
+`--interval` is seconds and accepts fractional values, as on `cv scry`; negative values exit 2.
+Watch cursors are version 2: a 0.17 cursor starts a fresh baseline. A compressed Codex byte mark
+cannot identify a position in the decoded transcript and remains unresolved.
 
 Every time it archives a changed session it logs the delta to stderr:
 

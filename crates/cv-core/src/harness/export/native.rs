@@ -20,23 +20,23 @@ struct Archive {
     source: JsonSource,
     entries: Vec<Entry>,
     // Positions sorted by id then original position; discovery keeps archive order.
-    by_id: Vec<usize>,
+    by_id: crate::harness::store::selection::Positions,
     charge: usize,
+    /// The file is not a JSON archive: read as none, reported by discovery.
+    undecodable: bool,
 }
 impl Archive {
     fn entry(&self, id: &str) -> Option<&Entry> {
-        let position = self.by_id.partition_point(|&i| self.entries[i].id.as_str() < id);
         self.by_id
-            .get(position)
+            .equal(|i| self.entries[i].id.as_str().cmp(id))
+            .first()
             .map(|&i| &self.entries[i])
-            .filter(|entry| entry.id == id)
     }
 }
-fn entry_index(entries: &[Entry]) -> Vec<usize> {
-    let mut index: Vec<_> = (0..entries.len()).collect();
-    index.sort_unstable_by(|&a, &b| entries[a].id.cmp(&entries[b].id).then(a.cmp(&b)));
-    index
+fn entry_index(entries: &[Entry]) -> crate::harness::store::selection::Positions {
+    crate::harness::store::selection::Positions::new(entries.len(), |a, b| entries[a].id.cmp(&entries[b].id))
 }
+
 struct Cached {
     path: PathBuf,
     archive: Arc<Archive>,
@@ -101,6 +101,8 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
                 let Some(record) = Fields::parse(view, CONVERSATION_FIELDS)? else {
                     continue;
                 };
+                // Account archives are assumed uniform: only record zero selects the export
+                // shape. A missing discriminator there leaves the archive unrecognized.
                 if position == 0 {
                     shapes = [record.get("mapping").is_some(), record.get("chat_messages").is_some()];
                 }
@@ -161,6 +163,7 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
             }
             Ok(())
         });
+        let mut undecodable = false;
         if let Err(error) = scanned {
             if source.check().is_err() {
                 continue;
@@ -169,6 +172,7 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
                 return Err(error);
             }
             entries.clear();
+            undecodable = true;
         }
         source.check()?;
         if !cacheable && selected.is_some() {
@@ -180,6 +184,7 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
             entries,
             by_id,
             charge,
+            undecodable,
         });
         if cacheable && charge <= CACHE_BYTES {
             let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -206,16 +211,27 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
     anyhow::bail!("export changed while reading {}", path.display())
 }
 
-pub(super) fn discover(kind: Kind, paths: Vec<PathBuf>) -> Vec<SessionRef> {
-    let mut out = Vec::new();
+/// Every conversation of `kind` in the archives at `paths`; an archive that cannot be read or
+/// decoded is a reported skip.
+pub(super) fn discover(kind: Kind, paths: Vec<PathBuf>) -> crate::Discovered {
+    let mut out = crate::Discovered::default();
     let mut seen = std::collections::HashSet::new();
     for path in paths {
-        let Ok(archive) = load(&path, None) else { continue };
+        let Some(archive) = out.keep(&path, load(&path, None)) else {
+            continue;
+        };
+        if archive.undecodable {
+            out.skipped.push(crate::Skipped {
+                path: path.clone(),
+                why: "not a JSON export archive".into(),
+            });
+            continue;
+        }
         for r in archive.entries.iter().filter_map(|e| e.refs[slot(kind)].as_ref()) {
             if seen.insert(r.id.clone()) {
                 let mut r = r.clone();
                 r.path = path.clone();
-                out.push(r);
+                out.refs.push(r);
             }
         }
     }
@@ -263,7 +279,7 @@ fn view_ref(kind: Kind, path: &Path, r: &Fields<'_>, id: &str) -> Result<Session
         title,
         created_at: timestamp("create_time", "created_at")?,
         updated_at: timestamp("update_time", "updated_at")?,
-        message_count,
+        message_count: Some(message_count),
         ..SessionRef::new(id, kind.harness(), path.to_path_buf())
     })
 }
@@ -355,7 +371,7 @@ fn node_role(kind: Kind, view: JsonView<'_>) -> Result<Option<String>> {
     };
     author.string("role")
 }
-pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
     let archive = load(&r.path, Some(&r.id))?;
     let entry = archive
         .entry(&r.id)
@@ -422,12 +438,10 @@ pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &ParseOptions, sink: &mut
                     )
                 });
                 has_sources |= sourced;
-                if sourced {
-                    archive.source.check()?;
-                }
+                let started = std::time::Instant::now();
                 let flow = sink.try_message(message)?;
                 if sourced {
-                    archive.source.check()?;
+                    archive.source.check_after(started)?;
                 }
                 if flow == Flow::Stop {
                     break;
@@ -746,8 +760,12 @@ mod tests {
         assert!(archive.entry("conversation-2048-extra").is_none());
         assert!(archive.entry("before-all").is_none());
         assert!(archive.entry("zzz-after-all").is_none());
-        // Cache hits reuse the charged index, and freshness still rejects changed archives.
-        assert!(Arc::ptr_eq(&archive, &load(&path, Some("conversation-2048"))?));
+        // Selection keeps the first duplicate even if another reader evicts the shared cache.
+        let selected = load(&path, Some("conversation-2048"))?;
+        let expected = archive.entry("conversation-2048").unwrap();
+        let actual = selected.entry("conversation-2048").unwrap();
+        assert_eq!((actual.offset, actual.len), (expected.offset, expected.len));
+        // Freshness still rejects changed archives.
         std::fs::write(&path, b"[]")?;
         assert!(archive.source.check().is_err());
         assert!(load(&path, Some("conversation-2048"))?
@@ -791,7 +809,7 @@ mod tests {
         let mut sink = crate::stream::CollectSink::default();
         std::fs::write(&path, format!("[{first},]")).unwrap();
         let r = SessionRef::new("target", Harness::ClaudeExport, path.clone());
-        assert!(stream(Kind::Claude, &r, &ParseOptions::lazy(), &mut sink).is_err());
+        assert!(stream(Kind::Claude, &r, &Demand::LEAN.with_spans(), &mut sink).is_err());
         assert!(
             sink.messages.is_empty(),
             "whole archive syntax must pass before callbacks"

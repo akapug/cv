@@ -84,9 +84,6 @@ pub struct AppendOutcome {
     pub effective_state: Option<String>,
     /// The caller's carried-in advisory warnings — the set MCP ships in its JSON reply.
     pub warnings: Vec<String>,
-    /// Kept for compatibility. Successful nonempty appends validated the log strictly under the
-    /// lock, so they have no replay warnings; later writes cannot change their result.
-    pub replay_warnings: Vec<String>,
 }
 
 /// The one agent-facing append path shared by the CLI and MCP: append the event through the
@@ -105,7 +102,6 @@ pub fn append(
         effective_state: proj.map(effective_display),
         event,
         warnings,
-        replay_warnings: Vec::new(),
     })
 }
 

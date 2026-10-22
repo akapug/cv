@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use cv_core::ir::{Harness, Message, SessionRef};
-use cv_core::{Adapter, Flow, MessageSink, ParseOptions};
+use cv_core::{Adapter, Demand, Flow, MessageSink};
 use std::path::Path;
 
 // ---------- exit codes ----------
@@ -249,21 +249,31 @@ impl WindowArgs {
     }
 }
 
+/// A streaming window either has forward bounds or retains a tail until EOF.
+pub(crate) enum StreamWindow {
+    Range(usize, Option<usize>),
+    Tail(usize),
+}
+
 impl Window {
-    /// Resolve to `[start, end)`; `end == None` means "through the last message".
-    pub(crate) fn bounds(self, total: impl FnOnce() -> Result<usize>) -> Result<(usize, Option<usize>)> {
-        Ok(match self {
-            Window::First(n) => (0, Some(n)),
-            Window::Last(n) => {
-                let total = total()?;
-                (total.saturating_sub(n), None)
-            }
-            Window::Range(a, b) => (a, b),
-            Window::Around { center, context } => (
+    pub(crate) fn streaming(self) -> StreamWindow {
+        match self {
+            Window::First(n) => StreamWindow::Range(0, Some(n)),
+            Window::Last(n) => StreamWindow::Tail(n),
+            Window::Range(a, b) => StreamWindow::Range(a, b),
+            Window::Around { center, context } => StreamWindow::Range(
                 center.saturating_sub(context),
                 Some(center.saturating_add(context).saturating_add(1)),
             ),
-        })
+        }
+    }
+
+    /// Resolve to `[start, end)`; `end == None` means "through the last message".
+    pub(crate) fn bounds(self, total: impl FnOnce() -> Result<usize>) -> Result<(usize, Option<usize>)> {
+        match self.streaming() {
+            StreamWindow::Range(start, end) => Ok((start, end)),
+            StreamWindow::Tail(n) => Ok((total()?.saturating_sub(n), None)),
+        }
     }
 }
 
@@ -323,13 +333,6 @@ fn next_index(n: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Clamp a `[start, end)` window to `len` messages (a past-the-end window is empty, never a panic).
-#[cfg(test)]
-pub(crate) fn clamp(range: (usize, Option<usize>), len: usize) -> (usize, usize) {
-    let end = range.1.unwrap_or(len).min(len);
-    (range.0.min(end), end)
-}
-
 /// The IR message count of a session, by one streamed pass under lazy options (content stays on
 /// disk). `SessionRef::message_count` counts conversational turns only, so `--last N` can't use it.
 pub(crate) fn count_messages(adapter: &dyn Adapter, r: &SessionRef) -> Result<usize> {
@@ -341,7 +344,7 @@ pub(crate) fn count_messages(adapter: &dyn Adapter, r: &SessionRef) -> Result<us
         }
     }
     let mut c = Count(0);
-    adapter.try_stream(r, &ParseOptions::lazy(), &mut c)?;
+    adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut c)?;
     Ok(c.0)
 }
 
@@ -407,6 +410,19 @@ pub(crate) fn dim_cwd(p: Option<&Path>) -> String {
     p.map(home_rel).unwrap_or_else(|| "(no cwd)".into())
 }
 
+/// One word for a POSIX shell command line: bare when every byte is inert in a word (letters,
+/// digits, `/ . _ - + : @`), single-quoted otherwise. `~` is not inert: a bare leading `~` expands.
+pub(crate) fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+' | b':' | b'@'))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 pub(crate) fn dirs_home() -> Option<std::path::PathBuf> {
     cv_core::env::var_os("HOME").map(std::path::PathBuf::from)
 }
@@ -446,6 +462,19 @@ pub(crate) fn dry_run_nulls(v: &mut serde_json::Value, pinned: bool, paths: &[&s
         "dry run — nothing written; a real run mints a fresh session id (pass --to to pin one)"
     }
     .into();
+}
+
+/// `--interval <SECONDS>` on `scry` and `watch`: finite and not negative (a usage error, never a
+/// silent clamp); a positive value below the quarter-second floor polls at the floor.
+pub(crate) fn poll_interval(seconds: f64) -> Result<std::time::Duration> {
+    if !seconds.is_finite() {
+        return usage("--interval must be finite");
+    }
+    if seconds < 0.0 {
+        return usage(format!("--interval must not be negative (got {seconds})"));
+    }
+    std::time::Duration::try_from_secs_f64(seconds.max(0.25))
+        .map_err(|_| UsageError("--interval exceeds the supported duration".into()).into())
 }
 
 /// `--thinking <native|text|drop>`: what an emit does with the model's reasoning on the way out.
@@ -591,9 +620,6 @@ mod tests {
             ..Default::default()
         };
         assert!(bad.window().is_err());
-        assert_eq!(clamp((10, Some(20)), 5), (5, 5)); // past the end → empty, not a panic
-        assert_eq!(clamp((2, None), 5), (2, 5));
-        assert_eq!(clamp((0, Some(3)), 5), (0, 3));
     }
 
     #[test]
@@ -621,7 +647,7 @@ mod tests {
             title: None,
             created_at: None,
             updated_at: None,
-            message_count: 3,
+            message_count: Some(3),
         };
         let v = session_row(&r, Some(10));
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
@@ -642,5 +668,26 @@ mod tests {
         );
         assert!(v["title"].is_null(), "missing title is an explicit null");
         assert_eq!(v["size_bytes"], 10);
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn interval_rejects_negative_nonfinite_and_overflow_without_panicking() {
+        for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -1.0, -0.001] {
+            assert!(
+                poll_interval(seconds)
+                    .unwrap_err()
+                    .downcast_ref::<UsageError>()
+                    .is_some(),
+                "{seconds}"
+            );
+        }
+        assert_eq!(poll_interval(0.0).unwrap(), Duration::from_millis(250));
+        assert_eq!(poll_interval(1.5).unwrap(), Duration::from_millis(1500));
     }
 }

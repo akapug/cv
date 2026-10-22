@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use cv_core::{Adapter, Flow, Message, ParseOptions, SessionRef, TryFnSink};
+use cv_core::{Adapter, Demand, Flow, Message, SessionRef, TryFnSink};
 
 /// The pass a counts recount runs per session: a lazy stream, every message counted.
 fn count_pass(adapter: &dyn Adapter, r: &SessionRef) -> (usize, cv_core::affordance::Counts) {
@@ -21,8 +21,10 @@ fn count_pass(adapter: &dyn Adapter, r: &SessionRef) -> (usize, cv_core::afforda
         counter.note(&m)?;
         Ok(Flow::Continue)
     });
-    let s = adapter.try_stream(r, &ParseOptions::lazy(), &mut sink).expect("stream");
-    (n, counter.finish(&s, &adapter.store_affordances(r)))
+    let s = adapter
+        .try_stream(r, &Demand::LEAN.with_spans(), &mut sink)
+        .expect("stream");
+    (n, counter.finish(&s, &adapter.store_affordances(r).unwrap()))
 }
 
 fn best_of<T>(runs: usize, mut f: impl FnMut() -> T) -> (f64, T) {
@@ -99,7 +101,7 @@ fn dump_stream_hashes() {
                         continue;
                     };
                     let mut line = format!("{} {} {}", r.harness.as_str(), r.id, r.path.display());
-                    for opts in [ParseOptions::lazy(), ParseOptions::bulk(), ParseOptions::full()] {
+                    for opts in [Demand::LEAN.with_spans(), Demand::LEAN, Demand::RICH] {
                         let mut h = std::collections::hash_map::DefaultHasher::new();
                         let mut n = 0usize;
                         let result = {

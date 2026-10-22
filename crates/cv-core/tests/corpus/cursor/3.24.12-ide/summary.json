@@ -76,10 +76,45 @@
         "run_terminal_command_v2"
       ],
       "usage_messages": 44,
+      "model_messages": 4,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "edit_file_v2": {
+            "calls": 4,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "glob_file_search": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "read_file_v2": {
+            "calls": 8,
+            "edits": 0,
+            "reads": 8,
+            "commands": 0,
+            "errors": 0
+          },
+          "run_terminal_command_v2": {
+            "calls": 4,
+            "edits": 0,
+            "reads": 0,
+            "commands": 4,
+            "errors": 1
+          }
+        },
+        "total_calls": 17,
+        "total_errors": 1
+      },
       "lineage": {},
       "model": "grok-4.6",
       "skipped_lines": 0

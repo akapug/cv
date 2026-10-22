@@ -1,5 +1,5 @@
 use super::*;
-use crate::emit::grok_qwen_tests::Frozen;
+use crate::emit::frozen::Frozen;
 use crate::emit::{EmitOptions, ThinkingMode};
 
 fn fixture() -> Result<Session> {

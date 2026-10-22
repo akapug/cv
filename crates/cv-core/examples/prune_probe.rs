@@ -6,6 +6,30 @@ use cv_core::prune::{prune_session, PruneOptions};
 static ALLOCATOR: cv_testkit::heap::Allocator = cv_testkit::heap::Allocator;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().skip(2).any(|mode| mode == "rewind") {
+        let source = cv_core::SessionRef::from_path(std::path::Path::new(&args[1]), cv_core::Harness::Claude);
+        let options = cv_core::rewind::RewindOptions {
+            at: cv_core::rewind::CutAt::End,
+            full: true,
+            out_dir: Some(std::path::Path::new(&args[1]).parent().unwrap().join("rewound")),
+            new_id: Some("22222222-2222-4222-8222-222222222222".into()),
+            dry_run: false,
+            thinking: Some(cv_core::emit::ThinkingMode::Native),
+            generator: "operation-probe".into(),
+            skills_policy: Default::default(),
+        };
+        #[cfg(feature = "probe-heap")]
+        let baseline = cv_testkit::heap::begin();
+        let start = std::time::Instant::now();
+        let result = cv_core::rewind::rewind_session(&source, &options)?;
+        let elapsed = start.elapsed().as_secs_f64();
+        #[cfg(feature = "probe-heap")]
+        let heap = Some(cv_testkit::heap::end(baseline));
+        #[cfg(not(feature = "probe-heap"))]
+        let heap: Option<serde_json::Value> = None;
+        println!("{}", serde_json::json!({"result":result,"seconds":elapsed,"heap":heap}));
+        return Ok(());
+    }
     let mut options = PruneOptions {
         new_id: Some("22222222-2222-4222-8222-222222222222".into()),
         keep_last: 2,
@@ -30,7 +54,7 @@ fn main() -> Result<()> {
     #[cfg(feature = "probe-heap")]
     let baseline = cv_testkit::heap::begin();
     let start = std::time::Instant::now();
-    let result = prune_session(std::path::Path::new(&args[1]), &options)?;
+    let result = prune_session(cv_core::Harness::Claude, std::path::Path::new(&args[1]), &options)?;
     let elapsed = start.elapsed().as_secs_f64();
     #[cfg(feature = "probe-heap")]
     let heap = Some(cv_testkit::heap::end(baseline));

@@ -77,7 +77,8 @@ impl Admission {
 
 /// The compact document owns one public byte vector and a private field-address vector. Charge
 /// the exact byte capacity plus twice the field count at a conservative address size (the private
-/// packed address is smaller). Include both vector headers, wrapper and allocation overhead.
+/// packed address is smaller). A minimum four slots covers small-vector allocation slack; the
+/// extra 128 bytes conservatively covers vector headers and allocator overhead beyond the wrapper.
 fn document_bytes(document: &TantivyDocument) -> usize {
     document
         .node_data
@@ -126,46 +127,67 @@ pub(super) struct Writer {
     /// `None` only while [`Drop`] closes it.
     inner: Option<IndexWriter<AdmittedDocument>>,
     pub(super) admission: Arc<Admission>,
-    #[cfg(test)]
-    fail_after: Mutex<Option<usize>>,
+    fault: Fault,
 }
 impl Writer {
     pub(super) fn new(index: &Index, heap: usize) -> Result<Self> {
         let inner = index.writer(heap).context("creating tantivy index writer")?;
-        #[cfg(all(test, feature = "probe-heap"))]
-        let limit = if std::env::var_os("CV_SWEEP_COMPARE_UNBOUNDED").is_some() {
-            usize::MAX
-        } else {
-            DOCUMENT_BYTES
-        };
-        #[cfg(not(all(test, feature = "probe-heap")))]
-        let limit = DOCUMENT_BYTES;
         Ok(Self {
             inner: Some(inner),
-            admission: Admission::new(limit),
-            #[cfg(test)]
-            fail_after: Mutex::new(None),
+            admission: Admission::new(document_limit()),
+            fault: Fault::default(),
         })
     }
-    #[cfg(test)]
-    pub(super) fn add_document(&self, document: TantivyDocument) -> Result<Opstamp> {
-        self.add_admitted(self.admission.document(document)?)
-    }
     pub(super) fn add_admitted(&self, document: AdmittedDocument) -> Result<Opstamp> {
-        #[cfg(test)]
-        if let Some(remaining) = self.fail_after.lock().unwrap().as_mut() {
+        self.fault.check()?;
+        (**self).add_document(document).map_err(Into::into)
+    }
+}
+
+#[cfg(not(all(test, feature = "probe-heap")))]
+fn document_limit() -> usize {
+    DOCUMENT_BYTES
+}
+#[cfg(all(test, feature = "probe-heap"))]
+fn document_limit() -> usize {
+    if std::env::var_os("CV_SWEEP_COMPARE_UNBOUNDED").is_some() {
+        usize::MAX
+    } else {
+        DOCUMENT_BYTES
+    }
+}
+#[cfg(not(test))]
+#[derive(Default)]
+struct Fault {}
+#[cfg(not(test))]
+impl Fault {
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+#[cfg(test)]
+#[derive(Default)]
+struct Fault(Mutex<Option<usize>>);
+#[cfg(test)]
+impl Fault {
+    fn check(&self) -> Result<()> {
+        if let Some(remaining) = self.0.lock().unwrap().as_mut() {
             anyhow::ensure!(*remaining != 0, "injected index consumer failure");
             *remaining -= 1;
         }
-        (**self).add_document(document).map_err(Into::into)
+        Ok(())
     }
-    #[cfg(test)]
+}
+#[cfg(test)]
+impl Writer {
+    pub(super) fn add_document(&self, document: TantivyDocument) -> Result<Opstamp> {
+        self.add_admitted(self.admission.document(document)?)
+    }
     pub(super) fn document_limit(&mut self, bytes: usize) {
         self.admission = Admission::new(bytes);
     }
-    #[cfg(test)]
     pub(super) fn fail_after(&self, documents: usize) {
-        *self.fail_after.lock().unwrap() = Some(documents);
+        *self.fault.0.lock().unwrap() = Some(documents);
     }
 }
 

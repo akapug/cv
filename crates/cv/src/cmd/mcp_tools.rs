@@ -46,6 +46,8 @@ pub(crate) struct ArgSpec {
     pub long: Option<String>,
     #[serde(default)]
     pub multiple: bool,
+    #[serde(default)]
+    pub global: bool,
     pub kind: ArgKind,
     #[serde(default)]
     pub value_type: String,
@@ -324,7 +326,7 @@ fn select_tool_commands(all: Vec<CommandSpec>) -> Vec<CommandSpec> {
         .filter(|c| (TOOL_GROUPS.contains(&c.group.as_str()) && c.name != "hook") || c.name.starts_with("task "))
         .filter(|c| {
             let has_children = names.iter().any(|n| n.starts_with(&format!("{} ", c.name)));
-            !(has_children && c.args.is_empty())
+            !(has_children && c.args.iter().all(|a| a.global))
         })
         .map(|mut c| {
             c.args.retain(|a| !(a.name == "follow" && a.kind == ArgKind::Flag));
@@ -457,6 +459,26 @@ pub(crate) fn build_argv(cmd: &CommandSpec, args: &Value) -> Result<Vec<String>>
         other => return Err(invalid(format!("arguments must be an object, got {other}"))),
     };
 
+    for key in obj.keys() {
+        let replacement = match (cmd.name.as_str(), key.as_str()) {
+            ("dataset", "out" | "out_removed") => Some("file"),
+            ("deferrals", "since" | "since_removed") => Some("at"),
+            ("port" | "pack" | "splice", "to") => Some("harness"),
+            ("show" | "export", "head") => Some("first"),
+            ("show" | "export", "tail") => Some("last"),
+            ("port", "to_dir") => Some("cwd"),
+            ("prune", "range") => Some("keep"),
+            ("prune", "retrieve") => Some("cat tool with session and tool_use_id"),
+            ("rewind", "from_compaction") => Some("full (omit it to start at the last compaction)"),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            return Err(invalid(format!(
+                "argument `{key}` was removed from `{}` — use `{replacement}`",
+                cmd.tool_name()
+            )));
+        }
+    }
     for key in obj.keys() {
         if key == "json" {
             continue; // forced on; tolerated from a caller that echoes the CLI
@@ -591,6 +613,49 @@ fn invalid(msg: String) -> anyhow::Error {
 mod tests {
     use super::*;
 
+    #[test]
+    fn skills_policy_uses_the_same_name_in_mcp_and_cli() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let tree = crate::build_cli();
+                let tools = CliTools::from_tree(&tree).unwrap();
+                for name in ["prune", "rewind", "port"] {
+                    let command = tools.find(name).unwrap();
+                    let descriptor = tool_descriptor(command);
+                    let properties = &descriptor["inputSchema"]["properties"];
+                    assert!(properties.get("skills_policy").is_none());
+                    assert_eq!(properties["skills"]["enum"], json!(["keep", "drop", "drop-stale"]));
+                    let argv = build_argv(command, &json!({"id":"source", "skills":"drop-stale"})).unwrap();
+                    assert!(argv.windows(2).any(|args| args == ["--skills", "drop-stale"]));
+                    tree.clone()
+                        .try_get_matches_from(std::iter::once("cv".to_owned()).chain(argv))
+                        .unwrap();
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// `WINDOW_SELECTORS` is `WindowArgs`' own flags plus `pre_compaction`: a window flag added to
+    /// the shared struct must reach the MCP default-window rule, never a hand copy of the list.
+    #[test]
+    fn window_selectors_are_the_window_args_table() {
+        use clap::Args;
+        let cmd = crate::util::WindowArgs::augment_args(clap::Command::new("window"));
+        let mut table: Vec<&str> = cmd
+            .get_arguments()
+            .map(|a| a.get_id().as_str())
+            .filter(|id| *id != "context")
+            .collect();
+        table.push("pre_compaction");
+        table.sort_unstable();
+        let mut have = WINDOW_SELECTORS.to_vec();
+        have.sort_unstable();
+        assert_eq!(have, table);
+    }
+
     fn spec(json_src: &str) -> CommandSpec {
         serde_json::from_str(json_src).expect("command spec")
     }
@@ -691,7 +756,8 @@ mod tests {
     #[test]
     fn subcommand_names_join_with_underscores_and_dispatchers_are_dropped() {
         let all: Vec<CommandSpec> = serde_json::from_str(
-            r#"[{"name":"formats","group":"System","about":"Formats","args":[]},
+            r#"[{"name":"formats","group":"System","about":"Formats","args":[
+                   {"name":"frozen","kind":"flag","global":true}]},
                 {"name":"formats census","group":"System","about":"Census","args":[
                    {"name":"harness","kind":"option","value_type":"string","help":"h","required":false}]},
                 {"name":"task","group":"Fleet & live","about":"Tasks","args":[]}]"#,
@@ -873,6 +939,27 @@ mod tests {
         let e = build_argv(&cat(), &json!({"session": "abc"})).unwrap_err();
         assert!(e.downcast_ref::<InvalidParams>().is_some(), "{e}");
         assert!(format!("{e}").contains("tool_use_id"), "{e}");
+    }
+
+    #[test]
+    fn removed_properties_name_the_replacement() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                for (name, old, replacement) in [
+                    ("pack", "to", "harness"),
+                    ("dataset", "out", "file"),
+                    ("deferrals", "since", "at"),
+                ] {
+                    let commands = CliTools::from_tree(&crate::build_cli()).unwrap();
+                    let command = commands.commands().iter().find(|cmd| cmd.name == name).unwrap();
+                    let error = build_argv(command, &json!({old: "value"})).unwrap_err().to_string();
+                    assert!(error.contains(&format!("use `{replacement}`")), "{error}");
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

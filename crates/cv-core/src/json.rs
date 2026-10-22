@@ -27,7 +27,9 @@ use std::sync::Arc;
 
 /// A complete JSON value. Source descriptors clone cheaply; owned values retain Value semantics.
 /// Deserialization always produces `Owned`, including objects that resemble source descriptors.
-#[derive(Clone, Debug)]
+/// Equality is the record replay's "unchanged" test: owned values by value, source descriptors
+/// by range (the same bytes of the same captured source), never an owned value against a range.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Json {
     Owned(Value),
     Source(Arc<JsonRange>),
@@ -44,6 +46,21 @@ pub struct JsonRange {
     len: u64,
     decoded: Option<Arc<crate::harness::store::bytes::ByteSource>>,
 }
+
+/// The same bytes of the same captured source (and the same decoded backing, by identity).
+impl PartialEq for JsonRange {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.offset == other.offset
+            && self.len == other.len
+            && match (&self.decoded, &other.decoded) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+impl Eq for JsonRange {}
 
 /// Distinguish invalid content (archives historically appear empty) from unavailable or changed
 /// sources, whose failures must abort consumers and cannot publish freshness.
@@ -118,7 +135,8 @@ impl JsonSource {
     }
     pub(crate) fn capture_with_reads(path: &Path, reads: &crate::source::ReadSet) -> Result<Self> {
         let source = Self::capture_guarded(path, Some(Arc::new(reads.clone())))?;
-        source.check()?;
+        // The capture just stat'ed the path; only the dependencies are older than it.
+        source.check_reads()?;
         Ok(source)
     }
     fn capture_guarded(path: &Path, reads: Option<Arc<crate::source::ReadSet>>) -> Result<Self> {
@@ -149,6 +167,15 @@ impl JsonSource {
         let metadata = std::fs::metadata(&self.0.path)
             .with_context(|| format!("reading JSON source {}", self.0.path.display()))?;
         self.check_metadata(metadata)
+    }
+    /// After a sink callback that began at `started` and received a descriptor of this source:
+    /// recheck if the callback was slow ([`SLOW_CALLBACK`](crate::harness::store::jsonl::Read::SLOW_CALLBACK));
+    /// a fast one is covered by the reader's EOF check.
+    pub(crate) fn check_after(&self, started: std::time::Instant) -> Result<()> {
+        if started.elapsed() < crate::harness::store::jsonl::Read::SLOW_CALLBACK {
+            return Ok(());
+        }
+        self.check()
     }
     /// Whether the file as observed now still carries every byte captured: identical, or for an
     /// append-only log admitted as growth ([`FileId::admits`]).
@@ -333,9 +360,10 @@ impl JsonSource {
             // The controlled producer has completed and strictly encoded this entire string.
             // Construct its descriptor without remapping/scanning the bytes it just emitted.
             range.check_retained_bounds()?;
-            let mut text = crate::lazy::SourceText::new(Arc::new(range));
-            text.known_len = Some(decoded_len);
-            Ok(crate::lazy::Text::Source(text))
+            Ok(crate::lazy::Text::Source(crate::lazy::SourceText::generated(
+                Arc::new(range),
+                decoded_len,
+            )))
         } else {
             range.with_validation(Validation::Cached, |view| {
                 view.source_text()?.context("constructed JSON string")
@@ -419,6 +447,8 @@ impl JsonRange {
         Ok(())
     }
 
+    /// The source still holds its capture and the decoded backing still holds this range. The
+    /// backing is the arena, not the source, so one source check covers both.
     pub(crate) fn check_retained_bounds(&self) -> Result<()> {
         self.check()?;
         if let Some(bytes) = &self.decoded {
@@ -428,7 +458,7 @@ impl JsonRange {
                 "source text backing is truncated"
             );
         }
-        self.check()
+        Ok(())
     }
 
     /// Captured auxiliary source dependencies, retaining original stamps and absence.
@@ -436,16 +466,6 @@ impl JsonRange {
     /// append-aware consumers can handle their primary transcript identity independently.
     pub fn dependencies(&self) -> Option<&crate::source::ReadSet> {
         self.source.0.reads.as_deref()
-    }
-    pub(crate) fn same_range(&self, other: &Self) -> bool {
-        self.source == other.source
-            && self.offset == other.offset
-            && self.len == other.len
-            && match (&self.decoded, &other.decoded) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            }
     }
     fn child(&self, offset: u64, len: u64) -> Result<Self> {
         anyhow::ensure!(
@@ -752,8 +772,8 @@ impl<'a> JsonView<'a> {
     }
     /// Transcript text by the codec's span rule: a string whose *decoded* length exceeds
     /// INLINE_MAX stays in the source when `spans` is demanded, and anything else is inline.
-    /// Both builds describe it as a [`Span`](crate::lazy::Span) of the session's primary file,
-    /// held to the session's parse-time stamp (same file, only grown). None for a nonstring.
+    /// Both builds keep it as checked [`SourceText`](crate::lazy::SourceText) in its file, held
+    /// to the read's capture (same file, only grown). None for a nonstring.
     pub(crate) fn lazy_text(self, spans: bool) -> Result<Option<crate::lazy::Text>> {
         if !self.is_string()? {
             return Ok(None);
@@ -794,27 +814,19 @@ impl<'a> JsonView<'a> {
     }
     /// Visit a string's decoded characters until `visit` returns false; false for a nonstring.
     pub(crate) fn for_each_char(self, mut visit: impl FnMut(char) -> bool) -> Result<bool> {
-        #[derive(Debug)]
-        struct Stop;
-        impl std::fmt::Display for Stop {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("character visit stopped")
-            }
-        }
-        impl std::error::Error for Stop {}
-        match self.for_each_str_chunk(|chunk| {
+        Ok(crate::stream::stopped(self.for_each_str_chunk(|chunk| {
             for c in chunk.chars() {
                 if !visit(c) {
-                    return Err(Stop.into());
+                    return Err(crate::stream::Stop.into());
                 }
             }
             Ok(())
-        }) {
-            Err(error) if error.is::<Stop>() => Ok(true),
-            result => result,
-        }
+        }))?
+        .unwrap_or(true))
     }
-    /// Native transcript text uses the session's primary source, just like existing Text spans.
+    /// A string, inline or, with `spans` and a body over [`INLINE_MAX`](crate::lazy::INLINE_MAX),
+    /// left in its source as checked [`SourceText`](crate::lazy::SourceText): the session's
+    /// primary transcript like any other file, cell or decoded backing.
     pub(crate) fn text(self, spans: bool) -> Result<Option<crate::lazy::Text>> {
         let View::Source(source) = self.0 else {
             let View::Owned(value) = self.0 else { unreachable!() };
@@ -828,12 +840,9 @@ impl<'a> JsonView<'a> {
             return self.source_text();
         }
         if spans && source.value.len - 2 > crate::lazy::INLINE_MAX as u64 {
-            return Ok(Some(crate::lazy::Text::Span(crate::lazy::Span {
-                source: None,
-                offset: source.value.offset + 1,
-                len: source.value.len - 2,
-                escaped: source.source.escaped(source.value)?,
-            })));
+            if let Json::Source(range) = self.to_json()? {
+                return Ok(Some(crate::lazy::Text::Source(crate::lazy::SourceText::new(range))));
+            }
         }
         Ok(Some(crate::lazy::Text::Inline(
             source.source.materialize(source.value)?,
@@ -1279,6 +1288,9 @@ fn write_source(view: SourceView<'_>, writer: &mut impl Write) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use serde_json::json;
+
     #[test]
     fn canonical_replacements_require_same_capture_and_exact_range() {
         let world = cv_testkit::World::new("json-canonical-replacements");
@@ -1306,8 +1318,6 @@ mod tests {
             serde_json::to_vec(&serde_json::from_str::<Value>(raw).unwrap()).unwrap()
         );
     }
-    use super::*;
-    use serde_json::json;
 
     #[cfg(not(feature = "mmap"))]
     #[test]
@@ -1591,16 +1601,11 @@ mod tests {
                     crate::harness::store::document::Fields::parse(view, &["id", "id", "body", "input"])?.unwrap();
                 assert_eq!(fields.string("id")?.as_deref(), Some("last"));
                 let text = fields.get("body").unwrap().text(true)?.unwrap();
-                let crate::lazy::Text::Span(span) = text else {
-                    panic!("large text must remain a span")
-                };
-                assert!(span.escaped);
-                assert_eq!(
-                    crate::lazy::Resolver::new(Some(fixture.path.clone()))
-                        .try_resolve(&span)
-                        .unwrap(),
-                    body
+                assert!(
+                    matches!(text, crate::lazy::Text::Source(_)),
+                    "large text must remain in its source"
                 );
+                assert_eq!(text.try_resolve(&crate::lazy::Resolver::new(None)).unwrap(), body);
                 let argument = fields.get("input").unwrap().argument(true)?;
                 assert!(matches!(argument, Json::Source(_)));
                 assert_eq!(

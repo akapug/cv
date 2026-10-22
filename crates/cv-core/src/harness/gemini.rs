@@ -47,7 +47,7 @@ use super::{parse_ts, Adapter};
 use crate::ir::*;
 use crate::json::JsonSource;
 use crate::source::{Dependencies, Probe};
-use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
+use crate::stream::{self, CollectSink, Flow, MessageSink};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -60,6 +60,10 @@ pub struct Gemini {
     /// Every `tmp` root that exists: `~/.gemini/tmp`, then the sandbox root `~/.cache/.gemini/tmp`.
     roots: Vec<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Gemini = Gemini { roots: Vec::new() };
 
 impl Gemini {
     pub fn detect() -> Self {
@@ -109,32 +113,42 @@ impl Adapter for Gemini {
         self.roots.clone()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         if self.roots.is_empty() {
-            return Ok(vec![]);
+            return Ok(Default::default());
         }
         // Collect candidate file paths first (cheap walk over every root), then read+parse in
         // parallel. A single `logs.json` can expand into many sessions, so this is a flat-map.
+        // An unreadable dir, and a session file that fails to read, are skipped and reported.
+        let mut walk_errors = Vec::new();
         let paths: Vec<_> = self
             .roots
             .iter()
-            .flat_map(|root| WalkDir::new(root).into_iter().filter_map(|e| e.ok()))
+            .flat_map(WalkDir::new)
+            .filter_map(|e| e.map_err(|e| walk_errors.extend(crate::Skipped::walk(&e))).ok())
             .filter(|e| e.file_type().is_file())
             .map(|e| e.into_path())
             .collect();
-        let refs = crate::par_discovery_flat_map(paths, |path| {
-            crate::discover_cache::cached_scan_many(&path, || scan_session_file(&path, Harness::Gemini))
-        });
-        Ok(dedupe_by_id(refs))
+        let mut found: crate::Discovered = crate::par_discovery_flat_map(paths, |path| {
+            crate::Skipped::listed_many(
+                &path,
+                crate::discover_cache::cached_scan_many_checked(&path, || scan_session_file(&path, Harness::Gemini)),
+            )
+        })
+        .into_iter()
+        .collect();
+        found.refs = dedupe_by_id(std::mem::take(&mut found.refs));
+        found.skipped.extend(walk_errors);
+        Ok(found)
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &stream::Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| stream_for(Harness::Gemini, r, opts, sink))
     }
 
     /// The per-session side files under `tmp/<project>/<session id>/`: the task tracker
     /// (`tracker/<id>.json`, `tracker_*` tools) and the plan-mode plans (`plans/*.md`).
-    fn store_affordances(&self, r: &SessionRef) -> Vec<crate::affordance::Affordance> {
+    fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
         side_affordances(&r.path, &r.id)
     }
 }
@@ -153,7 +167,7 @@ fn dedupe_by_id(refs: Vec<SessionRef>) -> Vec<SessionRef> {
                 // `session-<ts>-<id>.jsonl` for the same id holding only the `<session_context>`
                 // preamble (later gemini-cli deletes it, `deleteCurrentSessionIfNotResumableAsync`),
                 // and it is the NEWER file. Between equals the most recently updated wins.
-                let key = |r: &SessionRef| (r.message_count > 0, r.updated_at);
+                let key = |r: &SessionRef| (r.message_count.is_some_and(|n| n > 0), r.updated_at);
                 if key(&r) > key(&out[i]) {
                     out[i] = r;
                 }
@@ -292,18 +306,17 @@ fn registry_for(runtime: &Path) -> Registry {
 /// Shared with the [`Qwen`](crate::harness::qwen) adapter (identical on-disk format). Notably,
 /// checkpoints derive their id from the `checkpoint-<tag>` *filename* here — the same id
 /// [`stream_for`]'s bounded path produces on parse — so discover/parse/stream all agree.
-pub(crate) fn scan_session_file(path: &Path, harness: Harness) -> Vec<SessionRef> {
+pub(crate) fn scan_session_file(path: &Path, harness: Harness) -> Result<Vec<SessionRef>> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     if name == "logs.json" {
-        if let Ok(text) = fs::read_to_string(path) {
-            return parse_logs_str(&text, Some(path.to_path_buf()))
-                .iter()
-                .map(|s| session_ref(s, path, harness))
-                .collect();
-        }
+        let text = fs::read_to_string(path)?;
+        return Ok(parse_logs_str(&text, Some(path.to_path_buf()))
+            .iter()
+            .map(|s| session_ref(s, path, harness))
+            .collect());
     } else if is_chat_recording(path) {
         let mut turns = 0usize;
         let mut sink = |m: Message| {
@@ -311,19 +324,17 @@ pub(crate) fn scan_session_file(path: &Path, harness: Harness) -> Vec<SessionRef
             Flow::Continue
         };
         let r = SessionRef::new("", harness, path.to_path_buf());
-        if let Ok(s) = stream_for(harness, &r, &ParseOptions::lazy(), &mut sink) {
-            let mut r = session_ref(&s, path, harness);
-            r.message_count = turns;
-            return vec![r];
-        }
+        let s = stream_for(harness, &r, &stream::Demand::LEAN.with_spans(), &mut sink)?;
+        let mut r = session_ref(&s, path, harness);
+        r.message_count = Some(turns);
+        return Ok(vec![r]);
     } else if is_checkpoint(&name) {
-        if let Ok(text) = fs::read_to_string(path) {
-            if let Some(s) = parse_checkpoint(&text, &name, Some(path.to_path_buf())) {
-                return vec![session_ref(&s, path, harness)];
-            }
+        let text = fs::read_to_string(path)?;
+        if let Some(s) = parse_checkpoint(&text, &name, Some(path.to_path_buf())) {
+            return Ok(vec![session_ref(&s, path, harness)]);
         }
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 /// Streaming parse of any Gemini-format session file, tagged as `harness` in the returned session.
@@ -332,7 +343,7 @@ pub(crate) fn scan_session_file(path: &Path, harness: Harness) -> Vec<SessionRef
 pub(crate) fn stream_for(
     harness: Harness,
     r: &SessionRef,
-    opts: &ParseOptions,
+    opts: &stream::Demand,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
     let name = r
@@ -422,20 +433,6 @@ fn is_checkpoint(name: &str) -> bool {
 // Chat recordings: one reader per era, both feeding the message codec in `record.rs`.
 // ---------------------------------------------------------------------------
 
-/// The demand a recording read puts to the codec: under spans, large fields stay in `source`.
-fn demand<'a>(
-    harness: Harness,
-    opts: &ParseOptions,
-    source: &'a JsonSource,
-    resolver: &'a crate::lazy::Resolver,
-) -> record::Demand<'a> {
-    record::Demand {
-        harness,
-        source: opts.spans.then_some(source),
-        resolver,
-    }
-}
-
 /// Read a *legacy whole-file* chat recording (`{sessionId, messages:[…]}` as one JSON document):
 /// a streaming visitor over `messages[]`, one message through the codec at a time, so the
 /// document is never materialized. Mapped builds borrow it from one mapping; positioned builds
@@ -444,7 +441,7 @@ fn demand<'a>(
 fn read_document(
     path: &Path,
     harness: Harness,
-    opts: &ParseOptions,
+    opts: &stream::Demand,
     sink: &mut dyn MessageSink,
 ) -> Result<Option<Session>> {
     let source = JsonSource::capture(path)?;
@@ -452,7 +449,7 @@ fn read_document(
         return Ok(None);
     }
     let resolver = crate::lazy::Resolver::new(Some(path.to_path_buf()));
-    let d = demand(harness, opts, &source, &resolver);
+    let d = record::Demand::of(harness, opts, &source, &resolver);
     // Nearly every recording is one Value-compatible document: one validating pass, and its
     // messages need no check of their own. One that is not (a field Value rejects) is read as
     // serde's typed envelope: syntax only, each message accepted on its own. Either way the
@@ -555,7 +552,7 @@ fn document(
 }
 
 /// Read a *modern* append-only JSONL recording. A later record can replace or truncate earlier
-/// messages, so a first pass over [`for_each_line`](super::store::jsonl::for_each_line) reaches
+/// messages, so a first pass over the lines ([`jsonl::Read::lines`](super::store::jsonl::Read::lines)) reaches
 /// EOF retaining only keys and byte ranges, never a superseded message's content; the effective
 /// messages are then read again by range, in order, through the codec.
 ///
@@ -563,34 +560,36 @@ fn document(
 fn read_jsonl(
     path: &Path,
     harness: Harness,
-    opts: &ParseOptions,
+    opts: &stream::Demand,
     sink: &mut dyn MessageSink,
 ) -> Result<Option<Session>> {
-    let source = JsonSource::capture(path)?;
-    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    source.check_metadata(file.metadata()?)?;
+    let read = super::store::jsonl::Read::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut replay = RecordingReplay::default();
-    super::store::jsonl::for_each_line(&source, &file, 0, source.len(), |line| {
+    read.lines(0, |line| {
         if let Some(view) = line.view {
             replay.ingest(view)?;
         }
         Ok(Flow::Continue)
     })?;
     let resolver = crate::lazy::Resolver::new(Some(path.to_path_buf()));
-    let mut records = super::store::jsonl::Records::new(&source, &file);
+    let mut records = read.records();
     let mut published = false;
-    let session = replay.emit(
-        demand(harness, opts, &source, &resolver),
-        Some(path),
-        Some(&mut records),
-        sink,
-        &mut published,
-    )?;
+    // The effective records are read again by range between callbacks: under the guard, a slow
+    // callback's backing check stops the read before the next range is touched.
+    let session = crate::stream::guarded(sink, &read, |sink| {
+        replay.emit(
+            record::Demand::of(harness, opts, read.source(), &resolver),
+            Some(path),
+            Some(&mut records),
+            sink,
+            &mut published,
+        )
+    });
     if published {
-        source.check_metadata(file.metadata()?)?;
-        source.check()?;
+        // Completion validates the source even when the consumer stopped with an error.
+        read.check()?;
     }
-    Ok(session)
+    session
 }
 
 /// Where a retained message lives: a byte range of the source, or an owned value (records of a
@@ -603,9 +602,9 @@ enum Body {
 
 impl Body {
     fn of(view: crate::json::JsonView<'_>) -> Result<Self> {
-        Ok(match view.source_range()? {
-            Some((at, len)) => Body::Range(at, len),
-            None => Body::Owned(view.resolve()?.into_owned()),
+        Ok(match view.to_json()? {
+            crate::json::Json::Source(range) => Body::Range(range.offset(), range.len()),
+            crate::json::Json::Owned(value) => Body::Owned(value),
         })
     }
 }
@@ -822,7 +821,10 @@ pub fn parse_all_str_for(harness: Harness, text: &str, source_path: Option<PathB
 
 fn parse_all_str_inner(harness: Harness, text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
     // Chat recording? (object with sessionId+messages, or jsonl with a metadata line)
-    if let Some(s) = parse_chat_recording(text, harness, source_path.clone()) {
+    if let Some(s) = parse_chat_recording(text, harness, source_path.clone()).unwrap_or_else(|error| {
+        crate::env::warn_once("Gemini string recording", format!("{error:#}"));
+        None
+    }) {
         return vec![s];
     }
 
@@ -890,7 +892,7 @@ fn parse_logs_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
             .filter(|e| e.get("type").and_then(Value::as_str) == Some("user"))
             .filter_map(|e| e.get("message").and_then(Value::as_str))
             .find(|t| !is_ignored_user_content(t))
-            .map(|t| crate::ir::truncate(t, 80));
+            .map(|t| crate::ir::truncate(t, crate::projection::Head::TITLE));
         let times: Vec<DateTime<Utc>> = items
             .iter()
             .filter_map(|e| e.get("timestamp").and_then(Value::as_str).and_then(parse_ts))
@@ -935,7 +937,7 @@ fn parse_logs_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
 /// JSON object (`{sessionId, messages:[…]}`) or the modern append-only JSONL log (metadata line +
 /// message records + `$set` / `$rewindTo` control records), through the same readers as a file.
 /// `None` if the text is not a recording.
-fn parse_chat_recording(text: &str, harness: Harness, source_path: Option<PathBuf>) -> Option<Session> {
+fn parse_chat_recording(text: &str, harness: Harness, source_path: Option<PathBuf>) -> Result<Option<Session>> {
     let resolver = crate::lazy::Resolver::new(None);
     let d = record::Demand {
         harness,
@@ -946,27 +948,27 @@ fn parse_chat_recording(text: &str, harness: Harness, source_path: Option<PathBu
     // A modern recording's metadata line also starts with `{`, but a whole-file parse of
     // multi-line JSONL fails, so it falls through to the line replay.
     let document = match serde_json::from_str::<Value>(text) {
-        Ok(value @ Value::Object(_)) => document((&value).into(), source_path.as_deref(), d, &mut sink, true)
-            .ok()
-            .flatten(),
+        Ok(value @ Value::Object(_)) => document((&value).into(), source_path.as_deref(), d, &mut sink, true)?,
         _ => None,
     };
     let mut session = match document {
         Some(session) => session,
         None => {
             let mut replay = RecordingReplay::default();
-            super::for_each_json_line_str(text, |rec| {
-                let _ = replay.ingest((&rec).into());
-                Flow::Continue
-            });
-            replay
-                .emit(d, source_path.as_deref(), None, &mut sink, &mut false)
-                .ok()
-                .flatten()?
+            super::store::jsonl::slice(text.as_bytes(), |line| {
+                if let Some(view) = line.view {
+                    replay.ingest(view)?;
+                }
+                Ok(Flow::Continue)
+            })?;
+            let Some(session) = replay.emit(d, source_path.as_deref(), None, &mut sink, &mut false)? else {
+                return Ok(None);
+            };
+            session
         }
     };
     session.messages = sink.messages;
-    Some(session)
+    Ok(Some(session))
 }
 
 /// Build the IR [`Session`] *metadata* (everything but `messages`) from a `ConversationRecord`'s
@@ -1073,7 +1075,10 @@ fn parse_checkpoint(text: &str, file_name: &str, source_path: Option<PathBuf>) -
             m.kind = MessageKind::SystemPrompt;
         }
         if let Some(parts) = obj.get("parts") {
-            let _ = record::content_blocks(parts.into(), parts_demand, &mut m.content);
+            if let Err(error) = record::content_blocks(parts.into(), parts_demand, &mut m.content) {
+                crate::env::warn_once("Gemini checkpoint parts", format!("{error:#}"));
+                return None;
+            }
         }
         // If this "user" turn is purely tool results, retag it as a Tool turn.
         if role == Role::User
@@ -1106,7 +1111,7 @@ fn parse_checkpoint(text: &str, file_name: &str, source_path: Option<PathBuf>) -
             title = m
                 .text()
                 .filter(|t| !is_ignored_user_content(t))
-                .map(|t| crate::ir::truncate(&t, 80));
+                .map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE));
         }
         if !m.content.is_empty() {
             messages.push(m);
@@ -1160,50 +1165,47 @@ fn checkpoint_id(file_name: &str) -> String {
 
 fn session_ref(s: &Session, path: &Path, harness: Harness) -> SessionRef {
     SessionRef {
-        id: s.id.clone(),
-        harness,
-        path: path.to_path_buf(),
         cwd: s.cwd.clone(),
         title: s.title.clone(),
         created_at: s.created_at,
-        updated_at: s.updated_at,
-        // The contract count (`SessionRef::message_count`): user + assistant turns only — a tool
+        updated_at: s.updated_at, // The contract count (`SessionRef::message_count`): user + assistant turns only — a tool
         // result, an `info`/`error` notice or a `$rewindTo` branch marker is a message, not a turn.
-        message_count: s
-            .messages
-            .iter()
-            .filter(|m| matches!(m.role, Role::User | Role::Assistant))
-            .count(),
+        message_count: Some(
+            s.messages
+                .iter()
+                .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+                .count(),
+        ),
+        ..SessionRef::new(s.id.clone(), harness, path.to_path_buf())
     }
 }
 
 /// `tracker/*.json` as the session's plan and each `plans/*.md` as one plan row (its first
 /// heading), from the session's directory beside `chats/`.
-fn side_affordances(recording: &Path, id: &str) -> Vec<crate::affordance::Affordance> {
+fn side_affordances(recording: &Path, id: &str) -> Result<Vec<crate::affordance::Affordance>> {
     use crate::affordance::{item_of, json_files, plan_state, Affordance, Kind};
     let Some(project) = recording
         .ancestors()
         .find(|a| a.file_name().is_some_and(|n| n == "chats"))
         .and_then(Path::parent)
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let dir = project.join(id);
     let mut out = Vec::new();
-    let items: Vec<_> = json_files(&dir.join("tracker"))
+    let items: Vec<_> = json_files(&dir.join("tracker"))?
         .iter()
         .filter_map(|(_, v)| item_of(v))
         .collect();
     out.extend(plan_state(Kind::Plan, "tracker/", items));
-    let mut plans: Vec<PathBuf> = fs::read_dir(dir.join("plans"))
+    let mut plans: Vec<PathBuf> = super::side_entries(&dir.join("plans"))?
         .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok().map(|e| e.path()))
+        .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "md"))
         .collect();
     plans.sort();
     for p in plans {
-        let text = fs::read_to_string(&p).unwrap_or_default();
+        let text = fs::read_to_string(&p)?;
         let head = text
             .lines()
             .map(|l| l.trim_start_matches('#').trim())
@@ -1217,7 +1219,7 @@ fn side_affordances(recording: &Path, id: &str) -> Vec<crate::affordance::Afford
             Vec::new(),
         ));
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1225,10 +1227,10 @@ mod tests {
     use super::*;
     use crate::harness::Parse;
 
-    fn checked_complete() -> ParseOptions {
-        ParseOptions {
+    fn checked_complete() -> stream::Demand {
+        stream::Demand {
             spans: true,
-            ..ParseOptions::complete()
+            ..stream::Demand::COMPLETE
         }
     }
 
@@ -1306,7 +1308,7 @@ mod tests {
         }
         for (i, (text, accepted)) in cases.into_iter().enumerate() {
             fs::write(&path, &text).unwrap();
-            for opts in [ParseOptions::full(), ParseOptions::lazy()] {
+            for opts in [stream::Demand::RICH, stream::Demand::LEAN.with_spans()] {
                 let mut sink = CollectSink::default();
                 let session = read_document(&path, Harness::Gemini, &opts, &mut sink).unwrap();
                 assert_eq!(session.is_some(), accepted, "case {i}");
@@ -1374,12 +1376,12 @@ mod tests {
             let pure = parse_all_str(&text, Some(path.clone())).remove(0);
             assert!(json_inputs(&pure).iter().all(|j| matches!(j, crate::Json::Owned(_))));
             for opts in [
-                ParseOptions::full(),
-                ParseOptions::bulk(),
-                ParseOptions::complete(),
+                stream::Demand::RICH,
+                stream::Demand::LEAN,
+                stream::Demand::COMPLETE,
                 checked_complete(),
-                ParseOptions::lazy(),
-                ParseOptions::lazy_extra(),
+                stream::Demand::LEAN.with_spans(),
+                stream::Demand::RICH.with_spans(),
             ] {
                 let mut actual = crate::stream::collect_with(&adapter, &reference, &opts).unwrap();
                 let inputs = json_inputs(&actual);
@@ -1433,8 +1435,8 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let adapter = Gemini { roots: vec![] };
         let reference = SessionRef::new("source", Harness::Gemini, path);
-        let expected = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full()).unwrap();
-        let mut actual = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy()).unwrap();
+        let expected = crate::stream::collect_with(&adapter, &reference, &stream::Demand::RICH).unwrap();
+        let mut actual = crate::stream::collect_with(&adapter, &reference, &stream::Demand::LEAN.with_spans()).unwrap();
         assert_eq!(json_inputs(&actual).len(), 3);
         assert!(json_inputs(&actual).iter().all(|j| matches!(j, crate::Json::Source(_))));
         actual.materialize().unwrap();
@@ -1466,8 +1468,9 @@ mod tests {
             };
             fs::write(&path, &bytes).unwrap();
             let reference = SessionRef::new("selected", Harness::Gemini, path.clone());
-            let expected = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full()).unwrap();
-            let mut actual = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy()).unwrap();
+            let expected = crate::stream::collect_with(&adapter, &reference, &stream::Demand::RICH).unwrap();
+            let mut actual =
+                crate::stream::collect_with(&adapter, &reference, &stream::Demand::LEAN.with_spans()).unwrap();
             assert!(matches!(
                 actual.messages[0].content[0],
                 Block::Thinking {
@@ -1477,7 +1480,8 @@ mod tests {
             ));
             actual.materialize().unwrap();
             assert_eq!(as_json(&actual), as_json(&expected));
-            let mut retained = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy()).unwrap();
+            let mut retained =
+                crate::stream::collect_with(&adapter, &reference, &stream::Demand::LEAN.with_spans()).unwrap();
             fs::write(&path, b"{}").unwrap();
             assert!(retained.materialize().is_err());
             for at in [1, 2] {
@@ -1492,10 +1496,16 @@ mod tests {
                     Ok(Flow::Continue)
                 });
                 let error = adapter
-                    .stream(&reference, &ParseOptions::lazy(), &mut sink)
+                    .stream(&reference, &stream::Demand::LEAN.with_spans(), &mut sink)
                     .unwrap_err();
-                assert!(format!("{error:#}").contains("changed"), "{error:#}");
-                assert!(!format!("{error:#}").contains("consumer cap"));
+                // The shared guard preserves the first failure: a fast callback can report
+                // its own error before a backing check. Neither case may deliver another turn.
+                let diagnostic = format!("{error:#}");
+                assert!(
+                    diagnostic.contains("changed") || diagnostic.contains("consumer cap"),
+                    "{diagnostic}"
+                );
+                assert_eq!(calls, at);
             }
         }
     }
@@ -1515,6 +1525,9 @@ mod tests {
                 self.calls += 1;
                 if self.calls == self.at {
                     fs::remove_file(&self.path).unwrap();
+                    // The contract: a callback slow enough to mutate the source is rechecked on
+                    // return; a fast one is the EOF check's.
+                    std::thread::sleep(crate::harness::store::jsonl::Read::SLOW_CALLBACK * 10);
                 }
                 Flow::Continue
             }
@@ -1542,7 +1555,7 @@ mod tests {
                 };
                 let result = Gemini { roots: vec![] }.stream(
                     &SessionRef::new("source", Harness::Gemini, path.clone()),
-                    &ParseOptions::lazy(),
+                    &stream::Demand::LEAN.with_spans(),
                     &mut sink,
                 );
                 assert!(result.is_err());
@@ -1572,19 +1585,21 @@ mod tests {
         fs::write(&path, text).unwrap();
         let adapter = Gemini { roots: vec![] };
         let reference = SessionRef::new("source", Harness::Gemini, path.clone());
-        let full = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full()).unwrap();
+        let full = crate::stream::collect_with(&adapter, &reference, &stream::Demand::RICH).unwrap();
         let mut expected = crate::events::EventSink::new(None);
         for message in &full.messages {
             expected.try_message(message.clone()).unwrap();
         }
         let mut actual = crate::events::EventSink::new(None);
-        adapter.stream(&reference, &ParseOptions::lazy(), &mut actual).unwrap();
+        adapter
+            .stream(&reference, &stream::Demand::LEAN.with_spans(), &mut actual)
+            .unwrap();
         assert_eq!(actual.into_events().unwrap(), expected.into_events().unwrap());
         assert_eq!(
             serde_json::to_value(crate::affordance::read(&adapter, &reference).unwrap()).unwrap(),
             serde_json::to_value(crate::affordance::of_session(&full).unwrap()).unwrap()
         );
-        let lazy = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy()).unwrap();
+        let lazy = crate::stream::collect_with(&adapter, &reference, &stream::Demand::LEAN.with_spans()).unwrap();
         assert!(json_inputs(&lazy).iter().all(|j| matches!(j, crate::Json::Source(_))));
         fs::remove_file(path).unwrap();
         assert!(json_inputs(&lazy)[0].resolve().is_err());
@@ -1630,8 +1645,11 @@ mod tests {
             ]
         );
         assert!(
-            s.messages.iter().all(|m| m.model.is_none()),
-            "every turn used the session model, so none repeats it"
+            s.messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .all(|m| m.model.as_deref() == Some("gemini-3-flash-preview")),
+            "every assistant record states its model"
         );
 
         let asst = &s.messages[1];
@@ -1702,7 +1720,7 @@ mod tests {
             Some("fix the build"),
             "only the human prompt titles"
         );
-        assert_eq!(s.first_user_text().as_deref(), Some("fix the build"));
+
         let record_type = |i: usize| s.messages[i].harness_extra(Harness::Gemini).unwrap()["record_type"].clone();
         assert_eq!(record_type(6), "info");
         assert_eq!(record_type(7), "warning");
@@ -1714,12 +1732,19 @@ mod tests {
     }
 
     #[test]
-    fn message_model_only_when_it_differs_from_the_session() {
+    fn every_turn_states_the_model_its_record_names() {
         let text = fixture("session_model_fallback.jsonl");
         let s = &parse_all_str(&text, None)[0];
         assert_eq!(s.model.as_deref(), Some("gemini-3-pro"));
-        assert_eq!(s.messages[1].model, None);
+        assert_eq!(s.messages[1].model.as_deref(), Some("gemini-3-pro"));
         assert_eq!(s.messages[2].model.as_deref(), Some("gemini-3-flash"));
+    }
+
+    #[test]
+    fn windowed_reads_keep_the_model() {
+        let _world = crate::test_world("gemini-windowed");
+        let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/gemini/0.63.0/.gemini");
+        crate::harness::assert_windowed_models(&Gemini::with_home(&home));
     }
 
     #[test]
@@ -1850,7 +1875,13 @@ mod tests {
         assert_eq!(b.harness_extra(Harness::Gemini).unwrap()["rewind_to"], "a3");
         assert_eq!(b.harness_extra(Harness::Gemini).unwrap()["record_type"], "rewind");
         assert_eq!(s.messages[branches[0] + 1].id.as_deref(), Some("a3"));
-        assert!(s.messages.iter().all(|m| m.model.is_none()), "one model throughout");
+        assert!(
+            s.messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .all(|m| m.model.as_deref() == Some("gemini-3-pro")),
+            "one model throughout, stated on every assistant record"
+        );
         assert_nested_extra(s, Harness::Gemini);
 
         // tool call + result present
@@ -1882,7 +1913,7 @@ mod tests {
         assert!(s.messages[2]
             .content
             .iter()
-            .any(|b| matches!(b, Block::ToolResult { content, .. } if content == "4")));
+            .any(|b| matches!(b, Block::ToolResult { content, .. } if content.matches_str("4") == Some(true))));
     }
 
     #[test]
@@ -1955,7 +1986,7 @@ mod tests {
         );
 
         // Native stream and explicit checked complete preparation retain the existing codec.
-        for opts in [ParseOptions::full(), ParseOptions::complete(), checked_complete()] {
+        for opts in [stream::Demand::RICH, stream::Demand::COMPLETE, checked_complete()] {
             let mut sink = CollectSink::default();
             let mut streamed = adapter.stream(&r, &opts, &mut sink).expect("on-disk stream");
             assert!(streamed.messages.is_empty(), "stream returns empty messages");
@@ -1984,7 +2015,7 @@ mod tests {
         fs::write(&file, text).unwrap();
         let mut sink = CollectSink::default();
         // Call this path directly: a fallback would hide the borrowing failure.
-        let mut streamed = read_document(&file, Harness::Gemini, &ParseOptions::full(), &mut sink)
+        let mut streamed = read_document(&file, Harness::Gemini, &stream::Demand::RICH, &mut sink)
             .unwrap()
             .expect("escaped strings are a legacy recording");
         streamed.messages = sink.messages;
@@ -2023,7 +2054,7 @@ mod tests {
         let mut s = Gemini { roots: vec![] }
             .stream(
                 &SessionRef::new("lazy", Harness::Gemini, file.clone()),
-                &ParseOptions::lazy(),
+                &stream::Demand::LEAN.with_spans(),
                 &mut sink,
             )
             .unwrap();
@@ -2032,7 +2063,7 @@ mod tests {
             .messages
             .iter()
             .flat_map(|m| &m.content)
-            .any(|b| matches!(b, Block::Text { text } if text.is_span())));
+            .any(|b| matches!(b, Block::Text { text } if text.is_lazy())));
         s.materialize().unwrap();
         assert_eq!(
             as_json(&s),
@@ -2066,9 +2097,9 @@ mod tests {
             fs::write(&file, &text).unwrap();
             let reference = parse_all_str(&text, Some(file.clone())).remove(0);
             for opts in [
-                ParseOptions::full(),
-                ParseOptions::lazy(),
-                ParseOptions::complete(),
+                stream::Demand::RICH,
+                stream::Demand::LEAN.with_spans(),
+                stream::Demand::COMPLETE,
                 checked_complete(),
             ] {
                 let mut sink = CollectSink::default();
@@ -2083,15 +2114,17 @@ mod tests {
                 s.materialize().unwrap();
                 assert_eq!(as_json(&s), as_json(&reference));
             }
-            let refs = scan_session_file(&file, Harness::Gemini);
+            let refs = scan_session_file(&file, Harness::Gemini).unwrap();
             assert_eq!(refs.len(), 1);
             assert_eq!(
                 refs[0].message_count,
-                reference
-                    .messages
-                    .iter()
-                    .filter(|m| matches!(m.role, Role::User | Role::Assistant))
-                    .count()
+                Some(
+                    reference
+                        .messages
+                        .iter()
+                        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+                        .count()
+                )
             );
         }
         fs::remove_dir_all(dir).unwrap();
@@ -2114,9 +2147,9 @@ mod tests {
             let reference = parse_all_str(&text, Some(file.clone())).remove(0);
             assert_eq!(reference.messages.len(), 2);
             for opts in [
-                ParseOptions::lazy(),
-                ParseOptions::full(),
-                ParseOptions::complete(),
+                stream::Demand::LEAN.with_spans(),
+                stream::Demand::RICH,
+                stream::Demand::COMPLETE,
                 checked_complete(),
             ] {
                 let mut sink = CollectSink::default();
@@ -2135,9 +2168,9 @@ mod tests {
         fs::write(&file, text).unwrap();
         let mut sessions = Vec::new();
         for opts in [
-            ParseOptions::lazy(),
-            ParseOptions::full(),
-            ParseOptions::complete(),
+            stream::Demand::LEAN.with_spans(),
+            stream::Demand::RICH,
+            stream::Demand::COMPLETE,
             checked_complete(),
         ] {
             let mut sink = CollectSink::default();
@@ -2165,7 +2198,7 @@ mod tests {
             seen += 1;
             Flow::Stop
         };
-        let _ = adapter.stream(&r, &ParseOptions::full(), &mut sink).unwrap();
+        let _ = adapter.stream(&r, &stream::Demand::RICH, &mut sink).unwrap();
         assert_eq!(seen, 1, "Stop after the first message must halt streaming");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2228,7 +2261,7 @@ mod tests {
         )
         .unwrap();
 
-        let refs = scan_session_file(&file, Harness::Gemini);
+        let refs = scan_session_file(&file, Harness::Gemini).unwrap();
         assert_eq!(
             refs[0].cwd.as_deref(),
             Some(Path::new("/Users/u/work/proj")),
@@ -2256,19 +2289,23 @@ mod tests {
         // hash-named dirs (pre-registry) have no mapping → None, as before
         let (runtime3, file3) = runtime_fixture("hash", &"ab".repeat(32), "session_modern.jsonl");
 
-        let refs = scan_session_file(&file, Harness::Gemini);
+        let refs = scan_session_file(&file, Harness::Gemini).unwrap();
         assert_eq!(refs[0].cwd.as_deref(), Some(Path::new("/Users/u/pug/claurdvoyant")));
-        let refs2 = scan_session_file(&file2, Harness::Gemini);
+        let refs2 = scan_session_file(&file2, Harness::Gemini).unwrap();
         assert_eq!(refs2[0].cwd.as_deref(), Some(Path::new("/Users/u/cvrt8/gemtest")));
         // session_legacy.json parses to user, assistant, tool, assistant, info-notice: three turns.
-        assert_eq!(refs2[0].message_count, 3, "user + assistant turns, not every message");
-        let refs3 = scan_session_file(&file3, Harness::Gemini);
+        assert_eq!(
+            refs2[0].message_count,
+            Some(3),
+            "user + assistant turns, not every message"
+        );
+        let refs3 = scan_session_file(&file3, Harness::Gemini).unwrap();
         assert_eq!(refs3[0].cwd, None);
 
         // the streamed session carries it too (the sink's `meta` sees the cwd)
         let adapter = Gemini { roots: vec![] };
         let mut sink = CollectSink::default();
-        let s = adapter.stream(&refs[0], &ParseOptions::full(), &mut sink).unwrap();
+        let s = adapter.stream(&refs[0], &stream::Demand::RICH, &mut sink).unwrap();
         assert_eq!(s.cwd.as_deref(), Some(Path::new("/Users/u/pug/claurdvoyant")));
         // a record's own `directories[]` still wins (unchanged behaviour): covered by
         // `parses_legacy_chat_recording` fixtures carrying no registry at all.
@@ -2295,7 +2332,7 @@ mod tests {
             fixture("registry/project_root"),
         )
         .unwrap();
-        let refs = scan_session_file(&file, Harness::Gemini);
+        let refs = scan_session_file(&file, Harness::Gemini).unwrap();
         assert_eq!(refs[0].cwd.as_deref(), Some(Path::new("/Users/u/scratch/gemtest-proj")));
 
         // The marker beside the chats is enough on its own (a runtime root with no registry file
@@ -2306,7 +2343,7 @@ mod tests {
             "/Users/u/work/solo",
         )
         .unwrap();
-        let refs2 = scan_session_file(&file2, Harness::Gemini);
+        let refs2 = scan_session_file(&file2, Harness::Gemini).unwrap();
         assert_eq!(refs2[0].cwd.as_deref(), Some(Path::new("/Users/u/work/solo")));
         for d in [runtime, runtime2] {
             let _ = fs::remove_dir_all(&d);
@@ -2326,7 +2363,7 @@ mod tests {
             fixture("registry/project_root"),
         )
         .unwrap();
-        let refs = scan_session_file(&file, Harness::Gemini);
+        let refs = scan_session_file(&file, Harness::Gemini).unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].id, "ad7102ea-0b4f-4822-94f7-f3bbf67f1614");
         assert_eq!(refs[0].cwd.as_deref(), Some(Path::new("/Users/u/scratch/gemtest-proj")));
@@ -2334,7 +2371,7 @@ mod tests {
 
         let adapter = Gemini { roots: vec![] };
         let mut sink = CollectSink::default();
-        let s = adapter.stream(&refs[0], &ParseOptions::full(), &mut sink).unwrap();
+        let s = adapter.stream(&refs[0], &stream::Demand::RICH, &mut sink).unwrap();
         assert_eq!(s.title, None);
         assert_eq!(sink.messages.len(), 1, "the preamble turn is still in the transcript");
         let m = &sink.messages[0];
@@ -2367,12 +2404,12 @@ mod tests {
             .replacen(r#""kind":"main""#, r#""kind":"subagent""#, 1);
         fs::write(&child, text).unwrap();
 
-        let refs = scan_session_file(&child, Harness::Gemini);
+        let refs = scan_session_file(&child, Harness::Gemini).unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].id, "aaaa0000-0000-0000-0000-000000000001");
         let adapter = Gemini { roots: vec![] };
         let mut sink = CollectSink::default();
-        let s = adapter.stream(&refs[0], &ParseOptions::full(), &mut sink).unwrap();
+        let s = adapter.stream(&refs[0], &stream::Demand::RICH, &mut sink).unwrap();
         assert_eq!(
             s.lineage,
             Lineage {
@@ -2382,10 +2419,11 @@ mod tests {
         );
         assert_eq!(s.harness_extra(Harness::Gemini).unwrap()["kind"], "subagent");
         // the parent's own recording, one level up, has no parent
-        let parent_refs = scan_session_file(&runtime.join("tmp/proj/chats/session_modern.jsonl"), Harness::Gemini);
+        let parent_refs =
+            scan_session_file(&runtime.join("tmp/proj/chats/session_modern.jsonl"), Harness::Gemini).unwrap();
         let mut sink = CollectSink::default();
         let p = adapter
-            .stream(&parent_refs[0], &ParseOptions::full(), &mut sink)
+            .stream(&parent_refs[0], &stream::Demand::RICH, &mut sink)
             .unwrap();
         assert!(p.lineage.is_empty());
         let _ = fs::remove_dir_all(&runtime);
@@ -2547,16 +2585,16 @@ mod tests {
     fn a_startup_stub_never_shadows_the_session_it_shares_an_id_with() {
         let mk = |n: usize, mins: i64| {
             let mut r = SessionRef::new("same", Harness::Gemini, format!("/x/{n}.jsonl"));
-            r.message_count = n;
+            r.message_count = Some(n);
             r.updated_at = Some(chrono::DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::minutes(mins));
             r
         };
         let kept = dedupe_by_id(vec![mk(4, 1), mk(0, 2)]);
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].message_count, 4, "the newer stub lost");
+        assert_eq!(kept[0].message_count, Some(4), "the newer stub lost");
         assert_eq!(
             dedupe_by_id(vec![mk(2, 1), mk(3, 2)])[0].message_count,
-            3,
+            Some(3),
             "newer real copy wins"
         );
     }

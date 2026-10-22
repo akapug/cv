@@ -13,66 +13,100 @@ use crate::Session;
 use serde_json::{json, Value};
 
 mod read;
+mod selection;
 mod window;
+pub use selection::MessageWindow;
 pub use window::WindowSink;
+
+/// A router's arms spelled once: the `match` that answers and the method/path patterns
+/// `cv schema --json` lists under `routes`, so the compatibility gate probes the code's own table.
+/// Each arm names its method; a binding or `_` prints as `{}`, a rest pattern as `*`.
+#[macro_export]
+macro_rules! routes {
+    (@seg $l:literal) => { $l };
+    (@seg ..) => { "*" };
+    (@seg $i:tt) => { "{}" };
+    (@post GET) => { false };
+    (@post POST) => { true };
+    ($vis:vis const $inventory:ident;
+     $(#[$meta:meta])* $fvis:vis fn $name:ident($post:ident, $parts:ident $(, $arg:ident: $ty:ty)*) -> $ret:ty {
+        $( $( $method:ident [$($seg:tt),*] )|+ => $body:expr, )*
+        _ => $fallback:expr $(,)?
+    }) => {
+        $vis const $inventory: &[&str] =
+            &[$( $( concat!(stringify!($method), " ", $("/", $crate::routes!(@seg $seg)),*) ),+ ),*];
+        $(#[$meta])*
+        $fvis fn $name($post: bool, $parts: &[&str] $(, $arg: $ty)*) -> $ret {
+            match ($post, $parts) {
+                $( $( ($crate::routes!(@post $method), [$($seg),*]) )|+ => $body, )*
+                _ => $fallback,
+            }
+        }
+    };
+}
 
 /// Route a decoded path (`["api", "session", "claude", "abc"]`) plus a raw query string.
 /// Never panics; an unknown path is a 404.
 pub fn route_json(parts: &[&str], query: &str) -> (u16, Value) {
     let _reads = crate::source::read_scope();
-    match parts {
-        ["api", "health"] => ok(json!({
+    read(false, parts, query)
+}
+
+routes! {
+    pub const ROUTES;
+    fn read(_post, parts, query: &str) -> (u16, Value) {
+        GET ["api", "health"] => ok(json!({
             "ok": true,
             "harnesses": Harness::ALL.iter().map(|h| h.as_str()).collect::<Vec<_>>(),
         })),
 
-        ["api", "sessions"] => sessions(query),
+        GET ["api", "sessions"] => sessions(query),
 
-        ["api", "session", harness, id] => session(harness, id),
+        GET ["api", "session", harness, id] => session(harness, id),
 
-        ["api", "session", harness, id, "head"] => session_head(harness, id),
+        GET ["api", "session", harness, id, "head"] => session_head(harness, id),
 
-        ["api", "session", harness, id, "messages"] => messages(harness, id, query),
+        GET ["api", "session", harness, id, "messages"] => messages(harness, id, query),
 
-        ["api", "session", harness, id, "events"] => session_events(harness, id, query),
+        GET ["api", "session", harness, id, "events"] => session_events(harness, id, query),
 
-        ["api", "session", harness, id, "compactions"] => compactions(harness, id),
+        GET ["api", "session", harness, id, "compactions"] => compactions(harness, id),
 
-        ["api", "touched"] => touched(query),
+        GET ["api", "touched"] => touched(query),
 
-        ["api", "session", harness, id, "subagents"] => subagents(harness, id),
+        GET ["api", "session", harness, id, "subagents"] => subagents(harness, id),
 
-        ["api", "session", harness, parent, "subagent", agent] => subagent(harness, parent, agent),
+        GET ["api", "session", harness, parent, "subagent", agent] => subagent(harness, parent, agent),
 
-        ["api", "session", harness, id, "workflow", wf, "script"] => workflow_script(harness, id, wf),
+        GET ["api", "session", harness, id, "workflow", wf, "script"] => workflow_script(harness, id, wf),
 
         // Removed in 0.15.0 with the coordination board: a pointer, not a silent 404.
-        ["api", "board", ..] | ["api", "claims", _] | ["api", "who", _] | ["api", "channels"] => err(
+        GET ["api", "board", ..] | GET ["api", "claims", _] | GET ["api", "who", _] | GET ["api", "channels"] => err(
             410,
             "removed in 0.15.0 with the coordination board — the task log is the fleet's record: \
              /api/tasks, /api/tasks/inbox/{who}, /api/task/{id}/events",
         ),
 
-        ["api", "tasks"] => tasks(query),
+        GET ["api", "tasks"] => tasks(query),
 
         // Removed in 0.15.0 with the land facet: a pointer, not a silent 404.
-        ["api", "tasks", "debt"] | ["api", "tasks", "stats"] => err(
+        GET ["api", "tasks", "debt"] | GET ["api", "tasks", "stats"] => err(
             410,
             "removed in 0.15.0 with the task land facet — completion is self-reported and labeled; \
              read /api/tasks and /api/task/{id}",
         ),
 
-        ["api", "tasks", "inbox", who] => tasks_inbox(who, query),
+        GET ["api", "tasks", "inbox", who] => tasks_inbox(who, query),
 
         // Removed in 0.17: the inbox page reads the task rows with their backlog columns.
-        ["api", "backlog"] => err(
+        GET ["api", "backlog"] => err(
             410,
             "removed in 0.17 — read /api/tasks?detail=1 (every open task, oldest first; all=1 adds closed ones)",
         ),
 
-        ["api", "task", id] => task_one(id, Query::parse(query).flag("events")),
+        GET ["api", "task", id] => task_one(id, Query::parse(query).flag("events")),
 
-        ["api", "task", id, "events"] => task_events(id),
+        GET ["api", "task", id, "events"] => task_events(id),
 
         _ => err(404, "not found"),
     }
@@ -94,11 +128,8 @@ pub fn route_staged(parts: &[&str], query: &str) -> anyhow::Result<Option<Staged
     };
     let result = message_window(harness, id, query);
     let mut output = crate::bytes::ByteStage::default();
-    let position = std::rc::Rc::new(std::cell::Cell::new(0));
-    let mut counted = crate::projection::Counted {
-        inner: &mut output,
-        position: position.clone(),
-    };
+    let mut counted = crate::projection::Counted::new(&mut output);
+    let position = counted.position.clone();
     let status = match result {
         Ok((r, mut sink)) => {
             let frames = sink.finish()?;
@@ -302,7 +333,7 @@ fn complete_session_json(adapter: &dyn crate::Adapter, reference: &SessionRef) -
         guard: true,
         ..crate::stream::Pass::RECORD
     };
-    let read = crate::stream::stream_counted(adapter, reference, &crate::ParseOptions::full(), &mut sink, pass)?;
+    let read = crate::stream::stream_counted(adapter, reference, &crate::Demand::RICH, &mut sink, pass)?;
     let mut session = read.session;
     session.messages = sink.messages;
     session.materialize()?;
@@ -441,15 +472,11 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
         Ok(x) => x,
         Err(e) => return e,
     };
-    if events::needs_ingest(&r) {
-        if let Err(e) = events::ingest_ref(&r) {
-            return err(500, &format!("event ingest failed: {e:#}"));
-        }
-    }
-    let out: Vec<Value> = events::events_for(r.harness.as_str(), &r.id, kind.as_deref())
-        .iter()
-        .map(crate::rows::event_row)
-        .collect();
+    let rows = match events::read_ref(&r, kind.as_deref()) {
+        Ok(rows) => rows,
+        Err(e) => return err(500, &format!("event catalog: {e:#}")),
+    };
+    let out: Vec<Value> = rows.iter().map(crate::rows::event_row).collect();
     ok(json!(out))
 }
 
@@ -462,39 +489,29 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
 /// context it can no longer see. `pre_compaction_span` is the `[start, boundary)` range that was
 /// compacted away, in the same numbering `/messages` uses.
 fn compactions(harness: &str, id: &str) -> (u16, Value) {
-    let (r, _) = match lookup(harness, id) {
+    let (r, adapter) = match lookup(harness, id) {
         Ok(x) => x,
         Err(e) => return e,
     };
-    let boundaries = match crate::compaction::detect(&r, true) {
-        Ok(b) => b,
-        Err(e) => return err(500, &format!("compaction scan failed: {e:#}")),
-    };
-    let out: Vec<Value> = (0..boundaries.len())
-        .map(|n| {
-            let mut v = crate::compaction::row(&boundaries, n);
-            if let Some(obj) = v.as_object_mut() {
-                // An addition for the dashboard, never a rename: the CLI's keys stay the CLI's.
-                obj.insert("headline".into(), json!(boundaries[n].headline(n + 1)));
-            }
-            v
-        })
-        .collect();
-    // A bare array, like every other list this API serves.
-    ok(json!(out))
+    match read::compactions(read::shared(), adapter.as_ref(), &r) {
+        Ok(value) => ok(value),
+        Err(e) => err(500, &format!("compaction scan failed: {e:#}")),
+    }
 }
 
 /// `GET /api/touched?path=&edits_only=` — sessions whose tool events touched a file (exact or
-/// suffix path match), newest activity first, as `cv touched --json` rows. Empty on a cold catalog.
+/// suffix path match), newest activity first, as `cv touched --json` rows. Empty on a cold catalog;
+/// a catalog error is a 500, never an empty list.
 fn touched(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     let Some(path) = params.get("path") else {
         return err(400, "missing path parameter");
     };
-    let out: Vec<Value> = crate::events::sessions_touching(&path, params.flag("edits_only"))
-        .iter()
-        .map(crate::rows::touched_row)
-        .collect();
+    let rows = match crate::events::sessions_touching(&path, params.flag("edits_only")) {
+        Ok(rows) => rows,
+        Err(e) => return err(500, &format!("event catalog: {e:#}")),
+    };
+    let out: Vec<Value> = rows.iter().map(crate::rows::touched_row).collect();
     ok(json!(out))
 }
 
@@ -506,20 +523,13 @@ fn subagents(harness: &str, id: &str) -> (u16, Value) {
         Ok(x) => x,
         Err(e) => return e,
     };
-    let out: Vec<Value> = crate::subagent_tree_of(&r)
+    let forest = match crate::subagent_tree_of(&r) {
+        Ok(forest) => forest,
+        Err(error) => return err(500, &format!("forest read failed: {error:#}")),
+    };
+    let out: Vec<Value> = forest
         .iter()
-        .map(|s| {
-            let mut row = crate::rows::session_row(&s.session, size_of(&s.session));
-            let map = row.as_object_mut().expect("session_row is an object");
-            map.insert("agent_id".into(), json!(s.agent_id()));
-            map.insert("agent_type".into(), json!(s.agent_type));
-            map.insert("description".into(), json!(s.description));
-            map.insert("tool_use_id".into(), json!(s.tool_use_id));
-            map.insert("workflow".into(), json!(s.workflow));
-            map.insert("result_status".into(), json!(s.result_status));
-            map.insert("result_summary".into(), json!(s.result_summary));
-            row
-        })
+        .map(|s| crate::rows::subagent_row(s, size_of(&s.session)))
         .collect();
     ok(json!(out))
 }
@@ -533,12 +543,19 @@ fn subagent(harness: &str, parent: &str, agent: &str) -> (u16, Value) {
         Err((404, _)) => return err(404, "parent session not found"),
         Err(e) => return e,
     };
-    let Some(sr) = crate::subagent_tree_filtered_of(&r, crate::SubagentDemand::Sessions, None, |id, _| {
-        id == agent || id.strip_prefix("agent-") == Some(agent)
-    })
-    .into_iter()
-    .find(|s| s.session.id == agent || s.agent_id() == agent)
-    .map(|s| s.session) else {
+    // The full transcript id, Claude's bare `agentId`, or the agent part of a `<parent>/<agent>` id.
+    let forest = crate::subagent_tree_filtered_of(&r, crate::SubagentDemand::Sessions, None, |id, _| {
+        id == agent || id.strip_prefix("agent-") == Some(agent) || id.rsplit_once('/').is_some_and(|(_, a)| a == agent)
+    });
+    let forest = match forest {
+        Ok(forest) => forest,
+        Err(error) => return err(500, &format!("forest read failed: {error:#}")),
+    };
+    let Some(sr) = forest
+        .into_iter()
+        .find(|s| s.session.id == agent || s.agent_id() == agent)
+        .map(|s| s.session)
+    else {
         return err(404, "subagent not found");
     };
     match complete_session_json(adapter.as_ref(), &sr) {
@@ -652,7 +669,7 @@ fn err(status: u16, msg: &str) -> (u16, Value) {
 mod tests {
     use super::*;
     use crate::stream::{Flow, MessageSink};
-    use crate::{Message, ParseOptions};
+    use crate::{Demand, Message};
 
     fn window(start: usize, end: Option<usize>) -> WindowSink {
         WindowSink::page(
@@ -685,13 +702,13 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> anyhow::Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> anyhow::Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 reference: &SessionRef,
-                _: &crate::ParseOptions,
+                _: &crate::Demand,
                 sink: &mut dyn crate::MessageSink,
             ) -> anyhow::Result<Session> {
                 sink.dependency(&self.0);
@@ -798,7 +815,7 @@ mod tests {
         let mut callbacks = 0usize;
         for start in (0..records).step_by(page) {
             let mut sink = window(start, Some(start + page));
-            adapter.try_stream(&r, &ParseOptions::lazy(), &mut sink).unwrap();
+            adapter.try_stream(&r, &Demand::LEAN.with_spans(), &mut sink).unwrap();
             assert_eq!(sink.selected, page);
             assert_eq!(sink.more, start + page < records);
             callbacks += sink.idx;
@@ -807,7 +824,7 @@ mod tests {
         assert_eq!(callbacks, expected);
         let mut head_callbacks = 0usize;
         adapter
-            .try_stream(&r, &ParseOptions::lazy(), &mut |_m| {
+            .try_stream(&r, &Demand::LEAN.with_spans(), &mut |_m| {
                 head_callbacks += 1;
                 Flow::Continue
             })

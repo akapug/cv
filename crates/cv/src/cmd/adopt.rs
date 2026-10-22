@@ -8,7 +8,8 @@
 use crate::util::{fmt_local, home_rel, report, short_id, usage};
 use anyhow::{Context, Result};
 use cv_core::harness::claude::adopt::{self, AgentFile, Plan, SessionFile};
-use cv_core::ir::{human_bytes, Harness};
+use cv_core::harness::claude::sidecar;
+use cv_core::ir::human_bytes;
 use serde_json::json;
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -16,7 +17,7 @@ use std::path::PathBuf;
 /// Every Claude root cv reads (the store plus `CLUSTERVISION_CLAUDE_ROOTS` / `claude-roots`
 /// entries): the fleet lookup spans all of them; named here only in a miss's message.
 fn roots() -> Result<Vec<PathBuf>> {
-    let roots = cv_core::harness::for_harness(Harness::Claude)
+    let roots = cv_core::harness::for_harness(cv_core::harness::derived_host())
         .map(|a| a.roots())
         .unwrap_or_default();
     if roots.is_empty() {
@@ -53,14 +54,9 @@ pub(crate) struct AdoptArgs {
 
 /// Set `model` in a sub-agent's meta sidecar, creating the sidecar when the source had none.
 fn set_meta_model(path: &std::path::Path, model: &str) -> Result<()> {
-    let mut meta: serde_json::Value = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| json!({"agentType": "general-purpose"}));
-    if let Some(o) = meta.as_object_mut() {
-        o.insert("model".into(), json!(model));
-    }
+    let mut meta = sidecar::agent_meta(path);
+    meta.insert("model".into(), json!(model));
+    let meta = serde_json::Value::Object(meta);
     // The meta adopt itself just published (or none): replaced whole.
     cv_core::publish::publish_reader(
         path,
@@ -171,8 +167,10 @@ fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
             .dest_meta
             .clone()
             .unwrap_or_else(|| p.dest.with_extension("meta.json"));
-        if let (Some(m), false) = (&a.model, a.dry_run) {
-            set_meta_model(&meta_dest, m)?;
+        if !a.dry_run {
+            if let Some(m) = &a.model {
+                set_meta_model(&meta_dest, m)?;
+            }
         }
         let verb = if a.dry_run { "would adopt" } else { "adopted" };
         let _ = writeln!(
@@ -243,13 +241,13 @@ fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
         );
         done.push(json!({"plan": p, "result": r, "written": !a.dry_run}));
     }
-    let deads: std::collections::BTreeSet<&str> = plans.iter().map(|p| p.agent.session_id.as_str()).collect();
-    for dead in &deads {
+    let source_sessions: std::collections::BTreeSet<&str> = plans.iter().map(|p| p.agent.session_id.as_str()).collect();
+    for source in &source_sessions {
         let _ = writeln!(
             h,
-            "  ⚑ keep {dead}'s directory: these agents' persisted outputs stay in its tool-results/ \
+            "  ⚑ keep {source}'s directory: these agents' persisted outputs stay in its tool-results/ \
              (named by absolute path), and what `cv prune` snipped from it stays in its sidecar — \
-             `cv cat {dead} <tool_use_id>`; an agent's own calls: `cv cat agent-<id> <tool_use_id>`"
+             `cv cat {source} <tool_use_id>`; an agent's own calls: `cv cat agent-<id> <tool_use_id>`"
         );
     }
     if a.dry_run {
@@ -282,7 +280,16 @@ mod metadata_tests {
         let updated: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
             updated,
-            json!({"model":"requested-model","description":"keep","extra":{"a":1}})
+            json!({"agentType":"general-purpose","model":"requested-model","description":"keep","extra":{"a":1}}),
+            "a sidecar naming no type gets the default; every other key is the source's"
+        );
+        std::fs::write(&path, r#"{"agentType":"Explore","model":"old"}"#).unwrap();
+        set_meta_model(&path, "requested-model").unwrap();
+        let updated: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            updated,
+            json!({"agentType":"Explore","model":"requested-model"}),
+            "never overwritten"
         );
     }
 }

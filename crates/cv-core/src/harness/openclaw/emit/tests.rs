@@ -2,17 +2,24 @@ use super::*;
 use crate::{harness::wire::anthropic, Json, Message, Origin};
 use std::collections::HashMap;
 
+/// Only recorded counts are written; OpenClaw derives the total it is not given.
 #[test]
-fn derived_usage_total_saturates_instead_of_panicking_or_wrapping() {
+fn usage_writes_recorded_counts_and_no_total() {
     let usage = crate::Usage {
         input_tokens: Some(u64::MAX),
         output_tokens: Some(1),
         ..Default::default()
     };
     let value = openclaw_usage(Some(&usage)).unwrap();
-    assert_eq!(value["input"], json!(u64::MAX));
-    assert_eq!(value["output"], json!(1));
-    assert_eq!(value["totalTokens"], json!(u64::MAX));
+    assert_eq!(value, json!({"input": u64::MAX, "output": 1}));
+    let cost_only = crate::Usage {
+        cost_usd: Some(0.5),
+        ..Default::default()
+    };
+    assert_eq!(
+        openclaw_usage(Some(&cost_only)).unwrap(),
+        json!({"cost": {"total": 0.5}})
+    );
 }
 
 fn normalized(path: &Path) -> Result<Vec<u8>> {
@@ -215,7 +222,7 @@ fn fixture(base: &Path) -> Result<Session> {
 fn checked_openclaw_matches_frozen_records_index_and_all_modes() -> Result<()> {
     let world = crate::test_world("openclaw-checked-wire");
     let session = fixture(&world.base)?;
-    let mut frozen = crate::emit::grok_qwen_tests::Frozen::new("openclaw-fixture");
+    let mut frozen = crate::emit::frozen::Frozen::new("openclaw-fixture");
     for mode in ThinkingMode::ALL {
         let options = EmitOptions {
             new_id: Some("fixed".into()),
@@ -248,7 +255,7 @@ fn checked_openclaw_borrowed_wrapper_matches_replay_definition_and_none() -> Res
             input: input.clone(),
             namespace: namespace.map(str::to_owned),
         };
-        let rewrapped = crate::affordance::rewrap_deferred(Harness::OpenClaw, &block)?;
+        let rewrapped = crate::affordance::rewrap_deferred(crate::harness::openclaw::DEFERRED_WRAPPER, &block)?;
         assert_eq!(rewrapped.is_some(), namespace == Some(crate::affordance::DEFERRED));
         let expected = anthropic::assistant_blocks(&[rewrapped.unwrap_or(block.clone())], &anthropic::OPENCLAW)?;
         let mut bytes = Vec::new();
@@ -259,9 +266,9 @@ fn checked_openclaw_borrowed_wrapper_matches_replay_definition_and_none() -> Res
 }
 
 #[test]
-fn checked_openclaw_title_policy_matches_frozen_explicit_and_first_user() -> Result<()> {
+fn checked_openclaw_title_policy_matches_frozen_explicit_and_meaningful_prompt() -> Result<()> {
     let world = crate::test_world("openclaw-title-policy");
-    let mut frozen = crate::emit::grok_qwen_tests::Frozen::new("openclaw-title-policy");
+    let mut frozen = crate::emit::frozen::Frozen::new("openclaw-title-policy");
     for title in [None, Some(""), Some("   "), Some("explicit λ")] {
         for meaningful in [false, true] {
             let mut session = Session::new("source", Harness::Claude);
@@ -318,7 +325,7 @@ fn checked_openclaw_source_failure_preserves_transcript_and_index_even_for_ignor
         let dir = out.join("agents/main/sessions");
         fs::create_dir_all(&dir)?;
         fs::write(dir.join("fixed.jsonl"), "old transcript")?;
-        fs::write(dir.join("sessions.json"), "old index")?;
+        fs::write(dir.join("sessions.json"), r#"{"old":{"label":"index"}}"#)?;
         fs::write(world.base.join("input.json"), "changed source")?;
         assert!(emit(
             &session,
@@ -331,7 +338,52 @@ fn checked_openclaw_source_failure_preserves_transcript_and_index_even_for_ignor
         )
         .is_err());
         assert_eq!(fs::read_to_string(dir.join("fixed.jsonl"))?, "old transcript");
-        assert_eq!(fs::read_to_string(dir.join("sessions.json"))?, "old index");
+        assert_eq!(
+            fs::read_to_string(dir.join("sessions.json"))?,
+            r#"{"old":{"label":"index"}}"#
+        );
+    }
+    Ok(())
+}
+
+/// An index cv cannot read as one is refused, never replaced by one naming only this session;
+/// the transcript is not published either, and one it would replace keeps its bytes.
+#[test]
+fn an_unreadable_index_is_refused_and_nothing_is_published() -> Result<()> {
+    let world = crate::test_world("openclaw-unreadable-index");
+    let session = fixture(&world.base)?;
+    for (case, index) in [
+        ("broken", Some("{broken index")),
+        ("array", Some("[]")),
+        ("directory", None),
+    ] {
+        for force in [false, true] {
+            let out = world.base.join(format!("out-{case}-{force}"));
+            let dir = out.join("agents/main/sessions");
+            fs::create_dir_all(&dir)?;
+            match index {
+                Some(index) => fs::write(dir.join("sessions.json"), index)?,
+                None => fs::create_dir(dir.join("sessions.json"))?,
+            }
+            if force {
+                fs::write(dir.join("fixed.jsonl"), "old transcript")?;
+            }
+            let options = EmitOptions {
+                new_id: Some("fixed".into()),
+                force,
+                ..Default::default()
+            };
+            let error = format!("{:#}", emit(&session, &out, &options).unwrap_err());
+            assert!(error.contains("refusing to replace it"), "{case}: {error}");
+            if let Some(index) = index {
+                assert_eq!(fs::read_to_string(dir.join("sessions.json"))?, index);
+            }
+            match force {
+                true => assert_eq!(fs::read_to_string(dir.join("fixed.jsonl"))?, "old transcript"),
+                false => assert!(!dir.join("fixed.jsonl").exists()),
+            }
+            assert_eq!(fs::read_dir(&dir)?.count(), 1 + force as usize, "{case}");
+        }
     }
     Ok(())
 }
@@ -388,7 +440,7 @@ fn checked_openclaw_late_source_failure_cannot_publish_staged_records() -> Resul
 
 #[test]
 fn checked_openclaw_complete_preparation_preserves_ir_wire_report_and_late_failure() -> Result<()> {
-    use crate::stream::ParseOptions;
+    use crate::stream::Demand;
     let world = crate::test_world("openclaw-complete-preparation");
     let source = world.base.join("source.jsonl");
     let rows = [
@@ -410,7 +462,7 @@ fn checked_openclaw_complete_preparation_preserves_ir_wire_report_and_late_failu
     fs::write(&source, &bytes)?;
     let reference = crate::SessionRef::new("complete", Harness::OpenClaw, &source);
     let adapter = crate::harness::for_harness(Harness::OpenClaw).unwrap();
-    let owned = crate::stream::collect_with(adapter.as_ref(), &reference, &ParseOptions::complete())?;
+    let owned = crate::stream::collect_with(adapter.as_ref(), &reference, &Demand::COMPLETE)?;
     let checked = crate::emit::parse_for_emit(adapter.as_ref(), &reference, Harness::OpenClaw)?;
     assert!(checked.messages.iter().any(|m| m.content.iter().any(|b| matches!(
         b,
@@ -491,7 +543,7 @@ fn tool_export_preserves_every_result_structured_details_and_images() -> Result<
     let result = emit(&source, &world.base.join("output"), &EmitOptions::default())?;
     let adapter = crate::harness::for_harness(Harness::OpenClaw).unwrap();
     let reference = crate::SessionRef::new(&result.new_id, Harness::OpenClaw, &result.path);
-    let parsed = crate::stream::collect_with(adapter.as_ref(), &reference, &crate::stream::ParseOptions::full())?;
+    let parsed = crate::stream::collect_with(adapter.as_ref(), &reference, &crate::stream::Demand::RICH)?;
     assert_eq!(parsed.messages.len(), 2);
     assert!(
         matches!(&parsed.messages[0].content[0], Block::ToolResult { tool_use_id, tool_name, is_error:false, details:Some(details), content, .. }
@@ -511,7 +563,7 @@ fn tool_export_preserves_every_result_structured_details_and_images() -> Result<
 
 #[test]
 fn native_complete_export_preserves_records_branch_links_and_one_compaction_pair() -> Result<()> {
-    use crate::stream::ParseOptions;
+    use crate::stream::Demand;
     let world = crate::test_world("openclaw-native-complete-export");
     let original =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/openclaw/branchy-v4.jsonl"))?;
@@ -608,7 +660,7 @@ fn native_complete_export_preserves_records_branch_links_and_one_compaction_pair
             assert_eq!(actual, expected, "row {index} mode {mode}");
         }
         let emitted = crate::SessionRef::new(&result.new_id, Harness::OpenClaw, &result.path);
-        let parsed = crate::stream::collect_with(adapter.as_ref(), &emitted, &ParseOptions::full())?;
+        let parsed = crate::stream::collect_with(adapter.as_ref(), &emitted, &Demand::RICH)?;
         assert_eq!(
             parsed
                 .messages
@@ -642,7 +694,7 @@ fn native_complete_export_preserves_records_branch_links_and_one_compaction_pair
     };
     let result = emit(&edited, &world.base.join("edited"), &EmitOptions::default())?;
     let emitted = crate::SessionRef::new(&result.new_id, Harness::OpenClaw, &result.path);
-    let parsed = crate::stream::collect_with(adapter.as_ref(), &emitted, &ParseOptions::full())?;
+    let parsed = crate::stream::collect_with(adapter.as_ref(), &emitted, &Demand::RICH)?;
     assert!(parsed
         .messages
         .iter()
@@ -659,7 +711,7 @@ fn native_complete_export_preserves_records_branch_links_and_one_compaction_pair
         .timestamp = Some("2026-10-13T01:02:03Z".parse()?);
     let changed = emit(&owned_edit, &world.base.join("owned-edited"), &EmitOptions::default())?;
     let changed_ref = crate::SessionRef::new(&changed.new_id, Harness::OpenClaw, &changed.path);
-    let reparsed = crate::stream::collect_with(adapter.as_ref(), &changed_ref, &ParseOptions::full())?;
+    let reparsed = crate::stream::collect_with(adapter.as_ref(), &changed_ref, &Demand::RICH)?;
     assert!(reparsed
         .messages
         .iter()
@@ -679,5 +731,62 @@ fn native_complete_export_preserves_records_branch_links_and_one_compaction_pair
         owned_rows[3]["message"]["diagnostics"],
         rows[3]["message"]["diagnostics"]
     );
+    Ok(())
+}
+
+#[test]
+fn fixed_target_identity_reproduces_openclaw_corpus_bytes() -> Result<()> {
+    let world = crate::test_world("openclaw-repeatable-emit");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/openclaw/2026.1.29");
+    let id = "28aa9586-8613-4ec8-bf4d-02549281e1f2";
+    let reference = crate::SessionRef::new(
+        id,
+        Harness::OpenClaw,
+        root.join(format!("agents/main/sessions/{id}.jsonl")),
+    );
+    let adapter = crate::harness::openclaw::OpenClaw::with_state_dir(&root);
+    let source = crate::emit::parse_for_emit(&adapter, &reference, Harness::OpenClaw)?;
+    let options = EmitOptions {
+        new_id: Some("repeatable-target".into()),
+        ..Default::default()
+    };
+    let first = emit(&source, &world.base.join("first"), &options)?;
+    let second = emit(&source, &world.base.join("second"), &options)?;
+    assert_eq!(
+        crate::digest::sha256_hex(&fs::read(first.path)?),
+        crate::digest::sha256_hex(&fs::read(second.path)?),
+        "a fixed destination identity must produce the same transcript"
+    );
+    Ok(())
+}
+
+/// The index is claimed as it was read: another writer's update (or a new index) between the
+/// read and the publish refuses the emit, and neither file is published.
+#[test]
+fn an_index_changed_after_the_read_is_refused_and_nothing_is_published() -> Result<()> {
+    let world = crate::test_world("openclaw-claimed-index");
+    let session = fixture(&world.base)?;
+    for prior in [Some(r#"{"old":{"label":"index"}}"#), None] {
+        let out = world.base.join(format!("out-{}", prior.is_some()));
+        let dir = out.join("agents/main/sessions");
+        fs::create_dir_all(&dir)?;
+        if let Some(prior) = prior {
+            fs::write(dir.join("sessions.json"), prior)?;
+        }
+        let other = r#"{"other":{"label":"a concurrent update"}}"#;
+        let options = EmitOptions {
+            new_id: Some("fixed".into()),
+            ..Default::default()
+        };
+        let error = stream::emit_after_stage(&session, &out, &options, || {
+            Ok(fs::write(dir.join("sessions.json"), other)?)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed while cv updated it"), "{error}");
+        assert_eq!(fs::read_to_string(dir.join("sessions.json"))?, other);
+        assert!(!dir.join("fixed.jsonl").exists());
+        assert_eq!(fs::read_dir(&dir)?.count(), 1);
+    }
     Ok(())
 }

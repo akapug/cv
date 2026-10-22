@@ -81,7 +81,7 @@
 //! runs when a transcript holds a `leaf` control (OpenClaw's own rule for legacy flat readers,
 //! `selectSessionTranscriptLeafControlledPath`). Entries off the active branch are dropped by the
 //! lean passes and carried, tagged `extra["openclaw"]["inactive_branch"]`, under
-//! [`ParseOptions::complete`].
+//! [`Demand::COMPLETE`].
 //!
 //! Canonical entry types beyond `message` (`session-manager-types.ts:28-95`): `compaction`
 //! (`summary, firstKeptEntryId, tokensBefore, details?, fromHook?`), `reset` (`reason:
@@ -102,15 +102,16 @@
 //! `Branch`; `model_change` / `thinking_level_change` → `ModelChange` (`Message::model` = the new
 //! model); `branch_summary` / `custom_message` → `Notice`. `session_info` and `label` are session
 //! facts (`Session::title` + `extra["openclaw"]["session_name"]`, `extra["openclaw"]["labels"]`)
-//! and surface only under [`ParseOptions::complete`], as `Notice` turns; `custom`, `leaf`,
+//! and surface only under [`Demand::COMPLETE`], as `Notice` turns; `custom`, `leaf`,
 //! `thinking_level_change`-like bookkeeping and unknown types surface only under `complete`, as
 //! `Carrier` turns. Every carried record is the top-level `_record`; every harness fact is in
 //! `extra["openclaw"]` (`record_type` = the entry type, `message_role` = a custom message role,
 //! `session_version` on the first turn, `inactive_branch: true` off the visible path, the
-//! assistant's `api`/`provider`/`response_model`/`response_id`/`stop_reason`/`diagnostics`/
-//! `usage_raw`, and each control entry's own fields snake_cased). The header's `parentSession` is
-//! `Lineage::forked_from`; `usage.cost.total` is `Usage::cost_usd`; `Message::model` is set only
-//! when it differs from `Session::model` (the first non-synthetic one seen).
+//! assistant's `api`/`provider`/`responseModel`/`responseId`/`stopReason`/`diagnostics`/
+//! `usage_raw`, and each control entry's own fields under their native camelCase keys). The
+//! header's `parentSession` is `Lineage::forked_from`; `usage.cost.total` is `Usage::cost_usd`;
+//! `Message::model` is each record's own recorded model and `Session::model` the first
+//! non-synthetic one seen.
 
 mod discovery;
 mod emit;
@@ -126,7 +127,7 @@ use super::wire::anthropic;
 use super::{parse_ts, ts_from_value, Adapter};
 use crate::ir::*;
 use crate::source::{sqlite_sidecars, Dependencies, Probe};
-use crate::stream::{Flow, MessageSink, ParseOptions};
+use crate::stream::{Demand, Flow, MessageSink, Tier};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -139,6 +140,16 @@ use walkdir::WalkDir;
 pub struct OpenClaw {
     roots: Vec<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+/// OpenClaw 10.1's deferred-tool wrapper: `tool_call{id, args}`.
+pub(crate) const DEFERRED_WRAPPER: crate::affordance::DeferredWrapper = crate::affordance::DeferredWrapper {
+    name_key: "id",
+    args_key: "args",
+};
+
+pub(crate) static ROOTLESS: OpenClaw = OpenClaw { roots: Vec::new() };
 
 impl OpenClaw {
     pub fn detect() -> Self {
@@ -201,26 +212,29 @@ impl Adapter for OpenClaw {
         self.roots.clone()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
-        let mut out = Vec::new();
+    fn discover(&self) -> Result<crate::Discovered> {
+        // An unreadable store, dir or transcript is skipped and reported.
+        let mut out = crate::Discovered::default();
         // Sessions the sqlite store owns; a legacy JSONL twin (pre-migration copy) is skipped.
         let mut seen: HashSet<String> = HashSet::new();
         let mut indexes = discovery::Indexes::default();
         for root in &self.roots {
             // 1. The sqlite store (OpenClaw ≥ 2026-07-11): agents/<agentId>/agent/openclaw-agent*.sqlite
             for db in sqlite_stores(root) {
-                match discover_sqlite(&db) {
-                    Ok(refs) => {
-                        for r in refs {
-                            seen.insert(r.id.clone());
-                            out.push(r);
-                        }
-                    }
-                    Err(e) => eprintln!("cv: skipping {}: {e:#}", db.display()),
+                for r in out.keep(&db, discover_sqlite(&db)).into_iter().flatten() {
+                    seen.insert(r.id.clone());
+                    out.refs.push(r);
                 }
             }
             // 2. Legacy JSONL transcripts at agents/<agentId>/sessions/<sid>.jsonl.
-            for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(root) {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        out.skipped.extend(crate::Skipped::walk(&e));
+                        continue;
+                    }
+                };
                 let path = entry.path();
                 let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                     continue;
@@ -232,13 +246,9 @@ impl Adapter for OpenClaw {
                     continue;
                 }
                 let index = indexes.get(path.parent().unwrap());
-                match discovery::scan(path, index) {
-                    Ok(r) => {
-                        if !seen.contains(&r.id) {
-                            out.push(r);
-                        }
-                    }
-                    Err(e) => eprintln!("cv: skipping {}: {e:#}", path.display()),
+                let scanned = discovery::scan(path, index).map(|r| (!seen.contains(&r.id)).then_some(r));
+                if let Some(found) = crate::Skipped::listed(path, scanned) {
+                    out.push(found);
                 }
             }
         }
@@ -246,10 +256,33 @@ impl Adapter for OpenClaw {
         Ok(out)
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    /// An agent's `.sqlite` store is written in place; a JSONL transcript is a file like any other.
+    fn watch_policy(&self, r: &SessionRef) -> super::WatchPolicy {
+        if is_sqlite_store_path(&r.path) {
+            super::WatchPolicy::Database
+        } else {
+            super::WatchPolicy::Tree
+        }
+    }
+
+    fn capabilities(&self) -> super::Capabilities {
+        super::Capabilities {
+            denials: &[],
+            edit_guard: None,
+            lane_stops: None,
+            // OpenClaw 10.1 routes lazily loaded tools through `tool_call{id, args}` and its reader
+            // leaves the wrapper in place.
+            deferred_wrapper: Some(DEFERRED_WRAPPER),
+            rich_spans: false,
+            usage_cache_floor: 0,
+        }
+    }
+
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             // Spawn turns, sub-agent returns and deferred tool calls, typed (`crate::affordance`).
-            let mut spawns = crate::affordance::AffordanceSink::new(Harness::OpenClaw, sink);
+            let mut spawns = crate::affordance::AffordanceSink::new(Harness::OpenClaw, sink)
+                .unwrapping(self.capabilities().deferred_wrapper);
             let sink: &mut dyn MessageSink = &mut spawns;
             if is_sqlite_store_path(&r.path) {
                 return stream_sqlite(r, opts, sink);
@@ -257,10 +290,11 @@ impl Adapter for OpenClaw {
             with_jsonl_source(&r.path, |source| {
                 let mut reads = crate::source::ReadSet::default();
                 let facts = jsonl_key_facts_with_reads(&r.path, &r.id, &mut |path| sink.dependency(path), &mut reads)?;
-                source.check()?;
                 // Retained bodies depend on the inventory and sibling transcripts consulted
-                // for lineage, not only on their own unchanged bytes.
+                // for lineage, not only on their own unchanged bytes. The facts were read from
+                // the first capture's bytes: the guarded capture must still hold them.
                 let guarded = crate::json::JsonSource::capture_with_reads(&r.path, &reads)?;
+                anyhow::ensure!(source.admits(&guarded), "JSON source changed: {}", r.path.display());
                 stream_jsonl(r, &facts, opts, sink, &guarded)
             })
         })
@@ -268,17 +302,19 @@ impl Adapter for OpenClaw {
 
     /// The cron and sub-agent registries in the state dir that name this session's key
     /// ([`registry`]).
-    fn store_affordances(&self, r: &SessionRef) -> Vec<crate::affordance::Affordance> {
+    fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
         registry::affordances(r)
     }
 }
 
-/// Capture before registry/branch selection and validate the same primary source after every
-/// completion path, including owned/tree reads, callback stop and parser errors.
+/// Capture before registry/branch selection. A completed read was checked at its EOF
+/// ([`stream_jsonl`]); a failed one checks here, so a changed source outranks the error it caused.
 fn with_jsonl_source<T>(path: &Path, read: impl FnOnce(&crate::json::JsonSource) -> Result<T>) -> Result<T> {
     let source = crate::json::JsonSource::capture(path)?;
     let result = read(&source);
-    source.check()?;
+    if result.is_err() {
+        source.check()?;
+    }
     result
 }
 
@@ -298,37 +334,49 @@ fn is_leaf_entry(view: crate::json::JsonView<'_>) -> Result<bool> {
 fn stream_jsonl(
     r: &SessionRef,
     facts: &KeyFacts,
-    opts: &ParseOptions,
+    opts: &Demand,
     sink: &mut dyn MessageSink,
     source: &crate::json::JsonSource,
 ) -> Result<Session> {
-    use super::store::jsonl::{for_each_line, ranges};
-    let file = fs::File::open(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
-    source.check_metadata(file.metadata()?)?;
+    use super::store::jsonl::Read;
+    let read = Read::with(source.clone()).with_context(|| format!("reading {}", r.path.display()))?;
+    crate::stream::guarded(sink, &read, |sink| stream_lines(r, facts, opts, sink, &read))
+}
+
+/// [`stream_jsonl`] over the opened source, its callbacks guarded.
+fn stream_lines(
+    r: &SessionRef,
+    facts: &KeyFacts,
+    opts: &Demand,
+    sink: &mut dyn MessageSink,
+    read: &super::store::jsonl::Read,
+) -> Result<Session> {
+    use super::store::jsonl::ranges;
+    let source = read.source();
     let len = source.len();
     let mut tree = false;
-    for_each_line(source, &file, 0, len, |line| {
+    read.lines(0, |line| {
         tree = line.view.map(is_leaf_entry).transpose()?.unwrap_or(false);
         Ok(if tree { Flow::Stop } else { Flow::Continue })
     })?;
     let mut fold = Fold::new(r, facts, opts);
     if tree {
         // A tree is read whole: invalid UTF-8 anywhere, even off the branch, rejects it.
-        if !ranges::valid_utf8(&mut ranges::reader(&file, ranges::Range { offset: 0, len })?)? {
+        if !ranges::valid_utf8(&mut ranges::reader(read, ranges::Range { offset: 0, len })?)? {
             return Err(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8").into(),
             );
         }
         let mut descriptors = Vec::new();
         let mut records = Vec::new();
-        for_each_line(source, &file, 0, len, |line| {
+        read.lines(0, |line| {
             if let Some(view) = line.view {
                 descriptors.push(record::navigation(view)?);
                 records.push(view.source_range()?.context("a transcript line has a source range")?);
             }
             Ok(Flow::Continue)
         })?;
-        let navigation = select_navigation(&descriptors, opts.complete);
+        let navigation = select_navigation(&descriptors, opts.tier == Tier::Complete);
         drop(descriptors);
         for row in navigation {
             let (offset, len) = records[row.index];
@@ -338,14 +386,13 @@ fn stream_jsonl(
             }
         }
     } else {
-        for_each_line(source, &file, 0, len, |line| match line.view {
+        read.lines(0, |line| match line.view {
             Some(view) => fold.push(record::record(view, opts)?, true, None, sink),
             None => Ok(Flow::Continue),
         })?;
     }
     let session = fold.finish(sink);
-    source.check_metadata(file.metadata()?)?;
-    source.check()?;
+    read.check()?;
     Ok(session)
 }
 
@@ -361,7 +408,7 @@ struct Fold {
 }
 
 impl Fold {
-    fn new(r: &SessionRef, facts: &KeyFacts, opts: &ParseOptions) -> Self {
+    fn new(r: &SessionRef, facts: &KeyFacts, opts: &Demand) -> Self {
         let mut s = Session {
             cwd: r.cwd.clone(),
             title: r.title.clone(),
@@ -382,7 +429,8 @@ impl Fold {
             prompt_origin: facts.prompt_origin(),
             header_version: None,
             meta_sent: false,
-            owned: (opts.complete && !opts.spans).then(|| crate::lazy::Resolver::new(Some(r.path.clone()))),
+            owned: (opts.tier == Tier::Complete && !opts.spans)
+                .then(|| crate::lazy::Resolver::new(Some(r.path.clone()))),
         }
     }
 
@@ -418,7 +466,7 @@ impl Fold {
             // first, then this name — what its session list shows), so a titled ref keeps its
             // title and `cv ls` and `cv show` agree; the name is still first-class in the bag.
             if s.title.is_none() {
-                s.title = Some(crate::ir::truncate(&name, 80));
+                s.title = Some(crate::ir::truncate(&name, crate::projection::Head::TITLE));
             }
             s.harness_extra_mut(Harness::OpenClaw)
                 .insert("session_name".into(), Value::from(name));
@@ -460,11 +508,6 @@ impl Fold {
                         s.model = Some(model.to_string());
                     }
                 }
-            }
-            // IR diet: a turn names its model only when it differs from the session's. A
-            // `ModelChange` always names the model it switched to.
-            if m.kind != MessageKind::ModelChange && m.model.is_some() && m.model == s.model {
-                m.model = None;
             }
             if m.kind == MessageKind::SystemPrompt && s.system_prompt.is_none() {
                 s.system_prompt = m.text();
@@ -530,11 +573,14 @@ impl KeyFacts {
     }
 }
 
+// Enough room for the childSessionKey field plus quotes, colon and JSON-escaped delimiters.
+const CHILD_KEY_LOOKBEHIND: usize = 24;
+
 /// Whether `text` records `key` as a spawned child ([`ChildMarker`]'s policy over one string).
 #[cfg(test)]
 fn names_child(text: &str, key: &str) -> bool {
     text.match_indices(key).any(|(i, _)| {
-        let start = text.floor_char_boundary(i.saturating_sub(24));
+        let start = text.floor_char_boundary(i.saturating_sub(CHILD_KEY_LOOKBEHIND));
         text[start..i].contains("childSessionKey")
     })
 }
@@ -562,9 +608,14 @@ impl<'a> ChildMarker<'a> {
                 return;
             }
             self.window.extend_from_slice(chunk);
-            self.found = memchr::memmem::find_iter(&self.window, self.key.as_bytes())
-                .any(|at| memchr::memmem::find(&self.window[at.saturating_sub(24)..at], b"childSessionKey").is_some());
-            let keep = self.key.len().saturating_add(24);
+            self.found = memchr::memmem::find_iter(&self.window, self.key.as_bytes()).any(|at| {
+                memchr::memmem::find(
+                    &self.window[at.saturating_sub(CHILD_KEY_LOOKBEHIND)..at],
+                    b"childSessionKey",
+                )
+                .is_some()
+            });
+            let keep = self.key.len().saturating_add(CHILD_KEY_LOOKBEHIND);
             let start = self.window.len().saturating_sub(keep);
             self.window.copy_within(start.., 0);
             self.window.truncate(self.window.len() - start);
@@ -747,123 +798,54 @@ thread_local! {
 }
 
 #[cfg(feature = "sqlite")]
-enum WindowId {
-    Text(String),
-    Invalid(rusqlite::types::Type),
-    Utf8(std::str::Utf8Error),
-}
-#[cfg(feature = "sqlite")]
-#[derive(Default)]
-struct WindowGroups(HashMap<String, Vec<WindowId>>);
+struct WindowGroups(super::store::sqlite::Selection);
 #[cfg(feature = "sqlite")]
 impl WindowGroups {
-    fn load(conn: &rusqlite::Connection) -> Result<(Option<Self>, usize)> {
+    fn load(conn: &rusqlite::Connection) -> Result<(Self, usize)> {
         use rusqlite::types::ValueRef;
-        let mut groups = Self::default();
-        // Leave half the shared 16MiB operation budget for other inventories and guards.
-        // An oversized membership table keeps a tiny unavailable sentinel, then uses SQL.
-        const BUILD_BUDGET: usize = 8 * 1024 * 1024;
-        let mut strings = 0usize;
-        let mut vector_capacity = 0usize;
-        // This path is selected only for the original plain table scan and BINARY TEXT ID
-        // contract. Keep that same traversal order, not an invented chronological/id sort.
-        let mut stmt = conn.prepare("SELECT session_key,session_id FROM session_windows NOT INDEXED")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let Ok(key) = row.get_ref(0)?.as_str() else {
-                continue;
-            };
-            let value = row.get_ref(1)?;
-            if matches!(value, ValueRef::Null) {
-                continue;
-            }
-            let existing = groups.0.get(key);
-            let fresh = existing.is_none();
-            let old_capacity = existing.map_or(0, Vec::capacity);
-            let next_capacity = if existing.is_none_or(|ids| ids.len() == ids.capacity()) {
-                (old_capacity * 2).max(4)
-            } else {
-                old_capacity
-            };
-            let map_capacity = if fresh && groups.0.len() == groups.0.capacity() {
-                (groups.0.capacity() * 2).max(3)
-            } else {
-                groups.0.capacity()
-            };
-            let new_strings = key.len() * usize::from(fresh)
-                + match value {
-                    ValueRef::Text(bytes) => bytes.len(),
-                    _ => 0,
-                };
-            // Twofold table/vector storage allowance covers their next growth before allocating.
-            let estimate = strings
-                .saturating_add(new_strings)
-                .saturating_add(map_capacity * std::mem::size_of::<(String, Vec<WindowId>)>() * 2)
-                .saturating_add((vector_capacity - old_capacity + next_capacity) * std::mem::size_of::<WindowId>() * 2)
-                .saturating_add(std::mem::size_of::<WindowId>() * 8);
-            if estimate > BUILD_BUDGET {
-                return Ok((None, std::mem::size_of::<Option<Self>>()));
-            }
-            strings += new_strings;
-            let id = match value {
-                ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
-                    Ok(id) => WindowId::Text(id.to_owned()),
-                    Err(error) => WindowId::Utf8(error),
-                },
-                value => WindowId::Invalid(value.data_type()),
-            };
-            #[cfg(test)]
-            SQL_PARENT_ROWS.with(|count| count.set(count.get() + 1));
-            let ids = if fresh {
-                groups.0.entry(key.to_owned()).or_default()
-            } else {
-                groups.0.get_mut(key).expect("existing window group")
-            };
-            ids.push(id);
-            vector_capacity = vector_capacity - old_capacity + ids.capacity();
-        }
-        drop(rows);
-        #[cfg(test)]
-        SQL_PARENT_FULLSCANS
-            .with(|count| count.set(count.get() + stmt.get_status(rusqlite::StatementStatus::FullscanStep) as usize));
-        let bytes = groups.0.capacity() * std::mem::size_of::<(String, Vec<WindowId>)>()
-            + groups
-                .0
-                .iter()
-                .map(|(key, ids)| {
-                    key.capacity()
-                        + ids.capacity() * std::mem::size_of::<WindowId>()
-                        + ids
-                            .iter()
-                            .map(|id| match id {
-                                WindowId::Text(id) => id.capacity(),
-                                _ => 0,
-                            })
-                            .sum::<usize>()
-                })
-                .sum::<usize>();
-        Ok((Some(groups), bytes))
+        let selection = super::store::sqlite::Selection::build(
+            "CREATE TABLE windows(ordinal INTEGER PRIMARY KEY,key BLOB,session_id);
+             CREATE INDEX windows_by_key ON windows(key,ordinal);",
+            |index| {
+                let mut insert = index.prepare("INSERT INTO windows(key,session_id) VALUES (?1,?2)")?;
+                // Only the original plain BINARY/TEXT scan uses this index. Preserve its
+                // physical order and native ID types, including malformed UTF-8 text.
+                let mut stmt = conn.prepare("SELECT session_key,session_id FROM session_windows NOT INDEXED")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let Ok(key) = row.get_ref(0)?.as_str() else { continue };
+                    let value = row.get_ref(1)?;
+                    if matches!(value, ValueRef::Null) {
+                        continue;
+                    }
+                    insert.execute(rusqlite::params![
+                        key.as_bytes(),
+                        rusqlite::types::ToSqlOutput::Borrowed(value)
+                    ])?;
+                    #[cfg(test)]
+                    SQL_PARENT_ROWS.with(|count| count.set(count.get() + 1));
+                }
+                drop(rows);
+                #[cfg(test)]
+                SQL_PARENT_FULLSCANS.with(|count| {
+                    count.set(count.get() + stmt.get_status(rusqlite::StatementStatus::FullscanStep) as usize)
+                });
+                Ok(())
+            },
+        )?;
+        Ok((Self(selection), super::store::sqlite::Selection::RETAINED_BYTES))
     }
     fn candidates(&self, key: &str, current: &str) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        for id in self.0.get(key).into_iter().flatten() {
-            match id {
-                WindowId::Text(id) if id != current => out.push(id.clone()),
-                WindowId::Text(_) => {}
-                WindowId::Invalid(kind) => {
-                    return Err(rusqlite::Error::InvalidColumnType(0, "session_id".into(), *kind).into())
-                }
-                WindowId::Utf8(error) => {
-                    return Err(rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(*error),
-                    )
-                    .into())
-                }
-            }
-        }
-        Ok(out)
+        self.0.with(|index| {
+            // No affinity on the copied value: comparing TEXT current preserves the original
+            // TEXT-affinity table's stored values, and get(String) preserves selected errors.
+            let mut stmt =
+                index.prepare("SELECT session_id FROM windows WHERE key=?1 AND session_id!=?2 ORDER BY ordinal")?;
+            let candidates = stmt
+                .query_map(rusqlite::params![key.as_bytes(), current], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(candidates)
+        })
     }
 }
 #[cfg(feature = "sqlite")]
@@ -877,32 +859,83 @@ fn plain_parent_scan(conn: &rusqlite::Connection, key: &str, current: &str) -> R
     if !plain {
         return Ok(false);
     }
-    use rusqlite::OptionalExtension as _;
-    let ddl = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_windows'",
-            [],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten();
-    let Some(ddl) = ddl else {
-        return Ok(false);
+    super::store::sqlite::binary_text_columns(conn, "session_windows", &["session_key", "session_id"])
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_parent_candidates(
+    conn: &rusqlite::Connection,
+    by: &str,
+    session_id: &str,
+    path: &Path,
+    reads: &crate::source::ReadSet,
+) -> Result<std::sync::Arc<Vec<String>>> {
+    let load = || -> Result<Vec<String>> {
+        let mut stmt =
+            conn.prepare("SELECT session_id FROM session_windows WHERE session_key=?1 AND session_id!=?2")?;
+        let candidates = stmt
+            .query_map([by, session_id], |row| {
+                #[cfg(test)]
+                SQL_PARENT_ROWS.with(|count| count.set(count.get() + 1));
+                row.get(0)
+            })?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        #[cfg(test)]
+        SQL_PARENT_FULLSCANS
+            .with(|count| count.set(count.get() + stmt.get_status(rusqlite::StatementStatus::FullscanStep) as usize));
+        Ok(candidates)
     };
-    if ddl.to_ascii_uppercase().contains("COLLATE") {
-        return Ok(false);
-    }
-    let columns = conn
-        .prepare("PRAGMA table_info(session_windows)")?
-        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    // Native default TEXT/BINARY comparison matches String equality. Custom affinity or any
-    // explicit collation keeps the original SQL, including its coercion/exclusion behavior.
-    Ok(["session_key", "session_id"].iter().all(|name| {
-        columns
-            .iter()
-            .any(|(column, kind)| column == name && kind.eq_ignore_ascii_case("TEXT"))
-    }))
+    // Query plans can vary by parameter with SQLite statistics. Check the actual key's
+    // plan rather than applying one plain scan's traversal order to an indexed key.
+    let candidates = {
+        let mut encoded_plan_key = String::with_capacity(by.len() * 2);
+        use std::fmt::Write as _;
+        for byte in by.as_bytes() {
+            write!(&mut encoded_plan_key, "{byte:02x}")?;
+        }
+        encoded_plan_key.push(':');
+        for byte in session_id.as_bytes() {
+            write!(&mut encoded_plan_key, "{byte:02x}")?;
+        }
+        let (plain, _) =
+            crate::source::inventory("openclaw-parent-plan", &path.join(&encoded_plan_key), reads, || {
+                Ok((
+                    plain_parent_scan(conn, by, session_id)?,
+                    reads.clone(),
+                    std::mem::size_of::<bool>(),
+                ))
+            })?;
+        // The operation already memoizes complete query results. Only a second cache
+        // miss needs a whole-store index; a single-window scope keeps native startup cost.
+        crate::source::inventory("openclaw-parent-windows", &path.join(&encoded_plan_key), reads, || {
+            let candidates = if *plain && crate::source::inventory_scoped() {
+                let (queried, _) = crate::source::inventory("openclaw-window-queried", path, reads, || {
+                    Ok((
+                        std::sync::atomic::AtomicBool::new(false),
+                        reads.clone(),
+                        std::mem::size_of::<std::sync::atomic::AtomicBool>(),
+                    ))
+                })?;
+                if queried.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let (groups, _) = crate::source::inventory("openclaw-window-groups", path, reads, || {
+                        let (groups, bytes) = WindowGroups::load(conn)?;
+                        Ok((groups, reads.clone(), bytes))
+                    })?;
+                    groups.candidates(by, session_id)?
+                } else {
+                    load()?
+                }
+            } else {
+                // Both SQL parameters determine membership under custom collations.
+                load()?
+            };
+            let bytes = candidates.capacity() * std::mem::size_of::<String>()
+                + candidates.iter().map(String::capacity).sum::<usize>();
+            Ok((candidates, reads.clone(), bytes))
+        })?
+        .0
+    };
+    Ok(candidates)
 }
 
 /// [`KeyFacts`] from `session_windows`. The spawner is the window under `spawned_by` — when that key
@@ -936,64 +969,7 @@ fn sqlite_key_facts(
     };
     let mut parent = None;
     if let Some(by) = &spawned_by {
-        let load = || -> Result<Vec<String>> {
-            let mut stmt =
-                conn.prepare("SELECT session_id FROM session_windows WHERE session_key=?1 AND session_id!=?2")?;
-            let candidates = stmt
-                .query_map([by.as_str(), session_id], |row| {
-                    #[cfg(test)]
-                    SQL_PARENT_ROWS.with(|count| count.set(count.get() + 1));
-                    row.get(0)
-                })?
-                .collect::<std::result::Result<Vec<String>, _>>()?;
-            #[cfg(test)]
-            SQL_PARENT_FULLSCANS.with(|count| {
-                count.set(count.get() + stmt.get_status(rusqlite::StatementStatus::FullscanStep) as usize)
-            });
-            Ok(candidates)
-        };
-        // Query plans can vary by parameter with SQLite statistics. Check the actual key's
-        // plan rather than applying one plain scan's traversal order to an indexed key.
-        let candidates = {
-            let mut encoded_plan_key = String::with_capacity(by.len() * 2);
-            use std::fmt::Write as _;
-            for byte in by.as_bytes() {
-                write!(&mut encoded_plan_key, "{byte:02x}")?;
-            }
-            encoded_plan_key.push(':');
-            for byte in session_id.as_bytes() {
-                write!(&mut encoded_plan_key, "{byte:02x}")?;
-            }
-            let (plain, _) =
-                crate::source::inventory("openclaw-parent-plan", &path.join(&encoded_plan_key), reads, || {
-                    Ok((
-                        plain_parent_scan(conn, by, session_id)?,
-                        reads.clone(),
-                        std::mem::size_of::<bool>(),
-                    ))
-                })?;
-            if *plain && crate::source::inventory_scoped() {
-                let (groups, _) = crate::source::inventory("openclaw-window-groups", path, reads, || {
-                    let (groups, bytes) = WindowGroups::load(conn)?;
-                    Ok((groups, reads.clone(), bytes))
-                })?;
-                if let Some(groups) = groups.as_ref() {
-                    std::sync::Arc::new(groups.candidates(by, session_id)?)
-                } else {
-                    std::sync::Arc::new(load()?)
-                }
-            } else {
-                // Both SQL parameters determine membership. Rust string equality cannot
-                // decide whether this key includes the current child under custom collations.
-                crate::source::inventory("openclaw-parent-windows", &path.join(&encoded_plan_key), reads, || {
-                    let candidates = load()?;
-                    let bytes = candidates.capacity() * std::mem::size_of::<String>()
-                        + candidates.iter().map(String::capacity).sum::<usize>();
-                    Ok((candidates, reads.clone(), bytes))
-                })?
-                .0
-            }
-        };
+        let candidates = sqlite_parent_candidates(conn, by, session_id, path, reads)?;
         parent = if candidates.len() == 1 {
             candidates.first().cloned()
         } else {
@@ -1127,7 +1103,7 @@ struct ScanAcc {
 #[cfg(feature = "sqlite")]
 fn discover_sqlite(db: &Path) -> Result<Vec<SessionRef>> {
     let conn = open_ro(db)?;
-    conn.read(|conn| {
+    conn.read(|conn, reads| {
         let mut windows = conn.prepare(
             "SELECT w.session_id, w.created_at, w.updated_at, w.transcript_updated_at, w.display_name, \
          n.label, n.display_name, n.entry_json \
@@ -1156,7 +1132,7 @@ fn discover_sqlite(db: &Path) -> Result<Vec<SessionRef>> {
                 row.get(7)?,
             ))
         })?;
-        let events = Events::new(conn, db, conn.reads())?;
+        let events = Events::new(conn, db, reads)?;
         let mut out = Vec::new();
         for row in rows {
             let (session_id, created, updated, transcript_updated, w_display, n_label, n_display, entry_json) = row?;
@@ -1180,15 +1156,12 @@ fn discover_sqlite(db: &Path) -> Result<Vec<SessionRef>> {
                 .or(n_display)
                 .or(w_display)
                 .filter(|t| !t.trim().is_empty())
-                .map(|t| crate::ir::truncate(&t, 80))
+                .map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE))
                 .or(entry.title)
                 .or(acc.session_name)
                 .or(acc.first_user);
             let cwd = acc.cwd.or(entry.cwd);
             out.push(SessionRef {
-                id: session_id,
-                harness: Harness::OpenClaw,
-                path: db.to_path_buf(),
                 cwd,
                 title,
                 created_at: acc.created_at.or_else(|| created.and_then(ts_from_epoch)),
@@ -1196,7 +1169,8 @@ fn discover_sqlite(db: &Path) -> Result<Vec<SessionRef>> {
                     .and_then(ts_from_epoch)
                     .or_else(|| updated.and_then(ts_from_epoch))
                     .or(acc.updated_at),
-                message_count: acc.message_count,
+                message_count: Some(acc.message_count),
+                ..SessionRef::new(session_id, Harness::OpenClaw, db.to_path_buf())
             });
         }
         Ok(out)
@@ -1314,19 +1288,18 @@ fn discover_sqlite(_db: &Path) -> Result<Vec<SessionRef>> {
 /// JSONL path uses — `event_json` IS the JSONL line. Branch selection reads the navigation fields
 /// of every cell, then decodes only the selected ones.
 #[cfg(feature = "sqlite")]
-fn stream_sqlite(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
-    let conn = open_ro(&r.path)?;
-    conn.read(|conn| {
+fn stream_sqlite(r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
+    super::store::sqlite::read(&r.path, |conn, reads| {
         // Navigation and payload reads must see the same history: a concurrent leaf update cannot
         // change which rows the second pass emits. A deferred read transaction writes no store data.
-        let snapshot = conn.unchecked_transaction()?;
-        let events = Events::new(&snapshot, &r.path, conn.reads())?;
-        let facts = sqlite_key_facts(&snapshot, r, conn.reads(), &events)?;
+        let _snapshot = super::store::sqlite::snapshot(conn)?;
+        let events = Events::new(conn, &r.path, reads)?;
+        let facts = sqlite_key_facts(conn, r, reads, &events)?;
         // The whole transcript's diagnostics, even if the sink stops at its first turn.
         let mut cells = Vec::new();
         let mut skipped = 0;
         let mut tree = false;
-        events.each(&snapshot, &r.id, |cell| {
+        events.each(conn, &r.id, |cell| {
             match cell
                 .map(|cell| events.cells.read(cell, is_leaf_entry))
                 .transpose()?
@@ -1354,7 +1327,7 @@ fn stream_sqlite(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink
             for cell in &cells {
                 descriptors.push(events.cells.read(*cell, record::navigation)?.unwrap_or(Value::Null));
             }
-            for row in select_navigation(&descriptors, opts.complete) {
+            for row in select_navigation(&descriptors, opts.tier == Tier::Complete) {
                 if emit(row.index, row.active, row.parent)? == Flow::Stop {
                     break;
                 }
@@ -1367,13 +1340,13 @@ fn stream_sqlite(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink
             }
         }
         let mut s = fold.finish(sink);
-        super::note_skipped_lines(&mut s, skipped);
+        super::Unparsed(skipped).note(&mut s);
         Ok(s)
     })
 }
 
 #[cfg(not(feature = "sqlite"))]
-fn stream_sqlite(r: &SessionRef, _opts: &ParseOptions, _sink: &mut dyn MessageSink) -> Result<Session> {
+fn stream_sqlite(r: &SessionRef, _opts: &Demand, _sink: &mut dyn MessageSink) -> Result<Session> {
     anyhow::bail!(
         "{} is an OpenClaw sqlite store; cv-core was built without the `sqlite` feature",
         r.path.display()
@@ -1797,10 +1770,10 @@ mod tests {
 
     /// `text` read as a transcript file through the adapter, as `r` (full fidelity, collected).
     fn parse_text(text: &str, r: &SessionRef) -> Session {
-        parse_text_with(text, r, &ParseOptions::full())
+        parse_text_with(text, r, &Demand::RICH)
     }
 
-    fn parse_text_with(text: &str, r: &SessionRef, opts: &ParseOptions) -> Session {
+    fn parse_text_with(text: &str, r: &SessionRef, opts: &Demand) -> Session {
         let dir = std::env::temp_dir().join(format!("cv-openclaw-text-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let mut file_ref = r.clone();
@@ -1960,7 +1933,7 @@ mod tests {
         d
     }
 
-    fn collect(r: &SessionRef, opts: &ParseOptions) -> Result<Session> {
+    fn collect(r: &SessionRef, opts: &Demand) -> Result<Session> {
         let mut sink = crate::stream::CollectSink::default();
         let mut session = OpenClaw { roots: vec![] }.stream(r, opts, &mut sink)?;
         session.messages = sink.messages;
@@ -1979,7 +1952,7 @@ mod tests {
         fs::write(&jsonl, events.join("\n")).unwrap();
         let mut line_ref = r.clone();
         line_ref.path = jsonl;
-        for opts in [ParseOptions::full(), ParseOptions::complete()] {
+        for opts in [Demand::RICH, Demand::COMPLETE] {
             let rows = collect(&r, &opts).unwrap();
             let lines = collect(&line_ref, &opts).unwrap();
             assert_eq!(rows.extra["cv"]["skipped_lines"], 2);
@@ -1996,7 +1969,7 @@ mod tests {
             }
         }
         let mut sink = StopAfterOne(0);
-        let s = stream_sqlite(&r, &ParseOptions::lazy(), &mut sink).unwrap();
+        let s = stream_sqlite(&r, &Demand::LEAN.with_spans(), &mut sink).unwrap();
         assert_eq!(sink.0, 1);
         assert_eq!(s.extra["cv"]["skipped_lines"], 2);
         fs::remove_dir_all(agents.parent().unwrap()).unwrap();
@@ -2044,12 +2017,9 @@ mod tests {
             writer.execute("INSERT INTO transcript_events (session_id,seq,event_json,event_zstd,created_at) VALUES ('checked',999,NULL,?1,1)", [b"invalid compressed frame".as_slice()]).unwrap();
             let r = discover_sqlite(&db).unwrap().remove(0);
             for complete in [false, true] {
-                let options = ParseOptions {
-                    complete,
-                    ..ParseOptions::full()
-                };
+                let options = if complete { Demand::COMPLETE } else { Demand::RICH };
                 let inline = collect(&r, &options).unwrap();
-                let mut spans = collect(&r, &ParseOptions { spans: true, ..options }).unwrap();
+                let mut spans = collect(&r, &Demand { spans: true, ..options }).unwrap();
                 assert_eq!(inline.extra["cv"]["skipped_lines"], 4);
                 assert!(spans.messages.iter().any(|m| m.content.iter().any(|b| matches!(
                     b,
@@ -2066,9 +2036,9 @@ mod tests {
             }
             let mut retained = collect(
                 &r,
-                &ParseOptions {
+                &Demand {
                     spans: true,
-                    ..ParseOptions::complete()
+                    ..Demand::COMPLETE
                 },
             )
             .unwrap();
@@ -2096,7 +2066,7 @@ mod tests {
             "message":{"role":"user","content":"long λ\n".repeat(4096)}})
         .to_string();
         let db = write_store(&agents, "compat", &events);
-        let expected = collect(&discover_sqlite(&db).unwrap().remove(0), &ParseOptions::complete()).unwrap();
+        let expected = collect(&discover_sqlite(&db).unwrap().remove(0), &Demand::COMPLETE).unwrap();
         let writer = rusqlite::Connection::open(&db).unwrap();
         writer.execute_batch("ALTER TABLE transcript_events RENAME TO old_events;
             CREATE TABLE transcript_events (session_id TEXT NOT NULL,seq INTEGER NOT NULL,event_json TEXT,created_at INTEGER NOT NULL,PRIMARY KEY(session_id,seq)) WITHOUT ROWID;
@@ -2106,9 +2076,9 @@ mod tests {
         let r = discover_sqlite(&db).unwrap().remove(0);
         let mut actual = collect(
             &r,
-            &ParseOptions {
+            &Demand {
                 spans: true,
-                ..ParseOptions::complete()
+                ..Demand::COMPLETE
             },
         )
         .unwrap();
@@ -2151,9 +2121,9 @@ mod tests {
                     }
                 }
                 let r = SessionRef::new("identity", Harness::OpenClaw, &path);
-                let options = ParseOptions {
+                let options = Demand {
                     spans,
-                    ..ParseOptions::complete()
+                    ..Demand::COMPLETE
                 };
                 let error = OpenClaw { roots: vec![] }
                     .stream(&r, &options, &mut MutateFallible(&path))
@@ -2191,10 +2161,7 @@ mod tests {
                 .join("\n");
             fs::write(&path, &text)?;
             for spans in [false, true] {
-                let options = ParseOptions {
-                    spans,
-                    ..ParseOptions::full()
-                };
+                let options = Demand { spans, ..Demand::RICH };
                 let s = collect(&r, &options)?;
                 let ids: Vec<&str> = s.messages.iter().filter_map(|m| m.id.as_deref()).collect();
                 assert_eq!(ids, ["u1", "a1", "u2", "c1", "a3"], "{leaf}");
@@ -2219,7 +2186,7 @@ mod tests {
         };
         let r = discover_sqlite(&db).unwrap().remove(0);
         let mut expected = crate::stream::CollectSink::default();
-        stream_sqlite(&r, &ParseOptions::full(), &mut expected).unwrap();
+        stream_sqlite(&r, &Demand::RICH, &mut expected).unwrap();
         assert!(!expected.messages.is_empty());
         assert!(!sidecar("-wal").exists());
         assert!(!sidecar("-shm").exists());
@@ -2227,7 +2194,7 @@ mod tests {
             fs::write(sidecar("-journal"), b"changed during callback").unwrap();
             Flow::Stop
         };
-        let error = stream_sqlite(&r, &ParseOptions::lazy(), &mut mutate).unwrap_err();
+        let error = stream_sqlite(&r, &Demand::LEAN.with_spans(), &mut mutate).unwrap_err();
         assert!(error.to_string().contains("dependencies changed"), "{error:#}");
         fs::remove_dir_all(agents.parent().unwrap()).unwrap();
     }
@@ -2255,7 +2222,11 @@ mod tests {
             Some("Named session"),
             "session_info names the session"
         );
-        assert_eq!(r.message_count, 5, "every user/assistant row counts, branch or not");
+        assert_eq!(
+            r.message_count,
+            Some(5),
+            "every user/assistant row counts, branch or not"
+        );
         assert_eq!(r.created_at, parse_ts("2026-09-19T10:00:00.000Z"));
         assert_eq!(
             r.updated_at,
@@ -2299,8 +2270,8 @@ mod tests {
         let c1 = &s.messages[3];
         assert_eq!((c1.role, c1.origin), (Role::System, Origin::Harness));
         assert_eq!(c1.extra["openclaw"]["record_type"], "compaction");
-        assert_eq!(c1.extra["openclaw"]["tokens_before"], 1234);
-        assert_eq!(c1.extra["openclaw"]["first_kept_entry_id"], "u2");
+        assert_eq!(c1.extra["openclaw"]["tokensBefore"], 1234);
+        assert_eq!(c1.extra["openclaw"]["firstKeptEntryId"], "u2");
         let summary = &s.messages[4];
         assert_eq!(summary.text().as_deref(), Some("summary of earlier"));
         assert_eq!(
@@ -2313,15 +2284,28 @@ mod tests {
         // never a parent of anything on the path.
         assert_eq!(s.messages[2].parent_id.as_deref(), Some("a1"));
         assert_eq!(c1.parent_id.as_deref(), Some("si"));
-        // the session model is on the session, not repeated on every reply (IR diet)
-        assert!(s.messages.iter().all(|m| m.model.is_none()), "{:?}", s.messages);
+        // every reply states the model its row names; the first one is also the session's
+        assert!(
+            s.messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .all(|m| m.model.as_deref() == Some("claude-opus-4")),
+            "{:?}",
+            s.messages
+        );
         for m in &s.messages {
-            assert!(m.extra.keys().all(|k| k == "openclaw"), "{:?}", m.extra);
+            assert!(
+                m.extra
+                    .keys()
+                    .all(|k| k == "openclaw" || (k == crate::ir::CV_NAMESPACE && m.is_synthesized())),
+                "{:?}",
+                m.extra
+            );
         }
 
         // Complete parse: everything rides along; off-branch rows are tagged.
         let mut sink = crate::stream::CollectSink::default();
-        adapter.stream(r, &ParseOptions::complete(), &mut sink).unwrap();
+        adapter.stream(r, &Demand::COMPLETE, &mut sink).unwrap();
         let ids: Vec<&str> = sink.messages.iter().filter_map(|m| m.id.as_deref()).collect();
         assert_eq!(ids, ["u1", "a1", "a2", "l1", "u2", "si", "c1", "a3"]);
         let inactive: Vec<&str> = sink
@@ -2344,7 +2328,7 @@ mod tests {
         assert_eq!(l1.kind, MessageKind::Carrier);
         assert_eq!(l1.extra["openclaw"]["record_type"], "leaf");
         assert_eq!(
-            serde_json::to_value(l1).unwrap()["extra"][crate::harness::claude::CARRIER_KEY]["targetId"],
+            serde_json::to_value(l1).unwrap()["extra"][crate::ir::CARRIER_KEY]["targetId"],
             "a1"
         );
         // the session name is a notice under complete, carrying its record
@@ -2352,15 +2336,15 @@ mod tests {
         assert_eq!(si.kind, MessageKind::Notice);
         assert_eq!(si.extra["openclaw"]["record_type"], "session_info");
         assert_eq!(
-            serde_json::to_value(si).unwrap()["extra"][crate::harness::claude::CARRIER_KEY]["name"],
+            serde_json::to_value(si).unwrap()["extra"][crate::ir::CARRIER_KEY]["name"],
             "Named session"
         );
         assert_eq!(si.text().as_deref(), Some("[session named: Named session]"));
         for m in &sink.messages {
             assert!(
-                m.extra
-                    .keys()
-                    .all(|k| k == "openclaw" || k == crate::harness::claude::CARRIER_KEY),
+                m.extra.keys().all(|k| k == "openclaw"
+                    || k == crate::ir::CARRIER_KEY
+                    || (k == crate::ir::CV_NAMESPACE && m.is_synthesized())),
                 "{:?}",
                 m.extra
             );
@@ -2409,14 +2393,15 @@ mod tests {
         // user + assistant rows, branches included; each window also holds one `toolResult`
         // row, which is not a turn (`SessionRef::message_count`).
         assert_eq!(
-            main.message_count, 12,
+            main.message_count,
+            Some(12),
             "6 user + 6 assistant; the toolResult row is not a turn"
         );
         let fork = by_id("01a0bb4e-2bea-749a-8ec2-c494636244d1");
-        assert_eq!(fork.message_count, 11, "5 user + 6 assistant");
+        assert_eq!(fork.message_count, Some(11), "5 user + 6 assistant");
         let legacy = by_id("3f28190c-96fa-4d73-b37c-251dcccb3f9b");
         assert_eq!(legacy.cwd, Some(PathBuf::from("/Users/ember/ocfid/proj")));
-        assert_eq!(legacy.message_count, 4, "2 user + 2 assistant");
+        assert_eq!(legacy.message_count, Some(4), "2 user + 2 assistant");
 
         // OpenClaw's visible path for the main window. `session_info` and `label` are session
         // facts (they land in the session bag above, not as turns); `model_change` IS a turn —
@@ -2478,9 +2463,9 @@ mod tests {
         assert_eq!(compaction.role, Role::System);
         assert_eq!(compaction.kind, MessageKind::CompactionBoundary);
         assert_eq!(ocbag(compaction)["record_type"], "compaction");
-        assert_eq!(ocbag(compaction)["tokens_before"], 4321);
-        assert_eq!(ocbag(compaction)["first_kept_entry_id"], "u1");
-        assert_eq!(compaction.text().as_deref(), Some("[conversation compacted]"));
+        assert_eq!(ocbag(compaction)["tokensBefore"], 4321);
+        assert_eq!(ocbag(compaction)["firstKeptEntryId"], "u1");
+        assert!(compaction.content.is_empty() && compaction.is_synthesized());
         // The summary that seeds the next window is its own turn, hanging off the boundary; it is
         // the store's synthetic text, so it carries no entry id (hence the id list skips it).
         let summary = &s.messages[6];
@@ -2504,7 +2489,7 @@ mod tests {
 
         // complete: the abandoned branch, the side-mode note and the leaf controls ride along, tagged
         let mut sink = crate::stream::CollectSink::default();
-        adapter.stream(main, &ParseOptions::complete(), &mut sink).unwrap();
+        adapter.stream(main, &Demand::COMPLETE, &mut sink).unwrap();
         let inactive: Vec<String> = sink
             .messages
             .iter()
@@ -2661,25 +2646,25 @@ mod tests {
         assert_eq!(reset.extra["openclaw"]["reason"], "idle");
         let cm = &s.messages[4];
         assert_eq!(cm.kind, MessageKind::Notice);
-        assert_eq!(cm.extra["openclaw"]["custom_type"], "ext.note");
+        assert_eq!(cm.extra["openclaw"]["customType"], "ext.note");
         assert_eq!(cm.extra["openclaw"]["display"], true);
         assert_eq!(cm.text().as_deref(), Some("an extension note"));
 
-        let c = parse_text_with(&text, &r, &ParseOptions::complete());
+        let c = parse_text_with(&text, &r, &Demand::COMPLETE);
         let ids: Vec<&str> = c.messages.iter().filter_map(|m| m.id.as_deref()).collect();
         assert_eq!(ids, ["mc", "u1", "r1", "u2", "lb", "cx", "cm"]);
         let cx = c.messages.iter().find(|m| m.id.as_deref() == Some("cx")).unwrap();
         assert_eq!(cx.kind, MessageKind::Carrier);
         assert_eq!(cx.extra["openclaw"]["record_type"], "custom");
         assert_eq!(
-            serde_json::to_value(cx).unwrap()["extra"][crate::harness::claude::CARRIER_KEY]["data"]["ttl"],
+            serde_json::to_value(cx).unwrap()["extra"][crate::ir::CARRIER_KEY]["data"]["ttl"],
             60
         );
         let lb = c.messages.iter().find(|m| m.id.as_deref() == Some("lb")).unwrap();
         assert_eq!(lb.kind, MessageKind::Notice);
         assert_eq!(lb.text().as_deref(), Some("[label u2: pinned prompt]"));
         assert_eq!(
-            serde_json::to_value(lb).unwrap()["extra"][crate::harness::claude::CARRIER_KEY]["targetId"],
+            serde_json::to_value(lb).unwrap()["extra"][crate::ir::CARRIER_KEY]["targetId"],
             "u2"
         );
     }
@@ -2706,6 +2691,13 @@ mod tests {
     }
 
     #[test]
+    fn windowed_reads_keep_the_model() {
+        let _world = crate::test_world("openclaw-windowed");
+        let state = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/openclaw/2026.1.29");
+        crate::harness::assert_windowed_models(&OpenClaw::with_state_dir(&state));
+    }
+
+    #[test]
     fn parses_v3_full_content_union() {
         let s = parse_fixture("v3-full.jsonl");
         // header cwd + created_at pulled from the session line
@@ -2718,7 +2710,11 @@ mod tests {
         // but its model is not promoted to the session model)
         assert_eq!(s.messages.len(), 4);
         assert_eq!(s.messages[3].model.as_deref(), Some("delivery-mirror"));
-        assert_eq!(s.messages[1].model, None, "the session's own model is not repeated");
+        assert_eq!(
+            s.messages[1].model.as_deref(),
+            Some("claude-opus-4"),
+            "the reply states its model"
+        );
         let user = &s.messages[0];
         assert_eq!(user.role, Role::User);
         assert_eq!((user.kind, user.origin), (MessageKind::Prompt, Origin::Human));
@@ -2767,7 +2763,11 @@ mod tests {
         let bag = &asst.extra["openclaw"];
         assert!(bag.get("usage_raw").is_some());
         assert_eq!(bag["provider"], "anthropic");
-        assert_eq!(bag["stop_reason"], "toolUse");
+        assert_eq!(bag["stopReason"], "toolUse");
+        assert!(
+            bag.get("stop_reason").is_none(),
+            "native keys keep their camelCase: {bag}"
+        );
         assert_eq!(asst.extra.len(), 1, "nothing flat: {:?}", asst.extra);
 
         let tr = &s.messages[2];
@@ -2782,7 +2782,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(tool_use_id, "call_1");
-                assert_eq!(content, "file contents");
+                assert_eq!(content.inline_str(), Some("file contents"));
                 assert!(!is_error);
                 assert_eq!(tool_name.as_deref(), Some("read_file"));
             }
@@ -2830,11 +2830,11 @@ mod tests {
         let bash = &s.messages[0];
         assert_eq!(bash.extra["openclaw"]["message_role"], "bashExecution");
         assert!(bash.text().unwrap().contains("$ ls -la"));
-        assert_eq!(bash.extra["openclaw"]["exit_code"], 0);
+        assert_eq!(bash.extra["openclaw"]["exitCode"], 0);
 
         let branch = &s.messages[1];
         assert_eq!(branch.extra["openclaw"]["message_role"], "branchSummary");
-        assert_eq!(branch.extra["openclaw"]["branch_from_id"], "abc123");
+        assert_eq!(branch.extra["openclaw"]["fromId"], "abc123");
 
         // the single-record compaction: the boundary keeps the entry id and counts, the summary
         // its text, hanging off the boundary
@@ -2842,7 +2842,7 @@ mod tests {
         assert_eq!(boundary.id.as_deref(), Some("c3"));
         assert_eq!(boundary.parent_id.as_deref(), Some("c2"));
         assert_eq!(boundary.extra["openclaw"]["message_role"], "compactionSummary");
-        assert_eq!(boundary.extra["openclaw"]["tokens_before"], 5000);
+        assert_eq!(boundary.extra["openclaw"]["tokensBefore"], 5000);
         let summary = &s.messages[3];
         assert_eq!(summary.text().as_deref(), Some("earlier history compacted"));
         assert_eq!(summary.parent_id.as_deref(), Some("c3"));
@@ -2853,8 +2853,8 @@ mod tests {
 
         let custom = &s.messages[4];
         assert_eq!(custom.extra["openclaw"]["message_role"], "custom");
-        assert_eq!(custom.extra["openclaw"]["custom_type"], "openclaw.cache-ttl");
-        assert_eq!(custom.extra["openclaw"]["custom_details"]["ttlMs"], 3600000);
+        assert_eq!(custom.extra["openclaw"]["customType"], "openclaw.cache-ttl");
+        assert_eq!(custom.extra["openclaw"]["details"]["ttlMs"], 3600000);
     }
 
     #[test]
@@ -2866,11 +2866,11 @@ mod tests {
             (a1.role, a1.kind, a1.origin),
             (Role::Assistant, MessageKind::Error, Origin::Harness)
         );
-        assert_eq!(a1.extra["openclaw"]["error"]["error_message"], "overloaded");
-        assert_eq!(a1.extra["openclaw"]["error"]["error_code"], 529);
-        assert_eq!(a1.extra["openclaw"]["stop_reason"], "error");
+        assert_eq!(a1.extra["openclaw"]["error"]["errorMessage"], "overloaded");
+        assert_eq!(a1.extra["openclaw"]["error"]["errorCode"], 529);
+        assert_eq!(a1.extra["openclaw"]["stopReason"], "error");
         assert!(
-            a1.extra["openclaw"].get("error_message").is_none(),
+            a1.extra["openclaw"].get("errorMessage").is_none(),
             "the error is one object"
         );
         // a `system` record is the system prompt, session-level too
@@ -3034,7 +3034,7 @@ mod tests {
         )?;
         let adapter = OpenClaw::with_state_dir(&world.base);
         let reference = SessionRef::new("child", Harness::OpenClaw, &path);
-        let mut child = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy())?;
+        let mut child = crate::stream::collect_with(&adapter, &reference, &Demand::LEAN.with_spans())?;
         assert_eq!(child.lineage.parent.as_deref(), Some("parent"));
         fs::write(&parent, "changed parent")?;
         assert!(child.materialize().is_err());
@@ -3047,7 +3047,7 @@ mod tests {
             }
         }
         assert!(adapter
-            .stream(&reference, &ParseOptions::full(), &mut ChangeParent(parent))
+            .stream(&reference, &Demand::RICH, &mut ChangeParent(parent))
             .is_err());
         Ok(())
     }
@@ -3109,7 +3109,7 @@ mod tests {
                 serde_json::json!({"sessionId":format!("child-{i}")}),
             );
         }
-        let read = |i, opts: &ParseOptions| {
+        let read = |i, opts: &Demand| {
             crate::stream::collect_with(
                 &adapter,
                 &SessionRef::new(
@@ -3123,13 +3123,13 @@ mod tests {
         JSON_KEY_READS.with(|count| count.set(0));
         {
             let _scope = crate::source::read_scope();
-            let mut absent = read(0, &ParseOptions::lazy())?;
+            let mut absent = read(0, &Demand::LEAN.with_spans())?;
             for i in 1..40 {
-                assert_eq!(read(i, &ParseOptions::full())?.messages[0].origin, Origin::Human);
+                assert_eq!(read(i, &Demand::RICH)?.messages[0].origin, Origin::Human);
             }
             assert_eq!(JSON_KEY_READS.with(|count| count.get()), 1);
             fs::write(dir.join("sessions.json"), Value::Object(index).to_string())?;
-            assert_eq!(read(1, &ParseOptions::full())?.messages[0].origin, Origin::Scheduler);
+            assert_eq!(read(1, &Demand::RICH)?.messages[0].origin, Origin::Scheduler);
             assert_eq!(JSON_KEY_READS.with(|count| count.get()), 2);
             assert!(
                 absent.materialize().is_err(),
@@ -3138,7 +3138,7 @@ mod tests {
         }
         JSON_KEY_READS.with(|count| count.set(0));
         for i in 0..3 {
-            assert_eq!(read(i, &ParseOptions::full())?.messages[0].origin, Origin::Scheduler);
+            assert_eq!(read(i, &Demand::RICH)?.messages[0].origin, Origin::Scheduler);
         }
         assert_eq!(
             JSON_KEY_READS.with(|count| count.get()),
@@ -3187,11 +3187,10 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE session_windows(session_key TEXT,session_id TEXT);
             INSERT INTO session_windows VALUES ('parent','z'),('parent',NULL),('parent','self'),
-                ('parent','a'),('other',x'01'),('utf8',CAST(x'ff' AS TEXT));",
+                ('parent','a'),('parent','z'),('other',x'01'),('utf8',CAST(x'ff' AS TEXT));",
         )?;
         assert!(plain_parent_scan(&conn, "parent", "self")?);
         let (groups, _) = WindowGroups::load(&conn)?;
-        let groups = groups.expect("small native membership table");
         let oracle = conn
             .prepare("SELECT session_id FROM session_windows WHERE session_key=?1 AND session_id!=?2")?
             .query_map(["parent", "self"], |row| row.get::<_, String>(0))?
@@ -3200,6 +3199,20 @@ mod tests {
         assert!(groups.candidates("missing", "self")?.is_empty());
         assert!(groups.candidates("other", "self").is_err());
         assert!(groups.candidates("utf8", "self").is_err());
+        for key in ["other", "utf8"] {
+            let native = conn
+                .query_row(
+                    "SELECT session_id FROM session_windows WHERE session_key=?1 AND session_id!=?2",
+                    [key, "self"],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_err();
+            let indexed = groups.candidates(key, "self").unwrap_err();
+            assert_eq!(
+                indexed.downcast_ref::<rusqlite::Error>().unwrap().to_string(),
+                native.to_string()
+            );
+        }
         conn.execute("CREATE INDEX windows_by_key ON session_windows(session_key)", [])?;
         assert!(!plain_parent_scan(&conn, "parent", "self")?);
         for ddl in [
@@ -3212,19 +3225,124 @@ mod tests {
             custom.execute_batch(ddl)?;
             assert!(!plain_parent_scan(&custom, "parent", "self")?, "{ddl}");
         }
-        // Construction stops before copying metadata larger than the operation allowance.
+        // Oversized inventories remain indexed instead of falling back to a scan per key.
         let large = rusqlite::Connection::open_in_memory()?;
         large.execute_batch(
             "CREATE TABLE session_windows(session_key TEXT,session_id TEXT);
             INSERT INTO session_windows VALUES ('parent',printf('%.*c',9*1024*1024,'x'));",
         )?;
-        assert!(WindowGroups::load(&large)?.0.is_none());
+        let (groups, _) = WindowGroups::load(&large)?;
+        assert_eq!(groups.candidates("parent", "self")?[0].len(), 9 * 1024 * 1024);
+        assert!(groups.candidates("missing", "self")?.is_empty());
         Ok(())
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
-    fn sqlite_parent_window_scan_runs_once_per_scope_and_preserves_negative_groups() -> Result<()> {
+    fn sqlite_large_window_selection_uses_index_and_matches_native_scan() -> Result<()> {
+        use std::time::Instant;
+        let conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch("CREATE TABLE session_windows(session_key TEXT,session_id TEXT)")?;
+        {
+            let mut insert = conn.prepare("INSERT INTO session_windows VALUES (?1,?2)")?;
+            for ordinal in 0..25000 {
+                insert.execute(rusqlite::params![
+                    format!("key-{}", ordinal % 500),
+                    format!("{ordinal}:{}", "x".repeat(512))
+                ])?;
+            }
+        }
+        let start = Instant::now();
+        let (groups, _) = WindowGroups::load(&conn)?;
+        let build = start.elapsed();
+        let mut native_steps = 0;
+        let start = Instant::now();
+        let mut expected = Vec::new();
+        for i in 0..100 {
+            let mut stmt =
+                conn.prepare("SELECT session_id FROM session_windows WHERE session_key=?1 AND session_id!=?2")?;
+            expected.push(
+                stmt.query_map([format!("key-{i}"), "self".into()], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            );
+            native_steps += stmt.get_status(rusqlite::StatementStatus::FullscanStep);
+        }
+        let native = start.elapsed();
+        let start = Instant::now();
+        for (i, oracle) in expected.iter().enumerate() {
+            assert_eq!(&groups.candidates(&format!("key-{i}"), "self")?, oracle);
+        }
+        let indexed = start.elapsed();
+        let disk_bytes = groups.0.with(|index| {
+            let mut stmt =
+                index.prepare("SELECT session_id FROM windows WHERE key=?1 AND session_id!=?2 ORDER BY ordinal")?;
+            assert_eq!(
+                stmt.query_map(rusqlite::params![b"key-0".as_slice(), "self"], |row| row
+                    .get::<_, String>(0))?
+                    .count(),
+                50
+            );
+            assert_eq!(stmt.get_status(rusqlite::StatementStatus::FullscanStep), 0);
+            Ok(index.query_row(
+                "SELECT page_count*page_size FROM pragma_page_count(),pragma_page_size()",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?)
+        })?;
+        assert!(disk_bytes > 8 * 1024 * 1024);
+        assert_eq!(native_steps, 100 * 24999);
+        let reads = crate::source::ReadSet::default();
+        let selector = Path::new("/synthetic/openclaw-query-promotion");
+        let _scope = crate::source::read_scope();
+        let start = Instant::now();
+        assert_eq!(
+            &*sqlite_parent_candidates(&conn, "key-0", "self", selector, &reads)?,
+            &expected[0]
+        );
+        let first_query = start.elapsed();
+        // A repeated identical query is memoized and must not construct a private index.
+        assert_eq!(
+            &*sqlite_parent_candidates(&conn, "key-0", "self", selector, &reads)?,
+            &expected[0]
+        );
+        let start = Instant::now();
+        for (i, oracle) in expected.iter().enumerate().skip(1) {
+            assert_eq!(
+                &*sqlite_parent_candidates(&conn, &format!("key-{i}"), "self", selector, &reads)?,
+                oracle
+            );
+        }
+        let remaining_queries = start.elapsed();
+        eprintln!("adaptive selection: first={first_query:?} remaining99_including_build={remaining_queries:?}");
+        let tiny = rusqlite::Connection::open_in_memory()?;
+        tiny.execute_batch("CREATE TABLE session_windows(session_key TEXT,session_id TEXT); INSERT INTO session_windows VALUES ('key','a'),('key','b')")?;
+        let start = Instant::now();
+        let (small, _) = WindowGroups::load(&tiny)?;
+        let tiny_build = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..1000 {
+            assert_eq!(small.candidates("key", "self")?, ["a", "b"]);
+        }
+        let tiny_indexed = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..1000 {
+            let mut stmt =
+                tiny.prepare("SELECT session_id FROM session_windows WHERE session_key=?1 AND session_id!=?2")?;
+            assert_eq!(
+                stmt.query_map(["key", "self"], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+                ["a", "b"]
+            );
+        }
+        let tiny_native = start.elapsed();
+        eprintln!("tiny window selection: rows=2 queries=1000 build={tiny_build:?} native={tiny_native:?} indexed={tiny_indexed:?}");
+        eprintln!("window selection: rows=25000 queries=100 build={build:?} native={native:?} indexed={indexed:?} native_fullscan_steps={native_steps} private_bytes={disk_bytes}");
+        Ok(())
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_parent_window_scan_promotes_after_a_distinct_query_and_preserves_guards() -> Result<()> {
         let world = crate::test_world("openclaw-sql-parent-scope");
         let dir = world.base.join("agents/main/agent");
         fs::create_dir_all(&dir)?;
@@ -3270,11 +3388,7 @@ mod tests {
         drop(conn);
         let adapter = OpenClaw::with_state_dir(&world.base);
         let read = |id: &str| {
-            crate::stream::collect_with(
-                &adapter,
-                &SessionRef::new(id, Harness::OpenClaw, &path),
-                &ParseOptions::full(),
-            )
+            crate::stream::collect_with(&adapter, &SessionRef::new(id, Harness::OpenClaw, &path), &Demand::RICH)
         };
         SQL_PARENT_ROWS.with(|count| count.set(0));
         SQL_PARENT_FULLSCANS.with(|count| count.set(0));
@@ -3283,6 +3397,21 @@ mod tests {
             let _scope = crate::source::read_scope();
             for i in 0..40 {
                 assert_eq!(read(&format!("child-{i}"))?.lineage.parent.as_deref(), Some("parent"));
+                if i == 0 {
+                    assert_eq!(
+                        SQL_PARENT_ROWS.with(|count| count.get()),
+                        1,
+                        "one query keeps native startup"
+                    );
+                    let steps = SQL_PARENT_FULLSCANS.with(|count| count.get());
+                    assert_eq!(read("child-0")?.lineage.parent.as_deref(), Some("parent"));
+                    assert_eq!(
+                        SQL_PARENT_ROWS.with(|count| count.get()),
+                        1,
+                        "same memoized query does not promote"
+                    );
+                    assert_eq!(SQL_PARENT_FULLSCANS.with(|count| count.get()), steps);
+                }
             }
             for i in 0..40 {
                 assert_eq!(
@@ -3290,12 +3419,9 @@ mod tests {
                     Some(format!("distinct-parent-{i}").as_str())
                 );
             }
-            assert_eq!(SQL_PARENT_ROWS.with(|count| count.get()), 122);
+            assert_eq!(SQL_PARENT_ROWS.with(|count| count.get()), 123);
             one_scan = SQL_PARENT_FULLSCANS.with(|count| count.get());
-            assert!(
-                one_scan > 0 && one_scan <= 122,
-                "one actual global scan, not one perchild"
-            );
+            assert_eq!(one_scan, 2 * 121, "first query plus one whole-store inventory scan");
             assert!(read("negative")?.lineage.parent.is_none());
             let conn = rusqlite::Connection::open(&path)?;
             conn.execute("INSERT INTO session_nodes(session_key,current_session_id,entry_json,updated_at) VALUES ('not-yet','new-parent','{}',1)",[])?;
@@ -3309,7 +3435,7 @@ mod tests {
             assert_eq!(read(&format!("child-{i}"))?.lineage.parent.as_deref(), Some("parent"));
         }
         assert_eq!(SQL_PARENT_ROWS.with(|count| count.get()), 3);
-        assert!(SQL_PARENT_FULLSCANS.with(|count| count.get()) > one_scan * 2);
+        assert!(SQL_PARENT_FULLSCANS.with(|count| count.get()) > one_scan);
         Ok(())
     }
 

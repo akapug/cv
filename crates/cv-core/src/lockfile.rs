@@ -6,6 +6,10 @@
 //! re-create dance could crown two winners and cascade-steal a *live* holder's lock). The lockfile
 //! itself is never removed: unlinking it would let the next locker open a fresh inode and lock
 //! *that*, silently breaking mutual exclusion.
+//!
+//! Use this lock for read-modify-write transactions. The [`crate::lanes`] event ledger instead
+//! appends independent rows without a lock and skips torn lines when reading; it remains stored
+//! state, not a transactional task log.
 
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;

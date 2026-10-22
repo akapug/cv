@@ -15,7 +15,7 @@
 #   corpus_scrub DIR [--also FROM=TO ...]
 #                                -> rewrite $WORK paths to /home/corpus in every file (sqlite too),
 #                                   then fail on anything that looks like a secret or a real path
-#   corpus_size_check DIR        -> warn over 300 KB, fail over 1 MB
+#   corpus_size_check DIR        -> warn over 300 KB, fail over 1.5 MB
 #   corpus_manifest DIR k=v...   -> write DIR/MANIFEST.toml
 
 CORPUS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,7 +85,9 @@ corpus_size_check() {
   # Bytes as git stores them, not `du` blocks: a store of 150 small files is mostly block padding.
   kb="$(python3 -I -c 'import os,sys; print(sum(os.path.getsize(os.path.join(d,f)) for d,_,fs in os.walk(sys.argv[1]) for f in fs) // 1024)' "$1")"
   echo "corpus size: ${kb} KB ($1)"
-  [ "$kb" -le 1024 ] || { echo "over the 1 MB hard cap — trim the scenario prompts" >&2; exit 1; }
+  # 1.5 MB: Claude Code 2.1.300+ writes a request ledger (every request's prompt, tool schemas and
+  # messages, content-addressed) that nearly doubles a transcript; the warning line is the target.
+  [ "$kb" -le 1536 ] || { echo "over the 1.5 MB hard cap — trim the scenario prompts" >&2; exit 1; }
   [ "$kb" -le 300 ] || echo "warning: over the 300 KB target" >&2
 }
 

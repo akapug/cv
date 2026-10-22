@@ -1,6 +1,6 @@
 //! Bounded JSONL staging: serialize successfully before opening the destination.
 use super::bytes::ByteStage;
-use crate::publish::Claim;
+use crate::publish::{Claim, Set};
 use anyhow::Result;
 use serde::Serialize;
 use std::io::{BufReader, BufWriter, Write};
@@ -19,7 +19,7 @@ impl JsonlStage {
             failed: false,
         }
     }
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) fn record_count(&self) -> usize {
         self.records
     }
     pub(crate) fn is_empty(&self) -> bool {
@@ -42,18 +42,55 @@ impl JsonlStage {
         Ok(self.output.into_inner().map_err(|e| e.into_error())?.finish()?)
     }
     pub(crate) fn publish(self, path: &Path, claim: Claim) -> Result<()> {
+        publish_stage(self.into_stage()?, path, claim)
+    }
+    /// [`Self::publish`], running `check` on the staged file before it claims `path`.
+    pub(crate) fn publish_checked(
+        self,
+        path: &Path,
+        claim: Claim,
+        check: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        publish_stage_checked(self.into_stage()?, path, claim, check)
+    }
+    /// Stage the records for `path` as one member of `set`.
+    pub(crate) fn stage_into(self, set: &mut Set, path: &Path, claim: Claim) -> Result<()> {
+        stage_into(set, self.into_stage()?, path, claim)
+    }
+    fn into_stage(self) -> Result<ByteStage> {
         anyhow::ensure!(!self.failed, "cannot publish a failed JSONL stage");
-        let stage = self.output.into_inner().map_err(|e| e.into_error())?;
-        publish_stage(stage, path, claim)
+        Ok(self.output.into_inner().map_err(|e| e.into_error())?)
     }
 }
 
-/// Publish fully produced bytes through [`crate::publish`]: never written into an existing file.
+/// Publish fully produced bytes through [`crate::publish`], never through an existing inode;
+/// `Claim::Replace` replaces the destination name with the staged file.
 /// Checked serialization must complete before calling.
 pub(crate) fn publish_stage(stage: ByteStage, path: &Path, claim: Claim) -> Result<()> {
+    publish_stage_checked(stage, path, claim, |_| Ok(()))
+}
+
+/// [`publish_stage`], running `check` on the staged file before it claims `path`; on an error the
+/// staged file is removed and `path` keeps what it held.
+pub(crate) fn publish_stage_checked(
+    stage: ByteStage,
+    path: &Path,
+    claim: Claim,
+    check: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let source = stage.finish()?;
     let reader = BufReader::with_capacity(256 * 1024, source.reader()?);
-    crate::publish::publish_reader(path, "stage", reader, claim)
+    let staged = crate::publish::stage_reader(path, "stage", reader, claim)?;
+    check(staged.path())?;
+    staged.publish(path, claim)?;
+    Ok(())
+}
+
+/// [`publish_stage`] as one member of `set`.
+pub(crate) fn stage_into(set: &mut Set, stage: ByteStage, path: &Path, claim: Claim) -> Result<()> {
+    let source = stage.finish()?;
+    let reader = BufReader::with_capacity(256 * 1024, source.reader()?);
+    set.stage(path, "stage", reader, claim)
 }
 
 #[cfg(test)]
@@ -93,6 +130,33 @@ mod tests {
             .is_err());
         assert!(stage.publish(&path, Claim::Replace).is_err());
         assert_eq!(std::fs::read(&path)?, before);
+        Ok(())
+    }
+    /// The check sees the staged bytes before the name does; when it fails, the destination keeps
+    /// what it held (nothing, or the replaced file) and no temporary is left (a Claude emit's
+    /// resumability check rides this).
+    #[test]
+    fn a_failed_check_publishes_nothing() -> Result<()> {
+        let world = cv_testkit::World::new("jsonl-stage-check");
+        let dir = world.base.join("out");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("records.jsonl");
+        for prior in [None, Some(b"prior\n".as_slice())] {
+            if let Some(bytes) = prior {
+                std::fs::write(&path, bytes)?;
+            }
+            let mut stage = JsonlStage::new();
+            stage.push(serde_json::json!({"n": 1}))?;
+            let err = stage
+                .publish_checked(&path, Claim::Replace, |staged| {
+                    assert_eq!(std::fs::read(staged)?, b"{\"n\":1}\n");
+                    anyhow::bail!("not resumable")
+                })
+                .unwrap_err();
+            assert_eq!(err.to_string(), "not resumable");
+            assert_eq!(std::fs::read(&path).ok().as_deref(), prior);
+            assert_eq!(std::fs::read_dir(&dir)?.count(), usize::from(prior.is_some()));
+        }
         Ok(())
     }
     /// A replaced name gets a new file: the old inode, its other hard links and a symlink's

@@ -104,7 +104,10 @@ pub struct FieldDef {
 
 /// The capability flags accepted by `has:` (and surfaced in the reference).
 pub const HAS_FLAGS: &[(&str, &str)] = &[
-    ("subagents", "spawned at least one sub-agent (Claude forests)"),
+    (
+        "subagents",
+        "spawned at least one sub-agent (its forest, as `agents` counts)",
+    ),
     ("errors", "has at least one error event"),
     ("tools", "used at least one tool"),
     ("images", "contains an image block"),
@@ -575,7 +578,11 @@ fn eval_term(t: &Term, f: &Facts) -> anyhow::Result<Tri> {
         ),
         FieldId::Title => str_match(t.op, &t.val, f.r.title.as_deref().map(str::to_lowercase)),
         FieldId::Id => str_match(t.op, &t.val, Some(f.r.id.to_lowercase())),
-        FieldId::Msgs => num_match(t.op, &t.val, f.r.message_count as u64),
+        // An uncounted listing row cannot answer `msgs:`; the parse phase counts and decides.
+        FieldId::Msgs => match f.r.message_count {
+            Some(n) => num_match(t.op, &t.val, n as u64),
+            None => Tri::Unknown,
+        },
         FieldId::Created => date_match(t.op, &t.val, f.r.created_at.or(f.r.updated_at)),
         FieldId::Updated => date_match(t.op, &t.val, f.r.updated_at.or(f.r.created_at)),
         // Parse-required.
@@ -740,20 +747,18 @@ fn date_match(op: Op, val: &Val, when: Option<DateTime<Utc>>) -> Tri {
 /// A throwaway ref view of a parsed session so `matches_session` can reuse the catalog-field logic.
 fn session_as_ref(s: &Session) -> SessionRef {
     SessionRef {
-        id: s.id.clone(),
-        harness: s.harness,
-        path: s.source_path.clone().unwrap_or_default(),
         cwd: s.cwd.clone(),
         title: s.title.clone(),
         created_at: s.created_at,
-        updated_at: s.updated_at,
-        // `SessionRef.message_count` is contractually user+assistant turns only (see ir.rs), so
+        updated_at: s.updated_at, // `SessionRef.message_count` is contractually user+assistant turns only (see ir.rs), so
         // `msgs:` must count the same way here as the catalog prefilter does.
-        message_count: s
-            .messages
-            .iter()
-            .filter(|m| matches!(m.role, crate::ir::Role::User | crate::ir::Role::Assistant))
-            .count(),
+        message_count: Some(
+            s.messages
+                .iter()
+                .filter(|m| matches!(m.role, crate::ir::Role::User | crate::ir::Role::Assistant))
+                .count(),
+        ),
+        ..SessionRef::new(s.id.clone(), s.harness, s.source_path.clone().unwrap_or_default())
     }
 }
 
@@ -1278,7 +1283,6 @@ pub fn schema_json() -> serde_json::Value {
 pub mod facts;
 pub use facts::{
     filter_refs, filter_refs_limited, matches_full, matches_streamed, QueryReducer, SessionFacts, TextSets,
-    WindowPresence,
 };
 
 #[cfg(test)]

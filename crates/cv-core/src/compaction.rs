@@ -95,6 +95,12 @@ impl CompactionSink {
         }
     }
 
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn with_source(mut self, path: &std::path::Path) -> Self {
+        self.resolver = Some(crate::Resolver::new(Some(path.to_owned())));
+        self
+    }
+
     /// Finish a scan, rejecting partial results when a demanded summary failed.
     pub fn into_boundaries(self) -> anyhow::Result<Vec<Compaction>> {
         match self.error {
@@ -195,7 +201,7 @@ fn summary_text(
     let fallback = crate::lazy::Resolver::new(None);
     let resolver = resolver.unwrap_or(&fallback);
     let mut s = String::new();
-    let mut prefix = preview.map(crate::affordance::input::Prefix::new);
+    let mut prefix = preview.map(crate::projection::Head::bounded);
     let mut nonempty = false;
     let mut nonblank = false;
     for b in &m.content {
@@ -247,7 +253,7 @@ fn detect_with_preview(
     sink.resolver = Some(crate::lazy::Resolver::new(Some(r.path.clone())));
     // Boundary kinds and compactMetadata are reducer facts; summary bodies remain lazy until
     // requested. Adapters without a Facts projection conservatively retain their existing extra.
-    adapter.try_stream(r, &crate::stream::ParseOptions::facts(), &mut sink)?;
+    adapter.try_stream(r, &crate::stream::Demand::FACTS.with_spans(), &mut sink)?;
     sink.into_boundaries()
 }
 
@@ -281,7 +287,7 @@ pub fn row(boundaries: &[Compaction], n: usize) -> Value {
     v
 }
 
-/// A [`Session`]-level convenience (used by tests / whole-session consumers): detect compactions
+/// Test convenience: detect compactions
 /// from an already-parsed session's messages, without re-streaming. Mirrors [`CompactionSink`]'s
 /// logic on `session.messages`, resolving retained lazy text against `session.source_path` and
 /// returning demanded summary read errors.

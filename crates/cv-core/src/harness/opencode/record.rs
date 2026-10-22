@@ -297,7 +297,7 @@ impl Record {
                 push_extra_array(bag, "compactions", hydrated()?);
                 self.compaction = true;
             }
-            // Unknown / future part type: never drop it silently — stash verbatim.
+            // Missing or empty types are ignored; named unknown types are preserved.
             "" => {}
             _ => push_extra_array(bag, "unknown_parts", hydrated()?),
         }
@@ -459,7 +459,8 @@ pub(super) fn push_extra_array(extra: &mut Map<String, Value>, key: &str, v: Val
 }
 
 /// Look for a `signature` string anywhere one provider-level deep inside `metadata`
-/// (`metadata.<provider>.signature`), without hard-coding the provider name.
+/// (`metadata.<provider>.signature`), without hard-coding the provider name. This is a heuristic:
+/// an unrelated nested signature can be mistaken for a thinking signature.
 pub(super) fn find_signature(metadata: Option<&Value>) -> Option<&str> {
     let obj = metadata?.as_object()?;
     for v in obj.values() {

@@ -190,6 +190,7 @@ impl TaskStore {
     /// [`Self::append`] for a batch: admit and serialize every candidate before repairing EOF
     /// framing or writing. The lock covers the entire replay, repair and append.
     pub(super) fn append_committed(&self, events: Vec<TaskEvent>) -> Result<Committed> {
+        anyhow::ensure!(!crate::env::frozen(), "--frozen forbids writing tasks");
         debug_assert!(!events.is_empty());
         fs::create_dir_all(&self.dir).with_context(|| format!("creating tasks dir {}", self.dir.display()))?;
         let _lock = FileLock::acquire(self.lock_path())?;
@@ -369,7 +370,6 @@ impl TaskStore {
     }
 }
 
-/// The agent-facing seam: a kind cv retired is never written again, whatever constructed it.
 /// If `line` is a log-format header record, its declared version (`v` missing reads as 0, which
 /// is ≤ current and therefore skipped — keep it dumb).
 fn header_version(line: &str) -> Option<u64> {

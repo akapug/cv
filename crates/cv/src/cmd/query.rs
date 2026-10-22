@@ -8,7 +8,6 @@
 use crate::util::usage;
 use anyhow::{Context, Result};
 use cv_core::query::{FieldId, SessionQuery};
-use std::collections::HashSet;
 
 pub(crate) use cv_core::query::{filter_refs, TextSets};
 
@@ -25,16 +24,15 @@ pub(crate) fn build(query: Option<String>) -> Result<Option<SessionQuery>> {
 }
 
 /// Resolve every indexed matching ID per distinct `text:` needle, without reading transcripts.
-/// If there's no index, warn
-/// once and treat every `text:` needle as matching nothing.
+/// With no index there is no answer: a usage error (exit 2) pointing at `cv index`, never a
+/// silent "no match" (which `NOT text:` would turn into "everything").
 pub(crate) fn text_sets(query: &SessionQuery) -> Result<TextSets> {
     let needles = query.needles(FieldId::Text);
     if needles.is_empty() {
         return Ok(TextSets::empty());
     }
     if !cv_search::default_tantivy_dir().exists() {
-        eprintln!("cv: text: needs a full-text index — run `cv index` (treating text: as no match)");
-        return Ok(TextSets::resolve(query, |_| HashSet::new()));
+        return usage("`text:` needs a full-text index; build it with `cv index`");
     }
     let borrowed: Vec<_> = needles.iter().map(String::as_str).collect();
     let matches = cv_search::text_search_ids_batch(None, &borrowed).context("opening full-text query index")?;
@@ -58,8 +56,9 @@ mod tests {
     fn unavailable_index_and_missing_index_have_distinct_query_outcomes() {
         let _world = crate::test_world("query-text-index-errors");
         let query = SessionQuery::parse("NOT text:needle").unwrap();
-        let absent = text_sets(&query).unwrap();
-        assert!(!absent.contains("needle", "session"));
+        let absent = text_sets(&query).unwrap_err();
+        assert!(absent.downcast_ref::<crate::util::UsageError>().is_some(), "{absent:#}");
+        assert!(format!("{absent:#}").contains("cv index"), "{absent:#}");
         std::fs::create_dir_all(cv_search::default_tantivy_dir()).unwrap();
         assert!(
             text_sets(&query).is_err(),

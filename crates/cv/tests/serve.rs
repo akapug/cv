@@ -2,6 +2,8 @@
 //! `cv serve` HTTP endpoints (status codes, JSON shapes, query parsing) — all hermetic via a
 //! temp `$HOME` + `$CLUSTERVISION_HOME` passed only to child processes.
 
+use cv_core::rows::SEARCH_ROW_KEYS;
+use cv_testkit::http::status as raw_status;
 use cv_testkit::World;
 use serde_json::{json, Value};
 use std::fs;
@@ -198,59 +200,22 @@ fn ls_and_path_on_empty_archive() {
 
 // ───────────────────────────── serve ─────────────────────────────
 
-/// A minimal HTTP/1.0-style GET over a raw socket (no client dep): returns (status, body).
 fn http(port: u16, method: &str, path: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to cv serve");
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read response");
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("bad status line in: {text}"));
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
-        .unwrap_or_default();
-    (status, body)
+    let raw = raw_request(port, method, path, &[]);
+    (raw_status(&raw), cv_testkit::http::parts(&raw).1.to_owned())
 }
 
-/// Like [`http`] but also hands back the `Content-Type`, for the static-asset rules where the
-/// header IS the behaviour under test.
-fn get_raw(port: u16, path: &str) -> (u16, String, String) {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to cv serve");
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read response");
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("bad status line in: {text}"));
-    let ct = text
+/// Include Content-Type when the response headers are part of the contract.
+fn get_with_content_type(port: u16, path: &str) -> (u16, String, String) {
+    let raw = raw_get(port, path);
+    let (head, body) = cv_testkit::http::parts(&raw);
+    let content_type = head
         .lines()
-        .take_while(|l| !l.trim().is_empty())
-        .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-        .map(|l| l[l.find(':').unwrap() + 1..].trim().to_string())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.trim())
         .unwrap_or_default();
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
-        .unwrap_or_default();
-    (status, ct, body)
+    (raw_status(&raw), content_type.to_owned(), body.to_owned())
 }
 
 fn get_json(port: u16, path: &str) -> (u16, Value) {
@@ -278,11 +243,7 @@ fn full_session_downloads_match_native_exports_beyond_loaded_page() {
         ("opensession", "json", "application/json", "opensession.json"),
     ] {
         let (expected, _) = w.cv_ok(&["export", "download", "--harness", "claude", "--format", native]);
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        write!(stream, "GET /api/session/claude/download/export?format={format} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").unwrap();
-        let mut raw = String::new();
-        stream.read_to_string(&mut raw).unwrap();
+        let raw = raw_get(port, &format!("/api/session/claude/download/export?format={format}"));
         let (headers, body) = raw.split_once("\r\n\r\n").unwrap();
         assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
         let headers = headers.to_ascii_lowercase();
@@ -788,16 +749,16 @@ fn serve_static_missing_asset_is_404_not_the_index() {
     let webroot = write_web_root(&w);
     let (port, _reaper) = spawn_serve_with(&w, &["--web", webroot.to_str().unwrap()]);
 
-    let (status, ct, _) = get_raw(port, "/pkg/cv_web.js");
+    let (status, ct, _) = get_with_content_type(port, "/pkg/cv_web.js");
     assert_eq!(status, 404, "a missing module is a 404, not the index");
     assert!(!ct.contains("html"), "and not served as html: {ct}");
 
-    let (status, ct, _) = get_raw(port, "/components/cv-forest.js");
+    let (status, ct, _) = get_with_content_type(port, "/components/cv-forest.js");
     assert_eq!(status, 200);
     assert!(ct.contains("javascript"), "{ct}");
 
     // A route (no file extension) still resolves to the SPA index so deep links work.
-    let (status, ct, body) = get_raw(port, "/session/claude/alphasess");
+    let (status, ct, body) = get_with_content_type(port, "/session/claude/alphasess");
     assert_eq!(status, 200);
     assert!(ct.contains("html"), "{ct}");
     assert!(body.contains("<!doctype html>"), "{body}");
@@ -859,10 +820,9 @@ fn serve_compactions() {
     let (status, v) = get_json(port, "/api/session/claude/compactsess/messages");
     assert_eq!(status, 200);
     let m = &v["messages"].as_array().unwrap()[2];
-    // Lean read: no `extra` populated (the map is absent or empty for the boundary) — but `kind`
-    // is first-class, so the boundary is still identifiable without opting into the harness bag.
-    let extra_empty = m["extra"].is_null() || m["extra"].as_object().map(|o| o.is_empty()).unwrap_or(true);
-    assert!(extra_empty, "lean read should omit extra: {m}");
+    // Lean read: no `extra` on the wire at all (an empty bag is skipped) — but `kind` is
+    // first-class, so the boundary is still identifiable without opting into the harness bag.
+    assert_eq!(m.get("extra"), None, "lean read should omit extra: {m}");
     assert_eq!(m["kind"], "compaction_boundary", "{m}");
 }
 
@@ -907,7 +867,7 @@ fn serve_static_web_hub() {
 
     // Path traversal cannot escape the web root: the sibling secret is unreachable.
     let (status, body) = http(port, "GET", "/../secret.txt");
-    assert!(status == 403 || status == 200, "status {status}");
+    assert_eq!(status, 403, "path traversal must be refused: {body}");
     assert!(!body.contains("TOP SECRET"), "traversal leaked the secret:\n{body}");
     // Encoded traversal too.
     for path in [
@@ -1212,26 +1172,6 @@ fn raw_json(raw: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("non-JSON body {body:?}: {e}"))
 }
 
-/// The §3 search row: a session row plus what the search contributed. `cv search --json` emits
-/// exactly these keys in exactly this order, so `/api/search` must too — a consumer that cannot
-/// tell the CLI's rows from the daemon's is the whole point of the contract.
-const SEARCH_ROW_KEYS: [&str; 14] = [
-    "id",
-    "harness",
-    "path",
-    "cwd",
-    "title",
-    "created_at",
-    "updated_at",
-    "message_count",
-    "size_bytes",
-    "score",
-    "snippet",
-    "agent_id",
-    "parent_id",
-    "workflow",
-];
-
 /// `/api/search` over a world with NO full-text index: a 503 naming the cause and the fix unless
 /// the caller asks for the live scan (`scan=1`), which answers in the same row shape and SAYS it
 /// is a scan.
@@ -1360,6 +1300,7 @@ fn serve_stats() {
         [
             "sessions",
             "messages",
+            "uncounted",
             "by_harness",
             "top_cwds",
             "earliest_created",
@@ -1659,49 +1600,14 @@ fn raw_get(port: u16, path: &str) -> String {
 /// A raw request with custom headers, returning the full response text (headers + body).
 /// A default local `Host` is supplied unless the caller passes their own.
 fn raw_request(port: u16, method: &str, path: &str, headers: &[(&str, &str)]) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut req = format!("{method} {path} HTTP/1.1\r\n");
-    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
-        req.push_str(&format!("Host: 127.0.0.1:{port}\r\n"));
-    }
-    for (k, v) in headers {
-        req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    req.push_str("Connection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).unwrap();
-    let mut s = String::new();
-    stream.read_to_string(&mut s).unwrap();
-    s
-}
-
-/// The status code from a raw response's status line.
-fn raw_status(raw: &str) -> u16 {
-    raw.split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("bad status line in: {raw}"))
+    cv_testkit::http::raw_request(&format!("127.0.0.1:{port}"), method, path, headers, None)
 }
 
 // ───────────────────────────── the inbox on cv serve ─────────────────────────────
 
 /// A POST with a body and headers, returning the raw response.
 fn raw_post(port: u16, path: &str, body: &str, headers: &[(&str, &str)]) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut req = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\n",
-        body.len()
-    );
-    for (k, v) in headers {
-        req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    req.push_str("Connection: close\r\n\r\n");
-    req.push_str(body);
-    stream.write_all(req.as_bytes()).unwrap();
-    let mut s = String::new();
-    stream.read_to_string(&mut s).unwrap();
-    s
+    cv_testkit::http::raw_request(&format!("127.0.0.1:{port}"), "POST", path, headers, Some(body))
 }
 
 /// What `cv task serve` served moved onto `cv serve`: the page (at `/inbox`, and at `/` with no
@@ -1731,7 +1637,7 @@ fn serve_carries_the_inbox_and_guards_its_writes() {
     let (port, _reaper) = spawn_serve_with(&w, &["--who", "ember"]);
 
     for path in ["/", "/inbox"] {
-        let (status, ct, body) = get_raw(port, path);
+        let (status, ct, body) = get_with_content_type(port, path);
         assert_eq!(status, 200, "{path}");
         assert!(
             ct.contains("html") && body.contains("<title>cv inbox</title>"),
@@ -1783,7 +1689,7 @@ fn serve_carries_the_inbox_and_guards_its_writes() {
     oversized.push_str(&" ".repeat((1 << 20) + 1 - oversized.len()));
     let raw = raw_post(port, &path, &oversized, &[("Content-Type", "application/json")]);
     assert_eq!(raw_status(&raw), 413, "truncated JSON prefix was accepted: {raw}");
-    let (_, _, events) = get_raw(port, "/api/events");
+    let (_, _, events) = get_with_content_type(port, "/api/events");
     assert_eq!(
         events.lines().count(),
         1,
@@ -1814,7 +1720,7 @@ fn serve_carries_the_inbox_and_guards_its_writes() {
     assert_eq!(v["by"], "web:ember", "{v}");
 
     // The events feed is the same query as `cv task events`: JSON lines, the note last.
-    let (status, ct, lines) = get_raw(port, "/api/events?since=1h");
+    let (status, ct, lines) = get_with_content_type(port, "/api/events?since=1h");
     assert_eq!(status, 200);
     assert!(ct.contains("ndjson"), "{ct}");
     let last: Value = serde_json::from_str(lines.lines().last().unwrap()).unwrap();

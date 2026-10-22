@@ -90,11 +90,9 @@ refused.
 **There is one way to pose a decision.** A `decision` tag on a task with nothing posed is
 **refused by the reducer** — on the CLI, over MCP and from the page alike — with the message
 naming `cv task decide` and its required `--default`: a tag-only decision gave the decider an inbox
-card with no options and no buttons (two of them, 10-01). Stores that already hold tag-only
-decisions (or the `tagged decision` that `decide` wrote before 0.15.0) replay unchanged and keep
-showing them under "decisions owed" — the page offers "my last note is the answer — close it" —
-and nothing is migrated. `cv task split`, which mined `DECIDE:` notes into decisions, is gone
-with it: pose the question.
+card with no options and no buttons (two of them, 10-01). A tag-only decision already in a
+store reads as the plain task it is (an assigned action), and nothing is migrated. `cv task
+split`, which mined `DECIDE:` notes into decisions, is gone with it: pose the question.
 
 **Provisional resolutions** are how an orchestrator proceeds on a default without leaving the
 decision to rot as owed: `cv task decide … --provisional` (or
@@ -158,7 +156,7 @@ the slowest blocker a fleet has. Each reason has an honest aging anchor:
 
 | Reason | You appear because | Ages since |
 | --- | --- | --- |
-| `DecisionOwed` | a live decision (posed, or tagged `decision`) is assigned to you | the **pose** (the last event for a tag-only one) |
+| `DecisionOwed` | a live posed decision is assigned to you | the **pose** |
 | `Discussing` | you parked a decision for discussion — open, not owed | the last event |
 | `Provisional` | a decision assigned to you was resolved *for* you, provisionally — resolved, not owed | the **provisional resolve** |
 | `AssignedOpen` | an open task is assigned to you, unclaimed | the last event |
@@ -229,6 +227,9 @@ task 019f6e4b-74c5-74f0-a493-1f8131ca38d5  [done]  action
 
 Later, `cv task sweep --repo ~/code/demo` lists every still-open task that names a branch now
 merged into `main` — what git can say, offered as a candidate, closed by a person.
+
+`cv task events --kind <kind>` rejects unknown event kinds with exit 2 and lists the known
+kinds; `/api/events?kind=` returns 400 for the same mistake.
 
 `cv task show <id> --events` (or `GET /api/task/{id}/events`) prints the raw durable history —
 for this task: `opened`, `claimed`, `noted`, `done`.

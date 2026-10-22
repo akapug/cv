@@ -75,7 +75,7 @@ impl EventSpool {
         self.len() == 0
     }
     pub fn temporary_bytes(&self) -> Result<u64> {
-        self.ordered.temporary_bytes()
+        self.ordered.spilled_bytes()
     }
     pub fn push(&mut self, event: Event) -> Result<()> {
         self.ordered.push(event)
@@ -333,7 +333,7 @@ mod tests {
         let path = world.write_session("ingest", &[record]);
         let r = SessionRef::new("ingest", Harness::Claude, &path);
         assert_eq!(ingest_ref(&r).unwrap(), 1);
-        let before = format!("{:?}", events_for("claude", "ingest", None));
+        let before = format!("{:?}", events_for("claude", "ingest", None).unwrap());
         let content = fs::read_to_string(&path).unwrap().replace("old.rs", "new-longer.rs");
         fs::write(&path, content).unwrap();
         let conn = crate::catalog::open_db().unwrap();
@@ -342,19 +342,19 @@ mod tests {
         )
         .unwrap();
         assert!(ingest_ref(&r).is_err());
-        assert_eq!(format!("{:?}", events_for("claude", "ingest", None)), before);
+        assert_eq!(format!("{:?}", events_for("claude", "ingest", None).unwrap()), before);
         assert!(needs_ingest(&r));
         conn.execute_batch("DROP TRIGGER reject_event;").unwrap();
         assert_eq!(ingest_ref(&r).unwrap(), 1);
         assert_eq!(
-            events_for("claude", "ingest", None)[0].target.as_deref(),
+            events_for("claude", "ingest", None).unwrap()[0].target.as_deref(),
             Some("/repo/new-longer.rs")
         );
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
-    fn ordered_publication_preserves_suffix_dedup_and_rolls_back_failures() {
+    fn ordered_publication_replaces_the_suffix_and_rolls_back_failures() {
         use crate::events::{events_for, needs_ingest, record_spooled_with_source, Provenance};
         use crate::{Harness, SessionRef};
         let world = crate::test_world("event-spool-transaction");
@@ -373,18 +373,16 @@ mod tests {
             original.push(row).unwrap();
         }
         record_spooled_with_source(&r, 0, original, &source, &Provenance::default()).unwrap();
-        assert_eq!(events_for("claude", "events", None).len(), 2);
+        assert_eq!(events_for("claude", "events", None).unwrap().len(), 3);
         let mut spool = EventSpool::default();
         spool.push(event(2, None)).unwrap();
-        let mut duplicate = event(2, Some(String::new()));
-        duplicate.detail = Some("later duplicate must lose".into());
-        spool.push(duplicate).unwrap();
         spool.push(event(2, Some("new".into()))).unwrap();
         spool.push(event(3, Some("new".into()))).unwrap();
         record_spooled_with_source(&r, 2, spool, &source, &Provenance::default()).unwrap();
-        let rows = events_for("claude", "events", None);
+        let rows = events_for("claude", "events", None).unwrap();
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].msg_idx, 0);
+        assert_eq!(rows[3].msg_idx, 3);
         assert_eq!(rows[1].target, None);
         let before = format!("{rows:?}");
         assert!(!needs_ingest(&r));
@@ -400,14 +398,14 @@ mod tests {
                 spool.push(event(i, Some("invalid".into()))).unwrap();
             }
             assert!(record_spooled_with_source(&r, 2, spool, &changed, &Provenance::default()).is_err());
-            assert_eq!(format!("{:?}", events_for("claude", "events", None)), before);
+            assert_eq!(format!("{:?}", events_for("claude", "events", None).unwrap()), before);
             assert!(needs_ingest(&r));
         }
         // Force a disk decoding failure after a valid row; all earlier INSERTs still roll back.
         let mut spool = large_spool(2, 3000);
         spool.ordered.append_corrupt(b"{broken\n").unwrap();
         assert!(record_spooled_with_source(&r, 2, spool, &changed, &Provenance::default()).is_err());
-        assert_eq!(format!("{:?}", events_for("claude", "events", None)), before);
+        assert_eq!(format!("{:?}", events_for("claude", "events", None).unwrap()), before);
         assert!(needs_ingest(&r));
         // Force an SQL INSERT failure, again after the suffix DELETE.
         let conn = crate::catalog::open_db().unwrap();
@@ -417,7 +415,7 @@ mod tests {
         .unwrap();
         let spool = large_spool(2, 3000);
         assert!(record_spooled_with_source(&r, 2, spool, &changed, &Provenance::default()).is_err());
-        assert_eq!(format!("{:?}", events_for("claude", "events", None)), before);
+        assert_eq!(format!("{:?}", events_for("claude", "events", None).unwrap()), before);
         assert!(needs_ingest(&r));
     }
 }

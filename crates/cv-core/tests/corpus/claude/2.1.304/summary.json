@@ -1,0 +1,1592 @@
+{
+  "sessions": [
+    {
+      "id": "0c292c3a-6f59-4090-a0c7-155ce2588128",
+      "path": ".claude/projects/-home-corpus-project/0c292c3a-6f59-4090-a0c7-155ce2588128.jsonl",
+      "messages": 12,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 9,
+        "thinking": 1,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "WebFetch"
+      ],
+      "usage_messages": 3,
+      "model_messages": 3,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "WebFetch": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "10f0b442-3b0c-412e-91d1-dd209f9f8554",
+      "path": ".claude/projects/-home-corpus-project/10f0b442-3b0c-412e-91d1-dd209f9f8554.jsonl",
+      "messages": 16,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "system/injected_context",
+        "assistant/reply",
+        "tool/tool_result",
+        "system/injected_context",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 11,
+        "thinking": 1,
+        "tool_result": 2,
+        "tool_use": 2
+      },
+      "tools": [
+        "EnterWorktree",
+        "ExitWorktree"
+      ],
+      "usage_messages": 4,
+      "model_messages": 4,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "EnterWorktree": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "ExitWorktree": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "2d226267-d931-40b3-8ece-5388f53e2ae6",
+      "path": ".claude/projects/-home-corpus-project/2d226267-d931-40b3-8ece-5388f53e2ae6.jsonl",
+      "messages": 18,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "user/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "image": 1,
+        "text": 13,
+        "thinking": 3,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "Read"
+      ],
+      "usage_messages": 6,
+      "model_messages": 6,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 3
+      },
+      "tool_histogram": {
+        "tools": {
+          "Read": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 1,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "31541ac7-c214-42c0-b4b7-71462bec3b8d",
+      "path": ".claude/projects/-home-corpus-project/31541ac7-c214-42c0-b4b7-71462bec3b8d.jsonl",
+      "messages": 26,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 12,
+        "thinking": 4,
+        "tool_result": 5,
+        "tool_use": 5
+      },
+      "tools": [
+        "CronCreate",
+        "CronList",
+        "CronDelete",
+        "ScheduleWakeup",
+        "ScheduleWakeup"
+      ],
+      "usage_messages": 11,
+      "model_messages": 11,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 3,
+        "schedule/create": 3,
+        "schedule/delete": 1,
+        "schedule/fire": 1,
+        "schedule/list": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "CronCreate": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "CronDelete": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "CronList": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "ScheduleWakeup": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 5,
+        "total_errors": 1
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "361d1ccd-7782-48b8-909b-bfa910fc9125",
+      "path": ".claude/projects/-home-corpus-project/361d1ccd-7782-48b8-909b-bfa910fc9125.jsonl",
+      "messages": 18,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "user/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "user/injected_context",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 15,
+        "thinking": 1,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "Skill"
+      ],
+      "usage_messages": 4,
+      "model_messages": 4,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 3,
+        "skill/load": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "Skill": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "4b5305fa-44d4-46dc-9722-76cd18c854b9",
+      "path": ".claude/projects/-home-corpus-project/4b5305fa-44d4-46dc-9722-76cd18c854b9.jsonl",
+      "messages": 13,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "user/injected_context"
+      ],
+      "blocks": {
+        "text": 10,
+        "thinking": 1,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "Bash"
+      ],
+      "usage_messages": 2,
+      "model_messages": 2,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/deny": 1,
+        "approval/state": 1,
+        "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "Bash": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 1
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "67160a64-9b6c-4468-b9e0-5c38506dec65",
+      "path": ".claude/projects/-home-corpus-project/67160a64-9b6c-4468-b9e0-5c38506dec65.jsonl",
+      "messages": 14,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/error",
+        "system/error",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 13,
+        "thinking": 1
+      },
+      "tools": [],
+      "usage_messages": 3,
+      "model_messages": 2,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 3
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "6c79a036-08c4-46f6-b85d-fa477fd22e57",
+      "path": ".claude/projects/-home-corpus-project/6c79a036-08c4-46f6-b85d-fa477fd22e57.jsonl",
+      "messages": 15,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "user/injected_context",
+        "system/injected_context",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 13,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "Bash"
+      ],
+      "usage_messages": 3,
+      "model_messages": 3,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "background_job/complete": 1,
+        "background_job/start": 1,
+        "hook/output": 3
+      },
+      "tool_histogram": {
+        "tools": {
+          "Bash": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "6c9f789f-5dcc-4fd5-afd0-16c13fab9a4c",
+      "path": ".claude/projects/-home-corpus-project/6c9f789f-5dcc-4fd5-afd0-16c13fab9a4c.jsonl",
+      "messages": 17,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/subagent_spawn",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "user/subagent_return",
+        "system/injected_context",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 13,
+        "thinking": 2,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "Agent"
+      ],
+      "usage_messages": 5,
+      "model_messages": 5,
+      "compaction_boundaries": [],
+      "subagent_spawns": 1,
+      "subagent_returns": 1,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 3,
+        "subagent_return/return": 1,
+        "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "Agent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": [
+        {
+          "id": "agent-add50bd63daa9735b",
+          "path": ".claude/projects/-home-corpus-project/6c9f789f-5dcc-4fd5-afd0-16c13fab9a4c/subagents/agent-add50bd63daa9735b.jsonl",
+          "messages": 8,
+          "sequence": [
+            "user/prompt",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "assistant/reply",
+            "assistant/reply"
+          ],
+          "blocks": {
+            "text": 7,
+            "thinking": 1
+          },
+          "tools": [],
+          "usage_messages": 2,
+          "model_messages": 2,
+          "compaction_boundaries": [],
+          "subagent_spawns": 0,
+          "subagent_returns": 0,
+          "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
+          "lineage": {
+            "parent": "6c9f789f-5dcc-4fd5-afd0-16c13fab9a4c",
+            "spawned_by_tool_use": "call_29428e603c1b4bbcaf2eac06"
+          },
+          "model": "glm-5.3-flash",
+          "skipped_lines": 0
+        }
+      ]
+    },
+    {
+      "id": "6f6d5062-e599-4350-9ddf-3cdc1642c308",
+      "path": ".claude/projects/-home-corpus-project/6f6d5062-e599-4350-9ddf-3cdc1642c308.jsonl",
+      "messages": 56,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 25,
+        "thinking": 7,
+        "tool_result": 12,
+        "tool_use": 12
+      },
+      "tools": [
+        "Read",
+        "Read",
+        "Bash",
+        "Read",
+        "Edit",
+        "Bash",
+        "Bash",
+        "Bash",
+        "Bash",
+        "Write",
+        "Read",
+        "NotebookEdit"
+      ],
+      "usage_messages": 25,
+      "model_messages": 25,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/deny": 1,
+        "approval/state": 1,
+        "checkpoint/state": 1,
+        "hook/output": 7
+      },
+      "tool_histogram": {
+        "tools": {
+          "Bash": {
+            "calls": 5,
+            "edits": 0,
+            "reads": 0,
+            "commands": 5,
+            "errors": 0
+          },
+          "Edit": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "NotebookEdit": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "Read": {
+            "calls": 4,
+            "edits": 0,
+            "reads": 4,
+            "commands": 0,
+            "errors": 0
+          },
+          "Write": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 12,
+        "total_errors": 2
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "710c5fb7-53c1-4164-ab3f-96edf5ef7cf8",
+      "path": ".claude/projects/-home-corpus-project/710c5fb7-53c1-4164-ab3f-96edf5ef7cf8.jsonl",
+      "messages": 22,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 10,
+        "thinking": 4,
+        "tool_result": 4,
+        "tool_use": 4
+      },
+      "tools": [
+        "ToolSearch",
+        "ToolSearch",
+        "ToolSearch",
+        "mcp__corpus__add"
+      ],
+      "usage_messages": 9,
+      "model_messages": 9,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "ToolSearch": {
+            "calls": 3,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "mcp__corpus__add": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 4,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "7edb02e4-4203-4f0e-b047-e2300e115d5e",
+      "path": ".claude/projects/-home-corpus-project/7edb02e4-4203-4f0e-b047-e2300e115d5e.jsonl",
+      "messages": 11,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result"
+      ],
+      "blocks": {
+        "text": 8,
+        "thinking": 1,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "StructuredOutput"
+      ],
+      "usage_messages": 2,
+      "model_messages": 2,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "StructuredOutput": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "8134d27a-3ad8-4c78-a4e9-11222f9f2bdc",
+      "path": ".claude/projects/-home-corpus-project/8134d27a-3ad8-4c78-a4e9-11222f9f2bdc.jsonl",
+      "messages": 17,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/subagent_spawn",
+        "tool/tool_result",
+        "assistant/reply",
+        "user/subagent_return",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 13,
+        "thinking": 2,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "Agent"
+      ],
+      "usage_messages": 5,
+      "model_messages": 5,
+      "compaction_boundaries": [],
+      "subagent_spawns": 1,
+      "subagent_returns": 1,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 3,
+        "subagent_return/return": 1,
+        "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "Agent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": [
+        {
+          "id": "agent-aee84180e04c169e8",
+          "path": ".claude/projects/-home-corpus-project/8134d27a-3ad8-4c78-a4e9-11222f9f2bdc/subagents/agent-aee84180e04c169e8.jsonl",
+          "messages": 4,
+          "sequence": [
+            "assistant/subagent_spawn",
+            "user/prompt",
+            "assistant/reply",
+            "assistant/reply"
+          ],
+          "blocks": {
+            "text": 2,
+            "thinking": 1,
+            "tool_result": 1,
+            "tool_use": 1
+          },
+          "tools": [
+            "Agent"
+          ],
+          "usage_messages": 3,
+          "model_messages": 3,
+          "compaction_boundaries": [],
+          "subagent_spawns": 1,
+          "subagent_returns": 0,
+          "affordances": {
+            "fork/fork": 1,
+            "subagent_spawn/spawn": 1
+          },
+          "tool_histogram": {
+            "tools": {
+              "Agent": {
+                "calls": 1,
+                "edits": 0,
+                "reads": 0,
+                "commands": 0,
+                "errors": 0
+              }
+            },
+            "total_calls": 1,
+            "total_errors": 0
+          },
+          "lineage": {
+            "forked_from": "8134d27a-3ad8-4c78-a4e9-11222f9f2bdc",
+            "parent": "8134d27a-3ad8-4c78-a4e9-11222f9f2bdc",
+            "spawned_by_tool_use": "call_37989f15df6349a6aac9893c"
+          },
+          "model": "glm-5.3-flash",
+          "skipped_lines": 0
+        }
+      ]
+    },
+    {
+      "id": "8cc2f227-40d2-4dea-8cb9-043b466c8403",
+      "path": ".claude/projects/-home-corpus-project/8cc2f227-40d2-4dea-8cb9-043b466c8403.jsonl",
+      "messages": 13,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "tool/tool_result"
+      ],
+      "blocks": {
+        "text": 8,
+        "thinking": 1,
+        "tool_result": 2,
+        "tool_use": 2
+      },
+      "tools": [
+        "Read",
+        "Read"
+      ],
+      "usage_messages": 3,
+      "model_messages": 3,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "Read": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 2,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "a44fa227-332c-470a-a6d4-8878bf51667f",
+      "path": ".claude/projects/-home-corpus-project/a44fa227-332c-470a-a6d4-8878bf51667f.jsonl",
+      "messages": 35,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "system/compaction_boundary",
+        "user/compaction_summary",
+        "user/injected_context",
+        "user/notice",
+        "user/notice",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 31,
+        "thinking": 4
+      },
+      "tools": [],
+      "usage_messages": 8,
+      "model_messages": 8,
+      "compaction_boundaries": [
+        19
+      ],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 6
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "a541ffdb-3b53-47c5-a18c-923528ca2fc1",
+      "path": ".claude/projects/-home-corpus-project/a541ffdb-3b53-47c5-a18c-923528ca2fc1.jsonl",
+      "messages": 18,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 9,
+        "thinking": 1,
+        "tool_result": 4,
+        "tool_use": 4
+      },
+      "tools": [
+        "TaskCreate",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskList"
+      ],
+      "usage_messages": 6,
+      "model_messages": 6,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 2,
+        "plan/create": 2,
+        "plan/read": 1,
+        "plan/state": 1,
+        "plan/update": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "TaskCreate": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "TaskList": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "TaskUpdate": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 4,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "aa175cae-51ff-48f0-9ced-10a2ce2ff2f1",
+      "path": ".claude/projects/-home-corpus-project/aa175cae-51ff-48f0-9ced-10a2ce2ff2f1.jsonl",
+      "messages": 11,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 10,
+        "thinking": 1
+      },
+      "tools": [],
+      "usage_messages": 2,
+      "model_messages": 2,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": []
+    },
+    {
+      "id": "c6ce6482-2d08-4e2e-9b01-5978b6f8fce8",
+      "path": ".claude/projects/-home-corpus-project/c6ce6482-2d08-4e2e-9b01-5978b6f8fce8.jsonl",
+      "messages": 35,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/subagent_spawn",
+        "tool/tool_result",
+        "assistant/subagent_spawn",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "user/subagent_return",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "user/subagent_return",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "user/subagent_return",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 22,
+        "thinking": 7,
+        "tool_result": 3,
+        "tool_use": 3
+      },
+      "tools": [
+        "Agent",
+        "Agent",
+        "SendMessage"
+      ],
+      "usage_messages": 15,
+      "model_messages": 15,
+      "compaction_boundaries": [],
+      "subagent_spawns": 2,
+      "subagent_returns": 3,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 6,
+        "subagent_return/return": 3,
+        "subagent_spawn/spawn": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "Agent": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "SendMessage": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 3,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": [
+        {
+          "id": "agent-a573a5266b0dd7809",
+          "path": ".claude/projects/-home-corpus-project/c6ce6482-2d08-4e2e-9b01-5978b6f8fce8/subagents/agent-a573a5266b0dd7809.jsonl",
+          "messages": 10,
+          "sequence": [
+            "user/prompt",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "assistant/reply",
+            "tool/tool_result",
+            "system/injected_context",
+            "assistant/reply"
+          ],
+          "blocks": {
+            "text": 8,
+            "tool_result": 1,
+            "tool_use": 1
+          },
+          "tools": [
+            "Read"
+          ],
+          "usage_messages": 2,
+          "model_messages": 2,
+          "compaction_boundaries": [],
+          "subagent_spawns": 0,
+          "subagent_returns": 0,
+          "affordances": {},
+          "tool_histogram": {
+            "tools": {
+              "Read": {
+                "calls": 1,
+                "edits": 0,
+                "reads": 1,
+                "commands": 0,
+                "errors": 0
+              }
+            },
+            "total_calls": 1,
+            "total_errors": 0
+          },
+          "lineage": {
+            "parent": "c6ce6482-2d08-4e2e-9b01-5978b6f8fce8",
+            "spawned_by_tool_use": "call_8176f382417845a2862162c7"
+          },
+          "model": "glm-5.3-flash",
+          "skipped_lines": 0
+        },
+        {
+          "id": "agent-ae52e5bb0ec5a02fe",
+          "path": ".claude/projects/-home-corpus-project/c6ce6482-2d08-4e2e-9b01-5978b6f8fce8/subagents/agent-ae52e5bb0ec5a02fe.jsonl",
+          "messages": 11,
+          "sequence": [
+            "user/prompt",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "assistant/reply",
+            "assistant/reply",
+            "user/injected_context",
+            "assistant/reply",
+            "assistant/reply"
+          ],
+          "blocks": {
+            "text": 9,
+            "thinking": 2
+          },
+          "tools": [],
+          "usage_messages": 4,
+          "model_messages": 4,
+          "compaction_boundaries": [],
+          "subagent_spawns": 0,
+          "subagent_returns": 0,
+          "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
+          "lineage": {
+            "parent": "c6ce6482-2d08-4e2e-9b01-5978b6f8fce8",
+            "spawned_by_tool_use": "call_60b91c942a3440a0a0e5bfa7"
+          },
+          "model": "glm-5.3-flash",
+          "skipped_lines": 0
+        }
+      ]
+    },
+    {
+      "id": "e55ea121-48f2-441c-a430-fd701a8d9604",
+      "path": ".claude/projects/-home-corpus-project/e55ea121-48f2-441c-a430-fd701a8d9604.jsonl",
+      "messages": 17,
+      "sequence": [
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/subagent_spawn",
+        "tool/tool_result",
+        "assistant/reply",
+        "assistant/reply",
+        "user/subagent_return",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 12,
+        "thinking": 3,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "Workflow"
+      ],
+      "usage_messages": 6,
+      "model_messages": 6,
+      "compaction_boundaries": [],
+      "subagent_spawns": 1,
+      "subagent_returns": 1,
+      "affordances": {
+        "approval/state": 1,
+        "hook/output": 3,
+        "subagent_return/return": 1,
+        "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "Workflow": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "glm-5.3-flash",
+      "skipped_lines": 0,
+      "children": [
+        {
+          "id": "agent-ab358888aede1ce5c",
+          "path": ".claude/projects/-home-corpus-project/e55ea121-48f2-441c-a430-fd701a8d9604/subagents/workflows/wf_5039b6e7-1a7/agent-ab358888aede1ce5c.jsonl",
+          "messages": 8,
+          "sequence": [
+            "user/prompt",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "assistant/reply",
+            "assistant/reply"
+          ],
+          "blocks": {
+            "text": 7,
+            "thinking": 1
+          },
+          "tools": [],
+          "usage_messages": 2,
+          "model_messages": 2,
+          "compaction_boundaries": [],
+          "subagent_spawns": 0,
+          "subagent_returns": 0,
+          "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
+          "lineage": {
+            "parent": "e55ea121-48f2-441c-a430-fd701a8d9604"
+          },
+          "model": "glm-5.3-flash",
+          "skipped_lines": 0
+        },
+        {
+          "id": "agent-ac6a8f09d2adefeb4",
+          "path": ".claude/projects/-home-corpus-project/e55ea121-48f2-441c-a430-fd701a8d9604/subagents/workflows/wf_5039b6e7-1a7/agent-ac6a8f09d2adefeb4.jsonl",
+          "messages": 8,
+          "sequence": [
+            "user/prompt",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "system/injected_context",
+            "assistant/reply",
+            "assistant/reply"
+          ],
+          "blocks": {
+            "text": 7,
+            "thinking": 1
+          },
+          "tools": [],
+          "usage_messages": 2,
+          "model_messages": 2,
+          "compaction_boundaries": [],
+          "subagent_spawns": 0,
+          "subagent_returns": 0,
+          "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
+          "lineage": {
+            "parent": "e55ea121-48f2-441c-a430-fd701a8d9604"
+          },
+          "model": "glm-5.3-flash",
+          "skipped_lines": 0
+        }
+      ]
+    },
+    {
+      "id": "f7695189-d73c-4576-84e8-286850975e9e",
+      "path": ".claude/projects/-home-corpus-project/f7695189-d73c-4576-84e8-286850975e9e.jsonl",
+      "messages": 22,
+      "sequence": [
+        "system/compaction_boundary",
+        "user/compaction_summary",
+        "assistant/reply",
+        "assistant/reply",
+        "user/injected_context",
+        "user/notice",
+        "user/notice",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 19,
+        "thinking": 3
+      },
+      "tools": [],
+      "usage_messages": 6,
+      "model_messages": 6,
+      "compaction_boundaries": [
+        0
+      ],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1,
+        "fork/fork": 1,
+        "hook/output": 3
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
+      "lineage": {
+        "forked_from": "a44fa227-332c-470a-a6d4-8878bf51667f"
+      },
+      "model": "glm-5.3",
+      "skipped_lines": 0,
+      "children": []
+    }
+  ]
+}

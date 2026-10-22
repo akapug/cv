@@ -17,10 +17,9 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::harness::claude::{subagent_end, task_notices, ApiErrorNotice, SubagentEnd, TaskNotice};
 use crate::ir::{Block, Message, MessageKind, Role, SessionRef, Usage};
-use crate::stream::{Flow, ParseOptions};
-use crate::SubagentInfo;
+use crate::stream::{Demand, Flow};
+use crate::AgentRef;
 
 /// Token totals for one lane, following [`Usage`]'s disjoint convention.
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -78,8 +77,7 @@ pub const RETURNED_QUIET_SECS: i64 = 600;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LaneEvent {
     pub ts: DateTime<Utc>,
-    /// `start` or `stop`.
-    pub event: String,
+    pub event: LaneEventKind,
     /// The parent session's id (the hook's `session_id`).
     pub session_id: String,
     /// The bare agent id (`agent-` stripped, as `SendMessage` uses it).
@@ -99,7 +97,56 @@ pub struct LaneEvent {
     pub last_text: Option<String>,
 }
 
-/// `$CLUSTERVISION_HOME/lanes.jsonl` (default `~/.clustervision/lanes.jsonl`).
+/// What one lane-ledger row records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneEventKind {
+    /// A sub-agent started (`SubagentStart`).
+    Start,
+    /// A sub-agent stopped (`SubagentStop`).
+    Stop,
+}
+
+/// A lane's status: cv's own three verdicts, or the word a harness notice or a workflow journal
+/// recorded, kept as spelled (`completed`, `failed`, `killed`, `stopped`, `done`, `partial`, …).
+/// It serializes as that one word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneStatus {
+    /// No stop recorded anywhere, and the transcript does not read as finished.
+    Running,
+    /// Parked: a stop hook (in the transcript or the ledger) fired at or after the last turn.
+    Stopped,
+    /// Finished with no stop recorded anywhere: the harness lost the notification.
+    Returned,
+    /// As the harness's notice or the workflow journal recorded it.
+    Recorded(String),
+}
+
+impl LaneStatus {
+    pub fn as_str(&self) -> &str {
+        match self {
+            LaneStatus::Running => "running",
+            LaneStatus::Stopped => "stopped",
+            LaneStatus::Returned => "returned",
+            LaneStatus::Recorded(word) => word,
+        }
+    }
+}
+
+impl std::fmt::Display for LaneStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for LaneStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// `$CLUSTERVISION_HOME/lanes.jsonl` (default `~/.clustervision/lanes.jsonl`);
+/// falls back to the working directory when no cv home can be resolved.
 pub fn ledger_path() -> PathBuf {
     crate::env::Env::current()
         .cv_home()
@@ -107,9 +154,13 @@ pub fn ledger_path() -> PathBuf {
         .join("lanes.jsonl")
 }
 
-/// Append one row: a single `O_APPEND` `write_all` of one line, so concurrent hooks never tear
-/// each other's records (the board's idiom; no lock needed for append-only rows).
+/// Append one stored lane event with `O_APPEND`, without a read-modify-write transaction.
+/// `write_all` may retry a short write: readers tolerate torn lines, not transactional append
+/// isolation. See [`crate::lockfile`] for stores that require serialized transactions.
 pub fn append_lane_event(ev: &LaneEvent) -> std::io::Result<()> {
+    if crate::env::frozen() {
+        return Err(std::io::Error::other("--frozen forbids writing lanes"));
+    }
     use std::io::Write;
     let path = ledger_path();
     if let Some(dir) = path.parent() {
@@ -135,11 +186,80 @@ pub fn read_ledger() -> Vec<LaneEvent> {
 /// The latest `stop` per bare agent id — what [`status_of`] consults.
 fn ledger_stops(rows: &[LaneEvent], session_id: &str) -> HashMap<String, DateTime<Utc>> {
     let mut m: HashMap<String, DateTime<Utc>> = HashMap::new();
-    for r in rows.iter().filter(|r| r.event == "stop" && r.session_id == session_id) {
+    for r in rows
+        .iter()
+        .filter(|r| r.event == LaneEventKind::Stop && r.session_id == session_id)
+    {
         let e = m.entry(r.agent_id.clone()).or_insert(r.ts);
         *e = (*e).max(r.ts);
     }
     m
+}
+
+/// How a harness's hook rows in the lane ledger name the lanes whose `stop` counts for a parent
+/// ([`crate::harness::Capabilities::lane_stops`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopScope {
+    /// Rows whose `session_id` is the parent: its direct sub-agents.
+    Parent,
+    /// Rows whose `agent_id` is any member of the parent's forest, at any depth (a descendant's
+    /// row names its own parent).
+    Forest,
+}
+
+/// Where a sub-agent transcript ends: the timestamp of its last conversational record (`user` or
+/// `assistant`) and of its last `SubagentStop` hook attachment. Claude Code appends a
+/// `SubagentStop` attachment each time the agent stops; a `SendMessage` resume appends new turns
+/// after it. So `stopped_at > last_turn_at` means the agent is parked — finished or waiting —
+/// and `last_turn_at > stopped_at` (or no stop at all) means it is running, or died without the
+/// hook firing (a harness restart). Keeps timing and error facts, discarding ordinary content after each record.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SubagentEnd {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_at: Option<DateTime<Utc>>,
+    /// The last API-error notice (`isApiErrorMessage`) with no real turn after it — what killed
+    /// the agent, if anything did. A resume clears it (the next real record is a new turn).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_error: Option<ApiErrorNotice>,
+}
+
+/// The harness-side status of one sub-agent, as the parent's own records report it
+/// (`completed` / `failed` / `killed` / `stopped`, Claude's `<task-notification>`), with the
+/// notice's timestamp. A notice fires each time the agent stops, so this is the LAST one per
+/// agent id ([`crate::harness::Adapter::task_notices`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskNotice {
+    pub status: String,
+    pub ts: Option<DateTime<Utc>>,
+}
+
+/// One of Claude Code's synthetic API-error notices, as the transcript records it: the notice
+/// text (`You've hit your session limit · resets 9pm (America/New_York)`, `Prompt is too long`),
+/// the `error` class (`rate_limit`, `invalid_request`), the HTTP status when present, and the
+/// quota's reset instant (`quotaLimits.resetsAt`, epoch seconds) for a rate limit.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct ApiErrorNotice {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<DateTime<Utc>>,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+impl SubagentEnd {
+    /// Parked (a `SubagentStop` fired after the last turn)? `None` when the transcript has no
+    /// stop record at all — which is *also* what a killed harness leaves behind, so the caller
+    /// pairs this with the parent's `<task-notification>` status before saying "running".
+    pub fn stopped(&self) -> Option<bool> {
+        let stop = self.stopped_at?;
+        Some(self.last_turn_at.is_none_or(|t| stop >= t))
+    }
 }
 
 /// One sub-agent, summarized.
@@ -172,7 +292,7 @@ pub struct Lane {
     pub tokens: LaneTokens,
     /// `running` · `completed` · `stopped` · `failed` · `killed` · `returned` (finished, no stop
     /// recorded — a lost notification), or a journaled workflow status.
-    pub status: String,
+    pub status: LaneStatus,
     pub status_source: StatusSource,
     /// The last assistant text turn — the return value for a finished agent, the last narration
     /// for a running one.
@@ -230,18 +350,6 @@ pub struct LaneTask {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_note: Option<String>,
     pub last_ts: DateTime<Utc>,
-}
-
-/// The first `CV_ENDPOINT=<kind>:<name>` a shell command sets (`export CV_ENDPOINT=lane:x; …`,
-/// `CV_ENDPOINT="lane:x" cv task …`). `<name>` never starts with `/`, so a URL
-/// (`CV_ENDPOINT=https://…`) is not an endpoint.
-#[cfg(test)]
-pub fn endpoint_in(text: &str) -> Option<String> {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r#"CV_ENDPOINT=["']?([A-Za-z0-9_.@-]+:[A-Za-z0-9_.@-][A-Za-z0-9_.@/:-]*)"#).expect("endpoint regex")
-    });
-    re.captures(text).map(|c| c[1].to_string())
 }
 
 /// The description's leading token as a lane slug: `FIX-KICK: a kick ends authority…` →
@@ -330,7 +438,7 @@ impl Lane {
 
     /// Finished with no stop recorded anywhere: the harness lost this lane's notification.
     pub fn lost_notification(&self) -> bool {
-        self.status == "returned"
+        self.status == LaneStatus::Returned
     }
 
     /// Any activity (start or last turn) at or after `since`.
@@ -339,7 +447,7 @@ impl Lane {
     }
 
     pub fn is_running(&self) -> bool {
-        self.status == "running"
+        self.status == LaneStatus::Running
     }
 }
 
@@ -443,14 +551,13 @@ pub fn tool_summary(name: &str, input: &crate::json::Json) -> Result<String> {
             "skill",
         ] {
             let Some(value) = view.get(key)? else { continue };
-            if let Some(head) = crate::projection::string_prefix(value, 81)? {
+            if let Some(head) = crate::projection::Head::of_string(value, 80)? {
                 return Ok(head);
             }
         }
-        let (head, _) = view.canonical_prefix(4 * 81)?;
+        let head = crate::projection::Head::of_json(view, 80)?;
         Ok(if head == "{}" { String::new() } else { head })
     })?;
-    let arg = crate::ir::truncate(&arg, 80);
     Ok(if arg.is_empty() {
         name.to_string()
     } else {
@@ -551,7 +658,7 @@ fn pass(r: &SessionRef) -> Result<Pass> {
     let mut seen = std::collections::HashSet::new();
     // Only response identity is needed beyond the ordinary IR. Keep source-backed arguments
     // without unrelated raw result metadata; demanded assistant reports retain their full text.
-    let opts = ParseOptions::usage();
+    let opts = Demand::USAGE.with_spans();
     let resolver = crate::lazy::Resolver::new(Some(r.path.clone()));
     let session = adapter.try_stream(
         r,
@@ -625,15 +732,15 @@ fn pass(r: &SessionRef) -> Result<Pass> {
 /// Resolve the status of one lane from its three possible sources, most authoritative first;
 /// with none of them, the transcript's own shape decides between `running` and `returned`.
 fn status_of(
-    sub: &SubagentInfo,
+    sub: &AgentRef,
     end: &SubagentEnd,
     notice: Option<&TaskNotice>,
     ledger_stop: Option<DateTime<Utc>>,
     ends_in_report: bool,
     now: DateTime<Utc>,
-) -> (String, StatusSource) {
+) -> (LaneStatus, StatusSource) {
     if let Some(s) = sub.result_status.as_deref().filter(|s| !s.is_empty()) {
-        return (s.to_string(), StatusSource::Journal);
+        return (LaneStatus::Recorded(s.to_string()), StatusSource::Journal);
     }
     // A notification that post-dates the last turn describes the current stop; an older one
     // describes a stop the agent has since been resumed from.
@@ -644,16 +751,16 @@ fn status_of(
             (None, _) => end.stopped() == Some(true),
         };
         if current {
-            return (n.status.clone(), StatusSource::TaskNotification);
+            return (LaneStatus::Recorded(n.status.clone()), StatusSource::TaskNotification);
         }
     }
     if end.stopped() == Some(true) {
-        return ("stopped".into(), StatusSource::SubagentStop);
+        return (LaneStatus::Stopped, StatusSource::SubagentStop);
     }
     // The hook ledger saw the stop before the transcript recorded it (or the harness never
     // wrote the attachment): a stop at or after the last turn parks the lane the same way.
     if ledger_stop.is_some_and(|ts| end.last_turn_at.is_none_or(|lt| ts >= lt)) {
-        return ("stopped".into(), StatusSource::HookLedger);
+        return (LaneStatus::Stopped, StatusSource::HookLedger);
     }
     // No journal, no notification, no stop hook — but the transcript ends in a final report and
     // has been quiet for a while: the lane returned and nobody recorded it (a harness restart
@@ -663,24 +770,24 @@ fn status_of(
         .last_turn_at
         .is_some_and(|t| now.signed_duration_since(t).num_seconds() >= RETURNED_QUIET_SECS);
     if ends_in_report && quiet {
-        return ("returned".into(), StatusSource::Transcript);
+        return (LaneStatus::Returned, StatusSource::Transcript);
     }
-    ("running".into(), StatusSource::Transcript)
+    (LaneStatus::Running, StatusSource::Transcript)
 }
 
 fn lane_of(
-    sub: SubagentInfo,
+    sub: AgentRef,
     notices: &HashMap<String, TaskNotice>,
     ledger: &HashMap<String, DateTime<Utc>>,
 ) -> Result<Lane> {
     let p = pass(&sub.session)?;
-    // `subagent_end` reads Claude's jsonl sidecars; other harnesses' child sessions live inside
-    // their own stores (a `.db` path here), where a jsonl scan is meaningless.
-    let end = if sub.session.harness == crate::ir::Harness::Claude {
-        subagent_end(&sub.session.path)
-    } else {
-        SubagentEnd::default()
-    };
+    // Only a store that records the end beside the transcript answers; other harnesses' child
+    // sessions live inside their own stores (a `.db` path here), where there is nothing to scan.
+    let end = crate::harness::rootless(sub.session.harness)
+        .map(|adapter| adapter.subagent_end(&sub.session.path))
+        .transpose()?
+        .flatten()
+        .unwrap_or_default();
     let agent_id = sub.agent_id().to_string();
     let (status, status_source) = status_of(
         &sub,
@@ -700,7 +807,7 @@ fn lane_of(
     let last_text = sub.result_summary.clone().or(p.last_text);
     let parked = matches!(status.as_str(), "completed" | "stopped" | "returned");
     let stranded = parked && last_text.as_deref().is_some_and(text_is_waiting);
-    let cause = failure_cause(&status, &end);
+    let cause = failure_cause(status.as_str(), &end);
     let notice = end
         .api_error
         .as_ref()
@@ -738,12 +845,29 @@ fn lane_of(
 /// orchestrator issued them, which is how a status table reads). Read failures are explicit so a
 /// changing or unreadable source cannot silently remove a lane from the forest.
 pub fn lanes_of(parent: &SessionRef) -> Result<Vec<Lane>> {
-    let subs = crate::subagent_tree_of(parent);
-    let notices = task_notices(&parent.path);
-    let ledger = if parent.harness == crate::ir::Harness::Claude {
-        ledger_stops(&read_ledger(), &parent.id)
-    } else {
-        HashMap::new()
+    let subs = crate::subagent_tree_of(parent)?;
+    let notices = crate::harness::rootless(parent.harness)
+        .map(|adapter| adapter.task_notices(parent))
+        .transpose()?
+        .unwrap_or_default();
+    let rows = read_ledger();
+    let ledger = match crate::harness::rootless(parent.harness).and_then(|adapter| adapter.capabilities().lane_stops) {
+        Some(StopScope::Parent) => ledger_stops(&rows, &parent.id),
+        Some(StopScope::Forest) => {
+            let agents: std::collections::HashSet<_> = subs.iter().map(|sub| sub.agent_id()).collect();
+            let mut stops = HashMap::new();
+            for row in rows
+                .iter()
+                .filter(|row| row.event == LaneEventKind::Stop && agents.contains(row.agent_id.as_str()))
+            {
+                stops
+                    .entry(row.agent_id.clone())
+                    .and_modify(|at: &mut DateTime<Utc>| *at = (*at).max(row.ts))
+                    .or_insert(row.ts);
+            }
+            stops
+        }
+        None => HashMap::new(),
     };
     let mut lanes = crate::par_filter_map(subs, |s| Some(lane_of(s, &notices, &ledger)))
         .into_iter()
@@ -756,8 +880,15 @@ pub fn lanes_of(parent: &SessionRef) -> Result<Vec<Lane>> {
 mod tests {
     use super::*;
 
+    /// The first `CV_ENDPOINT=<kind>:<name>` a shell command sets (`export CV_ENDPOINT=lane:x; …`,
+    /// `CV_ENDPOINT="lane:x" cv task …`). `<name>` never starts with `/`, so a URL
+    /// (`CV_ENDPOINT=https://…`) is not an endpoint.
+    fn endpoint_in(text: &str) -> Option<String> {
+        endpoint_from(crate::json::JsonView::from(&serde_json::json!(text))).unwrap()
+    }
+
     #[test]
-    fn streamed_endpoint_matches_existing_regex_across_decoded_chunks() {
+    fn streamed_endpoint_is_the_same_across_decoded_chunks_and_sources() {
         let dir = cv_testkit::temp_dir("streamed-lane-endpoint");
         let path = dir.join("command.json");
         let mut cases = vec![
@@ -780,15 +911,17 @@ mod tests {
             "CV_ENDPOINT={} CV_ENDPOINT=lane:after-invalid",
             "x".repeat(150_000)
         ));
-        for text in cases {
-            let expected = endpoint_in(&text);
+        let mut frozen = crate::emit::frozen::Frozen::new("lanes-endpoint");
+        for (n, text) in cases.into_iter().enumerate() {
             let value = serde_json::json!(text);
-            assert_eq!(endpoint_from(crate::json::JsonView::from(&value)).unwrap(), expected);
+            let expected = endpoint_from(crate::json::JsonView::from(&value)).unwrap();
             let encoded = serde_json::to_vec(&value).unwrap();
             std::fs::write(&path, &encoded).unwrap();
             let source = crate::json::Json::source(&path, 0, encoded.len() as u64).unwrap();
             assert_eq!(source.with_view(endpoint_from).unwrap(), expected);
+            frozen.insert(format!("{n:02}"), serde_json::json!(expected));
         }
+        frozen.check().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -821,7 +954,7 @@ mod tests {
             title: None,
             created_at: None,
             updated_at: None,
-            message_count: 0,
+            message_count: None,
         };
         let adapter = crate::harness::for_harness(reference.harness).unwrap();
         let whole = crate::stream::collect(adapter.as_ref(), &reference).unwrap();
@@ -942,7 +1075,7 @@ mod tests {
             messages: 0,
             tool_calls: 0,
             tokens: LaneTokens::default(),
-            status: "running".into(),
+            status: LaneStatus::Running,
             status_source: StatusSource::Transcript,
             last_text: None,
             last_tool: None,
@@ -1048,7 +1181,7 @@ mod tests {
     /// lane was resumed since); and a transcript that recorded its own stop keeps that source.
     #[test]
     fn a_ledger_stop_parks_a_lane_the_transcript_has_not_stopped() {
-        let sub = SubagentInfo {
+        let sub = AgentRef {
             session: SessionRef {
                 id: "agent-a1".into(),
                 harness: crate::ir::Harness::Claude,
@@ -1057,7 +1190,7 @@ mod tests {
                 title: None,
                 created_at: None,
                 updated_at: None,
-                message_count: 0,
+                message_count: None,
             },
             agent_type: None,
             description: None,
@@ -1074,15 +1207,15 @@ mod tests {
         };
         assert_eq!(
             status_of(&sub, &running, None, None, false, now),
-            ("running".into(), StatusSource::Transcript)
+            (LaneStatus::Running, StatusSource::Transcript)
         );
         assert_eq!(
             status_of(&sub, &running, None, DateTime::from_timestamp(100, 0), false, now),
-            ("stopped".into(), StatusSource::HookLedger)
+            (LaneStatus::Stopped, StatusSource::HookLedger)
         );
         assert_eq!(
             status_of(&sub, &running, None, DateTime::from_timestamp(50, 0), false, now),
-            ("running".into(), StatusSource::Transcript),
+            (LaneStatus::Running, StatusSource::Transcript),
             "a stop before the last turn is a stop the lane was resumed from"
         );
         let stopped = SubagentEnd {
@@ -1094,9 +1227,9 @@ mod tests {
             StatusSource::SubagentStop
         );
         // The reducer keeps the newest stop per agent, bare id.
-        let row = |ts: i64, ev: &str| LaneEvent {
+        let row = |ts: i64, event: LaneEventKind| LaneEvent {
             ts: DateTime::from_timestamp(ts, 0).unwrap(),
-            event: ev.into(),
+            event,
             session_id: "s".into(),
             agent_id: "a1".into(),
             agent_type: None,
@@ -1105,20 +1238,20 @@ mod tests {
             cwd: None,
             last_text: None,
         };
-        let mut unrelated = row(200, "stop");
+        let mut unrelated = row(200, LaneEventKind::Stop);
         unrelated.session_id = "another-parent".into();
         let stops = ledger_stops(
             &[
-                row(10, "start"),
-                row(20, "stop"),
-                row(30, "stop"),
-                row(5, "stop"),
+                row(10, LaneEventKind::Start),
+                row(20, LaneEventKind::Stop),
+                row(30, LaneEventKind::Stop),
+                row(5, LaneEventKind::Stop),
                 unrelated,
             ],
             "s",
         );
         assert_eq!(stops.get("a1").copied(), DateTime::from_timestamp(30, 0));
-        assert!(ledger_stops(&[row(300, "stop")], "another-parent").is_empty());
+        assert!(ledger_stops(&[row(300, LaneEventKind::Stop)], "another-parent").is_empty());
     }
 
     #[test]

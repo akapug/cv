@@ -54,6 +54,11 @@ deliberately don't write back to), Kimi CLI (a frozen store), OpenSession (an ex
 to resume in), and the two account-data **exports** (`chatgpt-export` / `claude-export`, registered
 via `cv config --add-export`).
 
+Claude Code 2.1.304 is the verified writer in the committed corpus, including request-ledger
+records, fork sub-agents, retries and the harness's `--max-turns` option. Unknown records are
+carried in complete reads rather than counted as turns; `cv doctor` compares observed writer
+versions with this corpus coverage.
+
 ## Claude Code sessions outside `~/.claude`
 
 Claude Code keeps its sessions in `~/.claude/projects/` unless `CLAUDE_CONFIG_DIR` moves its config
@@ -101,6 +106,10 @@ as a tree — see [sub-agent trees in the app](viewing-and-sharing.md).
 - **Claude Code** writes Task sub-agents to a sibling `<sid>/subagents/agent-<id>.jsonl` (each with a
   `.meta.json` carrying `agentType` and `description`). The discovery walk is depth-limited so these
   don't get mistaken for top-level sessions; they're attached to their parent instead.
+- **Kimi** keeps each sub-agent in `<session>/subagents/<agent_id>/context.jsonl`, **Kimi Code** in
+  `<session>/agents/agent-N/wire.jsonl`, and **Hermes** marks a delegate run with
+  `model_config._delegate_from`; discovery leaves them out and each parent's forest lists them, as
+  `<parent>/<agent>` for the two Kimis.
 - **Grok** tags subagent sessions with `session_kind: "subagent"` (primary sessions instead carry an
   `agent_name`); the kind is preserved in the message `extra`.
 - **Gemini** dir-nests subagent recordings under `chats/<parentId>/<id>.jsonl`; **Qwen** writes them to `subagents/<parentId>/agent-<id>.jsonl`.

@@ -39,6 +39,7 @@ fn main() -> Result<()> {
         &EmitOptions {
             new_id: Some("00000000-0000-0000-0000-000000000001".into()),
             thinking: mode,
+            parsed_at: emit::ParsedAt::for_port(reference.harness, target),
             ..Default::default()
         },
     )?;

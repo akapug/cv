@@ -27,7 +27,8 @@
 //!
 //! Fidelity notes / variants (sniffed by content, never a version field):
 //! - There are **no first-class tool-call structures** on disk. Models like gpt-oss embed tool calls
-//!   inline in the assistant text via channel markers; we preserve that text verbatim (no `ToolUse`).
+//!   inline in the assistant text via channel markers ([`super::wire::harmony`] decodes them; a call's
+//!   id is derived from its position, since the text carries none).
 //! - File attachments are references only (`fileIdentifier`), not inlined bytes; images → [`Block::Image`],
 //!   other files → [`Block::File`]. The actual bytes live under `~/.lmstudio/.internal/files/`.
 //! - Older/newer schema drift is handled by being totally tolerant: unknown step/part types are
@@ -39,7 +40,7 @@ use super::Adapter;
 use super::EmitResult;
 use crate::ir::*;
 use crate::json::{JsonSource, JsonView};
-use crate::stream::{Flow, MessageSink, ParseOptions};
+use crate::stream::{Demand, Flow, MessageSink, Tier};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -49,6 +50,10 @@ use std::path::{Path, PathBuf};
 pub struct LmStudio {
     root: Option<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: LmStudio = LmStudio { root: None };
 
 impl LmStudio {
     /// Read an explicit conversations directory, without consulting installed harness homes.
@@ -85,29 +90,29 @@ impl Adapter for LmStudio {
             .collect()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         let _cache_scope = crate::discover_cache::read::Context::current().enter();
         let Some(root) = &self.root else {
-            return Ok(vec![]);
+            return Ok(Default::default());
         };
-        let mut out = Vec::new();
-        let entries = match fs::read_dir(root) {
-            Ok(e) => e,
-            Err(_) => return Ok(vec![]),
+        // An unreadable conversations dir, and a file whose scan fails, are skipped and reported.
+        let mut out = crate::Discovered::default();
+        let Some(entries) = out.keep(root, fs::read_dir(root).map_err(Into::into)) else {
+            return Ok(out);
         };
-        for entry in entries.filter_map(|e| e.ok()) {
+        for entry in entries {
+            let Some(entry) = out.keep(root, entry.map_err(Into::into)) else {
+                continue;
+            };
             let path = entry.path();
             if !is_conversation_file(&path) {
                 continue;
             }
-            if let Some(reference) = crate::discover_cache::cached_scan(&path, || match scan(&path) {
-                Ok(reference) => reference,
-                Err(error) => {
-                    eprintln!("cv: skipping {}: {error:#}", path.display());
-                    None
-                }
-            }) {
-                out.push(reference);
+            if let Some(found) = crate::Skipped::listed(
+                &path,
+                crate::discover_cache::cached_scan_checked(&path, || scan(&path).map(Some)),
+            ) {
+                out.push(found);
             }
         }
         Ok(out)
@@ -115,7 +120,7 @@ impl Adapter for LmStudio {
 
     /// Walk the validated document and selected versions with scoped source views. Lazy text
     /// keeps byte spans; unused versions, unknown fields and internal steps never become Values.
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             let source = JsonSource::capture(&r.path)?;
             source
@@ -180,7 +185,7 @@ impl Adapter for LmStudio {
                     let mut session_model = None;
                     sink.meta(&s);
                     if let Some(messages) = doc.get("messages").map(JsonView::array).transpose()?.flatten() {
-                        'turns: for turn in messages {
+                        'turns: for (at, turn) in messages.enumerate() {
                             let turn = turn?;
                             if !turn.accepts_value()? {
                                 continue;
@@ -196,10 +201,10 @@ impl Adapter for LmStudio {
                             else {
                                 continue;
                             };
-                            let primary = projected_version(version, &mut session_model, opts)?;
+                            let primary = projected_version(version, &mut session_model, opts, At(at, selected))?;
                             let has_primary = primary.is_some();
                             if let Some(mut message) = primary {
-                                if opts.complete {
+                                if opts.tier == Tier::Complete {
                                     let bag = message.harness_extra_mut(Harness::LmStudio);
                                     bag.insert("currentlySelected".into(), Value::Number(selected.into()));
                                     bag.insert("version_count".into(), Value::Number(version_count.into()));
@@ -208,7 +213,7 @@ impl Adapter for LmStudio {
                                     break;
                                 }
                             }
-                            if opts.complete {
+                            if opts.tier == Tier::Complete {
                                 let mut throwaway_model = session_model.clone();
                                 if let Some(variants) = versions.array()? {
                                     for (index, version) in variants.enumerate() {
@@ -217,7 +222,7 @@ impl Adapter for LmStudio {
                                             continue;
                                         }
                                         if let Some(mut message) =
-                                            projected_version(version, &mut throwaway_model, opts)?
+                                            projected_version(version, &mut throwaway_model, opts, At(at, index))?
                                         {
                                             message.kind = MessageKind::Branch;
                                             let bag = message.harness_extra_mut(Harness::LmStudio);
@@ -305,10 +310,16 @@ fn projected_selected_version<'a>(
     Ok(selected.or(last).map(|(index, version)| (index, version, count)))
 }
 
+/// Where a version sits: `messages[.0].versions[.1]`. Harmony calls carry no id, so theirs derive
+/// from it ([`projected_text`]).
+#[derive(Clone, Copy)]
+struct At(usize, usize);
+
 fn projected_version(
     version: JsonView<'_>,
     session_model: &mut Option<String>,
-    opts: &ParseOptions,
+    opts: &Demand,
+    at: At,
 ) -> Result<Option<Message>> {
     let Some(version) = Fields::parse(version, &["role", "type", "steps", "content"])? else {
         return Ok(None);
@@ -329,11 +340,11 @@ fn projected_version(
     if string_is(version.get("type"), "multiStep")? {
         if let Some(steps) = version.get("steps").map(JsonView::array).transpose()?.flatten() {
             for step in steps {
-                projected_step(step?, &mut message, session_model, opts)?;
+                projected_step(step?, &mut message, session_model, opts, at)?;
             }
         }
     } else {
-        projected_content(version.get("content"), &mut message, false, opts)?;
+        projected_content(version.get("content"), &mut message, false, opts, at)?;
     }
     Ok((!message.content.is_empty() || (role == Role::Assistant && message.usage.is_some())).then_some(message))
 }
@@ -342,7 +353,8 @@ fn projected_step(
     step: JsonView<'_>,
     message: &mut Message,
     session_model: &mut Option<String>,
-    opts: &ParseOptions,
+    opts: &Demand,
+    at: At,
 ) -> Result<()> {
     let Some(step) = Fields::parse(step, &["type", "genInfo", "stepIdentifier", "style", "content"])? else {
         return Ok(());
@@ -356,12 +368,12 @@ fn projected_step(
             let model = gen.get("indexedModelIdentifier").or_else(|| gen.get("identifier"));
             if let Some(model) = model.map(|v| v.text(false)).transpose()?.flatten() {
                 let model = model.inline_str().expect("inline metadata");
-                match session_model {
-                    None => *session_model = Some(model.to_owned()),
-                    Some(current) if current != model && message.model.is_none() => {
-                        message.model = Some(model.to_owned())
-                    }
-                    _ => {}
+                if session_model.is_none() {
+                    *session_model = Some(model.to_owned());
+                }
+                // The first step with generation info names the model the turn ran under.
+                if message.model.is_none() {
+                    message.model = Some(model.to_owned());
                 }
             }
             if message.usage.is_none() {
@@ -403,7 +415,7 @@ fn projected_step(
     } else {
         false
     };
-    projected_content(step.get("content"), message, thinking, opts)
+    projected_content(step.get("content"), message, thinking, opts, at)
 }
 
 /// Only the integer prefix is demanded from a step identifier. Its random suffix (or leading
@@ -450,11 +462,12 @@ fn projected_content(
     content: Option<JsonView<'_>>,
     message: &mut Message,
     thinking: bool,
-    opts: &ParseOptions,
+    opts: &Demand,
+    at: At,
 ) -> Result<()> {
     let Some(content) = content else { return Ok(()) };
     if content.is_string()? {
-        return projected_text(content, message, thinking, opts);
+        return projected_text(content, message, thinking, opts, at);
     }
     if let Some(parts) = content.array()? {
         for part in parts {
@@ -467,7 +480,7 @@ fn projected_content(
             };
             if string_is(part.get("type"), "text")? {
                 if let Some(text) = part.get("text") {
-                    projected_text(text, message, thinking, opts)?;
+                    projected_text(text, message, thinking, opts, at)?;
                 }
             } else if string_is(part.get("type"), "file")? {
                 let data_ref = part
@@ -496,7 +509,7 @@ fn projected_content(
     Ok(())
 }
 
-fn projected_text(view: JsonView<'_>, message: &mut Message, thinking: bool, opts: &ParseOptions) -> Result<()> {
+fn projected_text(view: JsonView<'_>, message: &mut Message, thinking: bool, opts: &Demand, at: At) -> Result<()> {
     let Some(text) = view.lazy_text(opts.spans)? else {
         return Ok(());
     };
@@ -512,14 +525,25 @@ fn projected_text(view: JsonView<'_>, message: &mut Message, thinking: bool, opt
         });
     } else {
         let harmony = if let Some(text) = text.inline_str() {
-            super::harmony::looks_like_harmony(text)
+            super::wire::harmony::looks_like_harmony(text)
         } else {
             projected_harmony(view)?
         };
         if harmony {
             let inline = view.text(false)?.expect("string view");
-            message.content.extend(super::harmony::decode_content(
+            // The n-th call of `messages[turn].versions[version]`: `cv:harmony:<turn>.<version>.<n>`.
+            let mut n = message
+                .content
+                .iter()
+                .filter(|b| matches!(b, Block::ToolUse { .. }))
+                .count();
+            let mut call_id = || {
+                n += 1;
+                crate::ir::derived_call_id("harmony", format!("{}.{}.{}", at.0, at.1, n - 1))
+            };
+            message.content.extend(super::wire::harmony::decode_content(
                 inline.inline_str().expect("inline decoding"),
+                &mut call_id,
             ));
         } else {
             message.content.push(Block::Text { text });
@@ -542,7 +566,7 @@ fn projected_harmony(view: JsonView<'_>) -> Result<bool> {
     let mut found = false;
     view.for_each_str_chunk(|chunk| {
         if !found {
-            found = super::harmony::looks_like_harmony(chunk);
+            found = super::wire::harmony::looks_like_harmony(chunk);
             let mut boundary = [0u8; OVERLAP * 2];
             boundary[..tail.len()].copy_from_slice(&tail);
             let head = chunk.len().min(OVERLAP);
@@ -627,13 +651,13 @@ fn is_conversation_file(path: &Path) -> bool {
         return false;
     }
     match path.file_name().and_then(|n| n.to_str()) {
-        Some(name) => name.ends_with(".conversation.json") || name.ends_with(".json"),
+        Some(name) => name.ends_with(".json"),
         None => false,
     }
 }
 
 /// Build a cheap [`SessionRef`] without parsing every step.
-fn scan(path: &Path) -> Result<Option<SessionRef>> {
+fn scan(path: &Path) -> Result<SessionRef> {
     let source = JsonSource::capture(path)?;
     let doc = source.read_document(scan_view)?;
 
@@ -652,13 +676,13 @@ fn scan(path: &Path) -> Result<Option<SessionRef>> {
     let updated_at = file_mtime(path).or(created_at);
     let message_count = doc.messages.count;
 
-    Ok(Some(SessionRef {
+    Ok(SessionRef {
         title,
         created_at,
         updated_at,
-        message_count,
+        message_count: Some(message_count),
         ..SessionRef::new(id, Harness::LmStudio, path.to_path_buf())
-    }))
+    })
 }
 
 /// Validate one turn at a time, including unused versions/fields, while retaining only the
@@ -683,9 +707,9 @@ fn scan_view(view: JsonView<'_>) -> Result<Scan> {
     };
     let mut scan = Scan::default();
     if let Some(name) = fields.get("name") {
-        let mut head = TitleHead::default();
-        head.read(name, true)?;
-        let name = head.finish(true);
+        let mut head = crate::projection::Head::trimmed(crate::projection::Head::TITLE);
+        read_head(&mut head, name)?;
+        let name = title(head);
         scan.name = name.filter(|name| name != "Untitled" && !name.starts_with("Untitled -"));
     }
     if let Some(created) = fields.get("createdAt") {
@@ -722,93 +746,49 @@ fn scan_view(view: JsonView<'_>) -> Result<Scan> {
         if !string_is(version.get("role"), "user")? {
             continue;
         }
-        let mut head = TitleHead::default();
+        let mut head = crate::projection::Head::bounded(crate::projection::Head::TITLE);
         if let Some(content) = version.get("content") {
             if content.is_string()? {
-                head.read(content, false)?;
+                read_head(&mut head, content)?;
             } else if let Some(parts) = content.array()? {
                 let mut first = true;
                 for part in parts {
                     let Some(text) = part?.get("text")? else { continue };
                     if text.is_string()? {
                         if !first {
-                            head.push("\n", false);
+                            head.push("\n");
                         }
                         first = false;
-                        head.read(text, false)?;
+                        read_head(&mut head, text)?;
                     }
                 }
             }
         }
-        scan.messages.title = head.finish(false);
+        scan.messages.title = title(head);
         search_title = scan.messages.title.is_none();
     }
     Ok(scan)
 }
 
-/// Preserve trim/empty detection and truncate's character semantics without retaining a title
-/// candidate or its trailing whitespace. Keep one extra character to distinguish truncation.
-#[derive(Default)]
-struct TitleHead {
-    head: String,
-    chars: usize,
-    nonwhite: usize,
-}
-#[derive(Debug, thiserror::Error)]
-#[error("LM Studio title prefix complete")]
-struct TitleComplete;
-
-impl TitleHead {
-    // Called only inside read_document, after whole-source Value validation. A prefix stop
-    // still passes its enclosing source-identity check; only this local marker is swallowed.
-    fn read(&mut self, view: JsonView<'_>, trim: bool) -> Result<()> {
-        let result = view.for_each_str_chunk(|text| {
-            self.push(text, trim);
-            if self.complete(trim) {
-                Err(TitleComplete.into())
-            } else {
-                Ok(())
-            }
-        });
-        match result {
-            Err(error) if error.downcast_ref::<TitleComplete>().is_some() => Ok(()),
-            result => result.map(|_| ()),
-        }
-    }
-    fn complete(&self, trim: bool) -> bool {
-        self.chars == 81 && (self.nonwhite == 81 || (!trim && self.nonwhite > 0))
-    }
-    fn push(&mut self, text: &str, trim: bool) {
-        if self.complete(trim) {
-            return;
-        }
-        for c in text.chars() {
-            if trim && self.chars == 0 && c.is_whitespace() {
-                continue;
-            }
-            if self.chars < 81 {
-                self.head.push(c);
-            }
-            self.chars = (self.chars + 1).min(81);
-            if !c.is_whitespace() {
-                self.nonwhite = self.chars;
-            }
-            if self.complete(trim) {
-                return;
-            }
-        }
-    }
-    fn finish(self, trim: bool) -> Option<String> {
-        if self.nonwhite == 0 {
-            return None;
-        }
-        let head = if trim {
-            self.head.chars().take(self.nonwhite).collect()
+/// Feed a JSON string into a title [`Head`](crate::projection::Head), stopping once it is decided. Called
+/// only inside read_document, after whole-source Value validation: a prefix stop still passes its
+/// enclosing source-identity check; only the `Stop` it raises is swallowed.
+fn read_head(head: &mut crate::projection::Head, view: JsonView<'_>) -> Result<()> {
+    let result = view.for_each_str_chunk(|text| {
+        if head.push(text) {
+            Err(crate::stream::Stop.into())
         } else {
-            self.head
-        };
-        Some(crate::ir::truncate(&head, 80))
+            Ok(())
+        }
+    });
+    match result {
+        Err(error) if error.downcast_ref::<crate::stream::Stop>().is_some() => Ok(()),
+        result => result.map(|_| ()),
     }
+}
+/// A title, or none for a blank one.
+fn title(head: crate::projection::Head) -> Option<String> {
+    (!head.is_blank()).then(|| head.finish())
 }
 
 fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
@@ -819,14 +799,14 @@ fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::grok_qwen_tests::Frozen;
+    use crate::emit::frozen::Frozen;
     use crate::harness::Parse;
 
     /// The selected version of one `messages[]` turn, through the stream's codec.
     fn selected(turn: &Value) -> Option<Message> {
         let fields = Fields::parse(JsonView::from(turn), &["versions", "currentlySelected"]).unwrap()?;
         let (_, version, _) = projected_selected_version(&fields, fields.get("versions")?).unwrap()?;
-        projected_version(version, &mut None, &ParseOptions::full()).unwrap()
+        projected_version(version, &mut None, &Demand::RICH, At(0, 0)).unwrap()
     }
 
     /// The simple oracle for [`projected_step_timestamp`]: a whole-string integer prefix.
@@ -864,7 +844,7 @@ mod tests {
                     projected_selected_version(&fields, versions)
                         .unwrap()
                         .and_then(|(_, version, _)| {
-                            projected_version(version, &mut None, &ParseOptions::full()).unwrap()
+                            projected_version(version, &mut None, &Demand::RICH, At(0, 0)).unwrap()
                         })
                 } else {
                     None
@@ -880,11 +860,13 @@ mod tests {
                         projected_selected_version(&fields, versions).unwrap()
                     {
                         let mut model = None;
-                        let _ = projected_version(selected_version, &mut model, &ParseOptions::complete()).unwrap();
+                        let _ = projected_version(selected_version, &mut model, &Demand::COMPLETE, At(0, selected))
+                            .unwrap();
                         for (index, version) in versions.array().unwrap().unwrap().enumerate() {
                             if index != selected {
                                 if let Some(mut message) =
-                                    projected_version(version.unwrap(), &mut model, &ParseOptions::complete()).unwrap()
+                                    projected_version(version.unwrap(), &mut model, &Demand::COMPLETE, At(0, index))
+                                        .unwrap()
                                 {
                                     message.kind = MessageKind::Branch;
                                     message
@@ -945,7 +927,7 @@ mod tests {
         for (case, text) in cases.into_iter().enumerate() {
             fs::write(&path, &text).unwrap();
             let r = SessionRef::new("schema", Harness::LmStudio, path.clone());
-            let actual = crate::stream::collect_with(&LmStudio { root: None }, &r, &ParseOptions::full());
+            let actual = crate::stream::collect_with(&LmStudio { root: None }, &r, &Demand::RICH);
             frozen.insert(
                 format!("{case:02}"),
                 actual
@@ -976,7 +958,7 @@ mod tests {
             }
         }
         let error = LmStudio { root: None }
-            .stream(&r, &ParseOptions::lazy(), &mut MutatingSink(path))
+            .stream(&r, &Demand::LEAN.with_spans(), &mut MutatingSink(path))
             .unwrap_err();
         assert!(format!("{error:#}").contains("source changed"));
         fs::remove_dir_all(dir).unwrap();
@@ -998,11 +980,11 @@ mod tests {
         ]}]});
         fs::write(&path, value.to_string()).unwrap();
         let r = SessionRef::new("lazy", Harness::LmStudio, path.clone());
-        let lazy = crate::stream::collect_with(&LmStudio { root: None }, &r, &ParseOptions::lazy()).unwrap();
+        let lazy = crate::stream::collect_with(&LmStudio { root: None }, &r, &Demand::LEAN.with_spans()).unwrap();
         assert_eq!(lazy.messages.len(), 1);
-        assert!(matches!(&lazy.messages[0].content[0], Block::Thinking { text, .. } if text.is_span()));
-        assert!(matches!(&lazy.messages[0].content[1], Block::Text { text } if text.is_span()));
-        let full = crate::stream::collect_with(&LmStudio { root: None }, &r, &ParseOptions::full()).unwrap();
+        assert!(matches!(&lazy.messages[0].content[0], Block::Thinking { text, .. } if text.is_lazy()));
+        assert!(matches!(&lazy.messages[0].content[1], Block::Text { text } if text.is_lazy()));
+        let full = crate::stream::collect_with(&LmStudio { root: None }, &r, &Demand::RICH).unwrap();
         let mut lazy = lazy;
         lazy.materialize().unwrap();
         assert_eq!(
@@ -1046,7 +1028,7 @@ mod tests {
             for padding in [0, 65_533, 65_537, 65_540] {
                 let wire = format!("\"{}{marker}\"", "x".repeat(padding));
                 let decoded: String = serde_json::from_str(&wire)?;
-                let expected = super::super::harmony::looks_like_harmony(&decoded);
+                let expected = super::super::wire::harmony::looks_like_harmony(&decoded);
                 assert_eq!(projected_harmony(JsonView::from(&Value::String(decoded)))?, expected);
                 fs::write(&path, &wire)?;
                 let source = JsonSource::capture(&path)?;
@@ -1075,10 +1057,10 @@ mod tests {
         if !path.exists() {
             return; // fixture optional in minimal checkouts
         }
-        let r = scan(&path).unwrap().unwrap();
+        let r = scan(&path).unwrap();
         assert_eq!(r.id, "sample");
         assert_eq!(r.title.as_deref(), Some("Hello there"));
-        assert_eq!(r.message_count, 2);
+        assert_eq!(r.message_count, Some(2));
 
         let s = LmStudio { root: None }.parse(&r).unwrap();
 
@@ -1097,12 +1079,12 @@ mod tests {
         assert_eq!(a.role, Role::Assistant);
         assert!(matches!(a.content[0], Block::Thinking { .. }));
         match &a.content[0] {
-            Block::Thinking { text, .. } => assert_eq!(text, "the user said hi"),
+            Block::Thinking { text, .. } => assert_eq!(text.inline_str(), Some("the user said hi")),
             _ => unreachable!(),
         }
         assert_eq!(a.text().as_deref(), Some("Hi! How can I help?"));
-        // IR diet: the assistant's model equals the session default, so it is not repeated.
-        assert!(a.model.is_none());
+        // The turn's model from its genInfo; the first one seen is also the session's.
+        assert_eq!(a.model.as_deref(), Some("openai/gpt-oss-120b"));
         assert_eq!(s.model.as_deref(), Some("openai/gpt-oss-120b"));
         assert_eq!((u.kind, u.origin), (MessageKind::Prompt, Origin::Human));
         assert_eq!((a.kind, a.origin), (MessageKind::Reply, Origin::Model));
@@ -1110,6 +1092,29 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(12));
         assert_eq!(usage.output_tokens, Some(34));
         assert!(a.timestamp.is_some(), "timestamp from stepIdentifier");
+    }
+
+    #[test]
+    fn windowed_reads_keep_the_model() {
+        let _world = crate::test_world("lmstudio-windowed");
+        let dir = std::env::temp_dir().join(format!("cv-lmstudio-windowed-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let turn = |role: &str, text: &str, gen: &str| {
+            format!(
+                r#"{{"versions":[{{"type":"multiStep","role":"{role}","steps":[{{"type":"contentBlock","stepIdentifier":"1754425095001-0.91","content":[{{"type":"text","text":"{text}"}}]{gen}}}]}}],"currentlySelected":0}}"#
+            )
+        };
+        let gen = r#","genInfo":{"indexedModelIdentifier":"openai/gpt-oss-120b","stats":{"promptTokensCount":1,"predictedTokensCount":2}}"#;
+        let doc = format!(
+            r#"{{"name":"two turns","createdAt":1754425038609,"messages":[{},{},{},{}]}}"#,
+            turn("user", "hi", ""),
+            turn("assistant", "hello", gen),
+            turn("user", "again", ""),
+            turn("assistant", "hello again", gen)
+        );
+        fs::write(dir.join("two.conversation.json"), doc).unwrap();
+        crate::harness::assert_windowed_models(&LmStudio::with_root(&dir));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1161,7 +1166,7 @@ mod tests {
 
     #[test]
     fn variant_versions_emitted_as_branches_under_complete() {
-        use crate::stream::{collect_with, ParseOptions};
+        use crate::stream::{collect_with, Demand};
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1181,7 +1186,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let r = scan(&path).unwrap().unwrap();
+        let r = scan(&path).unwrap();
 
         // Default parse: only the selected version — no branches.
         let normal = LmStudio { root: None }.parse(&r).unwrap();
@@ -1190,7 +1195,7 @@ mod tests {
         assert!(normal.messages.iter().all(|m| m.kind != MessageKind::Branch));
 
         // Complete parse: the non-selected version rides along as a Branch turn.
-        let full = collect_with(&LmStudio { root: None }, &r, &ParseOptions::complete()).unwrap();
+        let full = collect_with(&LmStudio { root: None }, &r, &Demand::COMPLETE).unwrap();
         let branch = full
             .messages
             .iter()
@@ -1286,7 +1291,7 @@ mod tests {
         assert!(result.path.exists(), "emitted file exists");
 
         // Re-parse the emitted file with this adapter.
-        let r = scan(&result.path).unwrap().unwrap();
+        let r = scan(&result.path).unwrap();
         let parsed = LmStudio { root: None }.parse(&r).unwrap();
 
         assert_eq!(parsed.messages.len(), 2, "both turns survive");
@@ -1304,9 +1309,10 @@ mod tests {
             "thinking block round-trips via style.type==thinking"
         );
         assert_eq!(a.text().as_deref(), Some("Hi! How can I help?"));
-        assert!(
-            a.model.is_none(),
-            "model rides on the session, not repeated on the turn"
+        assert_eq!(
+            a.model.as_deref(),
+            Some("openai/gpt-oss-120b"),
+            "the turn's genInfo names its model"
         );
         assert_eq!(parsed.model.as_deref(), Some("openai/gpt-oss-120b"));
         let usage = a.usage.as_ref().expect("usage round-trips");
@@ -1324,7 +1330,7 @@ mod tests {
         if !path.exists() {
             return; // fixture optional in minimal checkouts
         }
-        let r = scan(&path).unwrap().unwrap();
+        let r = scan(&path).unwrap();
         let s = LmStudio { root: None }.parse(&r).unwrap();
         assert_eq!(s.messages.len(), 2);
 
@@ -1341,7 +1347,11 @@ mod tests {
             other => panic!("expected Thinking, got {other:?}"),
         }
         match &a.content[1] {
-            Block::ToolUse { name, input, .. } => {
+            Block::ToolUse { id, name, input, .. } => {
+                assert_eq!(
+                    id, "cv:harmony:1.0.0",
+                    "Harmony carries no id: the first call of messages[1]"
+                );
                 assert_eq!(name, "get_weather");
                 assert_eq!(input.resolve().unwrap()["location"], "San Francisco, CA");
             }
@@ -1354,8 +1364,8 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
-        // Model + usage still parsed from genInfo (model on the session, not repeated per message).
-        assert!(a.model.is_none());
+        // Model + usage still parsed from genInfo (on the turn, and the first one on the session).
+        assert_eq!(a.model.as_deref(), Some("openai/gpt-oss-120b"));
         assert_eq!(s.model.as_deref(), Some("openai/gpt-oss-120b"));
         assert_eq!(a.usage.as_ref().unwrap().output_tokens, Some(68));
     }
@@ -1384,7 +1394,7 @@ mod tests {
         )
         .unwrap();
 
-        let r = scan(&path).unwrap().unwrap();
+        let r = scan(&path).unwrap();
 
         struct StopFirst {
             seen: Vec<String>,
@@ -1396,9 +1406,7 @@ mod tests {
             }
         }
         let mut sink = StopFirst { seen: Vec::new() };
-        let s = LmStudio { root: None }
-            .stream(&r, &ParseOptions::full(), &mut sink)
-            .unwrap();
+        let s = LmStudio { root: None }.stream(&r, &Demand::RICH, &mut sink).unwrap();
 
         assert_eq!(sink.seen, vec!["one".to_string()]);
         assert!(s.messages.is_empty(), "stream returns empty messages");
@@ -1424,14 +1432,18 @@ mod tests {
             let chars: Vec<_> = text.chars().collect();
             for width in (1..19).chain(std::iter::once(chars.len().max(1))) {
                 for trim in [false, true] {
-                    let mut head = TitleHead::default();
+                    let mut head = match trim {
+                        true => crate::projection::Head::trimmed(80),
+                        false => crate::projection::Head::bounded(80),
+                    };
                     for chunk in chars.chunks(width) {
-                        head.push(&chunk.iter().collect::<String>(), trim);
+                        head.push(&chunk.iter().collect::<String>());
                     }
                     let expected = if trim { text.trim() } else { &text };
                     assert_eq!(
-                        head.finish(trim),
-                        (!text.trim().is_empty()).then(|| crate::ir::truncate(expected, 80))
+                        title(head),
+                        (!text.trim().is_empty())
+                            .then(|| crate::ir::truncate(expected, crate::projection::Head::TITLE))
                     );
                 }
             }
@@ -1447,12 +1459,12 @@ mod tests {
         std::fs::write(&path, &original).unwrap();
         let source = JsonSource::capture(&path).unwrap();
         let result = source.read_document(|view| {
-            let mut head = TitleHead::default();
-            head.read(view.get("name")?.unwrap(), true)?;
-            assert!(head.complete(true));
+            let mut head = crate::projection::Head::trimmed(80);
+            read_head(&mut head, view.get("name")?.unwrap())?;
+            assert!(head.done());
             // A prefix stop must not bypass the enclosing check when the unread tail changes.
             std::fs::write(&path, b"{}").unwrap();
-            Ok(head.finish(true))
+            Ok(title(head))
         });
         assert!(result.is_err());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1477,9 +1489,9 @@ mod tests {
         let first = adapter.discover()?;
         assert_eq!(first.len(), 8);
         for reference in &first {
-            let direct = scan(&reference.path)?.unwrap();
+            let direct = scan(&reference.path)?;
             assert_eq!(serde_json::to_value(reference)?, serde_json::to_value(&direct)?);
-            assert_eq!(reference.message_count, 128);
+            assert_eq!(reference.message_count, Some(128));
             let hit = crate::discover_cache::cached_scan(&reference.path, || {
                 panic!("discovery must have cached every unchanged conversation")
             })
@@ -1492,7 +1504,7 @@ mod tests {
         let refreshed = adapter.discover()?;
         let reference = refreshed.iter().find(|reference| reference.id == "0").unwrap();
         assert_eq!(reference.title.as_deref(), Some("changed"));
-        assert_eq!(reference.message_count, 2);
+        assert_eq!(reference.message_count, Some(2));
         fs::write(&changed, "not JSON")?;
         assert_eq!(adapter.discover()?.len(), 7);
         fs::write(&changed, r#"{"name":"repaired","messages":[]}"#)?;
@@ -1545,7 +1557,7 @@ mod tests {
         let mut frozen = Frozen::new("lmstudio-scan");
         for (case, text) in cases.into_iter().enumerate() {
             fs::write(&path, &text).unwrap();
-            let actual = scan(&path).ok().flatten().map(|r| {
+            let actual = scan(&path).ok().map(|r| {
                 assert_eq!(r.id, "sample");
                 assert_eq!(r.updated_at, file_mtime(&path).or(r.created_at));
                 (r.title, r.created_at, r.message_count)

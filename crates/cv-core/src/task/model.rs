@@ -80,7 +80,7 @@ pub enum TaskEventKind {
     Superseded {
         by_task: String,
     },
-    /// Add tags (deduplicated, lowercase labels such as `decision`, `deploy`, `lean`). Tags are
+    /// Add tags (deduplicated, case-sensitive labels such as `decision`, `deploy`, `lean`). Tags are
     /// additive: a task's tag set is the union of every `tagged` event on it.
     Tagged {
         tags: Vec<String>,
@@ -219,6 +219,16 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    /// Every state, in lifecycle order: the vocabulary `--state` accepts and `as_str` spells.
+    pub const ALL: [TaskState; 6] = [
+        TaskState::Open,
+        TaskState::Claimed,
+        TaskState::Done,
+        TaskState::Abandoned,
+        TaskState::Superseded,
+        TaskState::Resolved,
+    ];
+
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -226,7 +236,8 @@ impl TaskState {
         )
     }
 
-    pub fn as_str(self) -> &'static str {
+    /// The state's one spelling, the same as its serde name.
+    pub const fn as_str(self) -> &'static str {
         match self {
             TaskState::Open => "open",
             TaskState::Claimed => "claimed",
@@ -238,9 +249,35 @@ impl TaskState {
     }
 }
 
+impl std::str::FromStr for TaskState {
+    type Err = String;
+
+    /// One of [`TaskState::ALL`] by its spelling; an unknown word names the whole vocabulary.
+    fn from_str(s: &str) -> Result<Self, String> {
+        TaskState::ALL
+            .into_iter()
+            .find(|state| state.as_str() == s)
+            .ok_or_else(|| {
+                format!(
+                    "unknown state {s:?} (expected one of {})",
+                    TaskState::ALL.map(TaskState::as_str).join("|")
+                )
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_state_is_spelled_once() {
+        for state in TaskState::ALL {
+            assert_eq!(serde_json::to_value(state).unwrap(), state.as_str());
+            assert_eq!(state.as_str().parse::<TaskState>(), Ok(state));
+        }
+        assert!("redy".parse::<TaskState>().unwrap_err().contains("open|claimed|done"));
+    }
 
     fn event(kind: TaskEventKind) -> TaskEvent {
         TaskEvent {

@@ -81,6 +81,8 @@ impl SourceRegistry {
             Some(id) => {
                 let bytes = self.decoded.get(id).context("unknown staged decoded JSON")?.clone();
                 let len = bytes.len()?;
+                // A descriptor must name a complete JSON value; even an empty JSON string
+                // occupies two quote bytes, so a zero-length range cannot be valid.
                 anyhow::ensure!(
                     descriptor.len != 0
                         && descriptor

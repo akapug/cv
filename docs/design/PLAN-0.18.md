@@ -52,7 +52,7 @@ here, not the goal.
 
 Lessons kept: overlapping lanes integrate once on a branch; independent lanes land serially via
 dispatched CI (60 s poll); nothing compiles on the laptop (persvati; `-rc` tags for macOS
-artifacts); budgets `--write` per commit and every touched module falls or the commit says why;
+artifacts); size drift is reported against the last release tag and a module that grows says why;
 byte identity by hashed samples over an APFS clone; lanes capped at ~250K tokens with a
 continuation file at 200K; delete-first inside a lane.
 

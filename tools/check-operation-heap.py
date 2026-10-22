@@ -87,6 +87,26 @@ def write_rows(path, rows, payload_prefix="", row_prefix=b"", row_suffix=b"\n", 
             output.write(row_suffix)
 
 
+def rewind_gate(binary, root, env):
+    case = root / "rewind"
+    case.mkdir()
+    source = case / "source.jsonl"
+    prune_fixture(source, "thinking")
+    original = file_digest(source)
+    child = subprocess.run([str(binary), str(source), "rewind"], env=env, capture_output=True, text=True)
+    assert child.returncode == 0, f"rewind probe failed: {child.stderr[-2000:]}"
+    report = json.loads(child.stdout)
+    peak = checked_peak(report["heap"])
+    output = Path(report["result"]["new_path"])
+    # Frozen native output from67ad8bf9; includes the giant reasoning and linked tool result.
+    assert output.stat().st_size == 67117243
+    assert file_digest(output) == "4553371cfa62e4eabe181e4f4438c5b2443ac62487ec97524e8b193c0c412654"
+    assert file_digest(source) == original, "rewind modified source"
+    assert report["result"]["open_tool_calls"] == 0
+    print(json.dumps({"case":"rewind-native", "peak_live_rust_bytes":peak,
+                      "source_bytes":source.stat().st_size, "output_bytes":output.stat().st_size}))
+
+
 def prune_gate(binary, root, env, cases=("thinking", "ascii-declass", "unicode-declass")):
     # Frozen native sidecars (measured when the prune turn/linked-input paths landed). Hashes cover the
     # full decoded payload and metadata, without building a second giant owned Value tree.
@@ -379,7 +399,8 @@ def codex_thinking_gate(binary, root, env):
         peak = checked_peak(json.loads(child.stderr))
         output = Path(report["path"])
         digest, rows = codex_output_digest(output)
-        # Independent frozen whole-port output/report from the pre-projection dispatcher.
+        # Frozen whole-port output: partial usage has no invented total; the report
+        # declares timestamps supplied by the target (including split accounting turns).
         expected_digest, expected_rows, expected_report = CODEX_THINKING_EXPECTED[mode]
         assert digest == expected_digest and rows == expected_rows
         assert report["messages"] == 5 and report["fidelity"] == expected_report
@@ -390,22 +411,25 @@ def codex_thinking_gate(binary, root, env):
     shutil.rmtree(directory)
 
 
-CODEX_THINKING_EXPECTED = {'text': ['cc7670ce4e3e93f0ae3099f76bb771d2ff100c393486ed6302c3cefd4e16aa5d',
+CODEX_THINKING_EXPECTED = {'text': ['c6bc76805ca65ae2f0d545d380dd97b7b3cad84630acf7d51ab375ffcdca199e',
           14,
-          {'deltas': [{'field': 'thinking(signature)', 'before': '1', 'after': '0', 'expected': True},
-                      {'field': 'message ids', 'before': '4', 'after': '0', 'expected': True},
-                      {'field': 'message ids (tool turns)', 'before': '1', 'after': '0', 'expected': True}]}],
- 'drop': ['cb0d4dd02494a631c0d197a4951f4536fb5d27016d62f39e61dc88b5fd298562',
+          {'deltas': [{'what': 'thinking(signature)', 'a': '1', 'b': '0', 'expected': True, 'where': 'codex'},
+                      {'what': 'timestamps supplied by target', 'a': '4', 'b': '6', 'expected': True, 'where': 'codex'},
+                      {'what': 'message ids', 'a': '4', 'b': '0', 'expected': True, 'where': 'codex'},
+                      {'what': 'message ids (tool turns)', 'a': '1', 'b': '0', 'expected': True, 'where': 'codex'}]}],
+ 'drop': ['f44659d7fbb0e8de2c128e5eda50ad5b9e2917866f1c1c55ee82d3da85705190',
           13,
-          {'deltas': [{'field': 'thinking(text)', 'before': '1', 'after': '0', 'expected': True},
-                      {'field': 'thinking(signature)', 'before': '1', 'after': '0', 'expected': True},
-                      {'field': 'message ids', 'before': '4', 'after': '0', 'expected': True},
-                      {'field': 'message ids (tool turns)', 'before': '1', 'after': '0', 'expected': True}]}]}
+          {'deltas': [{'what': 'thinking(text)', 'a': '1', 'b': '0', 'expected': True, 'where': 'codex'},
+                      {'what': 'thinking(signature)', 'a': '1', 'b': '0', 'expected': True, 'where': 'codex'},
+                      {'what': 'timestamps supplied by target', 'a': '4', 'b': '5', 'expected': True, 'where': 'codex'},
+                      {'what': 'message ids', 'a': '4', 'b': '0', 'expected': True, 'where': 'codex'},
+                      {'what': 'message ids (tool turns)', 'a': '1', 'b': '0', 'expected': True, 'where': 'codex'}]}]}
 
 
 def gemini_output_digest(path):
-    """Fixed pretty fixture: normalize only validated messages[].id lines, not payload/tool IDs."""
-    pattern = re.compile(rb'(      "id": ")([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(",\n)')
+    """Fixed pretty fixture: normalize only validated messages[].id lines (name-based UUID v5),
+    not payload/tool IDs."""
+    pattern = re.compile(rb'(      "id": ")([0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(",\n)')
     digest = hashlib.sha256()
     ids = 0
     with path.open("rb") as source:
@@ -458,8 +482,8 @@ def cline_port_gate(binary, root, env):
     peak = checked_peak(json.loads(child.stderr))
     # Frozen legacy format loses timestamps and IDs; ownership changes preserve its report.
     assert report["messages"] == 4 and report["fidelity"] == dict(deltas=[
-        dict(field="timestamps", before="4", after="1", expected=False),
-        dict(field="message ids", before="4", after="0", expected=False)])
+        dict(what="timestamps", a="4", b="1", expected=False, where="cline"),
+        dict(what="message ids", a="4", b="0", expected=False, where="cline")])
     output = Path(report["path"])
     files = {
         "api_conversation_history.json": (33555154, "ce2ed1d91cd5c44afd871021a6a417c7a3bcde99ac31369715447509f515286c"),
@@ -611,6 +635,7 @@ def main():
                    CLUSTERVISION_HOME=str(root / "catalog"), RAYON_NUM_THREADS="1")
         binary = args.prune_probe.resolve(strict=True)
         prune_gate(binary, root, env)
+        rewind_gate(binary, root, env)
         usage_gate(binary, root, env)
         window_gate(window_binary(args.window_build_report), root, env)
         claude_port_gate(args.claude_port_probe.resolve(strict=True), root, env)

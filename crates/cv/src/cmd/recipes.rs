@@ -96,7 +96,7 @@ One selector at a time. Piped `cv show` with no selector over 200 KB prints the 
 
 13. What did I promise to do later, and does a task hold it?
     cv deferrals <id> --open-tasks               # exit 1 while any deferral is UNMATCHED — gate a closeout on it
-    cv deferrals <id> --since <msg> --json
+    cv deferrals <id> --at <msg> --json
     → [{index, timestamp, phrase, context, matched?: {task_id, title, state, shared}}]
 
 14. Hand a lane's context on without its transcript (distill)

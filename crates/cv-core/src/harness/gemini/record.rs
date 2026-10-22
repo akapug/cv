@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::harness::store::{document::Fields, text};
+use crate::harness::wire::genai::{self, Dialect, Part};
 use crate::json::{JsonSource, JsonView};
 use crate::lazy::{Resolver, Text};
 
@@ -33,7 +34,16 @@ pub(super) struct Demand<'a> {
     pub resolver: &'a Resolver,
 }
 
-impl Demand<'_> {
+impl<'a> Demand<'a> {
+    /// The read's demand over its captured `source`: under spans, large fields stay in it.
+    pub fn of(harness: Harness, demand: &stream::Demand, source: &'a JsonSource, resolver: &'a Resolver) -> Self {
+        Demand {
+            harness,
+            source: demand.spans.then_some(source),
+            resolver,
+        }
+    }
+
     fn spans(self) -> bool {
         self.source.is_some()
     }
@@ -51,8 +61,9 @@ impl Demand<'_> {
     }
 }
 
-/// The sink, rechecking the source after each delivered message that holds a source
-/// descriptor: a consumer must not go on with a descriptor of a source that has changed.
+/// The sink, rechecking the source after a slow callback handed a source descriptor (a consumer
+/// must not go on with a descriptor of a source that has changed); the reader's EOF check covers
+/// the fast ones.
 struct Out<'s> {
     sink: &'s mut dyn MessageSink,
     published: &'s mut bool,
@@ -67,11 +78,12 @@ impl Out<'_> {
             Block::ToolUse { input, .. } => matches!(input, crate::Json::Source(_)),
             _ => false,
         });
+        let started = std::time::Instant::now();
         let flow = self.sink.message(m);
         if sourced {
             *self.published = true;
             if let Some(source) = d.source {
-                source.check()?;
+                source.check_after(started)?;
             }
         }
         Ok(flow)
@@ -95,14 +107,13 @@ fn message(view: JsonView<'_>, d: Demand<'_>, st: &mut EmitState, out: &mut Out<
             let mut m = Message::new(Role::Assistant);
             m.id = id;
             m.timestamp = ts;
-            // The first model seen becomes `Session::model`; a turn records its own only when it
-            // differs (`Message::model` is the exception, not the rule — IR diet).
+            // The first model seen becomes `Session::model`; every turn carries the model its
+            // record states, so a read that starts mid-file reports the same model a full one does.
             if let Some(model) = rec.string("model")? {
-                match st.session_model.as_deref() {
-                    None => st.session_model = Some(model),
-                    Some(m0) if m0 != model => m.model = Some(model),
-                    _ => {}
+                if st.session_model.is_none() {
+                    st.session_model = Some(model.clone());
                 }
+                m.model = Some(model);
             }
             m.usage = rec.get("tokens").map(tokens).transpose()?.flatten();
 
@@ -379,13 +390,6 @@ pub(super) fn content_blocks(view: JsonView<'_>, d: Demand<'_>, out: &mut Vec<Bl
     Ok(false)
 }
 
-fn object_field<'a>(fields: &Fields<'a>, key: &str) -> Result<Option<JsonView<'a>>> {
-    match fields.get(key) {
-        Some(view) if view.is_object()? => Ok(Some(view)),
-        _ => Ok(None),
-    }
-}
-
 /// One Part: text / inlineData / fileData / functionCall / functionResponse. True when it has a
 /// `functionResponse` key, whatever its value or which field won dispatch.
 fn part_block(view: JsonView<'_>, d: Demand<'_>, out: &mut Vec<Block>) -> Result<bool> {
@@ -395,81 +399,51 @@ fn part_block(view: JsonView<'_>, d: Demand<'_>, out: &mut Vec<Block>) -> Result
         }
         return Ok(false);
     }
-    let Some(obj) = Fields::parse(
-        view,
-        &[
-            "functionCall",
-            "functionResponse",
-            "inlineData",
-            "fileData",
-            "text",
-            "thought",
-        ],
-    )?
-    else {
-        return Ok(false);
-    };
-    if let Some(fc) = object_field(&obj, "functionCall")? {
-        if let Some(fc) = Fields::parse(fc, &["name", "id", "args"])? {
-            let name = fc.string("name")?.unwrap_or_else(|| "tool".into());
-            let id = fc.string("id")?.unwrap_or_else(|| format!("{name}-call"));
-            out.push(Block::ToolUse {
-                id,
-                name,
-                input: match fc.get("args") {
-                    Some(args) => args.argument(d.spans())?,
-                    None => Value::Null.into(),
-                },
-                namespace: None,
-            });
+    let selected = genai::select(view, Dialect::Gemini)?;
+    match selected.part {
+        Some(Part::Call(fc)) => {
+            if let Some(fc) = Fields::parse(fc, &["name", "id", "args"])? {
+                let name = fc.string("name")?.unwrap_or_else(|| "tool".into());
+                let id = fc.string("id")?.unwrap_or_else(|| format!("{name}-call"));
+                out.push(Block::ToolUse {
+                    id,
+                    name,
+                    input: match fc.get("args") {
+                        Some(args) => args.argument(d.spans())?,
+                        None => Value::Null.into(),
+                    },
+                    namespace: None,
+                });
+            }
         }
-    } else if let Some(fr) = object_field(&obj, "functionResponse")? {
-        if let Some(fr) = Fields::parse(fr, &["name", "id", "response"])? {
-            let name = fr.string("name")?.unwrap_or_else(|| "tool".into());
-            let id = fr.string("id")?.unwrap_or_else(|| format!("{name}-call"));
-            out.push(Block::ToolResult {
-                tool_use_id: id,
-                content: match fr.get("response") {
-                    Some(response) => d.text(value_chunk(response)?)?,
-                    None => Text::default(),
-                },
-                is_error: false,
-                tool_name: Some(name),
-                status: None,
-                details: None,
-            });
+        Some(Part::Response(fr)) => {
+            if let Some(fr) = Fields::parse(fr, &["name", "id", "response"])? {
+                let name = fr.string("name")?.unwrap_or_else(|| "tool".into());
+                let id = fr.string("id")?.unwrap_or_else(|| format!("{name}-call"));
+                out.push(Block::ToolResult {
+                    tool_use_id: id,
+                    content: match fr.get("response") {
+                        Some(response) => d.text(value_chunk(response)?)?,
+                        None => Text::default(),
+                    },
+                    is_error: false,
+                    tool_name: Some(name),
+                    status: None,
+                    details: None,
+                });
+            }
         }
-    } else if let Some(inline) = object_field(&obj, "inlineData")? {
-        if let Some(inline) = Fields::parse(inline, &["mimeType"])? {
-            out.push(Block::Image {
-                media_type: inline.string("mimeType")?,
-                data_ref: None, // we don't inline base64 bytes into the IR
-            });
-        }
-    } else if let Some(fd) = object_field(&obj, "fileData")? {
-        if let Some(fd) = Fields::parse(fd, &["mimeType", "fileUri"])? {
-            out.push(Block::File {
-                mime: fd.string("mimeType")?,
-                path: None,
-                source: fd.string("fileUri")?,
-            });
-        }
-    } else if let Some(text) = obj.get("text").map(|v| v.lazy_text(d.spans())).transpose()?.flatten() {
-        if !text.is_empty() {
-            let thought = obj.get("thought").map(JsonView::as_bool).transpose()?.flatten() == Some(true);
-            out.push(if thought {
-                Block::Thinking {
-                    text,
-                    signature: None,
-                    encrypted: None,
-                    redacted: false,
+        Some(Part::Media(block)) => out.push(block),
+        Some(Part::Text { value, thought, .. }) => {
+            if let Some(text) = value.lazy_text(d.spans())? {
+                if !text.is_empty() {
+                    out.push(genai::text_block(text, thought, None));
                 }
-            } else {
-                Block::Text { text }
-            });
+            }
         }
+        None => {}
     }
-    Ok(obj.get("functionResponse").is_some())
+    Ok(selected.response_present)
 }
 
 /// One piece of a tool result or thought: nothing, a string, or a value shown as compact JSON.
@@ -724,33 +698,41 @@ impl Demand<'_> {
         }));
         type_user_turn_from(m, &info.trimmed);
         if st.title.is_none() && info.has_text && !is_ignored_user_content(&info.trimmed) {
-            st.title = Some(crate::ir::truncate(&info.head, 80));
+            st.title = Some(info.head.finish());
         }
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct TextInfo {
-    head: String,
-    head_chars: usize,
+    head: crate::projection::Head,
     trimmed: String,
     trimmed_chars: usize,
     has_text: bool,
     nonwhite: bool,
 }
 
+impl Default for TextInfo {
+    fn default() -> Self {
+        Self {
+            head: crate::projection::Head::bounded(crate::projection::Head::TITLE),
+            trimmed: String::new(),
+            trimmed_chars: 0,
+            has_text: false,
+            nonwhite: false,
+        }
+    }
+}
+
 impl TextInfo {
     fn complete(&self) -> bool {
-        self.head_chars == 81 && self.trimmed_chars == 64
+        self.head.done() && self.trimmed_chars == 64
     }
 
     fn feed(&mut self, s: &str) {
         self.has_text |= !s.is_empty();
         for c in s.chars() {
-            if self.head_chars < 81 {
-                self.head.push(c);
-                self.head_chars += 1;
-            }
+            self.head.push_char(c);
             if !self.nonwhite && !c.is_whitespace() {
                 self.nonwhite = true;
             }
@@ -814,5 +796,39 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod genai_contracts {
+    use super::*;
+    use crate::harness::wire::genai_frozen as frozen;
+    #[test]
+    fn decoder_matches_independent_frozen_parts() -> Result<()> {
+        let world = crate::test_world("gemini-genai-frozen");
+        let path = world.base.join("parts.json");
+        let resolver = Resolver::new(Some(path.clone()));
+        let mut rows = Vec::new();
+        for (case, parts) in frozen::cases().into_iter().enumerate() {
+            let value = parts;
+            let bytes = serde_json::to_vec(&value)?;
+            std::fs::write(&path, &bytes)?;
+            let source = JsonSource::capture(&path)?;
+            for demand in 0..2 {
+                let (blocks, flag) = source.read_range_value(0, source.len(), |view| {
+                    let d = Demand {
+                        harness: Harness::Gemini,
+                        source: if demand == 0 { None } else { Some(&source) },
+                        resolver: &resolver,
+                    };
+                    let mut blocks = Vec::new();
+                    let flag = content_blocks(view, d, &mut blocks)?;
+                    Ok((blocks, flag))
+                })?;
+                rows.push(serde_json::json!({"case":case,"demand":demand,"source_sha256":crate::digest::sha256_hex(&bytes),"result":frozen::row(blocks,flag,&resolver)?}));
+            }
+            assert_eq!(std::fs::read(&path)?, bytes, "decoder changed source");
+        }
+        frozen::assert_frozen(rows, include_str!("../../../tests/fixtures/wire/gemini-parts.jsonl"))
     }
 }

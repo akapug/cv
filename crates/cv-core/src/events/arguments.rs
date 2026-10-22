@@ -1,5 +1,5 @@
 //! Tool projections retain command prefixes and patch target lines, never unrelated argument trees.
-use crate::affordance::input::{self, Prefix};
+use crate::affordance::input;
 use crate::json::JsonView;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -203,7 +203,7 @@ impl Trigger {
 }
 
 pub(super) fn command_rows(view: JsonView<'_>, cap: usize) -> Result<Option<(String, Vec<String>)>> {
-    let mut prefix = Prefix::new(cap);
+    let mut prefix = crate::projection::Head::bounded(cap);
     let mut trigger = Trigger::default();
     let exists = command_chunks(view, |chunk| {
         prefix.push(chunk);
@@ -221,7 +221,14 @@ pub(super) fn command_rows(view: JsonView<'_>, cap: usize) -> Result<Option<(Str
             patch.push(chunk);
             Ok(())
         })?;
-        patch.finish()
+        // A compound shell command may change directories before applying a patch. Without
+        // interpreting shell grammar, only a leading apply_patch has a known relative base.
+        // Absolute headers remain usable; native completions supply unresolved relative edits.
+        patch
+            .finish()
+            .into_iter()
+            .filter(|path| trigger.apply || std::path::Path::new(path).is_absolute())
+            .collect()
     } else {
         Vec::new()
     };
@@ -303,14 +310,19 @@ mod tests {
     }
 
     #[test]
-    fn chunked_patch_matches_owned_oracle() {
-        for text in [
-            "--- a/a\n+++ b/a\n*** Add File: later\n+body\n*** Move to: renamed\n*** Add File: later\n",
-            "--- a/a\n+++ b/a\n+++ b/b\n+++ /dev/null\n",
-            "+++ b/not-a-patch\n+irrelevant\n",
-            "\u{2003}*** Update File: λ.rs\r\n*** Delete File: /dev/null\n",
+    fn chunked_patch_yields_the_same_targets_at_every_width() {
+        for (text, expected) in [
+            (
+                "--- a/a\n+++ b/a\n*** Add File: later\n+body\n*** Move to: renamed\n*** Add File: later\n",
+                vec!["later", "renamed"],
+            ),
+            ("--- a/a\n+++ b/a\n+++ b/b\n+++ /dev/null\n", vec!["a", "b"]),
+            ("+++ b/not-a-patch\n+irrelevant\n", vec![]),
+            (
+                "\u{2003}*** Update File: λ.rs\r\n*** Delete File: /dev/null\n",
+                vec!["λ.rs"],
+            ),
         ] {
-            let expected = super::super::patch_targets(text);
             for width in 1..32 {
                 let mut patch = Patch::default();
                 let mut start = 0;

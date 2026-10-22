@@ -137,6 +137,7 @@ pub struct InboxCounts {
     pub provisional: usize,
     pub assigned: usize,
     pub claimed: usize,
+    /// Unread open items only; unread rows in closed are not included.
     pub unread: usize,
     pub closed: usize,
 }

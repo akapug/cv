@@ -268,7 +268,7 @@ pub(crate) fn exercise_frozen(
     direct: fn(&Session, &Path, &crate::emit::EmitOptions) -> Result<crate::harness::EmitResult>,
     writer: impl Fn(&Session, &crate::emit::EmitOptions, &mut Connection) -> Result<()>,
 ) -> Result<()> {
-    let mut frozen = crate::emit::grok_qwen_tests::Frozen::new(name);
+    let mut frozen = crate::emit::frozen::Frozen::new(name);
     exercise_with(
         target,
         |mode, rows| {

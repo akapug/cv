@@ -21,17 +21,61 @@ const TOP: &[&str] = &[
     "synthetic_reason",
 ];
 
+#[derive(Clone, Copy)]
+enum Kind {
+    Turn(Role),
+    ToolResult,
+    Reasoning,
+}
+
+/// The shared record projection and classification. Demands choose what to resolve from it;
+/// neither discovery nor message decoding has its own wire grammar.
+struct Record<'a> {
+    top: Fields<'a>,
+    kind: Kind,
+}
+
+impl<'a> Record<'a> {
+    fn parse(view: JsonView<'a>) -> Result<Option<Self>> {
+        let Some(top) = Fields::parse(view, TOP)? else {
+            return Ok(None);
+        };
+        let kind = match top.string("type")?.as_deref() {
+            Some("system") => Kind::Turn(Role::System),
+            Some("user") => Kind::Turn(Role::User),
+            Some("assistant") => Kind::Turn(Role::Assistant),
+            Some("tool_result") => Kind::ToolResult,
+            Some("reasoning") => Kind::Reasoning,
+            _ => return Ok(None),
+        };
+        Ok(Some(Self { top, kind }))
+    }
+
+    fn title(&self) -> Result<Option<String>> {
+        if !matches!(self.kind, Kind::Turn(Role::User)) {
+            return Ok(None);
+        }
+        super::super::wire::text_title(self.top.get("content"))
+    }
+}
+
+/// Discovery demand: title text only, without reasoning, arguments or tool outputs.
+pub(super) fn discovery_title(view: JsonView<'_>) -> Result<Option<String>> {
+    Record::parse(view)?
+        .map(|record| record.title())
+        .transpose()
+        .map(Option::flatten)
+}
+
 /// One record: whether it is a standalone `reasoning` record (which joins the next turn), and
 /// its message. `spans` is the captured source when the demand keeps large strings in it.
 pub(super) fn message(
     view: JsonView<'_>,
     spans: Option<&JsonSource>,
     enrich: &HashMap<String, ToolEnrich>,
+    resolver: &crate::Resolver,
 ) -> Result<(bool, Option<Message>)> {
-    let Some(top) = Fields::parse(view, TOP)? else {
-        return Ok((false, None));
-    };
-    let Some(ty) = top.string("type")? else {
+    let Some(Record { top, kind }) = Record::parse(view)? else {
         return Ok((false, None));
     };
     let text = |v: JsonView<'_>| {
@@ -43,7 +87,7 @@ pub(super) fn message(
     };
 
     // tool_result lines become a distinct Tool-role message so conversions re-encode them correctly.
-    if ty == "tool_result" {
+    if matches!(kind, Kind::ToolResult) {
         let tool_use_id = top.string("tool_call_id")?.unwrap_or_default();
         let content = join(top.get("content"), spans)?;
         let e = enrich.get(&tool_use_id);
@@ -62,7 +106,7 @@ pub(super) fn message(
     // 1.0.5x writes reasoning as its own record before the assistant turn it belongs to:
     // `{type: reasoning, id, summary: [{type: summary_text, text}], encrypted_content?}`. Older
     // versions nest it in the assistant line (`reasoning{text,encrypted}`, below).
-    if ty == "reasoning" {
+    if matches!(kind, Kind::Reasoning) {
         let summary = top.get("summary").filter(|v| v.is_array().unwrap_or(false));
         let text = join(summary, spans)?;
         let encrypted = top.string("encrypted_content")?;
@@ -79,11 +123,8 @@ pub(super) fn message(
         return Ok((true, Some(m)));
     }
 
-    let role = match ty.as_str() {
-        "system" => Role::System,
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        _ => return Ok((false, None)),
+    let Kind::Turn(role) = kind else {
+        anyhow::bail!("Grok record is not a turn");
     };
     let mut m = Message::new(role);
     let content = join(top.get("content"), spans)?;
@@ -92,7 +133,7 @@ pub(super) fn message(
     match role {
         // The system prompt (also `system_prompt.txt`, mirrored into `Session::system_prompt`).
         Role::System => m.kind = MessageKind::SystemPrompt,
-        Role::User => (m.kind, m.origin) = user_kind_origin(synthetic.as_deref(), &content)?,
+        Role::User => (m.kind, m.origin) = user_kind_origin(synthetic.as_deref(), &content, resolver)?,
         _ => {}
     }
 
@@ -124,9 +165,10 @@ pub(super) fn message(
         for call in calls {
             let block = openai::tool_call_from_view(call?, spans.is_some())?;
             let Block::ToolUse { id, .. } = &block else {
-                unreachable!()
+                anyhow::bail!("Grok tool call did not decode as a tool use");
             };
-            // Stash sidecar enrichment so nothing is lost (ir.rs has no field for it yet).
+            // Grok-specific sidecar title/kind/locations belong in the harness bag;
+            // preserve them there without inventing shared IR fields.
             if let Some(e) = enrich.get(id) {
                 let mut info = serde_json::Map::new();
                 if let Some(t) = &e.title {
@@ -179,7 +221,9 @@ pub(super) fn message(
 /// `text` of each part joined by newlines. Under spans, one large string stays in the source and
 /// several parts are joined into the source's private decoded backing, never owned.
 fn join(view: Option<JsonView<'_>>, spans: Option<&JsonSource>) -> Result<Text> {
-    super::super::wire::joined_text(view, spans, &mut |view| match spans {
+    use super::super::wire;
+    let backing = spans.map_or(wire::Backing::Inline, wire::Backing::Source);
+    wire::joined(view, wire::TEXT, backing, &mut |view| match spans {
         Some(_) => view.source_text(),
         None => view.text(false),
     })
@@ -190,10 +234,15 @@ fn join(view: Option<JsonView<'_>>, spans: Option<&JsonSource>) -> Result<Text> 
 /// `<system-reminder>` skill/rule blocks and background-task notices (flagged by
 /// `synthetic_reason`) and the unflagged `<user_info>` environment block — all InjectedContext /
 /// Harness. A `compaction_meta` turn is the summary that seeds the post-compaction window.
-fn user_kind_origin(synthetic: Option<&str>, content: &Text) -> Result<(MessageKind, Origin)> {
+fn user_kind_origin(
+    synthetic: Option<&str>,
+    content: &Text,
+    resolver: &crate::Resolver,
+) -> Result<(MessageKind, Origin)> {
     let user_info = || -> Result<bool> {
-        let (head, _) = document::text_head(content, &crate::lazy::Resolver::new(None), 11, true)?;
-        Ok(head == "<user_info>")
+        const USER_INFO: &str = "<user_info>";
+        let (head, _) = document::text_head(content, resolver, USER_INFO.chars().count(), true)?;
+        Ok(head == USER_INFO)
     };
     Ok(match synthetic {
         // After a compaction 1.0.5x re-tags the leading `<user_info>` block `compaction_meta` too;

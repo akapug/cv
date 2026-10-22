@@ -9,7 +9,7 @@
 
 use crate::ir::{home_rel, Harness, Message, SessionRef, Usage};
 use crate::spill::{ExactStrings, Ordered, Record};
-use crate::stream::{Flow, ParseOptions};
+use crate::stream::{Demand, Flow};
 #[cfg(feature = "sqlite")]
 mod usage_cache;
 use anyhow::{Context, Result};
@@ -26,7 +26,10 @@ pub const TOP_CWDS: usize = 10;
 #[derive(Debug, Clone, Default)]
 pub struct CorpusStats {
     pub sessions: usize,
+    /// Turns over the counted sessions; an uncounted session (`message_count` `None`) adds nothing.
     pub messages: usize,
+    /// Sessions whose turns no listing, full read or index has counted yet.
+    pub uncounted: usize,
     pub by_harness: Vec<(&'static str, usize)>,
     /// Every cwd, home-relative (`~/dev/x`), `(no cwd)` for sessions that record none. The full
     /// list; [`CorpusStats::to_json`] and the table take the first [`TOP_CWDS`].
@@ -45,7 +48,10 @@ impl CorpusStats {
         };
         for r in refs {
             *per_harness.entry(r.harness.as_str()).or_default() += 1;
-            stats.messages += r.message_count;
+            match r.message_count {
+                Some(n) => stats.messages += n,
+                None => stats.uncounted += 1,
+            }
             let cwd = r.cwd.as_deref().map(home_rel).unwrap_or_else(|| "(no cwd)".into());
             *per_cwd.entry(cwd).or_default() += 1;
             if let Some(c) = r.created_at {
@@ -63,7 +69,7 @@ impl CorpusStats {
     }
 
     /// The `cv stats --json` payload, whose top-level keys are exactly `sessions, messages,
-    /// by_harness, top_cwds, earliest_created, latest_updated`. `by_harness` is an object in
+    /// uncounted, by_harness, top_cwds, earliest_created, latest_updated`. `by_harness` is an object in
     /// descending-count order (the workspace's serde_json keeps insertion order).
     pub fn to_json(&self) -> Value {
         let by_harness: serde_json::Map<String, Value> =
@@ -77,6 +83,7 @@ impl CorpusStats {
         json!({
             "sessions": self.sessions,
             "messages": self.messages,
+            "uncounted": self.uncounted,
             "by_harness": by_harness,
             "top_cwds": top_cwds,
             "earliest_created": self.earliest_created.map(|d| d.to_rfc3339()),
@@ -184,21 +191,10 @@ struct UsageHit {
     usage: Usage,
 }
 
-/// The identity that makes two messages *the same API call*, when the harness records one.
-///
-/// Claude Code writes one JSONL line per content block of a streamed response, each repeating the
-/// response's `usage`, and a resumed session copies its predecessor's history into the new file —
-/// so the same `message.id` recurs within and across transcripts. Other harnesses record usage once
-/// per call and carry no such id, so they are never deduplicated.
+/// The identity that makes two messages *the same API call*, when the harness records one
+/// ([`crate::harness::Adapter::usage_key`]); a harness without one is never deduplicated.
 pub(crate) fn usage_key(h: Harness, m: &Message) -> Option<String> {
-    match h {
-        Harness::Claude => m
-            .harness_extra(Harness::Claude)
-            .and_then(|b| b.get("message.id"))
-            .and_then(Value::as_str)
-            .map(|id| format!("claude:{id}")),
-        _ => None,
-    }
+    crate::harness::rootless(h)?.usage_key(m)
 }
 
 /// A transcript is staged until EOF: failures discard every hit and missing per-message models
@@ -232,10 +228,10 @@ fn usage_hits(
         return Ok(None);
     };
     #[cfg(feature = "sqlite")]
-    // Tiny native transcripts cost less to parse than to validate and replay a ledger.
+    // Below its adapter's floor a transcript costs less to parse than to validate and replay a ledger.
     let cache = cache.filter(|_| {
-        !matches!(r.harness, Harness::Claude | Harness::Codex)
-            || std::fs::metadata(adapter.resume_source(r)).is_ok_and(|metadata| metadata.len() >= 64 * 1024)
+        let floor = adapter.capabilities().usage_cache_floor;
+        floor == 0 || std::fs::metadata(adapter.resume_source(r)).is_ok_and(|metadata| metadata.len() >= floor)
     });
     #[cfg(feature = "sqlite")]
     let source = cache.map(|_| crate::source::Probe::default().snapshot(r));
@@ -288,7 +284,7 @@ fn usage_hits(
         reads.record(&adapter.resume_source(r));
     }
     // Usage identity is selected without materializing unrelated rich sidecars.
-    let session = adapter.try_stream(r, &ParseOptions::usage(), &mut sink);
+    let session = adapter.try_stream(r, &Demand::USAGE.with_spans(), &mut sink);
     if let Some(error) = sink.error.take() {
         return Err(error);
     }
@@ -395,11 +391,15 @@ fn read_string(reader: &mut impl BufRead, limit: Option<usize>) -> Result<Option
     }
 }
 
-fn subagent_usage_refs(r: &SessionRef) -> Vec<SessionRef> {
-    match r.harness {
-        Harness::Claude => crate::harness::claude::subagent_session_refs(&r.path),
-        _ => crate::subagent_tree_of(r).into_iter().map(|s| s.session).collect(),
-    }
+/// Token aggregation needs the full forest and its metadata order, without task descriptions or
+/// journaled return bodies ([`crate::SubagentDemand::Sessions`]).
+fn subagent_usage_refs(r: &SessionRef) -> Result<Vec<SessionRef>> {
+    Ok(
+        crate::subagent_tree_filtered_of(r, crate::SubagentDemand::Sessions, None, |_, _| true)?
+            .into_iter()
+            .map(|s| s.session)
+            .collect(),
+    )
 }
 
 fn parse_workers() -> usize {
@@ -467,10 +467,15 @@ impl TokenStats {
             sessions: refs.len(),
             ..TokenStats::default()
         };
-        let subs: Vec<SessionRef> = crate::par_flat_map(refs.to_vec(), |r| subagent_usage_refs(&r));
+        let subs: Vec<SessionRef> = crate::par_flat_map(refs.to_vec(), |r| vec![subagent_usage_refs(&r)])
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         stats.subagents = subs.len();
         let mut fold = TokenFold::default();
-        // Bound completed spool retention to one 256KiB allowance per configured worker.
+        // Bound completed spool retention to one spill::ordered::MEMORY_BYTES per configured worker.
         // Main sessions precede every subagent, matching the existing first-response-ID oracle.
         for group in [refs, subs.as_slice()] {
             for chunk in group.chunks(parse_workers()) {
@@ -615,9 +620,10 @@ impl TokenFold {
 
 /// The keys `cv stats --json` / `GET /api/stats` carry, in order.
 #[cfg(test)]
-pub const STATS_KEYS: [&str; 6] = [
+pub const STATS_KEYS: [&str; 7] = [
     "sessions",
     "messages",
+    "uncounted",
     "by_harness",
     "top_cwds",
     "earliest_created",
@@ -642,7 +648,7 @@ mod tests {
             updated_at: DateTime::parse_from_rfc3339(updated)
                 .ok()
                 .map(|d| d.with_timezone(&Utc)),
-            message_count: msgs,
+            message_count: Some(msgs),
         }
     }
 
@@ -673,11 +679,23 @@ mod tests {
                 "2026-02-01T00:00:00Z",
                 "2026-02-02T00:00:00Z",
             ),
+            // A listing that read only metadata: not in the sum, reported beside it.
+            SessionRef {
+                message_count: None,
+                ..r(
+                    "d",
+                    Harness::Zed,
+                    0,
+                    Some("/w/two"),
+                    "2026-01-03T00:00:00Z",
+                    "2026-01-04T00:00:00Z",
+                )
+            },
         ];
         let s = CorpusStats::compute(&refs);
-        assert_eq!((s.sessions, s.messages), (3, 15));
+        assert_eq!((s.sessions, s.messages, s.uncounted), (4, 15, 1));
         // Descending count, ties by name.
-        assert_eq!(s.by_harness, vec![("codex", 2), ("claude", 1)]);
+        assert_eq!(s.by_harness, vec![("codex", 2), ("claude", 1), ("zed", 1)]);
         assert_eq!(s.top_cwds[0], ("/w/one".to_string(), 2));
         assert!(s.top_cwds.iter().any(|(c, n)| c == "(no cwd)" && *n == 1));
 
@@ -690,7 +708,8 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(harnesses, ["codex", "claude"], "by_harness stays rank-ordered");
+        assert_eq!(harnesses, ["codex", "claude", "zed"], "by_harness stays rank-ordered");
+        assert_eq!(v["uncounted"], 1);
         assert_eq!(v["earliest_created"], "2025-06-01T00:00:00+00:00");
         assert_eq!(v["latest_updated"], "2026-03-01T00:00:00+00:00");
     }
@@ -804,7 +823,7 @@ mod tests {
                 .unwrap();
             expected.push(hit(Some(&format!("id-{i}")), Harness::Claude, "late-model", usage));
         }
-        assert!(spool.temporary_bytes().unwrap() > 0);
+        assert!(spool.spilled_bytes().unwrap() > 0);
         oracle.fold(expected.into_iter()).unwrap();
         let mut fold = TokenFold::default();
         for row in spool.rows().unwrap() {
@@ -844,79 +863,8 @@ mod tests {
         }
     }
 
-    // Frozen pre-spill compute recipe: this oracle exercises the original parallel helpers and
-    // whole-transcript vectors, rather than comparing two runs of the new streaming fold.
-    fn legacy_compute(refs: &[SessionRef]) -> TokenStats {
-        let mut all = refs.to_vec();
-        let subs = crate::par_flat_map(refs.to_vec(), |r| {
-            crate::subagent_tree_of(&r).into_iter().map(|s| s.session).collect()
-        });
-        let subagents = subs.len();
-        all.extend(subs);
-        let total = all.len();
-        let parsed = crate::par_filter_map(all, |r| {
-            let adapter = crate::harness::for_harness(r.harness)?;
-            let mut hits = Vec::new();
-            let session = adapter
-                .try_stream(&r, &ParseOptions::lazy_extra(), &mut |m: Message| {
-                    if let Some(usage) = m
-                        .usage
-                        .as_ref()
-                        .filter(|u| u.total_tokens() > 0 || u.cost_usd.is_some())
-                    {
-                        hits.push(UsageHit {
-                            key: usage_key(r.harness, &m),
-                            harness: r.harness,
-                            model: m.model.clone().unwrap_or_default(),
-                            usage: usage.clone(),
-                        });
-                    }
-                    Flow::Continue
-                })
-                .ok()?;
-            for hit in &mut hits {
-                if hit.model.is_empty() {
-                    hit.model = session.model.clone().unwrap_or_else(|| "(unknown)".into());
-                }
-            }
-            Some(hits)
-        });
-        let mut stats = TokenStats {
-            sessions: refs.len(),
-            subagents,
-            failed: total - parsed.len(),
-            ..TokenStats::default()
-        };
-        let mut seen = std::collections::HashSet::new();
-        let mut rows = HashMap::new();
-        for hit in parsed.into_iter().flatten() {
-            if let Some(key) = hit.key {
-                if !seen.insert(key) {
-                    stats.duplicates += 1;
-                    continue;
-                }
-            }
-            let harness = hit.harness.as_str();
-            rows.entry((harness, hit.model.clone()))
-                .or_insert_with(|| TokenRow {
-                    harness,
-                    model: hit.model,
-                    ..TokenRow::default()
-                })
-                .add(&hit.usage);
-        }
-        stats.rows = rows.into_values().collect();
-        stats.rows.sort_by(|a, b| {
-            b.total()
-                .cmp(&a.total())
-                .then(a.harness.cmp(b.harness))
-                .then(a.model.cmp(&b.model))
-        });
-        stats
-    }
-
     #[test]
-    fn old_parallel_compute_matches_multiple_transcript_precedence_and_cost_bits() {
+    fn parallel_compute_matches_recorded_precedence_and_cost_bits() -> anyhow::Result<()> {
         let world = crate::test_world("token-stats-parallel-oracle");
         let mut refs = Vec::new();
         for (i, model) in ["first", "ignored", "ignored-again"].into_iter().enumerate() {
@@ -952,30 +900,19 @@ mod tests {
             Harness::Claude,
             world.base.join("absent.jsonl"),
         ));
+        // Recorded from the retired pre-spill parallel recipe's answer (the opencode cost sum's
+        // bits included: JSON floats round-trip exactly).
+        let mut frozen = crate::emit::frozen::Frozen::new("stats-tokens");
+        let first = TokenStats::compute(&refs).unwrap().to_json();
+        frozen.insert("in order", first.clone());
         let check = || {
-            let old = legacy_compute(&refs);
             let new = TokenStats::compute(&refs).unwrap();
             assert_eq!(
                 serde_json::to_vec(&new.to_json()).unwrap(),
-                serde_json::to_vec(&old.to_json()).unwrap()
+                serde_json::to_vec(&first).unwrap()
             );
             assert_eq!(new.duplicates, 2);
             assert_eq!(new.failed, 1);
-            let old_cost = old
-                .rows
-                .iter()
-                .find(|r| r.harness == "opencode")
-                .unwrap()
-                .cost_usd
-                .unwrap();
-            let new_cost = new
-                .rows
-                .iter()
-                .find(|r| r.harness == "opencode")
-                .unwrap()
-                .cost_usd
-                .unwrap();
-            assert_eq!(new_cost.to_bits(), old_cost.to_bits());
             assert_eq!(new.rows.iter().find(|r| r.harness == "claude").unwrap().model, "first");
         };
         #[cfg(feature = "parallel")]
@@ -996,8 +933,8 @@ mod tests {
                 .is_some());
         }
         refs.reverse();
-        let reordered = TokenStats::compute(&refs).unwrap();
-        assert_eq!(reordered.to_json(), legacy_compute(&refs).to_json());
+        let reordered = TokenStats::compute(&refs).unwrap().to_json();
+        frozen.insert("reversed", reordered.clone());
         #[cfg(feature = "sqlite")]
         {
             // Damaged persistent bytes must restart the entire ordered fold, including IDs
@@ -1013,16 +950,14 @@ mod tests {
                     rusqlite::params![r.harness.as_str(), r.id, r.path.to_string_lossy()],
                 )
                 .unwrap();
-            assert_eq!(
-                TokenStats::compute(&refs).unwrap().to_json(),
-                legacy_compute(&refs).to_json()
-            );
+            assert_eq!(TokenStats::compute(&refs).unwrap().to_json(), reordered);
         }
+        frozen.check()
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
-    fn tiny_native_sources_parse_without_publishing_usage_cache() {
+    fn tiny_native_sources_parse_without_publishing_usage_cache() -> anyhow::Result<()> {
         let world = crate::test_world("token-stats-tiny");
         let path = world.write_session(
             "tiny",
@@ -1031,17 +966,18 @@ mod tests {
             "usage":{"input_tokens":3,"output_tokens":7}}})],
         );
         let r = SessionRef::new("tiny", Harness::Claude, path);
-        let expected = legacy_compute(std::slice::from_ref(&r)).to_json();
-        for _ in 0..2 {
-            assert_eq!(
-                TokenStats::compute(std::slice::from_ref(&r)).unwrap().to_json(),
-                expected
-            );
-        }
+        let expected = TokenStats::compute(std::slice::from_ref(&r)).unwrap().to_json();
+        let mut frozen = crate::emit::frozen::Frozen::new("stats-tiny");
+        frozen.insert("tiny", expected.clone());
+        assert_eq!(
+            TokenStats::compute(std::slice::from_ref(&r)).unwrap().to_json(),
+            expected
+        );
         assert!(usage_cache::Cache::new()
             .unwrap()
             .load(&r, &crate::source::Probe::default().snapshot(&r))
             .is_none());
+        frozen.check()
     }
 
     #[test]
@@ -1078,7 +1014,7 @@ mod tests {
             title: None,
             created_at: None,
             updated_at: None,
-            message_count: 1,
+            message_count: Some(1),
         };
         let t = TokenStats::compute(&[sref("sess", &parent), sref("resumed", &resumed)]).unwrap();
         let warm = TokenStats::compute(&[sref("sess", &parent), sref("resumed", &resumed)]).unwrap();

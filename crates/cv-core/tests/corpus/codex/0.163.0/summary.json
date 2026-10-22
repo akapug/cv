@@ -1,0 +1,316 @@
+{
+  "sessions": [
+    {
+      "id": "01a14d80-f542-73f3-8b8e-f0f43d9f9169",
+      "path": ".codex/sessions/2026/10/18/rollout-2026-10-18T01-34-19-01a14d80-f542-73f3-8b8e-f0f43d9f9169.jsonl",
+      "messages": 12,
+      "sequence": [
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "user/injected_context",
+        "user/prompt",
+        "assistant/reply",
+        "assistant/reply",
+        "system/notice",
+        "tool/tool_result",
+        "assistant/notice",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 9,
+        "thinking": 2,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "functions/exec"
+      ],
+      "usage_messages": 2,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "apply_patch": {
+            "calls": 0,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "exec": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "gpt-6-luna",
+      "skipped_lines": 0
+    },
+    {
+      "id": "01a14d81-27ad-7082-988a-be3d4f3fc0d6",
+      "path": ".codex/sessions/2026/10/18/rollout-2026-10-18T01-34-32-01a14d81-27ad-7082-988a-be3d4f3fc0d6.jsonl",
+      "messages": 20,
+      "sequence": [
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "user/injected_context",
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "assistant/reply",
+        "assistant/reply",
+        "system/compaction_boundary",
+        "system/compaction_summary",
+        "assistant/notice",
+        "system/injected_context",
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 18,
+        "thinking": 3
+      },
+      "tools": [],
+      "usage_messages": 3,
+      "model_messages": 0,
+      "compaction_boundaries": [
+        11
+      ],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "gpt-6-luna",
+      "skipped_lines": 0
+    },
+    {
+      "id": "01a14d81-a46d-77a2-98c6-c641cb78e857",
+      "path": ".codex/sessions/2026/10/18/rollout-2026-10-18T01-35-04-01a14d81-a46d-77a2-98c6-c641cb78e857.jsonl",
+      "messages": 17,
+      "sequence": [
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "user/injected_context",
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/notice",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/notice",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 10,
+        "thinking": 3,
+        "tool_result": 2,
+        "tool_use": 2
+      },
+      "tools": [
+        "functions/exec",
+        "functions/exec"
+      ],
+      "usage_messages": 3,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "exec": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "gpt-6-luna",
+      "skipped_lines": 0
+    },
+    {
+      "id": "01a14d81-f1dd-7bc2-8aa4-55aa88a84990",
+      "path": ".codex/sessions/2026/10/18/rollout-2026-10-18T01-35-24-01a14d81-f1dd-7bc2-8aa4-55aa88a84990.jsonl",
+      "messages": 29,
+      "sequence": [
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "user/injected_context",
+        "system/injected_context",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "assistant/reply",
+        "system/subagent_spawn",
+        "tool/tool_result",
+        "assistant/notice",
+        "assistant/reply",
+        "system/subagent_return",
+        "system/notice",
+        "tool/tool_result",
+        "assistant/notice",
+        "user/prompt",
+        "assistant/reply",
+        "assistant/reply",
+        "system/notice",
+        "tool/tool_result",
+        "assistant/notice",
+        "assistant/reply",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/notice",
+        "assistant/reply",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 15,
+        "thinking": 4,
+        "tool_result": 4,
+        "tool_use": 4
+      },
+      "tools": [
+        "collaboration/spawn_agent",
+        "collaboration/wait_agent",
+        "collaboration/wait_agent",
+        "collaboration/list_agents"
+      ],
+      "usage_messages": 5,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 1,
+      "subagent_returns": 1,
+      "affordances": {
+        "approval/state": 1,
+        "subagent_return/return": 1,
+        "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "list_agents": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "spawn_agent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "wait_agent": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 4,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": "gpt-6-luna",
+      "skipped_lines": 0
+    },
+    {
+      "id": "01a14d82-0a66-7f30-8f54-2b5f21787890",
+      "path": ".codex/sessions/2026/10/18/rollout-2026-10-18T01-35-30-01a14d82-0a66-7f30-8f54-2b5f21787890.jsonl",
+      "messages": 14,
+      "sequence": [
+        "system/injected_context",
+        "system/injected_context",
+        "system/injected_context",
+        "user/injected_context",
+        "user/prompt",
+        "assistant/reply",
+        "system/notice",
+        "tool/tool_result",
+        "assistant/notice",
+        "assistant/reply",
+        "system/notice",
+        "tool/tool_result",
+        "assistant/notice",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 10,
+        "tool_result": 2,
+        "tool_use": 2
+      },
+      "tools": [
+        "functions/exec",
+        "functions/exec"
+      ],
+      "usage_messages": 3,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "exec": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
+      },
+      "lineage": {
+        "parent": "01a14d81-f1dd-7bc2-8aa4-55aa88a84990",
+        "agent_path": "/root/ok_reply"
+      },
+      "model": "gpt-6-luna",
+      "skipped_lines": 0
+    }
+  ]
+}

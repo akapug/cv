@@ -13,6 +13,9 @@
 //! - [`Claim::Replace`] renames over the destination. The name moves to the new inode; a reader
 //!   holding the old one keeps the old bytes, and a symlink at the destination is replaced, not
 //!   followed.
+//!
+//! A [`Set`] publishes several files as one: every name takes its new file, or every name keeps
+//! what it held, and a failure to undo is reported.
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{self, Write};
@@ -162,50 +165,27 @@ impl Drop for Staged {
     }
 }
 
-/// Undo a publication whose companion then failed, returning `cause` with any failure to undo it.
-/// Only the file `published` refers to is removed, never one someone else has put there since: the
-/// name is moved to a private one in one step, and what it held is removed only if it is that file;
-/// another writer's file is put back without replacing a newer one. Without inode identity (off
-/// Unix) nothing can be checked, so nothing is removed and the error says so.
-pub fn retract(destination: &Path, published: &File, cause: anyhow::Error) -> anyhow::Error {
-    match retract_racing(destination, published, || {}) {
-        Ok(()) => cause,
-        Err(e) => cause.context(format!("{} is left published: {e:#}", destination.display())),
-    }
-}
-
-/// [`retract`], running `race` between looking at the name and taking it.
+/// Undo a [`Set`] member's claim of a new name. Only the file `published` refers to is removed,
+/// never one someone else has put there since: the name is moved to a private one in one step,
+/// and what it held is removed only if it is that file; another writer's file is put back without
+/// replacing a newer one. Without inode identity (off Unix) nothing can be checked, so nothing is
+/// removed and the error says so. `race` runs between looking at the name and taking it.
 fn retract_racing(destination: &Path, published: &File, race: impl FnOnce()) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let ours = published.metadata()?;
-        let is_ours = |m: &std::fs::Metadata| m.dev() == ours.dev() && m.ino() == ours.ino();
-        match std::fs::symlink_metadata(destination) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
-            Ok(named) if !is_ours(&named) => return Ok(()),
-            Ok(_) => {}
-        }
-        race();
-        // The name can change hands after that look; the rename takes exactly what it holds now.
-        let aside = destination.with_file_name(format!(".cv-retract-{}.tmp", uuid::Uuid::new_v4()));
-        match std::fs::rename(destination, &aside) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            taken => taken.context("retracting it")?,
-        }
-        let held = std::fs::symlink_metadata(&aside).with_context(|| format!("checking {}", aside.display()))?;
-        if is_ours(&held) {
-            return std::fs::remove_file(&aside).with_context(|| format!("removing {}", aside.display()));
-        }
-        rename_no_replace(&aside, destination)
-            .with_context(|| format!("another writer's file is kept at {}", aside.display()))
+    if !holds(destination, published)? {
+        return Ok(());
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (destination, published, race);
-        anyhow::bail!("this platform cannot check that the name still holds the published file")
+    race();
+    // The name can change hands after that look; the rename takes exactly what it holds now.
+    let aside = destination.with_file_name(format!(".cv-retract-{}.tmp", uuid::Uuid::new_v4()));
+    match std::fs::rename(destination, &aside) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        taken => taken.context("retracting it")?,
     }
+    if holds(&aside, published).with_context(|| format!("checking {}", aside.display()))? {
+        return std::fs::remove_file(&aside).with_context(|| format!("removing {}", aside.display()));
+    }
+    rename_no_replace(&aside, destination)
+        .with_context(|| format!("another writer's file is kept at {}", aside.display()))
 }
 
 /// The filesystem cannot make a hard link here (as opposed to the name being taken or the caller
@@ -289,7 +269,13 @@ fn rename_with(from: &Path, to: &Path, flag: libc::c_uint) -> Option<io::Result<
 /// 0666 before the umask; a file it replaces keeps its permission bits. With [`Claim::Replace`]
 /// the name moves to the new file: a symlink there is replaced rather than followed, and other
 /// hard links keep the old bytes.
-pub fn publish_reader(destination: &Path, tag: &str, mut bytes: impl io::Read, claim: Claim) -> Result<()> {
+pub fn publish_reader(destination: &Path, tag: &str, bytes: impl io::Read, claim: Claim) -> Result<()> {
+    stage_reader(destination, tag, bytes, claim)?.publish(destination, claim)?;
+    Ok(())
+}
+
+/// Stage everything `bytes` yields for `destination`, as [`publish_reader`] publishes it.
+pub(crate) fn stage_reader(destination: &Path, tag: &str, mut bytes: impl io::Read, claim: Claim) -> Result<Staged> {
     let replaced = match claim {
         Claim::Replace => std::fs::metadata(destination).ok().filter(|m| m.is_file()),
         Claim::New => None,
@@ -299,8 +285,177 @@ pub fn publish_reader(destination: &Path, tag: &str, mut bytes: impl io::Read, c
         staged.file().set_permissions(metadata.permissions())?;
     }
     io::copy(&mut bytes, &mut staged).with_context(|| format!("writing {}", destination.display()))?;
-    staged.publish(destination, claim)?;
-    Ok(())
+    Ok(staged)
+}
+
+/// Several files published as one: every destination takes its new file, or every destination
+/// keeps what it held. Members are claimed in the order added, each as [`Staged::publish`] claims
+/// it, except that a [`Claim::Replace`] of an existing name keeps the replaced file (swapped into
+/// the temporary's name, or moved aside where the platform has no atomic swap, leaving the name
+/// briefly absent) until every member holds its name. When a claim fails, every claimed member is
+/// undone, last first: its own file is retracted, or the replaced one put back if the name still
+/// holds its own. An undo that fails is reported with where each file is, never discarded. A crash
+/// midway can still leave a prefix claimed, so add members in the order a reader best tolerates.
+#[derive(Default)]
+pub struct Set {
+    members: Vec<(Staged, PathBuf, Claim)>,
+}
+
+/// A member holding its name: its own file, and where the file it replaced is kept until commit.
+struct Claimed {
+    destination: PathBuf,
+    file: File,
+    replaced: Option<PathBuf>,
+}
+
+impl Set {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stage everything `bytes` yields for `destination`, as [`publish_reader`] would.
+    pub fn stage(&mut self, destination: &Path, tag: &str, bytes: impl io::Read, claim: Claim) -> Result<()> {
+        let staged = stage_reader(destination, tag, bytes, claim)?;
+        self.add(staged, destination, claim);
+        Ok(())
+    }
+
+    pub fn add(&mut self, staged: Staged, destination: impl Into<PathBuf>, claim: Claim) {
+        self.members.push((staged, destination.into(), claim));
+    }
+
+    /// Claim every member, or none (see [`Set`]); then remove the files they replaced.
+    pub fn publish(self) -> Result<()> {
+        self.publish_using(swap, |_| Ok(()))
+    }
+
+    fn publish_using(
+        self,
+        swap: impl Fn(&Path, &Path) -> Option<io::Result<()>>,
+        mut before_claim: impl FnMut(usize) -> io::Result<()>,
+    ) -> Result<()> {
+        let mut claimed = Vec::with_capacity(self.members.len());
+        for (n, (staged, destination, claim)) in self.members.into_iter().enumerate() {
+            let result = before_claim(n)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| claim_member(staged, &destination, claim, &swap));
+            match result {
+                Ok(member) => claimed.push(member),
+                Err(cause) => return Err(undo(claimed, cause)),
+            }
+        }
+        let kept: Vec<_> = claimed
+            .iter()
+            .filter_map(|member| member.replaced.as_ref())
+            .filter_map(|old| {
+                std::fs::remove_file(old)
+                    .err()
+                    .map(|e| format!("{}: {e}", old.display()))
+            })
+            .collect();
+        anyhow::ensure!(
+            kept.is_empty(),
+            "published; removing the replaced files failed ({})",
+            kept.join("; ")
+        );
+        Ok(())
+    }
+}
+
+fn claim_member(
+    mut staged: Staged,
+    destination: &Path,
+    claim: Claim,
+    swap: impl Fn(&Path, &Path) -> Option<io::Result<()>>,
+) -> Result<Claimed> {
+    let context = || format!("publishing {}", destination.display());
+    let existing = match claim {
+        Claim::Replace => match std::fs::symlink_metadata(destination) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).with_context(context),
+        },
+        Claim::New => None,
+    };
+    let Some(existing) = existing else {
+        let file = staged.publish(destination, claim)?;
+        return Ok(Claimed {
+            destination: destination.to_owned(),
+            file,
+            replaced: None,
+        });
+    };
+    anyhow::ensure!(!existing.is_dir(), "{} is a directory", destination.display());
+    let file = staged.file.take().expect("a staged file is published once");
+    file.sync_all().with_context(context)?;
+    let path = std::mem::take(&mut staged.path);
+    match exchange(&path, destination, swap, rename_no_replace) {
+        Ok(replaced) => {
+            sync_parent(destination);
+            Ok(Claimed {
+                destination: destination.to_owned(),
+                file,
+                replaced: Some(replaced),
+            })
+        }
+        Err((error, kept)) => {
+            if !kept {
+                staged.path = path;
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Undo `claimed`, last first, and return `cause` with every undo that failed.
+fn undo(claimed: Vec<Claimed>, cause: anyhow::Error) -> anyhow::Error {
+    let failed: Vec<_> = claimed
+        .iter()
+        .rev()
+        .filter_map(|member| {
+            let undone = match &member.replaced {
+                None => retract_racing(&member.destination, &member.file, || {}),
+                Some(old) => restore(&member.destination, &member.file, old),
+            };
+            undone
+                .err()
+                .map(|e| format!("{} is left published: {e:#}", member.destination.display()))
+        })
+        .collect();
+    match failed.is_empty() {
+        true => cause,
+        false => cause.context(format!("undoing the set failed: {}", failed.join("; "))),
+    }
+}
+
+/// Put `old` back at `destination` if the name still holds `published`; otherwise keep both.
+fn restore(destination: &Path, published: &File, old: &Path) -> Result<()> {
+    let kept = || format!("the replaced file is kept at {}", old.display());
+    anyhow::ensure!(
+        holds(destination, published)?,
+        "the name holds another file; {}",
+        kept()
+    );
+    std::fs::rename(old, destination).with_context(kept)
+}
+
+/// Whether `destination` names `published` itself; off Unix there is no inode to check, so never.
+fn holds(destination: &Path, published: &File) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ours = published.metadata()?;
+        match std::fs::symlink_metadata(destination) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+            Ok(named) => Ok(named.dev() == ours.dev() && named.ino() == ours.ino()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (destination, published);
+        anyhow::bail!("this platform cannot check that the name still holds the published file")
+    }
 }
 
 /// A directory built under a private name beside its destination, then published whole: never
@@ -331,12 +486,6 @@ impl StagedDir {
     /// claims. If restoration fails, both trees are kept and the error names them.
     /// The replaced tree is then deleted.
     pub fn publish(self, destination: &Path, claim: Claim) -> Result<()> {
-        #[cfg(target_vendor = "apple")]
-        let swap = |from: &Path, to: &Path| rename_with(from, to, libc::RENAME_SWAP);
-        #[cfg(target_os = "linux")]
-        let swap = |from: &Path, to: &Path| rename_with(from, to, libc::RENAME_EXCHANGE);
-        #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-        let swap = |_: &Path, _: &Path| None;
         self.publish_using(destination, claim, swap, |_, _| Ok(()))
     }
 
@@ -347,7 +496,7 @@ impl StagedDir {
         swap: impl FnOnce(&Path, &Path) -> Option<io::Result<()>>,
         mut before_move: impl FnMut(&Path, &Path) -> io::Result<()>,
     ) -> Result<()> {
-        let mut rename = |from: &Path, to: &Path| {
+        let rename = |from: &Path, to: &Path| {
             before_move(from, to)?;
             rename_no_replace(from, to)
         };
@@ -370,36 +519,13 @@ impl StagedDir {
             sync_parent(destination);
             return Ok(());
         }
-        let old = match swap(&staged, destination) {
-            // The staged name now holds the replaced tree.
-            Some(Ok(())) => staged,
-            Some(Err(e)) => {
-                self.path = staged;
-                return Err(e).with_context(context);
-            }
-            None => {
-                let aside = staged.with_extension("replaced");
-                if let Err(e) = rename(destination, &aside) {
+        let old = match exchange(&staged, destination, swap, rename) {
+            Ok(old) => old,
+            Err((error, kept)) => {
+                if !kept {
                     self.path = staged;
-                    return Err(e).with_context(context);
                 }
-                if let Err(e) = rename(&staged, destination) {
-                    if let Err(restore) = rename(&aside, destination) {
-                        // Neither tree holds the name now. Delete nothing; say where both are.
-                        return Err(e).with_context(|| {
-                            format!(
-                                "publishing {}; putting the replaced tree back also failed ({restore}), \
-                                 so it is kept at {} and the new one at {}",
-                                destination.display(),
-                                aside.display(),
-                                staged.display()
-                            )
-                        });
-                    }
-                    self.path = staged;
-                    return Err(e).with_context(context);
-                }
-                aside
+                return Err(error);
             }
         };
         sync_parent(destination);
@@ -412,6 +538,63 @@ impl Drop for StagedDir {
         if !self.path.as_os_str().is_empty() {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+/// The platform's atomic exchange of two existing names; `None` where it has none.
+fn swap(from: &Path, to: &Path) -> Option<io::Result<()>> {
+    #[cfg(target_vendor = "apple")]
+    return rename_with(from, to, libc::RENAME_SWAP);
+    #[cfg(target_os = "linux")]
+    return rename_with(from, to, libc::RENAME_EXCHANGE);
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    {
+        let _ = (from, to);
+        None
+    }
+}
+
+/// Give the existing `destination` to `staged` and return where the replaced entry now is: the
+/// staged name after an atomic swap, else an aside name (the destination is briefly absent, and a
+/// failed claim puts the old entry back). Every fallback move refuses an existing name. On failure
+/// the flag says whether `staged` still holds the staged entry and may be removed; when putting
+/// the old entry back fails too, both are kept and the error names them.
+fn exchange(
+    staged: &Path,
+    destination: &Path,
+    swap: impl FnOnce(&Path, &Path) -> Option<io::Result<()>>,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> std::result::Result<PathBuf, (anyhow::Error, bool)> {
+    let failed = |e: io::Error| {
+        (
+            anyhow::Error::new(e).context(format!("publishing {}", destination.display())),
+            false,
+        )
+    };
+    match swap(staged, destination) {
+        // The staged name now holds the replaced entry.
+        Some(Ok(())) => return Ok(staged.to_owned()),
+        Some(Err(e)) => return Err(failed(e)),
+        None => {}
+    }
+    let aside = staged.with_extension("replaced");
+    rename(destination, &aside).map_err(failed)?;
+    let Err(e) = rename(staged, destination) else {
+        return Ok(aside);
+    };
+    match rename(&aside, destination) {
+        Ok(()) => Err(failed(e)),
+        // Neither entry holds the name now. Delete nothing; say where both are.
+        Err(restore) => Err((
+            anyhow::Error::new(e).context(format!(
+                "publishing {}; putting the replaced entry back also failed ({restore}), so it is kept at {} \
+                 and the new one at {}",
+                destination.display(),
+                aside.display(),
+                staged.display()
+            )),
+            true,
+        )),
     }
 }
 
@@ -448,7 +631,7 @@ pub fn mode_of(source: &File) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -572,6 +755,28 @@ mod tests {
         assert_eq!(temporaries(dir), 0);
     }
 
+    #[test]
+    fn replacement_metadata_failure_is_not_absence() {
+        let world = cv_testkit::World::new("publish-metadata-error");
+        let parent = world.base.join("file");
+        std::fs::write(&parent, "original").unwrap();
+        let error = claim_member(
+            staged(&world.base, b"new"),
+            &parent.join("child"),
+            Claim::Replace,
+            |_, _| panic!("metadata must be checked before claiming"),
+        )
+        .err()
+        .expect("a non-directory parent is an error");
+        assert!(format!("{error:#}").contains("publishing"));
+        assert_ne!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(std::fs::read(&parent).unwrap(), b"original");
+        assert_eq!(temporaries(&world.base), 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn replace_moves_the_name_and_a_reader_keeps_the_old_bytes() {
@@ -654,6 +859,120 @@ mod tests {
         }
     }
 
+    /// Make `dir` read-only (or writable again); `false` where that does not bind (running as root).
+    #[cfg(unix)]
+    pub(crate) fn read_only(dir: &Path, on: bool) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if on { 0o555 } else { 0o755 };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        let probe = dir.join(".cv-probe");
+        let binds = !on || std::fs::write(&probe, "").is_err();
+        let _ = std::fs::remove_file(&probe);
+        binds
+    }
+
+    /// The first member of a set is claimed; the second's directory is read-only, so its claim
+    /// fails. With an atomic swap and without one, whether the first replaced a file, claimed a
+    /// missing name with Replace, or claimed a new one: the first name is back as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_whose_second_claim_fails_publishes_nothing() {
+        let world = cv_testkit::World::new("publish-set");
+        for swapping in [true, false] {
+            for (case, claim, before) in [
+                ("replace", Claim::Replace, Some("old")),
+                ("missing", Claim::Replace, None),
+                ("new", Claim::New, None),
+            ] {
+                let base = world.base.join(format!("{case}-{swapping}"));
+                let (a, b) = (base.join("a"), base.join("b"));
+                std::fs::create_dir_all(&a).unwrap();
+                std::fs::create_dir_all(&b).unwrap();
+                let first = a.join("first");
+                if let Some(before) = before {
+                    std::fs::write(&first, before).unwrap();
+                }
+                let mut set = Set::new();
+                set.stage(&first, "test", &b"new first"[..], claim).unwrap();
+                set.stage(&b.join("second"), "test", &b"new second"[..], Claim::New)
+                    .unwrap();
+                if !read_only(&b, true) {
+                    return;
+                }
+                let swap = |from: &Path, to: &Path| if swapping { swap(from, to) } else { None };
+                let error = set.publish_using(swap, |_| Ok(())).unwrap_err();
+                read_only(&b, false);
+                assert!(!format!("{error:#}").contains("undoing"), "{error:#}");
+                assert_eq!(std::fs::read_to_string(&first).ok().as_deref(), before, "{case}");
+                assert!(!b.join("second").exists());
+                assert_eq!(temporaries(&a), 0, "{case}");
+            }
+        }
+        let a = world.base.join("ok");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("first"), "old").unwrap();
+        let mut set = Set::new();
+        set.stage(&a.join("first"), "test", &b"new first"[..], Claim::Replace)
+            .unwrap();
+        set.stage(&a.join("second"), "test", &b"new second"[..], Claim::New)
+            .unwrap();
+        set.publish().unwrap();
+        assert_eq!(std::fs::read(a.join("first")).unwrap(), b"new first");
+        assert_eq!(std::fs::read(a.join("second")).unwrap(), b"new second");
+        assert_eq!(temporaries(&a), 0);
+    }
+
+    /// The first member's directory turns read-only after its claim, so undoing it fails too: the
+    /// error says so and where the replaced file is, and nothing is deleted.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_reports_an_undo_that_fails() {
+        let world = cv_testkit::World::new("publish-set-undo");
+        for (case, claim) in [("replace", Claim::Replace), ("new", Claim::New)] {
+            let base = world.base.join(case);
+            let (a, b) = (base.join("a"), base.join("b"));
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::create_dir_all(&b).unwrap();
+            let first = a.join("first");
+            if claim == Claim::Replace {
+                std::fs::write(&first, "old").unwrap();
+            }
+            let mut set = Set::new();
+            set.stage(&first, "test", &b"new first"[..], claim).unwrap();
+            set.stage(&b.join("second"), "test", &b"new second"[..], Claim::New)
+                .unwrap();
+            if !read_only(&b, true) {
+                return;
+            }
+            let error = set
+                .publish_using(swap, |n| {
+                    if n == 1 {
+                        read_only(&a, true);
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+            read_only(&a, false);
+            read_only(&b, false);
+            let error = format!("{error:#}");
+            assert!(error.contains("undoing the set failed"), "{error}");
+            assert!(
+                error.contains(&format!("{} is left published", first.display())),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&first).unwrap(), b"new first", "{case}");
+            if claim == Claim::Replace {
+                let kept = std::fs::read_dir(&a)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .find(|p| p != &first)
+                    .unwrap();
+                assert!(error.contains(&format!("kept at {}", kept.display())), "{error}");
+                assert_eq!(std::fs::read(&kept).unwrap(), b"old");
+            }
+        }
+    }
+
     /// Another writer replaces the published name after retract has looked at it: retract still
     /// removes nothing but its own file.
     #[cfg(unix)]
@@ -688,12 +1007,11 @@ mod tests {
         assert_eq!(mode_of(&file), umask_applied);
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, "someone else").unwrap();
-        let cause = || anyhow::anyhow!("companion failed");
-        assert_eq!(format!("{:#}", retract(&path, &file, cause())), "companion failed");
+        retract_racing(&path, &file, || {}).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"someone else");
         std::fs::remove_file(&path).unwrap();
         let file = staged(dir, b"ours").publish(&path, Claim::New).unwrap();
-        assert_eq!(format!("{:#}", retract(&path, &file, cause())), "companion failed");
+        retract_racing(&path, &file, || {}).unwrap();
         assert!(!path.exists());
         assert_eq!(temporaries(dir), 0);
     }

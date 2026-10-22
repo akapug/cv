@@ -20,9 +20,20 @@ fn cv_ok(w: &World, args: &[&str]) -> String {
 
 /// `cv hook <name>` fed one payload; the hook must exit 0 whatever happens.
 fn hook(w: &World, name: &str, payload: &serde_json::Value, env: &[(&str, &str)]) -> String {
-    let (ok, code, out, err) = w.cv_full(&["hook", name], env, Some(&payload.to_string()));
+    hook_full(w, &["hook", name], payload, env).0
+}
+
+/// `cv hook <name> --harness codex`, as `cv hooks install codex` writes it.
+fn codex_hook(w: &World, name: &str, payload: &serde_json::Value, env: &[(&str, &str)]) -> String {
+    hook_full(w, &["hook", name, "--harness", "codex"], payload, env).0
+}
+
+/// `(stdout, stderr)` of one hook call, which must exit 0.
+fn hook_full(w: &World, args: &[&str], payload: &serde_json::Value, env: &[(&str, &str)]) -> (String, String) {
+    let name = args[1];
+    let (ok, code, out, err) = w.cv_full(args, env, Some(&payload.to_string()));
     assert!(ok, "cv hook {name} exited {code}\nstdout:\n{out}\nstderr:\n{err}");
-    out
+    (out, err)
 }
 
 fn settings_path(w: &World) -> PathBuf {
@@ -110,14 +121,17 @@ fn install_is_idempotent_show_reports_and_remove_restores_the_file() {
     assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "Bash", "theirs stays first");
     assert_eq!(s["hooks"]["PreToolUse"][1]["matcher"], "Edit|Write");
     let cmd = s["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
-    assert!(cmd.ends_with("/cv hook compact"), "absolute binary path: {cmd}");
+    assert!(
+        cmd.ends_with("/cv hook compact --harness claude"),
+        "absolute binary path: {cmd}"
+    );
     assert_eq!(s["hooks"]["SessionStart"][1]["matcher"], "startup|resume");
     assert_eq!(s["hooks"]["SubagentStart"][0]["hooks"][0]["async"], true);
     assert_eq!(s["hooks"]["SubagentStop"][0]["hooks"][0]["async"], true);
     assert!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap()
-        .ends_with(" hook decisions"));
+        .ends_with(" hook decisions --harness claude"));
     let skill = w.home.join(".claude/skills/cv/SKILL.md");
     assert!(
         fs::read_to_string(&skill).unwrap().starts_with("---\nname: cv\n"),
@@ -149,14 +163,14 @@ fn install_is_idempotent_show_reports_and_remove_restores_the_file() {
     let out = cv_ok(&w, &["hooks", "remove", "claude"]);
     assert!(out.contains("nothing written"), "{out}");
 
-    // Project scope writes under the cwd, and only Claude is a known harness.
+    // Project scope writes under the cwd, and unsupported harnesses error.
     let out = cv_ok(&w, &["hooks", "install", "claude", "--scope", "project"]);
     assert!(out.contains("installed"), "{out}");
     assert!(w.base.join(".claude/settings.json").exists());
     assert!(w.base.join(".claude/skills/cv/SKILL.md").exists());
-    let (ok, code, _, err) = w.cv(&["hooks", "install", "codex"]);
+    let (ok, code, _, err) = w.cv(&["hooks", "install", "gemini"]);
     assert!(!ok && code == 1, "unknown harness errors");
-    assert!(err.contains("Claude Code only"), "{err}");
+    assert!(err.contains("no verified hook contract"), "{err}");
 
     // doctor says whether the hooks are installed (project scope here) and the policy in force.
     w.write_session(
@@ -419,8 +433,551 @@ fn each_hook_answers_the_docs_payload_for_its_event() {
         ""
     );
 
+    // Codex rejects `ask`; a real conflict must use its supported blocking decision.
+    let codex_patch = with(
+        common(&w, "codex-current", "PreToolUse"),
+        json!({
+            "tool_name": "apply_patch", "tool_input": {"command": "*** Begin Patch\n*** Add File: src/untracked.rs\n+new\n*** Update File: src/widget.rs\n@@\n-a\n+b\n*** End Patch"}
+        }),
+    );
+    let out = codex_hook(&w, "edit", &codex_patch, &[]);
+    let output: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .contains("widget.rs"));
+
     // Garbage on stdin never fails the harness.
     let (ok, _, out, err) = w.cv_stdin(&["hook", "edit"], "not json");
     assert!(ok && out.is_empty(), "{out}");
     assert!(err.contains("not the hook JSON"), "{err}");
+}
+
+#[test]
+fn codex_install_scopes_preserve_unrelated_hooks_and_are_reversible() {
+    let w = World::new("codex-hooks-install");
+    for (scope, root) in [("user", w.home.clone()), ("project", w.base.clone())] {
+        let path = root.join(".codex/hooks.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let theirs = json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify.sh"}]}]}});
+        fs::write(&path, theirs.to_string()).unwrap();
+        cv_ok(&w, &["hooks", "install", "codex", "--scope", scope]);
+        let once = fs::read(&path).unwrap();
+        let out = cv_ok(&w, &["hooks", "install", "codex", "--scope", scope]);
+        assert!(out.contains("nothing written"), "{out}");
+        assert_eq!(fs::read(&path).unwrap(), once);
+        let shown: serde_json::Value =
+            serde_json::from_str(&cv_ok(&w, &["hooks", "show", "codex", "--scope", scope, "--json"])).unwrap();
+        assert_eq!(shown["installed"].as_array().unwrap().len(), 6);
+        assert_eq!(shown["would_change"], false);
+        assert!(shown["installed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["event"] == "PreToolUse" && row["matcher"] == "apply_patch"));
+        assert!(shown["installed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["command"].as_str().unwrap().ends_with(" --harness codex")));
+        cv_ok(&w, &["hooks", "remove", "codex", "--scope", scope]);
+        let back: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(back, theirs);
+        assert!(!root.join(".codex/skills/cv/SKILL.md").exists());
+    }
+}
+
+#[test]
+fn codex_real_hook_payloads_compose_with_the_recorded_rollouts() {
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let target = to.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy(&path, &target);
+            } else {
+                fs::copy(&path, &target).unwrap();
+                // The edit guard counts another session as live only if its transcript changed in
+                // the last 30 minutes. On macOS `fs::copy` clones and keeps the source's mtime,
+                // so the copied rollouts are "live" by the checkout's age unless we say so.
+                fs::File::options()
+                    .write(true)
+                    .open(&target)
+                    .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                    .unwrap();
+            }
+        }
+    }
+    let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cv-core/tests/corpus/codex/0.163.0");
+    let w = World::new("codex-real-hooks");
+    copy(&corpus.join(".codex"), &w.home.join(".codex"));
+    cv_ok(&w, &["index"]);
+    cv_ok(
+        &w,
+        &[
+            "task",
+            "decide",
+            "fixture choice",
+            "--for",
+            "corpus:hooks",
+            "--default",
+            "left",
+            "--option",
+            "right",
+        ],
+    );
+    let mut observed = [false; 5];
+    let mut parent = None;
+    for line in fs::read_to_string(corpus.join("hooks.jsonl")).unwrap().lines() {
+        let capture: serde_json::Value = serde_json::from_str(line).unwrap();
+        let mut input = capture["input"].clone();
+        for field in ["transcript_path", "agent_transcript_path"] {
+            if let Some(path) = input[field]
+                .as_str()
+                .and_then(|p| p.strip_prefix("/home/corpus/.codex/"))
+            {
+                input[field] = json!(w.home.join(".codex").join(path));
+            }
+        }
+        let (name, index) = match input["hook_event_name"].as_str().unwrap() {
+            "SessionStart" if input["source"] == "compact" => ("compact", 0),
+            "SessionStart" => ("start", 1),
+            "SubagentStart" | "SubagentStop" => ("lane", 2),
+            "UserPromptSubmit" => ("decisions", 3),
+            "PreToolUse" => ("edit", 4),
+            other => panic!("unexpected recorded hook {other}"),
+        };
+        let output = codex_hook(&w, name, &input, &[("CV_ENDPOINT", "corpus:hooks")]);
+        match name {
+            "compact" => assert!(context_of(&output).contains("compaction #1")),
+            "start" => assert!(context_of(&output).contains("earlier session(s)")),
+            "decisions" => assert!(context_of(&output).contains("1 decision(s) owed")),
+            "edit" => assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&output).unwrap()["hookSpecificOutput"]["permissionDecision"],
+                "deny"
+            ),
+            "lane" => {
+                assert!(output.is_empty());
+                if input["hook_event_name"] == "SubagentStop" {
+                    parent = Some(input["transcript_path"].as_str().unwrap().to_string());
+                }
+            }
+            _ => unreachable!(),
+        }
+        observed[index] = true;
+    }
+    assert!(observed.into_iter().all(|seen| seen));
+    let ledger: Vec<serde_json::Value> = fs::read_to_string(w.cv_home.join("lanes.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let stop = ledger.iter().find(|row| row["event"] == "stop").unwrap();
+    assert_eq!(stop["transcript_path"].as_str(), parent.as_deref());
+    let selector = format!("codex:{}", stop["session_id"].as_str().unwrap());
+    let lanes: Vec<serde_json::Value> = serde_json::from_str(&cv_ok(&w, &["lanes", &selector, "--json"])).unwrap();
+    assert!(lanes.iter().any(|lane| lane["agent_id"] == stop["agent_id"]
+        && lane["status"] == "stopped"
+        && lane["status_source"] == "hook_ledger"));
+}
+
+/// Codex's `[hooks.state]` in `config.toml`, as its startup hooks review writes it.
+fn write_codex_trust(w: &World, hashes: &[(String, String)]) {
+    let mut text = String::from("[hooks.state]\n");
+    for (key, hash) in hashes {
+        text.push_str(&format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"{hash}\"\n"));
+    }
+    fs::write(w.home.join(".codex/config.toml"), text).unwrap();
+}
+
+fn trust_rows(w: &World, scope: &str) -> Vec<(String, String, String)> {
+    let shown: serde_json::Value =
+        serde_json::from_str(&cv_ok(w, &["hooks", "show", "codex", "--scope", scope, "--json"])).unwrap();
+    shown["installed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["trust_key"].as_str().unwrap().to_string(),
+                row["current_hash"].as_str().unwrap().to_string(),
+                row["trust"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn codex_trust_is_read_from_the_store_codex_writes() {
+    let w = World::new("codex-trust");
+    // doctor wants a session to report on; its hooks lines do not depend on it.
+    w.write_session(
+        "docsess",
+        &[
+            user("u0", "2026-10-01T10:00:00Z", "hi"),
+            assistant("a0", "2026-10-01T10:00:05Z", "hello"),
+        ],
+    );
+    // A fresh install is untrusted, and install says so with the two ways out.
+    let out = cv_ok(&w, &["hooks", "install", "codex"]);
+    assert!(out.contains("Codex trust: 6 untrusted"), "{out}");
+    assert!(out.contains("startup hooks review"), "{out}");
+    assert!(out.contains("--dangerously-bypass-hook-trust"), "{out}");
+    let rows = trust_rows(&w, "user");
+    assert_eq!(rows.len(), 6);
+    // Codex keys by the canonical path (`/var/…` is `/private/var/…` on macOS).
+    let hooks_json = fs::canonicalize(w.home.join(".codex/hooks.json"))
+        .unwrap()
+        .display()
+        .to_string();
+    assert!(rows.iter().all(|(_, _, t)| t == "untrusted"), "{rows:?}");
+    assert!(
+        rows.iter()
+            .any(|(k, _, _)| *k == format!("{hooks_json}:pre_tool_use:0:0")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(k, _, _)| *k == format!("{hooks_json}:session_start:1:0")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().all(|(_, h, _)| h.starts_with("sha256:") && h.len() == 71),
+        "{rows:?}"
+    );
+    let (ok, _, out, _) = w.cv(&["doctor", "docsess"]);
+    assert!(ok);
+    assert!(
+        out.contains("Codex hooks: 6/6 in ~/.codex/hooks.json (User), 6 untrusted"),
+        "{out}"
+    );
+    assert!(out.contains("Hooks:       not installed"), "{out}");
+
+    // A settings file that is not JSON is unreadable, with its path, not "not installed".
+    let project = w.base.join(".codex/hooks.json");
+    fs::create_dir_all(project.parent().unwrap()).unwrap();
+    fs::write(&project, "{ not json").unwrap();
+    let (_, _, out, _) = w.cv(&["doctor", "docsess"]);
+    assert!(
+        out.contains("6 untrusted") && out.contains("/.codex/hooks.json (Project) unreadable (key must be a string"),
+        "{out}"
+    );
+    let (_, _, out, _) = w.cv(&["doctor", "docsess", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let broken = &doc["hooks"]["codex"][1];
+    assert!(
+        broken["entries"].is_null() && broken["error"].as_str().unwrap().starts_with("key must be a string"),
+        "{broken}"
+    );
+    fs::remove_file(&project).unwrap();
+
+    // Trust recorded for every key: trusted; a reinstall writes nothing and says so.
+    write_codex_trust(
+        &w,
+        &rows.iter().map(|(k, h, _)| (k.clone(), h.clone())).collect::<Vec<_>>(),
+    );
+    assert!(trust_rows(&w, "user").iter().all(|(_, _, t)| t == "trusted"));
+    let out = cv_ok(&w, &["hooks", "install", "codex"]);
+    assert!(
+        out.contains("nothing written") && out.contains("Codex trust: trusted"),
+        "{out}"
+    );
+    let (_, _, out, _) = w.cv(&["doctor", "docsess"]);
+    assert!(
+        out.contains("Codex hooks: 6/6 in ~/.codex/hooks.json (User), trusted"),
+        "{out}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&cv_ok(&w, &["doctor", "docsess", "--json"])).unwrap();
+    assert_eq!(doc["hooks"]["codex"][0]["trust"].as_array().unwrap().len(), 6);
+    assert!(doc["hooks"]["codex"][0]["trust"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|t| t["trust"] == "trusted"));
+
+    // One entry trusted at another hash (a moved binary, an edited matcher): modified, skipped again.
+    write_codex_trust(
+        &w,
+        &rows
+            .iter()
+            .map(|(k, h, _)| {
+                let h = if k.ends_with(":pre_tool_use:0:0") {
+                    "sha256:stale".to_string()
+                } else {
+                    h.clone()
+                };
+                (k.clone(), h)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let rows = trust_rows(&w, "user");
+    assert_eq!(rows.iter().filter(|(_, _, t)| t == "modified").count(), 1, "{rows:?}");
+    assert_eq!(rows.iter().filter(|(_, _, t)| t == "trusted").count(), 5, "{rows:?}");
+    let (_, _, out, _) = w.cv(&["doctor", "docsess"]);
+    assert!(
+        out.contains("(User), 1 modified since trusted — Codex skips them"),
+        "{out}"
+    );
+    let out = cv_ok(&w, &["hooks", "show", "codex"]);
+    assert!(
+        out.contains("hook edit --harness codex · modified") && out.contains("hook start --harness codex · trusted"),
+        "{out}"
+    );
+    assert!(out.contains("Codex trust: 1 modified since trusted"), "{out}");
+
+    // Project scope: its own keys under ./.codex/hooks.json, and the extra project-trust step.
+    let out = cv_ok(&w, &["hooks", "install", "codex", "--scope", "project"]);
+    assert!(out.contains("6 untrusted") && out.contains("trusted project"), "{out}");
+    let project = fs::canonicalize(w.base.join(".codex/hooks.json"))
+        .unwrap()
+        .display()
+        .to_string();
+    assert!(trust_rows(&w, "project")
+        .iter()
+        .all(|(k, _, t)| k.starts_with(&project) && t == "untrusted"));
+}
+
+/// The real-binary gate for trust: with `CV_CODEX_BIN=/path/to/codex`, ask that Codex's
+/// `app-server` for `hooks/list` over the file cv wrote and compare keys, hashes and states.
+/// Without the variable the test passes without running; CI sets it to a pinned release.
+#[test]
+fn codex_trust_matches_the_real_binary() {
+    let Some(codex) = std::env::var_os("CV_CODEX_BIN") else {
+        eprintln!("CV_CODEX_BIN unset: skipping the real-binary trust check");
+        return;
+    };
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let w = World::new("codex-trust-real");
+    cv_ok(&w, &["hooks", "install", "codex"]);
+    let rows = trust_rows(&w, "user");
+    // Trust five as Codex would, leave one at a stale hash: expect trusted ×5, modified ×1.
+    write_codex_trust(
+        &w,
+        &rows
+            .iter()
+            .map(|(k, h, _)| {
+                let h = if k.ends_with(":user_prompt_submit:0:0") {
+                    "sha256:stale".to_string()
+                } else {
+                    h.clone()
+                };
+                (k.clone(), h)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut child = Command::new(&codex)
+        .arg("app-server")
+        .env("CODEX_HOME", w.home.join(".codex"))
+        .env("HOME", &w.home)
+        .current_dir(&w.base)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("codex app-server");
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"clientInfo":{{"name":"cv-test","version":"0"}}}}}}"#
+    )
+    .unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"initialized"}}"#).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"hooks/list","params":{{"cwds":[{}]}}}}"#,
+        serde_json::to_string(&w.base).unwrap()
+    )
+    .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reported = std::collections::HashMap::new();
+    for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+        let msg: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if msg["id"] != 2 {
+            continue;
+        }
+        for entry in msg["result"]["data"].as_array().expect("hooks/list result") {
+            for hook in entry["hooks"].as_array().unwrap() {
+                reported.insert(
+                    hook["key"].as_str().unwrap().to_string(),
+                    (
+                        hook["currentHash"].as_str().unwrap().to_string(),
+                        hook["trustStatus"].as_str().unwrap().to_string(),
+                    ),
+                );
+            }
+        }
+        break;
+    }
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let rows = trust_rows(&w, "user");
+    assert_eq!(rows.len(), 6);
+    for (key, hash, trust) in &rows {
+        let (their_hash, their_trust) = reported.get(key).unwrap_or_else(|| panic!("codex did not list {key}"));
+        assert_eq!(their_hash, hash, "{key}");
+        assert_eq!(their_trust, trust, "{key}");
+    }
+    assert_eq!(rows.iter().filter(|(_, _, t)| t == "modified").count(), 1);
+}
+
+/// The live effect, with no model call: `codex exec` runs SessionStart and UserPromptSubmit hooks
+/// before it asks the model anything, and reports each as `hook: <Event> Completed`. Untrusted
+/// (a fresh install) Codex skips every one; `--dangerously-bypass-hook-trust` runs them. The model
+/// request itself fails unauthenticated, which is why the run is read until both lines appear (or
+/// a deadline) and then killed. Opt-in on `CV_CODEX_BIN`, like the trust check.
+#[test]
+fn codex_hooks_run_in_the_real_binary_only_with_trust() {
+    let Some(codex) = std::env::var_os("CV_CODEX_BIN") else {
+        eprintln!("CV_CODEX_BIN unset: skipping the real-binary hook run");
+        return;
+    };
+    use std::process::{Command, Stdio};
+    let w = World::new("codex-hooks-real");
+    cv_ok(&w, &["hooks", "install", "codex"]);
+    let run = |bypass: bool| -> String {
+        let log = w.base.join(if bypass {
+            "exec-bypass.log"
+        } else {
+            "exec-untrusted.log"
+        });
+        let out = fs::File::create(&log).unwrap();
+        let mut cmd = Command::new(&codex);
+        cmd.args(["exec", "--skip-git-repo-check"]);
+        if bypass {
+            cmd.arg("--dangerously-bypass-hook-trust");
+        }
+        let mut child = cmd
+            .arg("hello")
+            .env("CODEX_HOME", w.home.join(".codex"))
+            .env("HOME", &w.home)
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("CODEX_API_KEY")
+            .current_dir(&w.base)
+            .stdin(Stdio::null())
+            .stdout(out.try_clone().unwrap())
+            .stderr(out)
+            .spawn()
+            .expect("codex exec");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            let text = fs::read_to_string(&log).unwrap_or_default();
+            let hooked =
+                text.contains("hook: SessionStart Completed") && text.contains("hook: UserPromptSubmit Completed");
+            // Untrusted: Codex reaches the model request (and its retries) without a hook line.
+            let reached_model = text.contains("Reconnecting... 2/");
+            let exited = child.try_wait().unwrap().is_some();
+            if (bypass && hooked) || (!bypass && reached_model) || exited || std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return fs::read_to_string(&log).unwrap_or_default();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    let untrusted = run(false);
+    assert!(!untrusted.contains("hook: "), "untrusted hooks ran:\n{untrusted}");
+    let bypassed = run(true);
+    assert!(
+        bypassed.contains("hook: SessionStart Completed") && bypassed.contains("hook: UserPromptSubmit Completed"),
+        "hooks did not complete under --dangerously-bypass-hook-trust:\n{bypassed}"
+    );
+    assert!(
+        !bypassed.contains("Failed") && !bypassed.contains("Blocked"),
+        "{bypassed}"
+    );
+}
+
+/// A Codex rollout under the world's `~/.codex/sessions`: a `session_meta` header (with
+/// `parent_thread_id` for a child thread) and one `apply_patch` of `file`, in the record shapes
+/// Codex 0.163.0 writes (`tests/fixtures/codex/direct_patch.jsonl`).
+fn codex_rollout(w: &World, id: &str, parent: Option<&str>, file: &str) -> PathBuf {
+    let dir = w.home.join(".codex/sessions/2026/10/19");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("rollout-2026-10-19T10-00-00-{id}.jsonl"));
+    let mut meta = json!({"id": id, "session_id": parent.unwrap_or(id), "timestamp": "2026-10-19T10:00:00.000Z",
+        "cwd": "/work/proj", "originator": "codex_exec", "cli_version": "0.163.0", "source": "exec"});
+    if let Some(parent) = parent {
+        meta["parent_thread_id"] = json!(parent);
+    }
+    let call = format!("call_{id}");
+    let patch = format!("*** Begin Patch\n*** Update File: {file}\n@@\n-a\n+b\n*** End Patch");
+    let lines = [
+        json!({"timestamp": "2026-10-19T10:00:00.000Z", "ordinal": 0, "type": "session_meta", "payload": meta}),
+        json!({"timestamp": "2026-10-19T10:00:01.000Z", "ordinal": 1, "type": "response_item", "payload": {
+            "type": "function_call", "id": format!("fc_{id}"), "name": "exec_command", "call_id": call,
+            "arguments": json!({"cmd": format!("apply_patch <<'PATCH'\n{patch}\nPATCH"), "workdir": "/work/proj"}).to_string()}}),
+        json!({"timestamp": "2026-10-19T10:00:02.000Z", "ordinal": 2, "type": "event_msg", "payload": {
+            "type": "item_completed", "thread_id": id, "item": {"type": "FileChange", "id": call, "status": "completed",
+            "changes": {format!("/work/proj/{file}"): {"type": "update", "unified_diff": "@@ -1 +1 @@\n-a\n+b\n", "move_path": null}}}}}),
+        json!({"timestamp": "2026-10-19T10:00:03.000Z", "ordinal": 3, "type": "response_item", "payload": {
+            "type": "function_call_output", "id": format!("fco_{id}"), "call_id": call, "output": "Success. Updated the following files:\nM shared.txt\n"}}),
+    ];
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn codex_edit_guard_exempts_the_root_threads_lineage_and_denies_strangers() {
+    let w = World::new("codex-lineage");
+    let parent = "01a14d90-0000-7000-8000-000000000001";
+    let child = "01a14d90-0000-7000-8000-000000000002";
+    let stranger = "01a14d90-0000-7000-8000-000000000003";
+    let parent_path = codex_rollout(&w, parent, None, "shared.txt");
+    let child_path = codex_rollout(&w, child, Some(parent), "shared.txt");
+    let stranger_path = codex_rollout(&w, stranger, None, "other.txt");
+    cv_ok(&w, &["index"]);
+    let patch = |file: &str| format!("*** Begin Patch\n*** Update File: {file}\n@@\n-b\n+c\n*** End Patch");
+    let input = |sid: &str, path: &PathBuf, file: &str| {
+        json!({"session_id": sid, "transcript_path": path, "cwd": "/work/proj", "hook_event_name": "PreToolUse",
+            "permission_mode": "bypassPermissions", "tool_name": "apply_patch", "tool_input": {"command": patch(file)}})
+    };
+    // All three rollouts were just written: every editor is live. The child edited shared.txt
+    // moments ago, yet the parent patching it is not a conflict, and neither is the child patching
+    // what its root edited.
+    assert_eq!(
+        codex_hook(&w, "edit", &input(parent, &parent_path, "shared.txt"), &[]),
+        ""
+    );
+    assert_eq!(
+        codex_hook(&w, "edit", &input(child, &child_path, "shared.txt"), &[]),
+        ""
+    );
+    // An unrelated root thread is denied, as before.
+    let out = codex_hook(&w, "edit", &input(parent, &parent_path, "other.txt"), &[]);
+    let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(out["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("codex:{stranger}")));
+    let out = codex_hook(&w, "edit", &input(stranger, &stranger_path, "shared.txt"), &[]);
+    assert!(out.contains("\"deny\""), "{out}");
+    // A child the catalog has not indexed yet is still placed by the lane ledger's start row.
+    let late = "01a14d90-0000-7000-8000-000000000004";
+    let late_path = codex_rollout(&w, late, Some(parent), "shared.txt");
+    codex_hook(
+        &w,
+        "lane",
+        &json!({"session_id": parent, "transcript_path": parent_path, "hook_event_name": "SubagentStart",
+            "agent_id": late, "agent_type": "default", "cwd": "/work/proj"}),
+        &[],
+    );
+    assert_eq!(codex_hook(&w, "edit", &input(late, &late_path, "shared.txt"), &[]), "");
+}
+
+/// `$CV_HOOK_HARNESS` (0.17's Codex entries) was removed: it exits 2 with the reinstall pointer.
+#[test]
+fn removed_hook_harness_variable_exits_two_with_a_pointer() {
+    let w = World::new("codex-hook-harness-env");
+    let (ok, code, _, err) = w.cv_full(&["hook", "edit"], &[("CV_HOOK_HARNESS", "codex")], Some("{}"));
+    assert!(!ok && code == 2, "{err}");
+    assert!(
+        err.contains("CV_HOOK_HARNESS") && err.contains("cv hooks install codex"),
+        "{err}"
+    );
 }

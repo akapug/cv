@@ -3,6 +3,7 @@ use super::*;
 use crate::json::JsonSource;
 use crate::source::{Probe, ReadSet};
 use crate::stream::{Flow, MessageSink};
+use anyhow::Context;
 use std::collections::HashMap;
 
 struct Collect {
@@ -86,7 +87,7 @@ fn text_mut(block: &mut crate::Block) -> Option<&mut crate::Text> {
 pub(super) fn parse(
     adapter: &dyn crate::harness::Adapter,
     reference: &SessionRef,
-    options: &ParseOptions,
+    options: &Demand,
 ) -> Result<Session> {
     Ok(selected(adapter, reference, options, 0, None)?.0)
 }
@@ -94,7 +95,7 @@ pub(super) fn parse(
 pub(super) fn selected(
     adapter: &dyn crate::harness::Adapter,
     reference: &SessionRef,
-    options: &ParseOptions,
+    options: &Demand,
     start: usize,
     end: Option<usize>,
 ) -> Result<(Session, usize)> {
@@ -128,7 +129,6 @@ pub(super) fn selected(
         sink.reads.fresh(&mut Probe::default()) && crate::source::unchanged_from(reference, &primary, &guard),
         "source changed during port preparation"
     );
-    let resolver = session.resolver();
     for message in &mut sink.messages {
         for block in &mut message.content {
             let Some(value) = text_mut(block) else { continue };
@@ -145,41 +145,17 @@ pub(super) fn selected(
                 .get(&path)
                 .ok_or_else(|| anyhow::anyhow!("uncaptured retained span source: {}", path.display()))?;
             source.check()?;
-            let mut literal_backslash = false;
-            if !span.escaped {
-                value.try_for_each_chunk(&resolver, 64 * 1024, |chunk| {
-                    literal_backslash |= chunk.contains('\\');
-                    Ok(())
-                })?;
-            }
-            let quoted = if !literal_backslash {
-                span.offset
-                    .checked_sub(1)
-                    .zip(span.len.checked_add(2))
-                    .filter(|(offset, len)| {
-                        offset
-                            .checked_add(*len)
-                            .is_some_and(|end| fs::metadata(&path).is_ok_and(|metadata| end <= metadata.len()))
-                    })
-                    .map(|(offset, len)| {
-                        source.read_range_value(offset, len, |view| {
-                            if view.source_range()? == Some((offset, len)) {
-                                view.source_text()
-                            } else {
-                                Ok(None)
-                            }
-                        })
-                    })
-            } else {
-                None
-            };
-            let bound = match quoted {
-                Some(Ok(Some(text))) => text,
-                Some(Err(error)) if error.downcast_ref::<crate::json::InvalidJson>().is_none() => return Err(error),
-                _ => crate::harness::store::text::append(source, &source.decoded_backing()?, |builder| {
-                    value.try_for_each_chunk(&resolver, 64 * 1024, |chunk| builder.push(chunk))
-                })?,
-            };
+            // A wire-form span covers a JSON string's body: bind that string, quotes included,
+            // in the capture just checked rather than a fresh stat of the live path.
+            let (offset, len) = span
+                .offset
+                .checked_sub(1)
+                .zip(span.len.checked_add(2))
+                .filter(|(offset, len)| offset.checked_add(*len).is_some_and(|end| end <= source.len()))
+                .with_context(|| format!("retained span is outside its source {}", path.display()))?;
+            let bound = source
+                .read_range_value(offset, len, |view| view.source_text())?
+                .with_context(|| format!("retained span is not a JSON string in {}", path.display()))?;
             source.check()?;
             *value = bound;
         }
@@ -237,26 +213,23 @@ mod tests {
         fs::write(&path, &wire)?;
         let reference = SessionRef::new("session", Harness::Claude, &path);
         let adapter = crate::harness::claude::Claude::detect();
-        for (extra, usage_identity) in [(true, false), (false, false), (false, true)] {
-            let owned_options = ParseOptions {
-                extra,
-                usage_identity,
-                ..ParseOptions::complete()
-            };
+        {
+            let extra = "complete";
+            let owned_options = Demand::COMPLETE;
             let expected = crate::stream::collect_with(&adapter, &reference, &owned_options)?;
             assert!(expected
                 .messages
                 .iter()
                 .flat_map(|m| &m.content)
                 .all(|block| text(block).is_none_or(|t| t.inline_str().is_some())));
-            let checked_options = ParseOptions {
+            let checked_options = Demand {
                 spans: true,
                 ..owned_options
             };
             struct Facts(crate::stream::CollectSink);
             impl MessageSink for Facts {
-                fn extra_projection(&self) -> crate::stream::ExtraProjection {
-                    crate::stream::ExtraProjection::Facts
+                fn tier(&self) -> crate::stream::Tier {
+                    crate::stream::Tier::Facts
                 }
                 fn message(&mut self, message: Message) -> Flow {
                     self.0.message(message)
@@ -342,7 +315,7 @@ mod tests {
         fs::write(&path, &wire)?;
         let reference = SessionRef::new("session", Harness::Codex, &path);
         let adapter = crate::harness::codex::Codex::detect();
-        let expected = crate::stream::collect_with(&adapter, &reference, &ParseOptions::complete())?;
+        let expected = crate::stream::collect_with(&adapter, &reference, &Demand::COMPLETE)?;
         let actual = super::super::parse_for_emit(&adapter, &reference, Harness::Codex)?;
         assert!(actual
             .messages
@@ -412,7 +385,7 @@ mod tests {
             };
             fs::write(&path, &wire)?;
             let reference = SessionRef::new("source", Harness::Gemini, &path);
-            let expected = crate::stream::collect_with(&adapter, &reference, &ParseOptions::complete())?;
+            let expected = crate::stream::collect_with(&adapter, &reference, &Demand::COMPLETE)?;
             assert!(expected
                 .messages
                 .iter()
@@ -427,17 +400,9 @@ mod tests {
             let mut materialized = actual.clone();
             materialized.materialize()?;
             assert_serialized_equal(&materialized, &expected)?;
-            for extra in [false, true] {
-                let options = ParseOptions {
-                    spans: true,
-                    extra,
-                    usage_identity: !extra,
-                    ..ParseOptions::complete()
-                };
-                let mut custom = crate::stream::collect_with(&adapter, &reference, &options)?;
-                custom.materialize()?;
-                assert_serialized_equal(&custom, &expected)?;
-            }
+            let mut custom = crate::stream::collect_with(&adapter, &reference, &Demand::COMPLETE.with_spans())?;
+            custom.materialize()?;
+            assert_serialized_equal(&custom, &expected)?;
             let options = EmitOptions {
                 new_id: Some("00000000-0000-0000-0000-000000000001".into()),
                 ..Default::default()
@@ -515,7 +480,7 @@ mod tests {
         fs::write(&path, bytes)?;
         let reference = SessionRef::new("session", Harness::Claude, &path);
         let adapter = crate::harness::claude::Claude::detect();
-        let mut old = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
+        let mut old = crate::stream::collect_with(&adapter, &reference, &Demand::RICH)?;
         old.materialize()?;
         for (start, end) in [(5, Some(6)), (0, Some(0)), (8, Some(2)), (30, None), (11, None)] {
             let (mut selected, total) = super::super::prepare_selected(&adapter, &reference, start, end)?;
@@ -535,10 +500,10 @@ mod tests {
             &selected.messages[0].content[0],
             Block::Text { text: Text::Source(_) }
         ));
-        let mut builder = crate::loom::Composition::default();
+        let mut builder = crate::splice::Composition::default();
         builder.push(selected.clone(), 12, 5, Some(6));
         let actual = builder.finish(Some("00000000-0000-0000-0000-000000000002".into()), Harness::Claude);
-        let expected = crate::loom::tests::compose(&[(&old, 5, Some(6))], Some(actual.id.clone()), Harness::Claude);
+        let expected = crate::splice::tests::compose(&[(&old, 5, Some(6))], Some(actual.id.clone()), Harness::Claude);
         let mut owned_actual = actual.clone();
         owned_actual.materialize()?;
         assert_eq!(serde_json::to_value(&owned_actual)?, serde_json::to_value(&expected)?);
@@ -577,10 +542,10 @@ mod tests {
         fn roots(&self) -> Vec<PathBuf> {
             Vec::new()
         }
-        fn discover(&self) -> Result<Vec<SessionRef>> {
-            Ok(Vec::new())
+        fn discover(&self) -> Result<crate::Discovered> {
+            Ok(Default::default())
         }
-        fn stream(&self, reference: &SessionRef, _: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+        fn stream(&self, reference: &SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
             let mut session = Session::new(&reference.id, Harness::Claude);
             session.source_path = Some(reference.path.clone());
             sink.meta(&session);
@@ -604,48 +569,6 @@ mod tests {
         }
     }
     #[test]
-    fn literal_sidecar_spans_are_bounded_snapshots_with_original_identity() -> Result<()> {
-        let world = cv_testkit::World::new("port-prepare-sidecar");
-        let primary = world.base.join("session.jsonl");
-        let sidecar = world.base.join("body.txt");
-        fs::write(&primary, b"{}")?;
-        let body = "literal \\n body λ".repeat(1024);
-        fs::write(&sidecar, format!("!{body}"))?;
-        let reference = SessionRef::new("session", Harness::Claude, &primary);
-        let adapter = Sidecar {
-            path: sidecar.clone(),
-            mutate: false,
-            range: None,
-        };
-        let session = super::super::parse_for_emit(&adapter, &reference, Harness::Codex)?;
-        assert!(matches!(
-            &session.messages[0].content[0],
-            Block::Text { text: Text::Source(_) }
-        ));
-        let materialized = super::super::materialized_session(&session)?;
-        assert_eq!(materialized.messages[0].text().as_deref(), Some(body.as_str()));
-        fs::write(&sidecar, b"!changed")?;
-        assert!(emit(
-            &session,
-            Harness::Codex,
-            &world.base.join("output"),
-            &EmitOptions::default()
-        )
-        .is_err());
-        fs::write(&sidecar, format!("!{body}"))?;
-        assert!(super::super::parse_for_emit(
-            &Sidecar {
-                path: sidecar,
-                mutate: true,
-                range: None,
-            },
-            &reference,
-            Harness::Codex
-        )
-        .is_err());
-        Ok(())
-    }
-    #[test]
     fn selected_opensession_defaults_to_underlying_harness_and_provenance() -> Result<()> {
         let world = cv_testkit::World::new("selected-prepare-opensession");
         let path = world.base.join("source.opensession.json");
@@ -662,17 +585,17 @@ mod tests {
         )?;
         let reference = SessionRef::new("wrapped-codex", Harness::OpenSession, &path);
         let adapter = crate::harness::opensession::OpenSession;
-        let mut legacy = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
+        let mut legacy = crate::stream::collect_with(&adapter, &reference, &Demand::RICH)?;
         legacy.materialize()?;
         let (selected, total) = super::super::prepare_selected(&adapter, &reference, 1, Some(2))?;
         assert_eq!(selected.harness, Harness::Codex);
-        let mut builder = crate::loom::Composition::default();
+        let mut builder = crate::splice::Composition::default();
         builder.push(selected, total, 1, Some(2));
         let default_target = builder.first_harness().unwrap();
         assert_eq!(default_target, legacy.harness);
         let mut actual = builder.finish(Some("fixed".into()), default_target);
         actual.materialize()?;
-        let expected = crate::loom::tests::compose(&[(&legacy, 1, Some(2))], Some("fixed".into()), legacy.harness);
+        let expected = crate::splice::tests::compose(&[(&legacy, 1, Some(2))], Some("fixed".into()), legacy.harness);
         assert_eq!(serde_json::to_value(actual)?, serde_json::to_value(expected)?);
         Ok(())
     }
@@ -695,9 +618,9 @@ mod tests {
         fs::write(&path, bytes)?;
         let reference = SessionRef::new("rich", Harness::Claude, &path);
         let adapter = crate::harness::claude::Claude::detect();
-        let mut old = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
+        let mut old = crate::stream::collect_with(&adapter, &reference, &Demand::RICH)?;
         old.materialize()?;
-        let mut builder = crate::loom::Composition::default();
+        let mut builder = crate::splice::Composition::default();
         for (start, end) in [(1, Some(3)), (2, Some(3))] {
             let (source, total) = super::super::prepare_selected(&adapter, &reference, start, end)?;
             assert_eq!(total, old.messages.len());
@@ -706,7 +629,7 @@ mod tests {
         }
         let mut actual = builder.finish(Some("fixed".into()), Harness::Claude);
         actual.materialize()?;
-        let expected = crate::loom::tests::compose(
+        let expected = crate::splice::tests::compose(
             &[(&old, 1, Some(3)), (&old, 2, Some(3))],
             Some("fixed".into()),
             Harness::Claude,
@@ -730,25 +653,6 @@ mod tests {
         };
         // Even an empty selection must reject metadata/dependency mutation during the EOF pass.
         assert!(super::super::prepare_selected(&adapter, &reference, 5, None).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn literal_quoted_text_does_not_become_the_enclosing_json_value() -> Result<()> {
-        let world = cv_testkit::World::new("port-prepare-literal-quotes");
-        let primary = world.base.join("session.jsonl");
-        let sidecar = world.base.join("body.txt");
-        fs::write(&primary, b"{}")?;
-        fs::write(&sidecar, br#"[ "x" ]"#)?;
-        let reference = SessionRef::new("session", Harness::Claude, &primary);
-        let adapter = Sidecar {
-            path: sidecar,
-            mutate: false,
-            range: Some((2, 3)),
-        };
-        let session = super::super::parse_for_emit(&adapter, &reference, Harness::Codex)?;
-        let owned = super::super::materialized_session(&session)?;
-        assert_eq!(owned.messages[0].text().as_deref(), Some("\"x\""));
         Ok(())
     }
 }

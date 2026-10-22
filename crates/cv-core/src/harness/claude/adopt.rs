@@ -88,6 +88,7 @@ pub fn find_session(spec: &str) -> Result<SessionFile> {
         bail!("{spec} is a sub-agent id; this wants a session id");
     }
     match crate::find(spec, Some(Harness::Claude))? {
+        // Check the resolved id too: a short selector need not itself start with agent-.
         Some((r, _)) if !r.id.starts_with("agent-") => {
             SessionFile::of(r).with_context(|| format!("{spec}: the transcript has no project dir"))
         }
@@ -160,7 +161,7 @@ fn agents_in(session: &SessionFile, want: &str) -> Vec<AgentFile> {
 /// Every copy of an agent (full id or unique prefix; `agent-` optional) in any session's
 /// `subagents/` ([`crate::find_subagent_parents`]), or only in `from` when given. Newest copy
 /// first. Copies of ONE agent in several sessions (an earlier adoption) are expected; a prefix
-/// matching two different agent ids is an error.
+/// matching two different agent ids is an error unless an exact id matches, which wins first.
 pub fn find_agent(spec: &str, from: Option<&SessionFile>) -> Result<Vec<AgentFile>> {
     let want = spec.strip_prefix("agent-").unwrap_or(spec);
     let sessions: Vec<SessionFile> = match from {
@@ -277,7 +278,8 @@ fn execute_after_stage(
         let dir = p.dest.parent().context("destination has no parent dir")?;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let mut output = std::io::BufWriter::new(Staged::create(dir, "adopt", 0o600)?);
-        let counts = crate::restamp::write_restamped_transcript(&source, &file, &p.into_session, &mut output)?;
+        let counts = crate::derive::transcript(&source, &file, &p.into_session, super::IDENTITY, &mut output)
+            .with_context(|| format!("adopting {}", p.agent.path.display()))?;
         transcript = Some(output.into_inner().map_err(|e| e.into_error())?);
         if let (Some(src), Some(dest)) = (&p.agent.meta_path, &p.dest_meta) {
             let meta_source =
@@ -290,7 +292,8 @@ fn execute_after_stage(
         }
         counts
     } else {
-        crate::restamp::write_restamped_transcript(&source, &file, &p.into_session, &mut std::io::sink())?
+        crate::derive::transcript(&source, &file, &p.into_session, super::IDENTITY, &mut std::io::sink())
+            .with_context(|| format!("adopting {}", p.agent.path.display()))?
     };
     after_stage()?;
     source.check_metadata(file.metadata()?)?;
@@ -299,21 +302,30 @@ fn execute_after_stage(
         meta_source.check_metadata(meta_file.metadata()?)?;
         meta_source.check()?;
     }
+    if let Some(staged) = &transcript {
+        crate::derive::verify(
+            Harness::Claude,
+            &source,
+            &file,
+            Some(&p.agent.agent_id),
+            staged.path(),
+            &p.dest,
+            Some(&p.agent.agent_id),
+        )?;
+    }
     if write && !force {
         refuse_destinations()?;
     }
     let claim = if force { Claim::Replace } else { Claim::New };
-    let metadata = metadata
-        .map(|(_, _, staged, destination)| staged.publish(destination, claim).map(|file| (destination, file)))
-        .transpose()?;
-    if let Some(staged) = transcript {
-        if let Err(error) = staged.publish(&p.dest, claim) {
-            return Err(match &metadata {
-                Some((destination, file)) => crate::publish::retract(destination, file, error),
-                None => error,
-            });
-        }
+    // One set, the metadata first: a published transcript always has its metadata.
+    let mut set = crate::publish::Set::new();
+    if let Some((_, _, staged, destination)) = metadata {
+        set.add(staged, destination, claim);
     }
+    if let Some(staged) = transcript {
+        set.add(staged, &p.dest, claim);
+    }
+    set.publish()?;
     Ok(Adopted {
         agent_id: p.agent.agent_id.clone(),
         lines: counts.lines,
@@ -415,14 +427,15 @@ mod tests {
     }
 
     #[test]
-    fn adopt_streams_large_and_malformed_rows_with_exact_old_output_and_dry_counts() {
+    fn adopt_streams_large_and_blank_rows_with_exact_old_output_and_dry_counts() {
         let root = fixture("streamed-output");
         let into = sf(&root, LIVE);
         let dead = sf(&root, DEAD);
         let agent = find_agent(AGENT, Some(&dead)).unwrap().remove(0);
         let original = format!(
-            "\r\n{{ \"sessionId\" : \"{DEAD}\", \"text\":\"{}\", \"n\":1.50 }}\r\nnot json ☃\n{}\n{{\"session_id\":\"{DEAD}\"}}",
-            "λ\\n".repeat(40000), " ".repeat(100000)
+            "\r\n{{ \"sessionId\" : \"{DEAD}\", \"text\":\"{}\", \"n\":1.50 }}\r\n{}\n{{\"session_id\":\"{DEAD}\"}}",
+            "λ\\n".repeat(40000),
+            " ".repeat(100000)
         );
         std::fs::write(&agent.path, &original).unwrap();
         let expected = restamp(&original, LIVE);
@@ -438,6 +451,36 @@ mod tests {
                 (expected.lines, expected.stamped, expected.body.len())
             );
         }
+        cleanup_owned_test_root(&root);
+    }
+
+    /// A malformed line between two readable records is a record to no reader; an adoption that
+    /// copied it verbatim would publish an agent transcript Claude Code cannot load. Refuse first,
+    /// naming the file and the byte, and publish nothing.
+    #[test]
+    fn adopt_refuses_a_malformed_line_inside_the_transcript() {
+        let root = fixture("malformed-inside");
+        let into = sf(&root, LIVE);
+        let dead = sf(&root, DEAD);
+        let agent = find_agent(AGENT, Some(&dead)).unwrap().remove(0);
+        let first = format!(
+            "{{\"parentUuid\":null,\"isSidechain\":true,\"agentId\":\"{AGENT}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"brief\"}},\"uuid\":\"u1\",\"sessionId\":\"{DEAD}\"}}\n"
+        );
+        let original = format!(
+            "{first}{{\"parentUuid\":\"u1\",\"isSidechain\":true,\"agentId\":\"{AGENT}\",\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":\"cut sho\n\
+             {{\"parentUuid\":\"u1\",\"isSidechain\":true,\"agentId\":\"{AGENT}\",\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":\"ok\"}},\"uuid\":\"a1\",\"sessionId\":\"{DEAD}\"}}\n"
+        );
+        std::fs::write(&agent.path, &original).unwrap();
+        let p = plan(agent, vec![], &into);
+        for write in [true, false] {
+            let error = execute(&p, write, false).unwrap_err();
+            assert!(error.is::<crate::json::InvalidJson>(), "{error:#}");
+            let message = format!("{error:#}");
+            assert!(message.contains(&p.agent.path.display().to_string()), "{message}");
+            assert!(message.contains(&format!("byte {}", first.len())), "{message}");
+            assert!(!p.dest.exists(), "nothing is published when the source is unreadable");
+        }
+        assert_eq!(std::fs::read(&p.agent.path).unwrap(), original.as_bytes());
         cleanup_owned_test_root(&root);
     }
 
@@ -505,6 +548,26 @@ mod tests {
                 .all(|entry| !entry.file_name().to_string_lossy().starts_with(".cv-adopt-")));
             cleanup_owned_test_root(&root);
         }
+    }
+
+    /// The staged transcript is verified resumable against the agent's own before it is published:
+    /// a break the source does not have refuses the adoption and publishes neither file.
+    #[test]
+    fn a_staged_adoption_that_breaks_resume_is_refused_and_leaves_nothing() {
+        let root = fixture("breaks-resume");
+        let into = sf(&root, LIVE);
+        let agent = find_agent(AGENT, Some(&sf(&root, DEAD))).unwrap().remove(0);
+        let p = plan(agent, vec![], &into);
+        let dir = p.dest.parent().unwrap().to_path_buf();
+        let err = execute_after_stage(&p, true, false, || crate::prune::tests::break_staged(&dir, "adopt"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parentUuid nowhere names no record"), "{err}");
+        assert!(!p.dest.exists());
+        assert!(!p.dest.with_extension("meta.json").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        execute(&p, true, false).unwrap();
+        cleanup_owned_test_root(&root);
     }
 
     #[test]

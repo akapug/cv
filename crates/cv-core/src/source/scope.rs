@@ -157,7 +157,11 @@ mod tests {
         assert!(!inventory_scoped());
         get().unwrap();
         get().unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "standalone reads were cached");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "standalone reads must each load the inventory"
+        );
         let scope = super::super::read_scope();
         let (first, reads) = get().unwrap();
         {

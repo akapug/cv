@@ -1,9 +1,10 @@
 //! Frozen wire and fidelity oracles for the Grok and Qwen emitters; `$HOME` and generated Qwen
 //! UUIDs normalize.
+use super::frozen::Frozen;
 use super::*;
 use crate::harness::Adapter;
 use crate::ir::{GitInfo, Message, Origin, Usage};
-use crate::stream::ParseOptions;
+use crate::stream::Demand;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -216,7 +217,7 @@ fn entry(target: Harness, result: &EmitResult, owned: &Session, mode: ThinkingMo
             }
         }
     }
-    let reread = fidelity::reparse_emitted(target, result, &ParseOptions::full())?;
+    let reread = fidelity::reparse_emitted(target, result, &Demand::RICH)?;
     let report = serde_json::to_vec(&fidelity::diff_fidelity(target, mode, owned, &reread))?;
     Ok(json!({ "files": files, "fidelity": crate::digest::sha256_hex(&report) }))
 }
@@ -237,49 +238,6 @@ fn compare(frozen: &mut Frozen, session: &Session, target: Harness, mode: Thinki
     let label = base.file_name().unwrap().to_string_lossy().into_owned();
     frozen.insert(label, actual);
     Ok(())
-}
-
-/// Output goldens per test under `tests/fixtures/emit-frozen/`, frozen from retired oracles
-/// (the pre-streaming emitters, distill's pre-sharing products). `CV_REGEN_CORPUS=1` rewrites
-/// them; explain every diff in the commit.
-pub(crate) struct Frozen(pub(crate) std::collections::BTreeMap<String, Value>, &'static str);
-
-impl Frozen {
-    pub(crate) fn new(name: &'static str) -> Self {
-        Self(Default::default(), name)
-    }
-
-    /// Record one labelled entry; labels are unique per golden.
-    pub(crate) fn insert(&mut self, label: impl Into<String>, entry: Value) {
-        assert!(self.0.insert(label.into(), entry).is_none(), "unique label");
-    }
-
-    pub(crate) fn check(self) -> Result<()> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/emit-frozen/{}.json", self.1));
-        let rows: Vec<String> = (self.0.iter())
-            .map(|(label, entry)| {
-                Ok(format!(
-                    "{}: {}",
-                    serde_json::to_string(label)?,
-                    serde_json::to_string(entry)?
-                ))
-            })
-            .collect::<Result<_>>()?;
-        let actual = format!("{{\n{}\n}}\n", rows.join(",\n"));
-        if std::env::var_os("CV_REGEN_CORPUS").is_some() {
-            fs::create_dir_all(path.parent().unwrap())?;
-            fs::write(&path, &actual)?;
-        }
-        let expected = anyhow::Context::with_context(fs::read_to_string(&path), || {
-            format!("{} (CV_REGEN_CORPUS=1 writes it)", path.display())
-        })?;
-        assert!(
-            expected == actual,
-            "{} differs from the frozen emitted output (CV_REGEN_CORPUS=1 rewrites)",
-            self.1
-        );
-        Ok(())
-    }
 }
 
 fn capture_bodies(session: &mut Session, base: &Path) -> Result<()> {
@@ -477,7 +435,7 @@ fn checked_grok_qwen_complete_selected_producer_matches_owned() -> Result<()> {
         ),
     ] {
         for reference in adapter.discover()? {
-            let owned = crate::stream::collect_with(adapter.as_ref(), &reference, &ParseOptions::complete())?;
+            let owned = crate::stream::collect_with(adapter.as_ref(), &reference, &Demand::COMPLETE)?;
             let selected = parse_for_emit(adapter.as_ref(), &reference, target)
                 .map_err(|error| anyhow::anyhow!("{target} {}: {error:#}", reference.path.display()))?;
             let mut materialized = selected.clone();
@@ -539,7 +497,7 @@ fn checked_grok_qwen_complete_selected_producer_matches_owned() -> Result<()> {
         };
         append.write_all(unicode.as_bytes())?;
         drop(append);
-        let owned = crate::stream::collect_with(adapter.as_ref(), &reference, &ParseOptions::complete())?;
+        let owned = crate::stream::collect_with(adapter.as_ref(), &reference, &Demand::COMPLETE)?;
         let selected = parse_for_emit(adapter.as_ref(), &reference, target)
             .map_err(|error| anyhow::anyhow!("{target} {}: {error:#}", reference.path.display()))?;
         assert!(
@@ -564,11 +522,52 @@ fn checked_grok_qwen_complete_selected_producer_matches_owned() -> Result<()> {
             )?;
         }
         let wire = adapter.resume_source(&reference);
-        // Truncation, not growth: an append-only log may grow under a selected source.
+        // Truncate to invalidate the selected source; append-only growth is permitted.
         std::fs::write(&wire, b"")?;
         let absent = world.base.join(format!("changed-{target}"));
         assert!(emit(&selected, target, &absent, &EmitOptions::default()).is_err());
         assert!(!absent.exists());
     }
     frozen.check()
+}
+
+/// Grok's three files are one publication: a claim that fails after another has been made (a
+/// directory holds `updates.jsonl` under `--force`, `summary.json` without it) leaves every
+/// name as it was.
+#[test]
+fn grok_files_publish_together_or_not_at_all() -> Result<()> {
+    let world = crate::test_world("grok-emit-set");
+    let session = fixture(Harness::Claude);
+    for (force, blocked) in [(true, "updates.jsonl"), (false, "summary.json")] {
+        let out = world.base.join(format!("out-{force}"));
+        let opts = EmitOptions {
+            new_id: Some("fixed".into()),
+            force,
+            ..Default::default()
+        };
+        let dir = emit(&session, Harness::Grok, &out, &opts)?.path;
+        for name in ["summary.json", "chat_history.jsonl", "updates.jsonl"] {
+            fs::remove_file(dir.join(name))?;
+            if force {
+                fs::write(dir.join(name), "existing destination")?;
+            }
+        }
+        if force {
+            fs::remove_file(dir.join(blocked))?;
+        }
+        fs::create_dir(dir.join(blocked))?;
+        assert!(emit(&session, Harness::Grok, &out, &opts).is_err());
+        let mut left: Vec<_> = fs::read_dir(&dir)?
+            .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<_>>()?;
+        left.sort();
+        if force {
+            assert_eq!(left, ["chat_history.jsonl", "summary.json", "updates.jsonl"]);
+            assert_eq!(fs::read(dir.join("chat_history.jsonl"))?, b"existing destination");
+            assert_eq!(fs::read(dir.join("summary.json"))?, b"existing destination");
+        } else {
+            assert_eq!(left, ["summary.json"], "only the blocking directory");
+        }
+    }
+    Ok(())
 }

@@ -14,9 +14,11 @@
 //! without itself looking copied, or holds the boundary `uuid` past its own first record. Only
 //! those few candidates are read whole. Siblings that are themselves forks of the same source are
 //! never chosen; a fork of a fork resolves to the original.
+//! Out-of-order head timestamps can falsely suggest a fork, costing a sibling-directory scan,
+//! candidate head reads, and whole-file searches for candidates requiring a boundary match.
 
-use crate::harness::store::{document::Fields, jsonl};
-use crate::json::JsonSource;
+use super::record::Facts;
+use crate::harness::store::jsonl;
 use crate::stream::Flow;
 use chrono::{DateTime, Utc};
 #[cfg(test)]
@@ -41,31 +43,21 @@ struct Head {
     began: Option<DateTime<Utc>>,
 }
 
-/// The head through the record codec's byte source: at most [`HEAD_LINES`] physical lines,
-/// counting blank and rejected ones, reading only the four fields that recognize a copy.
+/// The head through the record codec's byte source and its typed [`Facts`]: at most
+/// [`HEAD_LINES`] physical lines, counting blank and rejected ones.
 fn head(path: &Path) -> Option<Head> {
-    let source = JsonSource::capture(path).ok()?;
-    let file = fs::File::open(path).ok()?;
-    source.check_metadata(file.metadata().ok()?).ok()?;
+    let read = jsonl::Read::open(path).ok()?;
     let mut newest: Option<DateTime<Utc>> = None;
     let mut found = None;
     let mut lines = 0;
-    jsonl::for_each_line(&source, &file, 0, source.len(), |line| {
+    read.lines(0, |line| {
         lines += 1;
-        if let Some(fields) = line
-            .view
-            .map(|view| Fields::parse(view, &["uuid", "timestamp", "subtype", "parentUuid"]))
-            .transpose()?
-            .flatten()
-        {
-            let at = fields.string("timestamp")?.as_deref().and_then(super::parse_ts);
-            if let Some(uuid) = fields.string("uuid")? {
-                let boundary = fields.string("subtype")?.as_deref() == Some("compact_boundary")
-                    && fields
-                        .get("parentUuid")
-                        .map(|v| v.is_null())
-                        .transpose()?
-                        .unwrap_or(true);
+        if let Some(view) = line.view {
+            let (facts, _) = Facts::parse(view)?;
+            let at = facts.timestamp.as_deref().and_then(super::parse_ts);
+            if let Some(uuid) = facts.uuid {
+                // A head boundary has no string parent, as decoded by `Facts::parent`.
+                let boundary = facts.subtype.as_deref() == Some("compact_boundary") && facts.parent.flatten().is_none();
                 let older = matches!((at, newest), (Some(a), Some(n)) if a < n);
                 found = Some(Head {
                     uuid,
@@ -200,35 +192,6 @@ mod tests {
         json!({"type": "queue-operation", "operation": "enqueue", "timestamp": ts})
     }
 
-    fn legacy_head(path: &Path) -> Option<Head> {
-        let mut newest: Option<DateTime<Utc>> = None;
-        for line in BufReader::new(fs::File::open(path).ok()?).lines().take(HEAD_LINES) {
-            let Ok(line) = line else { break };
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let at = v
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(super::super::parse_ts);
-            if let Some(uuid) = v.get("uuid").and_then(Value::as_str) {
-                let boundary = v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
-                    && v.get("parentUuid").is_none_or(Value::is_null);
-                return Some(Head {
-                    uuid: uuid.into(),
-                    at,
-                    boundary,
-                    copied: boundary || matches!((at,newest), (Some(a),Some(n)) if a<n),
-                    began: newest,
-                });
-            }
-            if let Some(a) = at {
-                newest = Some(newest.map_or(a, |n| n.max(a)));
-            }
-        }
-        None
-    }
-
     #[test]
     fn projected_heads_match_value_validation_and_physical_line_limits() {
         let w = crate::test_world("fork-head-projection");
@@ -262,14 +225,17 @@ mod tests {
             )
             .into_bytes(),
         );
-        let observe = |head: Option<Head>| head.map(|h| (h.uuid, h.at, h.boundary, h.copied, h.began));
+        // Frozen from the retired line/`Value` head reader (decision 11: goldens, not oracles).
+        let mut frozen = crate::emit::frozen::Frozen::new("claude-fork-heads");
         for (i, bytes) in cases.iter().enumerate() {
             fs::write(&path, bytes).unwrap();
-            assert_eq!(observe(head(&path)), observe(legacy_head(&path)), "case {i}");
+            let observed = head(&path).map(|h| (h.uuid, h.at, h.boundary, h.copied, h.began));
+            frozen.insert(format!("case {i}"), serde_json::to_value(observed).unwrap());
         }
+        frozen.check().unwrap();
         // An invalid UTF-8 line is one rejected record, not the end of the file.
         fs::write(&path, [b"\xff\n".as_slice(), uuid.as_bytes()].concat()).unwrap();
-        assert_eq!(observe(head(&path)).map(|h| h.0), Some("shared".to_owned()));
+        assert_eq!(head(&path).map(|h| h.uuid).as_deref(), Some("shared"));
         fs::write(&path, [b"prefix\n\xff\n".as_slice(), b"needle\n"].concat()).unwrap();
         assert!(holds(&path, "needle"));
     }

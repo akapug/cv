@@ -270,6 +270,20 @@ fn workflow_renders_phase_tree_and_lists() {
     let (scr, _) = w.cv_ok(&["workflow", "fsess", "wf_test", "--script"]);
     assert!(scr.contains("the driving script body"), "script body:\n{scr}");
 
+    // A flag that acts on one run is refused where there is no run, not dropped.
+    for args in [
+        &["workflow", "fsess", "--script"][..],
+        &["workflow", "fsess", "--results"][..],
+        &["workflow", "fsess", "--revive"][..],
+        &["workflow", "fsess", "--follow"][..],
+        &["workflow", "fsess", "wf_test", "--revive-all"][..],
+        &["workflow", "fsess", "wf_test", "--revive", "--json"][..],
+        &["workflow", "fsess", "wf_test", "--revive", "--follow"][..],
+    ] {
+        let (_, code, _, err) = w.cv(args);
+        assert_eq!(code, 2, "{args:?}: {err}");
+    }
+
     // JSON round-trips the structured workflow.
     let (js, _) = w.cv_ok(&["workflow", "fsess", "wf_test", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&js).unwrap();

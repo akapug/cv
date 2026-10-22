@@ -205,6 +205,21 @@ class ProxyCase(unittest.TestCase):
         self.assertEqual(Upstream.seen, [])
         self.assertEqual(post(url + "/v1/chat/completions", chat_request()[1])[0], 200)
         self.assertEqual([l.get("injected", False) for l in self.calls(log)], [True, True, False])
+        # The same two scenarios on the passthrough wire (Claude Code's Anthropic messages), answered
+        # in that wire's error dialect, so a generator can record a provider failure and a retry.
+        Upstream.seen.clear()
+        url, log = self.start("passthrough", max_calls=1)
+        status, out = post(url + "/v1/messages", {"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "CORPUS-PROVIDER-ERROR then say ok"}]}]})
+        self.assertEqual(status, 500)
+        # A resumed session carries the failed prompt and the new one in one user message: no injection.
+        resumed = {"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "CORPUS-PROVIDER-ERROR then say ok"}, {"type": "text", "text": "say recovered"}]}]}
+        self.assertEqual(post(url + "/v1/messages", resumed)[0], 200)
+        self.assertEqual(json.loads(out), {"type": "error", "error": {"type": "api_error", "message": "corpus: injected provider error"}})
+        self.assertEqual(post(url + "/v1/messages", {"model": "corpus-error", "messages": []})[0], 400)
+        self.assertEqual([s["body"]["messages"][0]["content"][-1]["text"] for s in Upstream.seen], ["say recovered"])
+        self.assertEqual([l.get("injected", False) for l in self.calls(log)], [True, False, True])
 
     def test_calls_past_the_cap_get_a_400_and_never_reach_upstream(self):
         for tr in DIALECT:

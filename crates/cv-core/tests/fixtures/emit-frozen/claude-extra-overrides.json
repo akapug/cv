@@ -1,0 +1,6 @@
+{
+"case-0": "<out>/-/fixed-id.jsonl:1: tool_use orphan has no tool_result",
+"case-1": [3318,"d83e17e69797ab3aa5a59293f371dfd95ba9793d344450d20a4e6fec26492ea5"],
+"case-2": "<out>/-/fixed-id.jsonl:1: tool_use raw-orphan has no tool_result",
+"case-3": [3318,"dc89828920c8fc818963b7bc73b1d75f0adea17cf8dbf950c22113ed453f1d21"]
+}

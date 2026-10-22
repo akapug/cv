@@ -30,7 +30,7 @@ use super::store::document::Fields;
 use super::{ts_from_value, Adapter};
 use crate::ir::*;
 use crate::json::{JsonSource, JsonView};
-use crate::stream::{Flow, MessageSink, ParseOptions};
+use crate::stream::{Demand, Flow, MessageSink};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -151,11 +151,11 @@ impl Adapter for OpenSession {
         super::export::export_dirs()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
-        Ok(discover_documents(document_files()))
+    fn discover(&self) -> Result<crate::Discovered> {
+        Ok(discover_documents(super::export::export_dirs()))
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| stream_document(&r.path, opts, sink))
     }
 }
@@ -176,32 +176,31 @@ impl Adapter for RootedOpenSession {
     fn roots(&self) -> Vec<PathBuf> {
         self.roots.clone()
     }
-    fn discover(&self) -> Result<Vec<SessionRef>> {
-        Ok(discover_documents(super::export::files_under(
-            self.roots.clone(),
-            is_document_file,
-        )))
+    fn discover(&self) -> Result<crate::Discovered> {
+        Ok(discover_documents(self.roots.clone()))
     }
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| stream_document(&r.path, opts, sink))
     }
 }
 
-fn discover_documents(paths: Vec<PathBuf>) -> Vec<SessionRef> {
+/// Every OpenSession document under `roots`: an unreadable dir, and a document that cannot be
+/// read, does not decode or names no `id`, is a reported skip.
+fn discover_documents(roots: Vec<PathBuf>) -> crate::Discovered {
+    let mut out = crate::Discovered::default();
+    let paths = super::export::files_under(roots, is_document_file, &mut out.skipped);
     let mut seen = std::collections::HashSet::new();
-    paths
-        .into_iter()
-        .filter_map(|path| doc_ref(&path))
-        .filter(|r| seen.insert(r.id.clone()))
-        .collect()
+    for path in paths {
+        if let Some(r) = out.keep(&path, doc_ref(&path)) {
+            if seen.insert(r.id.clone()) {
+                out.refs.push(r);
+            }
+        }
+    }
+    out
 }
 
 // ── Discovery ─────────────────────────────────────────────────────────────────
-
-/// Every OpenSession document under the registered export sources.
-fn document_files() -> Vec<PathBuf> {
-    super::export::files_under(super::export::export_dirs(), is_document_file)
-}
 
 /// Is this file an OpenSession document? By name (`*.opensession.json`), or by a head sniff of a
 /// plain `*.json` for the version key.
@@ -215,46 +214,47 @@ fn is_document_file(p: &Path) -> bool {
     if !name.ends_with(".json") {
         return false;
     }
-    crate::lazy::read_head(p, SNIFF_BYTES)
-        .is_some_and(|head| head.contains(VERSION_KEY) || head.contains(VERSION_KEY_V02))
+    matches!(
+        crate::lazy::read_head_checked(p, SNIFF_BYTES),
+        Ok(crate::lazy::PersistedHead::Text(head)) if head.contains(VERSION_KEY) || head.contains(VERSION_KEY_V02)
+    )
 }
 
 /// A lightweight [`SessionRef`] for one document: metadata only, counting conversational turns
 /// (user + assistant, the cross-harness contract) straight off the raw records. A document with
-/// no `id` is not a session cv can name, so it is not discovered.
-fn doc_ref(path: &Path) -> Option<SessionRef> {
-    JsonSource::capture(path)
-        .ok()?
-        .read_document(|view| {
-            let record = Fields::parse(view, &["id", "cwd", "title", "created_at", "updated_at", "messages"])?
-                .context("document object")?;
-            let o = record.project(&["id", "cwd", "title", "created_at", "updated_at"])?;
-            let string = |k: &str| o.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
-            let mut message_count = 0;
-            if let Some(messages) = record.get("messages").map(JsonView::array).transpose()?.flatten() {
-                for message in messages {
-                    if let Some(message) = Fields::parse(message?, &["role"])? {
-                        if message
-                            .string("role")?
-                            .is_some_and(|role| matches!(role.as_str(), "user" | "assistant"))
-                        {
-                            message_count += 1;
-                        }
+/// no `id` is not a session cv can name: an error, as is one that cannot be read or decoded.
+fn doc_ref(path: &Path) -> Result<SessionRef> {
+    JsonSource::capture(path)?.read_document(|view| {
+        let record = Fields::parse(view, &["id", "cwd", "title", "created_at", "updated_at", "messages"])?
+            .context("document object")?;
+        let o = record.project(&["id", "cwd", "title", "created_at", "updated_at"])?;
+        let string = |k: &str| o.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
+        let mut message_count = 0;
+        if let Some(messages) = record.get("messages").map(JsonView::array).transpose()?.flatten() {
+            for message in messages {
+                if let Some(message) = Fields::parse(message?, &["role"])? {
+                    if message
+                        .string("role")?
+                        .is_some_and(|role| matches!(role.as_str(), "user" | "assistant"))
+                    {
+                        message_count += 1;
                     }
                 }
             }
-            Ok(SessionRef {
-                id: string("id").context("document id")?.to_owned(),
-                harness: Harness::OpenSession,
-                path: path.to_owned(),
-                cwd: string("cwd").map(PathBuf::from),
-                title: string("title").map(str::to_owned),
-                created_at: o.get("created_at").and_then(ts_from_value),
-                updated_at: o.get("updated_at").and_then(ts_from_value),
-                message_count,
-            })
+        }
+        Ok(SessionRef {
+            cwd: string("cwd").map(PathBuf::from),
+            title: string("title").map(str::to_owned),
+            created_at: o.get("created_at").and_then(ts_from_value),
+            updated_at: o.get("updated_at").and_then(ts_from_value),
+            message_count: Some(message_count),
+            ..SessionRef::new(
+                string("id").context("document id")?.to_owned(),
+                Harness::OpenSession,
+                path.to_owned(),
+            )
         })
-        .ok()
+    })
 }
 
 // ── Reading a document ────────────────────────────────────────────────────────
@@ -262,26 +262,26 @@ fn doc_ref(path: &Path) -> Option<SessionRef> {
 /// Read one OpenSession document into the IR. The inverse of [`document`].
 pub fn read_document(path: &Path) -> Result<Session> {
     let mut sink = crate::stream::CollectSink::default();
-    let mut session = stream_document(path, &ParseOptions::full(), &mut sink)?;
+    let mut session = stream_document(path, &Demand::RICH, &mut sink)?;
     session.messages = sink.messages;
     Ok(session)
 }
 
 /// Traverse the document's IR messages without retaining a complete Session.
-fn stream_document(path: &Path, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+fn stream_document(path: &Path, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
     let source = JsonSource::capture(path)?;
     source.read_document(|view| read(view, Some((path, &source)), opts, sink))
 }
 
 /// The document codec, the only decoder of this format: the session envelope through the IR's own
 /// `Deserialize`, messages and blocks projected so text follows [`JsonView::lazy_text`]. Shape
-/// validation finishes before the first callback, so a document is all-or-error. `file` is the
-/// document and its capture, which a source-backed message is rechecked against; None for an
-/// owned view.
+/// validation finishes before the first callback, so a document is all-or-error without retaining
+/// its decoded history. `file` is the document and its capture, which a source-backed message is
+/// rechecked against; None for an owned view.
 fn read(
     view: JsonView<'_>,
     file: Option<(&Path, &JsonSource)>,
-    opts: &ParseOptions,
+    opts: &Demand,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
     let check = || file.map_or(Ok(()), |(_, source)| source.check());
@@ -305,6 +305,8 @@ fn read(
             "not an OpenSession 0.3 document: messages must be an array"
         );
         session.source_path = file.map(|(path, _)| path.to_path_buf());
+        // Validate and discard one turn at a time before publishing even metadata. Keep payloads
+        // lazy in this pass regardless of delivery demand; only their shape needs validation.
         for view in messages.array()?.unwrap() {
             ir_message(view?, true)?;
         }
@@ -322,12 +324,10 @@ fn read(
                 )
             });
             has_sources |= sourced;
-            if sourced {
-                check()?;
-            }
+            let started = std::time::Instant::now();
             let flow = sink.try_message(message)?;
-            if sourced {
-                check()?;
+            if let Some((_, source)) = file.filter(|_| sourced) {
+                source.check_after(started)?;
             }
             if flow == Flow::Stop {
                 break;
@@ -437,7 +437,7 @@ fn ir_block(view: JsonView<'_>, spans: bool) -> Result<Block> {
 pub fn from_str(text: &str) -> Result<Session> {
     let v: Value = serde_json::from_str(text).context("not JSON")?;
     let mut sink = crate::stream::CollectSink::default();
-    let mut session = read((&v).into(), None, &ParseOptions::full(), &mut sink)?;
+    let mut session = read((&v).into(), None, &Demand::RICH, &mut sink)?;
     session.messages = sink.messages;
     Ok(session)
 }

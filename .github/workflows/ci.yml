@@ -38,13 +38,17 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
+      # Product lines per crate and module as drift since the last release tag (annotations, never
+      # a failure); no committed evidence files; design docs stay short. The shallow checkout needs
+      # the tag; on the release commit itself the tag does not exist yet and the drift is skipped.
+      - name: Size drift and repository hygiene
+        run: |
+          tag=v$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          git fetch --no-tags --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}" || echo "::warning::${tag} is not published yet"
+          python3 -I tools/check-size.py
+
       # The corpus generators' shared key proxy (every translator, every generator's own launch
       # line) against a local mock upstream, and scrub.py over a synthetic store. No network.
-      # Product lines per crate stay within tools/size-budget.txt (raised only as a reviewed
-      # decision, lowered as code shrinks); no committed evidence files; design docs stay short.
-      - name: Parsimony budget
-        run: python3 -I tools/check-size.py
-
       - name: Corpus tools
         run: python3 -I tools/harness-corpus/test_tools.py
 
@@ -56,6 +60,40 @@ jobs:
 
       - name: Build (default features)
         run: cargo build --workspace --all-targets
+
+      - name: Compatibility comparator controls
+        run: python3 -I tools/test-compatibility.py
+
+      # The released binary, not a rebuild of its tag: the comparator reads both binaries' own
+      # contracts (`schema --json` lists the HTTP routes from the routers' tables). Each `--accept`
+      # is one reviewed 0.18 change (manual/src/compatibility.md lists them); they leave with this
+      # baseline.
+      - name: Compatibility against the released 0.17.0 binary
+        shell: bash
+        run: |
+          baseline=$(mktemp -d "$RUNNER_TEMP/cv-compat-baseline-XXXXXX")
+          curl -fsSL --retry 3 https://github.com/emberian/cv/releases/download/v0.17.0/clustervision-x86_64-unknown-linux-gnu.tar.xz -o "$baseline/release.tar.xz"
+          echo "fb940a1bfa8b22cf637f7188a30d6e46ed24efd15144a41de4d3c8b3abf44e5b  $baseline/release.tar.xz" | sha256sum -c -
+          tar -xJf "$baseline/release.tar.xz" -C "$baseline" --strip-components=1
+          python3 -I tools/check-compatibility.py --baseline "$baseline/cv" --candidate target/debug/cv \
+            --accept tools.workflow.inputSchema.properties.follow \
+            --accept commands.rewind.args.from_compaction \
+            --accept tools.rewind.inputSchema.properties.from_compaction \
+            --accept commands.deferrals.args.since \
+            --accept tools.deferrals.inputSchema.properties.since \
+            --accept commands.dataset.args.out \
+            --accept tools.dataset.inputSchema.properties.out \
+            --accept commands.watch.args.interval.value_type \
+            --accept rows.codex.message_count
+
+      - name: Upgrade from the released 0.16.1 binary
+        shell: bash
+        run: |
+          baseline=$(mktemp -d "$RUNNER_TEMP/cv-upgrade-baseline-XXXXXX")
+          curl -fsSL --retry 3 https://github.com/emberian/cv/releases/download/v0.16.1/clustervision-x86_64-unknown-linux-gnu.tar.xz -o "$baseline/release.tar.xz"
+          echo "5dd429825e0c0dbb56c7ebf09fcb2339ff9d43916593dd769d3da89ce95b9540  $baseline/release.tar.xz" | sha256sum -c -
+          tar -xJf "$baseline/release.tar.xz" -C "$baseline" --strip-components=1
+          python3 -I tools/check-upgrade.py --baseline "$baseline/cv" --candidate target/debug/cv --scratch-parent "$RUNNER_TEMP"
 
       # One process per test (a test that hangs or aborts takes only itself down). nextest does
       # not run doctests; the second line keeps them.
@@ -70,6 +108,19 @@ jobs:
         run: |
           cargo nextest run --workspace --profile ci
           cargo test --workspace --doc
+
+      # The real Codex, not recorded payloads: the trust verdict from `app-server hooks/list` and
+      # the SessionStart/UserPromptSubmit effect of `codex exec`. Neither needs an API key or a model call.
+      - name: Codex hooks against the released 0.162.1 binary
+        shell: bash
+        run: |
+          codex=$(mktemp -d "$RUNNER_TEMP/codex-XXXXXX")
+          curl -fsSL --retry 3 https://github.com/openai/codex/releases/download/rust-v0.162.1/codex-x86_64-unknown-linux-musl.tar.gz -o "$codex/codex.tar.gz"
+          echo "86f268d81b898f3e144c5ecff2ad2fda2c5802e042d6195b72538fe0fa125057  $codex/codex.tar.gz" | sha256sum -c -
+          tar -xzf "$codex/codex.tar.gz" -C "$codex"
+          mv "$codex/codex-x86_64-unknown-linux-musl" "$codex/codex"
+          "$codex/codex" --version
+          CV_CODEX_BIN="$codex/codex" cargo nextest run --profile ci -p clustervision --test hooks -E 'test(real_binary) | test(codex_hooks_run_in_the_real)'
 
       # The parse budget (docs/design/PERF.md): the counting pass over the committed corpus as a
       # ratio to a plain read of the same bytes in the same run, so a slow runner moves both sides.
@@ -91,7 +142,6 @@ jobs:
           python3 -I tools/check-heap-budget.py /tmp/cv-store-probe-mmap --no-mmap-probe target/release/examples/store_probe --only active
           python3 -I tools/check-heap-budget.py /tmp/cv-store-probe-mmap --no-mmap-probe target/release/examples/store_probe --only query
           python3 -I tools/check-heap-budget.py /tmp/cv-store-probe-mmap --no-mmap-probe target/release/examples/store_probe --only doctor
-          python3 -I tools/check-heap-budget.py /tmp/cv-store-probe-mmap --no-mmap-probe target/release/examples/store_probe --only events
           python3 -I tools/check-heap-budget.py /tmp/cv-store-probe-mmap --no-mmap-probe target/release/examples/store_probe --only active --format zed
           python3 -I tools/check-heap-budget.py /tmp/cv-store-probe-mmap --no-mmap-probe target/release/examples/store_probe --only portable-docs
           python3 -I tools/check-heap-budget.py /tmp/cv-store-probe-mmap --no-mmap-probe target/release/examples/store_probe --only selected-docs
@@ -102,6 +152,7 @@ jobs:
           python3 tools/perf-sqlite-check.py --probe /tmp/cv-store-probe-mmap --hermes-giant --sizes 16777216 67108864
           python3 tools/perf-sqlite-check.py --probe /tmp/cv-store-probe-mmap --giant-discovery --sizes 16777216 67108864
           cargo build --release -p clustervision-core --example store_probe --no-default-features --features sqlite,probe-heap
+          python3 -I tools/check-heap-budget.py /tmp/cv-store-probe-mmap --no-mmap-probe target/release/examples/store_probe --only events
           python3 -I tools/check-heap-budget.py /tmp/cv-store-probe-mmap --no-mmap-probe target/release/examples/store_probe --only portable-selected-payloads
 
       # Exercises the production worker/tee/channel/Tantivy path, not a queue-only mock.

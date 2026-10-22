@@ -16,12 +16,12 @@ pub(crate) fn trim(bytes: &[u8]) -> &[u8] {
 
 /// [`trim`] over text.
 pub(crate) fn trim_str(text: &str) -> &str {
-    text.trim_matches(|c: char| c.is_ascii() && is_whitespace(&(c as u8)))
+    text.trim_matches([' ', '\t', '\n', '\r'])
 }
 
 /// The bytes a validation pass reads: a slice in memory, or a positioned source read in windows
 /// (`document::range::Windowed`). Indexes are relative to the pass's first byte.
-pub(crate) trait Bytes {
+pub(crate) trait ValidationBytes {
     fn get(&mut self, i: usize) -> Option<u8>;
     /// `len` bytes from `i`; None past the end (never at a window boundary).
     fn slice(&mut self, i: usize, len: usize) -> Option<&[u8]>;
@@ -31,7 +31,7 @@ pub(crate) trait Bytes {
     /// (`strict`), or by JSON grammar alone.
     fn number(&mut self, i: usize, end: usize, strict: bool) -> bool;
 }
-impl Bytes for &[u8] {
+impl ValidationBytes for &[u8] {
     #[inline]
     fn get(&mut self, i: usize) -> Option<u8> {
         (**self).get(i).copied()
@@ -49,7 +49,7 @@ impl Bytes for &[u8] {
 }
 /// `str` bytes: UTF-8 is known.
 pub(crate) struct Text<'a>(pub &'a [u8]);
-impl Bytes for Text<'_> {
+impl ValidationBytes for Text<'_> {
     #[inline]
     fn get(&mut self, i: usize) -> Option<u8> {
         self.0.get(i).copied()
@@ -78,12 +78,13 @@ pub(crate) fn number_accepted(token: &[u8], strict: bool) -> bool {
 /// `serde_json::from_str::<Value>` accepts when `strict` (JSON grammar, strings without control
 /// characters or invalid escapes including lone surrogates, finite numbers, Value's nesting
 /// limit, nothing after the value), and what `RawValue` accepts otherwise (lone UTF-16 escapes
-/// and infinite numbers pass; grammar, control characters, nesting and UTF-8 still apply).
+/// and out-of-range number tokens pass; grammar, control characters and UTF-8 still apply,
+/// without Value's nesting limit).
 /// `depth` levels are already open around the value. `span` sees the bounds of every string
 /// and container, so a caller can index them for later structural selection.
 /// Returns the value's bounds, or None when it is not accepted.
 pub(crate) fn validate_value(
-    b: &mut impl Bytes,
+    b: &mut impl ValidationBytes,
     strict: bool,
     depth: usize,
     mut span: impl FnMut(u8, usize, usize),
@@ -173,7 +174,7 @@ pub(crate) fn validate_value(
 
 /// After a comma: an object's next key and colon, or an array's next value start.
 fn key_or_value(
-    b: &mut impl Bytes,
+    b: &mut impl ValidationBytes,
     i: usize,
     object: bool,
     strict: bool,
@@ -186,7 +187,7 @@ fn key_or_value(
     }
 }
 
-fn skip_ws(b: &mut impl Bytes, mut i: usize) -> usize {
+fn skip_ws(b: &mut impl ValidationBytes, mut i: usize) -> usize {
     while b.get(i).is_some_and(|c| is_whitespace(&c)) {
         i += 1;
     }
@@ -194,7 +195,7 @@ fn skip_ws(b: &mut impl Bytes, mut i: usize) -> usize {
 }
 
 /// An object key and its colon; the offset after the colon.
-fn key(b: &mut impl Bytes, i: usize, strict: bool, span: &mut impl FnMut(u8, usize, usize)) -> Option<usize> {
+fn key(b: &mut impl ValidationBytes, i: usize, strict: bool, span: &mut impl FnMut(u8, usize, usize)) -> Option<usize> {
     if b.get(i) != Some(b'"') {
         return None;
     }
@@ -205,7 +206,7 @@ fn key(b: &mut impl Bytes, i: usize, strict: bool, span: &mut impl FnMut(u8, usi
 }
 
 /// The end of a valid JSON string starting at the quote `i`.
-fn string(b: &mut impl Bytes, i: usize, strict: bool) -> Option<usize> {
+fn string(b: &mut impl ValidationBytes, i: usize, strict: bool) -> Option<usize> {
     let mut j = i + 1;
     loop {
         j = special(b, j);
@@ -242,7 +243,7 @@ fn string(b: &mut impl Bytes, i: usize, strict: bool) -> Option<usize> {
 }
 
 /// The first quote, backslash or control byte at or after `j`, eight bytes at a time.
-fn special(b: &mut impl Bytes, mut j: usize) -> usize {
+fn special(b: &mut impl ValidationBytes, mut j: usize) -> usize {
     const ONES: u64 = u64::from_ne_bytes([1; 8]);
     const HIGH: u64 = u64::from_ne_bytes([0x80; 8]);
     let zero = |x: u64| x.wrapping_sub(ONES) & !x & HIGH;
@@ -285,26 +286,6 @@ pub(crate) fn decode_body(reader: &mut impl std::io::BufRead, f: &mut impl FnMut
     })
 }
 
-/// Validate a body in bounded windows without decoding it; returns whether it contained an
-/// escape. `value`: serde `Value` acceptance (Unicode escapes go through the strict decoder,
-/// surrogate pairing included). Otherwise string syntax only, which like `RawValue` accepts lone
-/// UTF-16 escapes. Strings without Unicode escapes have the same acceptance either way.
-pub(crate) fn validate_body(reader: &mut impl std::io::BufRead, value: bool) -> Result<bool, ()> {
-    use serde::Deserializer;
-    json_body_windows(reader, &mut |quoted| {
-        if value && memchr::memmem::find(quoted, b"\\u").is_some() {
-            let mut decoder = serde_json::Deserializer::from_slice(quoted);
-            decoder
-                .deserialize_str(JsonWindow(&mut |_: &str| true))
-                .map_err(|_| ())?;
-            decoder.end().map_err(|_| ())?;
-        } else {
-            serde_json::from_slice::<&serde_json::value::RawValue>(quoted).map_err(|_| ())?;
-        }
-        Ok(true)
-    })
-}
-
 fn json_body_windows(
     reader: &mut impl std::io::BufRead,
     visit: &mut impl FnMut(&[u8]) -> Result<bool, ()>,
@@ -322,6 +303,8 @@ fn json_body_windows(
                 break;
             }
             let n = (WINDOW + 1 - buf.len()).min(bytes.len());
+            // n fills at most WINDOW body bytes after the opening quote; the extra byte
+            // reserves its closing quote. Thus needed <= WINDOW + 2 and needed > buf.len().
             let needed = buf.len() + n + 1;
             if needed > buf.capacity() {
                 buf.reserve_exact(needed.max(2 * buf.capacity()).min(WINDOW + 2) - buf.len());
@@ -402,7 +385,7 @@ fn complete_json_window_prefix(raw: &[u8]) -> usize {
 
 /// The longest prefix of `raw` (a JSON string body) that ends on a *complete* escape sequence —
 /// i.e. doesn't cut a `\x` or `\uXXXX` in half. Truncating to this length keeps the prefix
-/// parseable by [`unescape_body`] instead of tripping its lossy raw fallback.
+/// parseable: the window decoder cuts there so an escape never spans two windows.
 pub(crate) fn complete_escape_prefix(raw: &[u8]) -> usize {
     let mut i = 0usize;
     while i < raw.len() {
@@ -437,54 +420,9 @@ pub(crate) fn complete_escape_prefix(raw: &[u8]) -> usize {
     raw.len()
 }
 
-/// Unescape a JSON string *body* (the bytes between the quotes) into its text, by re-quoting and
-/// letting `serde_json` parse it — correct for all JSON escapes. Falls back to a lossy decode.
-pub(crate) fn unescape_body(raw: &[u8]) -> String {
-    if !raw.contains(&b'\\') {
-        return String::from_utf8_lossy(raw).into_owned();
-    }
-    let mut quoted = Vec::with_capacity(raw.len() + 2);
-    quoted.push(b'"');
-    quoted.extend_from_slice(raw);
-    quoted.push(b'"');
-    serde_json::from_slice::<String>(&quoted).unwrap_or_else(|_| String::from_utf8_lossy(raw).into_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn validation_preflight_matches_string_decoder_acceptance() {
-        use std::io::{BufReader, Cursor};
-        let codes = [0, 0x41, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xffff];
-        let mut cases = vec![
-            b"a\xff".to_vec(),
-            b"a\\q".to_vec(),
-            b"\\u123".to_vec(),
-            b"\\n\\t".to_vec(),
-        ];
-        for high in codes {
-            cases.push(format!("a\\u{high:04x}z").into_bytes());
-            for low in codes {
-                cases.push(format!("a\\u{high:04x}\\u{low:04x}z").into_bytes());
-            }
-            for slashes in 0..8 {
-                cases.push(format!("{}u{high:04x}", "\\".repeat(slashes)).into_bytes());
-            }
-        }
-        for raw in cases {
-            for window in 1..20 {
-                let mut validate = BufReader::with_capacity(window, Cursor::new(&raw));
-                let mut decode = BufReader::with_capacity(window, Cursor::new(&raw));
-                assert_eq!(
-                    validate_body(&mut validate, true).is_ok(),
-                    decode_body(&mut decode, &mut |_| true).is_ok(),
-                    "raw={raw:?}, window={window}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn validated_decoder_stops_after_one_bounded_window() {
@@ -530,13 +468,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn unescape_handles_escapes() {
-        assert_eq!(unescape_body(b"a\\nb"), "a\nb");
-        assert_eq!(unescape_body(b"plain"), "plain");
-        assert_eq!(unescape_body(b"quote \\\" mark"), "quote \" mark");
     }
 
     #[test]

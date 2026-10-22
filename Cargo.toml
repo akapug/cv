@@ -32,9 +32,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 ruzstd = "0.8"
 dirs = "5"
 clap = { version = "4", features = ["derive"] }
-uuid = { version = "1", features = ["v4", "v7"] }
+uuid = { version = "1", features = ["v4", "v5", "v7"] }
 # Human-editable config (`~/.config/clustervision/config.toml`). Pure Rust.
 toml = "0.8"
+# `cv hooks` reproduces Codex's hook trust hash (sha256 over a normalized identity).
 # BurntSushi's regex engine — powers the query calculus's `~` (regex-match) operator. Linear-time
 # (no catastrophic backtracking) and already in the tree transitively (tantivy), so it's near-free.
 regex = "1"

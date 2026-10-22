@@ -10,8 +10,10 @@ use crate::json::InvalidJson;
 fn read<T>(path: &Path, f: impl for<'a> FnOnce(&JsonSource, JsonView<'a>) -> Result<T>) -> Result<Option<T>> {
     let source = JsonSource::capture(path)?;
     let file = fs::File::open(path)?;
-    source.check_metadata(file.metadata()?)?;
-    if file.metadata()?.len() == 0 {
+    let metadata = file.metadata()?;
+    let len = metadata.len();
+    source.check_metadata(metadata)?;
+    if len == 0 {
         source.check()?;
         return Ok(None);
     }
@@ -53,56 +55,38 @@ pub(super) fn items(reader: &mut Reader<'_>, root: JsonView<'_>) -> Result<()> {
 }
 
 /// Discovery deliberately keeps the legacy policy: only session timestamps, no cwd, no event
-/// authority, and turns counted by the record codec's heads demand, one item at a time.
-pub(super) fn scan(path: &Path) -> Result<CodexScan> {
-    Ok(read(path, |_source, root| {
-        let mut scan = CodexScan::default();
+/// authority; counts are deferred until full reads.
+pub(super) fn scan(path: &Path) -> Result<Session> {
+    let listing = read(path, |_source, root| {
+        let mut scan = Session::new(String::new(), Harness::Codex);
         let meta = root
             .get("session")?
-            .map(|v| Fields::parse(v, &["id", "timestamp", "agent_path"]))
+            .map(|v| Fields::parse(v, &["id", "timestamp"]))
             .transpose()?
             .flatten();
-        let mut ctx = CodexCtx::default();
         if let Some(meta) = meta {
             scan.id = meta.string("id")?.unwrap_or_default();
             scan.created_at = meta.string("timestamp")?.as_deref().and_then(parse_ts);
             scan.updated_at = scan.created_at;
-            ctx.agent_path = meta.string("agent_path")?;
         }
-        let mut session = Session::new(String::new(), Harness::Codex);
-        let mut out = Vec::new();
         if let Some(items) = items_of(root)? {
             for item in items {
                 let item = item?;
-                Reader {
-                    session: &mut session,
-                    ctx: &mut ctx,
-                    out: &mut out,
-                    has_events: false,
-                    demand: Demand {
-                        spans: false,
-                        heads: true,
-                    },
-                    source: None,
-                }
-                .item(Some(item), None)?;
-                scan.message_count += out.drain(..).filter(|m| m.is_turn()).count();
-                if scan.title.is_none() {
-                    if let Some(fields) = Fields::parse(item, &["type", "role", "content"])? {
-                        let user = fields.string("role")?.as_deref().unwrap_or("user") == "user";
-                        if fields.string("type")?.as_deref() == Some("message") && user {
-                            scan.consider_title(title_of(fields.get("content"), None)?);
-                        }
+                let payload = record::Payload::of(item)?;
+                if payload.ty.as_deref() == Some("message") && payload.role.as_deref().unwrap_or("user") == "user" {
+                    consider_title(&mut scan.title, title_of(payload.view.get("content")?, None)?);
+                    if scan.title.is_some() {
+                        break;
                     }
                 }
             }
         }
         Ok(scan)
-    })?
-    .unwrap_or_default())
+    })?;
+    Ok(listing.unwrap_or_else(|| Session::new(String::new(), Harness::Codex)))
 }
 
-pub(super) fn stream(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+pub(super) fn stream(r: &SessionRef, opts: &stream::Demand, sink: &mut dyn MessageSink) -> Result<Session> {
     let empty = || Session {
         source_path: Some(r.path.clone()),
         ..Session::new(r.id.clone(), Harness::Codex)
@@ -118,7 +102,7 @@ pub(super) fn stream(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn Message
             session: &'s mut Session,
             ctx: &'s mut CodexCtx,
             out: &'s mut Vec<Message>,
-            opts: &ParseOptions,
+            opts: &stream::Demand,
             source: &'s JsonSource,
         ) -> Reader<'s> {
             Reader {
@@ -126,7 +110,7 @@ pub(super) fn stream(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn Message
                 ctx,
                 out,
                 has_events: false,
-                demand: Demand::of(opts),
+                demand: opts.into(),
                 source: Some(source),
             }
         }
@@ -161,7 +145,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn collected(path: &Path, opts: &ParseOptions) -> Session {
+    fn collected(path: &Path, opts: &stream::Demand) -> Session {
         let r = SessionRef::new("fallback", Harness::Codex, path);
         let mut sink = crate::stream::CollectSink::default();
         let mut session = Codex { roots: Vec::new() }.stream(&r, opts, &mut sink).unwrap();
@@ -187,17 +171,21 @@ mod tests {
         ] {
             // Not exactly a serde Value (or no items): an empty session, an empty listing.
             fs::write(&path, raw).unwrap();
-            let actual = collected(&path, &ParseOptions::lazy());
+            let actual = collected(&path, &stream::Demand::LEAN.with_spans());
             assert!(actual.messages.is_empty(), "{raw}");
             assert_eq!(actual.id, "fallback");
-            assert_eq!(scan(&path).unwrap(), CodexScan::default(), "{raw}");
+            let listing = scan(&path).unwrap();
+            assert!(
+                listing.id.is_empty() && listing.title.is_none() && listing.created_at.is_none(),
+                "{raw}"
+            );
         }
         let mut bad_utf8 = valid_prefix.as_bytes().to_vec();
         bad_utf8.extend_from_slice(b"\"\xff\"}");
         fs::write(&path, bad_utf8).unwrap();
         let r = SessionRef::new("fallback", Harness::Codex, &path);
         let mut sink = crate::stream::CollectSink::default();
-        assert!(stream(&r, &ParseOptions::lazy(), &mut sink).is_err());
+        assert!(stream(&r, &stream::Demand::LEAN.with_spans(), &mut sink).is_err());
         assert!(sink.messages.is_empty());
         assert!(scan(&path).is_err());
 
@@ -211,7 +199,7 @@ mod tests {
             saved = Some(m);
             Flow::Stop
         };
-        let meta = stream(&r, &ParseOptions::lazy(), &mut stop).unwrap();
+        let meta = stream(&r, &stream::Demand::LEAN.with_spans(), &mut stop).unwrap();
         assert_eq!(meta.id, "legacy");
         let saved = saved.unwrap();
         assert!(matches!(saved.content.first(), Some(Block::Text { text }) if text.inline_str().is_none()));
@@ -224,6 +212,6 @@ mod tests {
             fs::write(&path, "replacement source").unwrap();
             Flow::Stop
         };
-        assert!(stream(&r, &ParseOptions::lazy(), &mut mutate).is_err());
+        assert!(stream(&r, &stream::Demand::LEAN.with_spans(), &mut mutate).is_err());
     }
 }

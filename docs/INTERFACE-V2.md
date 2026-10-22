@@ -16,9 +16,9 @@ the same thing on every command that has it; a JSON key is spelled one way; a me
 
 *From the 2026-10 parsimony review, which measured cv at 110K product lines growing 20K a month.
 It is the direction every change steers by: a change that moves away from it needs a reason
-written next to it. The reviewed 0.17 tree is 102.4K product lines (`python3 -I tools/check-size.py`),
-pinned per crate and per module in `tools/size-budget.txt`; a budget only rises as a reviewed
-decision and ratchets down as code shrinks.*
+written next to it. The reviewed 0.17 tree is 102.4K product lines (`python3 -I tools/check-size.py`,
+which reports every crate's and module's drift since the last release tag). Since 0.18 size drift
+informs design review, with no line targets or percentage ratchets.*
 
 **Three product libraries, one binary, one API, one UI, 37 commands, two reshape primitives.**
 The workspace also contains the CLI crate and `cv-testkit`.
@@ -29,11 +29,13 @@ The workspace also contains the CLI crate and `cv-testkit`.
 - `cv`: `cv <verb>`, `cv mcp`, `cv serve`, `cv watch`. The former `cvd` and `cv-mcp` binaries are
   these subcommands. The MCP roster is generated from the in-process clap tree, so it cannot skew
   from the CLI (it once shelled out to whatever `cv` was on PATH, and found a stale one).
-- **An adapter is `roots + discover + record-to-Message stream`, plus its emitter.** Its size is
+- **An adapter is `roots + discover + record-to-Message stream`, plus its emitter.** Optional
+  checkpoint/resume methods default to declining; source/dependency methods bound safe reuse
+  (`harness::Adapter`). This incremental store glue is part of **G** below. Its size is
   `S + Q + C + G + E`: the store description **S** (60-150 lines, plus about 25 per SQL table
   queried); genuine format quirks **Q** (0-400: Gemini's `$set`/`$rewindTo` replay, Kimi's
   rotation fingerprints, Codex's held `token_count`, OpenClaw's tree selection, Devin's forest);
-  the codec **C**, 0 when the adapter rides a shared wire codec (`harness/wire/{anthropic,openai}`)
+  the codec **C**, 0 when the adapter rides a shared wire codec (`harness/wire/{anthropic,openai,genai}`)
   and 480-1,000 for a format with its own record grammar (Codex, Claude, Kimi Code, OpenClaw,
   Hermes, OpenCode 1.x + 2.x); glue to the shared drivers **G** (at most 40); and the emitter **E**
   (150-450: the shared encoder, the format's fields, a `JsonlStage` or SQLite writer). Roo (132
@@ -64,13 +66,14 @@ codex 3,032, opencode 3,014, hermes 2,386, gemini 2,291, cursor 1,761, qwen 1,75
 and the wire codecs 1,313. Every family reads through one record codec over one byte source
 (`docs/design/CODEC.md`), but discovery still has its own grammar in Codex, Claude, Grok, Kimi and
 Kimi Code, and six heap-gate scenario paths (OpenClaw window groups, Goose fork inventory, Qwen
-`TaskInventory`, Hermes dedup, the export cache) are bespoke SQL or file walks. Emitters are
-written beside the codec, not derived from it (deferred to 0.18). `derive` does not exist:
-`prune.rs` is 3,469 lines with every transform twice (owned `Value` and the view for records over
-1 MiB), `rewind.rs` 1,001 with its own owned copier, `adopt` 248 in `cv`. `loom::Composition`
-(74 lines) still composes splice outside the emitter. Message windowing is written in
-`api::WindowSink`, `cv/src/cmd/view.rs` (the text renderer resolves `--first/--last/--range` in
-its own pass) and `cv/src/cmd/pack.rs`. CLI and HTTP search now share
+`TaskInventory`, Hermes dedup, the export cache) are bespoke SQL or file walks. Anthropic block publication and Qwen/Gemini part fields now share their wire grammar;
+store wrappers and output selection remain beside each adapter. `derive` now owns native record
+selection/writing for prune, rewind and adoption. Prune uses
+checked views at every size; untouched records keep their bytes except for selected identity
+changes. Rewind retains evidence/window selection and adoption retains destination/meta policy.
+`splice::Composition` (74 lines) still composes splice outside the emitter. Message window selection lives in
+`api::MessageWindow`, shared by JSON, text rendering and pack relevance excerpts.
+CLI and HTTP search now share
 `cv_search::Searcher::search`; each door renders its own response. The clap tree in
 `cv/src/main.rs` is 1,605 lines. The task reducer is 664 lines
 plus 224 of model inside a 2,182-line `task` module; `lanes.jsonl` is stored state (hook stops
@@ -123,6 +126,12 @@ and `splice <id>:A..B` use the same `A..B` grammar.
 (write somewhere other than the real store), `--json` (machine output where supported), `--limit N`, `--fresh` (bypass the catalog), `--all` (include what is
 hidden by default: finished lanes, archived sessions, terminal tasks).
 
+**Restored skills:** `prune`, `rewind`, and Claude-target `port` accept `--skills keep|drop|drop-stale`,
+parallel to `--thinking`. The default `keep` preserves existing transcript and report bytes.
+
+**Global:** `--frozen` (`CV_FROZEN=1`) leaves cv stores untouched; commands whose purpose is to
+write stores or sessions error with exit 2.
+
 **Session selectors:** accept a unique id prefix or `harness:id`. An ambiguous prefix lists the
 candidates as `harness:full-id` lines and exits 2.
 
@@ -146,10 +155,13 @@ every command of the clap tree on a pipe under this contract.
   `DateTime::to_rfc3339()` (`+00:00`); serialized IR sessions/messages use chrono serde (`Z`).
 - A **session row** (from `ls`, `search`, `/api/sessions`, …) always has the same keys:
   `id, harness, path, cwd, title, created_at, updated_at, message_count, size_bytes`
+  (`message_count` is `null` for a session no listing, full read or index has counted yet; `0` is a
+  session with no turns)
   (+ `display_title`, `git` under `--enrich`; + `score`, `snippet`, `agent_id`, `parent_id`,
   `workflow` from `search`). `cv schema --json` publishes this list as `session_row`, with
-  `session`, `message`, `block`, `prompt_row`, `lane`, `deferral` and `query`; the manual's
-  architecture chapter is the prose.
+  `subagent_row` (a forest member: the session row + its sidecar facts), `task_row`, `session`,
+  `message`, `block`, `prompt_row`, `lane`, `deferral` and `query`; the manual's architecture
+  chapter is the prose.
 - A **message** is the IR `Message`. A **block** is the IR `Block`, tagged by `type`.
 
 ## 4. The IR (cv-core `ir.rs`)
@@ -185,6 +197,10 @@ Rules:
 - **Emitters read kinds, never harness keys.** An emitter may consult `extra[<its own harness>]`
   only when round-tripping into the same harness (format-complete replay), where the non-first-class
   fields are mirrored into the harness bag and the carrier stays at `_record`.
+- **A shared module names a harness only inside an exhaustive match.** A harness fact is an
+  `Adapter` method with a "no opinion" default (a static one is a field of `Adapter::capabilities`),
+  asked of `harness::rootless(h)` when no store is needed; per-harness data is a `match` naming
+  every variant (`tests/harness_fence.rs`, over cv-core, the binary and cv-search).
 - **Shared core modules key off `kind`.** `compaction.rs` detects the two compaction kinds;
   `doctor.rs` buckets `InjectedContext` as system reminders (kind name from the harness bag when
   present); `render.rs`/`html.rs` label a System turn by its `kind`.

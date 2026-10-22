@@ -517,10 +517,18 @@ fn observe_stream_bounded_read_only_tail() {
     assert_eq!(v["count"], 0, "absent corpus → zero messages: {text}");
     assert_eq!(v["messages"].as_array().unwrap().len(), 0, "{text}");
     assert_eq!(v["more_pending"], false, "{text}");
-    assert!(
-        v["cursor"].as_str().unwrap().contains("\"v\":1"),
-        "cursor is versioned: {text}"
+    // The cursor's encoding is opaque; its contract is that it resumes: replayed, the call is no
+    // longer a baseline and still drains nothing.
+    let empty = v["cursor"].as_str().expect("a cursor").to_string();
+    let (text, is_err) = s.call_tool(
+        102,
+        "observe_stream",
+        json!({"cwd_contains": "/no/such/dir", "since_cursor": empty}),
     );
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["baseline"], false, "the empty-corpus cursor resumes: {text}");
+    assert_eq!(v["count"], 0, "{text}");
 
     // 2) Baseline over the REAL fixture corpus emits no backlog (only future activity is tailed),
     //    and hands back a cursor recording the current tail.

@@ -18,7 +18,8 @@ const WINDOW: usize = 64 * 1024;
 /// so each later structural selection (record, message, content, block) skips them in O(1).
 const SKIP_MIN: u64 = 128;
 
-/// Memoize at most 1024 recent long endpoints, keyed by absolute offset. Nested record wrappers
+/// Memoize at most 1024 insertion-ordered long endpoints, keyed by absolute offset. Reads do not
+/// refresh eviction order. Nested record wrappers
 /// reuse body bounds without retaining offsets for the entire history. Eviction affects only
 /// scan cost, not data.
 const ENDPOINTS: usize = 1024;
@@ -35,11 +36,12 @@ impl Range {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source range overflows"))
     }
     /// A quoted string's interior.
-    fn body(self) -> Range {
-        Range {
-            offset: self.offset + 1,
+    fn body(self) -> Result<Range> {
+        anyhow::ensure!(self.len >= 2, "not a quoted JSON string range");
+        Ok(Range {
+            offset: self.offset.checked_add(1).context("JSON string offset overflows")?,
             len: self.len - 2,
-        }
+        })
     }
 }
 
@@ -424,6 +426,9 @@ impl<'a> Cursor<'a> {
         self.consume(1);
         // Only quotes can end a string. Carry slash parity across refill boundaries so
         // dense escaped bodies remain vectorized rather than visiting every backslash.
+        // An all-backslash window extends the previous run, so XOR its parity. Any intervening
+        // non-backslash ends that run; a quote inherits prior parity only when its entire
+        // window prefix is backslashes (slashes == n).
         let mut trailing_odd = false;
         loop {
             let bytes = self.fill_buf()?;
@@ -640,7 +645,7 @@ impl<'s> Windowed<'s> {
         }
     }
 }
-impl super::super::json::Bytes for Windowed<'_> {
+impl super::super::json::ValidationBytes for Windowed<'_> {
     fn get(&mut self, i: usize) -> Option<u8> {
         self.load(i, 1).then(|| self.buf[i - self.start])
     }
@@ -752,7 +757,7 @@ impl<'a> RangeSource<'a> {
             let decoded: String = self.materialize(string)?;
             return visit(&decoded);
         }
-        let mut cursor = self.cursor(string.body())?;
+        let mut cursor = self.cursor(string.body()?)?;
         let mut callback_error = None;
         let decoded = super::super::json::decode_body(&mut cursor, &mut |part| {
             callback_error = visit(part).err();
@@ -833,6 +838,7 @@ impl<'a> RangeSource<'a> {
     }
     /// An object's entries as Value keeps them: each key at its first position, with its final
     /// value. None for a nonobject. Narrow objects dedupe by scanning; wide ones by a position map.
+    /// Retains all decoded keys (borrowing when possible); prefer get/select_each for selected keys.
     pub fn entries(&self, range: Range) -> Result<Option<Entries<'a>>> {
         let Some(iter) = self.object(range)? else {
             return Ok(None);
@@ -866,10 +872,6 @@ impl<'a> RangeSource<'a> {
             }
         }
         Ok(Some(entries))
-    }
-    /// Whether a string's body holds a backslash: the span rule's `escaped`.
-    pub fn escaped(&self, string: Range) -> Result<bool> {
-        self.scan(string.body(), 0, |bytes| memchr::memchr(b'\\', bytes).is_some())
     }
     /// Conservative printable-ASCII presence without decoding a retained JSON string.
     /// False proves absence; escaped backslashes may create harmless false positives.
@@ -1166,7 +1168,6 @@ mod tests {
             assert_eq!(fields[0], fields[1]);
             assert!(fields[2].is_none());
             assert_eq!(source.materialize::<u64>(fields[0].unwrap()).unwrap(), 2);
-            assert!(source.escaped(fields[3].unwrap()).unwrap());
             let mut decoded = String::new();
             source
                 .string_chunks(fields[3].unwrap(), &mut |part| {
@@ -1304,7 +1305,10 @@ mod syntax_tests {
         std::fs::write(&path, format!("[null,\"{}\"]", "a".repeat(WINDOW * 3))).unwrap();
         let source = RangeSource::open(&path).unwrap();
         let mut windowed = Windowed::new(&source, source.range());
-        assert_eq!(super::super::super::json::Bytes::get(&mut windowed, 0), Some(b'['));
+        assert_eq!(
+            super::super::super::json::ValidationBytes::get(&mut windowed, 0),
+            Some(b'[')
+        );
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)

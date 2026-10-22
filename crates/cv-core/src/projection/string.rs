@@ -3,24 +3,19 @@
 use crate::json::JsonView;
 use anyhow::Result;
 
-#[derive(Debug)]
-struct Complete;
-impl std::fmt::Display for Complete {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("string projection complete")
-    }
-}
-impl std::error::Error for Complete {}
-
-/// Visit decoded chunks until `fold` returns true. Returns false only for a nonstring. Only our
-/// private completion signal is intercepted; source/decoder failures remain errors. Callers keep
-/// reducer state staged until the enclosing with_view succeeds.
+/// Visit decoded chunks until `fold` returns true. Returns false only for a nonstring. Only the
+/// [`Stop`](crate::stream::Stop) it raises is intercepted; source/decoder failures remain errors. Callers keep
+/// reducer state staged until the enclosing with_view succeeds. The bool means "was a string",
+/// including early stops; callers track completion in their own reducer state.
 pub(crate) fn string_until(view: JsonView<'_>, mut fold: impl FnMut(&str) -> bool) -> Result<bool> {
-    match view.for_each_str_chunk(|chunk| if fold(chunk) { Err(Complete.into()) } else { Ok(()) }) {
-        Ok(is_string) => Ok(is_string),
-        Err(error) if error.is::<Complete>() => Ok(true),
-        Err(error) => Err(error),
-    }
+    let stop = |chunk: &str| {
+        if fold(chunk) {
+            Err(crate::stream::Stop.into())
+        } else {
+            Ok(())
+        }
+    };
+    Ok(crate::stream::stopped(view.for_each_str_chunk(stop))?.unwrap_or(true))
 }
 
 /// At most `max_chars` decoded Unicode characters, with original whitespace/newlines and no

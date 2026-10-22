@@ -30,7 +30,7 @@ fn has_sources(session: &Session) -> bool {
     })
 }
 fn check(adapter: &dyn Adapter, reference: &SessionRef, target: Harness, output: &Path, source: &Path) -> Result<()> {
-    let expected = crate::stream::collect_with(adapter, reference, &ParseOptions::complete())?;
+    let expected = crate::stream::collect_with(adapter, reference, &Demand::COMPLETE)?;
     assert!(!has_sources(&expected), "public complete must remain owned");
     let prepared = crate::emit::parse_for_emit(adapter, reference, target)?;
     assert!(has_sources(&prepared), "same-target preparation retained no sources");

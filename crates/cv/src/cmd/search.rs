@@ -1,12 +1,11 @@
 //! `cv search` / `cv index` — full-text and semantic search.
 
-use crate::util::{dirs_home, parse_harness, short_id};
+use crate::util::{parse_harness, short_id};
 use anyhow::Result;
 use cv_core::ir::truncate;
 use cv_core::sanitize::sanitize_line;
 use cv_search::{Found, Note, Source};
 use std::io::Write;
-use std::path::PathBuf;
 
 pub(crate) fn cmd_search(
     query: &str,
@@ -28,16 +27,6 @@ pub(crate) fn cmd_search(
     let source = if semantic {
         Source::Semantic
     } else {
-        // A retired sqlite FTS index may still be sitting on disk from older versions; tantivy is
-        // canonical now, so let the user know it's safe to remove.
-        if let Some(legacy) = legacy_sqlite_index_path() {
-            if legacy.exists() {
-                eprintln!(
-                    "(note: legacy sqlite index no longer used; safe to delete {})",
-                    legacy.display()
-                );
-            }
-        }
         if scan {
             eprintln!("(--scan: scanning transcripts live, head-capped; `cv index` makes search instant)");
             Source::Live
@@ -69,15 +58,6 @@ pub(crate) fn cmd_search(
     render(found, limit, query, json)
 }
 
-/// Where the retired sqlite FTS index used to live: `$CLUSTERVISION_HOME/index.sqlite` or
-/// `~/.clustervision/index.sqlite`. Only used to nudge cleanup of a stale file.
-fn legacy_sqlite_index_path() -> Option<PathBuf> {
-    cv_core::env::var_os("CLUSTERVISION_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs_home().map(|h| h.join(".clustervision")))
-        .map(|d| d.join("index.sqlite"))
-}
-
 /// A note in the CLI's words. The sub-agent miss is prose for the table only.
 fn note_line(note: &Note) -> Option<String> {
     match note {
@@ -85,6 +65,7 @@ fn note_line(note: &Note) -> Option<String> {
         Note::SnippetsUnavailable(e) => Some(format!(
             "(note: live snippets unavailable ({e}); showing indexed previews)"
         )),
+        Note::Unscanned(s) => Some(format!("(note: {s})")),
         Note::NoSubagents => None,
     }
 }
@@ -243,6 +224,9 @@ pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool, strict: 
     if json {
         let mut out = serde_json::json!({
             "indexed": indexed.total,
+            "changed": indexed.changed,
+            "removed": indexed.removed,
+            "errors": indexed.errors,
             "path": dir,
             "unreadable": indexed.unreadable,
         });

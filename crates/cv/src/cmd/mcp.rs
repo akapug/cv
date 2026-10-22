@@ -41,7 +41,7 @@
 use super::mcp_tools::CliTools;
 use anyhow::Context as _;
 use cv_core::scan::{ceil_char, floor_char};
-use cv_core::watch::{Cursor, Filter, Watcher};
+use cv_core::watch::{Cursor, Filter, Poll, Watcher};
 use cv_core::Harness;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -358,7 +358,12 @@ pub(crate) fn cmd_mcp(tree: clap::Command) -> anyhow::Result<()> {
             }
             continue;
         }
-        let blocking = params.as_ref().and_then(|p| p.get("name")).and_then(Value::as_str) == Some("await_omen");
+        let blocking = params
+            .as_ref()
+            .and_then(|p| p.get("name"))
+            .and_then(Value::as_str)
+            .and_then(NativeTool::find)
+            .is_some_and(NativeTool::blocking);
         let admission = if blocking { &polls } else { &ordinary };
         // Side-effect notifications wait: silently dropping them would change the protocol.
         let Some(permit) = admission.acquire(id.is_none(), &cancelled) else {
@@ -633,38 +638,74 @@ fn tool_list() -> Value {
     tools
 }
 
-pub(crate) fn base_tool_list() -> Value {
-    json!([
-        {
-            "name": "await_omen",
-            "description": "Block until another agent's session emits a message matching a regex, then return it. Watches live for new/appended messages (text, thinking, or tool results) across harnesses. Use to wait on a sibling agent — e.g. await_omen(regex='BUILD (PASSED|FAILED)', cwd_contains='/myproj'). Returns when matched or when timeout_secs elapses.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "regex": { "type": "string", "description": "Rust regex to match against newly-emitted message text." },
-                    "harness": { "type": "string", "description": "Only watch this harness." },
-                    "cwd_contains": { "type": "string", "description": "Only watch sessions whose cwd contains this substring." },
-                    "timeout_secs": { "type": "number", "description": "Give up after this many seconds (default 120)." },
-                    "interval_secs": { "type": "number", "description": "Poll interval (default 2)." }
-                },
-                "required": ["regex"]
-            }
-        },
-        {
-            "name": "observe_stream",
-            "description": "The NON-BLOCKING sibling of await_omen: drain the newly-appended messages from another agent's session(s) since an opaque cursor and return IMMEDIATELY with a fresh cursor — so a senior orchestrator can poll a junior agent's live activity on its own cadence (await_omen blocks until ONE regex matches; observe_stream tails the incremental stream of everything). The first call (no cursor) records a baseline and returns no backlog — pass the returned cursor to the next call to get only what was appended since. Read-only (never writes the board); bounded by max_messages + char_cap. Scope it with cwd_contains and/or harness, e.g. observe_stream(cwd_contains='/junior-proj').",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "cwd_contains": { "type": "string", "description": "Only observe sessions whose recorded cwd contains this substring." },
-                    "harness": { "type": "string", "description": "Only observe this harness (any name `cv ls --harness` takes)." },
-                    "since_cursor": { "type": "string", "description": "Opaque cursor from a previous observe_stream call. Omit on the first call to start from the current tail (baseline; returns no messages)." },
-                    "max_messages": { "type": "number", "description": "Max messages to return this call (default 50). Remaining unread messages are reported as more_pending; poll again with the returned cursor to drain them." },
-                    "char_cap": { "type": "number", "description": "Optional cap on total characters of message text returned; the last message is truncated to fit (default 16000)." }
-                }
-            }
+#[derive(Clone, Copy)]
+enum NativeTool {
+    AwaitOmen,
+    ObserveStream,
+}
+
+impl NativeTool {
+    const ALL: [Self; 2] = [Self::AwaitOmen, Self::ObserveStream];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::AwaitOmen => "await_omen",
+            Self::ObserveStream => "observe_stream",
         }
-    ])
+    }
+
+    fn find(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.name() == name)
+    }
+
+    fn blocking(self) -> bool {
+        matches!(self, Self::AwaitOmen)
+    }
+
+    fn call(self, args: &Value, cancelled: Cancellation<'_>) -> anyhow::Result<String> {
+        match self {
+            Self::AwaitOmen => await_omen(args, cancelled),
+            Self::ObserveStream => observe_stream(args, cancelled),
+        }
+    }
+
+    fn descriptor(self) -> Value {
+        match self {
+            Self::AwaitOmen => json!(        {
+                "name": self.name(),
+                "description": "Block until another agent's session emits a message matching a regex, then return it. Watches live for new/appended messages (text, thinking, or tool results) across harnesses. Use to wait on a sibling agent — e.g. await_omen(regex='BUILD (PASSED|FAILED)', cwd_contains='/myproj'). Returns when matched or when timeout_secs elapses.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "regex": { "type": "string", "description": "Rust regex to match against newly-emitted message text." },
+                        "harness": { "type": "string", "description": "Only watch this harness." },
+                        "cwd_contains": { "type": "string", "description": "Only watch sessions whose cwd contains this substring." },
+                        "timeout_secs": { "type": "number", "description": "Give up after this many seconds (default 120)." },
+                        "interval_secs": { "type": "number", "description": "Poll interval (default 2)." }
+                    },
+                    "required": ["regex"]
+                }
+            }),
+            Self::ObserveStream => json!(        {
+                "name": self.name(),
+                "description": "The NON-BLOCKING sibling of await_omen: drain the newly-appended messages from another agent's session(s) since an opaque cursor and return IMMEDIATELY with a fresh cursor — so a senior orchestrator can poll a junior agent's live activity on its own cadence (await_omen blocks until ONE regex matches; observe_stream tails the incremental stream of everything). The first call (no cursor) records a baseline and returns no backlog — pass the returned cursor to the next call to get only what was appended since. Read-only (never writes the board); bounded by max_messages + char_cap. Scope it with cwd_contains and/or harness, e.g. observe_stream(cwd_contains='/junior-proj').",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cwd_contains": { "type": "string", "description": "Only observe sessions whose recorded cwd contains this substring." },
+                        "harness": { "type": "string", "description": "Only observe this harness (any name `cv ls --harness` takes)." },
+                        "since_cursor": { "type": "string", "description": "Opaque cursor from a previous observe_stream call. Omit on the first call to start from the current tail (baseline; returns no messages)." },
+                        "max_messages": { "type": "number", "description": "Max messages to return this call (default 50). Remaining unread messages are reported as more_pending; poll again with the returned cursor to drain them." },
+                        "char_cap": { "type": "number", "description": "Optional cap on total characters of message text returned; the last message is truncated to fit (default 16000)." }
+                    }
+                }
+            }),
+        }
+    }
+}
+
+pub(crate) fn base_tool_list() -> Value {
+    Value::Array(NativeTool::ALL.into_iter().map(NativeTool::descriptor).collect())
 }
 
 fn ok_response(id: Value, result: Value) -> Value {
@@ -769,9 +810,10 @@ enum ToolOutput {
     Command(super::mcp_tools::CommandOutput),
 }
 fn call_tool(name: &str, args: &Value, cancelled: Cancellation<'_>) -> anyhow::Result<ToolOutput> {
+    if let Some(tool) = NativeTool::find(name) {
+        return tool.call(args, cancelled).map(ToolOutput::Text);
+    }
     match name {
-        "await_omen" => await_omen(args, cancelled).map(ToolOutput::Text),
-        "observe_stream" => observe_stream(args, cancelled).map(ToolOutput::Text),
         // Removed in 0.15.0 (the coordination board): a pointer, never a silent "unknown tool".
         n if n.starts_with("board_") => anyhow::bail!(
             "{n} was removed in 0.15.0 with the coordination board — the task log is the fleet's record: \
@@ -798,6 +840,21 @@ fn call_tool(name: &str, args: &Value, cancelled: Cancellation<'_>) -> anyhow::R
     }
 }
 
+/// Check cancellation and the same observation deadline during discovery and polling.
+fn check_observation(
+    cancelled: Cancellation<'_>,
+    start: Instant,
+    timeout: Duration,
+    expired: &std::cell::Cell<bool>,
+) -> anyhow::Result<()> {
+    cancelled.check()?;
+    if start.elapsed() >= timeout {
+        expired.set(true);
+        anyhow::bail!("observation deadline reached");
+    }
+    Ok(())
+}
+
 /// Block until a newly-emitted message matches `regex` (or `timeout_secs` elapses). The polling loop
 /// runs on its request's own thread, so blocking is fine.
 fn await_omen(args: &Value, cancelled: Cancellation<'_>) -> anyhow::Result<String> {
@@ -815,12 +872,7 @@ fn await_omen(args: &Value, cancelled: Cancellation<'_>) -> anyhow::Result<Strin
     let start = Instant::now();
     let expired = std::cell::Cell::new(false);
     let watcher = Watcher::try_with_discovery(filter, false, cv_core::discover_all, || {
-        cancelled.check()?;
-        if start.elapsed() >= timeout {
-            expired.set(true);
-            anyhow::bail!("observation deadline reached");
-        }
-        Ok(())
+        check_observation(cancelled, start, timeout, &expired)
     });
     let mut watcher = match watcher {
         Ok(watcher) => watcher,
@@ -860,14 +912,7 @@ fn await_poll(
     timeout: Duration,
 ) -> anyhow::Result<Option<Value>> {
     let expired = std::cell::Cell::new(false);
-    let check = || {
-        cancelled.check()?;
-        if start.elapsed() >= timeout {
-            expired.set(true);
-            anyhow::bail!("observation deadline reached");
-        }
-        Ok(())
-    };
+    let check = || check_observation(cancelled, start, timeout, &expired);
     let mut matched = None;
     let result = watcher.try_poll_messages(&check, |kind, reference, message| {
         let resolver = cv_core::Resolver::new(Some(reference.path.clone()));
@@ -966,38 +1011,46 @@ fn observe_poll_checked(
     let mut chars_used = 0usize;
     let mut projection_error = None;
     let more_pending = !baseline
-        && watcher.try_poll_bounded_retained_checked(max_messages, &mut check, |ev| {
-            if projection_error.is_some() {
-                return 0;
-            }
-            let r = &ev.reference;
-            let resolver = cv_core::Resolver::new(Some(r.path.clone()));
-            let mut taken = 0;
-            for m in &ev.new_messages {
-                let room = char_cap.saturating_sub(chars_used);
-                if room == 0 {
-                    break;
+        && watcher.try_poll(
+            Poll {
+                max: max_messages,
+                strict: true,
+                retained: true,
+                checked: Some(&mut check),
+            },
+            |ev| {
+                if projection_error.is_some() {
+                    return 0;
                 }
-                let text = match project(m, &resolver, room) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        projection_error = Some(error);
+                let r = &ev.reference;
+                let resolver = cv_core::Resolver::new(Some(r.path.clone()));
+                let mut taken = 0;
+                for m in &ev.new_messages {
+                    let room = char_cap.saturating_sub(chars_used);
+                    if room == 0 {
                         break;
                     }
-                };
-                chars_used += text.len();
-                out_msgs.push(json!({
-                    "harness": r.harness.as_str(),
-                    "session_id": r.id,
-                    "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
-                    "role": cv_core::render::role_label(m.role),
-                    "timestamp": m.timestamp.map(|t| t.to_rfc3339()),
-                    "text": text,
-                }));
-                taken += 1;
-            }
-            taken
-        })?;
+                    let text = match project(m, &resolver, room) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            projection_error = Some(error);
+                            break;
+                        }
+                    };
+                    chars_used += text.len();
+                    out_msgs.push(json!({
+                        "harness": r.harness.as_str(),
+                        "session_id": r.id,
+                        "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        "role": cv_core::render::role_label(m.role),
+                        "timestamp": m.timestamp.map(|t| t.to_rfc3339()),
+                        "text": text,
+                    }));
+                    taken += 1;
+                }
+                taken
+            },
+        )?;
     if let Some(error) = projection_error {
         return Err(error);
     }
@@ -1085,13 +1138,14 @@ mod projection_tests {
             .unwrap()
             .discover()
             .unwrap()
+            .refs
     }
 
     // Independent pre-change owned observer: whole searchable strings, then truncation.
     fn owned_observe_oracle(watcher: &mut Watcher, cap: usize) -> anyhow::Result<String> {
         let mut rows = Vec::new();
         let mut used = 0usize;
-        let more = watcher.try_poll_bounded(50, |event| {
+        let more = watcher.try_poll(Poll { max: 50, strict: true, ..Poll::default() }, |event| {
             let r=&event.reference; let mut taken=0;
             for m in event.new_messages {
                 let full=message_text(&m).unwrap(); let room=cap.saturating_sub(used);
@@ -1139,11 +1193,19 @@ mod projection_tests {
         let path = world.write_session("observe-mutation", &[json!({"type":"assistant", "sessionId":"observe-mutation", "uuid":"a", "message":{"role":"assistant","content":"hello"}})]);
         let mut watcher = Watcher::with_discovery(Filter::default(), true, discover);
         let before = watcher.to_cursor().encode();
-        let result = watcher.try_poll_bounded_retained(50, |event| {
-            assert_eq!(event.new_messages.len(), 1);
-            std::fs::write(&path, b"changed").unwrap();
-            1
-        });
+        let result = watcher.try_poll(
+            Poll {
+                max: 50,
+                strict: true,
+                retained: true,
+                ..Poll::default()
+            },
+            |event| {
+                assert_eq!(event.new_messages.len(), 1);
+                std::fs::write(&path, b"changed").unwrap();
+                1
+            },
+        );
         assert!(result.is_err());
         assert_eq!(watcher.to_cursor().encode(), before);
     }
@@ -1281,10 +1343,16 @@ mod projection_tests {
                 "cannot serialize a success cursor after failed projection"
             );
             let mut recovered = 0;
-            watcher.poll_bounded(50, |event| {
-                recovered += event.new_messages.len();
-                event.new_messages.len()
-            });
+            watcher.poll(
+                Poll {
+                    max: 50,
+                    ..Poll::default()
+                },
+                |event| {
+                    recovered += event.new_messages.len();
+                    event.new_messages.len()
+                },
+            );
             assert_eq!(recovered, 1, "failed projection must leave offered messages unread");
         }
     }
@@ -1549,6 +1617,7 @@ mod admission_tests {
                 .unwrap()
                 .discover()
                 .unwrap()
+                .refs
         }
         let mut watcher = Watcher::with_discovery(Filter::default(), true, discover_omen);
         let matched = await_poll(

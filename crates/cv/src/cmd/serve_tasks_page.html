@@ -329,7 +329,6 @@
       if (i.body.length > 360) kids.push(el('button', { class: 'more', text: long ? 'show all (x)' : 'less (x)', onclick: () => { S.expanded[i.id] = !S.expanded[i.id]; render(); } }));
     }
     if (i.decision) kids.push(decisionBlock(i, closed));
-    else if (!closed && (i.reason === 'decision_owed' || i.reason === 'discussing')) kids.push(taggedDecisionBlock(i));
     else if (!closed) kids.push(actionBlock(i));
     if (!closed && S.discussOpen[i.id]) kids.push(inlineBox(i, 'discuss', 'what needs discussing? (⌘⏎ sends)', 'Park for discussion'));
     if (!closed && S.doneOpen[i.id]) kids.push(inlineBox(i, 'done', 'observed where? a path, url, or a word (⌘⏎ sends)', 'Mark done'));
@@ -403,19 +402,6 @@
       el('button', { class: 'btn primary', text: label, onclick: () => send(ta.value) }),
       el('button', { class: 'btn quiet', text: 'cancel', onclick: () => { if (verb === 'discuss') S.discussOpen[i.id] = false; else S.doneOpen[i.id] = false; render(); } })]);
   }
-  // A decision that was TAGGED, not posed: no options to click. It is answered by a note and closed,
-  // or parked for discussion.
-  function taggedDecisionBlock(i) {
-    const parked = i.reason === 'discussing' ? latestDiscussNote(i) : null;
-    const last = (i.notes || []).slice().reverse().find((x) => !/^NEEDS DISCUSSION:/.test(x.text));
-    return el('div', { class: 'decision' }, [
-      parked ? el('p', { class: 'default' }, [el('b', { text: 'you asked: ' }), parked]) : null,
-      el('p', { class: 'default' }, [el('b', { text: 'no options were posed: ' }), 'answer in a note, then close it; or park it for discussion']),
-      el('div', { class: 'choices' }, [
-        el('button', { class: 'btn primary', title: last ? 'closes with your last note as the answer: ' + last.text : 'write a note first', onclick: () => { if (last) act(i, 'done', { observed: 'answered: ' + last.text }); else toast('write the answer as a note first'); } }, [el('kbd', { text: 'a' }), last ? 'my last note is the answer — close it' : 'answer in a note first']),
-        i.reason !== 'discussing' ? el('button', { class: 'btn quiet', onclick: () => discuss(i) }, [el('kbd', { text: 'd' }), 'needs discussion']) : null])]);
-  }
-
   function act(i, verb, body) {
     if (S.busy) return;
     S.busy = true; body.who = S.who;
@@ -591,7 +577,6 @@
         if (!inboxPane || !cur) break;
         if (cur.decision && !cur.decision.resolution) act(cur, 'resolve', { accept_default: true });
         else if (cur.decision && cur.reason === 'provisional') act(cur, 'resolve', { confirm: true });
-        else if (!cur.decision && (cur.reason === 'decision_owed' || cur.reason === 'discussing')) { const b = document.querySelector('.card.sel .decision .btn.primary'); if (b) b.click(); }
         break;
       case 'd': if (inboxPane && cur && cur.reason !== 'discussing' && !(cur.decision && cur.decision.resolution)) discuss(cur); break;
       case 'n': if (cur) { const ta = document.getElementById('note-' + cur.id); if (ta) { ta.focus(); ev.preventDefault(); } else if (S.pane === 'backlog') { S.expanded['b:' + cur.id] = true; render(); } } break;

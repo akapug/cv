@@ -20,16 +20,20 @@
 //! | `compaction` | `CompactionBoundary`/Harness, then (status `completed`) a `CompactionSummary` with `summary` |
 //! | `model-switched` | `ModelChange`/Harness, `Message::model` = the new model |
 //! | `agent-switched`, `location-switched` | `Notice`/Harness |
-//! | `idle` | a turn-end marker: a `Carrier` under `ParseOptions::complete`, otherwise skipped |
+//! | `idle` | a turn-end marker: a `Carrier` under `Demand::COMPLETE`, otherwise skipped |
 //!
 //! Anything else is kept verbatim as a `Carrier` under `complete`, and is counted in
 //! `extra["opencode"]["unknown_message_types"]` on the session otherwise — never silently dropped.
+
+/// cv preserves tool-result details in OpenCode's free-form metadata under this key.
+/// The reader restores the original IR value; it is not an OpenCode-native status field.
+pub(super) const DETAILS_KEY: &str = "clustervision.details";
 
 use super::record::{find_signature, get, nonempty, owned, push_extra_array, string, usage, Ctx};
 use crate::ir::*;
 use crate::json::JsonView;
 use crate::lazy::Text;
-use crate::stream::ParseOptions;
+use crate::stream::{Demand, Tier};
 use anyhow::Result;
 use serde_json::{json, Map, Value};
 
@@ -80,7 +84,7 @@ pub(super) fn build(
     id: &str,
     ty: &str,
     data: JsonView<'_>,
-    opts: &ParseOptions,
+    opts: &Demand,
     ctx: Ctx<'_>,
 ) -> Result<Option<Vec<Message>>> {
     let ts = owned(get(data.get("time")?, "created")?)?
@@ -206,6 +210,8 @@ pub(super) fn build(
             out.push(b);
             if completed {
                 let mut s = new(Role::Assistant, MessageKind::CompactionSummary, Origin::Harness);
+                // One native compaction produces two IR turns; suffix the summary id so it
+                // differs from its boundary. Native prefixed IDs do not contain `#`.
                 s.id = Some(format!("{id}#summary"));
                 if let Some(text) = text_of("summary")? {
                     s.content.push(Block::Text { text });
@@ -257,20 +263,19 @@ pub(super) fn build(
             out.push(m);
         }
         "idle" => {
-            if opts.complete {
+            if opts.tier == Tier::Complete {
                 out.push(carrier(id, ty, data, ts)?);
             }
         }
         _ => {
-            if !opts.complete {
+            if opts.tier != Tier::Complete {
                 return Ok(None);
             }
             out.push(carrier(id, ty, data, ts)?);
         }
     }
-    Ok(crate::affordance::refine_complete_group(Harness::OpenCode, &mut out)
-        .is_ok()
-        .then_some(out))
+    crate::affordance::refine_complete_group(Harness::OpenCode, &mut out)?;
+    Ok(Some(out))
 }
 
 fn nonempty_array(view: Option<JsonView<'_>>) -> Result<Option<JsonView<'_>>> {
@@ -458,7 +463,7 @@ fn tool_blocks(c: JsonView<'_>, ctx: Ctx<'_>) -> Result<(Block, Vec<Block>)> {
             is_error,
             tool_name: (!name.is_empty()).then_some(name),
             status: (!status.is_empty()).then_some(status),
-            details: match owned(get(get(state, "metadata")?, "clustervision.details")?)? {
+            details: match owned(get(get(state, "metadata")?, DETAILS_KEY)?)? {
                 Some(details) => Some(details),
                 None => (!details.is_empty()).then_some(Value::Object(details)),
             },
@@ -549,8 +554,7 @@ fn carrier(id: &str, ty: &str, data: JsonView<'_>, ts: Option<chrono::DateTime<c
     let mut rec = data.resolve()?.as_object().cloned().unwrap_or_default();
     rec.insert("id".into(), json!(id));
     rec.insert("type".into(), json!(ty));
-    m.extra
-        .insert(crate::harness::claude::CARRIER_KEY.into(), Value::Object(rec));
+    m.extra.insert(crate::ir::CARRIER_KEY.into(), Value::Object(rec));
     Ok(m)
 }
 
@@ -573,11 +577,11 @@ fn finish(m: &mut Message, bag: Map<String, Value>) {
 mod tests {
     use super::*;
 
-    fn build(id: &str, ty: &str, data: &Value, opts: &ParseOptions) -> Option<Vec<Message>> {
+    fn build(id: &str, ty: &str, data: &Value, opts: &Demand) -> Option<Vec<Message>> {
         super::build(id, ty, JsonView::owned(data), opts, Ctx::Owned).unwrap()
     }
     fn one(ty: &str, data: &str) -> Vec<Message> {
-        build("msg_1", ty, &serde_json::from_str(data).unwrap(), &ParseOptions::full()).unwrap()
+        build("msg_1", ty, &serde_json::from_str(data).unwrap(), &Demand::RICH).unwrap()
     }
 
     #[test]
@@ -608,7 +612,7 @@ mod tests {
         assert_eq!(a[0].model.as_deref(), Some("glm"));
         assert_eq!(a[0].usage.as_ref().unwrap().cost_usd, Some(0.5));
         assert!(
-            matches!(&a[1].content[0], Block::ToolResult { is_error: true, content, .. } if content == "No such file")
+            matches!(&a[1].content[0], Block::ToolResult { is_error: true, content, .. } if content.matches_str("No such file") == Some(true))
         );
 
         let e = one(
@@ -674,12 +678,12 @@ mod tests {
     #[test]
     fn idle_and_unknown_types_are_carried_only_when_complete() {
         let d = serde_json::json!({"time": {"created": 1}, "outcome": "succeeded"});
-        assert!(build("i", "idle", &d, &ParseOptions::full()).unwrap().is_empty());
-        let c = build("i", "idle", &d, &ParseOptions::complete()).unwrap();
+        assert!(build("i", "idle", &d, &Demand::RICH).unwrap().is_empty());
+        let c = build("i", "idle", &d, &Demand::COMPLETE).unwrap();
         assert_eq!(c[0].kind, MessageKind::Carrier);
-        assert!(build("x", "from-the-future", &d, &ParseOptions::full()).is_none());
-        let c = build("x", "from-the-future", &d, &ParseOptions::complete()).unwrap();
+        assert!(build("x", "from-the-future", &d, &Demand::RICH).is_none());
+        let c = build("x", "from-the-future", &d, &Demand::COMPLETE).unwrap();
         assert_eq!(c[0].kind, MessageKind::Carrier);
-        assert_eq!(c[0].extra[crate::harness::claude::CARRIER_KEY]["outcome"], "succeeded");
+        assert_eq!(c[0].extra[crate::ir::CARRIER_KEY]["outcome"], "succeeded");
     }
 }

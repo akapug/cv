@@ -117,7 +117,7 @@ class BudgetTests(unittest.TestCase):
 
 
     def test_gemini_digest_keeps_tool_nested_ids_and_all_payload_bytes(self):
-        identifier = "11111111-1111-4111-8111-111111111111"
+        identifier = "11111111-1111-5111-8111-111111111111"
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "output.json"
             header = b'      "id": "' + identifier.encode() + b'",\n'
@@ -127,11 +127,11 @@ class BudgetTests(unittest.TestCase):
             normalized = header.replace(identifier.encode(), b"00000000-0000-4000-8000-000000000000")
             expected = hashlib.sha256(normalized + payload + nested).hexdigest()
             self.assertEqual(gate.gemini_output_digest(path), (expected, 1))
-            path.write_bytes(header + payload + nested.replace(identifier.encode(), b"22222222-2222-4222-8222-222222222222"))
+            path.write_bytes(header + payload + nested.replace(identifier.encode(), b"22222222-2222-5222-8222-222222222222"))
             self.assertNotEqual(gate.gemini_output_digest(path)[0], expected)
             path.write_bytes(header + payload.replace(b'x', b'y') + nested)
             self.assertNotEqual(gate.gemini_output_digest(path)[0], expected)
-            path.write_bytes(header.replace(b"4111", b"3111") + payload + nested)
+            path.write_bytes(header.replace(b"5111", b"4111") + payload + nested)
             self.assertEqual(gate.gemini_output_digest(path)[1], 0)
 
 

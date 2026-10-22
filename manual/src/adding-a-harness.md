@@ -156,3 +156,7 @@ manifest has never heard of — which is how you find out upstream shipped a new
 The fastest way to get it right: **send us your transcripts.** We can only test what we can see, and
 historical format variants are an explicit goal. Open an issue or a PR with a few real (redacted, if
 you like — `cv export --redact` helps) session files. 💜
+
+Run `python3 -I tools/check-size.py` to review product/test line drift against the last release
+tag. It reports drift without line targets or percentage ratchets; design documents stay under
+250 lines. The old `--write` option and committed `tools/size-budget.txt` are removed.

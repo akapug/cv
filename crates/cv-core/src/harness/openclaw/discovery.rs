@@ -109,29 +109,27 @@ fn timestamp(value: Option<JsonView<'_>>) -> Result<Option<DateTime<Utc>>> {
 }
 
 pub(super) fn scan(path: &Path, index: &Index) -> Result<SessionRef> {
-    let source = JsonSource::capture(path)?;
-    let file = fs::File::open(path)?;
-    source.check_metadata(file.metadata()?)?;
-    // The prior read_to_string rejected every invalid byte, even on malformed/ignored rows.
-    anyhow::ensure!(
-        ranges::valid_utf8(&mut ranges::reader(
-            &file,
-            ranges::Range {
-                offset: 0,
-                len: source.len()
-            }
-        )?)?,
-        "OpenClaw discovery transcript did not contain valid UTF-8"
-    );
+    let read = jsonl::Read::open(path)?;
     let mut acc = ScanAcc::default();
-    jsonl::for_each_line(&source, &file, 0, source.len(), |line| {
-        if let Some(view) = line.view {
-            feed(view, &mut acc)?;
+    read.lines(0, |line| {
+        match line.view {
+            Some(view) => feed(view, &mut acc)?,
+            // Invalid UTF-8 is not one JSON value, so only a rejected line can hold it; the prior
+            // read_to_string rejected every invalid byte, even on malformed rows.
+            None if !line.blank => anyhow::ensure!(
+                ranges::valid_utf8(&mut ranges::reader(
+                    &read,
+                    ranges::Range {
+                        offset: line.at,
+                        len: line.end - line.at
+                    }
+                )?)?,
+                "OpenClaw discovery transcript did not contain valid UTF-8"
+            ),
+            None => {}
         }
         Ok(Flow::Continue)
     })?;
-    source.check_metadata(file.metadata()?)?;
-    source.check()?;
     let id = if acc.id.is_empty() {
         session_id_from_filename(path)
     } else {
@@ -139,8 +137,6 @@ pub(super) fn scan(path: &Path, index: &Index) -> Result<SessionRef> {
     };
     let entry = index.get(&id);
     Ok(SessionRef {
-        harness: Harness::OpenClaw,
-        path: path.to_path_buf(),
         title: entry
             .and_then(|e| e.title.clone())
             .or(acc.session_name)
@@ -148,8 +144,8 @@ pub(super) fn scan(path: &Path, index: &Index) -> Result<SessionRef> {
         cwd: acc.cwd.or_else(|| entry.and_then(|e| e.cwd.clone())),
         created_at: acc.created_at,
         updated_at: entry.and_then(|e| e.updated_at).or(acc.updated_at),
-        message_count: acc.message_count,
-        id,
+        message_count: Some(acc.message_count),
+        ..SessionRef::new(id, Harness::OpenClaw, path.to_path_buf())
     })
 }
 
@@ -308,7 +304,7 @@ mod tests {
             cwd: acc.cwd.or_else(|| entry.and_then(|e| e.cwd.clone())),
             created_at: acc.created_at,
             updated_at: entry.and_then(|e| e.updated_at).or(acc.updated_at),
-            message_count: acc.message_count,
+            message_count: Some(acc.message_count),
         })
     }
 
@@ -347,7 +343,7 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].title.as_deref(), Some("index title"));
         assert_eq!(refs[0].cwd.as_deref(), Some(Path::new("/transcript")));
-        assert_eq!(refs[0].message_count, 3);
+        assert_eq!(refs[0].message_count, Some(3));
         fs::write(&path, [text.as_bytes(), b"\n{bad}\xff"].concat())?;
         assert!(scan(&path, &index).is_err());
         Ok(())

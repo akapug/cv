@@ -18,7 +18,7 @@ pub(super) struct DeferredMessage {
     sources: Vec<(SourceSlot, SourceDescriptor)>,
 }
 impl DeferredMessage {
-    pub(super) fn new(mut message: Message, registry: &mut SourceRegistry) -> Self {
+    pub(super) fn stage(mut message: Message, registry: &mut SourceRegistry) -> Self {
         // The query has already inspected the original message. Only training rendering uses
         // this projection; unconsumed rich sidecars/IDs/usage need not occupy the private spool.
         message.id = None;
@@ -39,7 +39,12 @@ impl DeferredMessage {
                 if let crate::lazy::Text::Source(source) = text {
                     let skip = source.skip;
                     let mut json = source.json();
-                    sources.push((SourceSlot::Text { index, skip }, registry.detach(&mut json).unwrap()));
+                    sources.push((
+                        SourceSlot::Text { index, skip },
+                        registry
+                            .detach(&mut json)
+                            .expect("source text yields a source JSON descriptor"),
+                    ));
                     *text = crate::lazy::Text::Inline(String::new());
                 }
             }
@@ -253,11 +258,11 @@ mod tests {
         let mut ordered = crate::spill::Ordered::default();
         for _ in 0..1000 {
             ordered
-                .push(DeferredMessage::new(original.clone(), &mut registry))
+                .push(DeferredMessage::stage(original.clone(), &mut registry))
                 .unwrap();
         }
         assert_eq!(registry.owner_counts(), (1, 1));
-        assert!(ordered.temporary_bytes().unwrap() < body.len() as u64 * 10);
+        assert!(ordered.spilled_bytes().unwrap() < body.len() as u64 * 10);
         drop(original);
         drop(source);
         drop(backing);
@@ -319,10 +324,10 @@ mod tests {
         let mut ordered = crate::spill::Ordered::default();
         for _ in 0..1000 {
             ordered
-                .push(DeferredMessage::new(original.clone(), &mut registry))
+                .push(DeferredMessage::stage(original.clone(), &mut registry))
                 .unwrap();
         }
-        let temporary_bytes = ordered.temporary_bytes().unwrap();
+        let temporary_bytes = ordered.spilled_bytes().unwrap();
         assert!(temporary_bytes > 0);
         assert!(
             temporary_bytes < body.len() as u64 * 10,
@@ -358,7 +363,7 @@ mod tests {
                 message.content.push(Block::Text {
                     text: "a\n\"🌙".repeat(size).into(),
                 });
-                DeferredMessage::new(message, &mut SourceRegistry::default())
+                DeferredMessage::stage(message, &mut SourceRegistry::default())
                     .write(&mut bytes)
                     .unwrap();
             }
@@ -392,7 +397,7 @@ mod tests {
             input: Json::source(&path, 0, 4).unwrap(),
         });
         let mut registry = SourceRegistry::default();
-        let staged = DeferredMessage::new(message, &mut registry);
+        let staged = DeferredMessage::stage(message, &mut registry);
         let encoded = serde_json::to_value(&staged).unwrap();
         for failure in ["index", "type", "placeholder", "source", "duplicate"] {
             let mut corrupted = encoded.clone();

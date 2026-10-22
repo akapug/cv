@@ -1,12 +1,13 @@
 ---
 name: cv
-description: ClusterVision (`cv`) reads every agent session on this machine, including yours. Use when context was compacted and you need what was lost, when a lane of yours should be rewound, distilled or adopted, when you want to know what another session is doing to the same files, or to install the Claude Code hooks that surface these moments automatically.
+description: ClusterVision (`cv`) reads every agent session on this machine, including yours. Use when context was compacted and you need what was lost, when a lane of yours should be rewound, distilled or adopted, when you want to know what another session is doing to the same files, or to install the Claude Code or Codex hooks that surface these moments automatically.
 ---
 
 # cv — the session store as an instrument
 
 `cv` reads the harnesses' own transcripts; nothing has to be wired for it to see a session.
-Every command takes a session id prefix (8 chars is enough) or an `agent-<id>`.
+Every command takes a unique session id prefix or an `agent-<id>`. For Codex, use
+`codex:<full-uuid>`: neighboring UUIDv7 sessions often share an eight-character prefix.
 
 ## After a compaction
 
@@ -17,7 +18,7 @@ The pre-compaction records are still in your transcript; only your context lost 
 - `cv show <id> --pre-compaction N` — the span the Nth compaction discarded, verbatim.
 - `cv show <id> --kind prompt,answer --pre-compaction N` — only the human prompts of that span
   (cheap first look).
-- `cv rewind <id> --at <msg|sha>` — a NEW resumable session of the agent as it stood at a
+- `cv rewind <id> --at <msg|sha>` (Claude sessions) — a NEW resumable session of the agent as it stood at a
   message or at the commit it made; `claude --resume <new-id> --fork-session`.
 
 ## Reshaping a lane (sub-agent)
@@ -51,6 +52,15 @@ settings (`~/.claude/settings.json`, or `<project>/.claude/settings.json`) and c
 beside them; it is idempotent, `cv hooks show claude` prints what it would change, and
 `cv hooks remove claude` deletes exactly its entries. Each hook is `cv hook <name>`, reads the
 hook JSON on stdin, prints at most a line or two:
+
+For Codex, use the same commands with `codex`: user scope writes `$CODEX_HOME/hooks.json`
+(default `~/.codex/hooks.json`), project scope writes `.codex/hooks.json`. Codex skips them until
+you accept them in its startup hooks review (`codex exec --dangerously-bypass-hook-trust` for
+automation); `cv hooks show codex` says whether each is trusted. The edit matcher
+is `apply_patch`; every path in its patch is checked. A live conflict blocks the patch
+with `deny` because Codex does not support `ask`; your own sub-agents and parent are not another
+session. Coordinate with the other session before editing. To override after coordinating, remove the edit handler from `hooks.json`. Compaction recovery uses `cv show`;
+`cv rewind` currently supports Claude sessions.
 
 | event | `cv hook` | what you see |
 |---|---|---|

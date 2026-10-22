@@ -219,6 +219,8 @@ fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) ->
         ..Changes::default()
     };
     rows(&bytes, |row| {
+        // Malformed rows are copied verbatim, including their unparsed links; only accepted
+        // records can have parent links patched after removals.
         if empties
             && !removed_rows.contains(&row.offset)
             && (removed.is_empty() || source.accept(row, Validation::Value)?.is_none())
@@ -227,6 +229,7 @@ fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) ->
         }
         let mut patches = Vec::new();
         // (block, kept) for every content element, in order.
+        // Recompute block fates per row rather than retaining every block across both passes.
         let mut elements: Vec<(Range, bool)> = Vec::new();
         blocks(&source, row, |block| {
             let ty = string(&source, source.get(block, "type")?)?;

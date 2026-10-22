@@ -1,28 +1,22 @@
-//! The one message window: `cv show --json` (and so `cv mcp`'s `show`), `cv export`'s JSON
+//! The JSON sink over the shared message selector: `cv show --json` (and so `cv mcp`'s `show`), `cv export`'s JSON
 //! forms and `GET /api/session/{h}/{id}/messages` all select messages through this sink. The
 //! window is `[start, end)`, or the last `n`, cut at a byte budget; selected messages are staged
 //! as RS-framed compact JSON ([`crate::projection::write_frame`]) and out-of-window messages pass
 //! by as lazy handles, never materialized.
+use super::MessageWindow;
 use crate::bytes::{ByteSource, ByteStage};
 use crate::source::ReadSet;
-use crate::stream::{Checkpoint, ExtraProjection, Flow, MessageSink};
+use crate::stream::{Checkpoint, Flow, MessageSink, Tier};
 use crate::{Message, Resolver, Session};
 use anyhow::{Context as _, Result};
 use serde_json::Value;
-use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 pub struct WindowSink {
     resolver: Resolver,
     primary: PathBuf,
-    /// Index of the next message to arrive.
-    pub idx: usize,
-    pub start: usize,
-    /// Exclusive window end; `None` streams to EOF.
-    pub end: Option<usize>,
-    /// `--last n`: the ring of the last `n` messages, replayed through the window at the end.
-    tail: Option<(usize, VecDeque<Message>)>,
+    window: MessageWindow<Message>,
     stage: Option<BufWriter<ByteStage>>,
     budget: Option<usize>,
     bytes: usize,
@@ -49,10 +43,7 @@ impl WindowSink {
         Self {
             resolver: Resolver::new(Some(primary.to_path_buf())),
             primary: primary.to_path_buf(),
-            idx: 0,
-            start,
-            end,
-            tail: None,
+            window: MessageWindow::new(start, end),
             stage: Some(BufWriter::with_capacity(64 * 1024, ByteStage::default())),
             budget: None,
             bytes: 0,
@@ -81,7 +72,7 @@ impl WindowSink {
 
     /// Select the last `n` messages instead of `[start, end)`.
     pub fn tail(mut self, n: usize) -> Self {
-        self.tail = Some((n, VecDeque::new()));
+        self.window = MessageWindow::new(self.start, self.end).tail(n);
         self
     }
 
@@ -92,7 +83,9 @@ impl WindowSink {
         self
     }
 
-    /// Materialize and keep the selected messages as well.
+    /// Materialize and retain selected messages instead of staging their payload frames.
+    /// Budgeting still measures their serialized size; retrieve the messages with [`Self::take_kept`].
+    /// Configure this before streaming begins.
     pub fn keeping(mut self) -> Self {
         self.kept = Some(Vec::new());
         self
@@ -139,11 +132,8 @@ impl WindowSink {
         if let Some(error) = self.fail.take() {
             return Err(error);
         }
-        if let Some((_, ring)) = self.tail.take() {
-            self.start = self.idx - ring.len();
-            for (i, message) in ring.into_iter().enumerate() {
-                self.accept(message, self.start + i)?;
-            }
+        for (i, message) in self.window.finish() {
+            self.accept(message, i)?;
         }
         let stage = self.stage.take().context("window frames already taken")?;
         Ok(stage.into_inner().map_err(|error| error.into_error())?.finish()?)
@@ -167,16 +157,16 @@ impl WindowSink {
     }
 
     fn in_window(&self, index: usize) -> bool {
-        index >= self.start && self.end.is_none_or(|end| index < end)
+        self.window.contains(index)
     }
 }
 
 impl MessageSink for WindowSink {
-    fn extra_projection(&self) -> ExtraProjection {
-        if self.tail.is_some() || (self.fail.is_none() && self.next.is_none() && self.in_window(self.idx)) {
-            ExtraProjection::Full
+    fn tier(&self) -> Tier {
+        if self.window.is_tail() || (self.fail.is_none() && self.next.is_none() && self.in_window(self.idx)) {
+            Tier::Rich
         } else {
-            ExtraProjection::Facts
+            Tier::Facts
         }
     }
     fn dependency(&mut self, path: &Path) {
@@ -205,29 +195,17 @@ impl MessageSink for WindowSink {
     fn message(&mut self, m: Message) -> Flow {
         crate::source::record_message_reads(&m, &self.primary, &mut self.reads);
         let index = self.idx;
-        self.idx += 1;
         if self.fail.is_some() {
             return Flow::Stop;
         }
-        if let Some((n, ring)) = self.tail.as_mut() {
-            if *n > 0 {
-                ring.push_back(m);
-                if ring.len() > *n {
-                    ring.pop_front();
-                }
-            }
+        let selected = self.window.push(m);
+        if !self.window.is_tail() && self.end.is_some_and(|end| index >= end) && self.stop_at_end {
+            self.more = true;
+            return Flow::Stop;
+        }
+        let Some((index, m)) = selected else {
             return Flow::Continue;
-        }
-        if index < self.start {
-            return Flow::Continue; // before the window: skip without touching content bytes
-        }
-        if self.end.is_some_and(|end| index >= end) {
-            if self.stop_at_end {
-                self.more = true; // a message exists at `end`: note it, read no further
-                return Flow::Stop;
-            }
-            return Flow::Continue; // past the window: session facts written later still arrive
-        }
+        };
         match self.accept(m, index) {
             Ok(()) => Flow::Continue,
             Err(error) => {
@@ -235,5 +213,17 @@ impl MessageSink for WindowSink {
                 Flow::Stop
             }
         }
+    }
+}
+
+impl std::ops::Deref for WindowSink {
+    type Target = MessageWindow<Message>;
+    fn deref(&self) -> &Self::Target {
+        &self.window
+    }
+}
+impl std::ops::DerefMut for WindowSink {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.window
     }
 }

@@ -18,13 +18,10 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 
 /// The bucket name for an injected-context turn: the harness's own attachment kind when it recorded
-/// one (`extra[h]["attachment_type"]`, e.g. Claude's `hook_success`), else the IR kind name.
+/// one ([`crate::harness::Adapter::attachment_kind`], e.g. Claude's `hook_success`), else the IR
+/// kind name.
 fn injected_kind(m: &Message) -> String {
-    m.extra
-        .values()
-        .filter_map(Value::as_object)
-        .find_map(|bag| bag.get("attachment_type"))
-        .and_then(Value::as_str)
+    crate::harness::attachment_kind(m)
         .map(str::to_string)
         .unwrap_or_else(|| m.kind.as_str().to_string())
 }
@@ -67,7 +64,7 @@ pub struct Report {
 
 impl Report {
     /// Start folding one session into the report. Stream its messages into the returned sink (a
-    /// [`ParseOptions::facts`](crate::ParseOptions::facts) pass: attribution counts
+    /// [`Demand::FACTS`](crate::Demand::FACTS) pass: attribution counts
     /// decoded text in bounded chunks, and attachment/compaction metadata live in `extra`), then
     /// call [`SessionPass::finish`]. Adapters without a facts projection retain their full metadata.
     pub fn session(&mut self, source: Option<std::path::PathBuf>) -> SessionPass<'_> {
@@ -106,7 +103,7 @@ impl Report {
     }
 
     /// The machine-readable diagnosis — `cv doctor --json` and the MCP `doctor` tool share this.
-    /// Existing field names are retained: `conversational` and tool/attachment values are cumulative
+    /// `conversational` and tool/attachment values are cumulative
     /// byte-based estimates, not measured provider tokens or a current-window breakdown. `thinking`
     /// includes opaque payloads. `peak_context` is maximum recorded prompt usage;
     /// `fixed_overhead_est` is the maximum first nonzero prompt usage across sessions and includes

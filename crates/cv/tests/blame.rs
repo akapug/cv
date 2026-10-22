@@ -151,7 +151,7 @@ fn blame_end_to_end() {
         title: None,
         created_at: None,
         updated_at: None,
-        message_count: 4,
+        message_count: Some(4),
     };
     cv_core::events::ingest_ref(&rx).expect("ingest exact fixture session");
     let r = cv_core::ir::SessionRef {
@@ -162,12 +162,13 @@ fn blame_end_to_end() {
         title: Some("add the widget".into()),
         created_at: None,
         updated_at: None,
-        message_count: 3,
+        message_count: Some(3),
     };
     cv_core::events::ingest_ref(&r).expect("ingest fixture session");
     cv_core::catalog::sync(&[r.clone(), rx]);
     // The edit's msg_idx as the catalog recorded it — asserted against, never assumed.
     let edit_idx = cv_core::events::events_for("claude", "blame-e2e", Some("file_edit"))
+        .unwrap()
         .first()
         .expect("edit event ingested")
         .msg_idx;

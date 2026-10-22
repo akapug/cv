@@ -3,12 +3,12 @@
 //! Pure-Rust search over clustervision sessions, in two flavours:
 //!
 //! 1. **Full-text** via [`tantivy`] (a Lucene-like inverted index) — `index_all` builds a
-//!    persistent index, `text_search` queries it and returns highlighted snippets. This is a
+//!    persistent index, [`Searcher`] queries it and returns highlighted snippets. This is a
 //!    strict upgrade over a SQLite FTS5 index: real tokenization, BM25 scoring, fielded queries
 //!    (`harness:claude foo`), phrase/boolean operators, and fast incremental commits.
 //!
 //! 2. **Semantic** via [`model2vec-rs`] (distilled *static* embeddings — tiny, fast, no ONNX
-//!    runtime). `embed_all` embeds every session and persists the vectors; `semantic_search`
+//!    runtime). `embed_sessions` embeds sessions and persists the vectors; [`Searcher`]
 //!    embeds the query and does a brute-force cosine ranking. For ~1k sessions an in-memory
 //!    `Vec<(id, Vec<f32>)>` scan is plenty — no ANN crate needed. Gated behind the `semantic`
 //!    cargo feature (default-on, since model2vec is lightweight); a minimal FTS-only build is
@@ -17,8 +17,6 @@
 //! Both indexes live under `$CLUSTERVISION_HOME` (or `~/.clustervision`): the tantivy index in
 //! `…/tantivy/` and the embedding store in `…/embeddings.bin`.
 
-#[cfg(feature = "semantic")]
-use anyhow::Context;
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -136,6 +134,8 @@ pub enum Note {
     NoSubagents,
     /// Live snippets could not be generated for the shown hits; the indexed previews stand in.
     SnippetsUnavailable(String),
+    /// A live scan could not read some sources or sessions; they were not searched.
+    Unscanned(String),
 }
 
 /// What one search found: the hits in rank order (or discovery order, live), where they came
@@ -153,24 +153,50 @@ pub struct Found {
 #[derive(Default)]
 pub struct Searcher {
     #[cfg(feature = "semantic")]
-    pub semantic: SemanticSearch,
+    semantic: SemanticSearch,
+}
+
+#[cfg(feature = "semantic")]
+impl From<SemanticSearch> for Searcher {
+    fn from(semantic: SemanticSearch) -> Self {
+        Self { semantic }
+    }
 }
 
 impl Searcher {
     /// Errors are the path's own (an unusable index, an invalid query, a missing model); the
-    /// caller adds the door's pointer. Filters apply before ranking and once more after it.
+    /// caller adds the door's pointer. Filters apply before ranking.
     pub fn search(&self, query: &str, filter: SearchFilter<'_>, limit: usize, source: Source) -> Result<Found> {
+        self.search_in(&default_tantivy_dir(), query, filter, limit, source)
+    }
+
+    /// Search with an explicit full-text index location; live and semantic sources use their
+    /// configured stores. This avoids changing the process environment to select an index.
+    pub fn search_in(
+        &self,
+        dir: &std::path::Path,
+        query: &str,
+        filter: SearchFilter<'_>,
+        limit: usize,
+        source: Source,
+    ) -> Result<Found> {
         let mut found = Found {
             hits: Vec::new(),
             source,
             notes: Vec::new(),
             truncated: false,
         };
-        let dir = default_tantivy_dir();
+        let harness = filter.harness.and_then(cv_core::Harness::parse);
+        if filter.harness.is_some() && harness.is_none() {
+            return Ok(found);
+        }
+        let filter = SearchFilter {
+            harness: harness.map(cv_core::Harness::as_str),
+            ..filter
+        };
         match source {
             Source::Live => {
-                let want = filter.harness.and_then(cv_core::Harness::parse);
-                let live = cv_core::scan::live_search_filtered(query, want, limit, |r| {
+                let live = cv_core::scan::live_search_filtered(query, harness, limit, |r| {
                     filter.cwd.is_none_or(|needle| {
                         r.cwd
                             .as_ref()
@@ -179,30 +205,34 @@ impl Searcher {
                 })?;
                 found.hits = live.hits.into_iter().map(Hit::from).collect();
                 found.truncated = live.truncated;
+                if let Some(first) = live.unreadable.first() {
+                    found.notes.push(Note::Unscanned(format!(
+                        "{} source(s) could not be read and were not scanned (first: {}: {})",
+                        live.unreadable.len(),
+                        first.path.display(),
+                        first.why
+                    )));
+                }
                 return Ok(found);
             }
-            Source::Index => found.hits = fts::text_search_indexed_filtered(&dir, query, limit, filter)?,
+            Source::Index => {
+                let (hits, note) = fts::search_with_snippets(dir, query, limit, filter)?;
+                found.hits = hits;
+                if let Some(why) = note {
+                    found.notes.push(Note::SnippetsUnavailable(why));
+                }
+            }
             #[cfg(feature = "semantic")]
             Source::Semantic => found.hits = self.semantic.search(query, limit, filter)?,
             #[cfg(not(feature = "semantic"))]
             Source::Semantic => anyhow::bail!("semantic search is not built into this cv"),
         }
-        found.hits.retain(|h| {
-            filter.harness.is_none_or(|w| h.harness == w)
-                && filter
-                    .cwd
-                    .is_none_or(|needle| h.cwd.as_ref().is_some_and(|c| c.contains(needle)))
-        });
-        found.hits.truncate(limit);
         if source == Source::Index {
-            if let Err(e) = fts::enrich_text_snippets(&dir, query, filter.scope, &mut found.hits) {
-                found.notes.push(Note::SnippetsUnavailable(format!("{e:#}")));
-            }
             // Named on hits and misses: a hit list can be missing rows, not only an empty one.
-            if let Some(stale) = fts::staleness_note(&dir) {
+            if let Some(stale) = fts::staleness_note(dir) {
                 found.notes.push(Note::Stale(stale));
             }
-            if found.hits.is_empty() && !fts::has_subagent_docs(&dir) {
+            if found.hits.is_empty() && !fts::has_subagent_docs(dir) {
                 found.notes.push(Note::NoSubagents);
             }
         }
@@ -211,24 +241,11 @@ impl Searcher {
 }
 
 /// Root directory for cv-search's on-disk state: `$CLUSTERVISION_HOME` or `~/.clustervision`.
-///
-/// Back-compat: the project was once "claurdvoyant", so we still honor `$CLAURDVOYANT_HOME` and an
-/// existing `~/.claurdvoyant` (kept only if the new dir hasn't been created) — so a previously-built
-/// index/embedding store isn't orphaned by the rename.
 pub fn home_dir() -> PathBuf {
-    if let Some(v) = cv_core::env::var_os("CLUSTERVISION_HOME").or_else(|| cv_core::env::var_os("CLAURDVOYANT_HOME")) {
+    if let Some(v) = cv_core::env::var_os("CLUSTERVISION_HOME") {
         return PathBuf::from(v);
     }
-    let Some(home) = cv_core::env::home_dir() else {
-        return PathBuf::from(".");
-    };
-    let new = home.join(".clustervision");
-    let legacy = home.join(".claurdvoyant");
-    if !new.exists() && legacy.exists() {
-        legacy
-    } else {
-        new
-    }
+    cv_core::env::home_dir().map_or_else(|| PathBuf::from("."), |home| home.join(".clustervision"))
 }
 
 /// Default location of the tantivy full-text index.
@@ -273,21 +290,10 @@ pub fn index_sessions(
     )
 }
 
-/// Run a full-text query against the index at its default location.
-pub fn text_search(dir: impl Into<Option<PathBuf>>, query: &str, limit: usize) -> Result<Vec<Hit>> {
-    let dir = dir.into().unwrap_or_else(default_tantivy_dir);
-    fts::text_search(&dir, query, limit)
-}
-
 /// Distinguish an invalid full-text expression from an unavailable index. Callers may
 /// degrade storage/setup failures to live search, but a rejected query is a caller error.
 pub fn is_invalid_text_query(error: &anyhow::Error) -> bool {
     error.is::<tantivy::query::QueryParserError>()
-}
-
-/// Match every indexed session ID, without ranking or reading source transcripts.
-pub fn text_search_ids(dir: impl Into<Option<PathBuf>>, query: &str) -> Result<std::collections::HashSet<String>> {
-    fts::text_search_ids(&dir.into().unwrap_or_else(default_tantivy_dir), query)
 }
 
 /// Match several full-text needles using one index-reader snapshot. The outer result reports
@@ -346,33 +352,6 @@ impl Scope {
     }
 }
 
-/// Rank the requested number of matching sessions, applying filters before the ranking cutoff.
-pub fn text_search_indexed_filtered(
-    dir: impl Into<Option<PathBuf>>,
-    query: &str,
-    limit: usize,
-    filter: SearchFilter<'_>,
-) -> Result<Vec<Hit>> {
-    fts::text_search_indexed_filtered(&dir.into().unwrap_or_else(default_tantivy_dir), query, limit, filter)
-}
-
-/// Generate live snippets for only the selected displayed hits.
-pub fn enrich_text_snippets(
-    dir: impl Into<Option<PathBuf>>,
-    query: &str,
-    scope: Scope,
-    hits: &mut [Hit],
-) -> Result<()> {
-    fts::enrich_text_snippets(&dir.into().unwrap_or_else(default_tantivy_dir), query, scope, hits)
-}
-
-/// Discover, parse, and embed every session, persisting vectors to the default store.
-#[cfg(feature = "semantic")]
-pub fn embed_all(path: impl Into<Option<PathBuf>>) -> Result<usize> {
-    let path = path.into().unwrap_or_else(default_embeddings_path);
-    semantic::embed_all(&path)
-}
-
 /// Refresh semantic vectors using the same inventory as the full-text pass.
 #[cfg(feature = "semantic")]
 pub fn embed_sessions(path: impl Into<Option<PathBuf>>, refs: &[cv_core::SessionRef]) -> Result<usize> {
@@ -391,64 +370,8 @@ pub fn semantic_search(path: impl Into<Option<PathBuf>>, query: &str, k: usize) 
     semantic::semantic_search(&path, query, k)
 }
 
-/// Apply session metadata filters before the semantic ranking cutoff.
 #[cfg(feature = "semantic")]
-pub fn semantic_search_filtered(
-    path: impl Into<Option<PathBuf>>,
-    query: &str,
-    k: usize,
-    filter: SearchFilter<'_>,
-) -> Result<Vec<Hit>> {
-    semantic::semantic_search_filtered(&path.into().unwrap_or_else(default_embeddings_path), query, k, filter)
-}
-
-/// Read only the semantic projection demanded for one discovered session.
-#[cfg(feature = "semantic")]
-pub(crate) fn read_corpus_doc(r: &cv_core::SessionRef) -> Result<(Doc, cv_core::source::ReadSet)> {
-    let adapter = cv_core::harness::for_harness(r.harness).with_context(|| format!("no adapter for {}", r.harness))?;
-    let mut sink = semantic_corpus::DocSink::new(cv_core::Resolver::new(Some(r.path.clone())));
-    sink.copied_before = adapter.copied_before(r, &mut sink);
-    let meta = cv_core::stream::stream_counted(
-        &*adapter,
-        r,
-        &cv_core::ParseOptions::lazy(),
-        &mut sink,
-        cv_core::stream::Pass::RECORD,
-    )
-    .with_context(|| format!("reading semantic corpus session {} ({})", r.id, r.harness))?
-    .session;
-    let title = cv_core::label_from(meta.title.as_deref(), sink.first_prompt.as_deref());
-    Ok((
-        Doc {
-            id: r.id.clone(),
-            harness: r.harness.as_str().to_string(),
-            cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
-            title: Some(title),
-            body: sink.body.into_string(),
-            created_at: r.created_at.map(|t| t.timestamp()),
-            updated_at: r.updated_at.map(|t| t.timestamp()),
-        },
-        sink.reads,
-    ))
-}
-
-/// One indexable document distilled from a parsed [`cv_core::Session`], for the **semantic** path
-/// ([`semantic::embed_all`]), which reads exactly these fields. The FTS path no longer goes through
-/// `Doc`: it streams straight into `fts::ChunkSink`, which reads dates/path/mtime off the
-/// [`cv_core::SessionRef`] instead (so they aren't duplicated here).
-#[cfg(feature = "semantic")]
-#[derive(Debug, Clone)]
-pub(crate) struct Doc {
-    pub id: String,
-    pub harness: String,
-    pub cwd: Option<String>,
-    pub title: Option<String>,
-    pub body: String,
-    /// Unix-seconds session dates off the discovery [`cv_core::SessionRef`], so semantic hits
-    /// carry `created_at`/`updated_at` just like FTS hits do.
-    pub created_at: Option<i64>,
-    pub updated_at: Option<i64>,
-}
+pub(crate) use semantic_corpus::{read_corpus_doc, Doc};
 
 #[cfg(all(test, feature = "probe-heap"))]
 #[global_allocator]

@@ -1,4 +1,4 @@
-# Performance: goal, budgets, measured
+# Performance: measured behavior and regression checks
 
 The goal, in ember's words: "We can't be blowing up to GBs of heap. We need to find a way to have
 this being hella fast." Stream, never materialize a session or store you do not need whole; never
@@ -6,21 +6,20 @@ re-read bytes already seen; use all cores; keep heap bounded by work in flight, 
 every index or mark over a file verifies itself on use. The datapath design and open gaps are in
 [`DATAPATHS.md`](DATAPATHS.md); the dated logs and per-change evidence files are in git history.
 
-## Budgets
+## Regression checks
 
-| what | budget | gate |
-|---|---|---|
-| parse, counting pass | ≥ 1 GB/s per core on the largest real sessions; on the corpus, ≤ x90 a plain read | `tests/perf_budget.rs`, CI step |
-| heap per operation class | flat across 16/64 MiB giant fields, native and without mmap | `tools/check-heap-budget.py`, `tools/check-operation-heap.py`, CI |
-| `cv index`, nothing changed | ≤ 1 s | manual |
-| `cv index` after an append | O(new bytes): ≤ 0.5 s + 10 ms per new MB | manual |
-| `cv index`, full recount | ≤ 60 s on 12 cores, peak RSS ≤ 2 GB | manual |
-| `cv ls`, first run | ≤ 300 ms (stretch; discovery has to read every session head once) | manual |
-| `cv ls`, warm / `has:` | ≤ 100 ms | manual |
-| `cv show --last N` | ≤ the counting pass of that session | manual |
+CI checks the corpus counting pass against a plain read of the same bytes in the same run
+(`tests/perf_budget.rs`). This ratio partly controls runner speed; passing it is a regression
+check, not evidence of a small speedup or a throughput promise for real sessions.
 
-The parse gate compares throughput with a `std::fs::read` of the same bytes in the same run, which
-partly controls runner speed. Passing it is a regression check, not evidence of a small speedup.
+The generated-input heap gates (`tools/check-heap-budget.py` and
+`tools/check-operation-heap.py`) compare requested live Rust allocations across input sizes,
+including 16/64 MiB giant fields, native mmap and positioned reads. These checks remain useful
+regression detectors; their bounds do not describe native SQLite allocation or whole-process RSS.
+
+This document records measurements rather than latency, throughput, or fleet-size targets.
+First-run discovery, unchanged indexing, appends and full recounts need separate measurements:
+they do different work, and a result on one fleet is not a promise for another.
 
 ## How to measure without lying
 
@@ -35,7 +34,7 @@ partly controls runner speed. Passing it is a regression check, not evidence of 
 ## Measured
 
 Every number below carries its date and conditions; a wall time measured on a loaded host is
-reported with the load and is not a budget verdict. The 0.17 release tree (c7aa0c22, 2026-10-16)
+reported with the load. The 0.17 release tree (c7aa0c22, 2026-10-16)
 was not timed: the host sat at load 100-175 all day, so only load-independent facts about it are
 recorded (counts, instructions retired, memory, sizes) under "0.17 facts" below.
 
@@ -44,17 +43,17 @@ recorded (counts, instructions retired, memory, sizes) under "0.17 facts" below.
 fake HOME, 5,421 sessions (claude 38 GB; codex 40 GB, 3,923 of 4,483 rollouts `.jsonl.zst`,
 ~89 GB decoded). Live: the real HOME read-only, ~7,000 sessions, scratch `CLUSTERVISION_HOME`.
 
-| budget | 0eea676f | v17-perf | met? |
-|---|---|---|---|
-| index, nothing changed, frozen (≤ 1 s) | 7.5-9.0 G insn, 0.74-3.10 s | 4.3-4.5 G, 0.41-0.80 s | yes |
-| index, nothing changed, live (≤ 1 s) | 27-36 G, 2.6-5.2 s | 6.7-12.3 G, 0.99-1.61 s | no |
-| index after ~1 MB appended to each of 3 sessions (≤ 0.53 s) | 9.3 G, 0.95-0.98 s | 5.9-6.1 G, 0.70-0.74 s | no |
-| full recount, catalog deleted, frozen (≤ 60 s, RSS ≤ 2 GB) | 21.6 T, 849 s, RSS 2.9 GB | 12.8 T, 834 s, RSS 2.9 GB, footprint 689 MB | no |
-| ls, first run, frozen (≤ 300 ms) | 9,546 G, 257 s | 5,178-5,188 G, 158-186 s | no |
-| ls, warm, frozen / live (≤ 100 ms) | 0.50 G, 0.06-0.09 s | 0.50 G, 0.06-0.09 s | yes, when no live session changed |
-| `ls -q has:plan`, frozen (≤ 100 ms) | 4.9 G, 0.47-1.43 s | 1.7 G, 0.24-0.30 s | no |
-| `show --last 20` (≤ the session's counting pass) | | claude 3.7 G vs 3.6 G; codex 708 MB 12.6 G vs 12.7 G; codex zst 412 MB 28.0 G vs 27.8 G | yes, within startup |
-| counting pass (≥ 1 GB/s per core) | | best of 3: claude 190 MB at 641 MB/s, codex 708 MB at 719 MB/s, codex zst at 174 MB/s decoded | no |
+| operation | 0eea676f | v17-perf |
+|---|---|---|
+| index, nothing changed, frozen | 7.5-9.0 G insn, 0.74-3.10 s | 4.3-4.5 G, 0.41-0.80 s |
+| index, nothing changed, live | 27-36 G, 2.6-5.2 s | 6.7-12.3 G, 0.99-1.61 s |
+| index after ~1 MB appended to each of 3 sessions | 9.3 G, 0.95-0.98 s | 5.9-6.1 G, 0.70-0.74 s |
+| full recount, catalog deleted, frozen | 21.6 T, 849 s, RSS 2.9 GB | 12.8 T, 834 s, RSS 2.9 GB, footprint 689 MB |
+| ls, first run, frozen | 9,546 G, 257 s | 5,178-5,188 G, 158-186 s |
+| ls, warm, frozen / live | 0.50 G, 0.06-0.09 s | 0.50 G, 0.06-0.09 s (when no live session changed) |
+| `ls -q has:plan`, frozen | 4.9 G, 0.47-1.43 s | 1.7 G, 0.24-0.30 s |
+| `show --last 20` | | claude 3.7 G vs 3.6 G; codex 708 MB 12.6 G vs 12.7 G; codex zst 412 MB 28.0 G vs 27.8 G (session counting pass) |
+| counting pass | | best of 3: claude 190 MB at 641 MB/s, codex 708 MB at 719 MB/s, codex zst at 174 MB/s decoded |
 
 A live "nothing changed" index also re-reads whatever ember's running sessions appended, so its
 range is the live write rate. The compressed path's floor is ruzstd's decode: 18.1-18.6 G for
@@ -131,3 +130,20 @@ otherwise reads only the appended suffix. Watch resumes on every append, and the
 store is 33,168 transcripts holding 36.3 GB. A full check therefore turns every resumed pass back
 into a whole read of bytes already seen. Detecting such edits needs a writer or filesystem change
 signal, which no harness provides.
+
+## Open measurement gaps
+
+Audited against `git log v0.17.0..HEAD` on 2026-10-21:
+
+- **First listing and full recount remain unmeasured on the current fleet.** Count deferral
+  (`08a8dfb8`, `734af650`, `2ab873aa`, `80295ea7`, `a200e811`, `d358ff0e`) changed the work;
+  the 0.17 measurements above cannot stand in for a new composed run with compressed Codex.
+- **Repeated unchanged indexing needs fleet confirmation.** `6049df0a` removed discovery's
+  writer-observation work and `1aec79ae` checks unchanged compressed rollouts. These close that
+  regression case, not the historical fleet-wide second-pass measurement. No current fleet
+  result establishes that every baseline holds across repeated passes.
+- **Upgrade cost is unknown.** The 0.16.1 upgrade gate (`1ff6669c`) checks migrated output against
+  a clean index; it does not measure fleet upgrade time, heap or re-embedding cost.
+- **Arbitrary prefix-edit detection remains limited** by the samples described above. A full
+  hash contradicts the measured suffix-only work goal; no harness supplies a trusted change
+  signal. Native SQLite allocation and whole-process RSS likewise remain outside Rust heap gates.

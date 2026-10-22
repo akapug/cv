@@ -1,7 +1,39 @@
 //! Bounded semantic body and label projections; no embedding model is needed to test them.
+use anyhow::{Context, Result};
 #[cfg(test)]
 use cv_core::Text;
 use cv_core::{Block, Flow, Message, MessageSink, Resolver, Role};
+
+/// Read only the semantic projection demanded for one discovered session.
+pub(crate) fn read_corpus_doc(r: &cv_core::SessionRef) -> Result<(Doc, cv_core::source::ReadSet)> {
+    let adapter = cv_core::harness::for_harness(r.harness).with_context(|| format!("no adapter for {}", r.harness))?;
+    let mut sink = DocSink::for_ref(r, &*adapter);
+    let meta = cv_core::stream::stream_counted(
+        &*adapter,
+        r,
+        &cv_core::Demand::LEAN.with_spans(),
+        &mut sink,
+        cv_core::stream::Pass::RECORD,
+    )
+    .with_context(|| format!("reading semantic corpus session {} ({})", r.id, r.harness))?
+    .session;
+    let title = cv_core::label_from(meta.title.as_deref(), sink.first_prompt.as_deref());
+    Ok((
+        Doc {
+            title: Some(title),
+            body: sink.body.into_string(),
+        },
+        sink.reads,
+    ))
+}
+
+/// What the **semantic** path ([`semantic::embed_all`]) distills from one session beside the
+/// discovered [`cv_core::SessionRef`] it embeds: the label hits show and the body it embeds.
+#[derive(Debug, Clone)]
+pub(crate) struct Doc {
+    pub title: Option<String>,
+    pub body: String,
+}
 
 const EMBED_HEAD_BYTES: usize = 64 * 1024;
 
@@ -21,6 +53,12 @@ pub(super) struct DocSink {
     failed: bool,
 }
 impl DocSink {
+    fn for_ref(r: &cv_core::SessionRef, adapter: &dyn cv_core::Adapter) -> Self {
+        let mut sink = Self::new(Resolver::new(Some(r.path.clone())));
+        sink.copied_before = adapter.copied_before(r, &mut sink);
+        sink
+    }
+
     pub(super) fn new(resolver: Resolver) -> Self {
         Self {
             body: Head::new(EMBED_HEAD_BYTES),
@@ -48,74 +86,44 @@ impl DocSink {
             cv_core::Text::Inline(_) => {}
         }
     }
-    /// Message::append_searchable's projection, plus persisted-output heads, within one budget.
-    fn append_searchable(&mut self, message: &Message) {
-        for block in &message.content {
-            if self.body.full() {
-                break;
+}
+
+impl cv_core::projection::Searchable for DocSink {
+    fn full(&self) -> bool {
+        self.body.full()
+    }
+    fn str(&mut self, text: &str) {
+        self.body.push(text);
+    }
+    fn text(&mut self, text: &cv_core::Text, resolver: &Resolver, _: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        self.read_text(text);
+        self.body.try_push_text(text, resolver)
+    }
+    fn json(&mut self, input: &cv_core::Json, _: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        if !self.body.full() {
+            if let cv_core::Json::Source(range) = input {
+                self.reads.record(range.path());
+                if let Some(reads) = range.dependencies() {
+                    self.reads.merge(reads);
+                }
             }
-            match block {
-                Block::Text { text } | Block::Thinking { text, .. } => {
-                    self.read_text(text);
-                    if let Err(error) = self.body.try_push_text(text, &self.resolver) {
-                        self.error = Some(error);
-                        return;
-                    }
-                    self.body.push("\n");
-                }
-                Block::ToolUse { name, input, .. } => {
-                    self.body.push(name);
-                    self.body.push(" ");
-                    if !self.body.full() {
-                        if let cv_core::json::Json::Source(range) = input {
-                            self.reads.record(range.path());
-                            if let Some(reads) = range.dependencies() {
-                                self.reads.merge(reads);
-                            }
-                        }
-                        if let Err(error) = self.body.push_json(input) {
-                            self.error = Some(error);
-                            return;
-                        }
-                    }
-                    self.body.push("\n");
-                }
-                Block::ToolResult { content, .. } => {
-                    self.read_text(content);
-                    if let Err(error) = self.body.try_push_text(content, &self.resolver) {
-                        self.error = Some(error);
-                        return;
-                    }
-                    self.body.push("\n");
-                    if !self.body.full() {
-                        if let Some(path) = block.persisted_output_path() {
-                            self.reads.record(std::path::Path::new(path));
-                            match cv_core::lazy::read_head_checked(std::path::Path::new(path), self.body.remaining()) {
-                                Ok(head) => {
-                                    if let Some(text) = head.indexed_text(path) {
-                                        self.body.push(&text);
-                                        self.body.push("\n");
-                                    }
-                                }
-                                Err(error) => {
-                                    self.error = Some(error);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-                Block::File { path, source, .. } => {
-                    if let Some(path) = path.as_deref().or(source.as_deref()) {
-                        self.body.push(path);
-                        self.body.push("\n");
-                    }
-                }
-                Block::Image { .. } => {}
+            self.body.push_json(input)?;
+        }
+        Ok(())
+    }
+    fn after_block(&mut self, block: &Block) -> Result<()> {
+        if let Some(path) = block.persisted_output_path() {
+            self.reads.record(std::path::Path::new(path));
+            let head = cv_core::lazy::read_head_checked(std::path::Path::new(path), self.body.remaining())?;
+            if let Some(text) = head.indexed_text(path) {
+                self.body.push(&text);
+                self.body.push("\n");
             }
         }
+        Ok(())
     }
 }
+
 impl MessageSink for DocSink {
     fn dependency(&mut self, path: &std::path::Path) {
         self.reads.record(path);
@@ -132,6 +140,7 @@ impl MessageSink for DocSink {
         if self.failed || self.error.is_some() {
             return Flow::Stop;
         }
+        // Role is only a coarse gate; prompt_title below rejects non-prompt message kinds.
         if self.first_prompt.is_none() && message.role == Role::User {
             for block in &message.content {
                 if let Block::Text { text } = block {
@@ -148,7 +157,9 @@ impl MessageSink for DocSink {
         }
         let copied = matches!((message.timestamp, self.copied_before), (Some(at), Some(before)) if at < before);
         if message.kind.is_exchange() && !copied {
-            self.append_searchable(&message);
+            let resolver = std::mem::replace(&mut self.resolver, Resolver::new(None));
+            self.error = cv_core::projection::searchable(&message.content, &resolver, self, &mut || Ok(())).err();
+            self.resolver = resolver;
         }
         if self.error.is_some() || (self.body.full() && self.first_prompt.is_some()) {
             Flow::Stop
@@ -343,14 +354,14 @@ mod tests {
         let text_path = dir.join("text");
         let sidecar = dir.join("missing");
         std::fs::write(&json_path, "{\"arg\":true}").unwrap();
-        std::fs::write(&text_path, "label").unwrap();
+        std::fs::write(&text_path, "\"label\"").unwrap();
         let mut m = message(
             Role::User,
             vec![
                 Block::Text {
                     text: Text::Span(cv_core::Span {
                         source: Some(text_path.clone()),
-                        offset: 0,
+                        offset: 1,
                         len: 5,
                         escaped: false,
                     }),
@@ -385,8 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_head_matches_materialized_projection_and_labels() {
-        // Independent owned projection; fake embedding consumer reads the same resulting head.
+    fn semantic_head_has_canonical_blocks_and_prompt_label() {
         let messages = [
             message(
                 Role::Assistant,
@@ -407,22 +417,15 @@ mod tests {
             ),
             message(Role::User, vec![text(""), text("first\nuser"), text("second")]),
         ];
-        let mut expected = String::new();
         let mut actual = sink();
-        for m in &messages {
-            m.append_searchable(&mut expected).unwrap();
-            actual.message(m.clone());
+        for m in messages {
+            actual.message(m);
         }
-        assert_eq!(actual.body.as_str(), expected);
         assert_eq!(
-            actual.first_prompt,
-            messages[1].prompt_title(&Resolver::new(None)).unwrap()
+            actual.body.as_str(),
+            "tool {\"a\":[1,true,\"é\\n\\\"\"],\"z\":null}\nthought\na.rs\n\nfirst\nuser\nsecond\n"
         );
-        let fake_embed = |body: &str| {
-            body.bytes()
-                .fold(0u64, |sum, byte| sum.wrapping_mul(31).wrapping_add(byte as u64))
-        };
-        assert_eq!(fake_embed(actual.body.as_str()), fake_embed(&expected));
+        assert_eq!(actual.first_prompt.as_deref(), Some("first user second"));
     }
 
     #[test]
@@ -521,6 +524,27 @@ mod tests {
         assert!(actual.body.as_str().contains("chosen"));
     }
 
+    #[test]
+    fn semantic_transcript_head_is_independent_of_json_escaping() {
+        let world = cv_testkit::World::new("semantic-decoded-head");
+        for scalar in ["x", "\\u0078"] {
+            let path = world.proj.join("session.jsonl");
+            let raw = scalar.repeat(100_000);
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"user\",\"uuid\":\"u\",\"sessionId\":\"head\",\"message\":{{\"role\":\"user\",\"content\":\"{raw}\"}}}}\n"
+                ),
+            )
+            .unwrap();
+            let r = cv_core::SessionRef::new("head", cv_core::Harness::Claude, &path);
+            let (doc, reads) = read_corpus_doc(&r).unwrap();
+            assert_eq!(doc.body.len(), 64 * 1024);
+            assert!(doc.body.bytes().all(|byte| byte == b'x'));
+            assert!(reads.fresh(&mut cv_core::source::Probe::default()));
+        }
+    }
+
     /// The committed Claude corpus copies one CLAUDE.md into 18 transcripts; a vector embeds it
     /// only where the exchange says it (`dfa91e7c`'s reply quotes it), and the fork's copied
     /// turns (`b3a058ca`) are its source's alone, as the full-text `body` field holds them.
@@ -585,16 +609,17 @@ mod tests {
     }
 
     #[test]
-    fn semantic_head_lazy_spans_keep_raw_prefix_and_bound_lossy_expansion() {
+    fn semantic_head_lazy_spans_keep_a_bounded_prefix() {
         let dir = std::env::temp_dir().join(format!("cv-semantic-head-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
-        for (escaped, bytes) in [(true, b"\\u0061".repeat(20000)), (false, vec![0xff; 100000])] {
+        // A span covers a JSON string's body.
+        for (escaped, bytes) in [(true, b"\\u0061".repeat(20000)), (false, vec![b'a'; 100000])] {
             let path = dir.join("source");
-            std::fs::write(&path, &bytes).unwrap();
+            std::fs::write(&path, [&b"\""[..], &bytes, b"\""].concat()).unwrap();
             let resolver = Resolver::new(Some(path));
             let span = cv_core::Span {
                 source: None,
-                offset: 0,
+                offset: 1,
                 len: bytes.len() as u64,
                 escaped,
             };

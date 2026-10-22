@@ -89,7 +89,7 @@ fn tmp(tag: &str) -> PathBuf {
 
 fn refs(db: &Path) -> (OpenCode, Vec<SessionRef>) {
     let adapter = OpenCode::with_db(db.to_path_buf());
-    let r = adapter.discover().expect("discover the planted db");
+    let r = adapter.discover().expect("discover the planted db").refs;
     assert!(!r.is_empty(), "the planted db must be discovered");
     (adapter, r)
 }

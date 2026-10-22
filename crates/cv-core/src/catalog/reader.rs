@@ -4,6 +4,10 @@ use crate::Harness;
 
 /// No transaction spans filesystem scans. Separate operations reopen the current catalog path;
 /// this owner has no process-global connection or schema cache.
+/// What a failed skipped-source write warns about ([`crate::env::warn_once`]).
+#[cfg(feature = "sqlite")]
+pub(crate) const SKIPPED_LIST: &str = "the skipped-source list `cv doctor` shows";
+
 pub(crate) struct Reader {
     #[cfg(feature = "sqlite")]
     conn: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
@@ -11,23 +15,32 @@ pub(crate) struct Reader {
     counts_lookups: std::cell::Cell<usize>,
     #[cfg(all(test, feature = "sqlite"))]
     counts_rows: std::cell::Cell<usize>,
+    #[cfg(all(test, feature = "sqlite"))]
+    turn_snapshots: std::cell::Cell<usize>,
 }
 
 impl Reader {
     pub(crate) fn open() -> Option<Self> {
         #[cfg(feature = "sqlite")]
         {
-            super::imp::open_db().map(|conn| Self {
-                conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
-                #[cfg(test)]
-                counts_lookups: std::cell::Cell::new(0),
-                #[cfg(test)]
-                counts_rows: std::cell::Cell::new(0),
-            })
+            super::imp::open_db().map(|conn| Self::from_connection(std::sync::Arc::new(std::sync::Mutex::new(conn))))
         }
         #[cfg(not(feature = "sqlite"))]
         {
             None
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn from_connection(conn: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>) -> Self {
+        Self {
+            conn,
+            #[cfg(test)]
+            counts_lookups: std::cell::Cell::new(0),
+            #[cfg(test)]
+            counts_rows: std::cell::Cell::new(0),
+            #[cfg(test)]
+            turn_snapshots: std::cell::Cell::new(0),
         }
     }
 
@@ -56,38 +69,62 @@ impl Reader {
         {
             #[cfg(test)]
             self.counts_lookups.set(self.counts_lookups.get() + 1);
-            let (counts, record) = {
-                let conn = self.conn.lock().ok()?;
-                let mut stmt = conn
-                    .prepare_cached(
-                        "SELECT a.counts,d.record
-                     FROM affordance_counts AS a JOIN source_dependencies AS d
-                     ON d.consumer='counts' AND d.harness=a.harness AND d.id=a.id AND d.path=a.path
-                     WHERE a.harness=?1 AND a.id=?2 AND a.path=?3",
-                    )
-                    .ok()?;
-                stmt.query_row(
-                    rusqlite::params![r.harness.as_str(), r.id, r.path.to_string_lossy()],
-                    |row| {
-                        let record = (row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?);
-                        #[cfg(test)]
-                        self.counts_rows.set(self.counts_rows.get() + 1);
-                        Ok(record)
-                    },
-                )
-                .ok()?
-            }; // Reset the SQL statement before filesystem provenance checks or body reads.
-            crate::source::Published::decode(&record)?
-                .of(counts.as_bytes())?
-                .fresh(source, probe)
-                .then_some(())?;
-            super::imp::counts_of(&counts)
+            let record = super::imp::count_record_in(&*self.conn.lock().ok()?, r)?;
+            #[cfg(test)]
+            self.counts_rows.set(self.counts_rows.get() + 1);
+            let record = crate::source::Record::<super::imp::Counted>::decode(&record)?;
+            Some(record.admit(source, probe)?.counts.clone())
         }
         #[cfg(not(feature = "sqlite"))]
         {
             let _ = (r, source, probe);
             None
         }
+    }
+
+    /// Refill only source-certified exact counts. Cold/malformed candidates are rejected
+    /// before constructing source snapshots, so metadata discovery does not inventory sidecars
+    /// or tool-result directories merely to learn that no completed count exists.
+    pub(crate) fn refill_turns<'a>(&self, refs: impl Iterator<Item = &'a mut SessionRef>) {
+        #[cfg(feature = "sqlite")]
+        {
+            let mut probe = crate::source::Probe::default();
+            let mut candidates = 0;
+            for r in refs.filter(|r| r.message_count.is_none()) {
+                let Some(record) = self
+                    .conn
+                    .lock()
+                    .ok()
+                    .and_then(|conn| super::imp::count_record_in(&conn, r))
+                    .and_then(|record| crate::source::Record::<super::imp::Counted>::decode(&record))
+                else {
+                    continue;
+                };
+                let Some(turns) = record.payload.turns else {
+                    continue;
+                };
+                #[cfg(test)]
+                self.turn_snapshots.set(self.turn_snapshots.get() + 1);
+                let source = probe.snapshot(r);
+                if record.admit(&source, &mut probe).is_some() {
+                    r.message_count = Some(turns as usize);
+                }
+                // Bound retained fleet auxiliary metadata while sharing common DB identities
+                // within a batch. One exceptional certificate can still name many dependencies.
+                candidates += 1;
+                if candidates == 256 {
+                    probe = crate::source::Probe::default();
+                    candidates = 0;
+                }
+            }
+        }
+        #[cfg(not(feature = "sqlite"))]
+        let _ = refs;
+    }
+
+    #[cfg(all(test, feature = "sqlite"))]
+    pub(crate) fn turn_snapshots(&self) -> usize {
+        self.turn_snapshots.get()
     }
 
     #[cfg(all(test, feature = "sqlite"))]
@@ -204,6 +241,18 @@ impl Reader {
         {
             crate::discover_cache::persist(prune);
         }
+    }
+
+    /// Persist what each listed harness's discovery could not open (see
+    /// [`crate::harness::Discovered`]). A catalog that cannot take the write keeps its old rows and
+    /// says so once per process, so `cv doctor`'s list is never stale in silence.
+    pub(crate) fn record_skipped(&mut self, rows: &[(crate::Harness, &[crate::Skipped])]) {
+        #[cfg(feature = "sqlite")]
+        if let Err(error) = super::imp::record_skipped_in(&mut self.conn.lock().unwrap(), rows) {
+            crate::env::warn_once(SKIPPED_LIST, format_args!("{error:#}"));
+        }
+        #[cfg(not(feature = "sqlite"))]
+        let _ = rows;
     }
 
     pub(crate) fn publish_all(&mut self, rows: &[Publication<'_>]) {

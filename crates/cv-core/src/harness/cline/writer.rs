@@ -47,8 +47,8 @@ fn blocks(
         separate(writer)?;
         text_block(writer, &["<task>", title, "</task>"])?;
     }
+    let user = message.role == Role::User || message.role == Role::Tool;
     for block in &message.content {
-        let user = message.role == Role::User || message.role == Role::Tool;
         if message.role == Role::Tool && !matches!(block, Block::ToolResult { .. }) {
             continue;
         }
@@ -69,6 +69,8 @@ fn blocks(
             anthropic::write::block(writer, block, &anthropic::ANTHROPIC, user, resolver)?;
         }
     }
+    // The first user turn carries cwd even without a title; only the optional task wrapper
+    // above depends on a title. The reader recovers cwd from this environment trailer.
     if let Some(cwd) = cwd {
         separate(writer)?;
         text_block(

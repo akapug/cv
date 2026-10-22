@@ -6,7 +6,17 @@ use super::*;
 use crate::harness::store::{bytes::ByteSource, document::Fields, sqlite::Cells};
 use crate::json::JsonView;
 use crate::lazy::Text;
+use crate::stream::Tier;
 use std::io::Read;
+
+/// Cursor Agent CLI/ACP metadata (`meta.json` beside a `cli:` session's store) participates in
+/// both catalog discovery and consumer freshness. The path is returned even while absent:
+/// creating it can supply a previously missing cwd or title.
+pub(super) fn metadata(r: &SessionRef) -> Option<PathBuf> {
+    (r.harness == Harness::Cursor && r.id.starts_with("cli:"))
+        .then(|| r.path.parent().map(|parent| parent.join("meta.json")))
+        .flatten()
+}
 
 pub(super) fn roots(home: &Path) -> Vec<PathBuf> {
     ["chats", "acp-sessions"]
@@ -16,43 +26,57 @@ pub(super) fn roots(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-pub(super) fn discover(home: &Path, out: &mut Vec<SessionRef>) {
+pub(super) fn discover(home: &Path, out: &mut crate::Discovered) {
     for root in roots(home) {
-        for entry in walkdir::WalkDir::new(root).max_depth(3).into_iter().flatten() {
+        for entry in walkdir::WalkDir::new(root).max_depth(3) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    out.skipped.extend(crate::Skipped::walk(&e));
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() || entry.file_name() != "store.db" {
                 continue;
             }
             let path = entry.path();
-            let Ok(conn) = open_ro(path) else { continue };
-            let result = conn.read(|conn| -> Result<SessionRef> {
-                let mut collector = Count::default();
-                let r = SessionRef::new("cli:", Harness::Cursor, path);
-                let session = read_with_reads(conn, &r, &ParseOptions::lazy(), true, conn.reads(), &mut collector)?;
-                if let Some(error) = collector.error {
-                    return Err(error);
-                }
-                Ok(SessionRef {
-                    id: session.id,
-                    cwd: session.cwd,
-                    title: session.title.or(collector.title),
-                    created_at: session.created_at,
-                    updated_at: session.updated_at,
-                    message_count: collector.count,
-                    ..r
+            let result = open_ro(path).and_then(|conn| {
+                conn.read(|conn, reads| -> Result<SessionRef> {
+                    let mut collector = Count::default();
+                    let r = SessionRef::new("cli:", Harness::Cursor, path);
+                    let session = read_with_reads(
+                        conn,
+                        &r,
+                        &crate::stream::Demand::LEAN.with_spans(),
+                        true,
+                        reads,
+                        &mut collector,
+                    )?;
+                    if let Some(error) = collector.error {
+                        return Err(error);
+                    }
+                    Ok(SessionRef {
+                        id: session.id,
+                        cwd: session.cwd,
+                        title: session.title.or(collector.title),
+                        created_at: session.created_at,
+                        updated_at: session.updated_at,
+                        message_count: Some(collector.count),
+                        ..r
+                    })
                 })
             });
-            if let Ok(reference) = result {
+            if let Some(reference) = out.keep(path, result) {
                 // An empty or uninitialized native store is not a conversation.
-                if reference.message_count > 0 {
-                    out.push(reference);
+                if reference.message_count.is_some_and(|n| n > 0) {
+                    out.refs.push(reference);
                 }
             }
         }
     }
 }
 
-/// Discovery's sink: turns, and the title of the first human prompt (its text blocks, each without
-/// leading whitespace, joined by newlines, the first 96 characters).
+/// Discovery's sink: turns and the canonical title of the first meaningful human prompt.
 #[derive(Default)]
 struct Count {
     count: usize,
@@ -63,12 +87,8 @@ impl MessageSink for Count {
     fn message(&mut self, message: Message) -> Flow {
         self.count += usize::from(message.is_turn());
         if self.title.is_none() && message.kind == MessageKind::Prompt && message.origin == Origin::Human {
-            match title(&message) {
-                Ok(title) => {
-                    self.title = Some(title)
-                        .filter(|text| !text.trim().is_empty())
-                        .map(|text| crate::ir::truncate(&text, 80))
-                }
+            match message.prompt_title(&crate::lazy::Resolver::new(None)) {
+                Ok(title) => self.title = title,
                 Err(error) => {
                     self.error.get_or_insert(error);
                     return Flow::Stop;
@@ -78,66 +98,21 @@ impl MessageSink for Count {
         Flow::Continue
     }
 }
-fn title(message: &Message) -> Result<String> {
-    const MAX: usize = 96;
-    #[derive(Debug, thiserror::Error)]
-    #[error("Cursor CLI title prefix complete")]
-    struct Complete;
-    let mut title = String::new();
-    let mut chars = 0;
-    for block in &message.content {
-        let Block::Text { text } = block else { continue };
-        // Each block's prefix without leading whitespace; a blank block counts as one space.
-        let mut part = String::new();
-        let mut taken = 0;
-        let mut trimming = true;
-        let result = text.try_for_each_chunk(&crate::lazy::Resolver::new(None), 4096, |chunk| {
-            for ch in chunk.chars() {
-                if trimming && ch.is_whitespace() {
-                    continue;
-                }
-                trimming = false;
-                if taken == MAX - chars {
-                    return Err(Complete.into());
-                }
-                part.push(ch);
-                taken += 1;
-            }
-            Ok(())
-        });
-        match result {
-            Err(error) if error.downcast_ref::<Complete>().is_some() => {}
-            other => other?,
-        }
-        if part.is_empty() {
-            part.push(' ');
-        }
-        if !title.is_empty() && chars < MAX {
-            title.push('\n');
-            chars += 1;
-        }
-        for ch in part.chars().take(MAX - chars) {
-            title.push(ch);
-            chars += 1;
-        }
-    }
-    Ok(title)
-}
-
 pub(super) fn stream(
-    conn: &crate::harness::store::sqlite::ReadConnection,
+    conn: &Connection,
+    reads: &crate::source::ReadSet,
     r: &SessionRef,
-    opts: &ParseOptions,
+    opts: &crate::stream::Demand,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
-    read_with_reads(conn, r, opts, false, conn.reads(), sink)
+    read_with_reads(conn, r, opts, false, reads, sink)
 }
 
 #[cfg(test)]
 fn read(
     conn: &Connection,
     r: &SessionRef,
-    opts: &ParseOptions,
+    opts: &crate::stream::Demand,
     counting: bool,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
@@ -147,7 +122,7 @@ fn read(
 fn read_with_reads(
     conn: &Connection,
     r: &SessionRef,
-    opts: &ParseOptions,
+    opts: &crate::stream::Demand,
     counting: bool,
     reads: &crate::source::ReadSet,
     sink: &mut dyn MessageSink,
@@ -158,7 +133,7 @@ fn read_with_reads(
     let mut wal = r.path.as_os_str().to_os_string();
     wal.push("-wal");
     reads.record(&PathBuf::from(wal));
-    if let Some(meta) = crate::source::cursor_cli_metadata(r) {
+    if let Some(meta) = metadata(r) {
         reads.record(&meta);
     }
     let cells = Cells::new(conn, &r.path, &reads, "blobs")?;
@@ -171,12 +146,12 @@ fn read_with_reads(
 fn read_snapshot(
     conn: &Connection,
     r: &SessionRef,
-    opts: &ParseOptions,
+    opts: &crate::stream::Demand,
     counting: bool,
     sink: &mut dyn MessageSink,
     cells: &Cells,
 ) -> Result<Session> {
-    let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
+    let _snapshot = crate::harness::store::sqlite::snapshot(conn)?;
     let encoded: String = conn.query_row("SELECT value FROM meta WHERE key='0'", [], |row| row.get(0))?;
     let metadata: Value = serde_json::from_slice(&decode_hex(&encoded)?).context("Cursor CLI metadata JSON")?;
     let id = metadata
@@ -309,12 +284,8 @@ fn read_snapshot(
         return Err(error);
     }
     // Cursor's fact reducers read native summary/context/error markers through the IR; the
-    // record and part metadata bags are full-metadata demands.
-    let demand = Demand {
-        spans: opts.spans,
-        extra: opts.wants_full_extra(),
-        complete: opts.complete,
-    };
+    // record and part metadata bags are rich demands.
+    let demand = *opts;
     let mut emit = |id: &str| -> Result<Flow> {
         let decoded = match cells.row(conn, "blobs", "data", blob_rowid(conn, id)?)? {
             Some(cell) => cells.read(cell, |view| Ok((message(view, demand)?, model(view)?)))?,
@@ -478,15 +449,6 @@ fn encode_hex(bytes: &[u8]) -> String {
     text
 }
 
-/// What a read resolves: long text and arguments held in the store (`spans`), the record and part
-/// metadata bags (`extra`), and every record, carriers included (`complete`).
-#[derive(Clone, Copy)]
-struct Demand {
-    spans: bool,
-    extra: bool,
-    complete: bool,
-}
-
 fn string(view: Option<JsonView<'_>>) -> Result<Option<String>> {
     Ok(match view {
         Some(view) => view.text(false)?.and_then(|text| match text {
@@ -542,7 +504,9 @@ fn remainder(view: JsonView<'_>, taken: &[&str]) -> Result<Map<String, Value>> {
 
 /// One message record (`{role, id, content, providerOptions, ...}`); None for an unknown role or
 /// an empty message the demand does not carry.
-fn message(view: JsonView<'_>, demand: Demand) -> Result<Option<Message>> {
+/// The demand resolves long text and arguments held in the store (`spans`), the record and part
+/// metadata bags ([`Tier::Rich`]), and every record, carriers included ([`Tier::Complete`]).
+fn message(view: JsonView<'_>, demand: crate::stream::Demand) -> Result<Option<Message>> {
     let Some(fields) = Fields::parse(view, &["role", "id", "content", "providerOptions"])? else {
         return Ok(None);
     };
@@ -666,7 +630,7 @@ fn message(view: JsonView<'_>, demand: Demand) -> Result<Option<Message>> {
                     &["mimeType", "filename"]
                 }
                 _ => {
-                    if demand.complete {
+                    if demand.tier == Tier::Complete {
                         message
                             .harness_extra_mut(Harness::Cursor)
                             .entry("unhandled_parts")
@@ -678,7 +642,7 @@ fn message(view: JsonView<'_>, demand: Demand) -> Result<Option<Message>> {
                     &[]
                 }
             };
-            if demand.extra && !demand.complete {
+            if demand.tier == Tier::Rich {
                 let rest = remainder(part, taken)?;
                 if rest.len() > 1 {
                     message
@@ -693,13 +657,13 @@ fn message(view: JsonView<'_>, demand: Demand) -> Result<Option<Message>> {
         }
     }
     if message.content.is_empty() {
-        if !demand.complete {
+        if demand.tier != Tier::Complete {
             return Ok(None);
         }
         message.kind = MessageKind::Carrier;
         message.origin = Origin::Harness;
     }
-    if demand.extra || demand.complete {
+    if demand.tier >= Tier::Rich {
         let rest = remainder(view, &["id", "content", "role"])?;
         if !rest.is_empty() {
             message
@@ -707,7 +671,7 @@ fn message(view: JsonView<'_>, demand: Demand) -> Result<Option<Message>> {
                 .insert("record_metadata".into(), Value::Object(rest));
         }
     }
-    if demand.complete {
+    if demand.tier == Tier::Complete {
         message
             .harness_extra_mut(Harness::Cursor)
             .insert("record".into(), view.resolve()?.into_owned());
@@ -765,16 +729,31 @@ mod tests {
         (conn, SessionRef::new("cli:fixture", Harness::Cursor, path))
     }
     #[test]
+    fn discovery_title_peels_timestamp_without_changing_prompt_text() {
+        let world = crate::test_world("cursor-timestamp-title");
+        let body = "<timestamp>Monday, Oct 12, 2026, 7:50 PM (UTC-4)</timestamp>\nask about otters";
+        let record = json!({"role":"user","content":body}).to_string().into_bytes();
+        let (conn, r) = fixture(field(1, &[1; 32]), &[(1, record)], &world.base);
+        let mut count = Count::default();
+        let session = read(&conn, &r, &crate::stream::Demand::RICH, true, &mut count).unwrap();
+        assert_eq!(count.title.as_deref(), Some("ask about otters"));
+        assert_eq!(count.count, 1);
+        let _ = session;
+        let message = decode(&json!({"role":"user","content":body}), false, false).unwrap();
+        assert_eq!(message.text().as_deref(), Some(body));
+    }
+
+    #[test]
     fn native_capture_counts_and_tool_links_match_stream() {
         let home = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/cursor/2026.10.01-e373342/.cursor");
         let adapter = Cursor::with_cli_home(&home);
         let refs = adapter.discover().unwrap();
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].message_count, 5);
+        assert_eq!(refs[0].message_count, Some(5));
         let session = adapter.parse(&refs[0]).unwrap();
         assert_eq!(session.messages.len(), 10);
         assert_eq!(
-            session.messages.iter().filter(|m| m.is_turn()).count(),
+            Some(session.messages.iter().filter(|m| m.is_turn()).count()),
             refs[0].message_count
         );
         let uses: Vec<_> = session
@@ -818,7 +797,7 @@ mod tests {
                 &world.base.join(archive_field.to_string()),
             );
             let mut sink = CollectSink::default();
-            let session = read(&conn, &r, &ParseOptions::default(), false, &mut sink).unwrap();
+            let session = read(&conn, &r, &crate::stream::Demand::LEAN, false, &mut sink).unwrap();
             assert_eq!(sink.messages.len(), 2);
             assert_eq!(sink.messages[0].text().as_deref(), Some("older"));
             assert_eq!(session.lineage.parent.as_deref(), Some("cli:parent"));
@@ -827,10 +806,10 @@ mod tests {
     }
     /// One record decoded from an owned value.
     fn decode(value: &Value, extra: bool, complete: bool) -> Option<Message> {
-        let demand = Demand {
-            spans: false,
-            extra,
-            complete,
+        let demand = match (extra, complete) {
+            (_, true) => crate::stream::Demand::COMPLETE,
+            (true, false) => crate::stream::Demand::RICH,
+            (false, false) => crate::stream::Demand::LEAN,
         };
         message(JsonView::owned(value), demand).unwrap()
     }
@@ -874,10 +853,10 @@ mod tests {
             .collect();
         let (conn, r) = fixture(root, &records, &world.base);
         let mut count = Count::default();
-        read(&conn, &r, &ParseOptions::lazy(), true, &mut count).unwrap();
+        read(&conn, &r, &crate::stream::Demand::LEAN.with_spans(), true, &mut count).unwrap();
         assert_eq!(count.count, 3);
         // A blank first prompt titles nothing, so the next prompt titles the session.
-        let expected = crate::ir::truncate(&format!("first line\n{}", "y".repeat(85)), 80);
+        let expected = crate::ir::truncate(&format!("first line\n\n{}", "y".repeat(200)), 80);
         assert_eq!(count.title.as_deref(), Some(expected.as_str()));
         let only = Message {
             content: vec![
@@ -890,7 +869,10 @@ mod tests {
             ],
             ..Message::new(Role::User)
         };
-        assert_eq!(title(&only).unwrap(), format!("first line\n{}", "y".repeat(85)));
+        assert_eq!(
+            only.prompt_title(&crate::lazy::Resolver::new(None)).unwrap().as_deref(),
+            Some(expected.as_str())
+        );
         let empty = json!({"role":"assistant","content":[],"providerOptions":{"cursor":{"opaque":1}}});
         assert!(decode(&empty, true, false).is_none());
         assert!(!decode(&empty, true, true).unwrap().is_turn());
@@ -934,10 +916,10 @@ mod tests {
             .enumerate()
         {
             let (conn, r) = fixture(root, &[], &world.base.join(index.to_string()));
-            assert!(read(&conn, &r, &ParseOptions::default(), false, &mut Count::default()).is_err());
+            assert!(read(&conn, &r, &crate::stream::Demand::LEAN, false, &mut Count::default()).is_err());
         }
         let (conn, r) = fixture(field(1, &[1; 32]), &[], &world.base.join("missing"));
-        assert!(read(&conn, &r, &ParseOptions::default(), false, &mut Count::default()).is_err());
+        assert!(read(&conn, &r, &crate::stream::Demand::LEAN, false, &mut Count::default()).is_err());
         let mut root = field(1, &[1; 32]);
         root.extend(field(1, &[2; 32]));
         let (conn, r) = fixture(
@@ -951,7 +933,7 @@ mod tests {
                 Flow::Stop
             }
         }
-        assert!(read(&conn, &r, &ParseOptions::default(), false, &mut Stop).is_ok());
+        assert!(read(&conn, &r, &crate::stream::Demand::LEAN, false, &mut Stop).is_ok());
     }
     #[test]
     fn acp_sidecar_creation_change_and_identity_invalidate() {
@@ -973,12 +955,12 @@ mod tests {
             }
         }
         let mut absent = Reads(crate::source::ReadSet::default());
-        read(&conn, &reference, &ParseOptions::bulk(), false, &mut absent).unwrap();
+        read(&conn, &reference, &crate::stream::Demand::LEAN, false, &mut absent).unwrap();
         assert!(absent.0.fresh(&mut crate::source::Probe::default()));
         std::fs::write(dir.join("meta.json"), r#"{"cwd":"/scratch/project","title":"ACP"}"#).unwrap();
         assert!(!absent.0.fresh(&mut crate::source::Probe::default()));
         let mut current = Reads(crate::source::ReadSet::default());
-        let session = read(&conn, &reference, &ParseOptions::bulk(), false, &mut current).unwrap();
+        let session = read(&conn, &reference, &crate::stream::Demand::LEAN, false, &mut current).unwrap();
         assert_eq!(session.cwd.as_deref(), Some(Path::new("/scratch/project")));
         assert_eq!(session.title.as_deref(), Some("ACP"));
         std::fs::write(
@@ -988,7 +970,14 @@ mod tests {
         .unwrap();
         assert!(!current.0.fresh(&mut crate::source::Probe::default()));
         reference.id = "cli:replacement".into();
-        assert!(read(&conn, &reference, &ParseOptions::bulk(), false, &mut Count::default()).is_err());
+        assert!(read(
+            &conn,
+            &reference,
+            &crate::stream::Demand::LEAN,
+            false,
+            &mut Count::default()
+        )
+        .is_err());
     }
     #[test]
     fn updated_time_observes_active_wal() {
@@ -1007,7 +996,14 @@ mod tests {
             )
             .unwrap();
         }
-        let session = read(&conn, &reference, &ParseOptions::bulk(), false, &mut Count::default()).unwrap();
+        let session = read(
+            &conn,
+            &reference,
+            &crate::stream::Demand::LEAN,
+            false,
+            &mut Count::default(),
+        )
+        .unwrap();
         assert_eq!(session.updated_at.unwrap().timestamp(), 2);
     }
     #[test]
@@ -1024,7 +1020,7 @@ mod tests {
         let journal = r.path.with_file_name("store.db-journal");
         assert!(!wal.exists() && !shm.exists());
         let adapter = Cursor::with_cli_home(&world.base);
-        let retained = crate::stream::collect_with(&adapter, &r, &ParseOptions::facts()).unwrap();
+        let retained = crate::stream::collect_with(&adapter, &r, &crate::stream::Demand::FACTS.with_spans()).unwrap();
         assert!(!wal.exists() && !shm.exists());
         let Block::Text {
             text: crate::lazy::Text::Source(text),
@@ -1043,7 +1039,7 @@ mod tests {
             }
         }
         assert!(adapter
-            .stream(&r, &ParseOptions::bulk(), &mut Stop(journal))
+            .stream(&r, &crate::stream::Demand::LEAN, &mut Stop(journal))
             .unwrap_err()
             .to_string()
             .contains("dependencies changed"));
@@ -1066,8 +1062,9 @@ mod tests {
             .collect();
         let (_conn, reference) = fixture(root, &records, &world.base.join("source"));
         let adapter = Cursor::with_cli_home(&world.base);
-        let owned = crate::stream::collect_with(&adapter, &reference, &ParseOptions::bulk()).unwrap();
-        let mut lazy = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy()).unwrap();
+        let owned = crate::stream::collect_with(&adapter, &reference, &crate::stream::Demand::LEAN).unwrap();
+        let mut lazy =
+            crate::stream::collect_with(&adapter, &reference, &crate::stream::Demand::LEAN.with_spans()).unwrap();
         let mut owned_output = Vec::new();
         let mut lazy_output = Vec::new();
         crate::dataset::write_record(&owned, &mut owned_output, crate::dataset::Format::Chatml, None).unwrap();
@@ -1128,8 +1125,14 @@ mod tests {
             );
             let mut owned = CollectSink::default();
             let mut selected = CollectSink::default();
-            let full = read(&conn, &reference, &ParseOptions::bulk(), false, &mut owned);
-            let lazy = read(&conn, &reference, &ParseOptions::lazy(), false, &mut selected);
+            let full = read(&conn, &reference, &crate::stream::Demand::LEAN, false, &mut owned);
+            let lazy = read(
+                &conn,
+                &reference,
+                &crate::stream::Demand::LEAN.with_spans(),
+                false,
+                &mut selected,
+            );
             assert_eq!(full.is_ok(), lazy.is_ok(), "case {index}");
             if full.is_ok() {
                 let resolver = crate::lazy::Resolver::new(Some(reference.path.clone()));
@@ -1165,7 +1168,10 @@ mod tests {
         let mut reports = Vec::new();
         let mut sessions = Vec::new();
         let mut counts = Vec::new();
-        for options in [ParseOptions::lazy_extra(), ParseOptions::facts()] {
+        for options in [
+            crate::stream::Demand::RICH.with_spans(),
+            crate::stream::Demand::FACTS.with_spans(),
+        ] {
             let mut report = crate::doctor::Report::default();
             let mut pass = report.session(Some(reference.path.clone()));
             let session = read(&conn, &reference, &options, false, &mut pass).unwrap();
@@ -1179,7 +1185,7 @@ mod tests {
                 counter.note(message).unwrap();
             }
             counts.push(counter.finish(&session, &[]));
-            if options.facts_only() {
+            if options.tier == Tier::Facts {
                 assert!(retained.messages.iter().all(|message| message.extra.is_empty()));
                 assert!(matches!(
                     &retained.messages[1].content[0],
@@ -1201,8 +1207,7 @@ mod tests {
         assert_eq!(counts[0], counts[1]);
         assert_eq!(sessions[0].model, sessions[1].model);
         assert_eq!(sessions[0].extra, sessions[1].extra);
-        let mut complete = ParseOptions::facts();
-        complete.complete = true;
+        let complete = crate::stream::Demand::COMPLETE.with_spans();
         let mut retained = CollectSink::default();
         read(&conn, &reference, &complete, false, &mut retained).unwrap();
         assert!(retained.messages[1]
@@ -1216,7 +1221,14 @@ mod tests {
         let record=json!({"role":"assistant","content":[{"type":"tool-call","toolCallId":"call","toolName":"Read","args":{"body":"x".repeat(8192)}},{"type":"text","text":"日本語\n".repeat(4096)}]}).to_string().into_bytes();
         let (conn, reference) = fixture(field(1, &[1; 32]), &[(1, record)], &world.base.join("source"));
         let mut retained = CollectSink::default();
-        read(&conn, &reference, &ParseOptions::lazy(), false, &mut retained).unwrap();
+        read(
+            &conn,
+            &reference,
+            &crate::stream::Demand::LEAN.with_spans(),
+            false,
+            &mut retained,
+        )
+        .unwrap();
         let input = match &retained.messages[0].content[0] {
             Block::ToolUse { input, .. } => input,
             _ => panic!("expected tool"),
@@ -1261,7 +1273,14 @@ mod tests {
                 Flow::Stop
             }
         }
-        let error = read(&conn, &reference, &ParseOptions::lazy(), false, &mut Mutate(wal)).unwrap_err();
+        let error = read(
+            &conn,
+            &reference,
+            &crate::stream::Demand::LEAN.with_spans(),
+            false,
+            &mut Mutate(wal),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("dependencies changed"), "{error:#}");
     }
 }

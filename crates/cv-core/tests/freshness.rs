@@ -37,11 +37,11 @@ fn user_line(sid: &str, i: usize) -> String {
 }
 
 /// The comparable identity of a ref (timestamps excluded: the catalog stores second precision).
-fn key(r: &SessionRef) -> (String, String, PathBuf, usize) {
+fn key(r: &SessionRef) -> (String, String, PathBuf, Option<usize>) {
     (r.harness.as_str().into(), r.id.clone(), r.path.clone(), r.message_count)
 }
 
-fn keys(refs: &[SessionRef]) -> Vec<(String, String, PathBuf, usize)> {
+fn keys(refs: &[SessionRef]) -> Vec<(String, String, PathBuf, Option<usize>)> {
     let mut v: Vec<_> = refs.iter().map(key).collect();
     v.sort();
     v
@@ -70,7 +70,7 @@ fn cold_catalog_matches_discover_all() {
     assert_eq!(warm.iter().map(key).count(), 2);
     let alpha = warm.iter().find(|r| r.id == "alphasess").unwrap();
     assert_eq!(alpha.harness, Harness::Claude);
-    assert_eq!(alpha.message_count, 2);
+    assert_eq!(alpha.message_count, Some(2));
     assert_eq!(alpha.cwd.as_deref(), Some(std::path::Path::new("/work/proj")));
 }
 
@@ -108,7 +108,8 @@ fn append_in_top_k_detected() {
     let refs = cv_core::sessions();
     let alpha = refs.iter().find(|r| r.id == "alphasess").expect("alphasess present");
     assert_eq!(
-        alpha.message_count, 3,
+        alpha.message_count,
+        Some(3),
         "append must be re-scanned via the primary probe"
     );
 }
@@ -159,7 +160,7 @@ fn warm_path_reads_catalog_and_full_discovery_heals() {
         title: None,
         created_at: None,
         updated_at: None,
-        message_count: 7,
+        message_count: Some(7),
     };
     cv_core::catalog::sync(std::slice::from_ref(&phantom));
     let refs = cv_core::sessions();
@@ -181,7 +182,7 @@ fn warm_path_reads_catalog_and_full_discovery_heals() {
     assert_eq!(ids(&refs), vec!["alphasess"]);
 }
 
-/// A Codex rollout over the discovery scan cap lists with `message_count` 0 ("not counted": the
+/// A Codex rollout over the discovery scan cap lists with `message_count` `None` ("not counted": the
 /// middle was never read). The first full parse writes the true count back, and the next discovery
 /// keeps it (a scan-cache hit while the file is unchanged), so `cv ls` shows the real number.
 #[test]
@@ -218,10 +219,10 @@ fn a_full_parse_fills_a_not_counted_catalog_row() {
     let row = |refs: Vec<SessionRef>| refs.into_iter().find(|r| r.id == id).expect("codex row listed");
     assert_eq!(
         row(cv_core::discover_all()).message_count,
-        0,
+        None,
         "over the cap: not counted"
     );
-    assert_eq!(row(cv_core::sessions()).message_count, 0);
+    assert_eq!(row(cv_core::sessions()).message_count, None);
 
     let (r, adapter) = cv_core::find(id, Some(Harness::Codex)).unwrap().expect("resolves");
     // A stream that stops early (`cv show --range 0..1`) read a prefix: it proves nothing.
@@ -229,14 +230,14 @@ fn a_full_parse_fills_a_not_counted_catalog_row() {
     cv_core::stream::stream_counted(
         adapter.as_ref(),
         &r,
-        &cv_core::ParseOptions::lazy(),
+        &cv_core::Demand::LEAN.with_spans(),
         &mut head,
         cv_core::stream::Pass::RECORD,
     )
     .unwrap();
     assert_eq!(
         row(cv_core::sessions()).message_count,
-        0,
+        None,
         "a partial read fills nothing"
     );
     // A stream that reaches the end (`cv show`, `cv index`) fills the row with the parse's count.
@@ -244,12 +245,12 @@ fn a_full_parse_fills_a_not_counted_catalog_row() {
     cv_core::stream::stream_counted(
         adapter.as_ref(),
         &r,
-        &cv_core::ParseOptions::lazy(),
+        &cv_core::Demand::LEAN.with_spans(),
         &mut all,
         cv_core::stream::Pass::RECORD,
     )
     .unwrap();
-    assert_eq!(row(cv_core::sessions()).message_count, 5, "the streamed count");
+    assert_eq!(row(cv_core::sessions()).message_count, Some(5), "the streamed count");
     // `parse` (Codex's whole-text path) agrees, and a filled row is never rewritten.
     let parsed = adapter.parse(&r).unwrap();
     let turns = parsed.messages.iter().filter(|m| m.is_turn()).count();
@@ -262,12 +263,12 @@ fn a_full_parse_fills_a_not_counted_catalog_row() {
 
     assert_eq!(
         row(cv_core::sessions()).message_count,
-        5,
+        Some(5),
         "the catalog row holds the parse's count"
     );
     assert_eq!(
         row(cv_core::discover_all()).message_count,
-        5,
+        Some(5),
         "and a re-discovery keeps it (scan-cache hit)"
     );
 }
@@ -300,11 +301,17 @@ fn quiet_session_append_refreshes_catalog_and_follower() {
     let listed = cv_core::sessions();
     let q = listed.iter().find(|r| r.id == "quietsess").unwrap();
     assert_eq!(
-        q.message_count, 2,
+        q.message_count,
+        Some(2),
         "every primary path is checked, including quiet sessions"
     );
 
-    let events = watcher.poll();
+    let mut events = Vec::new();
+    watcher.poll(cv_core::watch::Poll::default(), |ev| {
+        let taken = ev.new_messages.len();
+        events.push(ev);
+        taken
+    });
     let ev = events
         .iter()
         .find(|e| e.reference.id == "quietsess")
@@ -442,7 +449,10 @@ fn full_discovery_avoids_unchanged_publication_but_enumerates_new_project_paths(
         .write_all(user_line("alpha", 2).as_bytes())
         .unwrap();
     let appended = cv_core::discover_all();
-    assert_eq!(appended.iter().find(|r| r.id == "alpha").unwrap().message_count, 3);
+    assert_eq!(
+        appended.iter().find(|r| r.id == "alpha").unwrap().message_count,
+        Some(3)
+    );
     assert_eq!(
         db.query_row(
             "SELECT count(*) FROM publication_audit WHERE table_name='sessions'",

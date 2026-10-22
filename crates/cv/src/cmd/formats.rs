@@ -68,6 +68,9 @@ fn census(harness: Option<Harness>, recent: usize, json_out: bool) -> Result<()>
             h.sessions, h.parse_errors
         );
         println!("  {cover}");
+        if let Some(error) = &h.first_error {
+            println!("  first parse error: {error}");
+        }
         if !h.kinds.is_empty() {
             println!("  kinds:  {}", tally(&h.kinds));
         }
@@ -81,7 +84,7 @@ fn census(harness: Option<Harness>, recent: usize, json_out: bool) -> Result<()>
             for (ty, s) in &h.records {
                 let mark = match (s.new, s.status) {
                     (true, _) => "NEW ".to_string(),
-                    (false, Some(st)) => format!("{:<4}", &st.as_str()[..3]),
+                    (false, Some(st)) => format!("{:<4}", st.as_str().chars().take(3).collect::<String>()),
                     (false, None) => "    ".to_string(),
                 };
                 println!("    {mark} {:<44} {:>6}  {}", ty, s.count, s.first_seen.display());

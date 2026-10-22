@@ -55,6 +55,16 @@ These are the harnesses `emit()` can currently write — the authoritative list 
 > safely). Asking to emit to one is a usage error ("not a supported target", exit 2) rather than
 > corrupting anything.
 
+Native output preserves recorded facts: Codex uses the source's `cli_version` or an empty
+unknown; OpenClaw derives total usage without a written `totalTokens`; LM Studio omits unknown
+`tokenCount`. Continue refuses a tool turn without a result. Gemini derives stable message ids
+from the session id and turn index, so re-emitting the same session keeps those ids.
+
+Emitters stage related files and attempt rollback if publication fails. An unreadable OpenClaw
+`sessions.json` or unwritable Gemini project registry is an error. These grouped file writes are
+not crash-atomic; a crash can leave a published prefix, and rollback failures are reported.
+Hermes and OpenCode reject unreadable sources before creating destination stores.
+
 ## `cv port` — one verb for both
 
 Converting a session's format and rehoming it to a new directory were always the same

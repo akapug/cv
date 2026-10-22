@@ -13,7 +13,7 @@
 
 use crate::events::{self, Event};
 use crate::ir::{Block, Message, SessionRef};
-use crate::stream::{Flow, MessageSink, ParseOptions};
+use crate::stream::{Demand, Flow, MessageSink};
 use std::collections::BTreeMap;
 
 /// A per-tool tally with the kind breakdown the event classifier assigns.
@@ -89,8 +89,9 @@ impl ToolHistogram {
         cwd: Option<&std::path::Path>,
         scratch: &mut Vec<Event>,
         tool: Option<&str>,
+        extractor: &mut events::EventExtractor,
     ) -> anyhow::Result<()> {
-        events::extract_into_for_tool(m, idx, cwd, tool, scratch)?;
+        extractor.extract(m, idx, cwd, tool, scratch)?;
         for event in scratch.iter() {
             self.note(event);
         }
@@ -106,8 +107,9 @@ impl ToolHistogram {
     ) -> anyhow::Result<Self> {
         let mut h = Self::default();
         let mut scratch = Vec::new();
+        let mut extractor = events::EventExtractor::default();
         for (i, m) in msgs.into_iter().enumerate() {
-            h.note_message(m, i, cwd, &mut scratch, None)?;
+            h.note_message(m, i, cwd, &mut scratch, None, &mut extractor)?;
         }
         Ok(h)
     }
@@ -122,11 +124,12 @@ impl ToolHistogram {
             cwd: r.cwd.clone(),
             msg_idx: 0,
             histogram: Self::default(),
+            extractor: events::EventExtractor::default(),
             tool: tool.map(str::to_owned),
             scratch: Vec::new(),
             fail: None,
         };
-        adapter.try_stream(r, &ParseOptions::lazy(), &mut sink)?;
+        adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
         Ok(sink.histogram)
     }
 
@@ -164,6 +167,7 @@ impl ToolHistogram {
 }
 
 struct HistogramSink {
+    extractor: events::EventExtractor,
     cwd: Option<std::path::PathBuf>,
     msg_idx: usize,
     histogram: ToolHistogram,
@@ -191,6 +195,7 @@ impl MessageSink for HistogramSink {
             self.cwd.as_deref(),
             &mut self.scratch,
             self.tool.as_deref(),
+            &mut self.extractor,
         ) {
             self.fail = Some(error);
             return Flow::Stop;
@@ -357,22 +362,10 @@ impl ForestTools {
         v
     }
 
-    /// One agent's histogram by id (orchestrator via `<orchestrator>`), or `None`.
+    /// One agent's histogram by its full id (orchestrator via `<orchestrator>`), or `None`. A
+    /// user-typed selector goes through [`resolve_agent`] first.
     pub fn agent(&self, id: &str) -> Option<&AgentTools> {
-        self.agents.iter().find(|a| a.agent == id || a.agent.starts_with(id))
-    }
-
-    /// Restrict to one workflow's agents (a new view sharing the same histograms).
-    #[cfg(test)]
-    pub fn for_workflow(&self, run_id: &str) -> ForestTools {
-        ForestTools {
-            agents: self
-                .agents
-                .iter()
-                .filter(|a| a.workflow.as_deref() == Some(run_id))
-                .cloned()
-                .collect(),
-        }
+        self.agents.iter().find(|a| a.agent == id)
     }
 }
 
@@ -389,8 +382,8 @@ pub fn forest_tools(r: &SessionRef) -> anyhow::Result<ForestTools> {
     forest_tools_selected(r, None, None, None)
 }
 
-/// Read only the selected agent/workflow's tool histograms. Agent prefixes retain the existing
-/// first-match precedence in newest-first forest order, with the orchestrator first.
+/// Read only the selected agent/workflow's tool histograms. `agent` is a full agent id, as
+/// [`resolve_agent`] returns it.
 pub fn forest_tools_selected(
     r: &SessionRef,
     agent: Option<&str>,
@@ -414,15 +407,7 @@ pub fn forest_tools_selected(
     }
 
     // Every sub-agent in the forest (direct + workflow), each its own histogram.
-    let mut subagents = selected_tool_agents(r, agent, workflow, crate::SubagentDemand::Tools)?;
-    if agent.is_some() {
-        if !agents.is_empty() {
-            subagents.clear();
-        } else {
-            subagents.truncate(1);
-        }
-    }
-    for s in subagents {
+    for s in selected_tool_agents(r, agent, workflow, crate::SubagentDemand::Tools)? {
         let hist = ToolHistogram::from_stream_selected(adapter.as_ref(), &s.session, tool)?;
         agents.push(AgentTools {
             agent: s.agent_id().to_string(),
@@ -439,7 +424,7 @@ pub fn forest_tools_selected(
 /// Streams each agent, collects its tool rows tagged with the agent id, then sorts by `(ts,
 /// agent, msg_idx)` so calls interleave in wall-clock order (untimestamped rows sort last, stably).
 /// Selectors compose before reading transcripts or decoding call arguments. Workflow must be a
-/// resolved run ID; agent keeps the existing exact-or-prefix timeline semantics.
+/// resolved run ID; agent a full agent id, as [`resolve_agent`] returns it.
 pub fn forest_timeline_selected(
     r: &SessionRef,
     agent: Option<&str>,
@@ -453,14 +438,14 @@ pub fn forest_timeline_selected(
     if workflow.is_none() && matches_agent(agent, ORCHESTRATOR) {
         let mut sink = CallSink::new(r.cwd.clone());
         sink.tool = tool.map(str::to_owned);
-        adapter.try_stream(r, &ParseOptions::lazy(), &mut sink)?;
+        adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
         timeline_calls(ORCHESTRATOR, sink.rows, &mut out);
     }
 
     for s in selected_tool_agents(r, agent, workflow, crate::SubagentDemand::Sessions)? {
         let mut sink = CallSink::new(s.session.cwd.clone());
         sink.tool = tool.map(str::to_owned);
-        adapter.try_stream(&s.session, &ParseOptions::lazy(), &mut sink)?;
+        adapter.try_stream(&s.session, &Demand::LEAN.with_spans(), &mut sink)?;
         timeline_calls(s.agent_id(), sink.rows, &mut out);
     }
 
@@ -477,7 +462,68 @@ pub fn forest_timeline_selected(
 }
 
 fn matches_agent(agent: Option<&str>, id: &str) -> bool {
-    agent.is_none_or(|key| id == key || id.starts_with(key))
+    agent.is_none_or(|key| id == key)
+}
+
+/// An `--agent` selector that names no agent, or more than one: the same two answers the session
+/// selector gives, and the CLI exits 2 on both.
+#[derive(Debug)]
+pub enum AgentSelectorError {
+    None { key: String },
+    Ambiguous { key: String, candidates: Vec<String> },
+}
+
+impl std::fmt::Display for AgentSelectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None { key } => write!(f, "no agent matching {key:?}"),
+            Self::Ambiguous { key, candidates } => write!(
+                f,
+                "ambiguous agent id {key:?} matches {} agents: {} — pass a longer id",
+                candidates.len(),
+                candidates.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AgentSelectorError {}
+
+/// The one `--agent` grammar: an exact agent id (`<orchestrator>` included), else a unique prefix
+/// of an id (a leading `agent-` is optional), among the orchestrator and the forest (the named
+/// workflow's agents when `workflow` is set). Returns the full id; a selector that matches none
+/// or several is an [`AgentSelectorError`].
+pub fn resolve_agent(r: &SessionRef, key: &str, workflow: Option<&str>) -> anyhow::Result<String> {
+    let bare = key.strip_prefix("agent-").unwrap_or(key);
+    let mut ids: Vec<String> = Vec::new();
+    if workflow.is_none() {
+        ids.push(ORCHESTRATOR.to_string());
+    }
+    ids.extend(
+        crate::subagent_tree_filtered_of(r, crate::SubagentDemand::Sessions, workflow, |_, run| {
+            workflow.is_none_or(|wanted| run == Some(wanted))
+        })?
+        .iter()
+        .map(|s| s.agent_id().to_string()),
+    );
+    ids.sort();
+    ids.dedup();
+    if ids.iter().any(|id| id == key) {
+        return Ok(key.to_string());
+    }
+    let mut hits: Vec<String> = ids
+        .into_iter()
+        .filter(|id| id.starts_with(bare) || id.starts_with(key))
+        .collect();
+    match hits.len() {
+        0 => Err(AgentSelectorError::None { key: key.to_string() }.into()),
+        1 => Ok(hits.remove(0)),
+        _ => Err(AgentSelectorError::Ambiguous {
+            key: key.to_string(),
+            candidates: hits,
+        }
+        .into()),
+    }
 }
 
 fn selected_tool_agents(
@@ -485,7 +531,7 @@ fn selected_tool_agents(
     agent: Option<&str>,
     workflow: Option<&str>,
     demand: crate::SubagentDemand,
-) -> anyhow::Result<Vec<crate::SubagentInfo>> {
+) -> anyhow::Result<Vec<crate::AgentRef>> {
     if agent == Some(ORCHESTRATOR) && workflow.is_none() {
         return Ok(Vec::new());
     }
@@ -496,7 +542,7 @@ fn selected_tool_agents(
             workflow_member.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         matches_workflow && matches_agent(agent, id.strip_prefix("agent-").unwrap_or(id))
-    });
+    })?;
     anyhow::ensure!(
         workflow.is_none()
             || if agent.is_some() {
@@ -513,6 +559,41 @@ fn selected_tool_agents(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_tools_preserve_unfiltered_native_edit_attribution() {
+        let session = crate::harness::codex::parse_str(
+            "direct",
+            include_str!("../tests/fixtures/codex/direct_patch.jsonl"),
+            true,
+            None,
+        );
+        let mut messages = session.messages.clone();
+        let mut visible = crate::Message::new(crate::Role::Assistant);
+        visible.content.push(crate::Block::ToolUse {
+            id: "visible-patch".into(),
+            name: "apply_patch".into(),
+            namespace: None,
+            input: serde_json::json!({"patch":"*** Begin Patch\n*** Add File: /repo/visible.txt\n+ok\n*** End Patch"})
+                .into(),
+        });
+        messages.insert(0, visible);
+        let all = ToolHistogram::from_messages(&messages, None).unwrap();
+        assert_eq!(all.tools["apply_patch"].calls, 1);
+        assert_eq!(all.tools["apply_patch"].edits, 1);
+        for tool in ["apply_patch", "exec_command"] {
+            let mut selected = ToolHistogram::default();
+            let mut extractor = events::EventExtractor::default();
+            let mut scratch = Vec::new();
+            for (idx, message) in messages.iter().enumerate() {
+                selected
+                    .note_message(message, idx, None, &mut scratch, Some(tool), &mut extractor)
+                    .unwrap();
+            }
+            assert_eq!(selected.tools.len(), 1);
+            assert_eq!(selected.tools[tool], all.tools[tool]);
+        }
+    }
+
     use super::*;
     use crate::ir::{Block, Message, Role};
     use serde_json::json;
@@ -540,6 +621,7 @@ mod tests {
     #[test]
     fn histogram_stream_retains_only_distinct_tools_and_keeps_meta_cwd_rules() {
         let mut sink = HistogramSink {
+            extractor: events::EventExtractor::default(),
             cwd: None,
             msg_idx: 0,
             histogram: ToolHistogram::default(),
@@ -571,6 +653,7 @@ mod tests {
         assert_eq!(sink.histogram.total_calls, 2200);
         assert_eq!(sink.scratch.capacity(), 0);
         let mut discovered = HistogramSink {
+            extractor: events::EventExtractor::default(),
             cwd: Some("/discovery".into()),
             msg_idx: 0,
             histogram: ToolHistogram::default(),
@@ -592,13 +675,13 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 vec![]
             }
-            fn discover(&self) -> anyhow::Result<Vec<SessionRef>> {
-                Ok(vec![])
+            fn discover(&self) -> anyhow::Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 _r: &SessionRef,
-                _opts: &ParseOptions,
+                _opts: &Demand,
                 sink: &mut dyn MessageSink,
             ) -> anyhow::Result<crate::Session> {
                 sink.message(asst(vec![tool_use("Read", json!({"file_path":"a.rs"}))]));
@@ -725,6 +808,7 @@ mod tests {
         assert_eq!(all.message(m.clone()), Flow::Stop);
         assert!(all.take_error().is_some());
         let mut histogram = HistogramSink {
+            extractor: events::EventExtractor::default(),
             cwd: None,
             msg_idx: 0,
             histogram: ToolHistogram::default(),
@@ -732,10 +816,11 @@ mod tests {
             scratch: Vec::new(),
             fail: None,
         };
-        assert_eq!(histogram.message(m.clone()), Flow::Continue);
-        assert_eq!(histogram.histogram.total_calls, 1);
-        assert_eq!(histogram.histogram.tools.len(), 1);
-        assert_eq!(histogram.histogram.tools["Read"].reads, 1);
+        // Histograms correlate native completions with every call before selecting rows.
+        // Missing excluded arguments cannot silently change canonical edit attribution.
+        assert_eq!(histogram.message(m.clone()), Flow::Stop);
+        assert!(histogram.take_error().is_some());
+        assert!(histogram.histogram.tools.is_empty());
         let mut selected = CallSink::new(None);
         selected.tool = Some("Read".into());
         assert_eq!(selected.message(m), Flow::Continue);
@@ -822,11 +907,6 @@ mod tests {
         let agent_users = ft.agents_using("Agent");
         assert_eq!(agent_users.len(), 1);
         assert_eq!(agent_users[0].0.agent, "<orchestrator>");
-
-        // Workflow restriction.
-        let wf = ft.for_workflow("wf_1");
-        assert_eq!(wf.agents.len(), 1);
-        assert_eq!(wf.agents[0].agent, "agentA");
     }
     #[test]
     fn histogram_and_timeline_stop_on_unreadable_tool_arguments() {
@@ -844,6 +924,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert!(ToolHistogram::from_messages([&message], None).is_err());
         let mut histogram = HistogramSink {
+            extractor: events::EventExtractor::default(),
             cwd: None,
             msg_idx: 0,
             histogram: ToolHistogram::default(),

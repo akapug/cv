@@ -2,7 +2,7 @@ use super::*;
 use crate::Harness;
 use crate::{
     harness::{opencode::OpenCode, Adapter},
-    stream::ParseOptions,
+    stream::Demand,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -22,8 +22,8 @@ fn logical_rows(db: &Path, id: &str) -> Result<Value> {
 }
 #[test]
 fn complete_v2_replay_matches_native_rows_owned_and_public_ir() -> Result<()> {
-    let root = std::env::temp_dir().join(format!("cv-complete-opencode-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root)?;
+    let world = crate::test_world("complete-opencode");
+    let root = world.proj.clone();
     let source = root.join("source.db");
     fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/opencode/2.0.25/.local/share/opencode/opencode.db"),
@@ -37,7 +37,7 @@ fn complete_v2_replay_matches_native_rows_owned_and_public_ir() -> Result<()> {
             checked.messages.iter().any(|m| m.complete_record.is_some()),
             "checked complete records retained"
         );
-        let owned = crate::stream::collect_with(&adapter, reference, &ParseOptions::complete())?;
+        let owned = crate::stream::collect_with(&adapter, reference, &Demand::COMPLETE)?;
         let serialized: Session = serde_json::from_slice(&serde_json::to_vec(&checked)?)?;
         let mut materialized = checked.clone();
         materialized.materialize()?;
@@ -99,13 +99,13 @@ fn complete_v2_replay_matches_native_rows_owned_and_public_ir() -> Result<()> {
             }
         }
     }
-    fs::remove_dir_all(root)?;
     Ok(())
 }
 
 #[test]
 fn embedded_v2_attachments_keep_bytes_external_references_report_loss() -> Result<()> {
-    let root = std::env::temp_dir().join(format!("cv-opencode-attachments-{}", Uuid::new_v4()));
+    let world = crate::test_world("opencode-attachments");
+    let root = world.proj.clone();
     let mut session = Session::new("foreign", Harness::Claude);
     let mut user = crate::Message::new(Role::User);
     user.content.push(Block::Image {
@@ -127,17 +127,16 @@ fn embedded_v2_attachments_keep_bytes_external_references_report_loss() -> Resul
         .unwrap()
         .contains("Image attachment unavailable"));
     assert!(
-        report.deltas.iter().any(|d| d.field == "block:image" && !d.expected),
+        report.deltas.iter().any(|d| d.what == "block:image" && !d.expected),
         "unavailable model input is an explicit fidelity loss"
     );
-    fs::remove_dir_all(root)?;
     Ok(())
 }
 
 #[test]
 fn complete_v2_edits_groups_models_and_raw_only_sources_are_guarded() -> Result<()> {
-    let root = std::env::temp_dir().join(format!("cv-opencode-edit-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root)?;
+    let world = crate::test_world("opencode-edit");
+    let root = world.proj.clone();
     let source = root.join("source.db");
     fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/opencode/2.0.25/.local/share/opencode/opencode.db"),
@@ -188,7 +187,16 @@ fn complete_v2_edits_groups_models_and_raw_only_sources_are_guarded() -> Result<
                         }
                     }
                 }
-                "model" => edited.model = Some("changed-model".into()),
+                "model" => {
+                    // The model is a per-turn fact the emitter writes as the turn states it; an
+                    // edit changes the turns (and the session default they share).
+                    edited.model = Some("changed-model".into());
+                    for message in &mut edited.messages {
+                        if message.role == Role::Assistant {
+                            message.model = Some("changed-model".into());
+                        }
+                    }
+                }
                 "delete-derived" => edited.messages.retain(|m| {
                     m.harness_extra(Harness::OpenCode)
                         .and_then(|extra| extra.get("record_owner"))
@@ -325,14 +333,13 @@ fn complete_v2_edits_groups_models_and_raw_only_sources_are_guarded() -> Result<
             connection,
         )
     })?;
-    fs::remove_dir_all(root)?;
     Ok(())
 }
 
 #[test]
 fn complete_legacy_producers_match_owned_preparation() -> Result<()> {
-    let root = std::env::temp_dir().join(format!("cv-opencode-legacy-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root)?;
+    let world = crate::test_world("opencode-legacy");
+    let root = world.proj.clone();
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR"));
     let sqlite = root.join("source.db");
     fs::copy(
@@ -347,7 +354,7 @@ fn complete_legacy_producers_match_owned_preparation() -> Result<()> {
     for (kind, adapter) in adapters.iter().enumerate() {
         for reference in adapter.discover()? {
             let checked = crate::emit::parse_for_emit(adapter, &reference, Harness::OpenCode)?;
-            let owned = crate::stream::collect_with(adapter, &reference, &ParseOptions::complete())?;
+            let owned = crate::stream::collect_with(adapter, &reference, &Demand::COMPLETE)?;
             assert_eq!(
                 serde_json::to_value(&checked)?,
                 serde_json::to_value(&owned)?,
@@ -379,6 +386,5 @@ fn complete_legacy_producers_match_owned_preparation() -> Result<()> {
             }
         }
     }
-    fs::remove_dir_all(root)?;
     Ok(())
 }

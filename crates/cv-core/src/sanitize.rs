@@ -13,7 +13,7 @@
 use std::borrow::Cow;
 
 /// Make `s` safe for a one-line terminal row: ESC/C1-initiated sequences (CSI, OSC, DCS, SOS, PM,
-/// APC) are dropped entirely (parameters and all), `\n`/`\t`/`\r` become single spaces (render
+/// APC) are dropped entirely (parameters and all), each `\n`/`\t`/`\r` becomes one space (render
 /// sites are one-line rows), and every other control character (C0, DEL, C1) is removed.
 /// Returns the input borrowed when it is already clean — the overwhelmingly common case.
 pub fn sanitize_line(s: &str) -> Cow<'_, str> {

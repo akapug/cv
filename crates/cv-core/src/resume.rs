@@ -5,8 +5,7 @@
 //! lets the next pass over the same file (grown by an append) read only what came after it. A
 //! mark passes its guards when the file's device/inode identity matches, it is at least `offset`
 //! bytes long, the sampled head and bytes immediately before `offset` hash as they did, and it was
-//! written by this very parser ([`version`]: the cv release, the affordance view, the adapter's
-//! state format and the consumer's). Anything else means a whole pass, which writes a new mark.
+//! written under this stored-format version, adapter state format and consumer ([`version`]). Anything else means a whole pass, which writes a new mark.
 //!
 //! These samples ([`Prefix`]) do not establish that the entire prefix is unchanged, here or in
 //! the append admission of a captured source ([`crate::source::FileId::admits`]), which uses the
@@ -66,17 +65,13 @@ impl MarkHead {
     }
 }
 
-/// The version a mark records and must match: the cv release, the affordance view, the adapter's
-/// checkpoint format and `consumer` (the caller's own state format). `None`: the adapter takes no
-/// checkpoints.
-pub fn version(adapter: &dyn Adapter, consumer: &str) -> Option<String> {
-    Some(format!(
-        "{}/view{}/{}{}/{consumer}",
-        env!("CARGO_PKG_VERSION"),
-        crate::affordance::VIEW_VERSION,
-        adapter.harness().as_str(),
-        adapter.resume_format()?
-    ))
+/// The version a mark records and must match: the one stored-format version
+/// ([`crate::source::VERSION`], which the affordance view shares), the harness and `consumer`
+/// (the caller's own state format). Not the cv release: a release that changes what a mark means
+/// bumps one of those. The adapter's codec version rides in the checkpoint itself
+/// ([`crate::harness::store::jsonl::Codec::VERSION`]), so a mark of another codec is declined.
+pub fn version(adapter: &dyn Adapter, consumer: &str) -> String {
+    crate::source::consumer_version(format_args!("{}/{consumer}", adapter.harness().as_str()))
 }
 
 /// A session and its new mark (`None`: it has none any more), for [`update`].
@@ -88,32 +83,9 @@ mod imp {
     use rusqlite::{params, Connection};
     use std::collections::HashMap;
 
+    /// The catalog connection: `resume_marks` is part of its migration.
     fn open() -> Option<Connection> {
-        let conn = crate::catalog::open_db()?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS resume_marks(
-                 harness TEXT NOT NULL,
-                 id      TEXT NOT NULL,
-                 path    TEXT NOT NULL,
-                 offset  INTEGER NOT NULL,
-                 hash    INTEGER NOT NULL,
-                 version TEXT NOT NULL,
-                 state   TEXT NOT NULL,
-                 PRIMARY KEY(harness, id, path)
-             );",
-        )
-        .ok()?;
-        let has_identity: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('resume_marks') WHERE name='identity')",
-                [],
-                |row| row.get(0),
-            )
-            .ok()?;
-        if !has_identity {
-            let _ = conn.execute_batch("ALTER TABLE resume_marks ADD COLUMN identity TEXT;");
-        }
-        Some(conn)
+        crate::catalog::open_db()
     }
 
     fn key(r: &SessionRef) -> (String, String, String) {
@@ -159,7 +131,23 @@ mod imp {
 
     /// The checkpoint `r`'s mark holds, when it is still the one `head` describes.
     pub fn state(r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
-        let conn = open()?;
+        Reader::default().state(r, head)
+    }
+
+    /// One operation's lazy catalog reader, reused by every job in an index worker.
+    pub struct Reader(crate::discover_cache::read::Context);
+    impl Default for Reader {
+        fn default() -> Self {
+            Self(crate::discover_cache::read::Context::current())
+        }
+    }
+    impl Reader {
+        pub fn state(&self, r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
+            self.0.with_connection(|conn| state_in(conn, r, head)).flatten()
+        }
+    }
+
+    fn state_in(conn: &Connection, r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
         let (h, i, p) = key(r);
         let (offset, hash, version, text, identity): (i64, i64, String, String, Option<String>) = conn
             .query_row(
@@ -172,7 +160,7 @@ mod imp {
         (row_head(offset, hash, version, identity).as_ref() == Some(head) && cp.offset == head.offset()).then_some(cp)
     }
 
-    /// A row's head; a legacy row without a device/inode identity has none and is read whole.
+    /// A row's head; a row without a device/inode identity has none and is read whole.
     fn row_head(offset: i64, hash: i64, version: String, identity: Option<String>) -> Option<MarkHead> {
         let (dev, ino) = serde_json::from_str(&identity?).ok()?;
         Some(MarkHead {
@@ -189,7 +177,7 @@ mod imp {
     /// Bring each session's mark up to date in one transaction: the new mark replaces the old,
     /// `None` drops it (the next pass over that file reads it whole).
     pub fn update(marks: &[MarkUpdate]) {
-        if marks.is_empty() {
+        if crate::env::frozen() || marks.is_empty() {
             return;
         }
         let Some(mut conn) = open() else { return };
@@ -229,7 +217,7 @@ mod imp {
 }
 
 #[cfg(feature = "sqlite")]
-pub use imp::{state, update, MarkTable};
+pub use imp::{state, update, MarkTable, Reader};
 
 /// Without the catalog there are no marks: every pass reads the whole file.
 #[cfg(not(feature = "sqlite"))]
@@ -346,5 +334,15 @@ mod tests {
         std::fs::write(&path, &grown.as_bytes()[..offset as usize - 1]).unwrap();
         assert!(head.admit(&path, "v1", &cp).is_none(), "truncated before the mark");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(not(feature = "sqlite"))]
+#[derive(Default)]
+pub struct Reader;
+#[cfg(not(feature = "sqlite"))]
+impl Reader {
+    pub fn state(&self, _: &SessionRef, _: &MarkHead) -> Option<Checkpoint> {
+        None
     }
 }

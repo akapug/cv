@@ -9,17 +9,18 @@
 //!    `assistant`, `tool_result`, `system`. `message` is a Gemini `Content` (`{role, parts}`: `text`,
 //!    `thought`, `functionCall`, `functionResponse`, `inlineData`). Sub-agent transcripts are
 //!    `projects/<cwd>/subagents/<parentSessionId>/agent-<agentId>.jsonl` (+ `.meta.json`), the same
-//!    record shape. `<sanitized cwd>` is the cwd with every non-alphanumeric byte a dash.
+//!    record shape. `<sanitized cwd>` is the cwd with every non-ASCII-alphanumeric character a dash.
 //! 2. **gemini-cli recordings** (the fork's original layout) — `~/.qwen/tmp/<projectHash>/{logs.json,
 //!    chats/session-*.json|jsonl, checkpoint-*.json}`, byte-identical to Gemini's: delegated to
 //!    [`crate::harness::gemini`] and re-tagged [`Harness::Qwen`].
 //!
 //! Missing dirs degrade gracefully to empty results.
 
+use super::store::jsonl;
 use super::{parse_ts, Adapter};
 use crate::ir::*;
 use crate::source::{Dependencies, Probe};
-use crate::stream::{Checkpoint, Flow, MessageSink, ParseOptions, ADAPTER_LAYER};
+use crate::stream::{self, Flow, MessageSink};
 use anyhow::{Context, Result};
 use record::Demand;
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,13 @@ pub struct Qwen {
     /// `~/.qwen/projects`: the session JSONL.
     projects: Option<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Qwen = Qwen {
+    root: None,
+    projects: None,
+};
 
 impl Qwen {
     pub fn detect() -> Self {
@@ -72,6 +80,12 @@ impl Adapter for Qwen {
         Harness::Qwen
     }
 
+    /// The chronological `projects/.../chats/*.jsonl` ChatRecords grow by appended lines; the
+    /// legacy gemini-shaped recording is rewritten whole.
+    fn append_only(&self, r: &SessionRef) -> bool {
+        is_session_jsonl(&r.path)
+    }
+
     fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
         deps.files.push(r.path.with_extension("meta.json"));
         if let Some(chats) = r.path.parent().filter(|p| p.file_name().is_some_and(|n| n == "chats")) {
@@ -93,14 +107,19 @@ impl Adapter for Qwen {
         self.projects.iter().chain(self.root.iter()).cloned().collect()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
+        // An unreadable dir, and a session file that fails to read, are skipped and reported.
+        let mut walk_errors = Vec::new();
+        let mut walked =
+            |e: walkdir::Result<walkdir::DirEntry>| e.map_err(|e| walk_errors.extend(crate::Skipped::walk(&e))).ok();
         let mut paths: Vec<PathBuf> = Vec::new();
         if let Some(projects) = &self.projects {
             paths.extend(
+                // projects/<cwd>/subagents/<session>/agent-<id>.jsonl is the deepest supported layout.
                 WalkDir::new(projects)
                     .max_depth(4)
                     .into_iter()
-                    .filter_map(|e| e.ok())
+                    .filter_map(&mut walked)
                     .filter(|e| e.file_type().is_file())
                     .map(|e| e.into_path())
                     .filter(|p| is_session_jsonl(p)),
@@ -113,96 +132,75 @@ impl Adapter for Qwen {
             paths.extend(
                 WalkDir::new(root)
                     .into_iter()
-                    .filter_map(|e| e.ok())
+                    .filter_map(&mut walked)
                     .filter(|e| e.file_type().is_file())
                     .map(|e| e.into_path())
                     .filter(|p| is_session_file(p)),
             );
         }
-        Ok(crate::par_discovery_flat_map(paths, |path| {
-            crate::discover_cache::cached_scan_many(&path, || {
+        let mut found: crate::Discovered = crate::par_discovery_flat_map(paths, |path| {
+            let scanned = crate::discover_cache::cached_scan_many_checked(&path, || {
                 if is_session_jsonl(&path) {
-                    scan_session_jsonl(&path).into_iter().collect()
+                    Ok(scan_session_jsonl(&path)?.into_iter().collect())
                 } else {
                     crate::harness::gemini::scan_session_file(&path, Harness::Qwen)
                 }
-            })
-        }))
-    }
-
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
-        crate::stream::checked(sink, |sink| {
-            if is_session_jsonl(&r.path) {
-                let source = crate::json::JsonSource::capture(&r.path)?;
-                let demand = if opts.spans {
-                    Demand::Spans(&source)
-                } else {
-                    Demand::Owned
-                };
-                let s = session_shell(&r.path, sink);
-                return replay(
-                    &r.path,
-                    &source,
-                    s,
-                    ReplayState::default(),
-                    0,
-                    None,
-                    demand,
-                    sink,
-                    &mut || Ok(()),
-                )
-                .map(Option::unwrap);
-            }
-            // The gemini-cli shape: the streaming machinery (mmap + RawValue for legacy whole-file
-            // JSON, line streaming for JSONL recordings) is shared and re-tags the session as Qwen.
-            crate::harness::gemini::stream_for(Harness::Qwen, r, opts, sink)
+            });
+            crate::Skipped::listed_many(&path, scanned)
         })
+        .into_iter()
+        .collect();
+        found.skipped.extend(walk_errors);
+        Ok(found)
     }
 
-    /// Project ChatRecords are chronological: each complete physical record finalizes all its
-    /// emitted messages, including rewind/compression markers. Legacy Gemini replay is excluded.
-    fn resume_format(&self) -> Option<u32> {
-        Some(1)
+    fn stream(&self, r: &SessionRef, opts: &stream::Demand, sink: &mut dyn MessageSink) -> Result<Session> {
+        self.transcript(r, opts, stream::Start::Whole, sink)?
+            .context("a whole read never declines")
     }
 
-    fn resume(
+    /// A project ChatRecord transcript through the driver. The gemini-cli shape (mmap + RawValue
+    /// for legacy whole-file JSON, line streaming for JSONL recordings) is read by the shared
+    /// Gemini machinery re-tagged as Qwen; it is rewritten whole, so it neither resumes nor
+    /// reads as a prefix.
+    fn transcript(
         &self,
         r: &SessionRef,
-        opts: &ParseOptions,
+        opts: &stream::Demand,
+        from: stream::Start<'_>,
         sink: &mut dyn MessageSink,
-        from: &Checkpoint,
     ) -> Result<Option<Session>> {
         crate::stream::checked(sink, |sink| {
             if !is_session_jsonl(&r.path) {
-                return Ok(None);
+                return match from {
+                    stream::Start::Whole => crate::harness::gemini::stream_for(Harness::Qwen, r, opts, sink).map(Some),
+                    _ => Ok(None),
+                };
             }
-            let Some(state) = from.get::<ReplayCheckpoint>(ADAPTER_LAYER) else {
-                return Ok(None);
+            let (s, st) = match from {
+                stream::Start::Checkpoint(cp) => {
+                    match jsonl::restore::<ReplayCheckpoint>(cp, <Replay as jsonl::Codec>::VERSION) {
+                        Some(state) => (state.session, state.replay),
+                        None => return Ok(None),
+                    }
+                }
+                _ => (session_shell(&r.path, sink), ReplayState::default()),
             };
-            let source = crate::json::JsonSource::capture(&r.path)?;
-            let demand = if opts.spans {
-                Demand::Spans(&source)
-            } else {
-                Demand::Owned
-            };
-            let (s, replay_state) = (state.session, state.replay);
-            replay(
-                &r.path,
-                &source,
+            let read = jsonl::Read::open(&r.path)?;
+            let codec = Replay {
                 s,
-                replay_state,
-                from.offset,
-                None,
-                demand,
-                sink,
-                &mut || Ok(()),
-            )
+                st,
+                demand: Demand::of(opts, read.source()),
+                stopped: false,
+                seen: false,
+            };
+            jsonl::drive(&read, from, codec, sink)
         })
     }
 
     /// The cron jobs `cron_create` persists per project in `tmp/<sha256(cwd)>/scheduled_tasks.json`
     /// ([`scheduled_tasks`]), for a session JSONL.
-    fn store_affordances(&self, r: &SessionRef) -> Vec<crate::affordance::Affordance> {
+    fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
         scheduled_tasks(r)
     }
 }
@@ -213,48 +211,41 @@ impl Adapter for Qwen {
 /// (`createdAt` inside the session's first..last record). The file is per project
 /// (`Storage.getGlobalTempDir()/getProjectHash(cwd)`, the sha256 of the cwd), so sub-agent
 /// transcripts, which share their parent's window, take none.
-fn scheduled_tasks(r: &SessionRef) -> Vec<crate::affordance::Affordance> {
+fn scheduled_tasks(r: &SessionRef) -> Result<Vec<crate::affordance::Affordance>> {
     let chats = r.path.parent();
     if chats.and_then(Path::file_name).is_none_or(|n| n != "chats") {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(qwen_dir) = chats
         .and_then(Path::parent)
         .and_then(Path::parent)
         .and_then(Path::parent)
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Some(cwd) = r.cwd.as_ref().and_then(|c| c.to_str()) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let file = qwen_dir
         .join("tmp")
         .join(crate::digest::sha256_hex(cwd.as_bytes()))
         .join("scheduled_tasks.json");
-    let read = || {
-        std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .unwrap_or(Value::Null)
-    };
+    let read = || crate::affordance::side_json(&file).map(|v| v.unwrap_or(Value::Null));
     if !crate::source::inventory_scoped() {
         // A single session needs one linear filter, not a time index for unrelated owners.
-        return task_rows_for_session(read(), r);
+        return Ok(task_rows_for_session(read()?, r));
     }
     let mut baseline = crate::source::ReadSet::default();
     baseline.record(&file);
     // The inventory's complete read set is this same file, already captured before the
     // affordance pass by source::Probe::dependencies(Qwen). Cache hits require that exact
     // baseline; the enclosing publication receipt revalidates it, so no dynamic guard is lost.
-    let Ok((inventory, _reads)) = crate::source::inventory("qwen-scheduled-tasks", &file, &baseline, || {
-        let inventory = TaskInventory::from_value(read());
+    let (inventory, _reads) = crate::source::inventory("qwen-scheduled-tasks", &file, &baseline, || {
+        let inventory = TaskInventory::from_value(read()?);
         let retained = inventory.retained_bytes();
         Ok((inventory, baseline.clone(), retained))
-    }) else {
-        return Vec::new();
-    };
-    inventory.for_session(r)
+    })?;
+    Ok(inventory.for_session(r))
 }
 
 fn task_affordance(task: &Value) -> crate::affordance::Affordance {
@@ -325,7 +316,7 @@ struct TaskInventory {
     owners: std::collections::HashMap<String, Vec<usize>>,
     unowned: Vec<TaskTime>,
     time_queried: std::sync::atomic::AtomicBool,
-    time_index: std::sync::OnceLock<Vec<TaskTime>>,
+    time_index: std::sync::OnceLock<super::store::selection::Positions>,
 }
 impl TaskInventory {
     fn from_value(value: Value) -> Self {
@@ -372,12 +363,12 @@ impl TaskInventory {
                     .saturating_add(rows.capacity().saturating_mul(std::mem::size_of::<usize>()))
             },
         );
-        // The second query's sorted copy is charged even while still uninitialized.
+        // The second query's position index is charged even while still uninitialized.
         let times = self
             .unowned
             .capacity()
-            .saturating_add(self.unowned.len())
-            .saturating_mul(std::mem::size_of::<TaskTime>());
+            .saturating_mul(std::mem::size_of::<TaskTime>())
+            .saturating_add(self.unowned.len().saturating_mul(std::mem::size_of::<usize>()));
         rows.saturating_add(owners)
             .saturating_add(times)
             .saturating_add(std::mem::size_of::<Self>())
@@ -412,13 +403,12 @@ impl TaskInventory {
                 selected.extend(right);
             } else {
                 let times = self.time_index.get_or_init(|| {
-                    let mut times = self.unowned.clone();
-                    times.sort_unstable();
-                    times
+                    super::store::selection::Positions::new(self.unowned.len(), |a, b| {
+                        self.unowned[a].cmp(&self.unowned[b])
+                    })
                 });
-                let start = times.partition_point(|(at, _)| *at < from);
-                let end = times.partition_point(|(at, _)| *at <= to);
-                selected.extend(times[start..end].iter().map(|(_, index)| *index));
+                let positions = times.range(|i| self.unowned[i].0 < from, |i| self.unowned[i].0 <= to);
+                selected.extend(positions.iter().map(|&i| self.unowned[i].1));
                 selected.sort_unstable();
             }
         }
@@ -475,38 +465,37 @@ fn subagent_parent(path: &Path) -> Option<String> {
         .flatten()
 }
 
-fn scan_session_jsonl(path: &Path) -> Option<SessionRef> {
-    let mut messages = 0usize;
-    let mut turns = 0usize;
-    let mut sink = |m: Message| {
-        messages += 1;
-        turns += usize::from(matches!(m.role, Role::User | Role::Assistant));
-        Flow::Continue
+/// Listing facts only: the session's id, cwd, title and time span, read through the driver at
+/// the discovery demand. Once a message is known to exist and the first prompt is read, records
+/// only fold their session facts and a title change; no message is built. The count is left to
+/// a full read, which certifies it.
+fn scan_session_jsonl(path: &Path) -> Result<Option<SessionRef>> {
+    let shell = session_shell(path, &mut crate::stream::Discard);
+    let read = jsonl::Read::open(path)?;
+    let codec = Replay {
+        s: shell,
+        st: ReplayState::default(),
+        demand: Demand::Discovery,
+        stopped: false,
+        seen: false,
     };
-    let source = crate::json::JsonSource::capture(path).ok()?;
-    let shell = session_shell(path, &mut sink);
-    let s = replay(
-        path,
-        &source,
-        shell,
-        ReplayState::default(),
-        0,
-        None,
-        Demand::Discovery,
-        &mut sink,
-        &mut || Ok(()),
-    )
-    .ok()??;
-    if messages == 0 && s.created_at.is_none() {
-        return None;
+    let mut seen = false;
+    let Some(s) = jsonl::drive(&read, stream::Start::Whole, codec, &mut |_: Message| {
+        seen = true;
+        Flow::Continue
+    })?
+    else {
+        return Ok(None);
+    };
+    if !seen && s.created_at.is_none() {
+        return Ok(None);
     }
     let mut r = SessionRef::new(s.id.clone(), Harness::Qwen, path.to_path_buf());
     r.cwd = s.cwd.clone();
     r.title = s.title.clone();
     r.created_at = s.created_at;
     r.updated_at = s.updated_at;
-    r.message_count = turns;
-    Some(r)
+    Ok(Some(r))
 }
 
 /// Cross-record state of one session file's emission.
@@ -519,7 +508,10 @@ struct ReplayState {
     spawn_calls: BTreeSet<String>,
     /// `functionCall` id → the tool's name (unwrapped from `tool_call`), for the results.
     call_names: std::collections::BTreeMap<String, String>,
-    skipped: u64,
+    /// Discovery has what it lists of the body (a message exists, the first prompt is read):
+    /// later records fold their session facts and a title change only.
+    #[serde(skip)]
+    pub(super) listed: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -551,99 +543,72 @@ fn session_shell(path: &Path, sink: &mut dyn MessageSink) -> Session {
     s
 }
 
-/// The message count an append-only project transcript had at a byte baseline, including an
-/// incomplete final physical record exactly as the whole parser would have accepted it then.
-/// Legacy Gemini shapes cannot pin old logical output with a physical byte prefix.
-pub(crate) fn count_prefix(r: &SessionRef, len: u64) -> Result<usize> {
-    count_prefix_checked(r, len, &mut || Ok(()))
+/// The Qwen ChatRecord codec over one project transcript: each record folds into the session and
+/// replay state (a checkpoint's, or a fresh shell at 0). A complete ChatRecord never changes an
+/// earlier message, so the codec is settled after every finished line, and a valid but unfinished
+/// EOF record is replayed from the previous boundary on append. After the sink stops, records
+/// still fold their session facts through EOF (never settled again).
+struct Replay<'r> {
+    s: Session,
+    st: ReplayState,
+    demand: Demand<'r>,
+    stopped: bool,
+    /// Discovery: a message was delivered.
+    seen: bool,
 }
 
-pub(crate) fn count_prefix_checked(r: &SessionRef, len: u64, check: &mut dyn FnMut() -> Result<()>) -> Result<usize> {
-    anyhow::ensure!(
-        is_session_jsonl(&r.path),
-        "Qwen recording is not chronological project JSONL"
-    );
-    let mut count = 0;
-    let mut sink = |_: Message| {
-        count += 1;
-        Flow::Continue
-    };
-    let source = crate::json::JsonSource::capture(&r.path)?;
-    let shell = session_shell(&r.path, &mut sink);
-    replay(
-        &r.path,
-        &source,
-        shell,
-        ReplayState::default(),
-        0,
-        Some(len),
-        Demand::Owned,
-        &mut sink,
-        check,
-    )?;
-    Ok(count)
-}
+impl jsonl::Codec for Replay<'_> {
+    const VERSION: u32 = 1;
 
-/// The one Qwen read: records `at..to` (EOF by default) of the captured transcript, each through
-/// the record codec, accumulating into `s` and `st` (a checkpoint's state, or a fresh shell at 0).
-/// A complete ChatRecord never changes an earlier message: checkpoints are offered only after a
-/// finished line, so a valid but unfinished EOF record is replayed from the previous boundary on
-/// append. After the sink stops, records still fold their session facts through EOF. `Ok(None)`:
-/// `at` lies beyond the file.
-#[allow(clippy::too_many_arguments)] // The replay state, its window and the demand.
-fn replay(
-    path: &Path,
-    source: &crate::json::JsonSource,
-    mut s: Session,
-    mut st: ReplayState,
-    at: u64,
-    to: Option<u64>,
-    demand: Demand<'_>,
-    sink: &mut dyn MessageSink,
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<Option<Session>> {
-    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    source.check_metadata(file.metadata()?)?;
-    if at > source.len() {
-        return Ok(None);
-    }
-    let to = to.map_or(source.len(), |to| to.min(source.len()));
-    let mut stopped = false;
-    super::store::jsonl::for_each_line(source, &file, at, to, |line| {
-        check()?;
-        match line.view {
-            Some(view) => {
-                if record::ingest(view, &mut s, &mut st, demand, stopped, sink)? == Flow::Stop {
-                    stopped = true;
-                }
-            }
-            None => st.skipped += u64::from(!line.blank),
+    fn record(&mut self, view: crate::json::JsonView<'_>, _: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
+        if matches!(self.demand, Demand::Discovery) {
+            let seen = &mut self.seen;
+            let mut noted = |m: Message| {
+                *seen = true;
+                sink.message(m)
+            };
+            let flow = record::ingest(view, &mut self.s, &mut self.st, self.demand, false, &mut noted)?;
+            self.st.listed = self.seen && self.st.first_prompt.is_some();
+            return Ok(flow);
         }
-        if !stopped && line.complete && sink.wants_checkpoint(line.end) {
-            let mut cp = Checkpoint::new(line.end);
-            cp.put(
-                ADAPTER_LAYER,
-                &ReplayCheckpoint {
-                    session: &s,
-                    replay: &st,
-                },
-            );
-            sink.checkpoint(&mut cp);
+        if record::ingest(view, &mut self.s, &mut self.st, self.demand, self.stopped, sink)? == Flow::Stop {
+            self.stopped = true;
         }
         Ok(Flow::Continue)
-    })?;
-    source.check_metadata(file.metadata()?)?;
-    source.check()?;
-    s.model = st.session_model.take();
-    s.title = st.title.take().or(st.first_prompt.take());
-    super::note_skipped_lines(&mut s, st.skipped);
-    Ok(Some(s))
+    }
+
+    fn settled(&self) -> bool {
+        !self.stopped
+    }
+
+    /// The replay state is the same at every demand but discovery's, which never checkpoints.
+    fn demand(&self) -> stream::Demand {
+        stream::Demand::default()
+    }
+
+    fn session(&mut self) -> &mut Session {
+        &mut self.s
+    }
+
+    fn state(&self) -> impl Serialize + '_ {
+        ReplayCheckpoint {
+            session: &self.s,
+            replay: &self.st,
+        }
+    }
+
+    fn finish(mut self, _: bool, _: &mut dyn MessageSink) -> Result<Session> {
+        self.s.model = self.st.session_model.take();
+        self.s.title = self.st.title.take().or(self.st.first_prompt.take());
+        Ok(self.s)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::harness::Parse;
+    use crate::stream::Checkpoint;
     use std::fs;
 
     #[derive(Default)]
@@ -698,7 +663,7 @@ mod tests {
             let done = stream_counted(
                 &adapter,
                 &r,
-                &ParseOptions::lazy(),
+                &stream::Demand::LEAN.with_spans(),
                 &mut full,
                 crate::stream::Pass {
                     every: Some(cadence),
@@ -728,7 +693,7 @@ mod tests {
                 let resumed = stream_counted(
                     &adapter,
                     &r,
-                    &ParseOptions::lazy(),
+                    &stream::Demand::LEAN.with_spans(),
                     &mut rest,
                     crate::stream::Pass {
                         from: Some(cp),
@@ -784,11 +749,16 @@ mod tests {
         let adapter = Qwen::with_home(&home);
         let r = SessionRef::new("session", Harness::Qwen, &path);
         let mut full = Kept::default();
-        let shell = adapter.stream(&r, &ParseOptions::full(), &mut full).unwrap();
+        let shell = adapter.stream(&r, &stream::Demand::RICH, &mut full).unwrap();
         let (count, checkpoint) = full.checkpoints.iter().find(|(count, _)| *count == 1).unwrap();
         let mut resumed = Kept::default();
         let suffix = adapter
-            .resume(&r, &ParseOptions::lazy(), &mut resumed, checkpoint)
+            .transcript(
+                &r,
+                &stream::Demand::LEAN.with_spans(),
+                crate::stream::Start::Checkpoint(checkpoint),
+                &mut resumed,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -822,28 +792,15 @@ mod tests {
     fn discovery_demand_matches_the_whole_replay_with_giant_system_payloads() -> Result<()> {
         let world = crate::test_world("qwen-discovery-selected");
         let body = "body λ\n".repeat(512 * 1024);
+        // The whole read's facts; discovery leaves the count to it.
         let oracle = |path: &Path| -> Result<Option<SessionRef>> {
             let mut messages = 0;
-            let mut turns = 0;
-            let mut sink = |m: Message| {
+            let mut sink = |_: Message| {
                 messages += 1;
-                turns += usize::from(matches!(m.role, Role::User | Role::Assistant));
                 Flow::Continue
             };
-            let source = crate::json::JsonSource::capture(path)?;
-            let shell = session_shell(path, &mut sink);
-            let session = replay(
-                path,
-                &source,
-                shell,
-                ReplayState::default(),
-                0,
-                None,
-                Demand::Owned,
-                &mut sink,
-                &mut || Ok(()),
-            )?
-            .unwrap();
+            let r = SessionRef::new("", Harness::Qwen, path);
+            let session = ROOTLESS.stream(&r, &stream::Demand::RICH, &mut sink)?;
             if messages == 0 && session.created_at.is_none() {
                 return Ok(None);
             }
@@ -852,7 +809,6 @@ mod tests {
             reference.title = session.title;
             reference.created_at = session.created_at;
             reference.updated_at = session.updated_at;
-            reference.message_count = turns;
             Ok(Some(reference))
         };
         let rows = [
@@ -882,7 +838,7 @@ mod tests {
             );
             fs::write(&path, bytes)?;
             assert_eq!(
-                serde_json::to_value(scan_session_jsonl(&path))?,
+                serde_json::to_value(scan_session_jsonl(&path)?)?,
                 serde_json::to_value(oracle(&path)?)?
             );
             for payload in [
@@ -906,7 +862,7 @@ mod tests {
                         )?,
                     )?;
                     assert_eq!(
-                        serde_json::to_value(scan_session_jsonl(&path))?,
+                        serde_json::to_value(scan_session_jsonl(&path)?)?,
                         serde_json::to_value(oracle(&path)?)?,
                         "{subtype}/{payload}"
                     );
@@ -929,7 +885,7 @@ mod tests {
             ];
             fs::write(&path, rows.iter().map(|row| format!("{row}\n")).collect::<String>())?;
             assert_eq!(
-                serde_json::to_value(scan_session_jsonl(&path))?,
+                serde_json::to_value(scan_session_jsonl(&path)?)?,
                 serde_json::to_value(oracle(&path)?)?
             );
         }
@@ -939,7 +895,7 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                serde_json::to_value(scan_session_jsonl(&reference.path))?,
+                serde_json::to_value(scan_session_jsonl(&reference.path)?)?,
                 serde_json::to_value(oracle(&reference.path)?)?
             );
         }
@@ -966,21 +922,38 @@ mod tests {
         )?;
         let _scope = crate::source::read_scope();
         let before = crate::source::Probe::default().snapshot(&reference);
-        assert_eq!(scheduled_tasks(&reference)[0].summary, "first");
-        assert_eq!(scheduled_tasks(&reference)[0].summary, "first");
+        assert_eq!(scheduled_tasks(&reference).unwrap()[0].summary, "first");
+        assert_eq!(scheduled_tasks(&reference).unwrap()[0].summary, "first");
+        #[cfg(feature = "sqlite")]
+        {
+            crate::catalog::sync(std::slice::from_ref(&reference));
+            let source = before.with_reads(&crate::source::ReadSet::default());
+            crate::catalog::note_affordances_with_source(&reference, &source, || {
+                [(crate::affordance::Kind::Schedule, 1)].into_iter().collect()
+            });
+            assert_eq!(
+                crate::catalog::AffordanceTable::load().counts(&reference).unwrap()[&crate::affordance::Kind::Schedule],
+                1
+            );
+        }
         fs::write(
             &file,
             serde_json::to_vec(&serde_json::json!([{"id":"changed schedule","sessionId":"session"}]))?,
         )?;
         assert!(!crate::source::unchanged(&reference, &before));
-        assert_eq!(scheduled_tasks(&reference)[0].summary, "changed schedule");
+        assert_eq!(scheduled_tasks(&reference).unwrap()[0].summary, "changed schedule");
+        #[cfg(feature = "sqlite")]
+        assert!(
+            crate::catalog::AffordanceTable::load().counts(&reference).is_none(),
+            "has:schedule must not reuse counts after a per-project edit"
+        );
         fs::remove_file(&file)?;
-        assert!(scheduled_tasks(&reference).is_empty());
+        assert!(scheduled_tasks(&reference).unwrap().is_empty());
         fs::write(
             &file,
             serde_json::to_vec(&serde_json::json!([{"id":"recreated","sessionId":"session"}]))?,
         )?;
-        assert_eq!(scheduled_tasks(&reference)[0].summary, "recreated");
+        assert_eq!(scheduled_tasks(&reference).unwrap()[0].summary, "recreated");
         Ok(())
     }
 
@@ -1006,7 +979,7 @@ mod tests {
         fs::write(&file, serde_json::to_vec(&value)?)?;
         let expected = task_rows_for_session(value, &reference);
         let _scope = crate::source::read_scope();
-        let first = scheduled_tasks(&reference);
+        let first = scheduled_tasks(&reference).unwrap();
         assert_eq!(serde_json::to_value(&first)?, serde_json::to_value(&expected)?);
         let mut baseline = crate::source::ReadSet::default();
         baseline.record(&file);
@@ -1020,7 +993,7 @@ mod tests {
             first.len()
         );
         let charged = inventory.retained_bytes();
-        let second = scheduled_tasks(&reference);
+        let second = scheduled_tasks(&reference).unwrap();
         assert_eq!(serde_json::to_value(second)?, serde_json::to_value(expected)?);
         assert!(inventory.time_index.get().is_some());
         assert_eq!(
@@ -1104,10 +1077,10 @@ mod tests {
         let mut r = SessionRef::new("s1", Harness::Qwen, home.join("projects/-p/chats/s1.jsonl"));
         r.cwd = Some(PathBuf::from("/p"));
         (r.created_at, r.updated_at) = (at(1_000), at(2_000));
-        let got: Vec<String> = scheduled_tasks(&r).into_iter().map(|a| a.summary).collect();
+        let got: Vec<String> = scheduled_tasks(&r).unwrap().into_iter().map(|a| a.summary).collect();
         assert_eq!(got, ["own · 0 9 * * * · a", "made · */5 * * * * · c · recurring"]);
         r.path = home.join("projects/-p/subagents/s1/agent-x.jsonl");
-        assert!(scheduled_tasks(&r).is_empty());
+        assert!(scheduled_tasks(&r).unwrap().is_empty());
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -1166,7 +1139,20 @@ mod tests {
                 assert_eq!(k, "qwen", "flat or misfiled extra key {k:?}");
             }
         }
-        assert!(s.messages.iter().all(|m| m.model.is_none()), "one model throughout");
+        assert!(
+            s.messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .all(|m| m.model.as_deref() == Some("gemini-3-flash-preview")),
+            "one model throughout, stated on every assistant record"
+        );
+    }
+
+    #[test]
+    fn windowed_reads_keep_the_model() {
+        let _world = crate::test_world("qwen-windowed");
+        let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/qwen/0.25.1/.qwen");
+        crate::harness::assert_windowed_models(&Qwen::with_home(&home));
     }
 
     #[test]
@@ -1229,7 +1215,7 @@ mod tests {
         let r = SessionRef::new("11112222-3333-4444-5555-666677778888", Harness::Qwen, path);
         let mut sink = crate::stream::CollectSink::default();
         let s = Qwen::detect()
-            .stream(&r, &crate::stream::ParseOptions::full(), &mut sink)
+            .stream(&r, &crate::stream::Demand::RICH, &mut sink)
             .expect("stream");
         assert_eq!(s.harness, Harness::Qwen);
 
@@ -1258,8 +1244,8 @@ mod tests {
         fs::write(&p1, &text).unwrap();
         fs::write(&p2, &text).unwrap();
 
-        let refs1 = crate::harness::gemini::scan_session_file(&p1, Harness::Qwen);
-        let refs2 = crate::harness::gemini::scan_session_file(&p2, Harness::Qwen);
+        let refs1 = crate::harness::gemini::scan_session_file(&p1, Harness::Qwen).unwrap();
+        let refs2 = crate::harness::gemini::scan_session_file(&p2, Harness::Qwen).unwrap();
         assert_eq!(refs1.len(), 1);
         assert_eq!(refs2.len(), 1);
         assert_eq!(refs1[0].id, "checkpoint-alpha");

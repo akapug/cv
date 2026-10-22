@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     harness::{
-        store::{bytes::ByteStage, publish_stage},
+        store::bytes::ByteStage,
         wire::write::{text, ObjectWriter},
     },
     ir_json::PrettyJson,
@@ -10,15 +10,14 @@ use crate::{
 };
 use std::io::{BufWriter, Write};
 
+/// The checked transcript bytes, staged for publication.
 pub(super) fn transcript(
     session: &Session,
     id: &str,
     title: Option<&str>,
     cwd: Option<&str>,
-    path: &Path,
     mode: crate::emit::ThinkingMode,
-    claim: crate::publish::Claim,
-) -> Result<()> {
+) -> Result<ByteStage> {
     let resolver = Resolver::new(session.source_path.clone());
     let mut stage = BufWriter::with_capacity(64 * 1024, ByteStage::new());
     {
@@ -54,6 +53,13 @@ pub(super) fn transcript(
                         write(Some(result))?;
                     }
                 } else {
+                    // A native tool message answers one call by `toolCallId`; a tool turn with no
+                    // result has none to name, and an empty id is not one. Fail closed.
+                    anyhow::ensure!(
+                        msg.role != Role::Tool,
+                        "Continue cannot hold a tool turn with no tool result ({}): it has no toolCallId",
+                        msg.id.as_deref().unwrap_or("no id")
+                    );
                     write(None)?;
                 }
             }
@@ -62,8 +68,7 @@ pub(super) fn transcript(
         })?;
         root.finish()?;
     }
-    let stage = stage.into_inner().map_err(|e| e.into_error())?;
-    publish_stage(stage, path, claim)
+    Ok(stage.into_inner().map_err(|e| e.into_error())?)
 }
 /// Continue's OpenAI usage counts include cache reads in the prompt total.
 pub(super) fn native_usage(usage: &Usage, model: Option<&str>) -> Result<Map<String, Value>> {
@@ -120,15 +125,9 @@ fn item(
                 Role::System => "system",
             },
         )?;
-        if msg.role == Role::Tool {
-            message.field("toolCallId", result.map(|r| r.0).unwrap_or(""))?;
-            message.field_with("content", |w| match result {
-                Some((_, content)) => text(w, content, resolver),
-                None => {
-                    serde_json::to_writer(w, "")?;
-                    Ok(())
-                }
-            })?;
+        if let (Role::Tool, Some((id, content))) = (msg.role, result) {
+            message.field("toolCallId", id)?;
+            message.field_with("content", |w| text(w, content, resolver))?;
         } else {
             message.field_with("content", |w| {
                 w.write_all(b"[")?;
@@ -236,86 +235,6 @@ fn item(
 }
 
 #[cfg(test)]
-fn legacy_emit(
-    session: &Session,
-    out_dir: &Path,
-    opts: &crate::emit::EmitOptions,
-) -> Result<crate::harness::EmitResult> {
-    let session = crate::emit::materialized_session(session)?;
-    let session = session.as_ref();
-    use anyhow::Context;
-
-    let new_id = opts.new_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let cwd = opts.new_cwd.clone().or_else(|| session.cwd.clone());
-    let cwd_str = cwd
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty());
-
-    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-
-    // ── transcript: <sessionId>.json ──
-    let title = session
-        .title
-        .clone()
-        .or_else(|| session.first_user_text())
-        .map(|t| crate::ir::truncate(&t, 80));
-
-    let mut history: Vec<Value> = Vec::new();
-    for msg in &session.messages {
-        history.push(history_item(msg, session.model.as_deref())?);
-    }
-
-    let mut transcript = Map::new();
-    transcript.insert("sessionId".into(), json!(new_id));
-    if let Some(t) = &title {
-        transcript.insert("title".into(), json!(t));
-    }
-    if let Some(c) = &cwd_str {
-        transcript.insert("workspaceDirectory".into(), json!(c));
-    }
-    transcript.insert("history".into(), Value::Array(history));
-
-    let file_path = out_dir.join(format!("{new_id}.json"));
-    fs::write(&file_path, serde_json::to_string_pretty(&Value::Object(transcript))?)
-        .with_context(|| format!("writing {}", file_path.display()))?;
-
-    // ── index: sessions.json (merge-or-create) ──
-    let index_path = out_dir.join("sessions.json");
-    let mut entries: Vec<Value> = fs::read_to_string(&index_path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    // Drop any stale entry for this id, then append a fresh one.
-    entries.retain(|e| e.get("sessionId").and_then(Value::as_str) != Some(new_id.as_str()));
-    let created = session
-        .created_at
-        .or(session.updated_at)
-        .unwrap_or_else(chrono::Utc::now);
-    let mut entry = Map::new();
-    entry.insert("sessionId".into(), json!(new_id));
-    if let Some(t) = &title {
-        entry.insert("title".into(), json!(t));
-    }
-    // `dateCreated` is a string holding millisecond epoch (the older-build shape, which the parser
-    // accepts alongside ISO).
-    entry.insert("dateCreated".into(), json!(created.timestamp_millis().to_string()));
-    if let Some(c) = &cwd_str {
-        entry.insert("workspaceDirectory".into(), json!(c));
-    }
-    entries.push(Value::Object(entry));
-    fs::write(&index_path, serde_json::to_string_pretty(&Value::Array(entries))?)
-        .with_context(|| format!("writing {}", index_path.display()))?;
-
-    Ok(crate::harness::EmitResult {
-        path: file_path,
-        new_id,
-        resume_hint: None,
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -335,7 +254,7 @@ mod tests {
         let session = crate::stream::collect_with(
             &adapter,
             &crate::SessionRef::new("source", Harness::Continue, &path),
-            &crate::stream::ParseOptions::lazy(),
+            &crate::stream::Demand::LEAN.with_spans(),
         )?;
         let opts = crate::emit::EmitOptions {
             new_id: Some("copy".into()),
@@ -346,11 +265,11 @@ mod tests {
         assert!(!report
             .deltas
             .iter()
-            .any(|delta| delta.field == "usage" || delta.field == "usage cost"));
+            .any(|delta| delta.what == "usage" || delta.what == "usage cost"));
         let reparsed = crate::stream::collect_with(
             &adapter,
             &crate::SessionRef::new("copy", Harness::Continue, &emitted.path),
-            &crate::stream::ParseOptions::full(),
+            &crate::stream::Demand::RICH,
         )?;
         assert_eq!(reparsed.messages.len(), session.messages.len());
         for (source, copied) in session.messages.iter().zip(&reparsed.messages) {
@@ -371,13 +290,13 @@ mod tests {
         let loss = report
             .deltas
             .iter()
-            .find(|delta| delta.field == "usage cache creation tokens")
+            .find(|delta| delta.what == "usage cache creation tokens")
             .expect("native cache-write absence is reported");
         assert!(loss.expected);
         assert!(!report
             .deltas
             .iter()
-            .any(|delta| delta.field == "usage" || delta.field == "usage cost"));
+            .any(|delta| delta.what == "usage" || delta.what == "usage cost"));
         let before = fs::read(&emitted.path)?;
         let index_before = fs::read(store.join("sessions/sessions.json"))?;
         let mut overflow = session.clone();
@@ -415,7 +334,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&doc)?)?;
         let adapter = crate::harness::continuedev::Continue::with_root(&store);
         let r = crate::SessionRef::new("source", Harness::Continue, &path);
-        let session = crate::stream::collect_with(&adapter, &r, &crate::stream::ParseOptions::lazy())?;
+        let session = crate::stream::collect_with(&adapter, &r, &crate::stream::Demand::LEAN.with_spans())?;
         let grouped = session.messages.iter().find(|m| m.role == Role::Tool).unwrap();
         assert_eq!(grouped.content.len(), 2);
         let opts = crate::emit::EmitOptions {
@@ -427,7 +346,7 @@ mod tests {
         let reparsed = crate::stream::collect_with(
             &adapter,
             &crate::SessionRef::new("copy", Harness::Continue, &emitted.path),
-            &crate::stream::ParseOptions::full(),
+            &crate::stream::Demand::RICH,
         )?;
         let outputs = reparsed
             .messages
@@ -488,8 +407,7 @@ mod tests {
             encrypted: None,
             redacted: false,
         });
-        let mut owned = lazy.clone();
-        owned.materialize()?;
+        let mut frozen = crate::emit::frozen::Frozen::new("continuedev-emit");
         for mode in [
             crate::emit::ThinkingMode::Native,
             crate::emit::ThinkingMode::Text,
@@ -500,18 +418,11 @@ mod tests {
                 thinking: mode,
                 ..Default::default()
             };
-            let mut oracle = owned.clone();
-            crate::emit::project_owned_thinking_for_test(&mut oracle, Harness::Continue, mode);
-            let old = legacy_emit(&oracle, &world.base.join(format!("old-{mode:?}")), &opts)?;
             let new = super::super::emit(&lazy, &world.base.join(format!("new-{mode:?}")), &opts)?;
-            let old = fs::read(old.path)?;
             let new = fs::read(new.path)?;
-            assert!(
-                old == new,
-                "wire mismatch {mode:?} at {:?}",
-                old.iter().zip(&new).position(|(a, b)| a != b)
-            );
+            frozen.insert(format!("{mode:?}"), json!([new.len(), crate::digest::sha256_hex(&new)]));
         }
+        frozen.check()?;
         let dest = world.base.join("mutation");
         fs::create_dir_all(&dest)?;
         let opts = crate::emit::EmitOptions {
@@ -595,12 +506,10 @@ mod tests {
         let index = dest.join("sessions.json");
         let index_before = fs::read(&index).ok();
         fs::remove_file(&path)?;
-        assert!(legacy_emit(&session, &world.base.join("old"), &opts).is_err());
         assert!(super::super::emit(&session, &dest, &opts).is_err());
         assert_eq!(fs::read(&emitted.path)?, before);
         assert_eq!(fs::read(&index).ok(), index_before);
-        // Drop does not demand legacy raw spans. Project the owned oracle before
-        // checked materialization, which correctly rejects an unprojected invalid span.
+        // Drop does not demand the unreadable span, so the checked writer still emits.
         fs::write(&path, b"short")?;
         if let Block::Thinking { text, .. } = &mut session.messages[0].content[0] {
             *text = crate::Text::Span(crate::lazy::Span {
@@ -610,17 +519,11 @@ mod tests {
                 escaped: true,
             });
         }
-        let mut owned = session.clone();
-        assert!(owned.materialize().is_err());
-        // The general owned projection helper expects materialized text. This
-        // oracle deliberately has an unreadable span, which Drop never demands.
-        for message in &mut owned.messages {
-            message.content.retain(|block| !matches!(block, Block::Thinking { .. }));
-        }
-        owned.materialize()?;
-        let oracle = legacy_emit(&owned, &world.base.join("span-oracle"), &opts)?;
         let new = super::super::emit(&session, &dest, &opts)?;
-        assert_eq!(fs::read(oracle.path)?, fs::read(new.path)?);
+        let bytes = fs::read(&new.path)?;
+        let mut frozen = crate::emit::frozen::Frozen::new("continuedev-emit-drop-span");
+        frozen.insert("drop", json!([bytes.len(), crate::digest::sha256_hex(&bytes)]));
+        frozen.check()?;
         assert_eq!(fs::read(&emitted.path)?, before);
         assert_eq!(fs::read(index).ok(), index_before);
         Ok(())
@@ -650,7 +553,6 @@ mod tests {
         let index = dest.join("sessions.json");
         let index_before = fs::read(&index)?;
         fs::remove_file(path)?;
-        assert!(legacy_emit(&session, &world.base.join("old"), &opts).is_err());
         assert!(super::super::emit(&session, &dest, &opts).is_err());
         assert_eq!(fs::read(emitted.path)?, before);
         assert_eq!(fs::read(index)?, index_before);
@@ -689,17 +591,30 @@ fn wide_grouped_tool_results_preserve_each_item_and_empty_context() -> Result<()
         });
         session.messages.push(tool);
         let path = world.base.join(format!("wide-{count}.json"));
-        transcript(
-            &session,
-            "copy",
-            None,
-            None,
-            &path,
-            crate::emit::ThinkingMode::Native,
-            crate::publish::Claim::New,
-        )?;
+        let stage = transcript(&session, "copy", None, None, crate::emit::ThinkingMode::Native)?;
+        crate::harness::store::publish_stage(stage, &path, crate::publish::Claim::New)?;
         let actual: Value = serde_json::from_slice(&fs::read(path)?)?;
         assert_eq!(actual, json!({"sessionId":"copy","history":expected}));
     }
+    Ok(())
+}
+/// A tool turn with no result has no `toolCallId` to write: the emit fails and publishes nothing.
+#[test]
+fn tool_turn_without_result_fails_closed() -> Result<()> {
+    let world = crate::test_world("continue-tool-without-result");
+    let mut session = Session::new("source", Harness::Continue);
+    let mut tool = Message::new(Role::Tool);
+    tool.content.push(Block::Text {
+        text: "prose only".into(),
+    });
+    session.messages.push(tool);
+    let dest = world.base.join("output");
+    let opts = crate::emit::EmitOptions {
+        new_id: Some("fixed".into()),
+        ..Default::default()
+    };
+    let err = super::emit(&session, &dest, &opts).unwrap_err();
+    assert!(format!("{err:#}").contains("toolCallId"), "{err:#}");
+    assert!(!dest.join("fixed.json").exists());
     Ok(())
 }

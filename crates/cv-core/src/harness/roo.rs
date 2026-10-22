@@ -18,13 +18,17 @@ use super::cline::{discover_in, emit_with_harness, stream_task_dir, task_dir_dep
 use super::Adapter;
 use crate::ir::*;
 use crate::source::{Dependencies, Probe};
-use crate::stream::{MessageSink, ParseOptions};
+use crate::stream::{Demand, MessageSink};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 pub struct Roo {
     roots: Vec<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Roo = Roo { roots: Vec::new() };
 
 impl Roo {
     pub fn detect() -> Self {
@@ -67,11 +71,11 @@ impl Adapter for Roo {
         self.roots.clone()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         Ok(discover_in(&self.roots, Harness::Roo))
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             // Spawn turns, sub-agent returns and deferred tool calls, typed (`crate::affordance`).
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Roo, sink);
@@ -83,19 +87,16 @@ impl Adapter for Roo {
     /// The checkpoints and permission asks `ui_messages.json` logs (the conversation file has
     /// neither): `say: checkpoint_saved` (a shadow-git commit under `checkpoints/`) and the `ask`s
     /// that gate a tool, a command, an MCP call or a browser launch.
-    fn store_affordances(&self, r: &SessionRef) -> Vec<crate::affordance::Affordance> {
+    fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
         ui_affordances(&r.path.join("ui_messages.json"))
     }
 }
 
-fn ui_affordances(path: &Path) -> Vec<crate::affordance::Affordance> {
+fn ui_affordances(path: &Path) -> Result<Vec<crate::affordance::Affordance>> {
     use crate::affordance::{Affordance, Kind};
     use serde_json::Value;
-    let Some(Value::Array(events)) = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-    else {
-        return Vec::new();
+    let Some(Value::Array(events)) = crate::affordance::side_json(path)? else {
+        return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for e in &events {
@@ -135,7 +136,7 @@ fn ui_affordances(path: &Path) -> Vec<crate::affordance::Affordance> {
             _ => {}
         }
     }
-    out
+    Ok(out)
 }
 
 /// Emit `session` into Roo's per-task layout under `out_dir`: the Cline writer, tagged for Roo.

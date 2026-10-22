@@ -1,0 +1,14 @@
+{
+"case 0": ["shared","2026-09-19T00:00:00Z",false,true,"2026-09-19T01:00:00Z"],
+"case 1": ["shared","2026-09-19T00:00:00Z",false,false,null],
+"case 10": ["giant",null,false,false,null],
+"case 11": ["escaped",null,false,false,null],
+"case 2": null,
+"case 3": ["shared","2026-09-19T00:00:00Z",false,false,null],
+"case 4": ["shared","2026-09-19T00:00:00Z",false,false,null],
+"case 5": ["shared","2026-09-19T00:00:00Z",false,false,null],
+"case 6": ["shared","2026-09-19T00:00:00Z",false,false,null],
+"case 7": ["final",null,true,true,null],
+"case 8": ["parent",null,true,true,null],
+"case 9": ["escaped1",null,false,false,null]
+}

@@ -31,7 +31,18 @@ impl Default for ExactStrings {
     }
 }
 impl ExactStrings {
-    #[cfg(test)]
+    pub(crate) fn with_memory_limit(limit: usize) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+
+    /// Checkpoints can retain the bounded fast path; spilled keys remain operation-owned.
+    pub(crate) fn memory_values(&self) -> Option<&HashSet<String>> {
+        self.spill.is_none().then_some(&self.memory)
+    }
+
     pub(crate) fn contains(&mut self, text: &str) -> Result<bool> {
         let hash = self.hash(text);
         match &mut self.spill {
@@ -41,29 +52,29 @@ impl ExactStrings {
     }
 
     /// True only on first insertion. Empty strings, embedded NUL and hash collisions are exact.
-    pub(crate) fn insert(&mut self, text: String) -> Result<bool> {
-        self.insert_text(Cow::Owned(text))
+    pub(crate) fn insert(&mut self, text: impl Into<crate::Text>) -> Result<bool> {
+        match text.into() {
+            crate::Text::Inline(text) => self.insert_text(Cow::Owned(text)),
+            text => self.insert_source(&text, &crate::Resolver::new(None)),
+        }
     }
 
     /// Borrow keys that only need writing/comparison after spill. In-memory retention still owns
     /// its exact bytes, and uses the same payload-plus-slot budget as owned insertion.
-    #[cfg(feature = "sqlite")]
     pub(crate) fn insert_borrowed(&mut self, text: &str) -> Result<bool> {
         self.insert_text(Cow::Borrowed(text))
     }
 
     /// Small checked keys keep the bounded memory fast path; larger keys stage once
     /// into the existing disk backend. Neither path publishes before the producer succeeds.
-    #[cfg(feature = "sqlite")]
     pub(crate) fn insert_source(&mut self, text: &crate::Text, resolver: &crate::lazy::Resolver) -> Result<bool> {
         if let Some(text) = text.inline_str() {
             return self.insert_borrowed(text);
         }
-        // Checked JSON text's raw extent bounds decoded bytes. Legacy Span also permits
-        // lossy UTF-8, whose replacement scalars can expand each source byte threefold.
+        // Checked JSON text's raw extent bounds decoded bytes, including wire-form spans.
         let bounded_len = match text {
             crate::Text::Source(source) => Some(source.raw_len()),
-            crate::Text::Span(span) => span.len.checked_mul(3).and_then(|n| usize::try_from(n).ok()),
+            crate::Text::Span(span) => usize::try_from(span.len).ok(),
             crate::Text::Inline(_) => unreachable!(),
         };
         if let Some(bound) = bounded_len.filter(|&bound| self.spill.is_none() && self.memory_cost(bound) <= self.limit)
@@ -138,12 +149,11 @@ impl ExactStrings {
             .saturating_add(slots.saturating_mul(std::mem::size_of::<String>() + 16))
     }
 
-    #[cfg(all(test, feature = "sqlite"))]
+    #[cfg(test)]
     pub(crate) fn is_spilled(&self) -> bool {
         self.spill.is_some()
     }
 
-    #[cfg(any(feature = "sqlite", test))]
     pub(crate) fn clear(&mut self) {
         self.spill.take();
         self.memory = HashSet::new();
@@ -282,7 +292,10 @@ impl Index {
                 write_page_at(&mut self.file, &page.bytes, offset).context("writing exact set index page")?;
             }
             let offset = number.checked_mul(PAGE_BYTES as u64).context("spill index overflow")?;
-            read_page_at(&mut self.file, &mut page.bytes, offset).context("reading exact set index page")?;
+            // read_exact_at may replace a prefix before failing. Publish bytes and tag together.
+            let mut replacement = [0; PAGE_BYTES];
+            read_page_at(&mut self.file, &mut replacement, offset).context("reading exact set index page")?;
+            page.bytes = replacement;
             page.key = Some(number);
             page.dirty = false;
         }
@@ -301,6 +314,20 @@ impl Index {
         Ok(())
     }
 }
+#[cfg(test)]
+thread_local! {
+    static FAIL_APPEND_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn write_key(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(prefix) = FAIL_APPEND_AFTER.with(|fault| fault.take()) {
+        file.write_all(&bytes[..prefix.min(bytes.len())])?;
+        return Err(std::io::Error::other("injected partial append"));
+    }
+    file.write_all(bytes)
+}
+
 struct Disk {
     data: File,
     index: Index,
@@ -386,7 +413,7 @@ impl Disk {
             if self.pending.is_empty() && text.len() >= APPEND_BYTES {
                 let count = text.len() / APPEND_BYTES * APPEND_BYTES;
                 self.data.seek(SeekFrom::Start(self.flushed))?;
-                self.data.write_all(&text[..count]).context("writing exact set key")?;
+                write_key(&mut self.data, &text[..count]).context("writing exact set key")?;
                 self.flushed += count as u64;
                 text = &text[count..];
                 continue;
@@ -396,9 +423,7 @@ impl Disk {
             text = &text[count..];
             if self.pending.len() == APPEND_BYTES {
                 self.data.seek(SeekFrom::Start(self.flushed))?;
-                self.data
-                    .write_all(&self.pending)
-                    .context("writing exact set key window")?;
+                write_key(&mut self.data, &self.pending).context("writing exact set key window")?;
                 self.flushed += self.pending.len() as u64;
                 self.pending.clear();
             }
@@ -414,43 +439,59 @@ impl Disk {
             self.grow()?;
             bucket = self.find(text, hash)?.0;
         }
-        let offset = self.end.checked_add(1).context("spill offset overflow")?;
-        let end = self.end.checked_add(text.len() as u64).context("spill size overflow")?;
-        self.append(text)?;
-        self.end = end;
-        Slot {
+        let start = self.end;
+        // Slot offset zero means vacant; occupied offsets are biased by one, including byte zero.
+        let offset = start.checked_add(1).context("spill offset overflow")?;
+        let end = start.checked_add(text.len() as u64).context("spill size overflow")?;
+        let slot = Slot {
             hash,
             offset,
             len: text.len() as u64,
+        };
+        if let Err(error) = self.append(text).and_then(|()| slot.write(&mut self.index, bucket)) {
+            return Err(self.roll_back(start, error));
         }
-        .write(&mut self.index, bucket)?;
+        self.end = end;
         self.len += 1;
         Ok(true)
     }
 
-    #[cfg(any(feature = "sqlite", test))]
+    /// The one rule for a key that did not become a member: its bytes past `start` go, so the
+    /// next key is written where its slot will say it is. A rollback that fails stops reuse.
+    fn roll_back(&mut self, start: u64, error: anyhow::Error) -> anyhow::Error {
+        match self.discard_suffix(start) {
+            Ok(()) => error,
+            Err(cleanup) => error.context(format!("exact set rollback also failed: {cleanup}")),
+        }
+    }
+
     fn flush_pending(&mut self) -> Result<()> {
         if !self.pending.is_empty() {
             self.data.seek(SeekFrom::Start(self.flushed))?;
-            self.data.write_all(&self.pending).context("flushing exact set keys")?;
+            write_key(&mut self.data, &self.pending).context("flushing exact set keys")?;
             self.flushed += self.pending.len() as u64;
             self.pending.clear();
         }
         Ok(())
     }
 
-    #[cfg(any(feature = "sqlite", test))]
+    /// Discard unpublished physical bytes even when write_all failed before advancing flushed.
+    /// Keep the valid pending prefix; failed cleanup permanently prevents reuse.
     fn discard_suffix(&mut self, start: u64) -> Result<()> {
-        let result = self.data.set_len(start).context("discarding unpublished exact set key");
+        let boundary = start.min(self.flushed);
+        let result = self
+            .data
+            .set_len(boundary)
+            .context("discarding unpublished exact set key");
         if result.is_err() {
             self.failed = true;
         }
-        self.flushed = start;
-        self.pending.clear();
+        self.pending
+            .truncate(usize::try_from(start - boundary).unwrap_or(usize::MAX));
+        self.flushed = boundary;
         result
     }
 
-    #[cfg(any(feature = "sqlite", test))]
     fn equal_ranges(&mut self, slot: Slot, start: u64, len: u64) -> Result<bool> {
         let mut left = [0; COMPARE_BYTES];
         let mut right = [0; COMPARE_BYTES];
@@ -469,7 +510,6 @@ impl Disk {
 
     /// Stage one decoded key in the same append file as retained keys. Errors and duplicates
     /// discard only unpublished bytes; complete source validation precedes exact membership.
-    #[cfg(any(feature = "sqlite", test))]
     fn insert_stream(
         &mut self,
         produce: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>,
@@ -509,6 +549,7 @@ impl Disk {
                     }
                     Slot {
                         hash,
+                        // Zero is the vacant-slot sentinel; store the byte offset plus one.
                         offset: start.checked_add(1).context("spill offset overflow")?,
                         len,
                     }
@@ -530,12 +571,7 @@ impl Disk {
                 self.discard_suffix(start)?;
                 Ok(false)
             }
-            Err(error) => {
-                if let Err(cleanup) = self.discard_suffix(start) {
-                    return Err(error.context(format!("exact set rollback also failed: {cleanup}")));
-                }
-                Err(error)
-            }
+            Err(error) => Err(self.roll_back(start, error)),
         }
     }
     fn grow(&mut self) -> Result<()> {
@@ -559,12 +595,10 @@ impl Disk {
     }
 }
 
-#[cfg(any(feature = "sqlite", test))]
 struct ChunkHash<H> {
     hasher: H,
     pending: Vec<u8>,
 }
-#[cfg(any(feature = "sqlite", test))]
 impl<H: Hasher> ChunkHash<H> {
     fn new(hasher: H) -> Self {
         Self {
@@ -599,6 +633,27 @@ impl<H: Hasher> ChunkHash<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn partial_index_read_preserves_cached_page_on_reuse() {
+        let other = CACHE_PAGES as u64;
+        let mut index = Index::new((other + 1) * SLOTS_PER_PAGE).unwrap();
+        let old = [0xa5; SLOT_BYTES as usize];
+        index.write(0, &old).unwrap(); // dirty page zero shares its cache slot with `other`
+        let offset = other * PAGE_BYTES as u64;
+        index.file.set_len(offset + 128).unwrap();
+        write_page_at(&mut index.file, &[0x5a; 128], offset).unwrap();
+        assert!(index.read(other * SLOTS_PER_PAGE).is_err()); // prefix read, then EOF
+        assert_eq!(
+            index.read(0).unwrap(),
+            old,
+            "failed replacement must not retag mixed bytes"
+        );
+        // Successful retry/eviction must not flush damaged bytes under the old page's offset.
+        index.file.set_len(offset + PAGE_BYTES as u64).unwrap();
+        assert_eq!(index.read(other * SLOTS_PER_PAGE).unwrap(), [0x5a; SLOT_BYTES as usize]);
+        assert_eq!(index.read(0).unwrap(), old);
+    }
+
     #[derive(Default)]
     struct CollisionHash;
     impl Hasher for CollisionHash {
@@ -652,7 +707,60 @@ mod tests {
         assert!(!stream(&mut disk, b"", 3).unwrap());
     }
 
-    #[cfg(feature = "sqlite")]
+    #[test]
+    fn partial_append_failure_truncates_physical_suffix_and_keeps_pending_prefix() {
+        for retained in [0, 8, APPEND_BYTES + 8] {
+            for streamed in [false, true] {
+                let mut disk = Disk::new(0).unwrap();
+                let prefix = vec![b'r'; retained];
+                assert!(disk.insert(&prefix, 1).unwrap());
+                if streamed {
+                    disk.flush_pending().unwrap();
+                }
+                let boundary = disk.flushed;
+                FAIL_APPEND_AFTER.with(|fault| fault.set(Some(4096)));
+                let failed = vec![b'f'; APPEND_BYTES];
+                let error = if streamed {
+                    // Fail the final flush, after the producer successfully staged a short key.
+                    disk.insert_stream(|visit| visit(&failed[..8000]), CollisionHash)
+                        .unwrap_err()
+                } else {
+                    disk.insert(&failed, 2).unwrap_err()
+                };
+                assert!(format!("{error:#}").contains("injected partial append"));
+                assert_eq!(disk.data.metadata().unwrap().len(), boundary);
+                assert_eq!(disk.flushed + disk.pending.len() as u64, retained as u64);
+                assert!(!disk.failed);
+                assert!(disk.find(&prefix, 1).unwrap().1);
+                assert!(disk.insert(b"after", 3).unwrap());
+                assert!(disk.find(b"after", 3).unwrap().1);
+            }
+        }
+    }
+
+    /// A key whose bytes fail to reach the append file is no member, and leaves no bytes behind
+    /// for the next key's offset to miss: `insert` rolls back as `insert_stream` does.
+    #[test]
+    fn failed_rollback_cleanup_poison_prevents_reuse() {
+        let world = cv_testkit::World::new("exact-insert-rollback");
+        let mut disk = Disk::new(0).unwrap();
+        assert!(disk.insert(b"retained", 1).unwrap());
+        let read_only = world.base.join("read-only");
+        std::fs::write(&read_only, "").unwrap();
+        let writable = std::mem::replace(&mut disk.data, File::open(&read_only).unwrap());
+        let failed = vec![b'f'; APPEND_BYTES];
+        let error = disk.insert(&failed, 2).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("writing exact set key window"),
+            "{error:#}"
+        );
+        assert_eq!((disk.end, disk.flushed + disk.pending.len() as u64), (8, 8));
+        assert!(disk.failed, "a failed physical truncation must poison reuse");
+        disk.data = writable;
+        assert!(disk.find(b"retained", 1).is_err());
+        assert!(disk.insert(b"after", 3).is_err());
+    }
+
     #[test]
     fn small_checked_sources_keep_memory_fast_path() {
         let world = crate::test_world("exact-small-source");
@@ -676,10 +784,7 @@ mod tests {
             assert!(matches!(text, crate::Text::Source(_)));
             assert!(set.insert_source(&text, &resolver).unwrap());
             assert!(!set.insert_source(&text, &resolver).unwrap());
-            assert!(
-                set.spill.is_none(),
-                "ordinary checked prompts must not open spill files"
-            );
+            assert!(!set.is_spilled(), "ordinary checked prompts must not open spill files");
             assert!(set.contains(&body).unwrap());
         }
     }
@@ -708,7 +813,6 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"unchanged");
     }
 
-    #[cfg(feature = "sqlite")]
     #[test]
     fn checked_source_insertion_matches_inline_keys_and_rejects_stale_sources() {
         let world = crate::test_world("exact-checked-source");
@@ -724,7 +828,7 @@ mod tests {
         let mut set = ExactStrings::default();
         assert!(set.insert_borrowed("retained before spill").unwrap());
         assert!(set.insert_source(&text, &resolver).unwrap());
-        assert!(set.spill.is_some(), "giant checked keys must spill");
+        assert!(set.is_spilled(), "giant checked keys must spill");
         assert!(!set.insert_borrowed(&body).unwrap());
         assert!(!set.insert_source(&text, &resolver).unwrap());
         std::fs::write(&path, "changed backing").unwrap();
@@ -761,16 +865,15 @@ mod tests {
         for i in 0..400 {
             assert!(set.insert(i.to_string()).unwrap());
         }
-        assert!(set.spill.is_some());
+        assert!(set.is_spilled());
         assert_eq!(set.memory.capacity(), 0);
         for i in 0..400 {
             assert!(set.contains(&i.to_string()).unwrap());
         }
         set.clear();
-        assert!(set.spill.is_none());
+        assert!(!set.is_spilled());
         assert!(!set.contains("").unwrap());
     }
-    #[cfg(feature = "sqlite")]
     #[test]
     fn borrowed_keys_survive_caller_changes_and_spill() {
         let mut set = ExactStrings {
@@ -783,7 +886,7 @@ mod tests {
         assert!(set.contains("source\0λ").unwrap());
         let large = "bodyλ\0".repeat(1024);
         assert!(set.insert_borrowed(&large).unwrap());
-        assert!(set.spill.is_some());
+        assert!(set.is_spilled());
         assert!(!set.insert_borrowed("source\0λ").unwrap());
         assert!(!set.insert_borrowed(&large).unwrap());
         assert!(set.insert_borrowed("").unwrap());

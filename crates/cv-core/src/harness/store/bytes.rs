@@ -3,24 +3,49 @@ pub(crate) const MEMORY_LIMIT: usize = 1024 * 1024;
 /// Darwin can fault while writing mmap-backed input into the same vnode. All arena append
 /// writes pass through independently owned bounded scratch, including serializer fast paths
 /// that bypass their own BufWriter for large windows.
-struct AppendWriter<'a> {
-    file: &'a mut std::fs::File,
+pub(crate) struct ScratchWriter<'a> {
+    out: &'a mut dyn std::io::Write,
     scratch: Vec<u8>,
+    quote: bool,
+    pub(crate) len: usize,
 }
-impl std::io::Write for AppendWriter<'_> {
+impl<'a> ScratchWriter<'a> {
+    pub(crate) fn new(out: &'a mut dyn std::io::Write, quote: bool) -> Self {
+        Self {
+            out,
+            scratch: Vec::new(),
+            quote,
+            len: 0,
+        }
+    }
+}
+impl std::io::Write for ScratchWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("scratch writer length overflow"))?;
         for part in bytes.chunks(64 * 1024) {
             self.scratch.clear();
-            if self.scratch.capacity() < part.len() {
-                self.scratch.reserve_exact(part.len());
+            self.scratch.reserve(part.len() * if self.quote { 2 } else { 1 });
+            if self.quote {
+                // Canonical JSON already escaped control bytes; embedding it as a string
+                // only needs another escape layer for quotes and backslashes.
+                for &byte in part {
+                    if matches!(byte, b'"' | b'\\') {
+                        self.scratch.push(b'\\');
+                    }
+                    self.scratch.push(byte);
+                }
+            } else {
+                self.scratch.extend_from_slice(part);
             }
-            self.scratch.extend_from_slice(part);
-            self.file.write_all(&self.scratch)?;
+            self.out.write_all(&self.scratch)?;
         }
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
+        self.out.flush()
     }
 }
 
@@ -200,13 +225,7 @@ impl ByteSource {
         // Failed appends remain unreachable; truncating could invalidate mapped views.
         {
             use std::io::Write;
-            let mut writer = std::io::BufWriter::with_capacity(
-                64 * 1024,
-                AppendWriter {
-                    file: &mut file,
-                    scratch: Vec::new(),
-                },
-            );
+            let mut writer = std::io::BufWriter::with_capacity(64 * 1024, ScratchWriter::new(&mut file, false));
             let produced = f(&mut writer);
             // Flush before observing the published extent. Failed producer output remains an
             // unreachable append, and the producer's error takes precedence over a flush error.
@@ -236,8 +255,8 @@ impl ByteSource {
         }
     }
 
-    #[cfg(any(test, feature = "sqlite"))]
-    pub(crate) fn read(mut input: impl std::io::Read) -> std::io::Result<Self> {
+    /// Read an operation-owned source, spilling above the fixed memory budget.
+    pub fn read(mut input: impl std::io::Read) -> std::io::Result<Self> {
         use std::io::Write;
         let mut stage = ByteStage::new();
         let mut chunk = [0; 64 * 1024];

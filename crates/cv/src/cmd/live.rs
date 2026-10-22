@@ -1,20 +1,29 @@
 //! `cv scry` — live activity across harnesses (`tail -f` for sessions).
 
-use crate::util::{home_rel, parse_harness, short_id, Wait};
+use crate::util::{home_rel, parse_harness, poll_interval, short_id, Wait};
 use anyhow::Result;
 use cv_core::ir::{truncate, SessionRef};
 use cv_core::watch::{EventKind, Filter, SessionEvent, Watcher};
-use std::time::Duration;
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_scry(
-    harness: Option<String>,
-    cwd: Option<String>,
-    interval: f64,
-    existing: bool,
-    follow: bool,
-    for_: Option<String>,
-) -> Result<()> {
+/// `cv scry`'s options, named once at the command boundary.
+pub(crate) struct ScryArgs {
+    pub harness: Option<String>,
+    pub cwd: Option<String>,
+    pub interval: f64,
+    pub existing: bool,
+    pub follow: bool,
+    pub for_: Option<String>,
+}
+
+pub(crate) fn cmd_scry(args: ScryArgs) -> Result<()> {
+    let ScryArgs {
+        harness,
+        cwd,
+        interval,
+        existing,
+        follow,
+        for_,
+    } = args;
     let interval = poll_interval(interval)?;
     let filter = Filter {
         harness: parse_harness(&harness)?,
@@ -25,7 +34,10 @@ pub(crate) fn cmd_scry(
     if matches!(wait, Wait::Once) && !existing {
         // The current state: the sessions a follower would baseline, in the order it polls them.
         for r in Watcher::new(filter, true).discover() {
-            println!("{}", header("   ·", &r, r.message_count));
+            println!(
+                "{}",
+                header("   ·", &r, r.message_count.map_or("–".into(), |n| n.to_string()))
+            );
         }
         return Ok(());
     }
@@ -42,7 +54,13 @@ pub(crate) fn cmd_scry(
         eprintln!("cv scry: following {} sessions", watcher.following());
     }
     loop {
-        for ev in watcher.poll() {
+        let mut events = Vec::new();
+        watcher.poll(cv_core::watch::Poll::default(), |ev| {
+            let taken = ev.new_messages.len();
+            events.push(ev);
+            taken
+        });
+        for ev in events {
             print_event(&ev);
         }
         if !wait.pause(interval) {
@@ -51,7 +69,7 @@ pub(crate) fn cmd_scry(
     }
 }
 
-fn header(tag: &str, r: &SessionRef, messages: usize) -> String {
+fn header(tag: &str, r: &SessionRef, messages: String) -> String {
     let where_ = r.cwd.as_deref().map(home_rel).unwrap_or_else(|| "?".into());
     format!(
         "{tag}  {:8} {:8}  {}  ({messages} msg)",
@@ -66,35 +84,10 @@ fn print_event(ev: &SessionEvent) {
         EventKind::New => "✷ new",
         EventKind::Updated => "   +",
     };
-    println!("{}", header(tag, &ev.reference, ev.new_messages.len()));
+    println!("{}", header(tag, &ev.reference, ev.new_messages.len().to_string()));
     for m in &ev.new_messages {
         if let Some(t) = m.text() {
             println!("      {} {}", cv_core::render::role_label(m.role), truncate(&t, 100));
         }
-    }
-}
-
-fn poll_interval(seconds: f64) -> Result<Duration> {
-    if !seconds.is_finite() {
-        return crate::util::usage("--interval must be finite");
-    }
-    Duration::try_from_secs_f64(seconds.max(0.25))
-        .map_err(|_| crate::util::UsageError("--interval exceeds the supported duration".into()).into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn scry_interval_rejects_nonfinite_and_overflow_without_panicking() {
-        for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
-            assert!(poll_interval(seconds)
-                .unwrap_err()
-                .downcast_ref::<crate::util::UsageError>()
-                .is_some());
-        }
-        assert_eq!(poll_interval(0.0).unwrap(), Duration::from_millis(250));
-        assert_eq!(poll_interval(-1.0).unwrap(), Duration::from_millis(250));
-        assert_eq!(poll_interval(1.5).unwrap(), Duration::from_millis(1500));
     }
 }

@@ -54,11 +54,11 @@
 
 mod record;
 
-use super::store::sqlite::{columns, open_ro, Cell, Cells};
+use super::store::sqlite::{open_ro, Cell, Cells, Select};
 use super::wire::anthropic;
 use super::Adapter;
 use crate::ir::*;
-use crate::stream::{Flow, MessageSink, ParseOptions};
+use crate::stream::{Demand, Flow, MessageSink};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -69,6 +69,10 @@ pub struct Zed {
     /// `threads.db`, if it exists on disk.
     db: Option<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Zed = Zed { db: None };
 
 impl Zed {
     pub fn detect() -> Self {
@@ -120,21 +124,30 @@ impl Adapter for Zed {
             .collect()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         let Some(db) = &self.db else {
-            return Ok(vec![]);
+            return Ok(Default::default());
         };
-        super::store::sqlite::cached_discover(db, || {
-            let conn = open_ro(db)?;
-            conn.read(|conn| discover_db(conn, db))
-        })
+        // The one database: one that cannot open or read is skipped and reported (the harness
+        // lists nothing), not a discovery failure that keeps the previous listing.
+        let mut found = crate::Discovered::default();
+        let refs = super::store::sqlite::cached_discover(db, || open_ro(db)?.read(|conn, _| discover_db(conn, db)));
+        if let Some(refs) = found.keep(db, refs) {
+            found.refs = refs;
+        }
+        Ok(found)
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    /// Zed writes `threads.db` in place.
+    fn watch_policy(&self, _r: &SessionRef) -> super::WatchPolicy {
+        super::WatchPolicy::Database
+    }
+
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             let conn = open_ro(&r.path)?;
-            conn.read(|conn| {
-                let cells = Cells::new(conn, &r.path, conn.reads(), "threads")?;
+            conn.read(|conn, reads| {
+                let cells = Cells::new(conn, &r.path, reads, "threads")?;
                 stream_thread(conn, r, sink, &cells, opts.spans)
             })
         })
@@ -142,68 +155,52 @@ impl Adapter for Zed {
 }
 
 fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
-    let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
-    let cols = columns(conn, "threads");
-    let has = |c: &str| cols.contains(c);
-    let sel = |c: &'static str| if has(c) { c } else { "NULL" };
+    let _snapshot = super::store::sqlite::snapshot(conn)?;
+    let select = Select::of(conn, "threads")
+        .always(&["id", "summary", "updated_at"])
+        .probed(&["created_at", "folder_paths", "folder_paths_order"])
+        .always(&["data_type"]);
     // Sorting only metadata keeps every complete blob out of SQLite's temporary sorter; each
     // thread's cell is then read by key.
-    let sql = format!(
-        "SELECT id, summary, updated_at, {}, {}, {}, data_type FROM threads ORDER BY updated_at DESC",
-        sel("created_at"),
-        sel("folder_paths"),
-        sel("folder_paths_order"),
-    );
+    let sql = format!("SELECT {} FROM threads ORDER BY updated_at DESC", select.list());
     let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "threads")?;
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        // One unreadable row never fails the harness.
-        let Ok(id) = row.get::<_, String>(0) else { continue };
-        let summary = row.get::<_, Option<String>>(1).ok().flatten();
-        let updated = row.get::<_, Option<String>>(2).ok().flatten();
-        let created = row.get::<_, Option<String>>(3).ok().flatten();
-        let folders = row.get::<_, Option<String>>(4).ok().flatten();
-        let order = row.get::<_, Option<String>>(5).ok().flatten();
-        let data_type = row.get::<_, Option<String>>(6).ok().flatten();
-        let thread = thread_cell(conn, &cells, &id, data_type.as_deref())
-            .ok()
-            .flatten()
-            .and_then(|cell| cells.read(cell, |view| listing(view, cells.out().0)).ok().flatten());
-        let (cwd, count) = thread.unwrap_or_default();
+        // A row without a text id is not an addressable thread (nothing could open it); the
+        // rest of the row's columns are optional facts.
+        let id = row.get::<_, String>(0)?;
+        let summary = row.get::<_, Option<String>>(1)?;
+        let updated = row.get::<_, Option<String>>(2)?;
+        let created = row.get::<_, Option<String>>(3)?;
+        let folders = row.get::<_, Option<String>>(4)?;
+        let order = row.get::<_, Option<String>>(5)?;
+        let data_type = row.get::<_, Option<String>>(6)?;
+        let thread = thread_cell(conn, &cells, &id, data_type.as_deref())?
+            .map(|cell| cells.read(cell, listing))
+            .transpose()?
+            .flatten();
+        let cwd = thread.flatten();
         out.push(SessionRef {
-            id,
-            harness: Harness::Zed,
-            path: db.to_path_buf(),
             cwd: cwd.or_else(|| first_folder_path(folders.as_deref(), order.as_deref())),
             title: summary
                 .filter(|s| !s.trim().is_empty())
-                .map(|t| crate::ir::truncate(&t, 80)),
+                .map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE)),
             created_at: created.as_deref().and_then(super::parse_ts),
             updated_at: updated.as_deref().and_then(super::parse_ts),
-            message_count: count,
+            message_count: None,
+            ..SessionRef::new(id, Harness::Zed, db.to_path_buf())
         });
     }
     Ok(out)
 }
 
-/// What a listing reads from a thread: its cwd and `message_count`, counted by the one decoder
-/// under the counting demand (user and assistant turns it emits).
-fn listing(view: crate::json::JsonView<'_>, source: &crate::json::JsonSource) -> Result<(Option<PathBuf>, usize)> {
-    let (metadata, messages) = record::header(view)?;
-    let mut count = 0;
-    if let Some(messages) = messages {
-        let demand = record::Demand {
-            spans: true,
-            count: true,
-        };
-        record::messages(messages, source, demand, &mut |m| {
-            count += usize::from(matches!(m.role, Role::User | Role::Assistant));
-            Flow::Continue
-        })?;
-    }
-    Ok((snapshot_cwd(&metadata), count))
+/// Listing needs the snapshot cwd, not a replay of the thread's message bodies.
+/// The complete cell is still decoded and validated before this metadata projection.
+fn listing(view: crate::json::JsonView<'_>) -> Result<Option<PathBuf>> {
+    let (metadata, _) = record::header(view)?;
+    Ok(snapshot_cwd(&metadata))
 }
 
 /// The thread's `data` cell, decompressed into the cells' arena: `data_type` `"zstd"` is one
@@ -235,18 +232,13 @@ fn stream_thread(
     cells: &Cells,
     spans: bool,
 ) -> Result<Session> {
-    let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
-    let cols = columns(conn, "threads");
-    let has = |c: &str| cols.contains(c);
-    let sel = |c: &'static str| if has(c) { c } else { "NULL" };
-    let sql = format!(
-        "SELECT summary, updated_at, {}, {}, {}, {}, data_type, {} FROM threads WHERE id = ?1",
-        sel("created_at"),
-        sel("parent_id"),
-        sel("folder_paths"),
-        sel("folder_paths_order"),
-        sel("worktree_branch"),
-    );
+    let _snapshot = super::store::sqlite::snapshot(conn)?;
+    let select = Select::of(conn, "threads")
+        .always(&["summary", "updated_at"])
+        .probed(&["created_at", "parent_id", "folder_paths", "folder_paths_order"])
+        .always(&["data_type"])
+        .probed(&["worktree_branch"]);
+    let sql = format!("SELECT {} FROM threads WHERE id = ?1", select.list());
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([&r.id])?;
     let row = rows.next()?.with_context(|| format!("zed thread {} not found", r.id))?;
@@ -259,7 +251,11 @@ fn stream_thread(
     let data_type = row.get::<_, Option<String>>(6).ok().flatten();
     let branch = row.get::<_, Option<String>>(7).ok().flatten().filter(|s| !s.is_empty());
     // The whole document is validated before any message is emitted, ignored fields included.
-    let cell = thread_cell(conn, cells, &r.id, data_type.as_deref());
+    // A store error is the read's; a blob that will not decompress reads as undecodable below.
+    let cell = match thread_cell(conn, cells, &r.id, data_type.as_deref()) {
+        Err(error) if error.is::<rusqlite::Error>() => return Err(error),
+        cell => cell,
+    };
     let thread = match &cell {
         Ok(Some(cell)) => cells.read(*cell, |view| {
             let (metadata, messages) = record::header(view)?;
@@ -288,13 +284,18 @@ fn stream_thread(
         blob_updated = t.get("updated_at").and_then(super::ts_from_value);
         cwd = snapshot_cwd(t);
         git = snapshot_git(t);
-        model = t.get("model").and_then(model_string);
+        let (name, provider) = t.get("model").map(model_and_provider).unwrap_or_default();
+        model = name;
+        if let Some(p) = provider {
+            zed.insert("provider".into(), Value::String(p));
+        }
         thread_extras(t, &mut zed, &mut parent_thread_id);
     } else if !matches!(cell, Ok(None)) {
         // The row has a blob that wouldn't decode — surface that instead of erroring, so one
         // corrupt thread never breaks listings or bulk exports.
         zed.insert("undecodable_blob".into(), Value::Bool(true));
     }
+    let undecodable = zed.contains_key("undecodable_blob");
     if let Some(branch) = branch {
         git.get_or_insert_with(GitInfo::default).branch.get_or_insert(branch);
     }
@@ -328,11 +329,14 @@ fn stream_thread(
             bag.insert(k, v);
         }
     }
+    // The thread's one record, undecodable, is counted as well as marked.
+    if undecodable {
+        super::Unparsed(1).note(&mut s);
+    }
     // All session metadata is known up front; hand it to the sink before the body.
     sink.meta(&s);
     if let Some((_, Some(messages))) = &thread {
-        let demand = record::Demand { spans, count: false };
-        messages.with_view(|view| record::messages(view, cells.out().0, demand, &mut |m| sink.message(m)))?;
+        messages.with_view(|view| record::messages(view, cells.out().0, spans, &mut |m| sink.message(m)))?;
     }
     Ok(s)
 }
@@ -341,16 +345,16 @@ fn stream_thread(
 // Thread-level metadata
 // ---------------------------------------------------------------------------
 
-/// `{provider, model}` → `"provider/model"` (matching the goose/hermes convention).
-fn model_string(v: &Value) -> Option<String> {
-    let provider = v.get("provider").and_then(Value::as_str).filter(|s| !s.is_empty());
-    let model = v.get("model").and_then(Value::as_str).filter(|s| !s.is_empty());
-    match (provider, model) {
-        (Some(p), Some(m)) => Some(format!("{p}/{m}")),
-        (None, Some(m)) => Some(m.to_string()),
-        (Some(p), None) => Some(p.to_string()),
-        (None, None) => None,
-    }
+/// `{provider, model}` → the model, and the provider beside it (`extra["zed"]["provider"]`): a
+/// thread that names only its provider has no model.
+fn model_and_provider(v: &Value) -> (Option<String>, Option<String>) {
+    let field = |k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    (field("model"), field("provider"))
 }
 
 /// First worktree path of `initial_project_snapshot` — the cwd the thread was created against.
@@ -631,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_reads_metadata_and_counts() {
+    fn discover_reads_metadata_without_decoding_messages() {
         let c = mk(SCHEMA);
         insert(&c, "t1", "Fix the flaky test", "zstd", &zstd_blob(&legacy_thread()));
         // A second, newer thread with workspace folders but an empty summary.
@@ -643,7 +647,9 @@ mod tests {
         )
         .unwrap();
 
+        record::DECODED_MESSAGES.with(|n| n.set(0));
         let refs = discover(&c);
+        assert_eq!(record::DECODED_MESSAGES.with(|n| n.get()), 0);
         assert_eq!(refs.len(), 2);
         // Ordered by updated_at DESC.
         assert_eq!(refs[0].id, "t2");
@@ -653,15 +659,77 @@ mod tests {
         assert_eq!(t1.title.as_deref(), Some("Fix the flaky test"));
         assert_eq!(t1.cwd.as_deref(), Some(Path::new("/Users/u/proj")));
         assert!(t1.created_at.unwrap() < t1.updated_at.unwrap());
-        // user + assistant turns only: 1 user + 2 assistant (the Tool turn doesn't count).
-        assert_eq!(t1.message_count, 3);
+        assert_eq!(t1.message_count, None, "exact counts come from complete reads");
 
         let t2 = &refs[0];
         assert_eq!(t2.title, None, "empty summary must not become a title");
         // Snapshot cwd wins over folder_paths.
         assert_eq!(t2.cwd.as_deref(), Some(Path::new("/Users/u/proj")));
-        // 1 user + 1 assistant ("Resume" and the Tool turn don't count).
-        assert_eq!(t2.message_count, 2);
+        assert_eq!(t2.message_count, None);
+        for reference in &refs {
+            parse_thread(&c, reference).unwrap();
+        }
+        assert!(
+            record::DECODED_MESSAGES.with(|n| n.get()) > 0,
+            "full reads still decode messages"
+        );
+    }
+
+    #[test]
+    fn complete_reads_refill_counts_and_database_changes_invalidate_them() -> Result<()> {
+        let world = crate::test_world("zed-count-refill");
+        let db = world.base.join("threads.db");
+        {
+            let writer = Connection::open(&db)?;
+            writer.execute_batch(SCHEMA)?;
+            insert(&writer, "thread", "Native title", "zstd", &zstd_blob(&legacy_thread()));
+        }
+        let adapter = Zed::with_root(&world.base);
+        let reference = adapter.discover()?.remove(0);
+        assert_eq!(reference.message_count, None);
+        crate::catalog::sync(std::slice::from_ref(&reference));
+        let complete = crate::stream::stream_counted(
+            &adapter,
+            &reference,
+            &Demand::FACTS.with_spans(),
+            &mut crate::stream::Discard,
+            crate::stream::Pass::RECORD,
+        )?;
+        let turns = complete.counted.unwrap().turns;
+        assert_eq!(turns, 3);
+        record::DECODED_MESSAGES.with(|n| n.set(0));
+        assert_eq!(adapter.discover()?[0].message_count, Some(turns));
+        assert_eq!(
+            record::DECODED_MESSAGES.with(|n| n.get()),
+            0,
+            "count reuse cannot replay bodies"
+        );
+        let stored = crate::catalog::Reader::open().unwrap().all_sessions().unwrap();
+        assert_eq!(stored[0].message_count, Some(turns));
+        // A live WAL changes the source even before the database file is checkpointed.
+        let writer = Connection::open(&db)?;
+        writer.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let mut changed = legacy_thread();
+        changed["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"role":"user","text":"next turn"}));
+        writer.execute("UPDATE threads SET data=?1 WHERE id='thread'", [zstd_blob(&changed)])?;
+        let unknown = adapter.discover()?.remove(0);
+        assert_eq!(unknown.message_count, None);
+        assert_eq!(unknown.cwd, reference.cwd);
+        assert_eq!(unknown.title, reference.title);
+        assert_eq!(record::DECODED_MESSAGES.with(|n| n.get()), 0);
+        let complete = crate::stream::stream_counted(
+            &adapter,
+            &unknown,
+            &Demand::FACTS.with_spans(),
+            &mut crate::stream::Discard,
+            crate::stream::Pass::RECORD,
+        )?;
+        assert_eq!(complete.counted.unwrap().turns, 4);
+        assert_eq!(adapter.discover()?[0].message_count, Some(4));
+        Ok(())
     }
 
     #[test]
@@ -674,7 +742,7 @@ mod tests {
 
         assert_eq!(s.title.as_deref(), Some("Fix the flaky test"));
         assert_eq!(s.cwd.as_deref(), Some(Path::new("/Users/u/proj")));
-        assert_eq!(s.model.as_deref(), Some("zed.dev/claude-sonnet-4-thinking"));
+        assert_eq!(s.model.as_deref(), Some("claude-sonnet-4-thinking"));
         let git = s.git.as_ref().unwrap();
         assert_eq!(git.branch.as_deref(), Some("main"));
         assert_eq!(git.commit.as_deref(), Some("abc123"));
@@ -728,8 +796,10 @@ mod tests {
         let a = &s.messages[1];
         assert_eq!(a.role, Role::Assistant);
         assert!(matches!(&a.content[0], Block::Thinking { text, signature, .. }
-            if text == "let me look" && signature.as_deref() == Some("sig1")));
-        assert!(matches!(&a.content[1], Block::Text { text } if text == "Checking the test now."));
+            if text.matches_str("let me look") == Some(true) && signature.as_deref() == Some("sig1")));
+        assert!(
+            matches!(&a.content[1], Block::Text { text } if text.matches_str("Checking the test now.") == Some(true))
+        );
         assert!(matches!(&a.content[2], Block::ToolUse { id, name, input , ..}
             if id == "toolu_1" && name == "read_file"
             && input.resolve().unwrap().get("path").and_then(Value::as_str) == Some("foo.rs")));
@@ -737,7 +807,7 @@ mod tests {
         assert_eq!(t.role, Role::Tool);
         assert!(
             matches!(&t.content[0], Block::ToolResult { tool_use_id, content, is_error, tool_name, details, .. }
-            if tool_use_id == "toolu_1" && content == "fn test_foo() {}" && !is_error
+            if tool_use_id == "toolu_1" && content.matches_str("fn test_foo() {}") == Some(true) && !is_error
             && tool_name.as_deref() == Some("read_file")
             && details.as_ref().and_then(|d| d.get("lines")).and_then(Value::as_i64) == Some(1))
         );
@@ -752,7 +822,13 @@ mod tests {
         crate::harness::assert_no_flat_keys(&s);
 
         assert_eq!(s.title.as_deref(), Some("Refactor the parser"));
-        assert_eq!(s.model.as_deref(), Some("openai/gpt-5-mini"));
+        assert_eq!(s.model.as_deref(), Some("gpt-5-mini"), "the model is the model");
+        assert_eq!(s.harness_extra(Harness::Zed).unwrap()["provider"], "openai");
+        // A thread naming only its provider has no model; the provider is never promoted to one.
+        assert_eq!(
+            model_and_provider(&serde_json::json!({"provider": "zed.dev", "model": ""})),
+            (None, Some("zed.dev".into()))
+        );
         assert_eq!(s.git.as_ref().unwrap().branch.as_deref(), Some("dev"));
         assert_eq!(s.lineage.parent.as_deref(), Some("parent-1"));
         assert_eq!(
@@ -776,14 +852,16 @@ mod tests {
             if uri == "file:///Users/u/proj/src/lib.rs"));
         let a = &s.messages[1];
         assert_eq!(a.role, Role::Assistant);
-        assert!(matches!(&a.content[0], Block::Thinking { text, .. } if text == "plan the split"));
-        assert!(matches!(&a.content[1], Block::Text { text } if text == "Splitting now."));
+        assert!(
+            matches!(&a.content[0], Block::Thinking { text, .. } if text.matches_str("plan the split") == Some(true))
+        );
+        assert!(matches!(&a.content[1], Block::Text { text } if text.matches_str("Splitting now.") == Some(true)));
         assert!(matches!(&a.content[2], Block::ToolUse { id, name, .. } if id == "toolu_9" && name == "edit_file"));
         let t = &s.messages[2];
         assert_eq!(t.role, Role::Tool);
         assert!(
             matches!(&t.content[0], Block::ToolResult { tool_use_id, content, is_error, tool_name, .. }
-            if tool_use_id == "toolu_9" && content == "permission denied" && *is_error
+            if tool_use_id == "toolu_9" && content.matches_str("permission denied") == Some(true) && *is_error
             && tool_name.as_deref() == Some("edit_file"))
         );
     }
@@ -814,7 +892,7 @@ mod tests {
         assert_eq!(s.messages[1].role, Role::Tool);
         assert!(
             matches!(&s.messages[1].content[0], Block::ToolResult { tool_name, content, .. }
-            if tool_name.as_deref() == Some("shell") && content == "file_a")
+            if tool_name.as_deref() == Some("shell") && content.matches_str("file_a") == Some(true))
         );
     }
 
@@ -865,7 +943,7 @@ mod tests {
                 expected.iter().collect::<Vec<_>>()
             );
             for r in actual {
-                assert_eq!(r.message_count, 3);
+                assert_eq!(r.message_count, None);
                 assert_eq!(parse_thread(&c, &r).unwrap().messages.len(), 4);
             }
             for text in [
@@ -887,7 +965,7 @@ mod tests {
                 assert!(unreadable.messages.is_empty());
                 assert!(unreadable.harness_extra(Harness::Zed).is_none());
                 let listed = discover(&c).into_iter().find(|r| r.id == "a").unwrap();
-                assert_eq!(listed.message_count, 0);
+                assert_eq!(listed.message_count, None);
                 assert_eq!(listed.cwd, None);
             }
         }
@@ -932,24 +1010,22 @@ mod tests {
         };
         let cells = Cells::new(&reader, &path, &crate::source::ReadSet::default(), "threads").unwrap();
         let session = stream_thread(&reader, &sref("t"), &mut sink, &cells, false).unwrap();
-        assert_eq!(session.model.as_deref(), Some("zed.dev/claude-sonnet-4-thinking"));
+        assert_eq!(session.model.as_deref(), Some("claude-sonnet-4-thinking"));
         assert_eq!(sink.messages.len(), 4);
         assert_eq!(sink.messages[0].text().as_deref(), Some("why is test_foo flaky?"));
         // A live WAL store is read through a private snapshot (cv never touches its -shm), so
         // even an unchecked second pass sees the snapshot, not the writer's later commit.
         assert_eq!(
             parse_thread(&reader, &sref("t")).unwrap().model.as_deref(),
-            Some("zed.dev/claude-sonnet-4-thinking")
+            Some("claude-sonnet-4-thinking")
         );
         // The internal SQLite snapshot remains consistent, but publication through the real
         // adapter must reject a source changed by a callback rather than recapture its identity.
-        assert!(reader.read(|conn| parse_thread(conn, &sref("t"))).is_err());
+        assert!(reader.read(|conn, _| parse_thread(conn, &sref("t"))).is_err());
         let adapter = Zed::with_root(&world.base);
         let mut reference = sref("t");
         reference.path = path;
-        let failure = adapter
-            .stream(&reference, &ParseOptions::default(), &mut sink)
-            .unwrap_err();
+        let failure = adapter.stream(&reference, &Demand::LEAN, &mut sink).unwrap_err();
         assert!(failure.to_string().contains("dependencies changed"));
     }
 
@@ -963,17 +1039,15 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_blob_is_tolerated_everywhere() {
+    fn corrupt_blob_is_reported_by_discovery_and_annotated_by_parse() {
         let c = mk(SCHEMA);
         insert(&c, "bad", "corrupt one", "zstd", b"\x28\xb5\x2f\xfdnot really zstd");
         insert(&c, "good", "fine one", "zstd", &zstd_blob(&legacy_thread()));
 
-        // discover lists both; the corrupt one just has no count/cwd.
-        let refs = discover(&c);
-        assert_eq!(refs.len(), 2);
-        let bad = refs.iter().find(|r| r.id == "bad").unwrap();
-        assert_eq!(bad.message_count, 0);
-        assert_eq!(bad.title.as_deref(), Some("corrupt one"));
+        assert!(
+            discover_db(&c, &db_path(&c)).is_err(),
+            "a failed projection is not an empty cwd"
+        );
 
         // parse returns the row's metadata + a flag, never an error.
         let s = parse_thread(&c, &sref("bad")).unwrap();
@@ -982,6 +1056,7 @@ mod tests {
             s.harness_extra(Harness::Zed).and_then(|b| b.get("undecodable_blob")),
             Some(&Value::Bool(true))
         );
+        assert_eq!(s.extra["cv"]["skipped_lines"], 1);
         assert_eq!(s.title.as_deref(), Some("corrupt one"));
     }
 
@@ -1006,10 +1081,10 @@ mod tests {
         for (id, data_type, data) in &cases {
             insert(&c, id, id, data_type, data);
         }
-        for r in discover(&c) {
-            assert_eq!(r.message_count, 0, "{}", r.id);
-            let s = parse_thread(&c, &sref(&r.id)).unwrap();
-            assert!(s.messages.is_empty(), "{}", r.id);
+        assert!(discover_db(&c, &db_path(&c)).is_err());
+        for (id, _, _) in &cases {
+            let s = parse_thread(&c, &sref(id)).unwrap();
+            assert!(s.messages.is_empty(), "{id}");
             assert_eq!(
                 s.harness_extra(Harness::Zed).and_then(|b| b.get("undecodable_blob")),
                 Some(&Value::Bool(true))
@@ -1036,8 +1111,8 @@ mod tests {
         let zed = Zed::with_root(&world.base);
         let mut reference = sref("t");
         reference.path = path;
-        let full = crate::stream::collect_with(&zed, &reference, &ParseOptions::full()).unwrap();
-        let lazy = crate::stream::collect_with(&zed, &reference, &ParseOptions::lazy()).unwrap();
+        let full = crate::stream::collect_with(&zed, &reference, &Demand::RICH).unwrap();
+        let lazy = crate::stream::collect_with(&zed, &reference, &Demand::LEAN.with_spans()).unwrap();
         assert_eq!(
             serde_json::to_value(&full).unwrap(),
             serde_json::to_value(&lazy).unwrap()
@@ -1083,7 +1158,7 @@ mod tests {
         let c = mk(SCHEMA);
         insert(&c, "t", "New Thread", "zstd", &zstd_blob(&thread));
         let refs = discover(&c);
-        assert_eq!(refs[0].message_count, 0);
+        assert_eq!(refs[0].message_count, None);
         let s = parse_thread(&c, &sref("t")).unwrap();
         assert!(s.messages.is_empty());
         assert_eq!(s.title.as_deref(), Some("New Thread"));
@@ -1100,7 +1175,7 @@ mod tests {
         .unwrap();
         let refs = discover(&c);
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].message_count, 3);
+        assert_eq!(refs[0].message_count, None);
         assert!(refs[0].created_at.is_none(), "no created_at column in old schema");
         let s = parse_thread(&c, &sref("t")).unwrap();
         assert_eq!(s.messages.len(), 4);
@@ -1233,7 +1308,7 @@ mod tests {
         for r in &refs {
             let parsed = zed.parse(r).unwrap();
             let mut sink = crate::stream::CollectSink::default();
-            let mut streamed = zed.stream(r, &crate::stream::ParseOptions::full(), &mut sink).unwrap();
+            let mut streamed = zed.stream(r, &crate::stream::Demand::RICH, &mut sink).unwrap();
             streamed.messages = sink.messages;
             assert_eq!(
                 serde_json::to_value(&parsed).unwrap(),
@@ -1241,13 +1316,11 @@ mod tests {
                 "parse != collect(stream) for {}",
                 r.id
             );
-            // And the discover contract: message_count == parsed user+assistant turns.
-            let ua = parsed
+            assert_eq!(r.message_count, None, "discovery leaves turns uncounted for {}", r.id);
+            assert!(parsed
                 .messages
                 .iter()
-                .filter(|m| matches!(m.role, Role::User | Role::Assistant))
-                .count();
-            assert_eq!(r.message_count, ua, "message_count contract for {}", r.id);
+                .any(|m| matches!(m.role, Role::User | Role::Assistant)));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1281,12 +1354,12 @@ mod tests {
                 reference.path = path.clone();
                 let expected = zed.parse(&reference).unwrap();
                 for options in [
-                    ParseOptions::lazy(),
-                    ParseOptions::facts(),
-                    ParseOptions::lazy_extra(),
-                    ParseOptions {
+                    Demand::LEAN.with_spans(),
+                    Demand::FACTS.with_spans(),
+                    Demand::RICH.with_spans(),
+                    Demand {
                         spans: true,
-                        ..ParseOptions::complete()
+                        ..Demand::COMPLETE
                     },
                 ] {
                     let mut sink = crate::stream::CollectSink::default();
@@ -1316,7 +1389,7 @@ mod tests {
         let mut reference = sref("t");
         reference.path = path;
         let mut sink = crate::stream::CollectSink::default();
-        zed.stream(&reference, &ParseOptions::lazy(), &mut sink).unwrap();
+        zed.stream(&reference, &Demand::LEAN.with_spans(), &mut sink).unwrap();
         let Block::Text { text } = &sink.messages[0].content[0] else {
             panic!("text")
         };
@@ -1359,7 +1432,7 @@ mod tests {
                 s.label(),
                 s.cwd,
                 s.messages.len(),
-                r.message_count
+                r.message_count.map_or("-".to_string(), |n| n.to_string())
             );
         }
     }

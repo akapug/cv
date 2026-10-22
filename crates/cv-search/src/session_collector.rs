@@ -38,6 +38,14 @@ impl<const N: usize> StoredHead<N> {
     }
 }
 fn stored_id(store: &StoreReader, doc: DocId, id: Field) -> tantivy::Result<Option<String>> {
+    stored_id_observed(store, doc, id, || {})
+}
+fn stored_id_observed(
+    store: &StoreReader,
+    doc: DocId,
+    id: Field,
+    fallback: impl FnOnce(),
+) -> tantivy::Result<Option<String>> {
     let mut first: StoredHead<1> = store.get(doc)?;
     if let Some((field, value)) = first.fields[0].take() {
         if field == id {
@@ -48,6 +56,7 @@ fn stored_id(store: &StoreReader, doc: DocId, id: Field) -> tantivy::Result<Opti
             });
         }
     }
+    fallback();
     let full: TantivyDocument = store.get(doc)?;
     Ok(full.get_first(id).and_then(|v| v.as_str()).map(str::to_owned))
 }
@@ -149,6 +158,8 @@ pub(crate) struct TopSessions {
     #[cfg(test)]
     /// Competitive stored identity requests; excludes filter and metadata lookups.
     pub(crate) stored_reads: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    pub(crate) fallback_reads: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     id: Field,
     limit: usize,
 }
@@ -162,6 +173,8 @@ impl TopSessions {
             full_documents: false,
             #[cfg(test)]
             stored_reads: None,
+            #[cfg(test)]
+            fallback_reads: None,
         }
     }
 }
@@ -175,6 +188,8 @@ impl Collector for TopSessions {
             full_documents: self.full_documents,
             #[cfg(test)]
             stored_reads: self.stored_reads.clone(),
+            #[cfg(test)]
+            fallback_reads: self.fallback_reads.clone(),
             filter_cache: HashMap::new(),
             id: self.id,
             ordinal,
@@ -223,6 +238,8 @@ pub(crate) struct SessionSegment {
     full_documents: bool,
     #[cfg(test)]
     stored_reads: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    fallback_reads: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     filter: Option<SessionFilter>,
     filter_cache: HashMap<String, bool>,
     id: Field,
@@ -231,31 +248,40 @@ pub(crate) struct SessionSegment {
     winners: Winners,
     error: Option<tantivy::TantivyError>,
 }
+#[cfg(not(test))]
+impl SessionSegment {
+    fn identity(&self, doc: DocId) -> tantivy::Result<Option<String>> {
+        stored_id(&self.store, doc, self.id)
+    }
+}
+#[cfg(test)]
+impl SessionSegment {
+    fn identity(&self, doc: DocId) -> tantivy::Result<Option<String>> {
+        if let Some(reads) = &self.stored_reads {
+            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.full_documents {
+            self.store
+                .get::<TantivyDocument>(doc)
+                .map(|stored| stored.get_first(self.id).and_then(|v| v.as_str()).map(str::to_owned))
+        } else {
+            stored_id_observed(&self.store, doc, self.id, || {
+                if let Some(reads) = &self.fallback_reads {
+                    reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        }
+    }
+}
 impl SegmentCollector for SessionSegment {
     type Fruit = tantivy::Result<Vec<Candidate>>;
     fn collect(&mut self, doc: DocId, score: Score) {
         if self.error.is_some() || !self.winners.competitive_score(score) {
             return;
         }
-        #[cfg(test)]
-        if let Some(reads) = &self.stored_reads {
-            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let identity = {
-            #[cfg(test)]
-            if self.full_documents {
-                self.store
-                    .get::<TantivyDocument>(doc)
-                    .map(|stored| stored.get_first(self.id).and_then(|v| v.as_str()).map(str::to_owned))
-            } else {
-                stored_id(&self.store, doc, self.id)
-            }
-            #[cfg(not(test))]
-            stored_id(&self.store, doc, self.id)
-        };
+        let identity = self.identity(doc);
         match identity {
-            Ok(id) => {
-                let id = id.unwrap_or_default();
+            Ok(Some(id)) => {
                 if let Some(filter) = &self.filter {
                     let accepted = if let Some(accepted) = self.filter_cache.get(&id) {
                         *accepted
@@ -271,6 +297,8 @@ impl SegmentCollector for SessionSegment {
                             FilterDecision::Document(accepted) => accepted,
                             FilterDecision::Session(accepted) => {
                                 // Only authoritative session decisions can be reused by id.
+                                // Bound per-segment decision memory. Clear-all avoids recency
+                                // bookkeeping for this opportunistic cache; misses recompute.
                                 if self.filter_cache.len() == 64 {
                                     self.filter_cache.clear();
                                 }
@@ -289,6 +317,7 @@ impl SegmentCollector for SessionSegment {
                     addr: DocAddress::new(self.ordinal, doc),
                 });
             }
+            Ok(None) => {}
             Err(error) => self.error = Some(error),
         }
     }
@@ -386,6 +415,37 @@ mod tests {
         {
             assert_eq!(stored_id(&store, doc as DocId, id).unwrap().as_deref(), expected);
         }
+    }
+
+    #[test]
+    fn ranked_search_skips_missing_ids_and_counts_reordered_heads() {
+        let mut schema = tantivy::schema::Schema::builder();
+        let id = schema.add_text_field("id", tantivy::schema::STRING | tantivy::schema::STORED);
+        let title = schema.add_text_field("title", tantivy::schema::STORED);
+        let index = tantivy::Index::create_in_ram(schema.build());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        for doc in [
+            tantivy::doc!(id => "first"),
+            tantivy::doc!(title => "title", id => "later"),
+            tantivy::doc!(title => "missing"),
+        ] {
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut collector = TopSessions::new(id, 10);
+        collector.fallback_reads = Some(count.clone());
+        let hits = index
+            .reader()
+            .unwrap()
+            .searcher()
+            .search(&tantivy::query::AllQuery, &collector)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["first", "later"]
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]

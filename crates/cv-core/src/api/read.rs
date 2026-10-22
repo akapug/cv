@@ -1,7 +1,7 @@
 //! Small verified continuations for repeated API reads. No messages are cached.
 use super::{session_meta_json, WindowSink};
 use crate::source::{Baseline, Probe, ReadSet};
-use crate::stream::{Checkpoint, Flow, ParseOptions};
+use crate::stream::{Checkpoint, Demand, Flow, Start};
 use crate::{Adapter, Session, SessionRef};
 use anyhow::Result;
 use serde::Serialize;
@@ -24,7 +24,7 @@ struct Key {
     title: Option<String>,
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    message_count: usize,
+    message_count: Option<usize>,
 }
 
 impl Key {
@@ -156,22 +156,12 @@ pub(super) fn window(
     end: Option<usize>,
     extra: bool,
 ) -> Result<(Session, WindowSink)> {
-    let opts = ParseOptions {
-        extra,
-        ..ParseOptions::lazy()
-    };
+    let opts = if extra { Demand::RICH } else { Demand::LEAN }.with_spans();
     let version = crate::resume::version(adapter, "api-window1");
     let primary = adapter.resume_source(r);
-    if version.is_none() {
-        let (before, reads) = captured(r, &primary);
-        let mut sink = WindowSink::page(&primary, start, end, false, reads);
-        let shell = adapter.try_stream(r, &opts, &mut sink)?;
-        verify(r, &primary, &before, &sink)?;
-        return Ok((shell, sink));
-    }
-    let key = version.and_then(|version| Key::admitted(r, &primary, version, extra));
+    let key = Key::admitted(r, &primary, version, extra);
     let (before, reads) = captured(r, &primary);
-    let mut sink = WindowSink::page(&primary, start, end, key.is_some(), reads);
+    let mut sink = WindowSink::page(&primary, start, end, key.is_some(), reads.clone());
     let mut resumed = false;
     let mut shell = None;
     if let Some(key) = &key {
@@ -189,7 +179,7 @@ pub(super) fn window(
                         if let Some(old_reads) = entry.source.reads() {
                             sink.reads.merge(&old_reads);
                         }
-                        shell = adapter.try_resume(r, &opts, &mut sink, &checkpoint)?;
+                        shell = adapter.transcript(r, &opts, Start::Checkpoint(&checkpoint), &mut sink)?;
                         resumed = shell.is_some();
                     }
                 }
@@ -199,8 +189,8 @@ pub(super) fn window(
         }
     }
     if shell.is_none() {
-        // A declined resume promises no callbacks, but discard its initial state too.
-        let (_, reads) = captured(r, &primary);
+        // A declined resume promises no callbacks, but discard its initial state too: the
+        // stream starts from the capture taken before the cache was consulted.
         sink = WindowSink::page(&primary, start, end, key.is_some(), reads);
         shell = Some(adapter.try_stream(r, &opts, &mut sink)?);
     }
@@ -217,20 +207,22 @@ pub(super) fn window(
         verify(r, &primary, &retry_before, &whole)?;
         return Ok((shell, whole));
     }
-    verify(r, &primary, &before, &sink)?;
-    if stable {
-        if let (Some(key), Some((index, checkpoint, meta))) = (key, sink.checkpoint.take()) {
-            cache.insert(Entry {
-                key,
-                source,
-                payload: Payload::Window {
-                    index,
-                    checkpoint,
-                    meta,
-                },
-                bytes: 0,
-            });
-        }
+    // `stable` is `verify`'s primary check on this same baseline and read set.
+    anyhow::ensure!(
+        stable && sink.reads.fresh(&mut Probe::default()),
+        "API window source changed before publication"
+    );
+    if let (Some(key), Some((index, checkpoint, meta))) = (key, sink.checkpoint.take()) {
+        cache.insert(Entry {
+            key,
+            source,
+            payload: Payload::Window {
+                index,
+                checkpoint,
+                meta,
+            },
+            bytes: 0,
+        });
     }
     Ok((shell.expect("a stream or accepted resume returned metadata"), sink))
 }
@@ -243,48 +235,29 @@ fn verify(r: &SessionRef, primary: &std::path::Path, before: &Baseline, sink: &W
     Ok(())
 }
 
-pub(super) fn head(cache: &Cache, adapter: &dyn Adapter, r: &SessionRef) -> Result<Value> {
-    let primary = adapter.resume_source(r);
-    let key = Key::admitted(r, &primary, format!("{}/api-head1", env!("CARGO_PKG_VERSION")), false);
+fn value(
+    cache: &Cache,
+    r: &SessionRef,
+    primary: &std::path::Path,
+    consumer: &str,
+    read: impl FnOnce(&mut ReadSet) -> Result<Value>,
+) -> Result<Value> {
+    let key = Key::admitted(r, primary, crate::source::consumer_version(consumer), false);
     if let Some(entry) = key.as_ref().and_then(|key| cache.get(key)) {
-        if fresh(r, &entry.source, &primary) {
+        if fresh(r, &entry.source, primary) {
             if let Payload::Head(value) = entry.payload {
                 return Ok(value);
             }
         } else {
-            cache.remove(key.as_ref().expect("cached head has a key"));
+            cache.remove(key.as_ref().expect("cached value has a key"));
         }
     }
-    let (before, reads) = captured(r, &primary);
-    struct Counter {
-        primary: std::path::PathBuf,
-        total: usize,
-        reads: ReadSet,
-    }
-    impl crate::MessageSink for Counter {
-        fn message(&mut self, message: crate::Message) -> Flow {
-            note_message_sources(&message, &self.primary, &mut self.reads);
-            self.total += 1;
-            Flow::Continue
-        }
-        fn dependency(&mut self, path: &std::path::Path) {
-            self.reads.record(path);
-        }
-    }
-    let mut counter = Counter {
-        primary: primary.clone(),
-        total: 0,
-        reads,
-    };
-    let shell = adapter.try_stream(r, &ParseOptions::lazy(), &mut counter)?;
-    let mut value = session_meta_json(&shell);
-    let map = value.as_object_mut().expect("session metadata is an object");
-    map.insert("total".into(), json!(counter.total));
-    map.insert("extra".into(), Value::Object(shell.extra));
-    let source = before.with_reads(&counter.reads);
+    let (before, mut reads) = captured(r, primary);
+    let value = read(&mut reads)?;
+    let source = before.with_reads(&reads);
     anyhow::ensure!(
-        fresh(r, &source, &primary) && counter.reads.fresh(&mut Probe::default()),
-        "API head source changed before publication"
+        fresh(r, &source, primary) && reads.fresh(&mut Probe::default()),
+        "API source changed before publication"
     );
     if let Some(key) = key.filter(|_| bounded_size(&value).is_some()) {
         cache.insert(Entry {
@@ -295,6 +268,77 @@ pub(super) fn head(cache: &Cache, adapter: &dyn Adapter, r: &SessionRef) -> Resu
         });
     }
     Ok(value)
+}
+
+pub(super) fn head(cache: &Cache, adapter: &dyn Adapter, r: &SessionRef) -> Result<Value> {
+    let primary = adapter.resume_source(r);
+    value(cache, r, &primary, "api-head1", |reads| {
+        struct Counter {
+            primary: std::path::PathBuf,
+            total: usize,
+            reads: ReadSet,
+        }
+        impl crate::MessageSink for Counter {
+            fn message(&mut self, message: crate::Message) -> Flow {
+                note_message_sources(&message, &self.primary, &mut self.reads);
+                self.total += 1;
+                Flow::Continue
+            }
+            fn dependency(&mut self, path: &std::path::Path) {
+                self.reads.record(path);
+            }
+        }
+        let mut counter = Counter {
+            primary: primary.clone(),
+            total: 0,
+            reads: std::mem::take(reads),
+        };
+        let shell = adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut counter)?;
+        let mut value = session_meta_json(&shell);
+        let map = value.as_object_mut().expect("session metadata is an object");
+        map.insert("total".into(), json!(counter.total));
+        map.insert("extra".into(), Value::Object(shell.extra));
+        *reads = counter.reads;
+        Ok(value)
+    })
+}
+
+pub(super) fn compactions(cache: &Cache, adapter: &dyn Adapter, r: &SessionRef) -> Result<Value> {
+    let primary = adapter.resume_source(r);
+    value(cache, r, &primary, "api-compactions1", |reads| {
+        struct Sink<'a> {
+            inner: crate::compaction::CompactionSink,
+            primary: &'a std::path::Path,
+            reads: &'a mut ReadSet,
+        }
+        impl crate::MessageSink for Sink<'_> {
+            fn message(&mut self, m: crate::Message) -> Flow {
+                note_message_sources(&m, self.primary, self.reads);
+                self.inner.message(m)
+            }
+            fn dependency(&mut self, path: &std::path::Path) {
+                self.reads.record(path);
+            }
+        }
+        let mut sink = Sink {
+            inner: crate::compaction::CompactionSink::new(true).with_source(&r.path),
+            primary: &primary,
+            reads,
+        };
+        adapter.try_stream(r, &Demand::FACTS.with_spans(), &mut sink)?;
+        let boundaries = sink.inner.into_boundaries()?;
+        Ok(Value::Array(
+            (0..boundaries.len())
+                .map(|n| {
+                    let mut row = crate::compaction::row(&boundaries, n);
+                    row.as_object_mut()
+                        .expect("compaction row")
+                        .insert("headline".into(), json!(boundaries[n].headline(n + 1)));
+                    row
+                })
+                .collect(),
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -353,10 +397,10 @@ mod tests {
         fn roots(&self) -> Vec<std::path::PathBuf> {
             self.inner.roots()
         }
-        fn discover(&self) -> Result<Vec<SessionRef>> {
+        fn discover(&self) -> Result<crate::Discovered> {
             self.inner.discover()
         }
-        fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+        fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
             if let Some(path) = &self.dependency {
                 sink.dependency(path);
             }
@@ -369,19 +413,19 @@ mod tests {
                 },
             )
         }
-        fn resume_format(&self) -> Option<u32> {
-            self.inner.resume_format()
-        }
         fn resume_source(&self, r: &SessionRef) -> std::path::PathBuf {
             self.inner.resume_source(r)
         }
-        fn resume(
+        fn transcript(
             &self,
             r: &SessionRef,
-            opts: &ParseOptions,
+            opts: &Demand,
+            from: Start<'_>,
             sink: &mut dyn MessageSink,
-            cp: &Checkpoint,
         ) -> Result<Option<Session>> {
+            if matches!(from, Start::Whole) {
+                return self.try_stream(r, opts, sink).map(Some);
+            }
             if self.decline {
                 return Ok(None);
             }
@@ -391,14 +435,14 @@ mod tests {
             if let Some(path) = &self.dependency {
                 sink.dependency(path);
             }
-            self.inner.try_resume(
+            self.inner.transcript(
                 r,
                 opts,
+                from,
                 &mut Observer {
                     sink,
                     messages: &self.messages,
                 },
-                cp,
             )
         }
     }
@@ -411,10 +455,7 @@ mod tests {
         let shell = adapter
             .try_stream(
                 r,
-                &ParseOptions {
-                    extra,
-                    ..ParseOptions::lazy()
-                },
+                &if extra { Demand::RICH } else { Demand::LEAN }.with_spans(),
                 &mut sink,
             )
             .unwrap();
@@ -437,7 +478,7 @@ mod tests {
 
     #[test]
     fn heads_and_windows_reject_mutation_before_publication() {
-        struct Mutating(bool);
+        struct Mutating;
         impl Adapter for Mutating {
             fn harness(&self) -> Harness {
                 Harness::Claude
@@ -445,13 +486,10 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
-            fn resume_format(&self) -> Option<u32> {
-                self.0.then_some(1)
-            }
-            fn stream(&self, r: &SessionRef, _: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+            fn stream(&self, r: &SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
                 let mut message = Message::new(crate::Role::Assistant);
                 message.content.push(crate::Block::Text {
                     text: "selected".into(),
@@ -465,15 +503,12 @@ mod tests {
         let path = world.home.join("source");
         std::fs::write(&path, b"original").unwrap();
         let r = SessionRef::new("mutating", Harness::Claude, path);
-        for resumable in [false, true] {
-            std::fs::write(&r.path, b"original").unwrap();
-            let cache = Cache::default();
-            assert!(window(&cache, &Mutating(resumable), &r, 0, Some(1), false).is_err());
-            assert!(cache.entries.lock().unwrap().is_empty());
-        }
+        let cache = Cache::default();
+        assert!(window(&cache, &Mutating, &r, 0, Some(1), false).is_err());
+        assert!(cache.entries.lock().unwrap().is_empty());
         std::fs::write(&r.path, b"original").unwrap();
         let cache = Cache::default();
-        assert!(head(&cache, &Mutating(false), &r).is_err());
+        assert!(head(&cache, &Mutating, &r).is_err());
         assert!(cache.entries.lock().unwrap().is_empty());
     }
 
@@ -561,6 +596,28 @@ mod tests {
     }
 
     #[test]
+    fn compactions_reuse_verified_rows_and_invalidate_on_append() {
+        let world = crate::test_world("api-compaction-cache");
+        let r = fixture(&world, 3);
+        let inner = crate::harness::claude::Claude::with_config_dir(&world.home.join(".claude"));
+        let adapter = Observed::new(&inner);
+        let cache = Cache::default();
+        assert_eq!(compactions(&cache, &adapter, &r).unwrap(), json!([]));
+        let count = adapter.messages.load(Ordering::Relaxed);
+        assert_eq!(compactions(&cache, &adapter, &r).unwrap(), json!([]));
+        assert_eq!(adapter.messages.load(Ordering::Relaxed), count);
+        use std::io::Write as _;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&r.path).unwrap(),
+            r#"{{"type":"system","subtype":"compact_boundary","uuid":"boundary","compactMetadata":{{"trigger":"auto","preTokens":1000}}}}"#).unwrap();
+        let rows = compactions(&cache, &adapter, &r).unwrap();
+        assert_eq!(rows[0]["boundary_msg_idx"], 3);
+        assert!(adapter.messages.load(Ordering::Relaxed) > count);
+        let count = adapter.messages.load(Ordering::Relaxed);
+        assert_eq!(compactions(&cache, &adapter, &r).unwrap(), rows);
+        assert_eq!(adapter.messages.load(Ordering::Relaxed), count);
+    }
+
+    #[test]
     fn pages_resume_and_heads_reuse_only_unchanged_sources() {
         let world = crate::test_world("api_cache_invalidation");
         let r = fixture(&world, 20);
@@ -605,10 +662,10 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
-            fn stream(&self, r: &SessionRef, _: &ParseOptions, _: &mut dyn MessageSink) -> Result<Session> {
+            fn stream(&self, r: &SessionRef, _: &Demand, _: &mut dyn MessageSink) -> Result<Session> {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 let mut shell = Session::new(&r.id, r.harness);
                 shell.title = r.title.clone();
@@ -631,7 +688,7 @@ mod tests {
                 2 => r.cwd = Some(world.home.join("new-cwd")),
                 3 => r.created_at = Some("2026-01-01T00:00:00Z".parse().unwrap()),
                 4 => r.updated_at = Some("2026-02-01T00:00:00Z".parse().unwrap()),
-                5 => r.message_count = 42,
+                5 => r.message_count = Some(42),
                 _ => {}
             }
             let value = head(&cache, &adapter, &r).unwrap();
@@ -639,7 +696,7 @@ mod tests {
             assert_eq!(value["cwd"], json!(r.cwd));
             assert_eq!(value["extra"]["created_hint"], json!(r.created_at));
             assert_eq!(value["extra"]["updated_hint"], json!(r.updated_at));
-            assert_eq!(value["extra"]["catalog_count"], r.message_count);
+            assert_eq!(value["extra"]["catalog_count"], json!(r.message_count));
             assert_eq!(head(&cache, &adapter, &r).unwrap(), value);
             assert_eq!(adapter.0.load(Ordering::Relaxed), i + 1);
         }
@@ -663,13 +720,13 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn resume_source(&self, _: &SessionRef) -> std::path::PathBuf {
                 self.0.clone()
             }
-            fn stream(&self, r: &SessionRef, _: &ParseOptions, _: &mut dyn MessageSink) -> Result<Session> {
+            fn stream(&self, r: &SessionRef, _: &Demand, _: &mut dyn MessageSink) -> Result<Session> {
                 self.1.fetch_add(1, Ordering::Relaxed);
                 let mut s = Session::new(&r.id, r.harness);
                 s.title = Some(std::fs::read_to_string(&self.0)?);
@@ -902,10 +959,10 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
-            fn stream(&self, r: &SessionRef, _: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+            fn stream(&self, r: &SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 let input = crate::json::Json::source(&self.path, 0, std::fs::metadata(&self.path)?.len())?;
                 let mut message = Message::new(crate::Role::Assistant);
@@ -933,7 +990,7 @@ mod tests {
         assert_eq!(adapter.calls.load(Ordering::Relaxed), 1);
         let (before, reads) = captured(&r, &crate::source::primary_path(&r));
         let mut sink = WindowSink::page(&crate::source::primary_path(&r), 1, Some(2), false, reads);
-        adapter.try_stream(&r, &ParseOptions::lazy(), &mut sink).unwrap();
+        adapter.try_stream(&r, &Demand::LEAN.with_spans(), &mut sink).unwrap();
         let source = before.with_reads(&sink.reads);
         assert!(fresh(&r, &source, &crate::source::primary_path(&r)));
         std::fs::write(path, r#"{"command":"updated"}"#).unwrap();

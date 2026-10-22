@@ -23,6 +23,7 @@ pub struct Env {
     vars: HashMap<OsString, OsString>,
     home: Option<PathBuf>,
     cache: Option<PathBuf>,
+    frozen: bool,
     /// What the library keeps alive while this environment is in use: its current catalog's scan
     /// cache. Shared by the copies [`Scope::set`] makes, so a variable change keeps it.
     retained: Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>,
@@ -41,6 +42,7 @@ impl Env {
             vars: std::env::vars_os().collect(),
             home: dirs::home_dir(),
             cache: dirs::cache_dir(),
+            frozen: std::env::var_os("CV_FROZEN").is_some_and(|v| v == "1"),
             retained: Default::default(),
         }
     }
@@ -56,7 +58,14 @@ impl Env {
         env
     }
 
+    /// Disable store writes, including in child commands inheriting this environment.
+    pub fn with_frozen(mut self) -> Self {
+        self.set("CV_FROZEN", Some(OsStr::new("1")));
+        self
+    }
+
     fn derive(&mut self) {
+        self.frozen = self.vars.get(OsStr::new("CV_FROZEN")).is_some_and(|v| v == "1");
         let var = |k: &str| self.var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         let home = if cfg!(windows) { var("USERPROFILE") } else { var("HOME") };
         let cache = if cfg!(target_os = "macos") {
@@ -215,7 +224,7 @@ impl Scope {
     fn update(key: &str, value: Option<&OsStr>) {
         SCOPED.with(|s| {
             let mut slot = s.borrow_mut();
-            let mut env = slot.as_deref().cloned().unwrap_or_else(|| (*Env::process()).clone());
+            let mut env = slot.as_deref().expect("updating an entered environment").clone();
             env.set(key, value);
             *slot = Some(Arc::new(env));
         });
@@ -227,6 +236,12 @@ impl Drop for Scope {
         let prev = self.prev.take();
         SCOPED.with(|s| *s.borrow_mut() = prev);
     }
+}
+
+/// Whether this command must leave cv’s stores untouched (`--frozen` or `CV_FROZEN=1`).
+/// Resolved once with the environment; scoped callers and their workers share the same policy.
+pub fn frozen() -> bool {
+    Env::current().frozen
 }
 
 /// `std::env::var_os` over [`Env::current`].
@@ -247,6 +262,22 @@ pub fn home_dir() -> Option<PathBuf> {
 /// `dirs::cache_dir` over [`Env::current`].
 pub fn cache_dir() -> Option<PathBuf> {
     Env::current().cache_dir()
+}
+
+/// The third channel of the skip policy (`harness::Skipped` names all three): an accelerator
+/// (the catalog, a cache, an index) that cannot open DEGRADES ONCE. The first failure of `what`
+/// in this process prints one stderr line and cv carries on without it; later failures of the
+/// same `what` print nothing. Nothing is memoized but the line: the caller retries the open next
+/// time, so an accelerator that recovers serves again. Returns whether this call printed.
+pub fn warn_once(what: &'static str, why: impl std::fmt::Display) -> bool {
+    static WARNED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut warned = WARNED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.contains(&what) {
+        return false;
+    }
+    warned.push(what);
+    eprintln!("cv: {what} unavailable, continuing without it: {why}");
+    true
 }
 
 /// `f` wrapped to run in the caller's entered environment, for a thread the library spawns.
@@ -290,5 +321,27 @@ mod tests {
         assert_eq!(Env::current().cv_home(), Some(PathBuf::from("/cv")));
         drop(outer);
         assert!(Env::scoped().is_none());
+    }
+
+    #[test]
+    fn frozen_is_resolved_with_the_environment_and_carried() {
+        let _outer = Env::from_vars([("CV_FROZEN", "0")]).enter();
+        assert!(!frozen());
+        {
+            let _inner = Env::from_vars([("CV_FROZEN", "1")]).enter();
+            assert!(frozen());
+            assert!(std::thread::spawn(carry(frozen)).join().unwrap());
+        }
+        assert!(!frozen());
+        let _flag = Env::default().with_frozen().enter();
+        assert!(frozen());
+        assert_eq!(var("CV_FROZEN").unwrap(), "1");
+    }
+
+    #[test]
+    fn warn_once_prints_one_line_per_accelerator() {
+        assert!(warn_once("env test accelerator", "first"));
+        assert!(!warn_once("env test accelerator", "second"));
+        assert!(warn_once("env test other accelerator", "first"));
     }
 }

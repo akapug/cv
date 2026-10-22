@@ -1,13 +1,14 @@
 //! Per-harness adapters: discover sessions on disk, parse them into the IR, and (optionally)
 //! emit the IR back into a harness's native format for cross-harness porting.
 
-use crate::ir::{Harness, Session, SessionRef};
-use crate::stream::{Flow, MessageSink, ParseOptions};
+use crate::ir::{Harness, Message, Session, SessionRef};
+#[cfg(test)]
+use crate::stream::Flow;
+use crate::stream::{Demand, MessageSink};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub mod claude;
 /// Claude Code `Workflow`-tool runs (phase tree + script), a first-class layer over the
@@ -26,7 +27,6 @@ pub mod gemini;
 #[cfg(feature = "sqlite")]
 pub mod goose;
 pub mod grok;
-pub mod harmony;
 #[cfg(feature = "sqlite")]
 pub mod hermes;
 pub mod kimi;
@@ -94,92 +94,8 @@ impl EpochNumber for u64 {
     }
 }
 
-/// Drive a tolerant JSONL pass over `reader`: blank and malformed lines are skipped (never fail a
-/// session over one bad record), every parsed record goes to `f`, and `Flow::Stop` ends the pass
-/// early. **Not** for offset-tracking paths (the claude/codex lazy-span readers need each line's
-/// byte offset and keep their own `read_until`/mmap loops).
-///
-/// Returns how many non-blank lines were skipped as unreadable (corrupt JSON or an undecodable
-/// read) before the pass ended — adapters surface a non-zero count via
-/// [`note_skipped_lines`] so silent corruption is at least visible in the session metadata.
-pub(crate) fn for_each_json_line<R: BufRead>(reader: R, f: impl FnMut(Value) -> Flow) -> u64 {
-    for_each_json_line_with(reader, |line| serde_json::from_str(line).ok(), f)
-}
-
-/// [`for_each_json_line`] with the line parser given: `parse` returns `None` for a line it cannot
-/// read (counted as skipped).
-pub(crate) fn for_each_json_line_with<R: BufRead>(
-    reader: R,
-    mut parse: impl FnMut(&str) -> Option<Value>,
-    mut f: impl FnMut(Value) -> Flow,
-) -> u64 {
-    for_each_json_line_at_with(reader, 0, &mut parse, |value, _, _, _| f(value))
-}
-
-/// The same tolerant record contract with absolute consumed positions for append checkpoints.
-/// `complete` is true only after a newline and known byte accounting; a partial EOF record is
-/// emitted but must be replayed on growth. JSON/UTF-8 failures remain per-line skips.
+/// Independent owned-value oracle for codec tests; production reads use `store::jsonl`.
 #[cfg(test)]
-pub(crate) fn for_each_json_line_at<R: BufRead>(
-    reader: R,
-    offset: u64,
-    f: impl FnMut(Value, u64, bool, u64) -> Flow,
-) -> u64 {
-    for_each_json_line_at_with(reader, offset, |line| serde_json::from_str(line).ok(), f)
-}
-
-/// Offset-tracked records with the same caller-supplied parser as [`for_each_json_line_with`].
-pub(crate) fn for_each_json_line_at_with<R: BufRead>(
-    reader: R,
-    offset: u64,
-    parse: impl FnMut(&str) -> Option<Value>,
-    f: impl FnMut(Value, u64, bool, u64) -> Flow,
-) -> u64 {
-    scan_json_lines(reader, offset, parse, f).0
-}
-
-fn scan_json_lines<R: BufRead>(
-    mut reader: R,
-    mut offset: u64,
-    mut parse: impl FnMut(&str) -> Option<Value>,
-    mut f: impl FnMut(Value, u64, bool, u64) -> Flow,
-) -> (u64, std::io::Result<()>) {
-    let mut skipped = 0;
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        loop {
-            match reader.read_until(b'\n', &mut line) {
-                Ok(0) if line.is_empty() => return (skipped, Ok(())),
-                Ok(_) => {
-                    offset += line.len() as u64;
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return (skipped + 1, Err(error)),
-            }
-        }
-        let complete = line.last() == Some(&b'\n');
-        let Ok(text) = std::str::from_utf8(&line) else {
-            skipped += 1;
-            continue;
-        };
-        let text = store::json::trim_str(text);
-        if text.is_empty() {
-            continue;
-        }
-        let Some(value) = parse(text) else {
-            skipped += 1;
-            continue;
-        };
-        if f(value, offset, complete, skipped) == Flow::Stop {
-            break;
-        }
-    }
-    (skipped, Ok(()))
-}
-
-/// [`for_each_json_line`] over already-read text (no per-line allocation). Returns the skip count.
 pub(crate) fn for_each_json_line_str(text: &str, mut f: impl FnMut(Value) -> Flow) -> u64 {
     let mut skipped = 0u64;
     let mut parse = |line: &str| serde_json::from_str(line).ok();
@@ -191,6 +107,7 @@ pub(crate) fn for_each_json_line_str(text: &str, mut f: impl FnMut(Value) -> Flo
     skipped
 }
 
+#[cfg(test)]
 fn each_json_line_inner(
     line: &str,
     skipped: &mut u64,
@@ -217,7 +134,7 @@ fn each_json_line_inner(
 /// list that GROWS — every new cross-harness diagnostic would have to be added to it and to every
 /// consumer that walks `extra` (see `harness::claude::emit::is_internal_extra_key`). A namespace does
 /// not. So §4's exceptions stay exactly what they are today, both on `Message` only:
-/// [`claude::CARRIER_KEY`] (`_record`, the verbatim source record under `ParseOptions::complete`)
+/// [`CARRIER_KEY`](crate::ir::CARRIER_KEY) (`_record`, the verbatim source record under `Demand::COMPLETE`)
 /// and [`crate::offsets::OFFSET_KEY`] (`cv_byte_offset`, written per message on the lazy-offset hot
 /// path, where a nested map per message would be pure allocation). `Session::extra` has **no** flat
 /// exception: every top-level key there is a namespace object — a harness name or `"cv"`.
@@ -235,6 +152,179 @@ pub(crate) fn note_skipped_lines(s: &mut Session, skipped: u64) {
     }
 }
 
+/// An aborted in-memory read keeps its diagnostic on the partial session, never an unmarked empty.
+pub(crate) fn note_read_error(session: &mut Session, result: anyhow::Result<()>) {
+    if let Err(error) = result {
+        session
+            .cv_extra_mut()
+            .insert("read_error".into(), Value::String(format!("{error:#}")));
+    }
+}
+
+/// The first channel of the skip policy: the records one read could not parse, COUNTED, never
+/// dropped silently. An adapter keeps one per read and writes it once with [`Unparsed::note`]
+/// (`extra["cv"]["skipped_lines"]`, nothing when zero, so a clean read is unchanged).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unparsed(pub(crate) u64);
+
+impl Unparsed {
+    /// One record that decoded to nothing. (Its callers today are SQLite stores; the line
+    /// readers carry their count in resumable state and hand it to [`Unparsed::note`].)
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    pub(crate) fn count(&mut self) {
+        self.0 += 1;
+    }
+
+    /// Write the count on `s` ([`note_skipped_lines`]).
+    pub(crate) fn note(self, s: &mut Session) {
+        note_skipped_lines(s, self.0);
+    }
+}
+
+/// A source [`Adapter::discover`] found but could not open (a locked or corrupt database, an
+/// unreadable directory, a file that fails to decode at open): its sessions are absent from the
+/// listing, and this says why. The skip policy is one rule in three channels: a record that
+/// cannot parse is counted ([`note_skipped_lines`]); a source that cannot open is reported here,
+/// persisted by the catalog and shown by `cv doctor`; an accelerator that cannot open degrades
+/// once (one stderr line per process). A source that is not there (`NotFound`) is the only honest
+/// empty and is never a `Skipped`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Skipped {
+    pub path: PathBuf,
+    /// The error's one-line rendering (its whole cause chain).
+    pub why: String,
+}
+
+impl Skipped {
+    /// `error` at `path` as a skip, or `None` when the error is a `NotFound` (nothing there).
+    pub fn of(path: impl Into<PathBuf>, error: &anyhow::Error) -> Option<Skipped> {
+        (!is_not_found(error)).then(|| Skipped {
+            path: path.into(),
+            why: format!("{error:#}"),
+        })
+    }
+
+    /// One source's scan as an item a [`Discovered`] collects: its ref, nothing (the source holds
+    /// no session), or a skip (any error but `NotFound`).
+    pub fn listed(path: &std::path::Path, scanned: Result<Option<SessionRef>>) -> Option<Result<SessionRef, Skipped>> {
+        match scanned {
+            Ok(r) => r.map(Ok),
+            Err(e) => Skipped::of(path, &e).map(Err),
+        }
+    }
+
+    /// One source's scan of several sessions as items a [`Discovered`] collects.
+    pub fn listed_many(
+        path: &std::path::Path,
+        scanned: Result<Vec<SessionRef>>,
+    ) -> Vec<std::result::Result<SessionRef, Skipped>> {
+        match scanned {
+            Ok(refs) => refs.into_iter().map(Ok).collect(),
+            Err(e) => Skipped::of(path, &e).map(Err).into_iter().collect(),
+        }
+    }
+
+    /// A directory walk's error as a skip: an unreadable directory hides every session under it.
+    /// `None` for a `NotFound` (an entry removed mid-walk).
+    pub fn walk(error: &walkdir::Error) -> Option<Skipped> {
+        if error
+            .io_error()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return None;
+        }
+        Some(Skipped {
+            path: error.path()?.to_path_buf(),
+            why: error.to_string(),
+        })
+    }
+}
+
+/// `error` is a `NotFound` somewhere in its chain: the source is not there, the only honest empty.
+pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|e| e.downcast_ref::<std::io::Error>())
+        .any(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// What [`Adapter::discover`] found: the sessions it could list and the sources it could not open.
+/// Reads as its `refs` (`Deref` to the `Vec`, `IntoIterator` over them); `skipped` rides beside.
+#[derive(Debug, Default)]
+pub struct Discovered {
+    pub refs: Vec<SessionRef>,
+    pub skipped: Vec<Skipped>,
+}
+
+impl Discovered {
+    /// `result` read at `path`: its value, or `None` with the error recorded as a skip (dropped
+    /// when it is a `NotFound`).
+    pub fn keep<T>(&mut self, path: &std::path::Path, result: Result<T>) -> Option<T> {
+        result.map_err(|e| self.skipped.extend(Skipped::of(path, &e))).ok()
+    }
+
+    /// One source's outcome ([`Skipped::listed`]): a ref or a skip.
+    pub fn push(&mut self, found: std::result::Result<SessionRef, Skipped>) {
+        match found {
+            Ok(r) => self.refs.push(r),
+            Err(s) => self.skipped.push(s),
+        }
+    }
+}
+
+impl From<Vec<SessionRef>> for Discovered {
+    fn from(refs: Vec<SessionRef>) -> Self {
+        Discovered {
+            refs,
+            skipped: Vec::new(),
+        }
+    }
+}
+
+impl FromIterator<SessionRef> for Discovered {
+    fn from_iter<I: IntoIterator<Item = SessionRef>>(iter: I) -> Self {
+        Vec::from_iter(iter).into()
+    }
+}
+
+/// Per-source outcomes of a parallel scan, a ref or a skip each.
+impl FromIterator<Result<SessionRef, Skipped>> for Discovered {
+    fn from_iter<I: IntoIterator<Item = Result<SessionRef, Skipped>>>(iter: I) -> Self {
+        let mut out = Discovered::default();
+        iter.into_iter().for_each(|found| out.push(found));
+        out
+    }
+}
+
+impl std::ops::Deref for Discovered {
+    type Target = Vec<SessionRef>;
+    fn deref(&self) -> &Vec<SessionRef> {
+        &self.refs
+    }
+}
+
+impl std::ops::DerefMut for Discovered {
+    fn deref_mut(&mut self) -> &mut Vec<SessionRef> {
+        &mut self.refs
+    }
+}
+
+impl IntoIterator for Discovered {
+    type Item = SessionRef;
+    type IntoIter = std::vec::IntoIter<SessionRef>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.refs.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Discovered {
+    type Item = &'a SessionRef;
+    type IntoIter = std::slice::Iter<'a, SessionRef>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.refs.iter()
+    }
+}
+
 /// Result of emitting an IR session into a harness's native on-disk format.
 #[derive(Debug, Clone)]
 pub struct EmitResult {
@@ -246,12 +336,67 @@ pub struct EmitResult {
     pub resume_hint: Option<String>,
 }
 
+/// The keys of a native record that carry its identity, as a derived copy rewrites them
+/// ([`Adapter::identity`]): the session id is restamped, a standalone copy of a sub-agent
+/// transcript drops the agent id and clears the sidechain flag, and a re-rooted record's parent
+/// link is nulled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity {
+    /// Top-level keys whose string value is the session id.
+    pub session_keys: &'static [&'static str],
+    pub agent_key: &'static str,
+    pub sidechain_key: &'static str,
+    pub parent_key: &'static str,
+}
+
+/// The static facts an adapter declares about its harness, in one value: what a shared module asks
+/// instead of naming a harness (`docs/INTERFACE-V2.md` §4), each "no opinion" in
+/// [`Capabilities::NONE`]. An adapter that declares any writes the whole literal (no `..NONE`), so
+/// a new fact is a compile error at every adapter that has an opinion, not a silent default.
+/// `#[non_exhaustive]`: a crate outside cv-core starts from `NONE` and sets fields.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct Capabilities {
+    /// The wordings of an error tool result that mean the call was denied (an approval refused, a
+    /// rule matched).
+    pub denials: &'static [crate::affordance::Denial],
+    /// What its edit hook answers when another live writer edited the file; `None`: no edit guard.
+    pub edit_guard: Option<crate::hooks::EditGuard>,
+    /// How its hook rows in cv's lane ledger name the sub-agents whose `stop` counts for a parent;
+    /// `None`: its hooks write no lane rows.
+    pub lane_stops: Option<crate::lanes::StopScope>,
+    /// The deferred-tool wrapper its reader leaves in calls, for
+    /// [`crate::affordance::AffordanceSink`] to unwrap; `None`: it leaves none.
+    pub deferred_wrapper: Option<crate::affordance::DeferredWrapper>,
+    /// Whether a [`Demand::RICH`] stream with spans keeps the same full-extra metadata as an
+    /// inline one, so a tail can leave large payloads in the source; `false`: read inline.
+    pub rich_spans: bool,
+    /// cv's own tuning, not a harness fact: the primary size below which parsing a transcript costs
+    /// less than validating and replaying its usage-cache ledger, so the cache is skipped; 0: always
+    /// use it.
+    pub usage_cache_floor: u64,
+}
+
+impl Capabilities {
+    /// No opinion on any fact.
+    pub const NONE: Capabilities = Capabilities {
+        denials: &[],
+        edit_guard: None,
+        lane_stops: None,
+        deferred_wrapper: None,
+        rich_spans: false,
+        usage_cache_floor: 0,
+    };
+}
+
 /// A harness adapter: where a harness keeps its sessions ([`roots`](Adapter::roots)), how to list
 /// them cheaply ([`discover`](Adapter::discover)), and how to read one as a message stream
 /// ([`stream`](Adapter::stream)). Implementors live in submodules and are registered in [`all`].
 /// A whole-session parse is not a fourth method: it is [`stream::collect`](crate::stream::collect)
 /// over `stream`, spelled `adapter.parse(&r)` on a `dyn Adapter`, so the streaming and the
 /// whole-session readers cannot diverge.
+/// Incremental reads are optional: checkpoint/resume methods default to declining, while
+/// source and dependency methods describe the inputs consumers must validate before reuse.
 ///
 /// `Send + Sync` so [`crate::discover_all`] can fan discovery across adapters in parallel. Every
 /// adapter holds only path data (connections are opened per call), so this bound is always satisfied.
@@ -266,40 +411,87 @@ pub trait Adapter: Send + Sync {
     /// no watch for. Empty when the harness is not installed.
     fn roots(&self) -> Vec<PathBuf>;
 
-    /// Cheaply enumerate sessions without fully parsing them.
-    fn discover(&self) -> Result<Vec<SessionRef>>;
+    /// Cheaply enumerate sessions without fully parsing them, and name the sources found but
+    /// unreadable ([`Discovered::skipped`]). `Err` only when the whole store cannot be listed.
+    fn discover(&self) -> Result<Discovered>;
 
     /// Stream a session's messages into `sink` one at a time, dropping each before the next, so
     /// peak memory is O(largest message) rather than O(transcript). Returns the session's metadata
     /// (id/cwd/title/model/git/timestamps) with an **empty** `messages` vec — the messages went to
-    /// the sink. `opts` controls how much of each message is materialized (see [`ParseOptions`]).
+    /// the sink. `opts` controls how much of each message is materialized (see [`Demand`]).
     /// See [`claude`](crate::harness::claude) for the reference; a store that can only be read
     /// whole hands its parsed session to [`crate::stream::replay`].
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session>;
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session>;
 
     /// Checked stream boundary for all implementations, including third-party adapters which
     /// implement only [`Self::stream`]. Consumer failures are errors, never successful stops.
-    fn try_stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn try_stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| self.stream(r, opts, sink))
     }
 
-    /// [`Self::resume`] with the same consumer error guard as [`Self::try_stream`]. A failed
-    /// consumer must not publish a mark even if the adapter offered checkpoints before failing.
-    fn try_resume(
+    /// Read `r` from `from`: whole, from a checkpoint an earlier read of the same file took (then
+    /// shorter), or as the first bytes of an append-only transcript ([`Start`](crate::stream::Start)).
+    /// A continued read delivers to `sink` exactly what the whole read would after that point and
+    /// returns the session the whole read returns; the caller has checked that the bytes before
+    /// the checkpoint are the ones it was taken on. Consumer failures are errors, as in
+    /// [`Self::try_stream`]. `Ok(None)`: this adapter or this file cannot start there (no state,
+    /// another layout, another codec version); nothing reached `sink`. A JSONL transcript is read
+    /// by the one driver ([`store::jsonl::drive`]), whose checkpoints are the only ones a read
+    /// offers. Default: a whole read streams, any other start declines.
+    fn transcript(
         &self,
         r: &SessionRef,
-        opts: &ParseOptions,
+        opts: &Demand,
+        from: crate::stream::Start<'_>,
         sink: &mut dyn MessageSink,
-        from: &crate::stream::Checkpoint,
     ) -> Result<Option<Session>> {
-        crate::stream::checked(sink, |sink| self.resume(r, opts, sink, from))
+        match from {
+            crate::stream::Start::Whole => self.try_stream(r, opts, sink).map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// The affordances that live only in a side store beside the transcript (a todo file, a
     /// table, a state row): the session's current plan, goals, schedules. Rows have no message
-    /// index (`docs/design/AFFORDANCES.md`). Default: the store keeps none. Unreadable side files
-    /// are skipped, never an error: the transcript is the session; this is a view over its store.
-    fn store_affordances(&self, _r: &SessionRef) -> Vec<crate::affordance::Affordance> {
+    /// index (`docs/design/AFFORDANCES.md`). Default: the store keeps none. Missing optional side
+    /// files are empty; unreadable files or rows are errors.
+    fn store_affordances(&self, _r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
+        Ok(Vec::new())
+    }
+
+    /// The affordances the session's own harness bag records once per session (a permission
+    /// mode, a todo state, a ruleset), in the order [`crate::affordance::session_rows`] lists them
+    /// after the shared mode row. Default: the bag records none.
+    fn session_affordances(&self, _s: &Session) -> Vec<crate::affordance::Affordance> {
+        Vec::new()
+    }
+
+    /// The launch description of the sub-agent `s` is, as this harness's bag in `s` records it
+    /// (the store keeps it beside the transcript). Default: the harness records none.
+    fn agent_description<'s>(&self, _s: &'s Session) -> Option<&'s str> {
+        None
+    }
+
+    /// The static facts this adapter declares about its harness ([`Capabilities`]). Default:
+    /// [`Capabilities::NONE`], no opinion on any.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::NONE
+    }
+
+    /// The affordance `m` is as one of this harness's own records that no `MessageKind` names (a
+    /// skill load, a completion notice, a refused call), its leading text read through `first`.
+    /// Default: the harness writes none.
+    fn record_affordance(
+        &self,
+        _m: &Message,
+        _first: &crate::affordance::FirstText<'_>,
+    ) -> Result<Option<crate::affordance::RecordHit>> {
+        Ok(None)
+    }
+
+    /// The affordances `m`'s harness bag records outside its blocks (a patch or snapshot part
+    /// riding the turn), in order. Default: the bag records none.
+    fn message_affordances(&self, _m: &Message) -> Vec<crate::affordance::BagHit> {
         Vec::new()
     }
 
@@ -309,16 +501,6 @@ pub trait Adapter: Send + Sync {
     /// Default: nothing copied (Codex lean passes already drop a rollout's inherited prefix).
     /// Paths the answer depends on are reported to `sink`.
     fn copied_before(&self, _r: &SessionRef, _sink: &mut dyn MessageSink) -> Option<DateTime<Utc>> {
-        None
-    }
-
-    /// The version of the state this adapter puts in a [`Checkpoint`], when its
-    /// [`stream`](Adapter::stream) offers checkpoints at all (only on an append-only transcript
-    /// file). It is part of every stored mark's version, so changing what the state holds, or what
-    /// a record parses to, means bumping it. `None`: the adapter never offers one.
-    ///
-    /// [`Checkpoint`]: crate::stream::Checkpoint
-    fn resume_format(&self) -> Option<u32> {
         None
     }
 
@@ -344,21 +526,198 @@ pub trait Adapter: Send + Sync {
         Some(())
     }
 
-    /// Continue a [`stream`](Adapter::stream) of `r` from `from`, a checkpoint an earlier stream of
-    /// the same file (then shorter) took: read from `from.offset` on with the adapter state it
-    /// kept, so `sink` sees exactly the messages the whole stream would deliver after that point,
-    /// and the returned session is the one the whole stream returns. `Ok(None)`: this adapter, or
-    /// this file, cannot resume from it (no state, a different layout); nothing reached `sink`.
-    /// The caller has checked that the bytes before `from.offset` are the ones it was taken on.
-    fn resume(
-        &self,
-        _r: &SessionRef,
-        _opts: &ParseOptions,
-        _sink: &mut dyn MessageSink,
-        _from: &crate::stream::Checkpoint,
-    ) -> Result<Option<Session>> {
+    // The facts below are what a shared module asks instead of naming a harness
+    // (`docs/INTERFACE-V2.md` §4). Each default is "no opinion"; none depends on the adapter's
+    // roots, so a shared module asks them of [`rootless`] without detecting a store.
+
+    /// The hook call `payload` (the JSON the harness pipes to `cv hook <name>`) as one
+    /// [`crate::hooks::Event`], decoded by the adapter that owns the payload's shape. Default:
+    /// `None`, the harness has no verified hook contract.
+    fn hook_event(&self, _payload: &Value) -> Result<Option<crate::hooks::Event>> {
         Ok(None)
     }
+
+    /// The lineage a live transcript records in its header, read without parsing its history
+    /// (a hook's budget). Default: the header records none.
+    fn hook_lineage(&self, _transcript: &std::path::Path) -> Result<Option<crate::ir::Lineage>> {
+        Ok(None)
+    }
+
+    /// The transcript of `agent_session`, a sub-agent of `parent` (inside `workflow`'s run when
+    /// given), as this store lays it out beside its parent. Default: the store keeps none there.
+    fn agent_transcript(&self, _parent: &SessionRef, _agent_session: &str, _workflow: Option<&str>) -> Option<PathBuf> {
+        None
+    }
+
+    /// Where the sub-agent transcript at `transcript` ended (last turn, last stop, a fatal API
+    /// notice), when the store records it there. Default: it records none.
+    fn subagent_end(&self, _transcript: &std::path::Path) -> Result<Option<crate::lanes::SubagentEnd>> {
+        Ok(None)
+    }
+
+    /// The last status notice `parent`'s own records give each sub-agent, by agent id. Default:
+    /// the parent records none.
+    fn task_notices(
+        &self,
+        _parent: &SessionRef,
+    ) -> Result<std::collections::HashMap<String, crate::lanes::TaskNotice>> {
+        Ok(std::collections::HashMap::new())
+    }
+
+    /// The newest compaction boundary in the last `tail` bytes of `transcript`:
+    /// `(trigger, tokens before)`. Default: the store records none a tail read can find.
+    fn last_compact_boundary(
+        &self,
+        _transcript: &std::path::Path,
+        _tail: u64,
+    ) -> Result<Option<(Option<String>, Option<u64>)>> {
+        Ok(None)
+    }
+
+    /// The native keys a derived copy of a session (`cv prune`, `cv rewind`, `cv adopt`) rewrites,
+    /// for the shared writer in `derive`. Default: none; the harness has no derived copies.
+    fn identity(&self) -> Option<Identity> {
+        None
+    }
+
+    /// Whether `r`'s source is a SQLite database, whose `-wal`/`-journal` sidecars then guard it;
+    /// `None` when that cannot be determined (no consumer certifies it). Default: by its extension.
+    fn sqlite_source(&self, r: &SessionRef) -> Option<bool> {
+        Some(crate::source::has_sqlite_extension(&r.path))
+    }
+
+    /// A metadata file beside `r`'s store that, once written, can supply a cwd or title the store
+    /// lacks: watched by the catalog and recorded as a read dependency even while absent.
+    /// Default: none.
+    fn metadata_file(&self, _r: &SessionRef) -> Option<PathBuf> {
+        None
+    }
+
+    /// The identity that makes two of this harness's messages *the same API call*, when its
+    /// store repeats one (so usage is counted once). Default: every message is its own call.
+    fn usage_key(&self, _m: &Message) -> Option<String> {
+        None
+    }
+
+    /// How a change to `r` shows on disk, so the catalog's freshness probe knows what to watch.
+    /// Default: as a directory change ([`WatchPolicy::Tree`]).
+    fn watch_policy(&self, _r: &SessionRef) -> WatchPolicy {
+        WatchPolicy::Tree
+    }
+
+    /// Whether `r`'s transcript only ever grows by appending lines, so its first `n` bytes pin a
+    /// past state, read back by [`Self::transcript`] from
+    /// [`Start::Prefix`](crate::stream::Start::Prefix). A follower records a byte mark for such a
+    /// session and resolves it later. Default: not append-only.
+    fn append_only(&self, _r: &SessionRef) -> bool {
+        false
+    }
+
+    /// The file edit `m`'s harness record states outside its tool blocks (Codex's `FileChange`
+    /// item), so the event extractor counts it without reading the harness bag itself. Default:
+    /// none.
+    fn native_edit<'m>(&self, _m: &'m Message) -> Option<crate::events::NativeEdit<'m>> {
+        None
+    }
+
+    /// The harness's own kind for an injected-context turn it recorded (Claude's
+    /// `attachment_type`, e.g. `hook_success`). Default: the store records none.
+    fn attachment_kind<'m>(&self, _m: &'m Message) -> Option<&'m str> {
+        None
+    }
+
+    /// Whether thinking recorded under `model` came from the provider this harness replays
+    /// natively (its signatures are valid as they are). [`crate::emit::ThinkingMode::replay_default`]
+    /// replays natively only when every recorded model is one some adapter claims. Default: no.
+    fn native_thinking(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// The sub-agent forest `r` spawned, newest first, keeping the members `select(id, workflow)`
+    /// admits (and only `workflow`'s, when given) before their bodies or optional metadata are
+    /// read. `demand` bounds what each member carries. Default: the store records no forest.
+    fn forest(
+        &self,
+        _r: &SessionRef,
+        _demand: crate::SubagentDemand,
+        _workflow: Option<&str>,
+        _select: &(dyn Fn(&str, Option<&str>) -> bool + Sync),
+    ) -> Result<Vec<crate::AgentRef>> {
+        Ok(Vec::new())
+    }
+
+    /// The `Workflow`-tool runs this store records beside a session, when it records any.
+    /// Default: none.
+    fn workflows(&self) -> Option<&'static dyn Workflows> {
+        None
+    }
+}
+
+/// The members of a forest read whole that `workflow` and `select` admit, in order: the
+/// [`Adapter::forest`] of a store that cannot select before reading.
+pub(crate) fn select_forest(
+    forest: Vec<crate::AgentRef>,
+    workflow: Option<&str>,
+    select: &(dyn Fn(&str, Option<&str>) -> bool + Sync),
+) -> Vec<crate::AgentRef> {
+    forest
+        .into_iter()
+        .filter(|s| {
+            workflow.is_none_or(|run| s.workflow.as_deref() == Some(run))
+                && select(&s.session.id, s.workflow.as_deref())
+        })
+        .collect()
+}
+
+/// The [`Adapter::forest`] of a store whose sub-agents are plain session refs with no sidecar
+/// facts (no agent type, launching call or journaled outcome): one member per ref, newest first.
+pub(crate) fn ref_forest(
+    refs: Vec<SessionRef>,
+    workflow: Option<&str>,
+    select: &(dyn Fn(&str, Option<&str>) -> bool + Sync),
+) -> Vec<crate::AgentRef> {
+    let mut forest: Vec<crate::AgentRef> = refs
+        .into_iter()
+        .map(|session| crate::AgentRef {
+            session,
+            agent_type: None,
+            description: None,
+            tool_use_id: None,
+            workflow: None,
+            result_status: None,
+            result_summary: None,
+        })
+        .collect();
+    forest.sort_by_key(|s| std::cmp::Reverse(s.session.created_at));
+    select_forest(forest, workflow, select)
+}
+
+/// How a session's change shows on disk ([`Adapter::watch_policy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchPolicy {
+    /// A new or rewritten file changes its directory: watching the tree is enough.
+    Tree,
+    /// The file is a database written in place, which changes no directory: watch the file and
+    /// its write-ahead log.
+    Database,
+}
+
+/// The `Workflow`-tool runs a store records beside its sessions ([`Adapter::workflows`]).
+pub trait Workflows: Sync {
+    /// Every run `r` launched, newest first.
+    fn runs(&self, r: &SessionRef) -> Vec<crate::Workflow>;
+    /// The runs of `r` named `name` (exact or prefix), reading only matching state files.
+    fn named(&self, r: &SessionRef, name: &str) -> Vec<crate::Workflow>;
+    /// One run by its id or unambiguous name.
+    fn run(&self, r: &SessionRef, key: &str) -> Option<crate::Workflow>;
+    /// The id `key` (an id or name) resolves to, without reading undemanded bodies.
+    fn run_id(&self, r: &SessionRef, key: &str) -> Option<String>;
+    /// Launches in `r`'s transcript with no recorded run.
+    fn ghosts(&self, r: &SessionRef) -> Vec<crate::WorkflowLaunch>;
+    /// Whether `r` recorded any run at all (a cheap gate before [`Self::ghosts`]).
+    fn has_records(&self, r: &SessionRef) -> bool;
+    /// Whether one of `r`'s sub-agent transcripts (either tier) has a file name starting `stem`.
+    fn has_agent(&self, r: &SessionRef, stem: &str) -> bool;
 }
 
 /// `parse` on a concrete adapter (`Claude::detect().parse(&r)`): the same
@@ -420,6 +779,80 @@ pub fn all() -> Vec<Box<dyn Adapter>> {
     ORDER.into_iter().filter_map(for_harness).collect()
 }
 
+/// Whether `h`'s adapter declares derived copies ([`Adapter::identity`]): what `cv prune`,
+/// `cv rewind`, `cv adopt` and a distilled agent write.
+pub fn has_derived_copies(h: Harness) -> bool {
+    rootless(h).is_some_and(|a| a.identity().is_some())
+}
+
+/// The harness a derived session is written into when nothing names one (`cv distill --session |
+/// --agent-of`, `cv adopt`, a bare transcript path): the one adapter that declares derived copies.
+/// A second such adapter makes this a choice for a flag; `one_derived_host` fails until then.
+pub fn derived_host() -> Harness {
+    Harness::ALL
+        .iter()
+        .copied()
+        .find(|h| has_derived_copies(*h))
+        .expect("the Claude adapter, always built, declares derived copies")
+}
+
+/// The adapter for `h` with no roots, `None` when it is not registered in this build. It
+/// discovers nothing; a shared module asks it the facts that do not depend on where the store
+/// lives (the [`Adapter`] methods after [`Adapter::resume`]) without detecting the store.
+pub fn rootless(h: Harness) -> Option<&'static dyn Adapter> {
+    Some(match h {
+        Harness::Claude => &claude::ROOTLESS,
+        Harness::Codex => &codex::ROOTLESS,
+        Harness::Grok => &grok::ROOTLESS,
+        Harness::OpenCode => &opencode::ROOTLESS,
+        Harness::Gemini => &gemini::ROOTLESS,
+        Harness::OpenClaw => &openclaw::ROOTLESS,
+        Harness::Kimi => &kimi::ROOTLESS,
+        Harness::KimiCode => &kimi_code::ROOTLESS,
+        Harness::Qwen => &qwen::ROOTLESS,
+        Harness::LmStudio => &lmstudio::ROOTLESS,
+        Harness::Cline => &cline::ROOTLESS,
+        Harness::Roo => &roo::ROOTLESS,
+        Harness::Continue => &continuedev::ROOTLESS,
+        Harness::ChatGptExport => &export::ChatGptExport,
+        Harness::ClaudeExport => &export::ClaudeExport,
+        Harness::OpenSession => &opensession::OpenSession,
+        #[cfg(feature = "sqlite")]
+        Harness::Hermes => &hermes::ROOTLESS,
+        #[cfg(feature = "sqlite")]
+        Harness::Cursor => &cursor::ROOTLESS,
+        #[cfg(feature = "sqlite")]
+        Harness::Goose => &goose::ROOTLESS,
+        #[cfg(feature = "sqlite")]
+        Harness::Zed => &zed::ROOTLESS,
+        #[cfg(feature = "sqlite")]
+        Harness::Devin => &devin::ROOTLESS,
+        #[cfg(not(feature = "sqlite"))]
+        Harness::Hermes | Harness::Cursor | Harness::Goose | Harness::Zed | Harness::Devin => return None,
+    })
+}
+
+/// The adapters of the harness bags `m` carries (`extra[<harness>]`), in key order: the ones a
+/// per-message fact is asked of.
+fn bag_owners(m: &Message) -> impl Iterator<Item = &'static dyn Adapter> + '_ {
+    m.extra
+        .keys()
+        .filter_map(|key| Harness::ALL.iter().find(|h| h.as_str() == key))
+        .filter_map(|h| rootless(*h))
+}
+
+/// The harness's own kind for an injected-context turn ([`Adapter::attachment_kind`]), asked of
+/// each bag's adapter, first answer wins.
+pub fn attachment_kind(m: &Message) -> Option<&str> {
+    bag_owners(m).find_map(|a| a.attachment_kind(m))
+}
+
+/// The file edit `m`'s record states outside its tool blocks ([`Adapter::native_edit`]), asked
+/// of each bag's adapter, first answer wins.
+pub fn native_edit(m: &Message) -> Option<crate::events::NativeEdit<'_>> {
+    bag_owners(m).find_map(|a| a.native_edit(m))
+}
+
 /// The adapter for a specific harness, if registered. Detects only that adapter: detection stats
 /// roots and reads config, so a per-session lookup must not detect the other twenty.
 pub fn for_harness(h: Harness) -> Option<Box<dyn Adapter>> {
@@ -455,14 +888,54 @@ pub fn for_harness(h: Harness) -> Option<Box<dyn Adapter>> {
     })
 }
 
+/// The adapter for `h` reading one explicit root and nothing it would detect (no `$HOME`, no
+/// configured extra roots): what a probe or a fixture reads. `root` is the directory the
+/// adapter's own explicit constructor takes: Claude's config dir, the native home of Codex, Gemini,
+/// Grok, Kimi, Kimi Code, Qwen and Hermes, Cline's and Roo's user home, OpenClaw's state dir,
+/// OpenCode's data dir, Continue's global dir, LM Studio's conversations dir, Goose's sessions dir,
+/// the dir holding Devin's or Zed's database, a Cursor `User` dir or CLI home, or the dir an
+/// export or OpenSession document sits in. `None` when `h` is not built in.
+pub fn for_harness_with_root(h: Harness, root: &Path) -> Option<Box<dyn Adapter>> {
+    Some(match h {
+        Harness::Claude => Box::new(claude::Claude::with_config_dir(root)),
+        Harness::Codex => Box::new(codex::Codex::with_home(root)),
+        Harness::Grok => Box::new(grok::Grok::with_home(root)),
+        Harness::Gemini => Box::new(gemini::Gemini::with_home(root)),
+        Harness::OpenClaw => Box::new(openclaw::OpenClaw::with_state_dir(root)),
+        Harness::Kimi => Box::new(kimi::Kimi::with_home(root)),
+        Harness::KimiCode => Box::new(kimi_code::KimiCode::with_home(root)),
+        Harness::Qwen => Box::new(qwen::Qwen::with_home(root)),
+        Harness::LmStudio => Box::new(lmstudio::LmStudio::with_root(root)),
+        Harness::Cline => Box::new(cline::Cline::with_home(root)),
+        Harness::Roo => Box::new(roo::Roo::with_home(root)),
+        Harness::Continue => Box::new(continuedev::Continue::with_root(root)),
+        Harness::OpenCode => Box::new(opencode::OpenCode::with_data_dir(root)),
+        Harness::ChatGptExport => Box::new(export::ChatGptExport::with_roots(vec![root.to_path_buf()])),
+        Harness::ClaudeExport => Box::new(export::ClaudeExport::with_roots(vec![root.to_path_buf()])),
+        Harness::OpenSession => Box::new(opensession::OpenSession::with_roots(vec![root.to_path_buf()])),
+        #[cfg(feature = "sqlite")]
+        Harness::Hermes => Box::new(hermes::Hermes::with_home(root)),
+        #[cfg(feature = "sqlite")]
+        Harness::Cursor => Box::new(cursor::Cursor::with_root(root)),
+        #[cfg(feature = "sqlite")]
+        Harness::Goose => Box::new(goose::Goose::with_sessions_dir(root)),
+        #[cfg(feature = "sqlite")]
+        Harness::Zed => Box::new(zed::Zed::with_root(root)),
+        #[cfg(feature = "sqlite")]
+        Harness::Devin => Box::new(devin::Devin::with_root(root)),
+        #[cfg(not(feature = "sqlite"))]
+        Harness::Hermes | Harness::Cursor | Harness::Goose | Harness::Zed | Harness::Devin => return None,
+    })
+}
+
 /// Assert the IR-v2 nesting invariant on a parsed session (`docs/INTERFACE-V2.md` §4), so every
 /// adapter's tests state the rule the same way instead of each spelling out its own key list.
 ///
 /// Every top-level key in `Session::extra` and in each `Message::extra` must be a **namespace whose
 /// value is an object** — a canonical harness name (`Harness::as_str`, so an alias like `cc` fails)
 /// or [`crate::ir::CV_NAMESPACE`]. Exactly two flat keys are allowed, both message-level and both cv's own
-/// streaming bookkeeping rather than harness facts: [`claude::CARRIER_KEY`] (`_record`, the verbatim
-/// source record under [`ParseOptions::complete`]) and [`crate::offsets::OFFSET_KEY`]
+/// streaming bookkeeping rather than harness facts: [`CARRIER_KEY`](crate::ir::CARRIER_KEY) (`_record`, the verbatim
+/// source record under [`Demand::COMPLETE`]) and [`crate::offsets::OFFSET_KEY`]
 /// (`cv_byte_offset`). `Session::extra` has no flat exception at all.
 #[cfg(test)]
 pub(crate) fn assert_no_flat_keys(s: &Session) {
@@ -473,7 +946,7 @@ pub(crate) fn assert_no_flat_keys(s: &Session) {
     }
     for m in &s.messages {
         for (k, v) in &m.extra {
-            if k == claude::CARRIER_KEY || k == crate::offsets::OFFSET_KEY {
+            if k == crate::ir::CARRIER_KEY || k == crate::offsets::OFFSET_KEY {
                 continue; // the two documented flat exceptions
             }
             assert!(
@@ -484,6 +957,76 @@ pub(crate) fn assert_no_flat_keys(s: &Session) {
             );
             assert!(v.is_object(), "namespace {k:?} must hold an object, got {v}");
         }
+    }
+}
+
+/// A message carries the model its record states however much of the session preceded it
+/// (INTERFACE-V2 §4). For every discovered session with a later assistant turn that a full read
+/// gives a model, a read that discards everything before that turn, which is what `cv show
+/// --range N..` and `--last N` do, reports the same model on its first delivered message.
+#[cfg(test)]
+pub(crate) fn assert_windowed_models(adapter: &dyn Adapter) {
+    use crate::ir::{Message, Role};
+    struct Window {
+        start: usize,
+        seen: usize,
+        first: Option<Option<String>>,
+    }
+    impl MessageSink for Window {
+        fn message(&mut self, m: Message) -> Flow {
+            self.seen += 1;
+            if self.seen <= self.start {
+                return Flow::Continue;
+            }
+            self.first = Some(m.model);
+            Flow::Stop
+        }
+    }
+    let mut checked = 0;
+    for r in adapter.discover().expect("discover") {
+        let s = adapter
+            .parse(&r)
+            .unwrap_or_else(|e| panic!("parsing {}: {e:#}", r.path.display()));
+        let Some(start) = s
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == Role::Assistant)
+            .skip(1)
+            .find(|(_, m)| m.model.is_some())
+            .map(|(i, _)| i)
+        else {
+            continue;
+        };
+        let mut w = Window {
+            start,
+            seen: 0,
+            first: None,
+        };
+        adapter
+            .try_stream(&r, &Demand::LEAN.with_spans(), &mut w)
+            .unwrap_or_else(|e| panic!("windowed read of {}: {e:#}", r.id));
+        let windowed = w
+            .first
+            .unwrap_or_else(|| panic!("{}: the window from message {start} delivered nothing", r.id));
+        assert_eq!(windowed, s.messages[start].model, "{}: message {start}", r.id);
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no session with a later assistant turn that states its model"
+    );
+}
+
+/// Entries of an optional side directory. Only a missing directory is empty.
+pub(crate) fn side_entries(path: &std::path::Path) -> Result<Vec<std::fs::DirEntry>> {
+    use anyhow::Context;
+    match std::fs::read_dir(path) {
+        Ok(entries) => entries
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("reading {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
 }
 
@@ -500,6 +1043,36 @@ mod tests {
                 assert_eq!(adapter.harness(), h);
             }
         }
+    }
+
+    #[test]
+    fn an_explicit_root_reads_nothing_else() {
+        // A store's reported root may be the install dir above the one given (LM Studio's), never
+        // anywhere detection would look.
+        let world = crate::test_world("explicit-root-registry");
+        let outer = world.base.join("explicit");
+        let root = outer.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        for h in Harness::ALL {
+            let Some(adapter) = for_harness_with_root(h, &root) else {
+                continue;
+            };
+            assert_eq!(adapter.harness(), h);
+            for found in adapter.roots() {
+                assert!(
+                    found.starts_with(&outer),
+                    "{h}: {} is outside the explicit root",
+                    found.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_derived_host() {
+        // A second adapter with derived copies makes `derived_host` a choice the CLI must offer.
+        let hosts: Vec<Harness> = Harness::ALL.into_iter().filter(|h| has_derived_copies(*h)).collect();
+        assert_eq!(hosts, [derived_host()]);
     }
 
     #[test]
@@ -528,62 +1101,6 @@ mod tests {
         assert_eq!(ts_from_epoch(1_767_323_045_000u64).unwrap(), s);
     }
 
-    struct InterruptedOnce {
-        input: std::io::Cursor<Vec<u8>>,
-        interrupted: bool,
-    }
-    impl std::io::Read for InterruptedOnce {
-        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-            std::io::Read::read(&mut self.input, bytes)
-        }
-    }
-    impl BufRead for InterruptedOnce {
-        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-            if !self.interrupted {
-                self.interrupted = true;
-                return Err(std::io::ErrorKind::Interrupted.into());
-            }
-            self.input.fill_buf()
-        }
-        fn consume(&mut self, bytes: usize) {
-            self.input.consume(bytes);
-        }
-    }
-
-    #[test]
-    fn json_lines_retry_interrupted_and_preserve_corrupt_record_offsets() {
-        let input = InterruptedOnce {
-            input: std::io::Cursor::new(b"\xff\n{\"n\":1}\n{\"n\":2}".to_vec()),
-            interrupted: false,
-        };
-        let mut seen = Vec::new();
-        let skipped = for_each_json_line_at(input, 5, |value, offset, complete, skipped| {
-            seen.push((value["n"].as_u64().unwrap(), offset, complete, skipped));
-            Flow::Continue
-        });
-        assert_eq!(skipped, 1);
-        assert_eq!(seen, vec![(1, 15, true, 1), (2, 22, false, 1)]);
-    }
-
-    struct TerminalIo;
-    impl std::io::Read for TerminalIo {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("terminal source failure"))
-        }
-    }
-    impl BufRead for TerminalIo {
-        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-            Err(std::io::Error::other("terminal source failure"))
-        }
-        fn consume(&mut self, _: usize) {}
-    }
-
-    #[test]
-    fn terminal_json_line_io_stops_legacy_helpers_with_one_skip() {
-        assert_eq!(for_each_json_line(TerminalIo, |_| unreachable!()), 1);
-        assert_eq!(for_each_json_line_at(TerminalIo, 0, |_, _, _, _| unreachable!()), 1);
-    }
-
     #[test]
     fn for_each_json_line_skips_junk_and_stops() {
         let text = "{\"n\":1}\n\n   \nnot json\n{\"n\":2}\n{\"n\":3}";
@@ -598,15 +1115,6 @@ mod tests {
         });
         assert_eq!(seen, vec![1, 2], "blank/junk skipped, Stop honored");
         assert_eq!(skipped, 1, "the `not json` line counts; blank lines don't");
-
-        // The reader-driven variant sees the same records and the same skip count.
-        let mut seen2 = Vec::new();
-        let skipped2 = for_each_json_line(std::io::Cursor::new(text.as_bytes()), |v| {
-            seen2.push(v.get("n").and_then(Value::as_i64).unwrap_or(0));
-            Flow::Continue
-        });
-        assert_eq!(seen2, vec![1, 2, 3]);
-        assert_eq!(skipped2, 1);
 
         // note_skipped_lines: zero leaves `extra` untouched (clean sessions stay byte-identical).
         let mut s = Session::new("x", Harness::Codex);

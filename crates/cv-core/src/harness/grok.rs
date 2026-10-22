@@ -42,7 +42,7 @@ use crate::ir::*;
 use crate::json::{JsonSource, JsonView};
 use crate::lazy::Text;
 use crate::source::{Dependencies, Probe};
-use crate::stream::{Checkpoint, Flow, MessageSink, ParseOptions};
+use crate::stream::{Demand, Flow, MessageSink, Start};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -53,6 +53,10 @@ use walkdir::WalkDir;
 pub struct Grok {
     root: Option<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Grok = Grok { root: None };
 
 impl Grok {
     pub fn detect() -> Self {
@@ -94,16 +98,25 @@ impl Adapter for Grok {
         // interpreting kind must not bless a later version of the summary.
         let summary_path = r.path.join("summary.json");
         probe.exists(&summary_path)?;
+        let note = |error: &anyhow::Error| {
+            crate::env::warn_once(
+                "Grok dependencies",
+                format_args!("{}: {error:#}", summary_path.display()),
+            );
+        };
+        const SUBAGENT_KIND: &str = "subagent";
         let subagent = JsonSource::capture(&summary_path)
+            .inspect_err(note)
             .ok()?
             .read_document(|view| {
                 let kind = view
                     .get("session_kind")?
-                    .map(|kind| crate::projection::string_prefix(kind, 9))
+                    .map(|kind| crate::projection::string_prefix(kind, SUBAGENT_KIND.len() + 1))
                     .transpose()?
                     .flatten();
-                Ok(kind.as_deref() == Some("subagent"))
+                Ok(kind.as_deref() == Some(SUBAGENT_KIND))
             })
+            .inspect_err(note)
             .ok()?;
         if subagent {
             let group = r.path.parent()?;
@@ -119,90 +132,104 @@ impl Adapter for Grok {
         self.root.clone().into_iter().collect()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         let Some(root) = &self.root else {
-            return Ok(vec![]);
+            return Ok(Default::default());
         };
-        let mut out = Vec::new();
-        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        // An unreadable dir, and a summary whose scan fails, are skipped and reported.
+        let mut out = crate::Discovered::default();
+        for entry in WalkDir::new(root) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    out.skipped.extend(crate::Skipped::walk(&e));
+                    continue;
+                }
+            };
             if entry.file_name() != "summary.json" {
                 continue;
             }
-            match scan(entry.path()) {
-                Ok(Some(r)) => out.push(r),
-                Ok(None) => {}
-                Err(e) => eprintln!("cv: skipping {}: {e:#}", entry.path().display()),
+            let dir = entry.path().parent().unwrap();
+            let mut reads = crate::source::ReadSet::default();
+            reads.record(entry.path());
+            let reference = SessionRef::new("", Harness::Grok, dir);
+            reads.record(&self.resume_source(&reference));
+            // Key by the public ref path, so the existing full-read count publication updates
+            // this same cache entry. Summary and transcript identities guard its contents.
+            let scanned = crate::discover_cache::cached_scan_with_reads(dir, reads, || scan(entry.path()));
+            if let Some(found) = crate::Skipped::listed(entry.path(), scanned) {
+                out.push(found);
             }
         }
         Ok(out)
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
-        crate::stream::checked(sink, |sink| {
-            // Spawn turns, sub-agent returns and deferred tool calls, typed (`crate::affordance`).
-            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Grok, sink);
-            let sink: &mut dyn MessageSink = &mut spawns;
-            let (s, enrich) = session_header(r);
-            sink.meta(&s);
-            stream_history_at(&self.resume_source(r), 0, s, &enrich, 0, opts, sink).map(Option::unwrap)
-        })
-    }
-
-    fn resume_format(&self) -> Option<u32> {
-        Some(1)
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
+        self.transcript(r, opts, Start::Whole, sink)?
+            .context("a whole read never declines")
     }
 
     fn resume_source(&self, r: &SessionRef) -> PathBuf {
         r.path.join("chat_history.jsonl")
     }
 
-    fn resume(
+    /// `chat_history.jsonl` through the driver, after the header `summary.json` gives. A
+    /// checkpoint names its transcript: one of another resumes nothing.
+    fn transcript(
         &self,
         r: &SessionRef,
-        opts: &ParseOptions,
+        opts: &Demand,
+        from: Start<'_>,
         sink: &mut dyn MessageSink,
-        from: &Checkpoint,
     ) -> Result<Option<Session>> {
         crate::stream::checked(sink, |sink| {
-            let Some(state) = from.get::<HistoryCheckpoint>(crate::stream::ADAPTER_LAYER) else {
-                return Ok(None);
-            };
             let wire = self.resume_source(r);
-            if state.wire != wire {
-                return Ok(None);
+            if let Start::Checkpoint(cp) = from {
+                match jsonl::restore::<HistoryCheckpoint>(cp, <History as jsonl::Codec>::VERSION) {
+                    Some(state) if state.wire == wire => {}
+                    _ => return Ok(None),
+                }
             }
-            let (s, enrich) = session_header(r);
+            // Spawn turns, sub-agent returns and deferred tool calls, typed (`crate::affordance`).
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Grok, sink);
+            let (s, enrich) = session_header(r);
             spawns.meta(&s);
-            stream_history_at(&wire, from.offset, s, &enrich, state.skipped, opts, &mut spawns)
+            let read = jsonl::Read::open(&wire).with_context(|| format!("reading {}", wire.display()))?;
+            let codec = History {
+                s,
+                enrich: &enrich,
+                spans: opts.spans.then_some(read.source()),
+                wire: &wire,
+                pending: None,
+                resolver: crate::Resolver::new(Some(wire.clone())),
+            };
+            jsonl::drive(&read, from, codec, &mut spawns)
         })
     }
 
     /// The todo list `todo_write` keeps in the session directory (`plan.json` `{todos: {id: …}}`),
     /// then the per-prompt restore points of `rewind_points.jsonl`, then every hook run
     /// `updates.jsonl` recorded ([`hook_runs`]).
-    fn store_affordances(&self, r: &SessionRef) -> Vec<crate::affordance::Affordance> {
-        let plan = fs::read_to_string(r.path.join("plan.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .and_then(|v| {
-                let items = crate::affordance::items_of(&v);
-                crate::affordance::plan_state(crate::affordance::Kind::Plan, "plan.json", items)
-            });
-        plan.into_iter()
-            .chain(rewind_points(&r.path))
-            .chain(hook_runs(&r.path))
-            .collect()
+    fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
+        let plan = crate::affordance::side_json(&r.path.join("plan.json"))?.and_then(|v| {
+            let items = crate::affordance::items_of(&v);
+            crate::affordance::plan_state(crate::affordance::Kind::Plan, "plan.json", items)
+        });
+        Ok(plan
+            .into_iter()
+            .chain(rewind_points(&r.path)?)
+            .chain(hook_runs(&r.path)?)
+            .collect())
     }
 }
 
 /// `rewind_points.jsonl`: one line per prompt, `{prompt_index, created_at, file_snapshots,
 /// after_snapshots}` — the files as they were before (and after) that prompt, which `/rewind`
 /// puts back. Each line is a checkpoint.
-fn rewind_points(dir: &Path) -> Vec<crate::affordance::Affordance> {
+fn rewind_points(dir: &Path) -> Result<Vec<crate::affordance::Affordance>> {
     use crate::affordance::{Affordance, Kind};
     let mut out = Vec::new();
-    if jsonl::for_each_record(&dir.join("rewind_points.jsonl"), |v| {
+    let read = jsonl::for_each_record(&dir.join("rewind_points.jsonl"), |v| {
         let Some(v) = Fields::parse(v, &["created_at", "file_snapshots", "prompt_index"])? else {
             return Ok(());
         };
@@ -233,13 +260,14 @@ fn rewind_points(dir: &Path) -> Vec<crate::affordance::Affordance> {
             &summary,
         ));
         Ok(())
-    })
-    .is_err()
-    {
-        out.clear();
+    });
+    if let Err(error) = read {
+        if !super::is_not_found(&error) {
+            return Err(error);
+        }
     }
 
-    out
+    Ok(out)
 }
 
 /// A number field, or None for any other value.
@@ -261,10 +289,10 @@ fn string(v: Option<JsonView<'_>>, key: &str) -> Result<Option<String>> {
 
 /// The `hook_execution` updates, reduced to metadata. Unknown update/run payloads are validated
 /// at the line boundary but never materialized.
-fn hook_runs(dir: &Path) -> Vec<crate::affordance::Affordance> {
+fn hook_runs(dir: &Path) -> Result<Vec<crate::affordance::Affordance>> {
     use crate::affordance::{Affordance, Kind};
     let mut out = Vec::new();
-    if jsonl::for_each_record(&dir.join("updates.jsonl"), |v| {
+    let read = jsonl::for_each_record(&dir.join("updates.jsonl"), |v| {
         let Some(params) = v.get("params")? else { return Ok(()) };
         let Some(u) = params.get("update")? else { return Ok(()) };
         if string(Some(u), "sessionUpdate")?.as_deref() != Some("hook_execution") {
@@ -309,13 +337,14 @@ fn hook_runs(dir: &Path) -> Vec<crate::affordance::Affordance> {
             }
         }
         Ok(())
-    })
-    .is_err()
-    {
-        out.clear();
+    });
+    if let Err(error) = read {
+        if !super::is_not_found(&error) {
+            return Err(error);
+        }
     }
 
-    out
+    Ok(out)
 }
 
 /// Static metadata/enrichment shared by whole and suffix passes. Mutable sidecars are verified
@@ -370,87 +399,73 @@ fn session_header(r: &SessionRef) -> (Session, HashMap<String, ToolEnrich>) {
     (s, enrich)
 }
 
-#[derive(serde::Deserialize)]
-struct HistoryCheckpoint {
-    wire: PathBuf,
-    skipped: u64,
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HistoryCheckpoint<P = PathBuf> {
+    wire: P,
 }
 
-/// The one Grok read: records `at..` of `chat_history.jsonl`, each through the record codec. A
-/// standalone `reasoning` record is held and joins the next assistant turn. After a finished
-/// line that delivered a message (and holds no reasoning) the sink may take a checkpoint with
-/// the rejected-line count so far. `Ok(None)`: `at` lies beyond the file (a resume that cannot be).
-fn stream_history_at(
-    wire: &Path,
-    at: u64,
-    mut s: Session,
-    enrich: &HashMap<String, ToolEnrich>,
-    prior_skipped: u64,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-) -> Result<Option<Session>> {
-    let source = JsonSource::capture(wire).with_context(|| format!("reading {}", wire.display()))?;
-    let file = fs::File::open(wire).with_context(|| format!("reading {}", wire.display()))?;
-    source.check_metadata(file.metadata()?)?;
-    if at > source.len() {
-        return Ok(None);
-    }
-    let spans = opts.spans.then_some(&source);
-    let session_model = s.model.clone();
-    let mut pending: Option<Message> = None;
-    let mut stopped = false;
-    let mut skipped = prior_skipped;
-    jsonl::for_each_line(&source, &file, at, source.len(), |line| {
-        let Some(view) = line.view else {
-            skipped += u64::from(!line.blank);
-            return Ok(Flow::Continue);
-        };
-        let (is_reasoning, message) = record::message(view, spans, enrich)?;
+/// The Grok record codec over `chat_history.jsonl`. A standalone `reasoning` record is held and
+/// joins the next assistant turn, so the codec is settled only when none is held; a checkpoint
+/// keeps the transcript it was taken on.
+struct History<'r> {
+    s: Session,
+    enrich: &'r HashMap<String, ToolEnrich>,
+    spans: Option<&'r JsonSource>,
+    wire: &'r Path,
+    pending: Option<Message>,
+    resolver: crate::Resolver,
+}
+
+impl jsonl::Codec for History<'_> {
+    const VERSION: u32 = 1;
+
+    fn record(&mut self, view: JsonView<'_>, _: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
+        let (is_reasoning, message) = record::message(view, self.spans, self.enrich, &self.resolver)?;
         let Some(mut m) = message else {
             return Ok(Flow::Continue);
         };
         if is_reasoning {
-            match pending.as_mut() {
+            match self.pending.as_mut() {
                 Some(p) => p.content.append(&mut m.content),
-                None => pending = Some(m),
+                None => self.pending = Some(m),
             }
             return Ok(Flow::Continue);
         }
-        if let Some(mut p) = pending.take() {
+        if let Some(mut p) = self.pending.take() {
             if m.role == Role::Assistant {
                 p.content.append(&mut m.content);
                 m.content = p.content;
             } else if sink.message(p) == Flow::Stop {
-                stopped = true;
                 return Ok(Flow::Stop);
             }
         }
-        if m.model.is_some() && m.model == session_model {
-            m.model = None;
-        }
-        let flow = sink.message(m);
-        stopped = flow == Flow::Stop;
-        // Reasoning at EOF is provisional: only a finished record with no held reasoning can
-        // finalize the emitted prefix. AffordanceSink also excludes unresolved synchronous spawns.
-        if !stopped && line.complete && sink.wants_checkpoint(line.end) {
-            #[derive(serde::Serialize)]
-            struct State<'a> {
-                wire: &'a Path,
-                skipped: u64,
-            }
-            let mut checkpoint = Checkpoint::new(line.end);
-            checkpoint.put(crate::stream::ADAPTER_LAYER, &State { wire, skipped });
-            sink.checkpoint(&mut checkpoint);
-        }
-        Ok(flow)
-    })?;
-    source.check_metadata(file.metadata()?)?;
-    source.check()?;
-    if let (Some(p), false) = (pending, stopped) {
-        sink.message(p);
+        Ok(sink.message(m))
     }
-    super::note_skipped_lines(&mut s, skipped);
-    Ok(Some(s))
+
+    /// Reasoning at EOF is provisional (AffordanceSink also excludes unresolved synchronous spawns).
+    fn settled(&self) -> bool {
+        self.pending.is_none()
+    }
+
+    /// The state (which transcript) is the same at every demand: a mark resumes at any.
+    fn demand(&self) -> Demand {
+        Demand::default()
+    }
+
+    fn session(&mut self) -> &mut Session {
+        &mut self.s
+    }
+
+    fn state(&self) -> impl serde::Serialize + '_ {
+        HistoryCheckpoint { wire: self.wire }
+    }
+
+    fn finish(self, stopped: bool, sink: &mut dyn MessageSink) -> Result<Session> {
+        if let (Some(p), false) = (self.pending, stopped) {
+            sink.message(p);
+        }
+        Ok(self.s)
+    }
 }
 
 /// Subagent nickname + Grok-specific session facts from `summary.json`: a subagent's `agent_name`
@@ -631,33 +646,33 @@ fn scan(summary_path: &Path) -> Result<Option<SessionRef>> {
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
         })
-        .map(|s| crate::ir::truncate(s, 80));
-    // `message_count` is the contract's user + assistant turns (`SessionRef::message_count`), so it
-    // is counted from the transcript: summary.json's `num_chat_messages` counts every line —
-    // `system` and `tool_result` included — and `num_messages` is the user-turn count. The same
-    // pass supplies the title fallback (first non-empty user text).
-    let mut message_count = 0usize;
-    let initial_title = title.clone();
-    if jsonl::for_each_record(&dir.join("chat_history.jsonl"), |v| {
-        let ty = string(Some(v), "type")?;
-        if matches!(ty.as_deref(), Some("user") | Some("assistant")) {
-            message_count += 1;
+        .map(|s| crate::ir::truncate(s, crate::projection::Head::TITLE));
+    // Exact turn counts belong to index/full reads. Summary-titled sessions do not open the
+    // transcript. Otherwise stream the codec's title demand until the first title or EOF;
+    // absence beyond a fixed byte budget is not yet an authorized metadata tradeoff.
+    if title.is_none() {
+        let read = jsonl::Read::open(&dir.join("chat_history.jsonl"));
+        if let Ok(read) = read {
+            let mut candidate = None;
+            if read
+                .lines(0, |line| {
+                    if let Some(view) = line.view {
+                        candidate = record::discovery_title(view)?;
+                    }
+                    Ok(if candidate.is_some() {
+                        Flow::Stop
+                    } else {
+                        Flow::Continue
+                    })
+                })
+                .is_ok()
+            {
+                title = candidate;
+            }
         }
-        if title.is_none() && ty.as_deref() == Some("user") {
-            title = super::wire::text_title(v.get("content")?)?;
-        }
-        Ok(())
-    })
-    .is_err()
-    {
-        message_count = 0;
-        title = initial_title;
     }
 
     Ok(Some(SessionRef {
-        id,
-        harness: Harness::Grok,
-        path: dir,
         cwd,
         title,
         created_at: summary.get("created_at").and_then(Value::as_str).and_then(parse_ts),
@@ -666,7 +681,8 @@ fn scan(summary_path: &Path) -> Result<Option<SessionRef>> {
             .and_then(Value::as_str)
             .and_then(parse_ts)
             .or_else(|| summary.get("last_active_at").and_then(Value::as_str).and_then(parse_ts)),
-        message_count,
+        message_count: None,
+        ..SessionRef::new(id, Harness::Grok, dir)
     }))
 }
 
@@ -692,15 +708,27 @@ mod tests {
 
     /// The record codec over an owned value, no spans.
     fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Message> {
-        record::message(v.into(), None, enrich).unwrap().1
+        record::message(v.into(), None, enrich, &crate::Resolver::new(None))
+            .unwrap()
+            .1
     }
 
     /// A whole stream of `r`, messages collected.
-    fn whole(adapter: &Grok, r: &SessionRef, opts: &ParseOptions) -> Session {
+    fn whole(adapter: &Grok, r: &SessionRef, opts: &Demand) -> Session {
         let mut all = ResumeKeep::default();
         let mut s = adapter.try_stream(r, opts, &mut all).unwrap();
         s.messages = all.messages;
         s
+    }
+
+    #[test]
+    fn dependency_decode_failure_is_named_and_never_certified() {
+        let world = crate::test_world("grok-dependency-error");
+        fs::write(world.home.join("summary.json"), "{broken").unwrap();
+        let r = SessionRef::new("fixture", Harness::Grok, &world.home);
+        let mut deps = Dependencies::default();
+        assert!(ROOTLESS.dependencies(&r, &mut Probe::default(), &mut deps).is_none());
+        assert!(!crate::env::warn_once("Grok dependencies", "already reported"));
     }
 
     #[test]
@@ -746,11 +774,16 @@ mod tests {
         let adapter = Grok::with_home(&world.home.join(".grok"));
         let r = SessionRef::new("session", Harness::Grok, &dir);
         let mut full = ResumeKeep::default();
-        let shell = adapter.stream(&r, &ParseOptions::full(), &mut full).unwrap();
+        let shell = adapter.stream(&r, &Demand::RICH, &mut full).unwrap();
         let (count, checkpoint) = &full.checkpoints[0];
         let mut resumed = ResumeKeep::default();
         let suffix = adapter
-            .resume(&r, &ParseOptions::lazy(), &mut resumed, checkpoint)
+            .transcript(
+                &r,
+                &Demand::LEAN.with_spans(),
+                crate::stream::Start::Checkpoint(checkpoint),
+                &mut resumed,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -799,17 +832,20 @@ mod tests {
             }
             let r = SessionRef::new("corpus", Harness::Grok, file.path().parent().unwrap());
             for opts in [
-                ParseOptions::lazy(),
-                ParseOptions::lazy_extra(),
-                ParseOptions::full(),
-                ParseOptions::complete(),
+                Demand::LEAN.with_spans(),
+                Demand::RICH.with_spans(),
+                Demand::RICH,
+                Demand::COMPLETE,
             ] {
                 let mut full = ResumeKeep::default();
                 let shell = adapter.try_stream(&r, &opts, &mut full).unwrap();
                 let stride = (full.checkpoints.len() / 12).max(1);
                 for (i, (count, cp)) in full.checkpoints.iter().enumerate().step_by(stride) {
                     let mut rest = ResumeKeep::default();
-                    let s = adapter.try_resume(&r, &opts, &mut rest, cp).unwrap().unwrap();
+                    let s = adapter
+                        .transcript(&r, &opts, crate::stream::Start::Checkpoint(cp), &mut rest)
+                        .unwrap()
+                        .unwrap();
                     assert_eq!(serde_json::to_value(s).unwrap(), serde_json::to_value(&shell).unwrap());
                     assert_eq!(
                         serde_json::to_value(&rest.messages).unwrap(),
@@ -847,7 +883,7 @@ mod tests {
         fs::write(dir.join("chat_history.jsonl"), &prefix).unwrap();
         let mut r = SessionRef::new("session", Harness::Grok, &dir);
         let adapter = Grok::with_home(&world.home.join(".grok"));
-        let opts = ParseOptions::lazy();
+        let opts = Demand::LEAN.with_spans();
         let mut first = ResumeKeep::default();
         adapter.try_stream(&r, &opts, &mut first).unwrap();
         let (count, cp) = first.checkpoints.last().unwrap();
@@ -864,7 +900,10 @@ mod tests {
         r.title = Some("current catalog title".into());
         let expected = whole(&adapter, &r, &opts);
         let mut suffix = ResumeKeep::default();
-        let mut shell = adapter.try_resume(&r, &opts, &mut suffix, cp).unwrap().unwrap();
+        let mut shell = adapter
+            .transcript(&r, &opts, crate::stream::Start::Checkpoint(cp), &mut suffix)
+            .unwrap()
+            .unwrap();
         assert_eq!(suffix.messages.len(), 201);
         assert_eq!(shell.title, r.title);
         shell.messages = first.messages[..*count]
@@ -879,7 +918,10 @@ mod tests {
         let mut other = r.clone();
         other.path = dir.join("other");
         let mut none = ResumeKeep::default();
-        assert!(adapter.try_resume(&other, &opts, &mut none, cp).unwrap().is_none());
+        assert!(adapter
+            .transcript(&other, &opts, crate::stream::Start::Checkpoint(cp), &mut none)
+            .unwrap()
+            .is_none());
         assert!(none.messages.is_empty());
         // A UTF-8 failure remains a tolerant skipped line rather than poisoning subsequent records.
         let mut bytes = fs::read(adapter.resume_source(&r)).unwrap();
@@ -897,9 +939,306 @@ mod tests {
 
     use super::*;
     use crate::harness::Parse;
+    use crate::stream::Checkpoint;
+
+    #[cfg(unix)]
+    #[test]
+    fn callback_boundaries_and_held_eof_verify_the_backing() {
+        const CHILD: &str = "CV_TEST_GROK_CALLBACK_BACKING";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "harness::grok::tests::callback_boundaries_and_held_eof_verify_the_backing",
+                ])
+                .env(CHILD, "1");
+            // A regressed mapped read may fail in the child, never in the shared runner.
+            unsafe {
+                command.pre_exec(|| {
+                    let limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "Grok callback child {} failed: {status}", child.id());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("Grok callback child {} timed out", child.id());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        eprintln!("GROK_CALLBACK_CHILD pid={}", std::process::id());
+        struct Callback {
+            wire: PathBuf,
+            stage: &'static str,
+            action: &'static str,
+            stop: bool,
+            calls: usize,
+            checkpoints: usize,
+            changed: bool,
+            first: Option<Message>,
+        }
+        impl Callback {
+            fn change(&mut self, stage: &str) {
+                if self.stage == stage && !self.changed {
+                    match self.action {
+                        "truncate" => fs::OpenOptions::new()
+                            .write(true)
+                            .open(&self.wire)
+                            .unwrap()
+                            .set_len(0)
+                            .unwrap(),
+                        "delete" => fs::remove_file(&self.wire).unwrap(),
+                        _ => return,
+                    }
+                    self.changed = true;
+                    // A callback that changed the file is a slow one by construction (the stream
+                    // module's source-guarantee policy): the reader checks right after it.
+                    std::thread::sleep(super::jsonl::Read::SLOW_CALLBACK * 10);
+                }
+            }
+        }
+        impl MessageSink for Callback {
+            fn message(&mut self, message: Message) -> Flow {
+                self.calls += 1;
+                if self.first.is_none() {
+                    self.first = Some(message);
+                }
+                self.change("message");
+                if self.stop {
+                    Flow::Stop
+                } else {
+                    Flow::Continue
+                }
+            }
+            fn wants_checkpoint(&mut self, _: u64) -> bool {
+                self.change("wants");
+                self.stage == "checkpoint"
+            }
+            fn checkpoint(&mut self, _: &mut Checkpoint) {
+                self.checkpoints += 1;
+                self.change("checkpoint");
+            }
+        }
+        let world = crate::test_world("grok-callback-boundaries");
+        let home = world.home.join(".grok");
+        let dir = home.join("sessions/group/scratch");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"scratch","cwd":"/synthetic"}}"#,
+        )
+        .unwrap();
+        let wire = dir.join("chat_history.jsonl");
+        let reference = SessionRef::new("scratch", Harness::Grok, &dir);
+        let adapter = Grok::with_home(&home);
+        let reasoning =
+            "{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"held reasoning\"}]}\n";
+        let user = serde_json::json!({"type":"user","content":"owned ".repeat(1000)});
+        let turns = format!("{user}\n{}", "{\"type\":\"user\",\"content\":\"tail\"}\n".repeat(999));
+        // EOF first gives a non-crashing independent refutation on an unguarded baseline.
+        for stage in ["eof", "pending", "message", "wants", "checkpoint"] {
+            let bytes = match stage {
+                "eof" => reasoning.to_owned(),
+                "pending" => format!("{reasoning}{turns}"),
+                _ => turns.clone(),
+            };
+            for lazy in [false, true] {
+                for action in ["unchanged", "truncate", "delete"] {
+                    if action == "delete" && stage != "eof" {
+                        continue;
+                    }
+                    for stop in [false, true] {
+                        if stop && matches!(stage, "wants" | "checkpoint") {
+                            continue;
+                        }
+                        fs::write(&wire, &bytes).unwrap();
+                        let mut sink = Callback {
+                            wire: wire.clone(),
+                            stage: if matches!(stage, "eof" | "pending") {
+                                "message"
+                            } else {
+                                stage
+                            },
+                            action,
+                            stop,
+                            calls: 0,
+                            checkpoints: 0,
+                            changed: false,
+                            first: None,
+                        };
+                        let opts = if lazy { Demand::LEAN.with_spans() } else { Demand::RICH };
+                        let result = adapter.try_stream(&reference, &opts, &mut sink);
+                        assert_eq!(
+                            result.is_err(),
+                            sink.changed,
+                            "stage={stage},lazy={lazy},action={action},stop={stop}"
+                        );
+                        if sink.changed || stop {
+                            assert_eq!(
+                                sink.calls, 1,
+                                "do not deliver another record after invalidation or Stop"
+                            );
+                        } else {
+                            assert_eq!(
+                                sink.calls,
+                                match stage {
+                                    "eof" => 1,
+                                    "pending" => 1001,
+                                    _ => 1000,
+                                }
+                            );
+                        }
+                        assert_eq!(sink.checkpoints > 0, stage == "checkpoint");
+                        if action == "unchanged" {
+                            assert_eq!(fs::read(&wire).unwrap(), bytes.as_bytes());
+                        }
+                        if !lazy && stage == "message" {
+                            let Block::Text {
+                                text: Text::Inline(text),
+                            } = &sink.first.as_ref().unwrap().content[0]
+                            else {
+                                panic!("owned text")
+                            };
+                            assert_eq!(text, &"owned ".repeat(1000));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
-    fn discovery_title_and_count_match_value_oracle() {
+    fn cheap_discovery_summary_title_never_opens_the_transcript() -> Result<()> {
+        let world = crate::test_world("grok-summary-only");
+        let dir = world.base.join("session");
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"s","cwd":"/project"},"session_summary":"native title","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}"#,
+        )?;
+        // A titled session is identifiable even while its transcript is absent/unreadable.
+        jsonl::OPENED.with(|paths| paths.borrow_mut().clear());
+        let r = scan(&dir.join("summary.json"))?.unwrap();
+        assert_eq!(r.title.as_deref(), Some("native title"));
+        assert_eq!(r.cwd.as_deref(), Some(Path::new("/project")));
+        assert_eq!(r.updated_at.unwrap().to_rfc3339(), "2026-01-02T00:00:00+00:00");
+        assert_eq!(r.message_count, None);
+        assert!(jsonl::OPENED.with(|paths| paths.borrow().is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn cheap_discovery_keeps_a_title_after_a_giant_preamble() -> Result<()> {
+        let world = crate::test_world("grok-bounded-title");
+        let dir = world.base.join("session");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("summary.json"), r#"{"info":{"id":"s"}}"#)?;
+        let history = format!(
+            "{{\"type\":\"system\",\"content\":\"{}\"}}\n{{\"type\":\"user\",\"content\":\"late title\"}}\n",
+            "x".repeat(1 << 20)
+        );
+        fs::write(dir.join("chat_history.jsonl"), history)?;
+        let r = scan(&dir.join("summary.json"))?.unwrap();
+        assert_eq!(
+            r.title.as_deref(),
+            Some("late title"),
+            "missing-summary fallback is unchanged"
+        );
+        assert_eq!(r.message_count, None);
+        Ok(())
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn cheap_discovery_keeps_exact_full_read_counts_only_while_sources_are_unchanged() -> Result<()> {
+        let world = crate::test_world("grok-count-publication");
+        let home = world.base.join("grok");
+        let dir = home.join("sessions/s");
+        fs::create_dir_all(&dir)?;
+        let summary = dir.join("summary.json");
+        fs::write(&summary, r#"{"info":{"id":"s"},"session_summary":"native title"}"#)?;
+        let history = dir.join("chat_history.jsonl");
+        let first = "{\"type\":\"user\",\"content\":\"question\"}\n{\"type\":\"assistant\",\"content\":\"answer\"}\n";
+        fs::write(&history, first)?;
+        let grok = Grok::with_home(&home);
+        let context = crate::discover_cache::read::Context::current();
+        let _scope = context.enter();
+        let r = grok.discover()?.remove(0);
+        assert_eq!(r.message_count, None);
+        crate::catalog::sync(std::slice::from_ref(&r));
+        crate::discover_cache::persist(false);
+        let mut sink = crate::stream::CollectSink::default();
+        let done = crate::stream::stream_counted(
+            &grok,
+            &r,
+            &Demand::FACTS.with_spans(),
+            &mut sink,
+            crate::stream::Pass::RECORD,
+        )?;
+        assert_eq!(done.counted.unwrap().turns, 2);
+        assert_eq!(grok.discover()?[0].message_count, Some(2));
+        let conn = crate::catalog::open_db().unwrap();
+        let persisted: String = conn.query_row(
+            "SELECT refs FROM scan_cache WHERE path=?1",
+            [dir.to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )?;
+        // Raw discovery metadata stays unknown: authenticated counts are refilled by logical
+        // session identity, rather than rewriting a cache entry whose key may be a directory.
+        assert_eq!(
+            serde_json::from_str::<Vec<SessionRef>>(&persisted)?[0].message_count,
+            None
+        );
+        assert_eq!(
+            crate::catalog::Reader::open().unwrap().all_sessions().unwrap()[0].message_count,
+            Some(2)
+        );
+        // A new operation also retains the exact count without an in-memory cache mutation.
+        drop(_scope);
+        let next = crate::discover_cache::read::Context::current();
+        let _next_scope = next.enter();
+        assert_eq!(grok.discover()?[0].message_count, Some(2));
+        fs::write(&history, format!("{first}{{\"type\":\"user\",\"content\":\"next\"}}\n"))?;
+        assert_eq!(
+            grok.discover()?[0].message_count,
+            None,
+            "growth invalidates the exact count"
+        );
+        let grown = grok.discover()?.remove(0);
+        crate::catalog::sync(std::slice::from_ref(&grown));
+        crate::stream::stream_counted(
+            &grok,
+            &grown,
+            &Demand::FACTS.with_spans(),
+            &mut sink,
+            crate::stream::Pass::RECORD,
+        )?;
+        assert_eq!(grok.discover()?[0].message_count, Some(3));
+        fs::write(&summary, r#"{"info":{"id":"s"},"session_summary":"renamed"}"#)?;
+        let renamed = grok.discover()?.remove(0);
+        assert_eq!(renamed.title.as_deref(), Some("renamed"));
+        assert_eq!(renamed.message_count, None);
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_title_matches_value_oracle_without_counting() {
         let world = cv_testkit::World::new("grok-raw-title");
         let dir = world.base.join("session");
         fs::create_dir_all(&dir).unwrap();
@@ -936,15 +1275,16 @@ mod tests {
                 let ty = v.get("type").and_then(Value::as_str);
                 expected_count += usize::from(matches!(ty, Some("user" | "assistant")));
                 if expected_title.is_none() && ty == Some("user") {
-                    let text = super::super::wire::text_parts(v.get("content"));
+                    let text = super::super::wire::joined_owned(v.get("content"), super::super::wire::TEXT);
                     if !text.trim().is_empty() {
-                        expected_title = Some(crate::ir::truncate(&text, 80));
+                        expected_title = Some(crate::ir::truncate(&text, crate::projection::Head::TITLE));
                     }
                 }
                 Flow::Continue
             });
             let actual = scan(&summary).unwrap().unwrap();
-            assert_eq!(actual.message_count, expected_count);
+            assert_eq!(actual.message_count, None);
+            assert!(expected_count > 0);
             assert_eq!(
                 actual.title,
                 expected_title,
@@ -959,7 +1299,7 @@ mod tests {
         )
         .unwrap();
         let actual = scan(&summary).unwrap().unwrap();
-        assert_eq!(actual.message_count, 1);
+        assert_eq!(actual.message_count, None);
         assert_eq!(actual.title.as_deref(), Some("prefix"));
     }
 
@@ -992,7 +1332,7 @@ mod tests {
             Affordance::store_event(Kind::Hook, "run", None, "updates.jsonl", "hook: selected · ok"),
         ];
         assert_eq!(
-            serde_json::to_value(hook_runs(dir)).unwrap(),
+            serde_json::to_value(hook_runs(dir).unwrap()).unwrap(),
             serde_json::to_value(expected).unwrap()
         );
         let snapshots = format!(
@@ -1016,17 +1356,17 @@ mod tests {
             Affordance::store_event(Kind::Checkpoint, "create", None, "rewind_points.jsonl", "prompt"),
         ];
         assert_eq!(
-            serde_json::to_value(rewind_points(dir)).unwrap(),
+            serde_json::to_value(rewind_points(dir).unwrap()).unwrap(),
             serde_json::to_value(expected).unwrap()
         );
         // A non-UTF-8 line is one rejected record; the rows around it stand.
         let mut bad = updates.into_bytes();
         bad.extend_from_slice(b"\n\xff");
         fs::write(dir.join("updates.jsonl"), bad).unwrap();
-        assert_eq!(hook_runs(dir).len(), 4);
+        assert_eq!(hook_runs(dir).unwrap().len(), 4);
         assert_eq!(read_update_enrichment(dir).len(), 1);
         fs::write(dir.join("rewind_points.jsonl"), b"{}\n\xff").unwrap();
-        assert_eq!(rewind_points(dir).len(), 1);
+        assert_eq!(rewind_points(dir).unwrap().len(), 1);
     }
 
     fn enrich_from(s: &str) -> HashMap<String, ToolEnrich> {
@@ -1079,7 +1419,7 @@ mod tests {
         match &m.content[0] {
             Block::Thinking { encrypted, text, .. } => {
                 assert_eq!(encrypted.as_deref(), Some("BLOB"));
-                assert_eq!(text, "thinking");
+                assert_eq!(text.inline_str(), Some("thinking"));
             }
             _ => unreachable!(),
         }
@@ -1101,7 +1441,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(tool_use_id, "call-1");
-                assert_eq!(content, "file contents");
+                assert_eq!(content.inline_str(), Some("file contents"));
                 assert!(!is_error);
             }
             other => panic!("expected tool_result, got {other:?}"),
@@ -1202,6 +1542,13 @@ mod tests {
     }
 
     #[test]
+    fn windowed_reads_keep_the_model() {
+        let _world = crate::test_world("grok-windowed");
+        let home = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/grok/1.0.50/.grok");
+        crate::harness::assert_windowed_models(&Grok::with_home(&home));
+    }
+
+    #[test]
     fn reasoning_records_join_the_next_turn_and_lineage_comes_from_summary_and_meta() {
         let group = tempdir_with("x", "");
         let parent = group.join("p1");
@@ -1296,14 +1643,14 @@ mod tests {
         let s = grok.parse(&r).unwrap();
         // The contract count: user + assistant turns (the fixture's `system` line and two
         // `tool_result` lines are not turns; summary.json's `num_chat_messages` says 5).
-        assert_eq!(r.message_count, 4);
+        assert_eq!(r.message_count, None, "discovery does not count transcript turns");
         assert_eq!(
-            r.message_count,
+            4,
             s.messages
                 .iter()
                 .filter(|m| matches!(m.role, Role::User | Role::Assistant))
                 .count(),
-            "discover's count is the parse's user+assistant count"
+            "a full read still yields the exact user+assistant count"
         );
         // Every Grok fact is nested under `extra["grok"]` (`docs/INTERFACE-V2.md` §4).
         crate::harness::assert_no_flat_keys(&s);

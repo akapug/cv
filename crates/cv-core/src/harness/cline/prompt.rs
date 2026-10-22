@@ -2,14 +2,6 @@
 //! a second bounded traversal selects the same first prose/task line as the owned codec.
 
 use anyhow::Result;
-#[derive(Debug)]
-struct Selected;
-impl std::fmt::Display for Selected {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("prompt metadata selected")
-    }
-}
-impl std::error::Error for Selected {}
 use std::path::PathBuf;
 
 #[derive(Default, Debug)]
@@ -61,102 +53,102 @@ impl Marker {
     }
 }
 
-#[derive(Default)]
+/// The first non-blank line, as a trimmed title [`Head`](crate::projection::Head).
 struct FirstLine {
-    prefix: String,
-    chars: u64,
-    last_nonwhite: u64,
+    line: crate::projection::Head,
     title: Option<String>,
+}
+impl Default for FirstLine {
+    fn default() -> Self {
+        Self {
+            line: crate::projection::Head::trimmed(crate::projection::Head::TITLE),
+            title: None,
+        }
+    }
 }
 impl FirstLine {
     fn feed(&mut self, c: char) {
         if self.title.is_some() {
             return;
         }
-        if c == '\n' {
+        if c == '\n' || self.line.push_char(c) {
             self.finish_line();
-        } else if self.chars != 0 || !c.is_whitespace() {
-            if self.chars < 81 {
-                self.prefix.push(c);
-            }
-            self.chars = self.chars.saturating_add(1);
-            if !c.is_whitespace() {
-                self.last_nonwhite = self.chars;
-                if self.last_nonwhite >= 81 {
-                    self.finish_line();
-                }
-            }
         }
     }
     fn finish_line(&mut self) {
         if self.title.is_some() {
             return;
         }
-        if self.last_nonwhite != 0 {
-            let text = if self.last_nonwhite <= 81 {
-                self.prefix.trim_end()
-            } else {
-                &self.prefix
-            };
-            self.title = Some(crate::ir::truncate(text, 80));
-        } else {
-            self.prefix.clear();
-            self.chars = 0;
+        let line = std::mem::replace(
+            &mut self.line,
+            crate::projection::Head::trimmed(crate::projection::Head::TITLE),
+        );
+        if !line.is_blank() {
+            self.title = Some(line.finish());
         }
     }
 }
 
 const CWD_PREFIX: &str = "# Current Working Directory";
+#[derive(Default, PartialEq, Eq)]
+enum CwdState {
+    #[default]
+    Prefix,
+    BeforePath,
+    Path,
+    IgnoreLine,
+    Done,
+}
+
 #[derive(Default)]
 struct Cwd {
     matched: usize,
-    // 0: prefix; 1: whitespace before '('; 2: path; 3: ignore line; 4: terminal.
-    state: u8,
+    state: CwdState,
     first: Option<u64>,
     last: u64,
     result: Option<(u64, u64)>,
 }
 impl Cwd {
     fn feed(&mut self, c: char, at: u64) {
-        if self.state == 4 {
+        if self.state == CwdState::Done {
             return;
         }
         if c == '\n' {
-            if self.state == 1 || self.state == 2 {
+            if self.state == CwdState::BeforePath || self.state == CwdState::Path {
                 // The owned extractor returns at the first prefix with malformed parentheses.
-                self.state = 4;
+                self.state = CwdState::Done;
             } else {
-                self.state = 0;
+                self.state = CwdState::Prefix;
                 self.matched = 0;
             }
             return;
         }
         match self.state {
-            0 => {
+            CwdState::Prefix => {
                 if self.matched == 0 && c.is_whitespace() {
                     return;
                 }
                 if CWD_PREFIX.as_bytes().get(self.matched).copied() == Some(c as u8) && c.is_ascii() {
                     self.matched += 1;
                     if self.matched == CWD_PREFIX.len() {
-                        self.state = 1;
+                        self.state = CwdState::BeforePath;
                     }
                 } else {
-                    self.state = 3;
+                    self.state = CwdState::IgnoreLine;
                 }
             }
-            1 if c.is_whitespace() => {}
-            1 if c == '(' => self.state = 2,
-            1 => self.state = 4,
-            2 if c == ')' => {
+            CwdState::BeforePath if c.is_whitespace() => {}
+            CwdState::BeforePath if c == '(' => self.state = CwdState::Path,
+            CwdState::BeforePath => self.state = CwdState::Done,
+            CwdState::Path if c == ')' => {
                 if let Some(first) = self.first {
                     self.result = Some((first, self.last));
-                    self.state = 4;
+                    self.state = CwdState::Done;
                 } else {
-                    self.state = 3;
+                    self.state = CwdState::IgnoreLine;
                 }
             }
-            2 if !c.is_whitespace() => {
+            CwdState::Path if !c.is_whitespace() => {
                 self.first.get_or_insert(at);
                 self.last = at + c.len_utf8() as u64;
             }
@@ -218,14 +210,14 @@ pub(super) fn summarize(mut visit: impl FnMut(&mut dyn FnMut(&str) -> Result<()>
             let title_complete = explicit.title.is_some() || (task_complete && prose.title.is_some());
             let path_complete = cwd.result.is_none_or(|(_, end)| next >= end);
             if title_complete && path_complete {
-                return Err(Selected.into());
+                return Err(crate::stream::Stop.into());
             }
         }
         position += chunk.len() as u64;
         Ok(())
     });
     if let Err(error) = selected {
-        if !error.is::<Selected>() {
+        if !error.is::<crate::stream::Stop>() {
             return Err(error);
         }
     }
@@ -278,7 +270,7 @@ mod tests {
                 passes += 1;
                 let result = view.for_each_str_chunk(feed).map(|_| ());
                 if passes == 2 {
-                    assert!(result.as_ref().is_err_and(|error| error.is::<Selected>()));
+                    assert!(result.as_ref().is_err_and(|error| error.is::<crate::stream::Stop>()));
                     std::fs::write(&path, b"\"changed\"")?;
                 }
                 result

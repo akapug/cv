@@ -70,6 +70,7 @@ fn claude_adapter(version_dir: &Path) -> Box<dyn Adapter> {
 /// the parent's `subagents/`, found the way `cv show --tree` finds them.
 fn claude_children(r: &SessionRef) -> Vec<SessionRef> {
     cv_core::harness::claude::subagent_tree(&r.path)
+        .unwrap()
         .into_iter()
         .map(|k| k.session)
         .collect()
@@ -180,12 +181,12 @@ const HARNESSES: &[CorpusHarness] = &[
     CorpusHarness {
         name: "kimi",
         adapter: kimi,
-        children: Some(cv_core::harness::kimi::subagent_refs),
+        children: Some(|r| cv_core::harness::kimi::subagent_refs(r).unwrap()),
     },
     CorpusHarness {
         name: "kimi-code",
         adapter: kimi_code,
-        children: Some(cv_core::harness::kimi_code::subagent_refs),
+        children: Some(|r| cv_core::harness::kimi_code::subagent_refs(r).unwrap()),
     },
     CorpusHarness {
         name: "qwen",
@@ -210,7 +211,7 @@ const HARNESSES: &[CorpusHarness] = &[
     CorpusHarness {
         name: "hermes",
         adapter: hermes,
-        children: Some(cv_core::harness::hermes::subagent_refs),
+        children: Some(|r| cv_core::harness::hermes::subagent_refs(r).unwrap()),
     },
 ];
 
@@ -228,17 +229,6 @@ fn subdirs(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-fn block_type(b: &Block) -> &'static str {
-    match b {
-        Block::Text { .. } => "text",
-        Block::Thinking { .. } => "thinking",
-        Block::ToolUse { .. } => "tool_use",
-        Block::ToolResult { .. } => "tool_result",
-        Block::Image { .. } => "image",
-        Block::File { .. } => "file",
-    }
-}
-
 fn tag(v: impl serde::Serialize) -> String {
     serde_json::to_value(v).unwrap().as_str().unwrap_or("?").to_string()
 }
@@ -252,7 +242,7 @@ fn summarize_one(adapter: &dyn Adapter, r: &SessionRef, version_dir: &Path) -> V
     let mut tools = Vec::new();
     for m in &s.messages {
         for b in &m.content {
-            *blocks.entry(block_type(b)).or_default() += 1;
+            *blocks.entry(b.type_tag()).or_default() += 1;
             if let Block::ToolUse { name, namespace, .. } = b {
                 tools.push(match namespace {
                     Some(ns) => format!("{ns}/{name}"),
@@ -275,12 +265,23 @@ fn summarize_one(adapter: &dyn Adapter, r: &SessionRef, version_dir: &Path) -> V
     for a in cv_core::affordance::of_session(&s)
         .unwrap()
         .into_iter()
-        .chain(adapter.store_affordances(r))
+        .chain(adapter.store_affordances(r).unwrap())
     {
         *affordances
             .entry(format!("{}/{}", a.kind.as_str(), a.action))
             .or_default() += 1;
     }
+    // The tool histogram `cv tools` reports, read as a stream; the whole-session path must agree.
+    let histogram = cv_core::tools::ToolHistogram::from_stream(adapter, r)
+        .unwrap_or_else(|e| panic!("histogram of {}: {e:#}", r.path.display()));
+    let histogram = serde_json::to_value(histogram).unwrap();
+    let whole = cv_core::tools::ToolHistogram::from_messages(s.messages.iter(), s.cwd.as_deref()).unwrap();
+    assert_eq!(
+        serde_json::to_value(whole).unwrap(),
+        histogram,
+        "{}: the message and stream histograms differ",
+        r.path.display()
+    );
     json!({
         "id": s.id,
         "path": r.path.strip_prefix(version_dir).unwrap_or(&r.path),
@@ -289,10 +290,12 @@ fn summarize_one(adapter: &dyn Adapter, r: &SessionRef, version_dir: &Path) -> V
         "blocks": blocks,
         "tools": tools,
         "usage_messages": s.messages.iter().filter(|m| m.usage.is_some()).count(),
+        "model_messages": s.messages.iter().filter(|m| m.model.is_some()).count(),
         "compaction_boundaries": indices(MessageKind::CompactionBoundary),
         "subagent_spawns": indices(MessageKind::SubagentSpawn).len(),
         "subagent_returns": indices(MessageKind::SubagentReturn).len(),
         "affordances": affordances,
+        "tool_histogram": histogram,
         "lineage": s.lineage,
         "model": s.model,
         "skipped_lines": s.cv_extra().and_then(|c| c.get("skipped_lines")).cloned().unwrap_or(json!(0)),
@@ -373,6 +376,43 @@ fn every_corpus_version_reads_as_its_golden_summary() {
     );
 }
 
+/// The writer roster (`writer_version::verified`) is exactly what the corpus declares, both ways:
+/// a harness with a verified version declares it (and nothing newer) in its corpus discovery, and
+/// a harness whose corpus discovery declares any writer version has a roster entry.
+#[test]
+fn the_writer_roster_is_what_corpus_discovery_declares() {
+    let _w = World::in_process("corpus-writers", cv_core::env::Env::enter_isolated);
+    for h in HARNESSES {
+        let harness = cv_core::Harness::parse(h.name).unwrap();
+        let mut declared = Vec::new();
+        for v in subdirs(&corpus_root().join(h.name)) {
+            declared.extend(cv_core::writer_version::declared_by((h.adapter)(&v).as_ref()).unwrap());
+        }
+        match cv_core::writer_version::verified(harness) {
+            Some(verified) => {
+                assert!(
+                    declared.iter().any(|d| d == verified),
+                    "{}: verified {verified}, but the corpus declares {declared:?}",
+                    h.name
+                );
+                for d in &declared {
+                    let order = cv_core::writer_version::compare(d, verified);
+                    assert!(
+                        order.is_some_and(|o| o.is_le()),
+                        "{}: the corpus declares {d}, newer than (or unlike) the verified {verified}",
+                        h.name
+                    );
+                }
+            }
+            None => assert!(
+                declared.is_empty(),
+                "{}: corpus discovery declares writer versions {declared:?}, but the roster has none",
+                h.name
+            ),
+        }
+    }
+}
+
 /// What cv persists or prints is byte-deterministic: two reads of one session take byte-identical
 /// checkpoints at every offset an adapter allows. Each read's hash maps get their own random seed,
 /// so a map serialized in iteration order differs between them.
@@ -398,9 +438,7 @@ fn every_corpus_checkpoint_serializes_deterministically() {
             for r in adapter.discover().expect("discover") {
                 let read = || {
                     let mut sink = Checkpoints(Vec::new());
-                    let session = adapter
-                        .try_stream(&r, &cv_core::ParseOptions::full(), &mut sink)
-                        .unwrap();
+                    let session = adapter.try_stream(&r, &cv_core::Demand::RICH, &mut sink).unwrap();
                     (sink.0, serde_json::to_vec(&session).unwrap())
                 };
                 let first = read();
@@ -421,12 +459,12 @@ fn doctor_lazy_report_matches_full_corpus() -> anyhow::Result<()> {
     for harness in HARNESSES {
         for version in subdirs(&corpus_root().join(harness.name)) {
             let adapter = (harness.adapter)(&version);
-            let mut refs = adapter.discover().unwrap();
+            let mut refs = adapter.discover().unwrap().refs;
             if let Some(children) = harness.children {
                 refs.extend(refs.clone().iter().flat_map(children));
             }
             for session in refs {
-                let report = |options: &cv_core::ParseOptions| -> anyhow::Result<Value> {
+                let report = |options: &cv_core::Demand| -> anyhow::Result<Value> {
                     let mut report = cv_core::doctor::Report::default();
                     let mut pass = report.session(Some(session.path.clone()));
                     adapter.try_stream(&session, options, &mut pass)?;
@@ -434,8 +472,8 @@ fn doctor_lazy_report_matches_full_corpus() -> anyhow::Result<()> {
                     Ok(report.to_json())
                 };
                 assert_eq!(
-                    report(&cv_core::ParseOptions::lazy_extra())?,
-                    report(&cv_core::ParseOptions::full())?,
+                    report(&cv_core::Demand::RICH.with_spans())?,
+                    report(&cv_core::Demand::RICH)?,
                     "doctor changed for {}:{} ({})",
                     harness.name,
                     session.id,
@@ -520,7 +558,7 @@ fn claude_corpus_workflow_runs_read_as_recorded() {
                 let runs: Vec<Value> = claude_workflow::workflows(&r.path)
                     .iter()
                     .map(|w| {
-                        let mut agents: Vec<Value> = claude::subagent_tree(&r.path)
+                        let mut agents: Vec<Value> = claude::subagent_tree(&r.path).unwrap()
                             .iter()
                             .filter(|k| k.workflow.as_deref() == Some(w.run_id.as_str()))
                             .map(|k| json!({"agent_id": k.agent_id(), "result_status": k.result_status, "result_summary": k.result_summary}))
@@ -587,10 +625,11 @@ const PERSISTED: &[(&str, &[&str])] = &[
         "cline/",
         &["subagent_spawn", "subagent_spawn/state", "subagent_return", "question"],
     ),
-    (
-        "codex/",
-        &["subagent_spawn", "subagent_return", "approval/state", "approval/deny"],
-    ),
+    ("codex/", &["subagent_spawn", "subagent_return", "approval/state"]),
+    // These versions exercised an MCP call refused by approval policy. The hooks-only writer
+    // fixture has no MCP request; a PreToolUse hook block is not an approval request record.
+    ("codex/0.161.0$", &["approval/deny"]),
+    ("codex/0.162.1$", &["approval/deny"]),
     ("continue/", &["plan", "subagent_spawn"]),
     (
         "devin/",
@@ -827,32 +866,6 @@ fn query_facts_match_collected_corpus() {
         }
     }
 
-    // Frozen pre-reducer tally, independent of ToolHistogram's new shared per-event helper.
-    fn legacy_histogram(events: &[cv_core::events::Event]) -> cv_core::tools::ToolHistogram {
-        let mut h = cv_core::tools::ToolHistogram::default();
-        for e in events {
-            if e.kind == "error" {
-                h.total_errors += 1;
-                if let Some(t) = &e.tool {
-                    h.tools.entry(t.clone()).or_default().errors += 1;
-                }
-            } else if let Some(t) = &e.tool {
-                let c = h.tools.entry(t.clone()).or_default();
-                if e.call {
-                    c.calls += 1;
-                    h.total_calls += 1;
-                }
-                match e.kind {
-                    "file_edit" => c.edits += 1,
-                    "file_read" => c.reads += 1,
-                    "command" => c.commands += 1,
-                    _ => {}
-                }
-            }
-        }
-        h
-    }
-
     let world = World::in_process("query_corpus_oracle", cv_core::env::Env::enter_isolated);
     let mut checked = HashMap::<&str, usize>::new();
     for harness in HARNESSES {
@@ -866,11 +879,12 @@ fn query_facts_match_collected_corpus() {
             copy_tree(&version, &scratch);
             let adapter = (harness.adapter)(&scratch);
             for r in adapter.discover().unwrap() {
-                let full = cv_core::stream::collect_with(adapter.as_ref(), &r, &cv_core::ParseOptions::lazy()).unwrap();
+                let full =
+                    cv_core::stream::collect_with(adapter.as_ref(), &r, &cv_core::Demand::LEAN.with_spans()).unwrap();
                 let rows = cv_core::affordance::of_session(&full)
                     .unwrap()
                     .into_iter()
-                    .chain(adapter.store_affordances(&r));
+                    .chain(adapter.store_affordances(&r).unwrap());
                 let mut counts = cv_core::affordance::Counts::new();
                 for row in rows {
                     *counts.entry(row.kind).or_default() += 1;
@@ -951,41 +965,13 @@ fn query_facts_match_collected_corpus() {
                         r.id
                     );
                 }
-                // Preserve the old stream's cwd/meta rules and tool-name pairing, separately
-                // from the whole-session convenience path (which resolves against final cwd).
-                let mut old_sink = cv_core::events::EventSink::new(r.cwd.clone());
-                adapter
-                    .stream(&r, &cv_core::ParseOptions::lazy(), &mut old_sink)
-                    .unwrap();
-                let expected = serde_json::to_value(legacy_histogram(old_sink.events())).unwrap();
-                let actual = cv_core::tools::ToolHistogram::from_stream(adapter.as_ref(), &r).unwrap();
-                assert_eq!(
-                    serde_json::to_value(actual).unwrap(),
-                    expected,
-                    "stream histogram: {} {} {}",
-                    harness.name,
-                    version.display(),
-                    r.id
-                );
-                let expected = serde_json::to_value(legacy_histogram(&events)).unwrap();
-                let actual =
-                    cv_core::tools::ToolHistogram::from_messages(full.messages.iter(), full.cwd.as_deref()).unwrap();
-                assert_eq!(
-                    serde_json::to_value(actual).unwrap(),
-                    expected,
-                    "message histogram: {} {} {}",
-                    harness.name,
-                    version.display(),
-                    r.id
-                );
-
                 // Presence queries cannot reveal count inflation: compare the entire tiny counter
                 // against the old row collector, including this adapter's own side stores.
                 let mut discard = cv_core::stream::Discard;
                 let counted = cv_core::stream::stream_counted(
                     adapter.as_ref(),
                     &r,
-                    &cv_core::ParseOptions::lazy(),
+                    &cv_core::Demand::LEAN.with_spans(),
                     &mut discard,
                     Default::default(),
                 )

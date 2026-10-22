@@ -42,7 +42,7 @@ mod record;
 use super::wire::openai;
 use super::{ts_from_epoch, Adapter};
 use crate::ir::*;
-use crate::stream::{Flow, MessageSink, ParseOptions};
+use crate::stream::{Demand, Flow, MessageSink};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
@@ -54,6 +54,10 @@ pub struct Continue {
     /// `<root>/sessions`, if it exists.
     sessions: Option<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Continue = Continue { sessions: None };
 
 impl Continue {
     pub fn detect() -> Self {
@@ -80,15 +84,19 @@ impl Adapter for Continue {
         self.sessions.clone().into_iter().collect()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         let Some(sessions) = &self.sessions else {
-            return Ok(vec![]);
+            return Ok(Default::default());
         };
 
-        // Index entries from sessions.json, if present.
-        let index = read_index(&sessions.join("sessions.json"));
+        // An unreadable or undecodable `sessions.json` is reported; its files are still listed by
+        // the walk below, without the index's facts. An unreadable dir or session file is skipped
+        // and reported; a session file that does not decode is listed (its read is an empty,
+        // counted session).
+        let mut out = crate::Discovered::default();
+        let index_path = sessions.join("sessions.json");
+        let index = out.keep(&index_path, read_index(&index_path)).unwrap_or_default();
 
-        let mut out = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Prefer the index, but only keep entries whose `<id>.json` actually exists.
@@ -100,17 +108,17 @@ impl Adapter for Continue {
             if !seen.insert(meta.session_id.clone()) {
                 continue;
             }
-            out.push(ref_from(
-                meta,
-                &path,
-                scan_session(&path).map_or(0, |s| s.message_count),
-            ));
+            // The index has the listing facts; counting would read the whole history (C1).
+            out.refs.push(ref_from(meta, &path));
         }
 
         // Fold in any `<id>.json` on disk that the index didn't mention (tolerant of a missing or
         // stale index).
-        if let Ok(rd) = fs::read_dir(sessions) {
-            for e in rd.filter_map(|e| e.ok()) {
+        if let Some(rd) = out.keep(sessions, fs::read_dir(sessions).map_err(Into::into)) {
+            for e in rd {
+                let Some(e) = out.keep(sessions, e.map_err(Into::into)) else {
+                    continue;
+                };
                 let p = e.path();
                 let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
                     continue;
@@ -122,14 +130,17 @@ impl Adapter for Continue {
                 if seen.contains(&id) {
                     continue;
                 }
-                let scan = scan_session(&p).unwrap_or_default();
+                let Some(scan) = out.keep(&p, scan_session(&p)) else {
+                    continue;
+                };
+                let (title, cwd) = scan.map_or((None, None), |s| (s.title, s.cwd));
                 let meta = IndexMeta {
                     session_id: id,
-                    title: scan.title,
-                    cwd: scan.cwd,
+                    title,
+                    cwd,
                     created_at: None,
                 };
-                out.push(ref_from(&meta, &p, scan.message_count));
+                out.refs.push(ref_from(&meta, &p));
             }
         }
 
@@ -137,7 +148,7 @@ impl Adapter for Continue {
     }
 
     /// Project one accepted history item at a time, retaining body source ranges in lazy mode.
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Continue, sink);
             let sink: &mut dyn MessageSink = &mut spawns;
@@ -153,10 +164,7 @@ impl Adapter for Continue {
             if let Some(error) = sink.take_error() {
                 return Err(error);
             }
-            let Some(source) = JsonSource::capture(&r.path).ok() else {
-                sink.meta(&s);
-                return Ok(s);
-            };
+            let source = JsonSource::capture(&r.path)?;
             let result = source.read_syntax(|root| {
                 let Some(doc) = Fields::parse_struct(root, &["title", "workspaceDirectory", "history"])? else {
                     return Err(InvalidStruct("expected Continue session struct").into());
@@ -175,7 +183,6 @@ impl Adapter for Continue {
                 }
                 sink.meta(&s);
                 let mut answered = std::collections::HashSet::<String>::new();
-                let mut has_sources = false;
                 for item in history.into_iter().flatten().flatten() {
                     let Some(item) = item? else { continue };
                     let reply_id = record::reply_id(item)?;
@@ -192,15 +199,11 @@ impl Adapter for Continue {
                                 s.system_prompt = Some(text);
                             }
                         }
-                        let sourced = record::has_sources(&message);
-                        has_sources |= sourced;
-                        if sourced {
-                            source.check()?;
-                        }
+                        // A span demand checks its own source; the stream rechecks after a slow callback and
+                        // at the end (`stream` module: who owns the source guarantee).
+                        let started = std::time::Instant::now();
                         let flow = sink.try_message(message)?;
-                        if sourced {
-                            source.check()?;
-                        }
+                        source.check_after(started)?;
                         if flow == Flow::Stop {
                             break;
                         }
@@ -211,21 +214,24 @@ impl Adapter for Continue {
                                 answered.insert(tool_use_id.clone());
                             }
                         }
-                        if sink.try_message(results)? == Flow::Stop {
+                        let started = std::time::Instant::now();
+                        let flow = sink.try_message(results)?;
+                        source.check_after(started)?;
+                        if flow == Flow::Stop {
                             break;
                         }
                     }
                 }
-                if has_sources {
-                    source.check()?;
-                }
+                source.check()?;
                 Ok(())
             });
             if let Err(error) = result {
-                if !error.is::<InvalidJson>() && !error.is::<InvalidStruct>() {
+                if !is_undecodable(&error) {
                     return Err(error);
                 }
                 sink.meta(&s);
+                // The document is the record: one that does not decode is counted.
+                super::Unparsed(1).note(&mut s);
             }
             Ok(s)
         })
@@ -289,17 +295,11 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
 
     // ── transcript: <sessionId>.json ──
     let resolver = crate::lazy::Resolver::new(session.source_path.clone());
-    let title = super::wire::write::fallback_title(session, Harness::Continue, opts.thinking, &resolver)?;
+    let title = super::wire::write::fallback_title(session, &resolver)?;
     let file_path = out_dir.join(format!("{new_id}.json"));
-    emit::transcript(
-        session,
-        &new_id,
-        title.as_deref(),
-        cwd_str.as_deref(),
-        &file_path,
-        opts.thinking,
-        opts.claim(),
-    )?;
+    let mut set = crate::publish::Set::new();
+    let transcript = emit::transcript(session, &new_id, title.as_deref(), cwd_str.as_deref(), opts.thinking)?;
+    super::store::stage_into(&mut set, transcript, &file_path, opts.claim())?;
 
     // ── index: sessions.json (merge-or-create) ──
     // Drop any stale entry for this id, then append a fresh one.
@@ -322,8 +322,10 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
     entries.push(Value::Object(entry));
     let mut stage = super::store::bytes::ByteStage::new();
     serde_json::to_writer_pretty(&mut stage, &entries)?;
-    // Continue's own index: cv's update replaces it whole.
-    super::store::publish_stage(stage, &index_path, crate::publish::Claim::Replace)?;
+    // Continue's own index: cv's update replaces it whole. Transcript and index publish as one
+    // set, the index last: a crash between leaves an unlisted transcript.
+    super::store::stage_into(&mut set, stage, &index_path, crate::publish::Claim::Replace)?;
+    set.publish()?;
 
     Ok(super::EmitResult {
         path: file_path,
@@ -333,98 +335,6 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
 }
 
 mod emit;
-
-#[cfg(test)]
-/// Build one `history` item (`{message, contextItems}`) from an IR message.
-fn history_item(msg: &Message, session_model: Option<&str>) -> Result<Value> {
-    let role_str = match msg.role {
-        Role::System => "system",
-        Role::Assistant => "assistant",
-        Role::Tool => "tool",
-        Role::User => "user",
-    };
-
-    let mut message = Map::new();
-    message.insert("role".into(), json!(role_str));
-
-    let mut context_items: Vec<Value> = Vec::new();
-
-    match msg.role {
-        Role::Tool => {
-            // A tool result: Continue stores output in `content`, keyed by `toolCallId`.
-            let (tool_use_id, content) = tool_result_of(&msg.content);
-            message.insert("toolCallId".into(), json!(tool_use_id));
-            message.insert("content".into(), json!(content));
-        }
-        _ => {
-            // content: array of text/image parts (the array shape the parser handles).
-            let mut parts: Vec<Value> = Vec::new();
-            let mut tool_calls: Vec<Value> = Vec::new();
-            for b in &msg.content {
-                match b {
-                    Block::Text { text } => {
-                        parts.push(json!({ "type": "text", "text": text }));
-                    }
-                    Block::Thinking { text, .. } => {
-                        // Continue's ChatMessage has no thinking part; preserve as text so it's
-                        // searchable and survives a round-trip as content.
-                        if !text.is_empty() {
-                            parts.push(json!({ "type": "text", "text": text }));
-                        }
-                    }
-                    Block::Image { data_ref, .. } => {
-                        if let Some(url) = data_ref {
-                            parts.push(json!({
-                                "type": "imageUrl",
-                                "imageUrl": { "url": url },
-                            }));
-                        }
-                    }
-                    Block::ToolUse { id, name, input, .. } => {
-                        tool_calls.push(json!({
-                            "id": id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                // `arguments` is a JSON-encoded *string*.
-                                "arguments": serde_json::to_string(input.resolve()?.as_ref())?,
-                            },
-                        }));
-                    }
-                    Block::File { path, source, mime } => {
-                        context_items.push(file_context_item(path, source, mime));
-                    }
-                    Block::ToolResult { .. } => {}
-                }
-            }
-            message.insert("content".into(), Value::Array(parts));
-            if msg.role == Role::Assistant && !tool_calls.is_empty() {
-                message.insert("toolCalls".into(), Value::Array(tool_calls));
-            }
-        }
-    }
-
-    // The owned control includes the same newly supported native usage field; body construction
-    // remains independent of the checked writer and the native roundtrip pins numeric semantics.
-    if msg.role == Role::Assistant {
-        if let Some(usage) = &msg.usage {
-            message.insert(
-                "usage".into(),
-                Value::Object(emit::native_usage(usage, msg.model.as_deref())?),
-            );
-        }
-    }
-    let mut item = Map::new();
-    item.insert("message".into(), Value::Object(message));
-    item.insert("contextItems".into(), Value::Array(context_items));
-    // Carry the model so the parser can backfill it (assistant turns).
-    if msg.role == Role::Assistant {
-        if let Some(model) = msg.model.as_deref().or(session_model) {
-            item.insert("promptLogs".into(), json!([{ "modelTitle": model }]));
-        }
-    }
-    Ok(Value::Object(item))
-}
 
 /// Map a `Block::File` to a Continue `contextItem` (`{name, description, uri:{type, value}}`) that
 /// the parser's `record::context_item` round-trips back into a `File` block.
@@ -457,20 +367,6 @@ fn file_name_of(p: &str) -> String {
     p.rsplit(['/', '\\']).next().unwrap_or(p).to_string()
 }
 
-/// Pull `(toolCallId, content)` from a Tool turn's first ToolResult block.
-#[cfg(test)]
-fn tool_result_of(content: &[Block]) -> (String, String) {
-    for b in content {
-        if let Block::ToolResult {
-            tool_use_id, content, ..
-        } = b
-        {
-            return (tool_use_id.clone(), content.to_string());
-        }
-    }
-    (String::new(), String::new())
-}
-
 // ---------------------------------------------------------------------------
 // Index (sessions.json)
 // ---------------------------------------------------------------------------
@@ -482,87 +378,81 @@ struct IndexMeta {
     created_at: Option<DateTime<Utc>>,
 }
 
-/// Read `sessions.json` (array of `{sessionId, title, dateCreated, workspaceDirectory}`). Empty vec
-/// on any error.
-fn read_index(path: &Path) -> Vec<IndexMeta> {
-    let Some(source) = JsonSource::capture(path).ok() else {
-        return Vec::new();
-    };
-    source
-        .read_document(|root| {
-            let mut out = Vec::new();
-            if let Some(entries) = root.array()? {
-                for entry in entries {
-                    let Some(fields) =
-                        Fields::parse(entry?, &["sessionId", "title", "dateCreated", "workspaceDirectory"])?
-                    else {
-                        continue;
-                    };
-                    let Some(session_id) = fields.string("sessionId")?.filter(|s| !s.is_empty()) else {
-                        continue;
-                    };
-                    out.push(IndexMeta {
-                        session_id,
-                        title: record::title(fields.get("title"), false)?,
-                        cwd: fields
-                            .string("workspaceDirectory")?
-                            .filter(|p| !p.is_empty())
-                            .map(|p| workspace_to_path(&p)),
-                        created_at: fields.value("dateCreated")?.as_ref().and_then(parse_date),
-                    });
-                }
+/// A document that read but did not decode (as opposed to one that could not be read).
+fn is_undecodable(error: &anyhow::Error) -> bool {
+    error.is::<InvalidJson>() || error.is::<InvalidStruct>()
+}
+
+/// Read `sessions.json` (array of `{sessionId, title, dateCreated, workspaceDirectory}`); a
+/// non-array document is an empty index, a read or decode failure an error.
+fn read_index(path: &Path) -> Result<Vec<IndexMeta>> {
+    JsonSource::capture(path)?.read_document(|root| {
+        let mut out = Vec::new();
+        if let Some(entries) = root.array()? {
+            for entry in entries {
+                let Some(fields) = Fields::parse(entry?, &["sessionId", "title", "dateCreated", "workspaceDirectory"])?
+                else {
+                    continue;
+                };
+                let Some(session_id) = fields.string("sessionId")?.filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                out.push(IndexMeta {
+                    session_id,
+                    title: record::title(fields.get("title"), false)?,
+                    cwd: fields
+                        .string("workspaceDirectory")?
+                        .filter(|p| !p.is_empty())
+                        .map(|p| workspace_to_path(&p)),
+                    created_at: fields.value("dateCreated")?.as_ref().and_then(parse_date),
+                });
             }
-            Ok(out)
-        })
-        .unwrap_or_default()
+        }
+        Ok(out)
+    })
 }
 
 /// Build a `SessionRef` from index metadata + the on-disk transcript path.
-fn ref_from(meta: &IndexMeta, path: &Path, message_count: usize) -> SessionRef {
+fn ref_from(meta: &IndexMeta, path: &Path) -> SessionRef {
     let updated = mtime(path);
     SessionRef {
-        id: meta.session_id.clone(),
-        harness: Harness::Continue,
-        path: path.to_path_buf(),
         cwd: meta.cwd.clone(),
         title: meta.title.clone(),
         created_at: meta.created_at.or(updated),
         updated_at: updated,
-        message_count,
+        // Uncounted (`SessionRef::new`): counting would read the whole history (C1).
+        ..SessionRef::new(meta.session_id.clone(), Harness::Continue, path.to_path_buf())
     }
 }
 
-/// Discovery keeps metadata and a count, never a whole history. Validate each discarded item
-/// before dropping it: IgnoredAny would accept malformed Unicode that the old Value rejected.
-/// Duplicate fields retain their last value, including null/wrong-type replacements.
+/// Discovery keeps the listing metadata of an unindexed session, never its history or a count
+/// (counting means reading every history item: `None` until a full read certifies it). The
+/// document is still validated whole, as Value. Duplicate fields retain their last value,
+/// including null/wrong-type replacements.
 #[derive(Default)]
 struct Scan {
     title: Option<String>,
     cwd: Option<PathBuf>,
-    message_count: usize,
 }
 
-fn scan_session(path: &Path) -> Option<Scan> {
-    let source = JsonSource::capture(path).ok()?;
-    source
-        .read_document(|root| {
-            let mut scan = Scan::default();
-            if let Some(fields) = Fields::parse(root, &["title", "workspaceDirectory", "history"])? {
-                scan.title = record::title(fields.get("title"), false)?;
-                scan.cwd = fields
-                    .string("workspaceDirectory")?
-                    .filter(|p| !p.is_empty())
-                    .map(|p| workspace_to_path(&p));
-                if let Some(history) = fields.get("history").map(JsonView::array).transpose()?.flatten() {
-                    for item in history {
-                        item?;
-                        scan.message_count += 1;
-                    }
-                }
-            }
-            Ok(scan)
-        })
-        .ok()
+/// `None` for a document that does not decode; an error for one that cannot be read.
+fn scan_session(path: &Path) -> Result<Option<Scan>> {
+    let scanned = JsonSource::capture(path)?.read_document(|root| {
+        let mut scan = Scan::default();
+        if let Some(fields) = Fields::parse(root, &["title", "workspaceDirectory"])? {
+            scan.title = record::title(fields.get("title"), false)?;
+            scan.cwd = fields
+                .string("workspaceDirectory")?
+                .filter(|p| !p.is_empty())
+                .map(|p| workspace_to_path(&p));
+        }
+        Ok(scan)
+    });
+    match scanned {
+        Ok(scan) => Ok(Some(scan)),
+        Err(error) if is_undecodable(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -729,7 +619,7 @@ mod tests {
             let reference = SessionRef::new("s", Harness::Continue, path.clone());
             let mut sink = crate::stream::CollectSink::default();
             let actual = Continue { sessions: None }
-                .stream(&reference, &ParseOptions::lazy(), &mut sink)
+                .stream(&reference, &Demand::LEAN.with_spans(), &mut sink)
                 .unwrap();
             match serde_json::from_str::<OldDoc<'_>>(text) {
                 Ok(old) => {
@@ -745,7 +635,7 @@ mod tests {
                         actual.title,
                         old.title
                             .filter(|t| !t.trim().is_empty())
-                            .map(|t| crate::ir::truncate(&t, 80)),
+                            .map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE)),
                         "{text}"
                     );
                     assert_eq!(
@@ -858,7 +748,7 @@ mod tests {
             }
         };
         assert!(Continue { sessions: None }
-            .stream(&reference, &ParseOptions::lazy(), &mut mutate)
+            .stream(&reference, &Demand::LEAN.with_spans(), &mut mutate)
             .is_err());
         assert!(published.unwrap().resolve().is_err());
     }
@@ -1019,7 +909,7 @@ mod tests {
                 tool_use_id, content, ..
             } => {
                 assert_eq!(tool_use_id, "call_1");
-                assert_eq!(content, "file contents here");
+                assert_eq!(content.inline_str(), Some("file contents here"));
             }
             _ => panic!("expected tool_result"),
         }
@@ -1142,7 +1032,7 @@ mod tests {
         assert!(parsed.messages[2].content.iter().any(|b| matches!(
             b,
             Block::ToolResult { tool_use_id, content, .. }
-                if tool_use_id == "call_1" && content == "fn main() {}"
+                if tool_use_id == "call_1" && content.matches_str("fn main() {}") == Some(true)
         )));
 
         // The index should also discover it.
@@ -1171,7 +1061,7 @@ mod tests {
             .expect("indexed session discovered");
         assert_eq!(r.title.as_deref(), Some("Refactor the parser"));
         assert_eq!(r.cwd.as_deref(), Some(Path::new("/Users/me/proj")));
-        assert!(r.message_count >= 3);
+        assert_eq!(r.message_count, None, "uncounted until a full read");
         assert!(r.created_at.is_some());
     }
 
@@ -1212,7 +1102,7 @@ mod tests {
         }
         let mut sink = StopFirst { seen: Vec::new() };
         let s = Continue { sessions: None }
-            .stream(&r, &ParseOptions::full(), &mut sink)
+            .stream(&r, &Demand::RICH, &mut sink)
             .unwrap();
 
         // Only the first message was ever materialized; the returned Session is metadata-only.
@@ -1265,20 +1155,19 @@ mod tests {
                     .get("title")
                     .and_then(Value::as_str)
                     .filter(|t| !t.trim().is_empty())
-                    .map(|t| crate::ir::truncate(t, 80));
+                    .map(|t| crate::ir::truncate(t, crate::projection::Head::TITLE));
                 let cwd = v
                     .get("workspaceDirectory")
                     .and_then(Value::as_str)
                     .filter(|p| !p.is_empty())
                     .map(workspace_to_path);
-                let count = v.get("history").and_then(Value::as_array).map_or(0, Vec::len);
-                (title, cwd, count)
+                (title, cwd)
             });
-            let actual = scan_session(&path).map(|s| (s.title, s.cwd, s.message_count));
+            let actual = scan_session(&path).unwrap().map(|s| (s.title, s.cwd));
             assert_eq!(actual, expected, "case prefix: {:?}", &text[..text.len().min(120)]);
         }
         fs::write(&path, b"{\"history\":[\"\xff\"]}").unwrap();
-        assert!(scan_session(&path).is_none());
+        assert!(scan_session(&path).unwrap().is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1317,15 +1206,29 @@ mod tests {
         assert_eq!(indexed.title.as_deref(), Some("index title"));
         assert_eq!(indexed.cwd.as_deref(), Some(Path::new("/index")));
         assert_eq!(indexed.created_at.unwrap().timestamp_millis(), 1700000000000);
-        assert_eq!(indexed.message_count, 2);
+        assert_eq!(indexed.message_count, None);
         let extra = refs.iter().find(|r| r.id == "extra").unwrap();
         assert_eq!(extra.title.as_deref(), Some("extra title"));
         assert_eq!(extra.cwd.as_deref(), Some(Path::new("/extra")));
         assert_eq!(extra.created_at, extra.updated_at);
-        assert_eq!(extra.message_count, 3);
+        assert_eq!(extra.message_count, None);
         let broken = refs.iter().find(|r| r.id == "broken").unwrap();
         assert!(broken.title.is_none());
-        assert_eq!(broken.message_count, 0);
+        assert_eq!(broken.message_count, None);
+        // The undecodable file reads as an empty session that counts its one record.
+        let adapter = Continue {
+            sessions: Some(dir.clone()),
+        };
+        let read = adapter.parse(broken).unwrap();
+        assert!(read.messages.is_empty());
+        assert_eq!(read.extra["cv"]["skipped_lines"], 1);
+        // An undecodable index is reported; the walk still lists every file, without its facts.
+        fs::write(dir.join("sessions.json"), "{broken").unwrap();
+        let found = adapter.discover().unwrap();
+        assert_eq!(found.refs.len(), 3);
+        assert_eq!(found.skipped.len(), 1);
+        assert_eq!(found.skipped[0].path, dir.join("sessions.json"));
+        assert!(found.refs.iter().find(|r| r.id == "indexed").unwrap().title.as_deref() == Some("file title"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

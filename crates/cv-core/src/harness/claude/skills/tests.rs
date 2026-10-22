@@ -4,8 +4,10 @@ use serde_json::json;
 const SID: &str = "11111111-1111-4111-8111-111111111111";
 const FRESH: &str = "# fresh\n\nDo the fresh thing.";
 const STALE_NOW: &str = "# stale\n\nThe rule as it reads today.";
+const CRATE: &str = "# crate\n\nBox the thing before it ships.";
 
-/// `<config>/projects/-work-proj/` with user skills `fresh` and `stale` on disk.
+/// `<config>/projects/-work-proj/` with user skills `fresh` and `stale` on disk, plus `crate`, a
+/// LEGACY skill whose text is a slash command's file (`commands/crate.md`).
 fn config() -> (PathBuf, PathBuf) {
     let config = std::env::temp_dir().join(format!("cv-skills-test-{}", uuid::Uuid::new_v4()));
     for (name, text) in [("fresh", FRESH), ("stale", STALE_NOW)] {
@@ -17,6 +19,13 @@ fn config() -> (PathBuf, PathBuf) {
         )
         .unwrap();
     }
+    let commands = config.join("commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(
+        commands.join("crate.md"),
+        format!("---\nname: crate\ndescription: d\n---\n\n{CRATE}\n"),
+    )
+    .unwrap();
     let project = config.join("projects").join("-work-proj");
     std::fs::create_dir_all(&project).unwrap();
     (config, project)
@@ -83,9 +92,9 @@ fn drop_stale_keeps_current_and_unverifiable_skills() {
 }
 
 #[test]
-fn drop_all_empties_the_record_and_keep_changes_nothing() {
+fn drop_empties_the_record_and_keep_changes_nothing() {
     let (config, _) = config();
-    let (out, report) = run(SkillsPolicy::DropAll, &[restore(false)], &config);
+    let (out, report) = run(SkillsPolicy::Drop, &[restore(false)], &config);
     assert!(names(&out[0]).is_empty());
     assert!(out[0].get("rendered").is_none());
     assert_eq!(report.dropped, 4);
@@ -143,6 +152,54 @@ fn project_skills_resolve_from_the_record_cwd() {
 }
 
 #[test]
+fn a_legacy_command_file_is_where_a_skill_reads_from() {
+    let (config, _) = config();
+    let command = entry("crate", "userSettings", CRATE);
+    assert!(current(&command, Some(&config), None), "commands/crate.md holds it");
+    assert!(
+        !current(&entry("crate", "userSettings", "# crate\n\nOther"), Some(&config), None),
+        "a command file that changed is stale like any other file"
+    );
+    // `skills/<name>/SKILL.md` resolves first: with both files there, the skill directory decides.
+    let dir = config.join("skills").join("crate");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: crate\n---\n\n# crate\n\nAnother rule.\n",
+    )
+    .unwrap();
+    assert!(!current(&command, Some(&config), None));
+    std::fs::remove_dir_all(config).ok();
+}
+
+#[test]
+fn a_nested_command_name_is_a_path_and_a_project_command_resolves_from_cwd() {
+    let (config, _) = config();
+    let nested = config.join("commands").join("a");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("b.md"), "# b\n\nNested.\n").unwrap();
+    assert!(current(
+        &entry("a:b", "userSettings", "# b\n\nNested."),
+        Some(&config),
+        None
+    ));
+
+    let root = std::env::temp_dir().join(format!("cv-skills-cmd-{}", uuid::Uuid::new_v4()));
+    let commands = root.join(".claude/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(commands.join("local.md"), "# local\n").unwrap();
+    assert!(current(
+        &entry("local", "projectSettings", "# local"),
+        None,
+        Some(&root.join("sub"))
+    ));
+    assert!(!current(&entry("local", "projectSettings", "# old"), None, Some(&root)));
+    std::fs::remove_dir_all(root).ok();
+    std::fs::remove_dir_all(config).ok();
+}
+
+#[test]
 fn config_dir_is_the_parent_of_projects() {
     let (config, project) = config();
     assert_eq!(
@@ -170,6 +227,7 @@ fn prune_and_rewind_apply_the_policy_to_the_new_session_only() {
     std::fs::write(&src, &body).unwrap();
 
     let pruned = crate::prune::prune_session(
+        crate::ir::Harness::Claude,
         &src,
         &crate::prune::PruneOptions {
             skills_policy: SkillsPolicy::DropStale,
@@ -195,7 +253,7 @@ fn prune_and_rewind_apply_the_policy_to_the_new_session_only() {
             new_id: None,
             dry_run: false,
             thinking: Some(crate::emit::ThinkingMode::Native),
-            skills_policy: SkillsPolicy::DropAll,
+            skills_policy: SkillsPolicy::Drop,
             generator: "cv-test".into(),
         },
     )
@@ -212,4 +270,35 @@ fn prune_and_rewind_apply_the_policy_to_the_new_session_only() {
         "the source is never touched"
     );
     std::fs::remove_dir_all(config).ok();
+}
+
+#[test]
+fn keep_preserves_exact_bytes_and_unknown_or_unreadable_files_are_kept() {
+    let raw = b" {\"type\":\"attachment\", \"attachment\":{\"type\":\"invoked_skills\",\"skills\":[]}}\r\n\n";
+    let mut stage = ByteStage::new();
+    stage.write_all(raw).unwrap();
+    let (out, report) = apply(stage.finish().unwrap(), SkillsPolicy::Keep, None).unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut out.reader().unwrap(), &mut bytes).unwrap();
+    assert_eq!(bytes, raw);
+    assert!(report.is_keep());
+
+    let (config, _) = config();
+    // A directory is unreadable as skill text, but its presence is not proof of staleness.
+    std::fs::create_dir_all(config.join("skills/unreadable/SKILL.md")).unwrap();
+    assert!(current(
+        &entry("unreadable", "userSettings", "text"),
+        Some(&config),
+        None
+    ));
+    assert!(current(&entry("plugin-skill", "plugin:p", "text"), Some(&config), None));
+    assert!(!current(&entry("gone", "userSettings", "text"), Some(&config), None));
+    assert!(!current(
+        &entry("fresh", "userSettings", &format!("{FRESH}\nobsolete text")),
+        Some(&config),
+        None
+    ));
+    let subagent = config.join("projects/p/session/subagents/agent-a.jsonl");
+    assert_eq!(config_dir_of(&subagent), Some(config.clone()));
+    std::fs::remove_dir_all(config).unwrap();
 }

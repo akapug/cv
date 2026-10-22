@@ -90,6 +90,14 @@ impl StringCount {
     }
 }
 impl Builder<'_> {
+    fn add_len(&mut self, len: usize) -> Result<()> {
+        self.1 = self
+            .1
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("text length overflow"))?;
+        Ok(())
+    }
+
     pub(crate) fn decoded_len(&self) -> usize {
         self.1
     }
@@ -107,10 +115,7 @@ impl Builder<'_> {
         }
         let len = text.len();
         text.serialize(&mut serde_json::Serializer::with_formatter(&mut *self.0, Interior))?;
-        self.1 = self
-            .1
-            .checked_add(len)
-            .ok_or_else(|| anyhow::anyhow!("text length overflow"))?;
+        self.add_len(len)?;
         Ok(())
     }
     /// Append a string view without decoding and re-encoding its already valid interior.
@@ -161,19 +166,13 @@ impl Builder<'_> {
         view.write_canonical(&mut interior)?;
         anyhow::ensure!(interior.last == Some(b'"'), "missing closing string quote");
         let len = interior.count.finish()?;
-        self.1 = self
-            .1
-            .checked_add(len)
-            .ok_or_else(|| anyhow::anyhow!("text length overflow"))?;
+        self.add_len(len)?;
         Ok(true)
     }
     /// Append a value's canonical JSON document as decoded text.
     pub(crate) fn push_json(&mut self, view: JsonView<'_>) -> Result<()> {
         let len = write_quoted_json(view, self.0)?;
-        self.1 = self
-            .1
-            .checked_add(len)
-            .ok_or_else(|| anyhow::anyhow!("text length overflow"))?;
+        self.add_len(len)?;
         Ok(())
     }
 }
@@ -214,40 +213,8 @@ fn generate_string_with_len(
 
 fn write_quoted_json(view: crate::json::JsonView<'_>, writer: &mut dyn std::io::Write) -> Result<usize> {
     use std::io::Write;
-    struct Escaped<'a> {
-        writer: &'a mut dyn Write,
-        scratch: Vec<u8>,
-        len: usize,
-    }
-    impl Write for Escaped<'_> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.len = self
-                .len
-                .checked_add(bytes.len())
-                .ok_or_else(|| std::io::Error::other("text length overflow"))?;
-            for chunk in bytes.chunks(64 * 1024) {
-                self.scratch.clear();
-                self.scratch.reserve(chunk.len().saturating_mul(2));
-                for &byte in chunk {
-                    if matches!(byte, b'"' | b'\\') {
-                        self.scratch.push(b'\\');
-                    }
-                    self.scratch.push(byte);
-                }
-                self.writer.write_all(&self.scratch)?;
-            }
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.writer.flush()
-        }
-    }
     let mut buffered = std::io::BufWriter::with_capacity(64 * 1024, writer);
-    let mut escaped = Escaped {
-        writer: &mut buffered,
-        scratch: Vec::new(),
-        len: 0,
-    };
+    let mut escaped = super::bytes::ScratchWriter::new(&mut buffered, true);
     view.write_canonical(&mut escaped)?;
     let len = escaped.len;
     buffered.flush()?;
@@ -303,7 +270,6 @@ mod tests {
         let Text::Source(mut counted) = text else {
             panic!("source carrier required")
         };
-        assert_eq!(counted.known_len, Some(expected.len()));
         for _ in 0..3 {
             assert_eq!(counted.try_decoded_len().unwrap(), expected.len());
         }

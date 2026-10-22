@@ -11,7 +11,7 @@ fn refx(id: &str, h: Harness, cwd: Option<&str>, title: Option<&str>, msgs: usiz
         title: title.map(str::to_string),
         created_at: None,
         updated_at: "2026-06-01T00:00:00Z".parse().ok(),
-        message_count: msgs,
+        message_count: Some(msgs),
     }
 }
 

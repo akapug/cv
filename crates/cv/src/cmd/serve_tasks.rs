@@ -40,21 +40,21 @@ pub(crate) enum Answer {
     Ndjson(String),
 }
 
-/// The inbox routes, or `None` when the path is not one of them (the read API answers it).
-pub(crate) fn route(post: bool, parts: &[&str], q: &Query, body: &Value, default_who: Option<&str>) -> Option<Answer> {
-    let json = |(status, v): (u16, Value)| Some(Answer::Json(status, v));
-    match (post, parts) {
-        (false, ["api", "inbox"]) => json(api_inbox(default_who, q)),
-        (false, ["api", "events"]) => Some(match api_events(q) {
+cv_core::routes! {
+    pub(crate) const ROUTES;
+    /// The inbox routes, or `None` when the path is not one of them (the read API answers it).
+    pub(crate) fn route(post, parts, q: &Query, body: &Value, default_who: Option<&str>) -> Option<Answer> {
+        GET ["api", "inbox"] => json(api_inbox(default_who, q)),
+        GET ["api", "events"] => Some(match api_events(q) {
             Ok(lines) => Answer::Ndjson(lines),
             Err(e) => Answer::Json(400, json!({"error": e.to_string()})),
         }),
-        (false, ["api", "lanes"]) => json(api_lanes(q)),
-        (true, ["api", "task", _, "reopen"]) => json((
+        GET ["api", "lanes"] => json(api_lanes(q)),
+        POST ["api", "task", _, "reopen"] => json((
             410,
             json!({"error": "removed in 0.17 — a closed task stays closed; open a new task (`cv task open`) and note the old id"}),
         )),
-        (true, ["api", "task", id, verb]) => {
+        POST ["api", "task", id, verb] => {
             let who = body
                 .get("who")
                 .and_then(Value::as_str)
@@ -65,9 +65,13 @@ pub(crate) fn route(post: bool, parts: &[&str], q: &Query, body: &Value, default
                 Some(who) => api_act(id, verb, &who, body),
                 None => (400, json!({"error": "who? pass `who` in the body or start with --who"})),
             })
-        }
+        },
         _ => None,
     }
+}
+
+fn json((status, v): (u16, Value)) -> Option<Answer> {
+    Some(Answer::Json(status, v))
 }
 
 fn with_replay(f: impl FnOnce(cv_core::task::ReplayOutcome) -> (u16, Value)) -> (u16, Value) {
@@ -162,7 +166,8 @@ fn api_events(q: &Query) -> Result<String> {
         since: Since::parse(q.get("since").as_deref(), now)?,
         kinds: q
             .get("kind")
-            .map(|k| k.split(',').map(task_ops::kind_tag).collect())
+            .map(|k| task_ops::kind_tags(&k))
+            .transpose()?
             .unwrap_or_default(),
         by: q.get("by"),
         not_by: q.get("not_by"),
@@ -223,7 +228,7 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
             let confirm = body.get("confirm").and_then(Value::as_bool).unwrap_or(false);
             let answer = task_ops::Answer::from_flags(text("choice"), accept, confirm)?;
             let out = task_ops::resolve(store, &outcome.model, &by, &id, answer, text("note"), false)?;
-            (vec![out.event], out.effective_state, out.replay_warnings)
+            (vec![out.event], out.effective_state, out.warnings)
         }
         "done" => {
             let out = task::append(
@@ -236,7 +241,7 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
                 },
                 Vec::new(),
             )?;
-            (vec![out.event], out.effective_state, out.replay_warnings)
+            (vec![out.event], out.effective_state, out.warnings)
         }
         "note" => {
             let Some(t) = text("text") else {
@@ -252,7 +257,7 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
                 },
                 Vec::new(),
             )?;
-            (vec![out.event], out.effective_state, out.replay_warnings)
+            (vec![out.event], out.effective_state, out.warnings)
         }
         "discuss" => {
             // One unit: the note and the `discuss` tag land together.
@@ -290,11 +295,11 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
                 },
                 Vec::new(),
             )?;
-            (vec![out.event], out.effective_state, out.replay_warnings)
+            (vec![out.event], out.effective_state, out.warnings)
         }
         "release" => {
             let out = task::append(store, Some(&id), &by, TaskEventKind::Released {}, Vec::new())?;
-            (vec![out.event], out.effective_state, out.replay_warnings)
+            (vec![out.event], out.effective_state, out.warnings)
         }
         other => bail!("unknown action {other:?}"),
     };

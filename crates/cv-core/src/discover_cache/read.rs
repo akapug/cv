@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 #[cfg(feature = "sqlite")]
 type Connection = Arc<std::sync::Mutex<rusqlite::Connection>>;
+type WriterKey = (crate::Harness, String, PathBuf);
 struct Owner {
+    writer_versions: std::sync::Mutex<std::collections::HashMap<WriterKey, Option<String>>>,
     path: PathBuf,
     #[cfg(feature = "sqlite")]
     connection: OnceLock<Option<Connection>>,
@@ -42,6 +44,7 @@ impl Context {
     pub(crate) fn current() -> Self {
         Self::inherited().unwrap_or_else(|| {
             Self(Arc::new(Owner {
+                writer_versions: Default::default(),
                 #[cfg(feature = "sqlite")]
                 path: crate::catalog::db_path()
                     .map(|path| catalog_key(&path))
@@ -66,6 +69,7 @@ impl Context {
         let cell = OnceLock::new();
         let _ = cell.set(Some(connection));
         Self(Arc::new(Owner {
+            writer_versions: Default::default(),
             path,
             connection: cell,
             cache: std::sync::OnceLock::new(),
@@ -76,6 +80,22 @@ impl Context {
             #[cfg(test)]
             rows: Default::default(),
         }))
+    }
+    /// Observation lifetime is this discovery operation, shared with its parallel workers.
+    pub(crate) fn observe_writer(&self, r: &crate::SessionRef, version: Option<&str>) {
+        let mut rows = self.0.writer_versions.lock().unwrap();
+        let newest = rows.entry((r.harness, r.id.clone(), r.path.clone())).or_default();
+        crate::writer_version::observe(newest, version);
+    }
+    pub(crate) fn writer_versions(&self, harness: crate::Harness) -> Vec<(String, String, Option<String>)> {
+        self.0
+            .writer_versions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((h, _, _), _)| *h == harness)
+            .map(|((_, id, path), version)| (id.clone(), path.to_string_lossy().into_owned(), version.clone()))
+            .collect()
     }
     pub(crate) fn path(&self) -> PathBuf {
         self.0.path.clone()
@@ -127,8 +147,13 @@ impl Context {
     }
     #[cfg(feature = "sqlite")]
     pub(crate) fn with_connection_mut<T>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> T) -> Option<T> {
-        let connection = self
-            .0
+        let connection = self.connection()?;
+        let mut connection = connection.lock().inspect_err(super::note).ok()?;
+        Some(f(&mut connection))
+    }
+    #[cfg(feature = "sqlite")]
+    fn connection(&self) -> Option<Connection> {
+        self.0
             .connection
             .get_or_init(|| {
                 if self.0.path.as_os_str().is_empty() {
@@ -138,9 +163,20 @@ impl Context {
                 self.0.opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::catalog::open_at(&self.0.path).map(|connection| Arc::new(std::sync::Mutex::new(connection)))
             })
-            .as_ref()?;
-        let mut connection = connection.lock().ok()?;
-        Some(f(&mut connection))
+            .clone()
+    }
+    /// Reuse the operation's existing catalog connection after scan-cache locks have dropped.
+    /// Refilling by logical session key also covers directory refs cached under a child file.
+    pub(crate) fn refill_turns(&self, refs: &mut [crate::SessionRef]) {
+        if refs.iter().all(|r| r.message_count.is_some()) {
+            return;
+        }
+        #[cfg(feature = "sqlite")]
+        if let Some(connection) = self.connection() {
+            crate::catalog::Reader::from_connection(connection).refill_turns(refs.iter_mut());
+        }
+        #[cfg(not(feature = "sqlite"))]
+        let _ = refs;
     }
 }
 

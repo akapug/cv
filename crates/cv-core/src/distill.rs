@@ -38,7 +38,7 @@ use std::sync::OnceLock;
 /// priced like tool-call JSON. Blocks use the shared [`crate::ir::est_tokens`].
 const PACK_KIND: crate::ir::TokenKind = crate::ir::TokenKind::ToolInput;
 
-/// Knobs for [`distill`].
+/// Knobs for [`prepare_distill`].
 #[derive(Debug, Clone)]
 pub struct DistillOptions {
     /// Keep the last N tool calls (and the turns around them) verbatim as the tail.
@@ -105,7 +105,7 @@ pub struct DistillStats {
     pub elided_outputs: usize,
 }
 
-/// The result of [`distill`].
+/// The result of [`prepare_distill`].
 #[derive(Debug, Clone)]
 pub struct Distilled {
     /// Brief + timeline + facts + ledger (the part that replaces the head of the transcript).
@@ -404,13 +404,6 @@ fn when(m: &Message) -> String {
         .unwrap_or_default()
 }
 
-fn attachment_type(m: &Message) -> Option<&str> {
-    m.extra
-        .get("claude")
-        .and_then(|b| b.get("attachment_type"))
-        .and_then(Value::as_str)
-}
-
 fn est(s: &str) -> u64 {
     est_tokens_bytes(s.len(), PACK_KIND)
 }
@@ -559,7 +552,7 @@ fn hosts_in(cmd: &str) -> Vec<String> {
     out
 }
 
-fn note_paths(p: &str) -> bool {
+fn plausible_path(p: &str) -> bool {
     p.len() >= 8
         && !p.starts_with("/dev/")
         && !p.starts_with("/proc/")
@@ -569,16 +562,9 @@ fn note_paths(p: &str) -> bool {
         && !p.starts_with("/etc/")
 }
 
-/// Distill `session` (any harness; owned or checked source-backed) into a context pack, a tail cut point and the
-/// elided-output list. Source-backed values are validated before analysis; failures propagate.
-/// Only demanded messages, fields and products become owned.
-pub fn distill(session: &Session, opts: &DistillOptions) -> anyhow::Result<Distilled> {
-    Ok(prepare_distill(session, opts)?.distilled)
-}
-
 /// Prepare only the pack and identical statistics, without retaining the sidecar roster.
-/// `elided` is empty even when `stats.elided_outputs` is nonzero; use [`distill`] or
-/// [`prepare_distill`] when complete sidecar entries or resumable products are needed.
+/// `elided` is empty even when `stats.elided_outputs` is nonzero; use [`prepare_distill`]
+/// when complete sidecar entries or resumable products are needed.
 pub fn distill_pack(session: &Session, opts: &DistillOptions) -> anyhow::Result<Distilled> {
     Ok(analyze(session, opts, Demand::Pack)?.distilled)
 }
@@ -646,7 +632,7 @@ fn validate_analysis_sources(session: &Session) -> anyhow::Result<()> {
                 Block::ToolResult { content, .. } => Some(content),
                 _ => None,
             };
-            if let Some(text) = text.filter(|text| text.is_span()) {
+            if let Some(text) = text.filter(|text| text.is_lazy()) {
                 text.try_for_each_chunk(&resolver, 64 * 1024, |_| Ok(()))?;
             }
         }
@@ -664,10 +650,11 @@ fn validate_analysis_sources(session: &Session) -> anyhow::Result<()> {
 }
 
 fn analysis_label(session: &Session, resolver: &crate::Resolver) -> anyhow::Result<String> {
-    if let Some(description) = session
-        .harness_extra(crate::Harness::Claude)
-        .and_then(|bag| bag.get("agent_description"))
-        .and_then(Value::as_str)
+    // Every adapter is asked: a bag is keyed by the harness that wrote it, not by `session.harness`.
+    if let Some(description) = crate::Harness::ALL
+        .iter()
+        .filter_map(|h| crate::harness::rootless(*h))
+        .find_map(|adapter| adapter.agent_description(session))
     {
         return Ok(description.to_owned());
     }
@@ -690,7 +677,8 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in msgs.iter().filter(|_| demand != Demand::Findings) {
         let incoming = (m.role == Role::User && m.kind == MessageKind::Prompt)
-            || (m.kind == MessageKind::InjectedContext && matches!(attachment_type(m), Some("queued_command")));
+            || (m.kind == MessageKind::InjectedContext
+                && matches!(crate::harness::attachment_kind(m), Some("queued_command")));
         if !incoming {
             continue;
         }
@@ -801,7 +789,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
             }
             (_, MessageKind::InjectedContext) if !in_tail && demand != Demand::Findings => {
                 // A message delivered mid-run (peer agent, coordinator, queued user input).
-                if matches!(attachment_type(m), Some("queued_command")) {
+                if matches!(crate::harness::attachment_kind(m), Some("queued_command")) {
                     timeline.push(Entry {
                         idx: i,
                         when: when(m),
@@ -928,7 +916,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                 if let Block::Text { .. } = b {
                     for c in path_re().captures_iter(reader.block(index)?) {
                         let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`']);
-                        if note_paths(p) {
+                        if plausible_path(p) {
                             bump(&mut facts.paths, p);
                         }
                     }
@@ -1153,7 +1141,7 @@ fn scan_input_facts(_name: &str, input: &Value, f: &mut Facts) {
     }
     for k in ["file_path", "path", "notebook_path"] {
         if let Some(p) = input.get(k).and_then(Value::as_str) {
-            if note_paths(p) {
+            if plausible_path(p) {
                 bump(&mut f.paths, p);
             }
         }
@@ -1161,7 +1149,7 @@ fn scan_input_facts(_name: &str, input: &Value, f: &mut Facts) {
     for t in texts {
         for c in path_re().captures_iter(t) {
             let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']);
-            if note_paths(p) {
+            if plausible_path(p) {
                 bump(&mut f.paths, p);
             }
         }
@@ -1394,14 +1382,14 @@ fn clear_resume_usage(message: &mut Message) {
     // The old complete native record would reintroduce stale usage or unclipped payloads
     // under complete emission. Distillation deliberately replaces that representation.
     message.complete_record = None;
-    message.extra.remove(crate::harness::claude::CARRIER_KEY);
+    message.extra.remove(crate::ir::CARRIER_KEY);
 }
 
 /// The tail as real IR turns for a resumable session: thinking dropped (unless asked), recorded
 /// usage stripped (so a resume gate never reads the source's stale near-limit size), oversized
 /// results clipped with a `cv cat` pointer, queued messages turned into user turns, harness-only
 /// records dropped. A trailing call with no result stays here (the pack shows the lane stopped
-/// mid-call); the Claude emitter drops it from a resumable session (`harness::claude::emit::make_resumable`).
+/// mid-call); the Claude emitter drops it from a resumable session (`harness::claude::emit::emit`).
 fn resumable_tail(
     msgs: &[Message],
     tail_start: usize,
@@ -1455,7 +1443,9 @@ fn resumable_tail(
                 owned.materialize(resolver)?;
                 out.push(owned);
             }
-            (_, MessageKind::InjectedContext) if matches!(attachment_type(m), Some("queued_command")) => {
+            (_, MessageKind::InjectedContext)
+                if matches!(crate::harness::attachment_kind(m), Some("queued_command")) =>
+            {
                 let mut u = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent);
                 u.id = m.id.clone();
                 u.parent_id = m.parent_id.clone();
@@ -1553,7 +1543,7 @@ pub fn resume_preamble(d: &Distilled, keep_last: usize) -> String {
 /// The caller emits it (as a session, or as a sub-agent of a root) with the Claude emitter, which
 /// owns the resumability rules: the first tail turn's parent names a record the tail does not
 /// carry and is re-linked to the opening prompt, a hook attachment's child is re-linked over the
-/// gap, an unanswered trailing call is dropped (`harness::claude::emit::make_resumable`). This is a selector.
+/// gap, an unanswered trailing call is dropped (`harness::claude::emit::emit`). This is a selector.
 pub fn resumable_session(session: &Session, d: &Distilled, opts: &DistillOptions) -> anyhow::Result<Session> {
     let tail = resumable_tail(
         &session.messages,
@@ -1610,7 +1600,7 @@ pub fn findings(session: &Session, opts: &DistillOptions) -> anyhow::Result<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::emit::grok_qwen_tests::Frozen;
+    use crate::emit::frozen::Frozen;
     use crate::ir::Harness;
     use serde_json::json;
 
@@ -1780,7 +1770,7 @@ body λ",
                     }
                 }
                 frozen.insert(format!("keep{keep_last}-result{tail_result_max}"), entry);
-                same_products(&distill(&source, &opts)?, &actual);
+                same_products(&prepare_distill(&source, &opts)?.distilled, &actual);
                 assert_eq!(
                     serde_json::to_value(resumable_session(&source, &actual, &opts)?)?,
                     serde_json::to_value(&actual_session)?
@@ -1834,7 +1824,7 @@ body λ",
         ));
         std::fs::write(&path, b"changed")?;
         assert!(prepare_distill(&source, &opts).is_err());
-        assert!(distill(&source, &opts).is_err());
+        assert!(prepare_distill(&source, &opts).is_err());
         assert!(findings(&source, &opts).is_err());
         Ok(())
     }
@@ -1935,7 +1925,7 @@ facts text",
             };
             let prepared = prepare_distill(&source, &opts)?;
             let (actual, actual_session) = prepared.into_resumable_session(&source);
-            same_products(&distill(&source, &opts)?, &actual);
+            same_products(&prepare_distill(&source, &opts)?.distilled, &actual);
             WORK.with(|cell| cell.set(Work::default()));
             let pack = distill_pack(&source, &opts)?;
             let work = WORK.with(|cell| cell.get());
@@ -1985,7 +1975,7 @@ facts text",
     }
 
     #[test]
-    fn full_analysis_preserves_malformed_span_text_but_rejects_failed_sources() -> anyhow::Result<()> {
+    fn full_analysis_reads_span_text_but_rejects_malformed_and_failed_sources() -> anyhow::Result<()> {
         let world = cv_testkit::World::new("distill-legacy-spans");
         let path = world.base.join("span.txt");
         let opts = DistillOptions {
@@ -1994,8 +1984,9 @@ facts text",
         };
         let mut frozen = Frozen::new("distill-span-text");
         for body in [Some(r#"escaped\n\u03bb"#), Some(r#"malformed\q"#), None] {
+            // A span covers a JSON string's body.
             if let Some(body) = body {
-                std::fs::write(&path, body)?;
+                std::fs::write(&path, format!("\"{body}\""))?;
             } else {
                 std::fs::remove_file(&path)?;
             }
@@ -2006,20 +1997,20 @@ facts text",
                 vec![Block::Text {
                     text: crate::Text::Span(crate::Span {
                         source: Some(path.clone()),
-                        offset: 0,
+                        offset: 1,
                         len: body.map_or(20, str::len) as u64,
                         escaped: true,
                     }),
                 }],
             ));
-            if body.is_none() {
-                assert!(distill(&source, &opts).is_err());
+            if body.is_none_or(|body| body.starts_with("malformed")) {
+                assert!(prepare_distill(&source, &opts).is_err());
                 assert!(prepare_distill(&source, &opts).is_err());
                 assert!(distill_pack(&source, &opts).is_err());
                 assert!(findings(&source, &opts).is_err());
                 continue;
             }
-            let expected = distill(&source, &opts)?;
+            let expected = prepare_distill(&source, &opts)?.distilled;
             frozen.insert(body.unwrap(), products(&expected));
             let pack = distill_pack(&source, &opts)?;
             assert_eq!(pack.pack(), expected.pack());
@@ -2092,7 +2083,7 @@ facts text",
                 keep_last: 0,
                 ..Default::default()
             };
-            let expected = distill(&session, &options)?;
+            let expected = prepare_distill(&session, &options)?.distilled;
             frozen.insert(format!("input{i}"), products(&expected));
             let pack = distill_pack(&session, &options)?;
             assert_eq!(pack.pack(), expected.pack());
@@ -2172,14 +2163,14 @@ facts text",
         };
         *input = crate::Json::source(&argument_path, 0, original_arguments.len() as u64)?;
         let span_path = world.base.join("legacy-span.txt");
-        std::fs::write(&span_path, b"legacy span reply")?;
+        std::fs::write(&span_path, b"\"legacy span reply\"")?;
         source.messages.push(msg(
             Role::Assistant,
             MessageKind::Reply,
             vec![Block::Text {
                 text: crate::Text::Span(crate::Span {
                     source: Some(span_path),
-                    offset: 0,
+                    offset: 1,
                     len: 17,
                     escaped: false,
                 }),
@@ -2272,14 +2263,15 @@ facts text",
     #[test]
     fn keeps_brief_words_commits_errors_and_collapses_polls() {
         let s = lane();
-        let d = distill(
+        let d = prepare_distill(
             &s,
             &DistillOptions {
                 keep_last: 2,
                 ..Default::default()
             },
         )
-        .unwrap();
+        .unwrap()
+        .distilled;
         let p = d.pack();
         assert!(p.contains("You are lane X. Build the thing on box1."));
         assert!(p.contains("Chose rebase over merge"));
@@ -2296,14 +2288,15 @@ facts text",
     #[test]
     fn tail_opens_on_an_assistant_turn_and_keeps_the_source_threading() {
         let s = lane();
-        let d = distill(
+        let d = prepare_distill(
             &s,
             &DistillOptions {
                 keep_last: 2,
                 ..Default::default()
             },
         )
-        .unwrap();
+        .unwrap()
+        .distilled;
         assert_eq!(s.messages[d.tail_start].role, Role::Assistant);
         let r = resumable_session(
             &s,
@@ -2435,10 +2428,9 @@ facts text",
                 input_tokens: Some(100000),
                 ..Default::default()
             });
-            message.extra.insert(
-                crate::harness::claude::CARRIER_KEY.into(),
-                json!({"usage":{"input_tokens":100000}}),
-            );
+            message
+                .extra
+                .insert(crate::ir::CARRIER_KEY.into(), json!({"usage":{"input_tokens":100000}}));
             crate::ir::CompleteRecord::attach(
                 std::slice::from_mut(message),
                 Harness::Claude,
@@ -2455,8 +2447,10 @@ facts text",
         assert_eq!(prepared.distilled.stats.tail_tool_calls, 3);
         let (_, resumed) = prepared.into_resumable_session(&source);
         assert!(resumed.messages.iter().all(|message| message.usage.is_none()));
-        assert!(resumed.messages.iter().all(|message| message.complete_record.is_none()
-            && !message.extra.contains_key(crate::harness::claude::CARRIER_KEY)));
+        assert!(resumed
+            .messages
+            .iter()
+            .all(|message| message.complete_record.is_none() && !message.extra.contains_key(crate::ir::CARRIER_KEY)));
         assert!(resumed.messages.iter().all(Message::is_model_visible));
         let retained = tool_index(&resumed.messages);
         for message in &resumed.messages {

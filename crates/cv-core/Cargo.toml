@@ -65,14 +65,16 @@ ruzstd = { workspace = true, optional = true }
 
 [features]
 zip-ingest = ["dep:zip"]
-default = ["sqlite", "parallel", "mmap"]
+default = ["sqlite", "parallel", "mmap", "zstd"]
 # `mmap` resolves lazy content spans by memory-mapping the source file (only touched pages page in).
 # Off for wasm32 (no mmap); the resolver falls back to a positioned ranged read, behavior identical.
 mmap = ["dep:memmap2"]
 # `sqlite` pulls in rusqlite (native C SQLite) for the SQLite-backed adapters (Hermes, Cursor,
 # Goose, Zed, Devin) and the FTS index, plus a zstd decoder for compressed rollouts and blobs.
 # Disable it (e.g. `--no-default-features`) to compile cv-core for wasm32.
-sqlite = ["dep:rusqlite", "dep:ruzstd", "dep:zstd"]
+sqlite = ["dep:rusqlite", "zstd"]
+# Compressed sources are independent of SQL stores; native libzstd, portable ruzstd.
+zstd = ["dep:ruzstd", "dep:zstd"]
 # `parallel` fans discovery across adapters/files with rayon. Off for wasm32 (no threads); the code
 # has a sequential fallback so behavior is identical, just slower.
 parallel = ["dep:rayon"]

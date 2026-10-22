@@ -10,6 +10,9 @@ use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::rc::Rc;
 
+/// Maximum decoded byte length of a root key considered for frame injection.
+const KEY_BYTES: usize = 128;
+
 /// RS cannot occur unescaped in JSON; each compact message is one frame. The complete frame is
 /// counted while only its first `remaining + 1` bytes are retained (`None` keeps it whole):
 /// discarding still reports successful writes, so every lazy demand and source check runs.
@@ -56,10 +59,32 @@ pub fn write_frame(
 pub struct Counted<W> {
     pub inner: W,
     pub position: Rc<Cell<u64>>,
+    digest: Option<crate::digest::Sha256>,
 }
+impl<W> Counted<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            position: Rc::new(Cell::new(0)),
+            digest: None,
+        }
+    }
+    /// Capture a content digest during serialization, so publication never re-reads its stage.
+    pub fn hashing(mut self) -> Self {
+        self.digest = Some(crate::digest::Sha256::new());
+        self
+    }
+    pub fn into_digest(self) -> Option<String> {
+        self.digest.map(crate::digest::Sha256::finish_hex)
+    }
+}
+
 impl<W: Write> Write for Counted<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(bytes)?;
+        if let Some(digest) = &mut self.digest {
+            digest.update(&bytes[..n]);
+        }
         self.position.set(
             self.position
                 .get()
@@ -112,6 +137,8 @@ pub fn write_json_array(
 }
 
 /// [`write_json_array`] with the pretty and archive options; returns the recorded [`Prefix`].
+/// Stage output before publishing: a missing field or mismatched total can fail after envelope
+/// bytes have already been written to out.
 pub fn write_frames(
     out: &mut impl Write,
     envelope: &impl Serialize,
@@ -119,15 +146,12 @@ pub fn write_frames(
     frames: &ByteSource,
     framing: Framing<'_>,
 ) -> anyhow::Result<Option<Prefix>> {
-    anyhow::ensure!(field.len() <= 128, "JSON frame field exceeds key budget");
-    let position = Rc::new(Cell::new(0));
-    let mut counted = Counted {
-        inner: out,
-        position: position.clone(),
-    };
+    anyhow::ensure!(field.len() <= KEY_BYTES, "JSON frame field exceeds key budget");
+    let mut counted = Counted::new(out);
+    let position = counted.position.clone();
     let mut array = Array {
         field,
-        frames: frames.reader()?,
+        frames: Some(frames.reader()?),
         framing,
         position,
         depth: 0,
@@ -164,7 +188,7 @@ pub fn write_frames(
 
 struct Array<'a> {
     field: &'a str,
-    frames: Box<dyn Read + 'a>,
+    frames: Option<Box<dyn Read + 'a>>,
     framing: Framing<'a>,
     position: Rc<Cell<u64>>,
     depth: usize,
@@ -201,7 +225,10 @@ impl Array<'_> {
             self.record_end();
             inner.end_array_value(w)?;
         }
-        let frames = std::mem::replace(&mut self.frames, Box::new(io::empty()));
+        let frames = self
+            .frames
+            .take()
+            .ok_or_else(|| io::Error::other("JSON frames already consumed"))?;
         let mut frames = io::BufReader::with_capacity(64 * 1024, frames);
         while !frames.fill_buf()?.is_empty() {
             if frames.fill_buf()?[0] != 0x1e {
@@ -281,7 +308,7 @@ impl<F: Formatter> Formatter for &mut Shell<'_, '_, F> {
     }
     fn write_string_fragment<W: ?Sized + Write>(&mut self, out: &mut W, part: &str) -> io::Result<()> {
         if self.array.reading_key {
-            if self.array.key.len().saturating_add(part.len()) <= 128 {
+            if self.array.key.len().saturating_add(part.len()) <= KEY_BYTES {
                 self.array.key.push_str(part);
             } else {
                 self.array.reading_key = false;
@@ -291,6 +318,8 @@ impl<F: Formatter> Formatter for &mut Shell<'_, '_, F> {
     }
     fn write_char_escape<W: ?Sized + Write>(&mut self, out: &mut W, escape: CharEscape) -> io::Result<()> {
         if self.array.reading_key {
+            // Match decoded key spelling, including escaped quotes; dropping an escape
+            // could alias a different key to the requested array field.
             let character = match &escape {
                 CharEscape::Quote => '"',
                 CharEscape::ReverseSolidus => '\\',
@@ -302,7 +331,7 @@ impl<F: Formatter> Formatter for &mut Shell<'_, '_, F> {
                 CharEscape::Tab => '\t',
                 CharEscape::AsciiControl(byte) => char::from(*byte),
             };
-            if self.array.key.len() + character.len_utf8() <= 128 {
+            if self.array.key.len() + character.len_utf8() <= KEY_BYTES {
                 self.array.key.push(character);
             } else {
                 self.array.reading_key = false;

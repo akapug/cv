@@ -1,12 +1,13 @@
 //! The Claude record codec: one validated record view and the reader's demand in, session facts
 //! and at most one IR message out. Every byte source feeds this one function: mapped lines,
 //! positioned records and parsed strings differ only in the [`JsonView`] they hand it. A demand
-//! (`ParseOptions` plus the sink's projection) chooses which fields are resolved, never which code
+//! (`crate::stream::Demand` plus the sink's projection) chooses which fields are resolved, never which code
 //! runs; a field nobody asked for is skipped by the view, not decoded and dropped.
 
 use super::*;
 use crate::harness::store::document::Fields;
 use crate::json::JsonView;
+use crate::stream::Tier;
 
 /// Every top-level key any record kind reads. One selection pass per record; a field is
 /// resolved only by the branch that needs it.
@@ -41,6 +42,9 @@ const TOP: &[&str] = &[
     "tag",
     "relocatedCwd",
     "continuedInSessionId",
+    "parentSessionId",
+    "parentLastUuid",
+    "contextLength",
     "prUrl",
     "attachment",
     "rendered",
@@ -57,6 +61,10 @@ const TOP: &[&str] = &[
     "hookAdditionalContext",
     "level",
     "cause",
+    "retryAttempt",
+    "maxRetries",
+    "retryInMs",
+    "source",
     "slug",
     "logicalParentUuid",
     "stopReason",
@@ -72,6 +80,7 @@ const TOP: &[&str] = &[
     "version",
     "parentToolUseID",
     "sourceToolAssistantUUID",
+    "sourceToolUseID",
     "attributionAgent",
     "attributionMcpServer",
     "attributionMcpTool",
@@ -85,6 +94,12 @@ const SYSTEM_EXTRA: &[&str] = &[
     "compactMetadata",
     "cause",
     "error",
+    // A retried request (2.1.302+ `api_error` with `source: request_retry`): which attempt, of how
+    // many, and the back-off before it.
+    "retryAttempt",
+    "maxRetries",
+    "retryInMs",
+    "source",
     "isMeta",
     "isSidechain",
     "agentId",
@@ -108,6 +123,380 @@ const SYSTEM_EXTRA: &[&str] = &[
     "direction",
 ];
 
+pub(crate) enum Demand {
+    Message,
+    Metadata,
+    /// The decision facts of [`Facts`].
+    Facts,
+    /// A compaction boundary's `subtype` and `compactMetadata`.
+    Compact,
+    /// The `message` whose role, text and tool calls the workflow readers mine.
+    Tools,
+}
+
+/// A read's tier picks the head: [`Tier::Discovery`] selects the listing keys, every other tier
+/// the message keys. Facts, Compact and Tools are the reshape readers' own selections.
+impl From<&crate::stream::Demand> for Demand {
+    fn from(demand: &crate::stream::Demand) -> Self {
+        if demand.tier == Tier::Discovery {
+            Demand::Metadata
+        } else {
+            Demand::Message
+        }
+    }
+}
+
+/// One shared selection/type parse for metadata and message demands. Fields are lazy views;
+/// discovery never constructs a message or resolves bodies, rich extras or tool arguments.
+pub(crate) struct Head<'a> {
+    pub(crate) top: Fields<'a>,
+    pub(crate) ty: String,
+}
+
+impl<'a> Head<'a> {
+    pub(crate) fn parse(view: JsonView<'a>, demand: Demand) -> Result<Option<Self>> {
+        let keys = match demand {
+            Demand::Message => TOP,
+            Demand::Facts => FACT_KEYS,
+            Demand::Compact => &["type", "subtype", "compactMetadata"],
+            Demand::Tools => &["type", "timestamp", "message"],
+            Demand::Metadata => &[
+                "type",
+                "version",
+                "cwd",
+                "timestamp",
+                "customTitle",
+                "aiTitle",
+                "isApiErrorMessage",
+                "message",
+            ],
+        };
+        let Some(top) = Fields::parse(view, keys)? else {
+            return Ok(None);
+        };
+        let ty = top.string("type")?.unwrap_or_default();
+        Ok(Some(Self { top, ty }))
+    }
+}
+
+/// Every record type the codec knows is no conversational turn: the titles (`summary`,
+/// `ai-title`, `custom-title`), the session facts (`continued-in`, `fork-context-ref`,
+/// `agent-name`, `tag`, `relocated`, `pr-link`), model-visible `attachment`s, and pure
+/// bookkeeping / live-process records with no conversational payload: the input queue,
+/// UI/permission state, the leaf pointer, sub-agent hook/streaming telemetry, running cost, the
+/// ATIS and isolation latches, artifact watches, request-side content replacements, and the
+/// request ledger (2.1.300+: `api-request` per API call, with its `api-request-shape` system
+/// prompt + tool schemas and `api-request-blob` messages, content-addressed; a blob's `message`
+/// is a request body, not a turn). Only `user`, `assistant` and `system` records are turns.
+pub(crate) const META_TYPES: &[&str] = &[
+    "summary",
+    "ai-title",
+    "custom-title",
+    "continued-in",
+    "fork-context-ref",
+    "agent-name",
+    "tag",
+    "relocated",
+    "pr-link",
+    "attachment",
+    "mode",
+    "permission-mode",
+    "last-prompt",
+    "progress",
+    "started",
+    "result",
+    "queue-operation",
+    "x-quota",
+    "file-history-snapshot",
+    "cost-state",
+    "atis-latch",
+    "isolation-latch",
+    "frame-link",
+    "content-replacement",
+    "artifact-comment-monitor",
+    "artifact-autoreact-ledger",
+    "api-request",
+    "api-request-shape",
+    "api-request-blob",
+];
+
+/// The keys [`Demand::Facts`] selects: what prune, rewind, fork recognition and the resumability
+/// check decide on, never a body.
+const FACT_KEYS: &[&str] = &[
+    "type",
+    "subtype",
+    "isSidechain",
+    "agentId",
+    "isApiErrorMessage",
+    "sessionId",
+    "cwd",
+    "timestamp",
+    "uuid",
+    "parentUuid",
+    "logicalParentUuid",
+    "_cv_orig_ctx",
+    "message",
+    "compactMetadata",
+    "toolUseResult",
+    "rendered",
+];
+
+/// One content block's identity, at its position in `message.content` (a non-object element
+/// keeps its slot with every field `None`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FactBlock {
+    pub ty: Option<String>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub tool_use_id: Option<String>,
+}
+
+/// A record's decision facts, typed: what `cv prune` and `cv rewind` select on, and what a fork's
+/// head is recognized by ([`super::fork`]). Strings are
+/// `Some` only when the record holds a string there; flags are `true` only for a JSON `true`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Facts {
+    /// `type`, or empty when absent or not a string.
+    pub ty: String,
+    pub subtype: Option<String>,
+    pub sidechain: bool,
+    /// `agentId`: the sub-agent a sidechain record belongs to.
+    pub agent_id: Option<String>,
+    pub api_error: bool,
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    /// `timestamp`, as recorded.
+    pub timestamp: Option<String>,
+    pub uuid: Option<String>,
+    /// `parentUuid`: `None` when the key is absent, `Some(None)` when it is null or not a string.
+    pub parent: Option<Option<String>>,
+    pub logical_parent: Option<String>,
+    /// `message` is an object (a turn with a body).
+    pub message: bool,
+    /// `message.id`: one API response split over several records shares it.
+    pub message_id: Option<String>,
+    pub model: Option<String>,
+    /// The context size `message.usage` records, read the way Claude Code reads it
+    /// ([`usage_context`]); `None` without a usage object.
+    pub usage_in: Option<u64>,
+    pub blocks: Vec<FactBlock>,
+    /// `compactMetadata.preservedSegment.headUuid`.
+    pub compact_head: Option<String>,
+    /// `_cv_orig_ctx`: the recorded context size a `cv prune --revive` replaced in `usage`.
+    pub orig_ctx: Option<u64>,
+    /// Byte spans of the `sessionId`/`session_id` strings a restamp rewrites.
+    pub ids: Vec<(u64, u64)>,
+}
+
+/// The body views a [`Facts`] read leaves in the source, for a consumer that prices them.
+#[derive(Default)]
+pub(crate) struct Body<'a> {
+    pub content: Option<JsonView<'a>>,
+    pub tool_use_result: Option<JsonView<'a>>,
+    pub rendered: Option<JsonView<'a>>,
+    /// The `content` of each `tool_result` block, in order.
+    pub results: Vec<JsonView<'a>>,
+}
+
+impl Facts {
+    /// A main-thread conversational turn: `Some(is_user)`, `None` for bookkeeping, sub-agent
+    /// lines and synthetic notices ([`is_turn`]).
+    pub(crate) fn turn_kind(&self) -> Option<bool> {
+        if self.sidechain || !is_turn(&self.ty, self.api_error, self.model.as_deref()) {
+            return None;
+        }
+        Some(self.ty == "user")
+    }
+
+    /// The record's place in the conversation tree: `None` when it records no `parentUuid`,
+    /// else the parent (`parentUuid`, or `logicalParentUuid` across a compaction) if it has one.
+    pub(crate) fn link(&self) -> Option<Option<&str>> {
+        let parent = self.parent.as_ref()?;
+        Some(parent.as_deref().or(self.logical_parent.as_deref()))
+    }
+
+    pub(crate) fn is_compact_boundary(&self) -> bool {
+        self.ty == "system" && self.subtype.as_deref() == Some("compact_boundary")
+    }
+
+    /// Facts and body views of one record. A record that is not an object has no facts but its
+    /// id spans (a positional `["<id>"]` row is restamped like a keyed one).
+    pub(crate) fn parse(view: JsonView<'_>) -> Result<(Self, Body<'_>)> {
+        let ids = crate::restamp::source_id_spans(view, super::IDENTITY.session_keys)?;
+        let Some(Head { top, ty }) = Head::parse(view, Demand::Facts)? else {
+            return Ok((Self { ids, ..Self::default() }, Body::default()));
+        };
+        let flag =
+            |key: &str| -> Result<bool> { Ok(top.get(key).map(|v| v.as_bool()).transpose()?.flatten() == Some(true)) };
+        let number = |key: &str| -> Result<Option<u64>> {
+            Ok(top
+                .get(key)
+                .map(|v| v.as_number())
+                .transpose()?
+                .flatten()
+                .and_then(|n| n.as_u64()))
+        };
+        let mut facts = Self {
+            ty,
+            subtype: top.string("subtype")?,
+            sidechain: flag("isSidechain")?,
+            agent_id: top.string("agentId")?,
+            api_error: flag("isApiErrorMessage")?,
+            session_id: top.string("sessionId")?,
+            cwd: top.string("cwd")?,
+            timestamp: top.string("timestamp")?,
+            uuid: top.string("uuid")?,
+            parent: match top.get("parentUuid") {
+                Some(_) => Some(top.string("parentUuid")?),
+                None => None,
+            },
+            logical_parent: top.string("logicalParentUuid")?,
+            orig_ctx: number("_cv_orig_ctx")?,
+            ids,
+            ..Self::default()
+        };
+        let mut body = Body {
+            tool_use_result: top.get("toolUseResult"),
+            rendered: top.get("rendered"),
+            ..Body::default()
+        };
+        if let Some(message) = top
+            .get("message")
+            .map(|m| Fields::parse(m, &["id", "model", "usage", "content"]))
+            .transpose()?
+            .flatten()
+        {
+            facts.message = true;
+            facts.message_id = message.string("id")?;
+            facts.model = message.string("model")?;
+            facts.usage_in = message.get("usage").map(usage_context).transpose()?.flatten();
+            body.content = message.get("content");
+            if let Some(blocks) = body.content.map(|c| c.array()).transpose()?.flatten() {
+                for block in blocks {
+                    let block = Fields::parse(block?, &["type", "id", "name", "tool_use_id", "content"])?;
+                    facts.blocks.push(match block {
+                        Some(b) => {
+                            let ty = b.string("type")?;
+                            if ty.as_deref() == Some("tool_result") {
+                                body.results.extend(b.get("content"));
+                            }
+                            FactBlock {
+                                ty,
+                                id: b.string("id")?,
+                                name: b.string("name")?,
+                                tool_use_id: b.string("tool_use_id")?,
+                            }
+                        }
+                        None => FactBlock::default(),
+                    });
+                }
+            }
+        }
+        if let Some(head) = top
+            .get("compactMetadata")
+            .map(|v| v.get("preservedSegment"))
+            .transpose()?
+            .flatten()
+            .map(|v| Fields::parse(v, &["headUuid"]))
+            .transpose()?
+            .flatten()
+        {
+            facts.compact_head = head.string("headUuid")?;
+        }
+        Ok((facts, body))
+    }
+}
+
+/// A conversational turn by type: a user record, or an assistant record that is not one of
+/// Claude Code's client-side notices (`isApiErrorMessage`, or the `<synthetic>` model).
+pub(crate) fn is_turn(ty: &str, api_error: bool, model: Option<&str>) -> bool {
+    match ty {
+        "user" => true,
+        "assistant" => !api_error && model != Some(SYNTHETIC_MODEL),
+        _ => false,
+    }
+}
+
+/// The three context-bearing counters of a `usage` object (input plus both cache buckets).
+pub(crate) const USAGE_CTX_KEYS: [&str; 3] = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
+
+/// The context-token count of a `usage` object, read the way Claude Code reads it. Since 2.1.277
+/// Claude Code sizes the loaded context from `usage.iterations` when present: the LAST iteration
+/// that is not an auxiliary request (`advisor_message`/`compaction`), when it is a well-formed
+/// request iteration (`message`/`fallback_message`, all four counts present, non-zero context);
+/// the top-level counters otherwise, and zero when they are zero. `None` for a non-object.
+pub(crate) fn usage_context(usage: JsonView<'_>) -> Result<Option<u64>> {
+    const ITERATION: &[&str] = &[
+        "type",
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+    ];
+    let Some(fields) = Fields::parse(
+        usage,
+        &[
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "iterations",
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    let count = |fields: &Fields<'_>, key: &str| -> Result<Option<u64>> {
+        Ok(fields
+            .get(key)
+            .map(|v| v.as_number())
+            .transpose()?
+            .flatten()
+            .and_then(|n| n.as_u64()))
+    };
+    let context = |fields: &Fields<'_>| -> Result<u64> {
+        let mut sum = 0u64;
+        for key in USAGE_CTX_KEYS {
+            sum += count(fields, key)?.unwrap_or(0);
+        }
+        Ok(sum)
+    };
+    let top = context(&fields)?;
+    if top == 0 {
+        return Ok(Some(0));
+    }
+    // The last non-auxiliary iteration; a non-object one is last too, and never a request.
+    let mut last: Option<Option<Fields<'_>>> = None;
+    if let Some(iterations) = fields.get("iterations").map(|v| v.array()).transpose()?.flatten() {
+        for iteration in iterations {
+            let Some(it) = Fields::parse(iteration?, ITERATION)? else {
+                last = Some(None);
+                continue;
+            };
+            if matches!(it.string("type")?.as_deref(), Some("advisor_message" | "compaction")) {
+                continue;
+            }
+            last = Some(Some(it));
+        }
+    }
+    if let Some(Some(it)) = last {
+        let request = matches!(it.string("type")?.as_deref(), Some("message" | "fallback_message"));
+        let mut counted = true;
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ] {
+            counted &= count(&it, key)?.is_some();
+        }
+        let sum = context(&it)?;
+        if request && counted && sum > 0 {
+            return Ok(Some(sum));
+        }
+    }
+    Ok(Some(top))
+}
+
 /// One record: update `session` and hand its message (if any) to `sink`. `at` is the record's
 /// byte offset when the source has one. `sourced` is set when the delivered message holds a
 /// source descriptor, which obliges the reader to recheck the source before going on. Errors
@@ -116,15 +505,14 @@ pub(super) fn ingest(
     session: &mut Session,
     view: JsonView<'_>,
     at: Option<u64>,
-    opts: &ParseOptions,
+    opts: &crate::stream::Demand,
     sink: &mut dyn MessageSink,
     sourced: &mut bool,
 ) -> Result<Flow> {
     // A record that is not an object carries nothing (Value's lookups all miss).
-    let Some(top) = Fields::parse(view, TOP)? else {
+    let Some(Head { top, ty }) = Head::parse(view, opts.into())? else {
         return Ok(Flow::Continue);
     };
-    let ty = top.string("type")?.unwrap_or_default();
     let ty = ty.as_str();
     let r = Record { view, top, at, opts };
 
@@ -196,6 +584,27 @@ pub(super) fn ingest(
             }
             return r.carry_or_skip(sink);
         }
+        // A fork sub-agent's first record (2.1.302+, `subagent_type: fork`): the child's context is
+        // the parent transcript up to `parentLastUuid` (`contextLength` records), so the parent is
+        // where it was forked from; the cut point rides in the bag as `fork_context`.
+        "fork-context-ref" => {
+            if let Some(id) = r.top.string("parentSessionId")? {
+                session.lineage.forked_from = Some(id);
+            }
+            let mut cut = Map::new();
+            if let Some(uuid) = r.top.string("parentLastUuid")? {
+                cut.insert("parent_last_uuid".into(), Value::String(uuid));
+            }
+            if let Some(n) = r.value("contextLength")?.filter(Value::is_number) {
+                cut.insert("context_length".into(), n);
+            }
+            if !cut.is_empty() {
+                session
+                    .harness_extra_mut(Harness::Claude)
+                    .insert("fork_context".into(), Value::Object(cut));
+            }
+            return r.carry_or_skip(sink);
+        }
         "agent-name" | "tag" | "relocated" | "pr-link" => {
             let (from, to) = match ty {
                 "agent-name" => ("agentName", "agent_name"),
@@ -253,31 +662,14 @@ pub(super) fn ingest(
                 None => r.carry_or_skip(sink),
             };
         }
-        // Pure bookkeeping / live-process records with no conversational payload: the input queue,
-        // UI/permission state, the leaf pointer, sub-agent hook/streaming telemetry, running cost,
-        // the ATIS latch, artifact watches, request-side content replacements. The lean passes drop
-        // them; `complete` carries them verbatim as round-trippable carrier messages.
-        "mode"
-        | "permission-mode"
-        | "last-prompt"
-        | "progress"
-        | "started"
-        | "result"
-        | "queue-operation"
-        | "x-quota"
-        | "file-history-snapshot"
-        | "cost-state"
-        | "atis-latch"
-        | "frame-link"
-        | "content-replacement"
-        | "artifact-comment-monitor"
-        | "artifact-autoreact-ledger" => return r.carry_or_skip(sink),
+        // The rest of [`META_TYPES`]: bookkeeping. The lean passes drop it; `complete` carries it
+        // verbatim as round-trippable carrier messages.
+        t if META_TYPES.contains(&t) => return r.carry_or_skip(sink),
         "user" | "assistant" | "system" | "" => {}
-        // Any other record without a `message` body is a bookkeeping record we haven't met yet
-        // (Claude Code adds a few per release). Never conversational — carry it in `complete` mode
-        // so round-trips stay lossless, skip it otherwise.
-        _ if r.top.get("message").is_none() => return r.carry_or_skip(sink),
-        _ => {}
+        // Any other record is a bookkeeping record we haven't met yet (Claude Code adds a few per
+        // release), whether or not it has a `message` field: only the three types above are turns.
+        // Carry it in `complete` mode so round-trips stay lossless, skip it otherwise.
+        _ => return r.carry_or_skip(sink),
     }
 
     note_conversation_metadata(
@@ -296,7 +688,8 @@ pub(super) fn ingest(
         return Ok(Flow::Continue);
     };
     r.stamp(&mut msg);
-    // Record-local models must not depend on how much of a transcript preceded the window.
+    // Keep the message model record-local; the session default is the first non-synthetic
+    // model encountered in this read, so a window can have a different session default.
     if session.model.is_none() && msg.model.as_deref() != Some(SYNTHETIC_MODEL) {
         session.model = msg.model.clone();
     }
@@ -314,11 +707,14 @@ fn deliver(msg: Message, sink: &mut dyn MessageSink, sourced: &mut bool) -> Flow
     sink.message(msg)
 }
 
+/// One record under the read's [`stream::Demand`]. At [`Tier::Facts`] Claude builds only the
+/// reducer facts: a notice's `compactMetadata` `trigger`/`preTokens`/`durationMs`, `message.id`,
+/// `sourceToolUseID`, the attachment type and a tool result's `details.restorable`.
 struct Record<'a, 'o> {
     view: JsonView<'a>,
     top: Fields<'a>,
     at: Option<u64>,
-    opts: &'o ParseOptions,
+    opts: &'o crate::stream::Demand,
 }
 
 impl<'a> Record<'a, '_> {
@@ -343,17 +739,18 @@ impl<'a> Record<'a, '_> {
     /// Carry the record verbatim under `complete`, skip it otherwise — the shared tail of every
     /// non-conversational record arm.
     fn carry_or_skip(&self, sink: &mut dyn MessageSink) -> Result<Flow> {
-        Ok(if self.opts.complete {
+        Ok(if self.opts.tier == Tier::Complete {
             sink.message(self.carrier()?)
         } else {
             Flow::Continue
         })
     }
 
-    /// A non-conversational meta record carried verbatim under [`ParseOptions::complete`] so a
+    /// A non-conversational meta record carried verbatim under [`crate::stream::Demand::COMPLETE`] so a
     /// `parse → emit` round-trip reproduces it. Modeled as an empty-content `System` message —
     /// render/dataset/count all skip empty turns — with the full original record stashed under
-    /// `extra["_record"]` for the emitter to replay byte-for-byte.
+    /// `extra["_record"]` for replay with JSON values and key order preserved; serialization
+    /// may normalize whitespace and numeric spelling.
     fn carrier(&self) -> Result<Message> {
         let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
         m.id = self.top.string("uuid")?;
@@ -374,7 +771,7 @@ impl<'a> Record<'a, '_> {
     /// A model-visible `attachment` record (one with a non-empty `rendered[]`) as a
     /// [`Role::System`] message: one text block per rendered item, exactly the text appended to
     /// the prompt. `None` when nothing was rendered. Under `complete` the message is also a carrier
-    /// of the verbatim record, so the emitter replays it byte-for-byte while lean consumers still
+    /// of the record, so the emitter preserves its JSON values and key order while lean consumers still
     /// see its text. `origin` is [`Origin::Hook`] for `hook_*` attachments (a user-configured
     /// hook's stdout) and [`Origin::Harness`] otherwise. The attachment kind always rides in
     /// `extra["claude"]["attachment_type"]`; the full `attachment` object only under rich demand.
@@ -405,7 +802,7 @@ impl<'a> Record<'a, '_> {
             .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
             .transpose()?
             .unwrap_or_else(|| "attachment".into());
-        let mut m = if self.opts.complete {
+        let mut m = if self.opts.tier == Tier::Complete {
             self.carrier()?
         } else {
             Message::new(Role::System)
@@ -421,7 +818,7 @@ impl<'a> Record<'a, '_> {
         m.timestamp = self.timestamp()?;
         m.content = blocks;
         let mut rich = Vec::new();
-        if self.opts.wants_full_extra() {
+        if self.opts.tier >= Tier::Rich {
             rich.push(("attachment", attachment.resolve()?.into_owned()));
             for key in ["renderedInHumanTurn", "agentId"] {
                 if let Some(val) = self.value(key)? {
@@ -445,10 +842,10 @@ impl<'a> Record<'a, '_> {
     /// notices) have no body and are dropped. `subtype`/`level`/metadata go to `extra` either way.
     fn system(&self) -> Result<Option<Message>> {
         // Format-complete: `system` records are carried verbatim. The lean passes *render* them
-        // (slash-command distillation, the synthesized `[conversation compacted]` marker, the ⛓
+        // (slash-command distillation, the compaction boundary, the ⛓
         // hook one-liner), which is lossy; carrying the raw record (system bodies are small
         // notices) is the only way `parse → emit` reproduces it.
-        if self.opts.complete {
+        if self.opts.tier == Tier::Complete {
             return Ok(Some(self.carrier()?));
         }
         let subtype = self.top.string("subtype")?.unwrap_or_default();
@@ -469,33 +866,67 @@ impl<'a> Record<'a, '_> {
                 }
             }
             return match render_hook_summary(&Value::Object(hooks)) {
-                Some(body) => self.system_msg(Text::Inline(body), &subtype),
+                Some(body) => self.system_msg(Some(Text::Inline(body)), &subtype),
                 None => Ok(None),
             };
         }
+        // Since 2.1.302 a retried request is an `api_error` with no `content`: `error` is an object
+        // (`formatted`, `message`, `status`) and `retryAttempt`/`maxRetries` say where the retry
+        // loop stood. That is the record of a provider failure the model never saw; render it.
+        let retry = if content.is_none() && subtype == "api_error" {
+            self.api_error_text()?
+        } else {
+            None
+        };
         // Subtypes with no human-readable body — keep them out of the message stream.
         let bodyless = matches!(subtype.as_str(), "turn_duration" | "agents_killed");
-        if bodyless || (content.is_none() && subtype != "compact_boundary") {
+        if bodyless || (content.is_none() && retry.is_none() && subtype != "compact_boundary") {
             return Ok(None);
+        }
+        if let Some(text) = retry {
+            return self.system_msg(Some(Text::Inline(text)), &subtype);
         }
         // Slash-command records wrap their payload in pseudo-XML tags; distill the tag soup to a
         // readable one/two-liner (these are always small, so they stay inline).
         if subtype == "local_command" {
             if let Some(c) = content.map(|v| v.resolve()).transpose()? {
                 if let Some(rendered) = render_slash_command(c.as_str().unwrap_or_default()) {
-                    return self.system_msg(Text::Inline(rendered), &subtype);
+                    return self.system_msg(Some(Text::Inline(rendered)), &subtype);
                 }
             }
         }
-        let text = match content {
-            Some(c) => c.lazy_text(self.opts.spans)?.unwrap_or_default(),
-            // compact_boundary often has only structured metadata; synthesize a marker.
-            None => Text::Inline("[conversation compacted]".to_string()),
-        };
+        let text = content.map(|c| c.lazy_text(self.opts.spans)).transpose()?.flatten();
         self.system_msg(text, &subtype)
     }
 
-    fn system_msg(&self, text: Text, subtype: &str) -> Result<Option<Message>> {
+    /// The one-line text of a content-less `api_error`: the error's `formatted` line (else its
+    /// `message`, else a bare string `error`), with the retry position when the record has one.
+    fn api_error_text(&self) -> Result<Option<String>> {
+        let error = self.top.get("error");
+        let mut text = match error
+            .as_ref()
+            .map(|e| Fields::parse(*e, &["formatted", "message"]))
+            .transpose()?
+            .flatten()
+        {
+            Some(fields) => fields.string("formatted")?.or(fields.string("message")?),
+            None => error
+                .map(|e| e.resolve())
+                .transpose()?
+                .and_then(|e| e.as_str().map(str::to_owned)),
+        };
+        let number = |key: &str| -> Result<Option<u64>> { Ok(self.value(key)?.and_then(|v| v.as_u64())) };
+        if let (Some(line), Some(attempt)) = (text.as_mut(), number("retryAttempt")?) {
+            line.push_str(&format!(" (retry {attempt}"));
+            if let Some(max) = number("maxRetries")? {
+                line.push_str(&format!(" of {max}"));
+            }
+            line.push(')');
+        }
+        Ok(text.filter(|t| !t.trim().is_empty()))
+    }
+
+    fn system_msg(&self, text: Option<Text>, subtype: &str) -> Result<Option<Message>> {
         // The subtype says what the notice IS: a compaction marker, an error the model never
         // answered, a Stop hook's output, a scheduled wakeup, or a plain harness notice.
         let (kind, origin) = match subtype {
@@ -506,7 +937,7 @@ impl<'a> Record<'a, '_> {
             _ => (MessageKind::Notice, Origin::Harness),
         };
         let mut bag = Map::new();
-        if self.opts.facts_only() {
+        if self.opts.tier == Tier::Facts {
             // Reducers read only the compaction facts: trigger and the two counters.
             if let Some(meta) = self
                 .top
@@ -526,7 +957,7 @@ impl<'a> Record<'a, '_> {
                 }
                 bag.insert("compactMetadata".into(), Value::Object(fields));
             }
-        } else if self.opts.extra {
+        } else if self.opts.tier >= Tier::Rich {
             if !subtype.is_empty() {
                 bag.insert("subtype".into(), Value::String(subtype.to_string()));
             }
@@ -536,23 +967,21 @@ impl<'a> Record<'a, '_> {
                 }
             }
         }
-        let mut extra = Map::new();
+        let mut m = match text {
+            Some(text) => {
+                let mut m = Message::of_kind(Role::System, kind, origin);
+                m.content.push(Block::Text { text });
+                m
+            }
+            None => Message::synthesized(kind, origin),
+        };
+        m.id = self.top.string("uuid")?;
+        m.parent_id = self.top.string("parentUuid")?;
+        m.timestamp = self.timestamp()?;
         if !bag.is_empty() {
-            extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));
+            m.extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));
         }
-        Ok(Some(Message {
-            complete_record: None,
-            id: self.top.string("uuid")?,
-            parent_id: self.top.string("parentUuid")?,
-            role: Role::System,
-            kind,
-            origin,
-            timestamp: self.timestamp()?,
-            model: None,
-            content: vec![Block::Text { text }],
-            usage: None,
-            extra,
-        }))
+        Ok(Some(m))
     }
 
     /// A `user` or `assistant` record. `None` when it has no `message` at all.
@@ -561,11 +990,8 @@ impl<'a> Record<'a, '_> {
             return Ok(None);
         };
         let opts = self.opts;
-        // The sink may ask for reducer facts instead of rich extras for this message.
-        let facts = opts.facts_only()
-            || (!opts.complete
-                && opts.wants_full_extra()
-                && sink.extra_projection() == crate::stream::ExtraProjection::Facts);
+        // The sink may narrow a rich read to reducer facts for this message.
+        let tier = opts.for_sink(sink);
         let body = Fields::parse(
             msg,
             &[
@@ -629,11 +1055,11 @@ impl<'a> Record<'a, '_> {
         // `Block::ToolResult::details`, not in the harness bag. Only rich demand resolves it: the
         // sidecar routinely dwarfs the visible transcript. Reducers read only `restorable`.
         let sidecar = self.top.get("toolUseResult");
-        if facts {
+        if tier == Tier::Facts {
             if let Some(restorable) = sidecar.map(|v| v.get("restorable")).transpose()?.flatten() {
                 attach_tool_use_result(&mut blocks, serde_json::json!({"restorable": restorable.resolve()?}));
             }
-        } else if opts.wants_full_extra() && blocks.iter().any(|b| matches!(b, Block::ToolResult { .. })) {
+        } else if tier >= Tier::Rich && blocks.iter().any(|b| matches!(b, Block::ToolResult { .. })) {
             if let Some(sidecar) = sidecar.filter(|v| !v.is_null().unwrap_or(false)) {
                 attach_tool_use_result(&mut blocks, sidecar.resolve()?.into_owned());
             }
@@ -678,12 +1104,16 @@ impl<'a> Record<'a, '_> {
                 && (head_text.starts_with("<command-name>") || head_text.starts_with("<local-command-stdout>")),
             user,
         };
-        let (role, kind, origin) = classify_conversation(role, class, opts.complete);
-        let model = if synthetic && !opts.complete { None } else { model };
+        let (role, kind, origin) = classify_conversation(role, class, opts.tier == Tier::Complete);
+        let model = if synthetic && opts.tier != Tier::Complete {
+            None
+        } else {
+            model
+        };
 
         // Everything Claude-specific lands in `extra["claude"]`; the top level stays clean.
         let mut bag = Map::new();
-        if synthetic && !opts.complete && !facts {
+        if synthetic && !matches!(tier, Tier::Facts | Tier::Complete) {
             for key in [
                 "isApiErrorMessage",
                 "error",
@@ -696,11 +1126,16 @@ impl<'a> Record<'a, '_> {
                 }
             }
         }
-        if facts || (!opts.extra && opts.usage_identity) {
+        // Skill bodies loaded by a tool have an ID; slash-loaded bodies do not. This small
+        // correlation fact prevents counting the tool invocation and its injected body twice.
+        if let Some(id) = self.top.string("sourceToolUseID")? {
+            bag.insert("sourceToolUseID".into(), Value::String(id));
+        }
+        if matches!(tier, Tier::Usage | Tier::Facts) {
             if let Some(id) = body_string("id")? {
                 bag.insert(format!("{MESSAGE_EXTRA_PREFIX}id"), Value::String(id));
             }
-        } else if opts.extra {
+        } else if tier >= Tier::Rich {
             for &key in CLAUDE_EXTRA_TOP {
                 if let Some(value) = self.value(key)?.filter(|v| keep_extra_top(key, v)) {
                     bag.insert(key.to_owned(), value);
@@ -722,7 +1157,7 @@ impl<'a> Record<'a, '_> {
         // first-classed ones) so `parse → emit` reproduces the record with no dropped keys. The
         // already-captured fields are re-confirmed, not duplicated. This is also the only producer
         // of the bag's verbatim `toolUseResult`, the complete-mode replay fallback.
-        if opts.complete {
+        if opts.tier == Tier::Complete {
             self.view.for_each_entry(|key, value| {
                 if !CLAUDE_FIRSTCLASS_TOP.contains(&key) && !bag.contains_key(key) {
                     bag.insert(key.to_owned(), value.resolve()?.into_owned());

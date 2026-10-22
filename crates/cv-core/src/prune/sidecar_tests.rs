@@ -1,6 +1,8 @@
+//! Sidecar writer and schema compatibility; retrieval behavior is tested in prune/tests.rs.
 use super::*;
 fn owned_line(id: &str, name: &str, input: &Value, content: &str) -> String {
-    // Frozen compatibility serializer: the former sidecar_line clone/Value-string wiring.
+    // Keep this serializer owned to independently pin the bytes of the borrowed writer;
+    // SidecarEntry supplies the shared schema while construction takes the owned path.
     serde_json::to_string(&SidecarEntry {
         id: id.to_owned(),
         slot: "content".into(),
