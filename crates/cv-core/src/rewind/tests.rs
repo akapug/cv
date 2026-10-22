@@ -1188,8 +1188,16 @@ fn sidechain_rec(ty: &str, uuid: &str, parent: Option<&str>, message: Value) -> 
     v
 }
 
+/// Read `v` the way the rewind pass does (a captured source, so `Facts` has its byte ranges),
+/// then feed it to the tracker.
 fn track(v: &Value, open: &mut HashMap<String, Option<String>>, closed: Option<&mut usize>) {
-    let facts = Facts::parse(crate::json::JsonView::from(v)).unwrap().0;
+    let world = crate::test_world("rewind");
+    let path = world.proj.join("record.jsonl");
+    std::fs::write(&path, v.to_string()).unwrap();
+    let source = crate::json::JsonSource::capture(&path).unwrap();
+    let facts = source
+        .read_range_value(0, source.len(), |view| Ok(Facts::parse(view)?.0))
+        .unwrap();
     track_tool_calls(&facts, open, closed);
 }
 
