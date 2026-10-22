@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Cold WAL store copies stage beside the catalog instead of `/tmp`; an unchanged Hermes or Devin store answers sub-agent forests without being copied.
 - `cv rewind` counts tool calls only on top-level turns; a request snapshot replaying a closed call no longer reopens it.
 - `--skills-policy` and `drop-all` still parse as `--skills` and `drop`.
 

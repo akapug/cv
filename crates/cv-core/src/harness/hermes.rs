@@ -387,61 +387,70 @@ fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
 /// segment of its compression chain, since a delegate records the session id live when it was
 /// spawned), as [`SessionRef`]s of the same shape discovery gives a session in that db, sorted by
 /// id. Discovery leaves them out (Hermes's picker hides them too); this is how a caller reaches
-/// them from their parent. Empty when the db cannot be opened.
+/// them from their parent. Every listed conversation's answer is derived once per db state and
+/// kept beside cv's catalog, so an unchanged db is neither copied nor opened to answer.
 pub fn subagent_refs(parent: &SessionRef) -> Result<Vec<SessionRef>> {
-    let conn = open_ro(&parent.path)?;
-    conn.read(|conn, reads| {
-        let chain = if Select::of(conn, "sessions").has("parent_session_id") {
-            session_lineage_root_to_tip(conn, &parent.id)
-        } else {
-            vec![parent.id.clone()]
-        };
-        let by_parent = delegates_by_parent(conn, &parent.path, reads)?;
-        let mut out: Vec<SessionRef> = chain
-            .iter()
-            .filter_map(|id| by_parent.get(id))
-            .flatten()
-            .cloned()
-            .collect();
-        out.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(out)
-    })
+    let forests = super::store::sqlite::derived(&parent.path, "hermes-delegates", forests_conn)?;
+    if forests.listed.contains(&parent.id) {
+        return Ok(forests.of.get(&parent.id).cloned().unwrap_or_default());
+    }
+    // A session discovery does not list (a delegate run, a compression ancestor) walks its chain.
+    open_ro(&parent.path)?.read(|conn, _| Ok(chain_delegates(conn, &parent.id, &forests.by_parent)))
 }
 
-/// Every delegate run in one db, by the session its `_delegate_from` names.
-type Delegates = std::collections::HashMap<String, Vec<SessionRef>>;
+/// What [`subagent_refs`] keeps per db state.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Forests {
+    /// Every delegate run, by the session its `_delegate_from` names.
+    by_parent: std::collections::HashMap<String, Vec<SessionRef>>,
+    /// The conversations discovery lists, each answered by `of` (absent there: none).
+    listed: HashSet<String>,
+    of: std::collections::HashMap<String, Vec<SessionRef>>,
+}
 
-/// [`subagent_refs`]'s scan of one db, kept while the db and its WAL and journal stat as they did
-/// when it ran. A forest fold asks for every conversation's delegates, and the scan walks the
-/// whole `sessions` table, overflow pages included: one scan per parent made a `--subagents` pass
-/// over a 4 GB store with ~7,000 conversations read ~4 GB per conversation.
-fn delegates_by_parent(
-    conn: &Connection,
-    path: &Path,
-    reads: &crate::source::ReadSet,
-) -> Result<std::sync::Arc<Delegates>> {
-    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-    type Memo = std::collections::HashMap<PathBuf, (crate::source::ReadSet, Arc<Delegates>)>;
-    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
-    let memo = MEMO.get_or_init(Default::default);
-    let hit = memo
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(path)
-        .filter(|(seen, _)| seen.fresh(&mut crate::source::Probe::default()))
-        .map(|(_, by)| Arc::clone(by));
-    if let Some(by) = hit {
-        return Ok(by);
-    }
-    let mut by = Delegates::new();
+/// One walk over `sessions` for the delegate runs, then each listed conversation's chain. The
+/// walk reads the overflow pages too; a forest fold asks for every conversation's delegates, so
+/// one walk per parent made a `--subagents` pass over a 4 GB store read ~4 GB per conversation.
+fn forests_conn(conn: &Connection, path: &Path) -> Result<Forests> {
+    let mut by_parent = std::collections::HashMap::<String, Vec<SessionRef>>::new();
     for (from, r) in refs_conn(conn, path, true)? {
-        by.entry(from.unwrap_or_default()).or_default().push(r);
+        by_parent.entry(from.unwrap_or_default()).or_default().push(r);
     }
-    let by = Arc::new(by);
-    memo.lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(path.to_path_buf(), (reads.clone(), Arc::clone(&by)));
-    Ok(by)
+    let listed: HashSet<String> = super::store::sqlite::cached_discover(path, || discover_conn(conn, path))?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let of = if by_parent.is_empty() {
+        Default::default()
+    } else {
+        listed
+            .iter()
+            .map(|id| (id.clone(), chain_delegates(conn, id, &by_parent)))
+            .filter(|(_, kids)| !kids.is_empty())
+            .collect()
+    };
+    Ok(Forests { by_parent, listed, of })
+}
+
+/// The delegates of every segment of `id`'s compression chain, sorted by id.
+fn chain_delegates(
+    conn: &Connection,
+    id: &str,
+    by_parent: &std::collections::HashMap<String, Vec<SessionRef>>,
+) -> Vec<SessionRef> {
+    let chain = if Select::of(conn, "sessions").has("parent_session_id") {
+        session_lineage_root_to_tip(conn, id)
+    } else {
+        vec![id.to_string()]
+    };
+    let mut out: Vec<SessionRef> = chain
+        .iter()
+        .filter_map(|id| by_parent.get(id))
+        .flatten()
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
 }
 
 /// Session refs in one db, each with the session its `_delegate_from` names: with `delegates`
@@ -2985,6 +2994,8 @@ mod tests {
         forest.sort();
         assert_eq!(forest, ["d1", "d2"]);
         let x = refs.iter().find(|r| r.id == "x").unwrap();
+        let opens = || super::super::store::sqlite::DERIVE_OPENS.with(std::cell::Cell::get);
+        let before = opens();
         assert_eq!(
             subagent_refs(x)
                 .unwrap()
@@ -2992,6 +3003,11 @@ mod tests {
                 .map(|r| r.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["dx"]
+        );
+        assert_eq!(
+            opens(),
+            before,
+            "an unchanged db answers every conversation from one scan"
         );
         // a child parses as its own conversation that names its parent
         let d1 = Hermes::with_db(db.clone()).parse(&kids[0]).unwrap();
@@ -3010,6 +3026,7 @@ mod tests {
             kids.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["d1", "d2", "d3"]
         );
+        assert_eq!(opens(), before + 1, "a written db is scanned again");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

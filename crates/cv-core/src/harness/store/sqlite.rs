@@ -190,11 +190,127 @@ pub(crate) fn cached_discover(
     discover: impl FnOnce() -> Result<Vec<crate::SessionRef>>,
 ) -> Result<Vec<crate::SessionRef>> {
     let path = std::path::absolute(db)?;
+    crate::discover_cache::cached_scan_many_with_reads(&path, store_reads(&path), discover)
+}
+
+/// The identities a database's contents depend on: the file, its WAL and its rollback journal
+/// (each its inode, size and mtime, or its absence). SHM is coordination state a reader rewrites.
+fn store_reads(path: &Path) -> crate::source::ReadSet {
     let mut reads = crate::source::ReadSet::default();
-    reads.record(&path);
-    reads.record(&sidecar(&path, "-wal"));
-    reads.record(&sidecar(&path, "-journal"));
-    crate::discover_cache::cached_scan_many_with_reads(&path, reads, discover)
+    reads.record(path);
+    reads.record(&sidecar(path, "-wal"));
+    reads.record(&sidecar(path, "-journal"));
+    reads
+}
+
+/// A value `derive` computes from one database, kept beside cv's catalog under the database's
+/// [`store_reads`]. While those stat as they did when `derive` ran, the value comes back without
+/// copying or opening the database, in this process or a later one; a changed store, an
+/// unreadable or foreign record, or no writable catalog runs `derive` over [`open_ro`] again.
+/// `derive` must depend only on that database; its errors are returned and never kept.
+pub(crate) fn derived<T>(
+    db: &Path,
+    purpose: &str,
+    derive: impl FnOnce(&Connection, &Path) -> Result<T>,
+) -> Result<std::sync::Arc<T>>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    use std::sync::{Arc, PoisonError};
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Derived<T> {
+        db: std::path::PathBuf,
+        purpose: String,
+        reads: crate::source::ReadSet,
+        value: T,
+    }
+    let path = std::path::absolute(db)?;
+    let key = (path.clone(), purpose.to_string());
+    let fresh = |reads: &crate::source::ReadSet| reads.fresh(&mut crate::source::Probe::default());
+    let hit = DERIVED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+        .filter(|(reads, _)| fresh(reads))
+        .and_then(|(_, value)| Arc::clone(value).downcast::<T>().ok());
+    if let Some(value) = hit {
+        return Ok(value);
+    }
+    // FNV-1a names the record stably; the record's own `db` and `purpose` are what admit it.
+    let hash = path
+        .as_os_str()
+        .to_string_lossy()
+        .bytes()
+        .fold(0xcbf29ce484222325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+        });
+    let record = crate::catalog::db_path().and_then(|catalog| {
+        Some(
+            catalog
+                .parent()?
+                .join("sqlite-derived")
+                .join(format!("{purpose}-{hash:016x}.json")),
+        )
+    });
+    let stored = record
+        .as_deref()
+        .and_then(|file| std::fs::read(file).ok())
+        .and_then(|bytes| serde_json::from_slice::<Derived<T>>(&bytes).ok())
+        .filter(|d| d.db == path && d.purpose == purpose && fresh(&d.reads));
+    let (reads, value) = match stored {
+        Some(d) => (d.reads, Arc::new(d.value)),
+        None => {
+            #[cfg(test)]
+            DERIVE_OPENS.with(|n| n.set(n.get() + 1));
+            let reader = open_ro(&path)?;
+            let value = reader.read(|conn, _| derive(conn, &path))?;
+            let reads = reader.reads.clone();
+            drop(reader);
+            if let Some(file) = record.filter(|_| !crate::env::frozen()) {
+                let derived = Derived {
+                    db: path.clone(),
+                    purpose: purpose.to_string(),
+                    reads,
+                    value,
+                };
+                let written = file
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|()| Ok(serde_json::to_vec(&derived)?))
+                    .and_then(|bytes| {
+                        crate::publish::publish_reader(
+                            &file,
+                            "derived",
+                            bytes.as_slice(),
+                            crate::publish::Claim::Replace,
+                        )
+                    });
+                if let Err(error) = written {
+                    crate::env::warn_once("the SQLite derived cache", error);
+                }
+                (derived.reads, Arc::new(derived.value))
+            } else {
+                (reads, Arc::new(value))
+            }
+        }
+    };
+    DERIVED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, (reads, Arc::clone(&value) as Arc<dyn std::any::Any + Send + Sync>));
+    Ok(value)
+}
+
+/// [`derived`]'s values in this process, each with the read set it was derived under.
+type Kept = (crate::source::ReadSet, std::sync::Arc<dyn std::any::Any + Send + Sync>);
+static DERIVED: std::sync::Mutex<std::collections::BTreeMap<(std::path::PathBuf, String), Kept>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`derived`] opened its database on this thread.
+    pub(crate) static DERIVE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
@@ -260,10 +376,7 @@ fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>
     } else {
         std::env::current_dir()?.join(path)
     };
-    let mut reads = crate::source::ReadSet::default();
-    reads.record(&path);
-    reads.record(&sidecar(&path, "-wal"));
-    reads.record(&sidecar(&path, "-journal"));
+    let reads = store_reads(&path);
     let has_frames = std::fs::metadata(sidecar(&path, "-wal")).is_ok_and(|m| m.len() > 0);
     let has_journal = sidecar(&path, "-journal").exists();
     let immutable = !has_frames && !has_journal;
@@ -1029,6 +1142,92 @@ mod tests {
         drop(second);
         drop(scope);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An isolated home whose catalog directory is `<root>/catalog`.
+    fn catalog_home() -> (std::path::PathBuf, crate::env::Scope) {
+        let root = std::env::temp_dir().join(format!("cv-derived-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        let scope = crate::env::Env::from_vars([
+            ("HOME", root.join("home")),
+            ("CLUSTERVISION_HOME", root.join("catalog")),
+        ])
+        .enter();
+        (root, scope)
+    }
+
+    fn sum(conn: &Connection, _: &Path) -> Result<i64> {
+        Ok(conn.query_row("SELECT sum(x) FROM t", [], |row| row.get(0))?)
+    }
+
+    /// A store whose db, WAL and journal stat as they did is answered from cv's own record,
+    /// in this process and a later one, with no copy and no open; a touched WAL derives again.
+    #[test]
+    fn derived_skips_an_unchanged_store_and_rederives_a_touched_wal() {
+        let _serial = SNAPSHOT_TEST.lock().unwrap();
+        let (root, _env) = catalog_home();
+        let (directory, database) = fixture();
+        let writer = live_store(&database, "CREATE TABLE t(x); INSERT INTO t VALUES(7);");
+        let opens = || DERIVE_OPENS.with(std::cell::Cell::get);
+        let before = opens();
+        assert_eq!(*derived(&database, "sum", sum).unwrap(), 7);
+        assert_eq!(opens(), before + 1);
+        let records: Vec<_> = std::fs::read_dir(root.join("catalog/sqlite-derived"))
+            .unwrap()
+            .collect();
+        assert_eq!(records.len(), 1, "one record beside the catalog");
+        assert_eq!(*derived(&database, "sum", sum).unwrap(), 7);
+        // A later process has only the record.
+        DERIVED.lock().unwrap().clear();
+        assert_eq!(
+            *derived(&database, "sum", |_: &Connection, _: &Path| -> Result<i64> {
+                panic!("an unchanged store was opened")
+            })
+            .unwrap(),
+            7
+        );
+        assert_eq!(opens(), before + 1, "unchanged: neither copied nor opened");
+        writer.execute("INSERT INTO t VALUES(8)", []).unwrap();
+        assert_eq!(*derived(&database, "sum", sum).unwrap(), 15);
+        assert_eq!(opens(), before + 2, "a touched WAL derives again");
+        // A record of another store or purpose never answers.
+        assert_eq!(
+            *derived(&database, "other", |_: &Connection, _: &Path| Ok(1i64)).unwrap(),
+            1
+        );
+        drop(writer);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A cold WAL copy is staged under cv's catalog directory, not the temporary directory,
+    /// and is gone once its reader and scope are.
+    #[test]
+    fn cold_copy_lands_beside_the_catalog_and_is_removed_after_the_pass() {
+        let _serial = SNAPSHOT_TEST.lock().unwrap();
+        let (root, _env) = catalog_home();
+        let (directory, database) = fixture();
+        let _writer = live_store(&database, "CREATE TABLE t(x); INSERT INTO t VALUES(7);");
+        let scope = read_scope();
+        let mut staged = None;
+        let reader = open_ro_with_copy_check(&database, |copied| {
+            staged = Some(copied.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        let staged = staged.unwrap();
+        assert!(
+            staged.starts_with(root.join("catalog").join("cv-sqlite-owners-v1")),
+            "{}",
+            staged.display()
+        );
+        assert!(staged.exists());
+        drop(reader);
+        drop(scope);
+        assert!(!staged.exists());
+        assert!(!staged.parent().unwrap().exists());
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

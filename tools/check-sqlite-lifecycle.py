@@ -60,6 +60,8 @@ def main():
             (root / directory).mkdir(parents=True, exist_ok=True)
     fixture = json.loads((root / "fixture.json").read_text())
     source, temporary = Path(fixture["path"]), root / "temporary"
+    # Cold copies stage beside the writable catalog, never in TMPDIR.
+    owners = root / "catalog" / "cv-sqlite-owners-v1"
     env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
     env.update(HOME=str(root / "home"), CLUSTERVISION_HOME=str(root / "catalog"), TMPDIR=str(temporary),
                GOOSE_PATH_ROOT=str(root / "goose"), XDG_DATA_HOME=str(root / "home/.local/share"),
@@ -74,13 +76,13 @@ def main():
 
     def payloads():
         return [{"path": str(path.relative_to(root)), "bytes": path.stat().st_size}
-                for path in sorted(temporary.rglob("store.db*")) if path.is_file()]
+                for path in sorted(owners.rglob("store.db*")) if path.is_file()]
 
     def wait_copy(process):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             assert process.poll() is None, "process completed before cancellation witness"
-            for path in temporary.rglob("store.db"):
+            for path in owners.rglob("store.db"):
                 try:
                     if path.stat().st_size >= fixture["physical_input_bytes"]:
                         return str(path.relative_to(root))
@@ -191,17 +193,17 @@ def main():
         "payloads_after_joined_handlers": payloads(), "stderr": err.decode()}
     report["final_normal_output_sha256"] = normal()
     report["final_bookkeeping"] = [{"path": str(path.relative_to(root)), "bytes": path.stat().st_size}
-                                   for path in sorted(temporary.rglob("*")) if path.is_file()]
-    for entry in temporary.iterdir():
-        assert entry.is_dir() and not entry.is_symlink() and entry.name.startswith("cv-sqlite-owners-v1-")
-        assert [path.name for path in entry.iterdir()] == ["gate"], "abandoned payload or metadata"
-        gate = json.loads((entry / "gate").read_bytes())
-        assert gate["magic"] == "cv-sqlite-owners-v1"
-        assert gate["root"] == {"volume": entry.stat().st_dev, "file": entry.stat().st_ino}
+                                   for path in sorted(owners.rglob("*")) if path.is_file()]
+    assert not any(temporary.iterdir()), "a copy staged in TMPDIR"
+    assert owners.is_dir() and not owners.is_symlink()
+    assert [path.name for path in owners.iterdir()] == ["gate"], "abandoned payload or metadata"
+    gate = json.loads((owners / "gate").read_bytes())
+    assert gate["magic"] == "cv-sqlite-owners-v1"
+    assert gate["root"] == {"volume": owners.stat().st_dev, "file": owners.stat().st_ino}
     report["limits"] = ["standalone abrupt exit reclamation is eventual at a later operation boundary",
         "MCP closed-output cancellation kills and reaps a stopped generated child before request cleanup",
         "logical named payload extents only, not physical APFS blocks or timing/RSS",
-        "owned fixture/home/catalog/TMPDIR only; source hash/identity/auxiliary absence and exact output preserved",
+        "owned fixture/home/catalog/TMPDIR only (copies stage in the catalog); source hash/identity/auxiliary absence and exact output preserved",
         "fixed recognized gate metadata may remain; no abandoned store.db payloads"]
     (root / "candidate-lifecycle.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))

@@ -49,6 +49,21 @@ pub(super) struct Owner {
 
 impl Namespace {
     pub(super) fn current() -> Self {
+        // On disk beside cv's catalog when that directory is ours to write: a temporary
+        // directory is often RAM-backed, and a multi-GB copy there is shared memory charged to
+        // the reader's cgroup. A frozen or unwritable catalog keeps the private per-home
+        // namespace in the temporary directory, which needs no writable cv state.
+        let beside = crate::catalog::db_path()
+            .filter(|_| !crate::env::frozen())
+            .and_then(|db| Some(db.parent()?.join(MAGIC)))
+            .filter(|root| {
+                private_directory(root, false)
+                    .and_then(|()| check_private_root(root))
+                    .is_ok()
+            });
+        if let Some(root) = beside {
+            return Self { root };
+        }
         // Separate users in a shared /tmp without depending on a writable cv catalog. The
         // namespace remains private and identity checked; this hash is a name, not authority.
         let home = crate::env::home_dir().unwrap_or_default();
@@ -457,6 +472,25 @@ mod tests {
             root: directory.join("owners"),
         };
         (Scratch(directory), namespace)
+    }
+    /// Beside a writable catalog, private; a frozen environment keeps the temporary directory.
+    #[test]
+    fn namespace_stages_beside_the_catalog_unless_frozen() {
+        let (scratch, _) = fixture();
+        let env = crate::env::Env::from_vars([
+            ("HOME", scratch.0.join("home")),
+            ("CLUSTERVISION_HOME", scratch.0.join("catalog")),
+        ]);
+        let frozen = env.clone().with_frozen();
+        let beside = {
+            let _scope = env.enter();
+            Namespace::current().root
+        };
+        assert_eq!(beside, scratch.0.join("catalog").join(MAGIC));
+        check_private_root(&beside).unwrap();
+        let _scope = frozen.enter();
+        assert!(Namespace::current().root.starts_with(std::env::temp_dir()));
+        assert!(!Namespace::current().root.starts_with(&scratch.0));
     }
     fn abandon(owner: Arc<Owner>) {
         let mut owner = Arc::try_unwrap(owner).ok().unwrap();

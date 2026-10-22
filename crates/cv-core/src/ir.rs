@@ -1198,7 +1198,7 @@ impl SessionRef {
 ///
 /// A deep session fans out into hundreds of these, and the sidecars are where their *purpose* and
 /// *outcome* live.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentRef {
     /// The transcript itself (Claude: id = `agent-<agentId>`), parseable like any other session.
     pub session: SessionRef,
