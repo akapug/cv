@@ -2319,9 +2319,12 @@ pub fn staleness(dir: &Path) -> Option<Staleness> {
 fn staleness_over(dir: &Path, refs: &[cv_core::SessionRef]) -> Option<Staleness> {
     let (sigs, _) = probe_indexed_sigs(dir)?;
     let indexed = sigs.values().filter(|(_, size)| *size >= 0).map(|&(mt, _)| mt).max()?;
+    // Count against the same preferred-candidate set the sweep indexes: a second on-disk
+    // copy of one session is not another stale session.
+    let prov = cv_core::events::Provenance::default();
     let mut stale_sessions = 0usize;
     let mut newest_on_disk = 0i64;
-    for r in refs {
+    for (r, _) in preferred_index_candidates(refs.iter().map(|r| (r, &prov)).collect()) {
         let cur = sig(cv_core::source::FileId::at(&cv_core::source::primary_path(r)));
         newest_on_disk = newest_on_disk.max(cur.0);
         if cur.0 == 0 || sigs.get(&r.id) != Some(&cur) {
@@ -7723,6 +7726,33 @@ mod tests {
 
         let refs = vec![sref("old", "one", p), sref("new", "two", p2)];
         assert_eq!(staleness_over(&dir, &refs).map(|s| s.stale_sessions), Some(1));
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// Discovery can report the same session twice (overlapping roots, a copy under another
+    /// layout). The pass indexes one preferred candidate per id, so the staleness count must judge
+    /// that same one — a losing copy's differing file is not drift, and a winning copy's is.
+    #[test]
+    fn staleness_judges_the_preferred_copy_only() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let p = write_claude(&sdir, "s1", "alpha corpus seed");
+        let r1 = sref("s1", "one", p); // updated_at = 2s
+        index_refs(&dir, std::slice::from_ref(&r1), false).unwrap();
+        let stale = |refs: &[cv_core::SessionRef]| staleness_over(&dir, refs).map(|s| s.stale_sessions);
+
+        // An older duplicate at a different path loses preference → not drift.
+        let mut old = sref("s1", "one", write_claude(&sdir, "s1dup", "different, older copy"));
+        old.updated_at = chrono::DateTime::from_timestamp(0, 0);
+        assert_eq!(stale(&[r1.clone(), old]), Some(0));
+
+        // A newer duplicate wins preference → its file is the session now → drift.
+        let mut new = sref("s1", "one", write_claude(&sdir, "s1new", "newer copy content"));
+        new.updated_at = chrono::DateTime::from_timestamp(3, 0);
+        assert_eq!(stale(&[r1, new]), Some(1));
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&sdir).ok();
