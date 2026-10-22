@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `cv rewind` counts tool calls only on top-level turns; a request snapshot replaying a closed call no longer reopens it.
+- `--skills-policy` and `drop-all` still parse as `--skills` and `drop`.
+
 - `prune`, `rewind`, and `port` accept `--skills keep|drop|drop-stale`, including legacy command-file skills; the default preserves restored skills unchanged.
 - **Breaking (library):** redaction and HTML message rendering require a resolver; Markdown consumers use `write_md_message`/`write_md_block` instead of removed buffering wrappers.
 
