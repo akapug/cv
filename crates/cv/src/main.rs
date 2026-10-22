@@ -82,14 +82,15 @@ pub(crate) fn group_of(name: &str) -> Option<&'static str> {
 
 /// `--skills` values. `--skills-policy` and `drop-all` are the fork's earlier spellings, still
 /// accepted so callers written against them keep working; each parses to its canonical name.
-fn skills_values() -> clap::builder::PossibleValuesParser {
-    use clap::builder::PossibleValue;
-    [
-        PossibleValue::new("keep"),
-        PossibleValue::new("drop").alias("drop-all"),
-        PossibleValue::new("drop-stale"),
-    ]
-    .into()
+fn skills_values() -> impl clap::builder::TypedValueParser<Value = String> {
+    use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
+    const VALUES: [(&str, Option<&str>); 3] = [("keep", None), ("drop", Some("drop-all")), ("drop-stale", None)];
+    PossibleValuesParser::new(VALUES.map(|(name, old)| PossibleValue::new(name).aliases(old))).map(|given: String| {
+        VALUES
+            .iter()
+            .find(|(_, old)| *old == Some(given.as_str()))
+            .map_or(given.clone(), |(name, _)| name.to_string())
+    })
 }
 
 const RECIPES_FOOTER: &str = "run `cv recipes` for the agent quickstart";
