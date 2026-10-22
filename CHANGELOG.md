@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Cold WAL store copies stage beside the catalog instead of `/tmp`; an unchanged Hermes or Devin store answers sub-agent forests without being copied.
 - OpenCode JSON-file reads avoid retaining duplicate part inventories while preserving source-change checks and bounded dataset selection heap.
 
 - Desktop ZIP imports report transcript decoding errors instead of attempting to serialize an ingestion result.

@@ -504,42 +504,57 @@ pub fn subagent_tree(db: &Path, session_id: &str) -> Result<Vec<crate::AgentRef>
     if session_id.contains('/') {
         return Ok(Vec::new());
     }
-    let conn = open_ro(db)?;
-    conn.read(|conn, _| {
-        let select = Select::of(conn, "sessions")
-            .always(&["working_directory"])
-            .probed(&["title"])
-            .always(&["created_at", "last_activity_at"]);
-        let (wd, title, created, last): (Option<String>, Option<String>, Option<i64>, Option<i64>) = conn.query_row(
-            &format!("SELECT {} FROM sessions WHERE id = ?1", select.list()),
-            [session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        let parent = SessionRef {
-            cwd: wd.filter(|s| !s.is_empty()).map(PathBuf::from),
-            title,
-            created_at: created.and_then(ts_from_epoch),
-            updated_at: last.and_then(ts_from_epoch),
-            ..SessionRef::new(session_id.to_string(), Harness::Devin, db.to_path_buf())
-        };
-        let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "message_nodes")?;
-        let forest = load_forest(conn, session_id, &cells)?;
-        let mut out = Vec::new();
-        for (agent, head, updated) in subagent_head_rows(conn, session_id, &forest)? {
-            if let Some(session) = child_ref(db, session_id, &agent, head, updated, &forest, &parent) {
-                out.push(crate::AgentRef {
-                    session,
-                    tool_use_id: spawning_call(&agent, &forest),
-                    agent_type: Some(agent),
-                    description: None,
-                    workflow: None,
-                    result_status: None,
-                    result_summary: None,
-                });
-            }
+    // Every listed session's forest, derived once per db state and kept beside cv's catalog: a
+    // forest fold over an unchanged store neither copies nor opens it.
+    let forests = super::store::sqlite::derived(db, "devin-forests", |conn, db| {
+        let listed = super::store::sqlite::cached_discover(db, || discover_conn(conn, db))?;
+        Ok(listed
+            .into_iter()
+            .filter(|r| !r.id.contains('/'))
+            .filter_map(|r| Some((r.id.clone(), forest_conn(conn, db, &r.id).ok()?)))
+            .collect::<HashMap<String, Vec<crate::AgentRef>>>())
+    })?;
+    if let Some(forest) = forests.get(session_id) {
+        return Ok(forest.clone());
+    }
+    open_ro(db)?.read(|conn, _| forest_conn(conn, db, session_id))
+}
+
+/// The subagent heads of `session_id`, each with the chain it names.
+fn forest_conn(conn: &Connection, db: &Path, session_id: &str) -> Result<Vec<crate::AgentRef>> {
+    let select = Select::of(conn, "sessions")
+        .always(&["working_directory"])
+        .probed(&["title"])
+        .always(&["created_at", "last_activity_at"]);
+    let (wd, title, created, last): (Option<String>, Option<String>, Option<i64>, Option<i64>) = conn.query_row(
+        &format!("SELECT {} FROM sessions WHERE id = ?1", select.list()),
+        [session_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let parent = SessionRef {
+        cwd: wd.filter(|s| !s.is_empty()).map(PathBuf::from),
+        title,
+        created_at: created.and_then(ts_from_epoch),
+        updated_at: last.and_then(ts_from_epoch),
+        ..SessionRef::new(session_id.to_string(), Harness::Devin, db.to_path_buf())
+    };
+    let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "message_nodes")?;
+    let forest = load_forest(conn, session_id, &cells)?;
+    let mut out = Vec::new();
+    for (agent, head, updated) in subagent_head_rows(conn, session_id, &forest)? {
+        if let Some(session) = child_ref(db, session_id, &agent, head, updated, &forest, &parent) {
+            out.push(crate::AgentRef {
+                session,
+                tool_use_id: spawning_call(&agent, &forest),
+                agent_type: Some(agent),
+                description: None,
+                workflow: None,
+                result_status: None,
+                result_summary: None,
+            });
         }
-        Ok(out)
-    })
+    }
+    Ok(out)
 }
 
 /// Row shape of the session metadata SELECT (columns probed — absent ones come back NULL):
