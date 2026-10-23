@@ -28,14 +28,28 @@
         "load_skill"
       ],
       "usage_messages": 5,
+      "model_messages": 5,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "skill/load": 1
       },
+      "tool_histogram": {
+        "tools": {
+          "load_skill": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-4.7-flash",
+      "model": "glm-4.7-flash",
       "skipped_lines": 0
     },
     {
@@ -59,12 +73,26 @@
         "shell"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "shell": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 1
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 1
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -88,12 +116,26 @@
         "shell"
       ],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "shell": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -111,12 +153,18 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -133,14 +181,20 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "schedule/fire": 1
       },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -164,12 +218,26 @@
         "chatrecall__chatrecall"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "chatrecall__chatrecall": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -185,12 +253,18 @@
       },
       "tools": [],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -221,6 +295,7 @@
         "load_skill"
       ],
       "usage_messages": 5,
+      "model_messages": 5,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -228,10 +303,23 @@
         "fork/fork": 1,
         "skill/load": 1
       },
+      "tool_histogram": {
+        "tools": {
+          "load_skill": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {
         "forked_from": "20261011_1"
       },
-      "model": "openai/glm-4.7-flash",
+      "model": "glm-4.7-flash",
       "skipped_lines": 0
     },
     {
@@ -255,10 +343,24 @@
         "Edit"
       ],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "Edit": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": null,
       "skipped_lines": 0
@@ -315,12 +417,54 @@
         "analyze"
       ],
       "usage_messages": 9,
+      "model_messages": 13,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "analyze": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 1
+          },
+          "edit": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "shell": {
+            "calls": 5,
+            "edits": 0,
+            "reads": 0,
+            "commands": 5,
+            "errors": 1
+          },
+          "tree": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "write": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 9,
+        "total_errors": 2
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -344,12 +488,26 @@
         "read_image"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "read_image": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -368,19 +526,25 @@
         "assistant/reply"
       ],
       "blocks": {
-        "text": 9,
+        "text": 8,
         "thinking": 2
       },
       "tools": [],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [
         4
       ],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -404,12 +568,26 @@
         "corpus__add"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "corpus__add": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -433,6 +611,7 @@
         "delegate"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 1,
@@ -440,8 +619,21 @@
         "subagent_return/return": 1,
         "subagent_spawn/spawn": 1
       },
+      "tool_histogram": {
+        "tools": {
+          "delegate": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -459,14 +651,20 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {
         "parent": "20261011_6"
       },
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -491,6 +689,7 @@
         "todo__todo_write"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -498,8 +697,21 @@
         "plan/state": 1,
         "plan/write": 1
       },
+      "tool_histogram": {
+        "tools": {
+          "todo__todo_write": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     },
     {
@@ -523,14 +735,28 @@
         "load_skill"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "skill/load": 1
       },
+      "tool_histogram": {
+        "tools": {
+          "load_skill": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
-      "model": "openai/glm-5.3-flash",
+      "model": "glm-5.3-flash",
       "skipped_lines": 0
     }
   ]

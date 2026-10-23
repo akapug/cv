@@ -2,7 +2,7 @@
 //! phase with their outcomes, the run totals, the driving script, and `--revive` (per-lane resume
 //! prompts mined from the transcripts of a run that died).
 
-use crate::util::{fmt_duration, fmt_int, short_id};
+use crate::util::{fmt_duration, fmt_int, short_id, Wait};
 use anyhow::{bail, Context, Result};
 use cv_core::ir::truncate;
 
@@ -12,18 +12,61 @@ use cv_core::ir::truncate;
 /// accept **names**: `run` matches a workflow name (exact, else unique prefix) as well as a run id,
 /// and when `<session>` matches no session id it's resolved as a workflow name across the whole
 /// catalog — session titles are auto-generated and rarely mention the workflow you remember.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_workflow(
-    id: &str,
-    run_id: Option<String>,
-    harness: Option<String>,
+pub(crate) struct WorkflowArgs<'a> {
+    pub id: &'a str,
+    pub run_id: Option<String>,
+    pub harness: Option<String>,
+    pub json: bool,
+    pub script: bool,
+    pub results: bool,
+    pub follow: bool,
+    pub for_: Option<String>,
+    pub revive: bool,
+    pub revive_all: bool,
+}
+
+/// How a run renders: `cv workflow`'s output flags, named once at the command boundary.
+#[derive(Clone, Copy)]
+struct Render {
     json: bool,
     script: bool,
     results: bool,
-    follow: bool,
     revive: bool,
     revive_all: bool,
-) -> Result<()> {
+}
+
+pub(crate) fn cmd_workflow(args: WorkflowArgs<'_>) -> Result<()> {
+    let WorkflowArgs {
+        id,
+        run_id,
+        harness,
+        json,
+        script,
+        results,
+        follow,
+        for_,
+        revive,
+        revive_all,
+    } = args;
+    // Flags that act on one run: a command that lists instead of rendering a run refuses them.
+    let run_flags: Vec<&str> = [
+        ("--script", script),
+        ("--results", results),
+        ("--follow", follow),
+        ("--for", for_.is_some()),
+        ("--revive", revive),
+        ("--revive-all", revive_all),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect();
+    let render = Render {
+        json,
+        script,
+        results,
+        revive,
+        revive_all,
+    };
     let (want, id) = crate::util::split_harness_id(id, crate::util::parse_harness(&harness)?);
     // find_cheap: don't pay a full fleet re-discovery before trying the id as a workflow name —
     // the name path escalates to a full `find` itself once every cheaper reading has missed.
@@ -34,16 +77,17 @@ pub(crate) fn cmd_workflow(
     };
     let Some((r, _adapter)) = found else {
         // Not a session id → maybe it's a workflow name ("the stark-kill session" problem).
-        return workflow_by_name_fleetwide(id, want, json, script, results, revive, revive_all);
+        return workflow_by_name_fleetwide(id, want, render, &run_flags);
     };
 
     // No run id → list the session's workflows (a directory of runs).
     let Some(run_id) = run_id else {
+        refuse_run_flags(&run_flags, "a session's run list")?;
         return list_workflows(&r, json);
     };
 
-    if follow {
-        return follow_workflow(&r, &run_id, json, script, results);
+    if follow || for_.is_some() {
+        return follow_workflow(&r, &run_id, render, Wait::resolve(true, for_.as_deref())?);
     }
 
     let mut wf = cv_core::workflow_of(&r, &run_id).with_context(|| {
@@ -61,34 +105,48 @@ pub(crate) fn cmd_workflow(
         )
     })?;
     wf.attach_journal(&r.path);
-    emit_workflow(&wf, json, script, results, revive, revive_all, Some(r.path.as_path()))
+    emit_workflow(&wf, render, Some(r.path.as_path()))
+}
+
+/// A flag that acts on one run, given where there is no single run to act on: a usage error, not a
+/// silently different command.
+fn refuse_run_flags(flags: &[&str], listing: &str) -> Result<()> {
+    match flags {
+        [] => Ok(()),
+        _ => crate::util::usage(format!(
+            "{} act on one run, but this prints {listing}; name the run: `cv workflow <session> <run_id> …`",
+            flags.join(", ")
+        )),
+    }
+}
+
+/// Recorded states share glyphs; callers choose the marker for an unrecorded state.
+fn state_glyph(state: Option<&str>, fallback: &'static str) -> &'static str {
+    match state {
+        Some("done") => "✓",
+        Some("error") => "✗",
+        Some("progress") => "…",
+        Some("start") => "▸",
+        _ => fallback,
+    }
 }
 
 /// `--follow`: poll the run's state file (the harness flushes it as agents progress) and stream
 /// agent state TRANSITIONS as feed lines — `12:03:41  ✓ verify:merkle → done (312,004 tok)` —
-/// then, when the run reaches a terminal status, emit the full render (honoring
+/// then, when the run reaches a terminal status or `--for` elapses, emit the full render (honoring
 /// `--json`/`--script`/`--results`). Waits for the state file if the run hasn't registered yet.
-fn follow_workflow(r: &cv_core::SessionRef, key: &str, json: bool, script: bool, results: bool) -> Result<()> {
+fn follow_workflow(r: &cv_core::SessionRef, key: &str, render: Render, wait: Wait) -> Result<()> {
     use std::collections::HashMap;
     let mut seen: HashMap<u64, String> = HashMap::new(); // agent index → last printed state
-    let mut announced = false;
+    wait.announce("workflow", &format!("run {key:?}"));
     loop {
         let Some(wf) = cv_core::workflow_of(r, key) else {
-            if !announced {
-                eprintln!("… waiting for run {key:?} to register (Ctrl-C to stop)");
-                announced = true;
+            if !wait.pause(std::time::Duration::from_secs(2)) {
+                eprintln!("cv workflow: run {key:?} never registered");
+                return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
             continue;
         };
-        if !announced {
-            eprintln!(
-                "✦ following {} ({}) — Ctrl-C to stop",
-                wf.name.as_deref().unwrap_or("(unnamed)"),
-                wf.run_id,
-            );
-            announced = true;
-        }
         let now = crate::util::fmt_local(chrono::Utc::now(), "%H:%M:%S");
         for a in wf.phases.iter().flat_map(|p| &p.agents).chain(&wf.orphan_agents) {
             let state = a.state.clone().unwrap_or_default();
@@ -96,12 +154,7 @@ fn follow_workflow(r: &cv_core::SessionRef, key: &str, json: bool, script: bool,
                 continue;
             }
             seen.insert(a.index, state.clone());
-            let glyph = match state.as_str() {
-                "done" => "✓",
-                "error" => "✗",
-                "progress" => "…",
-                _ => "▸",
-            };
+            let glyph = state_glyph(Some(&state), "▸");
             let tok = a.tokens.map(|t| format!(" ({} tok)", fmt_int(t))).unwrap_or_default();
             println!(
                 "{now}  {glyph} {} → {state}{tok}",
@@ -109,27 +162,36 @@ fn follow_workflow(r: &cv_core::SessionRef, key: &str, json: bool, script: bool,
             );
         }
         let live = matches!(wf.status.as_deref(), None | Some("running") | Some("started"));
-        if !live {
-            println!("\n── run reached {} ──\n", wf.status.as_deref().unwrap_or("?"));
-            let mut wf = wf;
-            wf.attach_journal(&r.path);
-            return emit_workflow(&wf, json, script, results, false, false, Some(r.path.as_path()));
+        if live && wait.pause(std::time::Duration::from_secs(2)) {
+            continue;
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        let status = wf.status.as_deref().unwrap_or("?");
+        if live {
+            println!("\n── --for elapsed, run still {status} ──\n");
+        } else {
+            println!("\n── run reached {status} ──\n");
+        }
+        let mut wf = wf;
+        wf.attach_journal(&r.path);
+        let render = Render {
+            revive: false,
+            revive_all: false,
+            ..render
+        };
+        return emit_workflow(&wf, render, Some(r.path.as_path()));
     }
 }
 
 /// Shared single-run output: `--json` gets the full structure (journal results included);
 /// otherwise the rendered view, with `--results` appending each agent's full journaled return.
-fn emit_workflow(
-    wf: &cv_core::Workflow,
-    json: bool,
-    script: bool,
-    results: bool,
-    revive: bool,
-    revive_all: bool,
-    session_path: Option<&std::path::Path>,
-) -> Result<()> {
+fn emit_workflow(wf: &cv_core::Workflow, render: Render, session_path: Option<&std::path::Path>) -> Result<()> {
+    let Render {
+        json,
+        script,
+        results,
+        revive,
+        revive_all,
+    } = render;
     if revive {
         return render_revive(wf, revive_all, session_path);
     }
@@ -184,11 +246,8 @@ fn render_journal_results(w: &cv_core::Workflow) {
 fn workflow_by_name_fleetwide(
     name: &str,
     want: Option<cv_core::ir::Harness>,
-    json: bool,
-    script: bool,
-    results: bool,
-    revive: bool,
-    revive_all: bool,
+    render: Render,
+    run_flags: &[&str],
 ) -> Result<()> {
     let hits = cv_core::find_workflows_by_name(name);
     if hits.is_empty() {
@@ -197,12 +256,15 @@ fn workflow_by_name_fleetwide(
             // Very last reading: a session id living in the discovery probe's blind spots (what
             // the full `find` covers and `find_cheap` deliberately skipped).
             match cv_core::find(name, want) {
-                Ok(Some((r, _adapter))) => return list_workflows(&r, json),
+                Ok(Some((r, _adapter))) => {
+                    refuse_run_flags(run_flags, "a session's run list")?;
+                    return list_workflows(&r, render.json);
+                }
                 Ok(None) => {}
                 Err(e) => return crate::util::resolve_found(Err(e), name, want).map(|_| ()),
             }
-        }
-        if !ghosts.is_empty() {
+        } else {
+            refuse_run_flags(run_flags, "ghost launches")?;
             println!(
                 "no recorded run named {name:?} — but {} GHOST launch(es) match (state never persisted; crash/kill before write?):\n",
                 ghosts.len()
@@ -221,18 +283,27 @@ fn workflow_by_name_fleetwide(
         bail!("no session and no workflow name matching {name:?} (try `cv ls -q 'workflow:{name}'`)");
     }
     if hits.len() == 1 {
+        // One run: `--follow`/`--for` need the session-and-run form that can poll its state file.
+        if run_flags.iter().any(|f| matches!(*f, "--follow" | "--for")) {
+            return crate::util::usage(format!(
+                "--follow/--for need the run named by session: `cv workflow {} {} --follow`",
+                short_id(&hits[0].0.id),
+                hits[0].1.run_id
+            ));
+        }
         let (r, wf) = &hits[0];
         let mut wf = wf.clone();
         wf.attach_journal(&r.path);
-        if !json {
+        if !render.json {
             println!(
                 "(in session {} — {})\n",
                 short_id(&r.id),
                 r.title.as_deref().unwrap_or("untitled")
             );
         }
-        return emit_workflow(&wf, json, script, results, revive, revive_all, Some(r.path.as_path()));
+        return emit_workflow(&wf, render, Some(r.path.as_path()));
     }
+    refuse_run_flags(run_flags, "the runs matching a name")?;
     println!("# {} workflow run(s) matching {name:?}:\n", hits.len());
     for (r, w) in &hits {
         println!(
@@ -358,8 +429,10 @@ fn render_workflow(w: &cv_core::Workflow, show_script: bool) -> Result<()> {
         println!("task: {t}");
     }
     if let Some(a) = &w.args {
-        let (head, _) = cv_core::JsonView::from(a).canonical_prefix(4 * 201)?;
-        println!("args: {}", truncate(&head, 200));
+        println!(
+            "args: {}",
+            cv_core::projection::Head::of_json(cv_core::JsonView::from(a), 200)?
+        );
     }
     if let Some(rf) = &w.resume_from {
         println!("resumed from: {rf}");
@@ -455,13 +528,7 @@ fn workflow_result_preview(value: &serde_json::Value) -> Result<(String, bool)> 
 /// One agent line inside a workflow's phase tree: state glyph, label, id, telemetry, and the head
 /// of its result.
 fn render_workflow_agent(a: &cv_core::WorkflowAgent) {
-    let glyph = match a.state.as_deref() {
-        Some("done") => "✓",
-        Some("error") => "✗",
-        Some("progress") => "…",
-        Some("start") => "▸",
-        _ => "•",
-    };
+    let glyph = state_glyph(a.state.as_deref(), "•");
     let id = a.agent_id.as_deref().map(short_id).unwrap_or_else(|| "—".into());
     let label = a.label.as_deref().unwrap_or("(agent)");
     let mut tele = Vec::new();
@@ -529,6 +596,8 @@ struct Revivable {
     commands: Vec<String>,
     /// The lane's last substantive note to itself, which usually says where it had got to.
     last_note: Option<String>,
+    /// Why mining stopped before the transcript's end: the log above it may be partial.
+    unread: Option<String>,
 }
 
 /// `--revive`: turn a dead or interrupted workflow run into per-lane resume prompts.
@@ -596,6 +665,7 @@ fn mine_lane(a: &cv_core::WorkflowAgent, run_id: &str, session_path: Option<&std
         files: Vec::new(),
         commands: Vec::new(),
         last_note: None,
+        unread: None,
     };
 
     let (Some(id), Some(sp)) = (a.agent_id.as_deref(), session_path) else {
@@ -606,98 +676,25 @@ fn mine_lane(a: &cv_core::WorkflowAgent, run_id: &str, session_path: Option<&std
     };
     let bare = id.strip_prefix("agent-").unwrap_or(id);
     let path = dir.join(format!("agent-{bare}.jsonl"));
-    let Ok(file) = std::fs::File::open(&path) else {
-        return rev;
-    };
-    mine_transcript_reader(std::io::BufReader::new(file), &mut rev);
+    apply(cv_core::LaneWork::mine(&path), &mut rev);
     rev
 }
 
-/// The transcript-mining half of [`mine_lane`], split from path resolution so it can be tested
-/// on JSONL text alone: the FULL first user prompt, the files the lane wrote or edited, its distinct
-/// Bash commands (first line, capped), and its last substantive note.
-#[cfg(test)]
-fn mine_transcript(text: &str, rev: &mut Revivable) {
-    mine_transcript_reader(std::io::Cursor::new(text.as_bytes()), rev);
+/// The transcript-mining half of [`mine_lane`]: what the lane's transcript shows it did. A
+/// mined prompt replaces the preview; with none, the preview stands.
+fn apply(work: cv_core::LaneWork, rev: &mut Revivable) {
+    if work.prompt.is_some() {
+        rev.prompt = work.prompt;
+    }
+    rev.files = work.files;
+    rev.commands = work.commands;
+    rev.last_note = work.last_note;
+    rev.unread = work.unread;
 }
 
-fn mine_transcript_reader(reader: impl std::io::BufRead, rev: &mut Revivable) {
-    let mut seen_files = std::collections::BTreeSet::new();
-    let mut seen_cmds = std::collections::BTreeSet::new();
-    let mut got_prompt = false;
-
-    // Retain one physical record rather than the whole transcript alongside its parsed record.
-    // Corrupt records are omitted; a read failure ends this best-effort recovery scan.
-    for line in std::io::BufRead::lines(reader) {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
-            Err(_) => break,
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let role = v.pointer("/message/role").and_then(|r| r.as_str()).unwrap_or("");
-        let content = match v.pointer("/message/content") {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // The lane's task is the first user message — the FULL text the orchestrator handed it.
-        if role == "user" && !got_prompt {
-            let full = match content {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Array(bs) => bs
-                    .iter()
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .next()
-                    .map(str::to_string),
-                _ => None,
-            };
-            if let Some(f) = full.filter(|f| !f.trim().is_empty()) {
-                rev.prompt = Some(f);
-                got_prompt = true;
-            }
-        }
-
-        let serde_json::Value::Array(blocks) = content else {
-            continue;
-        };
-        for b in blocks {
-            match b.get("type").and_then(|t| t.as_str()) {
-                Some("tool_use") => {
-                    let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let input = b.get("input");
-                    match name {
-                        "Write" | "Edit" | "NotebookEdit" => {
-                            if let Some(f) = input.and_then(|i| i.get("file_path")).and_then(|f| f.as_str()) {
-                                if seen_files.insert(f.to_string()) {
-                                    rev.files.push(f.to_string());
-                                }
-                            }
-                        }
-                        "Bash" => {
-                            if let Some(c) = input.and_then(|i| i.get("command")).and_then(|c| c.as_str()) {
-                                let head: String = c.split('\n').next().unwrap_or(c).chars().take(70).collect();
-                                if seen_cmds.insert(head.clone()) {
-                                    rev.commands.push(head);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Some("text") if role == "assistant" => {
-                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                        if t.trim().len() > 80 {
-                            rev.last_note = Some(t.to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+#[cfg(test)]
+fn mine_transcript(text: &str, rev: &mut Revivable) {
+    apply(cv_core::LaneWork::mine_bytes(text.as_bytes()), rev);
 }
 
 fn print_revive_block(rev: &Revivable) {
@@ -716,6 +713,12 @@ fn print_revive_block(rev: &Revivable) {
     println!();
     if let Some(e) = &rev.error {
         println!("died: {}", truncate(e, 200));
+    }
+    if let Some(why) = &rev.unread {
+        println!(
+            "transcript read stopped early (the work log may be partial): {}",
+            truncate(why, 200)
+        );
     }
     if rev.prompt.is_none() {
         println!("\n(no prompt recoverable — neither transcript nor preview; re-issue by hand)");
@@ -777,8 +780,8 @@ mod tests {
                 let truncated = old.len() > 2000;
                 let expected = if truncated { truncate(&old, 2000) } else { old };
                 assert_eq!(workflow_result_preview(&value).unwrap(), (expected, truncated));
-                let (args, _) = cv_core::JsonView::from(&value).canonical_prefix(4 * 201).unwrap();
-                assert_eq!(truncate(&args, 200), truncate(&value.to_string(), 200));
+                let args = cv_core::projection::Head::of_json(cv_core::JsonView::from(&value), 200).unwrap();
+                assert_eq!(args, truncate(&value.to_string(), 200));
             }
         }
     }
@@ -805,11 +808,9 @@ mod tests {
             files: vec![],
             commands: vec![],
             last_note: None,
+            unread: None,
         };
-        mine_transcript_reader(
-            std::io::BufReader::with_capacity(17, std::io::Cursor::new(input)),
-            &mut rev,
-        );
+        apply(cv_core::LaneWork::mine_bytes(&input), &mut rev);
         assert_eq!(rev.prompt.as_deref(), Some("full task"));
         assert_eq!(rev.files, vec!["recovered.rs"]);
     }
@@ -836,6 +837,7 @@ mod tests {
             files: vec![],
             commands: vec![],
             last_note: None,
+            unread: None,
         };
         mine_transcript(&lines, &mut rev);
         assert_eq!(

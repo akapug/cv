@@ -1,8 +1,8 @@
 //! The one decoder of a Zed thread document, over a view of the (decompressed) `data` cell.
 //! Messages are sniffed per message, not per thread, so a hand-migrated or mixed blob still
-//! parses. The [`Demand`] decides what is resolved, never which code runs.
+//! parses. The span demand decides what is resolved, never which codec runs.
 use super::*;
-use crate::harness::store::document::{text_head, Fields};
+use crate::harness::store::document::{text_is_blank, Fields};
 use crate::json::{JsonSource, JsonView};
 use crate::lazy::{Resolver, Text};
 
@@ -23,14 +23,8 @@ const METADATA: &[&str] = &[
     "imported",
 ];
 
-/// What a read resolves. `spans` holds long text and tool arguments in the cell (the codec's
-/// `lazy_text`/`argument` rules). `count` resolves only what decides whether a turn is emitted:
-/// no tool results, extras or media references (discovery's `message_count`).
-#[derive(Clone, Copy)]
-pub(super) struct Demand {
-    pub spans: bool,
-    pub count: bool,
-}
+#[cfg(test)]
+thread_local! { pub(super) static DECODED_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 /// The thread's metadata (owned; small) and its `messages` member, as a view.
 pub(super) fn header(view: JsonView<'_>) -> Result<(Value, Option<JsonView<'_>>)> {
@@ -42,12 +36,12 @@ pub(super) fn header(view: JsonView<'_>) -> Result<(Value, Option<JsonView<'_>>)
     Ok((Value::Object(fields.project(METADATA)?), fields.get("messages")))
 }
 
-/// Convert every thread message to IR and feed it to `f`, stopping on [`Flow::Stop`]. Discovery
-/// counts what this emits, so the `message_count` contract holds by construction.
+/// Convert thread messages to IR, stopping on [`Flow::Stop`]. Spans retain long text and
+/// tool arguments in the cell; complete reads supply counts independently of discovery.
 pub(super) fn messages(
     view: JsonView<'_>,
     source: &JsonSource,
-    demand: Demand,
+    spans: bool,
     f: &mut dyn FnMut(Message) -> Flow,
 ) -> Result<()> {
     let Some(messages) = view.array()? else {
@@ -56,6 +50,8 @@ pub(super) fn messages(
     // Tool-call ids → names, so legacy tool_results (which carry no name) get labeled.
     let mut names = HashMap::new();
     for message in messages {
+        #[cfg(test)]
+        DECODED_MESSAGES.with(|n| n.set(n.get() + 1));
         let Some(fields) = Fields::parse(
             message?,
             &[
@@ -76,8 +72,8 @@ pub(super) fn messages(
         else {
             continue;
         };
-        if legacy(&fields, source, demand, &mut names, f)? == Flow::Stop
-            || modern(&fields, source, demand, f)? == Flow::Stop
+        if legacy(&fields, source, spans, &mut names, f)? == Flow::Stop
+            || modern(&fields, source, spans, f)? == Flow::Stop
         {
             break;
         }
@@ -85,15 +81,29 @@ pub(super) fn messages(
     Ok(())
 }
 
-fn text(fields: &Fields<'_>, key: &str, demand: Demand) -> Result<Option<Text>> {
+fn text(fields: &Fields<'_>, key: &str, spans: bool) -> Result<Option<Text>> {
     fields
         .get(key)
-        .map(|v| v.lazy_text(demand.spans))
+        .map(|v| v.lazy_text(spans))
         .transpose()
         .map(Option::flatten)
 }
-fn nonempty(text: Option<Text>) -> Option<Text> {
-    text.filter(|text| !text.is_empty())
+/// One emptiness rule per type: `Text`'s inherent `is_empty` (span-safe `len`), `String`'s own.
+trait NonEmpty {
+    fn is_nonempty(&self) -> bool;
+}
+impl NonEmpty for Text {
+    fn is_nonempty(&self) -> bool {
+        !self.is_empty()
+    }
+}
+impl NonEmpty for String {
+    fn is_nonempty(&self) -> bool {
+        !self.is_empty()
+    }
+}
+fn nonempty<T: NonEmpty>(text: Option<T>) -> Option<T> {
+    text.filter(|text| text.is_nonempty())
 }
 fn nonnull(fields: &Fields<'_>, key: &str) -> Result<Option<Value>> {
     let Some(value) = fields.get(key) else { return Ok(None) };
@@ -109,7 +119,7 @@ fn remember(block: &Block, names: &mut HashMap<String, String>) {
         }
     }
 }
-fn tool_use(view: JsonView<'_>, demand: Demand) -> Result<Block> {
+fn tool_use(view: JsonView<'_>, spans: bool) -> Result<Block> {
     let fields = Fields::parse(view, &["id", "name", "input"])?;
     let string = |key| -> Result<String> {
         Ok(fields
@@ -125,7 +135,7 @@ fn tool_use(view: JsonView<'_>, demand: Demand) -> Result<Block> {
         input: fields
             .as_ref()
             .and_then(|v| v.get("input"))
-            .map(|v| v.argument(demand.spans))
+            .map(|v| v.argument(spans))
             .transpose()?
             .unwrap_or_default(),
         namespace: None,
@@ -138,7 +148,7 @@ fn tool_use(view: JsonView<'_>, demand: Demand) -> Result<Block> {
 fn legacy(
     fields: &Fields<'_>,
     source: &JsonSource,
-    demand: Demand,
+    spans: bool,
     names: &mut HashMap<String, String>,
     f: &mut dyn FnMut(Message) -> Flow,
 ) -> Result<Flow> {
@@ -168,18 +178,18 @@ fn legacy(
             let block = anthropic::block_from_view_with(
                 segment?,
                 &anthropic::ZED,
-                demand.spans,
-                &mut |v| v.lazy_text(demand.spans),
+                spans,
+                &mut |v| v.lazy_text(spans),
                 u64::MAX,
             )?;
             msg.content.extend(block);
         }
-    } else if let Some(text) = nonempty(text(fields, "text", demand)?) {
+    } else if let Some(text) = nonempty(text(fields, "text", spans)?) {
         msg.content.push(Block::Text { text });
     }
     if let Some(uses) = fields.get("tool_uses").map(|v| v.array()).transpose()?.flatten() {
         for value in uses {
-            let block = tool_use(value?, demand)?;
+            let block = tool_use(value?, spans)?;
             remember(&block, names);
             msg.content.push(block);
         }
@@ -187,10 +197,10 @@ fn legacy(
     // `context` is the rendered attached-files preamble. When it's the *only* content (an
     // attachment-only user turn) it is the text (mirroring Zed's own 0.2.0→0.3.0 upgrade);
     // otherwise the turn stays a prompt and the preamble is noted in `extra["zed"]`.
-    if let Some(context) = nonempty(text(fields, "context", demand)?) {
+    if let Some(context) = nonempty(text(fields, "context", spans)?) {
         if msg.content.is_empty() {
             msg.content.push(Block::Text { text: context });
-        } else if !demand.count {
+        } else {
             msg.harness_extra_mut(Harness::Zed).insert(
                 "context".into(),
                 Value::String(context.try_resolve(&Resolver::new(None))?.into_owned()),
@@ -206,7 +216,7 @@ fn legacy(
             msg.origin = Origin::Harness;
         }
     }
-    if let Some(value) = fields.get("creases").filter(|_| !demand.count) {
+    if let Some(value) = fields.get("creases") {
         if let Some(mut array) = value.array()? {
             if array.next().transpose()?.is_some() {
                 msg.harness_extra_mut(Harness::Zed)
@@ -218,15 +228,9 @@ fn legacy(
         return Ok(Flow::Stop);
     }
     let mut blocks = Vec::new();
-    if let Some(results) = fields
-        .get("tool_results")
-        .filter(|_| !demand.count)
-        .map(|v| v.array())
-        .transpose()?
-        .flatten()
-    {
+    if let Some(results) = fields.get("tool_results").map(|v| v.array()).transpose()?.flatten() {
         for result in results {
-            if let Some(block) = tool_result(result?, source, demand, names)? {
+            if let Some(block) = tool_result(result?, source, spans, names)? {
                 blocks.push(block);
             }
         }
@@ -248,7 +252,7 @@ fn emit_tools(blocks: Vec<Block>, f: &mut dyn FnMut(Message) -> Flow) -> Flow {
 fn tool_result(
     view: JsonView<'_>,
     source: &JsonSource,
-    demand: Demand,
+    spans: bool,
     names: &HashMap<String, String>,
 ) -> Result<Option<Block>> {
     let Some(fields) = Fields::parse(view, &["tool_use_id", "tool_name", "content", "is_error", "output"])? else {
@@ -260,7 +264,7 @@ fn tool_result(
     Ok(Some(Block::ToolResult {
         tool_name: fields.string("tool_name")?.or_else(|| names.get(&id).cloned()),
         tool_use_id: id,
-        content: result_content(fields.get("content"), source, demand)?,
+        content: result_content(fields.get("content"), source, spans)?,
         is_error: fields
             .get("is_error")
             .map(|v| v.as_bool())
@@ -275,9 +279,9 @@ fn tool_result(
 /// `LanguageModelToolResultContent`: a plain string, `{"Text": "…"}` (case-tolerant), or
 /// `{"Image": {…}}` (flattened to a marker; the IR doesn't inline image bytes). Anything else is
 /// its compact JSON, generated into the cell's arena when spans are demanded.
-fn result_content(view: Option<JsonView<'_>>, source: &JsonSource, demand: Demand) -> Result<Text> {
+fn result_content(view: Option<JsonView<'_>>, source: &JsonSource, spans: bool) -> Result<Text> {
     let Some(view) = view else { return Ok(Text::default()) };
-    if let Some(text) = view.lazy_text(demand.spans)? {
+    if let Some(text) = view.lazy_text(spans)? {
         return Ok(text);
     }
     if let Some(fields) = Fields::parse(view, &["Text", "text", "Image", "image"])? {
@@ -285,7 +289,7 @@ fn result_content(view: Option<JsonView<'_>>, source: &JsonSource, demand: Deman
         if let Some(text) = fields
             .get("Text")
             .or_else(|| fields.get("text"))
-            .map(|v| v.lazy_text(demand.spans))
+            .map(|v| v.lazy_text(spans))
             .transpose()?
             .flatten()
         {
@@ -298,7 +302,7 @@ fn result_content(view: Option<JsonView<'_>>, source: &JsonSource, demand: Deman
     if view.is_null()? {
         return Ok(Text::default());
     }
-    if !demand.spans {
+    if !spans {
         return Ok(Text::Inline(view.resolve()?.to_string()));
     }
     crate::harness::store::text::append(source, &source.decoded_backing()?, |writer| writer.push_json(view))
@@ -307,19 +311,14 @@ fn result_content(view: Option<JsonView<'_>>, source: &JsonSource, demand: Deman
 /// Modern (agent2 / 0.3.0) message: the externally tagged `Message` enum. `"Resume"` markers
 /// and unknown variants carry no transcript content; `Compaction` summaries become a
 /// `CompactionSummary` turn. Non-modern shapes are ignored.
-fn modern(
-    fields: &Fields<'_>,
-    source: &JsonSource,
-    demand: Demand,
-    f: &mut dyn FnMut(Message) -> Flow,
-) -> Result<Flow> {
+fn modern(fields: &Fields<'_>, source: &JsonSource, spans: bool, f: &mut dyn FnMut(Message) -> Flow) -> Result<Flow> {
     if let Some(user) = fields.get("User") {
         let mut msg = Message::new(Role::User);
         if let Some(user) = Fields::parse(user, &["id", "content"])? {
             msg.id = user.string("id")?;
             if let Some(content) = user.get("content").map(|v| v.array()).transpose()?.flatten() {
                 for item in content {
-                    msg.content.extend(user_block(item?, demand)?);
+                    msg.content.extend(user_block(item?, spans)?);
                 }
             }
         }
@@ -333,18 +332,14 @@ fn modern(
         };
         if let Some(content) = agent.get("content").map(|v| v.array()).transpose()?.flatten() {
             for item in content {
-                if let Some(block) = agent_block(item?, demand)? {
+                if let Some(block) = agent_block(item?, spans)? {
                     remember(&block, &mut names);
                     msg.content.push(block);
                 }
             }
         }
-        // Reasoning details alone make an emitted turn; counting needs only their presence.
-        let reasoning = match agent.get("reasoning_details") {
-            Some(value) if demand.count => (!value.is_null()?).then_some(Value::Null),
-            _ => nonnull(&agent, "reasoning_details")?,
-        };
-        if let Some(value) = reasoning {
+        // Reasoning details alone make an emitted turn.
+        if let Some(value) = nonnull(&agent, "reasoning_details")? {
             msg.harness_extra_mut(Harness::Zed)
                 .insert("reasoning_details".into(), value);
         }
@@ -353,19 +348,19 @@ fn modern(
         }
         // tool_results is an id-keyed map ({"<tool_use_id>": {…}}), ordered by insertion.
         let mut blocks = Vec::new();
-        if let Some(results) = agent.get("tool_results").filter(|_| !demand.count) {
+        if let Some(results) = agent.get("tool_results") {
             results.for_each_entry(|_, result| {
-                blocks.extend(tool_result(result, source, demand, &names)?);
+                blocks.extend(tool_result(result, source, spans, &names)?);
                 Ok(())
             })?;
         }
         return Ok(emit_tools(blocks, f));
     }
-    if let Some(compaction) = fields.get("Compaction").filter(|_| !demand.count) {
+    if let Some(compaction) = fields.get("Compaction") {
         // CompactionInfo::Summary(text) — the context-compaction summary that replaced history.
         if let Some(compaction) = Fields::parse(compaction, &["Summary"])? {
-            if let Some(text) = text(&compaction, "Summary", demand)? {
-                if !text_head(&text, &Resolver::new(None), 1, true)?.0.is_empty() {
+            if let Some(text) = text(&compaction, "Summary", spans)? {
+                if !text_is_blank(&text, &Resolver::new(None))? {
                     let mut msg = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
                     msg.content.push(Block::Text { text });
                     return Ok(f(msg));
@@ -376,11 +371,11 @@ fn modern(
     Ok(Flow::Continue)
 }
 
-fn user_block(view: JsonView<'_>, demand: Demand) -> Result<Option<Block>> {
+fn user_block(view: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
     let Some(item) = Fields::parse(view, &["Text", "Mention", "Image"])? else {
         return Ok(None);
     };
-    if let Some(text) = text(&item, "Text", demand)? {
+    if let Some(text) = text(&item, "Text", spans)? {
         return Ok(nonempty(Some(text)).map(|text| Block::Text { text }));
     }
     if let Some(mention) = item.get("Mention") {
@@ -390,12 +385,8 @@ fn user_block(view: JsonView<'_>, demand: Demand) -> Result<Option<Block>> {
             return Ok(None);
         };
         let Some(uri) = mention.get("uri") else { return Ok(None) };
-        let source = if demand.count {
-            None
-        } else {
-            let value = uri.resolve()?;
-            Some(value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string()))
-        };
+        let value = uri.resolve()?;
+        let source = Some(value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string()));
         return Ok(Some(Block::File {
             mime: None,
             path: None,
@@ -405,14 +396,10 @@ fn user_block(view: JsonView<'_>, demand: Demand) -> Result<Option<Block>> {
     if let Some(image) = item.get("Image") {
         // LanguageModelImage: {source: <base64>, size}.
         let fields = Fields::parse(image, &["source"])?;
-        let data_ref = match fields.as_ref().filter(|_| !demand.count) {
-            // 121 characters detect the 120-character truncation boundary; a retained source
-            // payload is never fully decoded merely to produce this reference.
-            Some(fields) => text(fields, "source", demand)?
-                .map(|text| -> Result<_> {
-                    let head = text_head(&text, &Resolver::new(None), 121, false)?.0;
-                    Ok(crate::ir::truncate(&head, 120))
-                })
+        let data_ref = match fields.as_ref() {
+            // A bounded head: a retained source payload is never fully decoded for a reference.
+            Some(fields) => text(fields, "source", spans)?
+                .map(|text| crate::projection::Head::of_text(&text, &Resolver::new(None), 120))
                 .transpose()?,
             None => None,
         };
@@ -424,11 +411,11 @@ fn user_block(view: JsonView<'_>, demand: Demand) -> Result<Option<Block>> {
     Ok(None)
 }
 
-fn agent_block(view: JsonView<'_>, demand: Demand) -> Result<Option<Block>> {
+fn agent_block(view: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
     let Some(item) = Fields::parse(view, &["Text", "Thinking", "RedactedThinking", "ToolUse"])? else {
         return Ok(None);
     };
-    if let Some(text) = text(&item, "Text", demand)? {
+    if let Some(text) = text(&item, "Text", spans)? {
         return Ok(nonempty(Some(text)).map(|text| Block::Text { text }));
     }
     if let Some(thinking) = item.get("Thinking") {
@@ -436,16 +423,11 @@ fn agent_block(view: JsonView<'_>, demand: Demand) -> Result<Option<Block>> {
         return Ok(Some(Block::Thinking {
             text: fields
                 .as_ref()
-                .map(|v| text(v, "text", demand))
+                .map(|v| text(v, "text", spans))
                 .transpose()?
                 .flatten()
                 .unwrap_or_default(),
-            signature: fields
-                .as_ref()
-                .map(|v| v.string("signature"))
-                .transpose()?
-                .flatten()
-                .filter(|s| !s.is_empty()),
+            signature: nonempty(fields.as_ref().map(|v| v.string("signature")).transpose()?.flatten()),
             encrypted: None,
             redacted: false,
         }));
@@ -458,5 +440,5 @@ fn agent_block(view: JsonView<'_>, demand: Demand) -> Result<Option<Block>> {
             redacted: true,
         }));
     }
-    item.get("ToolUse").map(|v| tool_use(v, demand)).transpose()
+    item.get("ToolUse").map(|v| tool_use(v, spans)).transpose()
 }

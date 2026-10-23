@@ -1,7 +1,7 @@
 //! `cv` — the clustervision CLI.
 //!
 //! This file holds only the clap surface (`Cli`/`Cmd`), the command groups, and the dispatch into
-//! the per-command modules under `cmd/`; shared helpers live in `util.rs` and `cv blame` in `blame.rs`.
+//! the per-command modules under `cmd/`; shared helpers live in `util.rs`.
 //!
 //! Interface v2 (0.11.0, `docs/INTERFACE-V2.md`): one verb per act, the same flag means the same
 //! thing everywhere, snake_case JSON, no hidden commands. A name removed in the current release is
@@ -12,7 +12,6 @@
 #[global_allocator]
 static ALLOCATOR: cv_testkit::heap::Allocator = cv_testkit::heap::Allocator;
 
-mod blame;
 mod cmd;
 mod http;
 mod llm;
@@ -20,57 +19,39 @@ mod util;
 
 /// A hermetic world whose environment this thread's library calls read (see `cv_core::env`).
 #[cfg(test)]
-fn test_world(tag: &str) -> cv_testkit::InProcess<cv_core::env::Scope> {
+fn test_world(tag: &str) -> cv_testkit::InProcess<cv_core::env::Isolated> {
     cv_testkit::World::in_process(tag, cv_core::env::Env::enter_isolated)
 }
-
-// Crate-root re-exports for `blame.rs`, which renders conversation windows via the same
-// streaming renderer `cv show` uses.
-pub(crate) use cmd::view::{show_header, show_message, stream_session_render, RenderOpts};
-pub(crate) use util::short_id;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use cmd::hooks::{HookName, HooksCmd};
 use cmd::task::TaskCmd;
 use cmd::{
-    archive, browse, cat, compose, config, doctor, events, formats, hooks, live, orchestrate, pack, port, recipes,
-    schema, search, serve, share, task, tools, view, workflow,
+    archive, blame, browse, cat, config, doctor, events, formats, hooks, live, pack, port, recipes, reshape, schema,
+    search, serve, session_reports, share, task, tools, view, workflow,
 };
 use std::path::PathBuf;
 use util::{usage, UsageError, WindowArgs};
 
-/// Resolve the caller-supplied `--declassify` term list from a CSV flag and/or a file (one term per
-/// line, `#` comments + blanks ignored). Terms are lowercased + de-duplicated. cv ships NO built-in
-/// list — the terms are always external (config/data), so cv's own source carries no domain shitlist.
-fn resolve_declassify_tokens(csv: Option<String>, file: Option<PathBuf>) -> Result<Vec<String>> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    let mut push = |t: &str| {
-        let t = t.trim().to_ascii_lowercase();
-        if !t.is_empty() && seen.insert(t.clone()) {
-            out.push(t);
-        }
-    };
-    if let Some(csv) = csv {
-        for t in csv.split(',') {
-            push(t);
-        }
-    }
-    if let Some(path) = file {
-        let body = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading --declassify-tokens-file {}", path.display()))?;
-        for line in body.lines() {
-            let line = line.split('#').next().unwrap_or("");
-            push(line);
-        }
-    }
-    Ok(out)
-}
-
 /// Version with the embedded build commit (set by build.rs; "unknown" outside git), so the
 /// binary in your PATH is checkable against source.
 const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CV_BUILD_SHA"), ")");
+
+/// The clap tree is well-formed (debug asserts: conflicting ids, bad defaults, …).
+/// Building the clap tree is deep: `Cli::command()` for every command with its args is a
+/// large stack frame in a debug build, and the default 2 MB test-thread stack overflows on
+/// it (the binary's main thread has 8 MB and is fine). Run the tree-building tests on a
+/// thread sized like main.
+#[cfg(test)]
+pub(crate) fn on_main_sized_stack(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("test thread panicked");
+}
 
 /// The command groups `cv --help` prints and `cv schema --commands` reports. clap renders
 /// subcommands as one flat list (its `next_help_heading` tags *arguments*), so the grouping lives
@@ -114,6 +95,19 @@ pub(crate) fn group_of(name: &str) -> Option<&'static str> {
     GROUPS.iter().find(|(_, cmds)| cmds.contains(&name)).map(|(g, _)| *g)
 }
 
+/// `--skills` values. `--skills-policy` and `drop-all` are the fork's earlier spellings, still
+/// accepted so callers written against them keep working; each parses to its canonical name.
+fn skills_values() -> impl clap::builder::TypedValueParser<Value = String> {
+    use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
+    const VALUES: [(&str, Option<&str>); 3] = [("keep", None), ("drop", Some("drop-all")), ("drop-stale", None)];
+    PossibleValuesParser::new(VALUES.map(|(name, old)| PossibleValue::new(name).aliases(old))).map(|given: String| {
+        VALUES
+            .iter()
+            .find(|(_, old)| *old == Some(given.as_str()))
+            .map_or(given.clone(), |(name, _)| name.to_string())
+    })
+}
+
 const RECIPES_FOOTER: &str = "run `cv recipes` for the agent quickstart";
 
 /// The grouped command listing that replaces clap's flat `Commands:` block — every visible
@@ -149,13 +143,19 @@ fn grouped_help(cmd: &clap::Command) -> String {
     help_template = "{before-help}{about-with-newline}\n{usage-heading} {usage}\n\nOptions:\n{options}\n{after-help}"
 )]
 struct Cli {
+    /// Leave cv's stores untouched (also CV_FROZEN=1). Normally full reads record counts and
+    /// affordances, and events refreshes stale sessions for later reads. Frozen reads record
+    /// nothing: events streams stale sessions, ls keeps unknown counts as a dash, and scan/usage
+    /// caches and skipped sources are not saved. Commands that write stores or sessions exit 2.
+    #[arg(long, global = true)]
+    frozen: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    // ───────────────────────────── Read ─────────────────────────────
     /// List discovered sessions across all harnesses.
     Ls {
         /// Only this harness (claude, codex, grok, opencode, gemini, cursor, kimi, kimi-code,
@@ -193,7 +193,8 @@ enum Cmd {
         /// (--json only) Enrich each row with transcript-derived `git` (branch/commit/remote, as
         /// `cv show --json` emits it) and `display_title` (the title with a first-real-user-text
         /// fallback). Costs one lazy transcript parse per emitted row — O(--limit), not the whole
-        /// fleet — so plain `ls --json` stays catalog-cheap; opt in when you need these fields.
+        /// fleet — so plain `ls --json` stays catalog-cheap; opt in when you need these fields. A
+        /// row whose transcript cannot be read carries `enrich_error` instead.
         #[arg(long)]
         enrich: bool,
     },
@@ -262,16 +263,35 @@ enum Cmd {
         query: String,
         #[arg(long)]
         harness: Option<String>,
+        /// Hits to show. Every match is still counted: the footer says `N of M matches`.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Use semantic (embedding) search instead of full-text. Requires `cv index --semantic`
         /// to have been run; downloads a small embedding model on first use.
         #[arg(long)]
         semantic: bool,
-        /// Emit the hits as one JSON array instead of the table — the same hits in the same
-        /// order (--harness/--limit/--semantic respected): a session row (`id, harness, path, cwd,
-        /// title, created_at, updated_at, message_count, size_bytes`) plus `score`, `snippet`, and
-        /// the sub-agent provenance `agent_id`/`parent_id`/`workflow`. Nothing else goes to stdout.
+        /// Scan the transcripts live instead of reading the index: slow, matches only each
+        /// session's head, and is never taken unasked. Without it a missing or unusable index is an
+        /// error that names its cause.
+        #[arg(long, conflicts_with = "semantic")]
+        scan: bool,
+        /// Which text to match: `exchange` (default: what the person asked, what the model
+        /// replied and ran, what came back), `context` (what surrounds it: injected instruction
+        /// files, system prompts, skill bodies, hook output, notices, compaction summaries), or
+        /// `all`. Context repeats across sessions, so it is matched only when asked for.
+        #[arg(long, value_name = "exchange|context|all", conflicts_with_all = ["semantic", "scan"])]
+        kind: Option<String>,
+        /// The index answers plus a live read of the sessions it has not seen as they are now
+        /// (grown, rewritten, new since `cv index`), from where the index stopped: all of them by
+        /// default; with this, at most BYTES of source, newest sessions first, and the footer
+        /// names what the budget left out. 0 (or global --frozen) answers from the index alone.
+        #[arg(long, value_name = "BYTES", conflicts_with_all = ["semantic", "scan"])]
+        live_bytes: Option<u64>,
+        /// Emit `{"hits": [...], "total": M}` instead of the table — the same hits in the same
+        /// order (--harness/--limit/--semantic respected), each a session row (`id, harness, path,
+        /// cwd, title, created_at, updated_at, message_count, size_bytes`) plus `score`, `snippet`,
+        /// and the sub-agent provenance `agent_id`/`parent_id`/`workflow`; `total` counts every
+        /// session that matched. Nothing else goes to stdout.
         #[arg(long)]
         json: bool,
     },
@@ -279,6 +299,9 @@ enum Cmd {
     ///
     /// Events are ingested during `cv index`; a session that isn't cataloged yet (or whose file
     /// changed since) is ingested on the spot — one streamed pass, large content stays on disk.
+    /// This read command writes derived events and counts to cv's catalog; it never changes
+    /// harness transcripts. Use global --frozen (or CV_FROZEN=1) to stream stale events without
+    /// publishing them or updating other cv stores; see --frozen in the global options.
     Events {
         id: String,
         #[arg(long)]
@@ -291,9 +314,14 @@ enum Cmd {
         /// is visible, not just the orchestrator's own tool calls.
         #[arg(long)]
         subagents: bool,
-        /// Emit the events as one JSON array (snake_case keys) instead of the table.
+        /// Emit the events as one JSON array (snake_case keys) instead of the table. Every
+        /// target and detail is whole: the full command, the full error text.
         #[arg(long)]
         json: bool,
+        /// Print each table cell whole (newlines as spaces). Without it the target column is
+        /// shortened to 90 characters and the detail line to 100, a cut marked with `…`.
+        #[arg(long, conflicts_with = "json")]
+        wide: bool,
     },
     /// Sessions that touched a file — every session with a file_edit/file_read event on its path.
     ///
@@ -314,17 +342,20 @@ enum Cmd {
         id: String,
         #[arg(long)]
         harness: Option<String>,
-        /// One agent's histogram ("which tools did agent X use"). `<orchestrator>` for the parent.
+        /// One agent's histogram ("which tools did agent X use"): its full id, or a unique prefix
+        /// (several matches exit 2). `<orchestrator>` for the parent. With `--timeline` it narrows
+        /// the timeline instead.
         #[arg(long)]
         agent: Option<String>,
-        /// Which agents used this tool, across the forest (ranked by count).
+        /// Which agents used this tool, across the forest (ranked by count). Not with `--agent`
+        /// unless `--timeline` narrows by both.
         #[arg(long)]
         tool: Option<String>,
         /// Restrict the analytics to one workflow run's agents.
         #[arg(long)]
         workflow: Option<String>,
         /// Per-agent breakdown (one row per agent) instead of the aggregate histogram.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["agent", "tool", "timeline"])]
         across: bool,
         /// The time-ordered tool-call timeline (optionally narrowed with `--agent`).
         #[arg(long)]
@@ -356,14 +387,18 @@ enum Cmd {
         /// render the full run when it reaches a terminal status.
         #[arg(long, short = 'f')]
         follow: bool,
+        /// Follow for this long (30s, 5m, 2h), then render the run as it stands; implies --follow.
+        #[arg(id = "for", long = "for", value_name = "DURATION")]
+        for_: Option<String>,
         /// Salvage a dead or interrupted run: emit a ready-to-paste standalone `Agent` prompt per
         /// lane — the FULL original task plus the work that lane already landed (files written,
         /// commands run, its own last note) — so lanes come back resumed rather than restarted.
-        #[arg(long)]
+        /// Prints prompts, so it excludes `--json`, `--script`, `--results` and `--follow`/`--for`.
+        #[arg(long, conflicts_with_all = ["json", "script", "results", "follow", "for"])]
         revive: bool,
         /// With `--revive`, include lanes that completed successfully too (default: only the ones
         /// that did not finish).
-        #[arg(long)]
+        #[arg(long, requires = "revive")]
         revive_all: bool,
     },
     /// The sub-agent forest as a status table: one row per lane with its model, start, duration,
@@ -377,8 +412,9 @@ enum Cmd {
         id: Option<String>,
         #[arg(long)]
         harness: Option<String>,
-        /// Instead of one session: the N most recently active Claude sessions whose cwd is
-        /// `--cwd` (default: the current directory), each row tagged with its session.
+        /// Instead of one session: the N most recently active sessions (of a harness whose hooks
+        /// record lanes: Claude Code, Codex) whose cwd is `--cwd` (default: the current
+        /// directory), each row tagged with its session.
         #[arg(long, value_name = "N")]
         recent: Option<usize>,
         /// With --recent: the project directory the sessions ran in.
@@ -418,9 +454,12 @@ enum Cmd {
         id: String,
         #[arg(long)]
         harness: Option<String>,
-        /// Only messages from this index on (e.g. the post-compaction region).
+        /// Only messages from this message index on (e.g. the post-compaction region).
         #[arg(long, value_name = "MSG")]
-        since: Option<usize>,
+        at: Option<usize>,
+        // Renamed to `--at` in 0.18.0 (`--since` is a duration on `lanes`) — hidden so the old flag errors with a pointer.
+        #[arg(long = "since", hide = true)]
+        since_removed: Option<String>,
         /// Cross-reference every task in the store (terminal ones included): a deferral MATCHES a
         /// task when they share three or more significant words.
         #[arg(long)]
@@ -481,7 +520,6 @@ enum Cmd {
         json: bool,
     },
 
-    // ───────────────────────────── Reshape ─────────────────────────────
     /// Custom, lossless compaction of a Claude session into a NEW resumable session: snip bulky old
     /// tool payloads (large reads/logs/screenshots) into a sidecar, leaving a small `[PRUNED]` marker
     /// — your prompts and flow stay verbatim, the recent turns stay sharp. Resume with
@@ -554,6 +592,9 @@ enum Cmd {
         /// version-controllable home for your term list — e.g. tuned from a classifier-trip corpus.
         #[arg(long, value_name = "PATH")]
         declassify_tokens_file: Option<PathBuf>,
+        /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
+        #[arg(long = "skills", alias = "skills-policy", value_parser = skills_values(), default_value = "keep")]
+        skills: String,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -590,17 +631,22 @@ enum Cmd {
         /// New session id (default: a fresh UUID).
         #[arg(long)]
         to: Option<String>,
-        /// Start at the last compaction boundary before the cut (the default): what a resume loads.
-        #[arg(long, conflicts_with = "full")]
+        // The default start, spelled out; removed in 0.18.0 — hidden so the old flag errors with a pointer.
+        #[arg(long, hide = true)]
         from_compaction: bool,
-        /// Start at the source's first record instead (the whole history up to the cut).
+        /// Start at the source's first record instead of the last compaction boundary before the
+        /// cut (the default: what a resume loads).
         #[arg(long)]
         full: bool,
-        /// Reasoning policy. native keeps the source's reasoning and identifiers; portable demotes
-        /// plaintext thinking to text, removes signature-only reasoning and repairs tool IDs.
-        /// Default: native when every model the window records is `claude-*`, else portable.
+        /// Reasoning policy, two of the four `--thinking` values (a rewind writes Claude): `native`
+        /// keeps the source's reasoning and identifiers; `portable` demotes plaintext thinking to
+        /// text, removes signature-only reasoning and repairs tool IDs. `text` and `drop` are
+        /// refused here. Default: native when every model the window records is `claude-*`, else portable.
         #[arg(long, value_parser = ["native", "portable"])]
         thinking: Option<String>,
+        /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
+        #[arg(long = "skills", alias = "skills-policy", value_parser = skills_values(), default_value = "keep")]
+        skills: String,
         /// Report the window that would be written without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -771,7 +817,7 @@ enum Cmd {
         #[arg(long = "no-context")]
         no_context: bool,
         /// Fail if the fidelity check finds a loss the target format could have carried. Losses the
-        /// format inherently cannot hold are still only reported under `⚠ lost`.
+        /// format inherently cannot hold are still only reported under `⚠ lossy:`.
         #[arg(long)]
         strict: bool,
         /// Native keeps reasoning where the target holds it; portable demotes plaintext thinking to
@@ -780,6 +826,9 @@ enum Cmd {
         /// Default: native when every recorded model is `claude-*`, else portable.
         #[arg(long, value_parser = ["native", "text", "drop", "portable"])]
         thinking: Option<String>,
+        /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
+        #[arg(long = "skills", alias = "skills-policy", value_parser = skills_values(), default_value = "keep")]
+        skills: String,
     },
     /// Print (or with --launch, run) the resume incantation for a session in its native harness.
     Resume {
@@ -791,7 +840,6 @@ enum Cmd {
         launch: bool,
     },
 
-    // ───────────────────────────── Export ─────────────────────────────
     /// Export a session to markdown or OpenSession JSON (stdout); `cv share` is the HTML artifact.
     Export {
         id: String,
@@ -820,9 +868,10 @@ enum Cmd {
         /// `harness:claude msgs>=20`, `after:2026-01-01 cwd:/pug` (implicit AND; see `cv schema`).
         #[arg(long, short = 'q')]
         query: Option<String>,
-        /// Also emit each Claude session's sub-agent forest (directly- and `Workflow`-spawned
-        /// transcripts in sidecar files). These are first-class training data — and a parent on one
-        /// model often spawns sub-agents on another, so `model:` queries need this to catch them.
+        /// Also emit each session's sub-agent forest (the transcripts its adapter keeps beside it:
+        /// Claude's direct and `Workflow` agents, Codex children, Kimi and Hermes delegates). These
+        /// are first-class training data — and a parent on one model often spawns sub-agents on
+        /// another, so `model:` queries need this to catch them.
         #[arg(long)]
         subagents: bool,
         /// Stop after N emitted records.
@@ -841,7 +890,10 @@ enum Cmd {
         redact_only: Option<String>,
         /// Write to this file instead of stdout.
         #[arg(long)]
-        out: Option<PathBuf>,
+        file: Option<PathBuf>,
+        // Renamed to `--file` in 0.18.0 (`--out` is a directory everywhere else) — hidden so the old flag errors with a pointer.
+        #[arg(long = "out", hide = true)]
+        out_removed: Option<PathBuf>,
         /// Replace an existing output file by atomic rename (otherwise a taken name exits 2).
         #[arg(long)]
         force: bool,
@@ -852,7 +904,7 @@ enum Cmd {
         task: String,
         /// Output shape: `md` (CLAUDE.md-style digest, default), `prompt` (system prompt),
         /// or `session` (a synthetic resumable session — see `--harness`).
-        #[arg(long, default_value = "md")]
+        #[arg(long, default_value = "md", value_parser = ["md", "prompt", "session"])]
         format: String,
         /// Target harness when `--format session`.
         #[arg(long)]
@@ -873,9 +925,21 @@ enum Cmd {
         /// other targets use the text policy.
         #[arg(long, default_value = "native", value_parser = ["native", "text", "drop", "portable"])]
         thinking: String,
+        /// Return the bundle or written artifact as a JSON result.
+        #[arg(long)]
+        json: bool,
+        /// Bytes of each span's transcript the `CV_PACK_LLM` digest may send. Default: the model's
+        /// context window as its provider reports it, less the digest's output and prompt (a token
+        /// is at least a byte). The bundle states each digest's input and limit.
+        #[arg(long, value_name = "N")]
+        context_bytes: Option<usize>,
+        /// Bytes of one message an excerpt shows; a longer one is cut there, an open code fence
+        /// closed, and marked `…`. The bundle's header states this and every other bound, and
+        /// what each cut.
+        #[arg(long, value_name = "N", default_value_t = pack::EXCERPT_BYTES)]
+        excerpt_bytes: usize,
     },
 
-    // ───────────────────────────── Fleet & live ─────────────────────────────
     /// Fleet task substrate: dispatch, review, and git-observed landing.
     Task {
         #[command(subcommand)]
@@ -888,19 +952,25 @@ enum Cmd {
         /// Only follow sessions whose cwd contains this substring.
         #[arg(long)]
         cwd: Option<String>,
-        /// Poll interval in seconds.
+        /// Poll interval in seconds (0.25 minimum; negative is a usage error).
         #[arg(long, default_value_t = 2.0)]
         interval: f64,
         /// Also emit the sessions that already exist at startup (default: only new activity).
         #[arg(long)]
         existing: bool,
+        /// Keep following when stdout is not a terminal (a pipe gets the current state once without it).
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Follow for this long (30s, 5m, 2h), then exit 0; implies --follow.
+        #[arg(id = "for", long = "for", value_name = "DURATION")]
+        for_: Option<String>,
     },
     /// Follow live activity and archive every session as it changes, forever (archives what
     /// already exists on the first poll). `cv scry` is the same feed without the archive.
     Watch {
-        /// Poll interval in seconds.
-        #[arg(long, default_value_t = 3)]
-        interval: u64,
+        /// Poll interval in seconds (0.25 minimum; negative is a usage error).
+        #[arg(long, default_value_t = 3.0)]
+        interval: f64,
         /// Only this harness (e.g. claude, codex, gemini).
         #[arg(long)]
         harness: Option<String>,
@@ -971,7 +1041,6 @@ enum Cmd {
         no_redact: bool,
     },
 
-    // ───────────────────────────── System ─────────────────────────────
     /// Build/refresh the tantivy full-text index that makes `cv search` instant.
     ///
     /// Incremental by default: only changed/new sessions are re-indexed and vanished ones reaped,
@@ -997,6 +1066,14 @@ enum Cmd {
         /// An explicit bare `cv index` still means "run now".
         #[arg(long, conflicts_with = "rebuild")]
         if_changed: bool,
+        /// Fail (exit 1) when any session cannot be read. By default such sessions are warnings:
+        /// the index commits the rest and a later pass retries them.
+        #[arg(long)]
+        strict: bool,
+        /// Print the result as JSON: `{indexed, changed, removed, errors, path, unreadable:
+        /// [{id, harness, reason}]}`.
+        #[arg(long)]
+        json: bool,
     },
     /// View the user config (`~/.config/clustervision/config.toml`) and manage the export-source index.
     /// With no flag, prints the config path + registered export sources. Account data exports
@@ -1048,11 +1125,14 @@ enum Cmd {
         #[command(subcommand)]
         action: HooksCmd,
     },
-    /// One hook's body, run by Claude Code: reads the hook JSON on stdin, prints a line or two of
-    /// hook JSON (or nothing). `cv hooks install claude` writes the entries that call these.
+    /// One hook's body, run by the harness: reads the hook JSON on stdin, prints a line or two of
+    /// hook JSON (or nothing). `cv hooks install <harness>` writes the entries that call these.
     Hook {
         #[arg(value_enum)]
         name: HookName,
+        /// The harness whose payload is on stdin (`claude` or `codex`; default `claude`).
+        #[arg(long)]
+        harness: Option<String>,
     },
 
     // ───────────────────────────── Removed (hidden stubs: error with a pointer, exit 2) ─────────────────────────────
@@ -1160,12 +1240,54 @@ fn run() -> Result<()> {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
+    // Install before any library read, and enter it so subprocesses (including MCP tools)
+    // inherit the flag as CV_FROZEN without mutating the process environment.
+    let env = cv_core::env::Env::from_process();
+    let env = if cli.frozen { env.with_frozen() } else { env };
+    cv_core::env::Env::install(env.clone());
+    let _env = env.enter();
+    if cv_core::env::frozen() {
+        let writes = match &cli.cmd {
+            Cmd::Index { .. }
+            | Cmd::Prune { .. }
+            | Cmd::Rewind { .. }
+            | Cmd::Adopt { .. }
+            | Cmd::Port { .. }
+            | Cmd::Distill { .. }
+            | Cmd::Splice { .. }
+            | Cmd::Task { .. }
+            | Cmd::Hook { .. }
+            | Cmd::Watch { .. } => true,
+            Cmd::Hooks { action } => !matches!(action, HooksCmd::Show { .. }),
+            Cmd::Archive { action, .. } => matches!(action, ArchiveCmd::Sync),
+            Cmd::Config { add_export, rm_export } => add_export.is_some() || rm_export.is_some(),
+            Cmd::Pack { format, .. } => format == "session",
+            Cmd::Resume { launch, .. } => *launch,
+            _ => false,
+        };
+        if writes {
+            return usage("--frozen (CV_FROZEN=1) forbids this command: it writes stores or sessions");
+        }
+    }
+    for (old, new) in [
+        ("CLAURDVOYANT_HOME", "CLUSTERVISION_HOME"),
+        ("CLAURDVOYANT_MAX_STALE_SECS", "CLUSTERVISION_MAX_STALE_SECS"),
+    ] {
+        if cv_core::env::var_os(old).is_some() {
+            return usage(format!("`${old}` was removed in 0.18.0 — use `${new}`; unset `${old}`"));
+        }
+    }
     let mcp_tree = retain_mcp_tree(tree, &cli);
     // Long-running services scope reuse per request/poll, so cold private snapshots do not
     // survive idle server time. Ordinary commands share one cache across their session reads.
     let _reads = (!matches!(
         &cli.cmd,
-        Cmd::Serve { .. } | Cmd::Mcp | Cmd::Watch { .. } | Cmd::Scry { .. } | Cmd::Workflow { follow: true, .. }
+        Cmd::Serve { .. }
+            | Cmd::Mcp
+            | Cmd::Watch { .. }
+            | Cmd::Scry { .. }
+            | Cmd::Workflow { follow: true, .. }
+            | Cmd::Workflow { for_: Some(_), .. }
     ))
     .then(cv_core::source::read_scope);
     match cli.cmd {
@@ -1179,14 +1301,17 @@ fn run() -> Result<()> {
             fresh,
             json,
             enrich,
-        } => browse::cmd_ls(harness, cwd, query, limit, &sort_by, asc, fresh, json, enrich),
+        } => browse::cmd_ls(browse::LsArgs { harness, cwd, query, limit, sort_by: &sort_by, asc, fresh, json, enrich }),
         Cmd::Search {
             query,
             harness,
             limit,
             semantic,
+            scan,
+            kind,
+            live_bytes,
             json,
-        } => search::cmd_search(&query, harness, limit, semantic, json),
+        } => search::cmd_search(&query, harness, limit, semantic, scan, kind, live_bytes, json),
         Cmd::Show {
             id,
             harness,
@@ -1234,20 +1359,18 @@ fn run() -> Result<()> {
             min_messages,
             redact,
             redact_only,
-            out,
+            file,
+            out_removed,
             force,
-        } => compose::cmd_dataset(
-            &format,
-            harness,
-            query,
-            subagents,
-            limit,
-            min_messages,
-            redact,
-            redact_only,
-            out,
-            force,
-        ),
+        } => {
+            if out_removed.is_some() {
+                return usage(
+                    "`cv dataset --out` was renamed to `--file <path>` in 0.18.0 (`--out` is a directory \
+                     everywhere else)",
+                );
+            }
+            reshape::cmd_dataset(reshape::DatasetArgs { format: &format, harness, query, subagents, limit, min_messages, redact, redact_only, file, force })
+        }
         Cmd::Port {
             id,
             harness,
@@ -1256,26 +1379,32 @@ fn run() -> Result<()> {
             no_context,
             strict,
             thinking,
-        } => port::cmd_port(&id, harness, cwd, out, no_context, strict, thinking.as_deref().map(util::parse_thinking).transpose()?),
+            skills,
+        } => port::cmd_port(&id, harness, cwd, out, no_context, strict, thinking.as_deref().map(util::parse_thinking).transpose()?, skills.parse()?),
         Cmd::Scry {
             harness,
             cwd,
             interval,
             existing,
-        } => live::cmd_scry(harness, cwd, interval, existing),
+            follow,
+            for_,
+        } => live::cmd_scry(live::ScryArgs { harness, cwd, interval, existing, follow, for_ }),
         Cmd::Index {
             semantic,
             rebuild,
             subagents,
             if_changed,
-        } => search::cmd_index(semantic, rebuild, subagents, if_changed),
+            strict,
+            json,
+        } => search::cmd_index(semantic, rebuild, subagents, if_changed, strict, json),
         Cmd::Events {
             id,
             harness,
             kind,
             subagents,
             json,
-        } => events::cmd_events(&id, harness, kind, subagents, json),
+            wide,
+        } => events::cmd_events(&id, harness, kind, subagents, json, wide),
         Cmd::Touched {
             path,
             edits_only,
@@ -1297,7 +1426,21 @@ fn run() -> Result<()> {
             out,
             force,
             thinking,
-        } => pack::cmd_pack(&task, &format, harness, limit, out, force, util::parse_thinking(&thinking)?),
+            json,
+            context_bytes,
+            excerpt_bytes,
+        } => pack::cmd_pack(pack::PackArgs {
+            task: &task,
+            format: &format,
+            harness,
+            limit,
+            out,
+            force,
+            thinking: util::parse_thinking(&thinking)?,
+            json,
+            context_bytes,
+            excerpt_bytes,
+        }),
         Cmd::Stats { query, json, tokens } => browse::cmd_stats(query, json, tokens),
         Cmd::Prune {
             id,
@@ -1315,35 +1458,15 @@ fn run() -> Result<()> {
             declassify,
             declassify_tokens,
             declassify_tokens_file,
+            skills,
             dry_run,
             json,
         } => {
-            let keep_range = keep.as_deref().map(util::parse_range).transpose()?;
-            let tokens = resolve_declassify_tokens(declassify_tokens, declassify_tokens_file)?;
-            if declassify && tokens.is_empty() {
-                eprintln!(
-                    "cv prune --declassify: no terms supplied (--declassify-tokens / \
-                     --declassify-tokens-file) — nothing will be snipped. cv ships no built-in list."
-                );
-            }
-            compose::cmd_prune(
-                &id,
-                harness,
-                min_size,
-                keep_last,
-                to,
-                force,
-                drop,
-                drop_thinking,
-                copy_resources,
-                !no_revive,
-                window,
-                keep_range,
-                declassify,
-                tokens,
-                dry_run,
-                json,
-            )
+            reshape::cmd_prune(reshape::PruneArgs {
+                id: &id, harness, min_size, keep_last, to, force, drop, thinking: drop_thinking,
+                copy_resources, revive: !no_revive, window, keep, declassify,
+                declassify_tokens, declassify_tokens_file, skills_policy: skills.parse()?, dry_run, json,
+            })
         }
         Cmd::Rewind {
             id,
@@ -1352,12 +1475,21 @@ fn run() -> Result<()> {
             agent,
             out,
             to,
-            from_compaction: _,
+            from_compaction,
             thinking,
+            skills,
             full,
             dry_run,
             json,
-        } => compose::cmd_rewind(&id, harness, agent, at.as_deref(), out, to, full, thinking.as_deref().map(str::parse).transpose()?, dry_run, json, BUILD_VERSION),
+        } => {
+            if from_compaction {
+                return usage(
+                    "`cv rewind --from-compaction` was removed in 0.18.0 — starting at the last compaction boundary is the default; \
+                     pass `--full` for the whole history",
+                );
+            }
+            reshape::cmd_rewind(reshape::RewindArgs { id: &id, harness, agent, at: at.as_deref(), out, to, full, thinking: thinking.as_deref().map(util::parse_thinking).transpose()?, skills_policy: skills.parse()?, dry_run, json, generator: BUILD_VERSION })
+        }
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
         Cmd::Schema { json, commands } => schema::cmd_schema(&build_cli(), json, commands),
         Cmd::Formats {
@@ -1368,7 +1500,7 @@ fn run() -> Result<()> {
         } => formats::cmd_formats(harness, recent, json, legacy),
         Cmd::Recipes => recipes::cmd_recipes(),
         Cmd::Hooks { action } => hooks::cmd_hooks(action),
-        Cmd::Hook { name } => hooks::cmd_hook(name),
+        Cmd::Hook { name, harness } => hooks::cmd_hook(name, harness),
         Cmd::Resume { id, harness, launch } => port::cmd_resume(&id, harness, launch),
         Cmd::Workflow {
             id,
@@ -1378,9 +1510,10 @@ fn run() -> Result<()> {
             script,
             results,
             follow,
+            for_,
             revive,
             revive_all,
-        } => workflow::cmd_workflow(&id, run_id, harness, json, script, results, follow, revive, revive_all),
+        } => workflow::cmd_workflow(workflow::WorkflowArgs { id: &id, run_id, harness, json, script, results, follow, for_, revive, revive_all }),
         Cmd::Tools {
             id,
             harness,
@@ -1390,7 +1523,7 @@ fn run() -> Result<()> {
             across,
             timeline,
             json,
-        } => tools::cmd_tools(&id, harness, agent, tool, wf, across, timeline, json),
+        } => tools::cmd_tools(tools::ToolsArgs { id: &id, harness, agent, tool, workflow: wf, across, timeline, json }),
         Cmd::Lanes {
             id,
             harness,
@@ -1405,19 +1538,19 @@ fn run() -> Result<()> {
             json,
         } => {
             let filter = if running {
-                orchestrate::LaneFilter::Running
+                session_reports::LaneFilter::Running
             } else if done {
-                orchestrate::LaneFilter::Done
+                session_reports::LaneFilter::Done
             } else if stranded {
-                orchestrate::LaneFilter::Stranded
+                session_reports::LaneFilter::Stranded
             } else if unfinished {
-                orchestrate::LaneFilter::Unfinished
+                session_reports::LaneFilter::Unfinished
             } else {
-                orchestrate::LaneFilter::All
+                session_reports::LaneFilter::All
             };
             let scope = match (id, recent) {
-                (Some(id), _) => orchestrate::LaneScope::Session { id, harness },
-                (None, Some(n)) => orchestrate::LaneScope::Recent {
+                (Some(id), _) => session_reports::LaneScope::Session { id, harness },
+                (None, Some(n)) => session_reports::LaneScope::Recent {
                     n,
                     dir: match cwd {
                         Some(d) => d,
@@ -1426,18 +1559,25 @@ fn run() -> Result<()> {
                 },
                 (None, None) => unreachable!("clap requires <ID> unless --recent is present"),
             };
-            orchestrate::cmd_lanes(scope, filter, since, tasks, json)
+            session_reports::cmd_lanes(scope, filter, since, tasks, json)
         }
         Cmd::Deferrals {
             id,
             harness,
-            since,
+            at,
+            since_removed,
             open_tasks,
             phrases_file,
             json,
         } => {
+            if since_removed.is_some() {
+                return usage(
+                    "`cv deferrals --since` was renamed to `--at <MSG>` in 0.18.0 (`--since` is a duration \
+                     on `cv lanes`)",
+                );
+            }
             // An unmatched deferral is a finding, not a failure: plain exit 1, no error text.
-            if !orchestrate::cmd_deferrals(&id, harness, since, open_tasks, phrases_file, json)? {
+            if !session_reports::cmd_deferrals(&id, harness, at, open_tasks, phrases_file, json)? {
                 std::process::exit(1);
             }
             Ok(())
@@ -1572,18 +1712,7 @@ fn run() -> Result<()> {
             } else {
                 None
             };
-            compose::cmd_splice(
-                &specs,
-                harness,
-                out,
-                export,
-                cwd,
-                generate,
-                gen_model,
-                util::parse_thinking(&thinking)?,
-                resumable,
-                json,
-            )
+            reshape::cmd_splice(reshape::SpliceArgs { specs: &specs, harness, out, export, cwd, generate, gen_model, thinking: util::parse_thinking(&thinking)?, resumable, json })
         }
         // Removed commands: one line each, pointing at the replacement; exit 2.
         Cmd::Timeline { .. } => usage(
@@ -1626,6 +1755,7 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::reshape::resolve_declassify_tokens;
 
     #[test]
     fn declassify_tokens_resolve_from_csv_and_file() {
@@ -1652,23 +1782,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The clap tree is well-formed (debug asserts: conflicting ids, bad defaults, …).
-    /// Building the clap tree is deep: `Cli::command()` for every command with its args is a
-    /// large stack frame in a debug build, and the default 2 MB test-thread stack overflows on
-    /// it (the binary's main thread has 8 MB and is fine). Run the tree-building tests on a
-    /// thread sized like main.
-    fn on_main_sized_stack(f: impl FnOnce() + Send + 'static) {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(f)
-            .expect("spawn")
-            .join()
-            .expect("test thread panicked");
+    #[test]
+    fn skills_policy_spelling_parses_to_the_canonical_skills_value() {
+        on_main_sized_stack(|| {
+            for (argv, want) in [
+                (["cv", "rewind", "s", "--skills-policy", "keep"], "keep"),
+                (["cv", "prune", "s", "--skills-policy", "drop-all"], "drop"),
+                (["cv", "port", "s", "--skills", "drop-stale"], "drop-stale"),
+            ] {
+                let m = build_cli().try_get_matches_from(argv).unwrap();
+                let (_, sub) = m.subcommand().unwrap();
+                assert_eq!(
+                    sub.get_one::<String>("skills").map(String::as_str),
+                    Some(want),
+                    "{argv:?}"
+                );
+            }
+            assert!(build_cli()
+                .try_get_matches_from(["cv", "rewind", "s", "--skills", "bogus"])
+                .is_err());
+        });
     }
 
     #[test]
     fn mcp_reuses_one_parsed_tree_with_exact_schema_and_releases_parser_owners() {
-        on_main_sized_stack(|| {
+        crate::on_main_sized_stack(|| {
             use std::sync::Arc;
             #[derive(Clone)]
             struct Owner(Arc<()>);
@@ -1732,14 +1870,14 @@ mod tests {
 
     #[test]
     fn clap_tree_is_valid() {
-        on_main_sized_stack(|| build_cli().debug_assert());
+        crate::on_main_sized_stack(|| build_cli().debug_assert());
     }
 
     /// Every visible command sits in exactly one group, and every grouped name is a real
     /// command — the table and the enum cannot drift apart.
     #[test]
     fn groups_cover_every_visible_command() {
-        on_main_sized_stack(groups_cover_every_visible_command_body);
+        crate::on_main_sized_stack(groups_cover_every_visible_command_body);
     }
 
     fn groups_cover_every_visible_command_body() {
@@ -1787,7 +1925,7 @@ mod tests {
     /// `cv --help` lists the groups and ends with the recipes pointer.
     #[test]
     fn help_is_grouped_and_ends_with_recipes() {
-        on_main_sized_stack(help_is_grouped_and_ends_with_recipes_body);
+        crate::on_main_sized_stack(help_is_grouped_and_ends_with_recipes_body);
     }
 
     fn help_is_grouped_and_ends_with_recipes_body() {

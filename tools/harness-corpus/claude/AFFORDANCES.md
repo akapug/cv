@@ -1,4 +1,4 @@
-# Claude Code affordances and what the corpus captures (2.1.296)
+# Claude Code affordances and what the corpus captures (2.1.296, 2.1.304)
 
 Enumerated from the binary's tool registry (`claude -p --output-format stream-json --verbose`
 prints the `system/init` tool list without a model call; `--tools` with every name shows which can
@@ -35,7 +35,7 @@ The IR column is how cv reads it today (`MessageKind`/`Block`/`extra["claude"]`/
 | sub-agent | `Agent` (`Task`) | `subagents/agent-<id>.jsonl` + `.meta.json` (`agentType`, `toolUseId`, `spawnDepth`, `requestShape`) | yes (custom `echoer`, `general-purpose`) | child session via `subagent_tree`, `lineage.parent`/`spawned_by_tool_use`; no `SubagentSpawn` message |
 | background agent + notification | `Agent run_in_background` | async launch result, then a `<task-notification>` user turn (`origin.kind: task-notification`, `turnOrigin: task_notification`) | yes | `Prompt` with `origin: harness`; status via `task_notices` |
 | resume a sub-agent | `SendMessage` | tool call; the child file grows | yes | `ToolUse`; child re-read |
-| fork sub-agent | `Agent` without type + `CLAUDE_CODE_FORK_SUBAGENT=1` | spawned a plain `general-purpose` child | no (did not engage headless) | — |
+| fork sub-agent | `Agent` without type (`subagent_type: fork`; default-on in `-p` since 2.1.302) | child opens with `fork-context-ref` `{parentSessionId, parentLastUuid, contextLength}`; meta `agentType: fork`, `isFork` | yes from 2.1.304 (2.1.296 spawned a plain `general-purpose` child) | `lineage.forked_from`, `extra.claude.fork_context` |
 | agent teams | `TeamCreate`/teammates (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) | — | no: tool not offered headless | — |
 | workflow | `Workflow` (saved `.claude/workflows/<name>.js`) | `workflows/wf_<run>.json`, `workflows/scripts/<name>-wf_<run>.js`, `subagents/workflows/wf_<run>/agent-*.jsonl` + `journal.jsonl` | yes (2 agents, 1 phase) | `claude_workflow::workflows`; children via `subagent_tree` with journal results |
 | background Bash | `Bash run_in_background` | launch result, output file under `$CLAUDE_CODE_TMPDIR`, `<task-notification>` turn | yes | `ToolResult`; notification as `Prompt`/`harness` |
@@ -43,7 +43,7 @@ The IR column is how cv reads it today (`MessageKind`/`Block`/`extra["claude"]`/
 | cron | `CronCreate`/`CronList`/`CronDelete` | tool calls (session-only jobs) | yes | `ToolUse` |
 | wakeup | `ScheduleWakeup` | tool call, then (process waits) a `user` turn `isMeta`, `turnOrigin: scheduled` | yes (fired) | `Prompt` with `origin: scheduler` |
 | /loop | bundled skill over cron | — | no (cron covered) | — |
-| skills | `/corpus-greet` and the `Skill` tool | command rows + skill body as a user text block; `attachment.skill_listing`, `command_permissions` | yes | `Notice` + `Prompt`; listing `InjectedContext` |
+| skills | `/corpus-greet` and the `Skill` tool | command rows + skill body as a user text block; `attachment.skill_listing`, `command_permissions` | yes | invocation `Notice`, body `InjectedContext`; slash body `skill/load` (tool-linked bodies deduplicated), listing `InjectedContext` |
 | MCP | `--mcp-config` stdio server | `mcp__corpus__add` tool_use | yes | `ToolUse` named `mcp__corpus__add` |
 | ToolSearch (deferred tools) | `ToolSearch` | `tool_reference` result blocks, `attachment.deferred_tools_delta`/`deferred_tools_record` | yes (MCP tool loaded through it) | `ToolResult`; deltas `InjectedContext` |
 | worktree | `EnterWorktree`/`ExitWorktree` | `worktree-state`, `relocated` | yes | carried; `relocated_cwd` in bag |
@@ -53,7 +53,11 @@ The IR column is how cv reads it today (`MessageKind`/`Block`/`extra["claude"]`/
 | interrupt | SIGINT mid-tool | "[Request interrupted by user for tool use]" user turn, rejected tool_result | yes | `Prompt` (a harness marker read as a prompt) |
 | AskUserQuestion | tool | — | no: interactive only | — |
 | PushNotification | tool | — | no: remote flag | — |
-| system prompt record | `prompt_snapshot` attachment | system prompt + tool schemas | yes (chat and tools sessions; `--system-prompt-snapshot off` elsewhere to save space) | `Session::system_prompt` |
+| system prompt record | `prompt_snapshot` attachment | system prompt + tool schemas | yes (chat session; `--system-prompt-snapshot off` elsewhere to save space) | `Session::system_prompt` |
+| request ledger | every API call (2.1.300+) | `api-request` (params, `base`/`keep` + `tail` blob hashes, cache points, digest), `api-request-shape` (system prompt + tool schemas per `shapeHash`), `api-request-blob` (one message per `hash`) | yes from 2.1.304 (every session) | carried under `complete`; not read |
+| provider error + retry | the proxy's injected 500 (`CORPUS-PROVIDER-ERROR`) | `system/api_error` `source: request_retry` per attempt, then a synthetic `assistant` API-error turn; the session resumes normally | yes from 2.1.304 | `Error` notices (`extra.claude.retryAttempt`…); `ApiErrorNotice` |
+| turn cap | `--max-turns` | `attachment.max_turns_reached` `{maxTurns, turnCount, exitCommitted}` (never rendered) | yes from 2.1.304 | carried under `complete` |
+| isolation latch | interactive sessions (`isolation-latch` `{side}`) | one bookkeeping record, no `version` | no (not written headless) | carried under `complete` |
 | cost / usage | `cost-state`, `message.usage` | per turn | yes | `Message::usage`; cost carried |
 | prompt history | `history.jsonl` | not written by `-p` | no | — |
 | live registry | `sessions/<pid>.json` | removed at exit | no | — |

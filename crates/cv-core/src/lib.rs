@@ -19,6 +19,7 @@ pub mod bytes {
     pub use crate::harness::store::bytes::{ByteSource, ByteStage};
 }
 
+pub mod codex_handoff;
 pub mod dataset;
 pub mod digest;
 pub mod discover_cache;
@@ -29,18 +30,18 @@ pub mod env;
 
 pub mod events;
 pub mod formats;
-pub mod handoff;
 pub mod harness;
+pub mod hooks;
 pub mod html;
 pub mod ingest;
 pub mod ir;
 mod ir_json;
 pub use ir_json::PrettyJson;
+mod derive;
 pub mod json;
 pub mod lanes;
 pub mod lazy;
 pub(crate) mod lockfile;
-pub mod loom;
 pub mod offsets;
 pub mod prune;
 pub mod publish;
@@ -55,20 +56,22 @@ pub mod sanitize;
 pub mod scan;
 pub mod source;
 pub(crate) mod spill;
+pub mod splice;
 pub mod stats;
 pub mod stream;
 pub mod task;
 pub mod tools;
+pub(crate) mod utf8;
 pub mod watch;
 
-pub use emit::{emit, EmitOptions};
-pub use harness::{Adapter, EmitResult};
+pub use emit::{emit, EmitOptions, SidechainOf};
+pub use harness::{Adapter, Discovered, EmitResult, Skipped};
 pub use ir::*;
 pub use json::{Json, JsonRange, JsonView};
 pub use lazy::{Resolver, Span, Text, INLINE_MAX};
 pub use query::SessionQuery;
 pub use restamp::{restamp, restamp_line, Restamped};
-pub use stream::{collect, CollectSink, ExtraProjection, Flow, MessageSink, ParseOptions, TeeSink, TryFnSink};
+pub use stream::{collect, CollectSink, Demand, Flow, MessageSink, TeeSink, Tier, TryFnSink};
 
 use anyhow::Result;
 
@@ -87,8 +90,8 @@ pub fn discover_all() -> Vec<SessionRef> {
 
 /// [`discover_all`], handing every rollout it decodes in full to `handoff`'s consumer (an index
 /// sweep running beside it), so that consumer reads each one without decoding it again.
-pub fn discover_all_handing_off(handoff: handoff::Handoff) -> Vec<SessionRef> {
-    handoff::within(&Some(handoff), discover_all)
+pub fn discover_all_handing_off(handoff: codex_handoff::Handoff) -> Vec<SessionRef> {
+    codex_handoff::within(&Some(handoff), discover_all)
 }
 
 fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<SessionRef> {
@@ -114,27 +117,28 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<Sessio
         .collect();
     drop(known);
 
-    // Per-adapter outcome: refs on success, `None` on error (the catalog keeps that harness's
-    // previous rows rather than wiping them over a transient failure). Rootless adapters are a
-    // successful empty scan — their catalog rows (root deleted since last sync) must clear.
+    // Per-adapter outcome: what it found on success, `None` on error (the catalog keeps that
+    // harness's previous rows rather than wiping them over a transient failure). Rootless
+    // adapters are a successful empty scan — their catalog rows (root deleted since last sync)
+    // must clear.
     fn run(
         a: &dyn Adapter,
         known: Vec<SessionRef>,
     ) -> (
         Harness,
         Vec<std::path::PathBuf>,
-        Option<Vec<SessionRef>>,
+        Option<Discovered>,
         catalog::PrimaryReads,
     ) {
         let h = a.harness();
         let roots = a.roots();
         if roots.is_empty() {
-            return (h, roots, Some(Vec::new()), Default::default());
+            return (h, roots, Some(Discovered::default()), Default::default());
         }
         let before = catalog::capture_primary_reads_from(a, &known);
         drop(known); // Retain source guards, not a second fleet of metadata, during discovery.
         match a.discover() {
-            Ok(refs) => (h, roots, Some(refs), before),
+            Ok(found) => (h, roots, Some(found), before),
             Err(e) => {
                 eprintln!("cv: discover failed for {h}: {e:#}");
                 (h, roots, None, before)
@@ -144,9 +148,9 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<Sessio
 
     let inventory = source::inventory_context();
     let env = env::Env::scoped();
-    let handoff = handoff::current();
+    let handoff = codex_handoff::current();
     let run_job = |(a, known): (Box<dyn Adapter>, Vec<SessionRef>)| {
-        let discover = || handoff::within(&handoff, || discovery.run(|| run(a.as_ref(), known)));
+        let discover = || codex_handoff::within(&handoff, || discovery.run(|| run(a.as_ref(), known)));
         env::within(&env, || match &inventory {
             Some(context) => context.run(discover),
             None => discover(),
@@ -154,18 +158,24 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<Sessio
     };
 
     #[cfg(feature = "parallel")]
-    let results: Vec<_> = {
+    let mut results: Vec<_> = {
         use rayon::prelude::*;
         jobs.into_par_iter().map(run_job).collect()
     };
     #[cfg(not(feature = "parallel"))]
-    let results: Vec<_> = jobs.into_iter().map(run_job).collect();
+    let mut results: Vec<_> = jobs.into_iter().map(run_job).collect();
 
     // Persist freshly-scanned metadata (pruning vanished files) so the next discovery reuses it.
     if catalog.is_none() {
         catalog = catalog::Reader::open();
     }
     if let Some(catalog) = &mut catalog {
+        catalog.refill_turns(
+            results
+                .iter_mut()
+                .filter_map(|(_, _, found, _)| found.as_mut())
+                .flat_map(|found| found.refs.iter_mut()),
+        );
         catalog.persist_discovery(true);
     } else {
         discover_cache::persist(true);
@@ -175,19 +185,38 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<Sessio
     // unchanged rows can be retained only after comparing the complete ordered inventory.
     let publications: Vec<_> = results
         .iter()
-        .filter_map(|(h, roots, refs, before)| {
-            refs.as_ref()
-                .map(|refs| (*h, refs.as_slice(), catalog::watches_for(*h, roots, refs), before))
+        .filter_map(|(h, roots, found, before)| {
+            found
+                .as_ref()
+                .zip(harness::rootless(*h))
+                .map(|(found, a)| (*h, found.refs.as_slice(), catalog::watches_for(a, roots, found), before))
         })
         .collect();
+    let skipped: Vec<_> = results
+        .iter()
+        .filter_map(|(h, _, found, _)| Some((*h, found.as_ref()?.skipped.as_slice())))
+        .collect();
+    note_skipped(&skipped);
     if let Some(catalog) = &mut catalog {
         catalog.publish_all(&publications);
+        catalog.record_skipped(&skipped);
     }
+    drop((publications, skipped));
     results
         .into_iter()
-        .filter_map(|(_, _, refs, _)| refs)
-        .flatten()
+        .filter_map(|(_, _, found, _)| found)
+        .flat_map(|found| found.refs)
         .collect()
+}
+
+/// The one stderr line a discovery that could not open some sources prints per process; the
+/// sources themselves are in the catalog, where `cv doctor` names them.
+fn note_skipped(skipped: &[(Harness, &[Skipped])]) {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let n: usize = skipped.iter().map(|(_, s)| s.len()).sum();
+    if n > 0 && !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("cv: {n} source(s) could not be read and are missing from the listing; `cv doctor` names them");
+    }
 }
 
 /// Every known session, served from the catalog when it's provably fresh — the **fast read path**
@@ -239,7 +268,6 @@ pub fn cataloged_sessions() -> Vec<SessionRef> {
 /// escalate to a second full scan).
 fn sessions_impl() -> (Vec<SessionRef>, bool) {
     let max_stale = env::var("CLUSTERVISION_MAX_STALE_SECS")
-        .or_else(|_| env::var("CLAURDVOYANT_MAX_STALE_SECS")) // back-compat with the old name
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(900);
@@ -276,9 +304,17 @@ fn refresh_harness(h: Harness, catalog: &mut catalog::Reader) {
     let _ = discover_harness(h, Some(catalog));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Scoped discoveries this thread ran: the agent-lookup test's counter.
+    static HARNESS_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Enumerate one complete harness scope without certifying freshness of the rest of the fleet.
 /// Returns the freshly discovered refs even when the catalog cannot be opened or published.
 fn discover_harness(h: Harness, mut catalog: Option<&mut catalog::Reader>) -> Option<Vec<SessionRef>> {
+    #[cfg(test)]
+    HARNESS_DISCOVERIES.with(|n| n.set(n.get() + 1));
     let a = harness::for_harness(h)?;
     let _sources = source::read_scope();
     let _cache_scope = catalog.as_ref().map(|reader| reader.discovery_scope());
@@ -287,19 +323,22 @@ fn discover_harness(h: Harness, mut catalog: Option<&mut catalog::Reader>) -> Op
         .map(|reader| reader.capture_primary_reads(a.as_ref()))
         .unwrap_or_default();
     let roots = a.roots();
-    let refs = if roots.is_empty() {
-        Vec::new()
+    let Discovered { mut refs, skipped } = if roots.is_empty() {
+        Discovered::default()
     } else {
         match a.discover() {
-            Ok(refs) => refs,
+            Ok(found) => found,
             Err(e) => {
                 eprintln!("cv: discover failed for {h}: {e:#}");
                 return None;
             }
         }
     };
+    note_skipped(&[(h, &skipped)]);
     if let Some(reader) = catalog.as_mut() {
-        reader.replace_harness(h, &refs, &catalog::watches_for(h, &roots, &refs), &before);
+        reader.refill_turns(refs.iter_mut());
+        reader.replace_harness(h, &refs, &catalog::watches_for(a.as_ref(), &roots, &refs), &before);
+        reader.record_skipped(&[(h, &skipped)]);
     }
     Some(refs)
 }
@@ -341,8 +380,10 @@ where
     F: Fn(T) -> Option<R> + Sync + Send,
 {
     let context = discover_cache::read::Context::current();
-    let handoff = handoff::current();
-    par_filter_map(items, |item| handoff::within(&handoff, || context.run(|| f(item))))
+    let handoff = codex_handoff::current();
+    par_filter_map(items, |item| {
+        codex_handoff::within(&handoff, || context.run(|| f(item)))
+    })
 }
 pub(crate) fn par_discovery_flat_map<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
 where
@@ -351,8 +392,10 @@ where
     F: Fn(T) -> Vec<R> + Sync + Send,
 {
     let context = discover_cache::read::Context::current();
-    let handoff = handoff::current();
-    par_flat_map(items, |item| handoff::within(&handoff, || context.run(|| f(item))))
+    let handoff = codex_handoff::current();
+    par_flat_map(items, |item| {
+        codex_handoff::within(&handoff, || context.run(|| f(item)))
+    })
 }
 
 /// Like [`par_filter_map`] but each input may yield zero, one, or many results (e.g. a Gemini
@@ -382,8 +425,6 @@ where
     }
 }
 
-pub use harness::claude::SubagentInfo;
-
 /// Fields demanded from the sub-agent forest's metadata and workflow journals.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SubagentDemand {
@@ -402,52 +443,40 @@ pub fn subagent_tree_filtered_of(
     demand: SubagentDemand,
     workflow: Option<&str>,
     select: impl Fn(&str, Option<&str>) -> bool + Sync,
-) -> Vec<SubagentInfo> {
-    if r.harness == Harness::Claude {
-        harness::claude::subagent_tree_filtered(&r.path, demand, workflow, &select)
-    } else {
-        subagent_tree_of(r)
-            .into_iter()
-            .filter(|s| {
-                workflow.is_none_or(|run| s.workflow.as_deref() == Some(run))
-                    && select(&s.session.id, s.workflow.as_deref())
-            })
-            .collect()
-    }
+) -> Result<Vec<AgentRef>> {
+    harness::rootless(r.harness).map_or_else(|| Ok(Vec::new()), |a| a.forest(r, demand, workflow, &select))
 }
 
 /// The full sub-agent **forest** a session spawned: directly-spawned (`Agent`/`Task`) sub-agents
 /// *and* `Workflow` sub-agents (which live a tier deeper), each enriched with its `*.meta.json`
 /// sidecar (agent type / task description / spawning tool_use) and, for workflow agents, the
-/// orchestrator's journaled result (`status` + `summary`). Newest first. Non-Claude harnesses
-/// return empty for now.
-pub fn subagent_tree_of(r: &SessionRef) -> Vec<SubagentInfo> {
-    match r.harness {
-        Harness::Claude => harness::claude::subagent_tree(&r.path),
-        Harness::Devin => {
-            #[cfg(feature = "sqlite")]
-            {
-                harness::devin::subagent_tree(&r.path, &r.id)
-            }
-            #[cfg(not(feature = "sqlite"))]
-            {
-                Vec::new()
-            }
-        }
-        _ => Vec::new(),
-    }
+/// orchestrator's journaled result (`status` + `summary`). Newest first. The adapter's
+/// [`harness::Adapter::forest`]: empty for a store that records none.
+pub fn subagent_tree_of(r: &SessionRef) -> Result<Vec<AgentRef>> {
+    subagent_tree_filtered_of(r, SubagentDemand::Rich, None, |_, _| true)
 }
 
-pub use harness::claude_workflow::{Workflow, WorkflowAgent, WorkflowLaunch, WorkflowPhase};
+/// The run store of `h`'s adapter, when it keeps one ([`harness::Adapter::workflows`]).
+fn workflow_store(h: Harness) -> Option<&'static dyn harness::Workflows> {
+    harness::rootless(h)?.workflows()
+}
+
+/// Every session whose adapter keeps a run store, with that store: the catalog's rows
+/// ([`sessions`], freshness-probed), never a rediscovery of the harness per call.
+fn workflow_sessions() -> Vec<(SessionRef, &'static dyn harness::Workflows)> {
+    sessions()
+        .into_iter()
+        .filter_map(|r| workflow_store(r.harness).map(|w| (r, w)))
+        .collect()
+}
+
+pub use harness::claude_workflow::{LaneWork, Workflow, WorkflowAgent, WorkflowLaunch, WorkflowPhase};
 
 /// Every `Workflow`-tool run a session launched, as first-class [`Workflow`] objects (phase tree →
 /// agents → outcomes + the driving script), newest first. Read from the session's
-/// `workflows/wf_*.json` state files. Non-Claude harnesses return empty.
+/// `workflows/wf_*.json` state files. Empty where the adapter keeps no run store.
 pub fn workflows_of(r: &SessionRef) -> Vec<Workflow> {
-    match r.harness {
-        Harness::Claude => harness::claude_workflow::workflows(&r.path),
-        _ => Vec::new(),
-    }
+    workflow_store(r.harness).map_or_else(Vec::new, |w| w.runs(r))
 }
 
 /// Find workflow runs by **name** (exact, else prefix) across the whole catalog — so a workflow
@@ -455,15 +484,12 @@ pub fn workflows_of(r: &SessionRef) -> Vec<Workflow> {
 /// and rarely mention the workflow's name). Returns `(session, run)` pairs, newest-session first.
 /// Cheap: the sidecar `workflows/` dir is only read for sessions that have one.
 pub fn find_workflows_by_name(name: &str) -> Vec<(SessionRef, Workflow)> {
-    let mut refs = sessions_for(Some(Harness::Claude));
-    refs.sort_by_key(|r| std::cmp::Reverse(r.updated_at.or(r.created_at)));
+    let mut refs = workflow_sessions();
+    refs.sort_by_key(|(r, _)| std::cmp::Reverse(r.updated_at.or(r.created_at)));
     let want = name.to_string();
-    let per_session: Vec<Vec<(SessionRef, Workflow)>> = par_filter_map(refs, move |r| {
+    let per_session: Vec<Vec<(SessionRef, Workflow)>> = par_filter_map(refs, move |(r, store)| {
         // The cheap name index picks candidates; only matching state files get fully parsed.
-        let hits: Vec<(SessionRef, Workflow)> = harness::claude_workflow::workflows_named(&r.path, &want)
-            .into_iter()
-            .map(|w| (r.clone(), w))
-            .collect();
+        let hits: Vec<(SessionRef, Workflow)> = store.named(&r, &want).into_iter().map(|w| (r.clone(), w)).collect();
         (!hits.is_empty()).then_some(hits)
     });
     let all: Vec<(SessionRef, Workflow)> = per_session.into_iter().flatten().collect();
@@ -477,44 +503,28 @@ pub fn find_workflows_by_name(name: &str) -> Vec<(SessionRef, Workflow)> {
 
 /// Find the parent session(s) of a sub-agent by its `agent-…` id (or bare/prefix form) — so an
 /// agent can be opened directly (`cv show <agent-id>`) without first knowing which session
-/// spawned it. Pure filename scan over each Claude session's `subagents/` sidecar (both tiers:
-/// direct agents and `subagents/workflows/<run>/`), in parallel; nothing is parsed.
+/// spawned it. A filename scan of each cataloged run-store session's agent transcripts
+/// ([`harness::Workflows::has_agent`]), in parallel; nothing is parsed or rediscovered.
 pub fn find_subagent_parents(agent_id: &str) -> Vec<SessionRef> {
     let want = format!("agent-{}", agent_id.strip_prefix("agent-").unwrap_or(agent_id));
-    let refs = sessions_for(Some(Harness::Claude));
-    let mut out = par_filter_map(refs, move |r| {
-        let base = harness::claude::sidecar::subagents_dir(&r.path)?;
-        let has_match = |dir: &std::path::Path| {
-            std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.ends_with(".jsonl") && n.starts_with(&want))
-            })
-        };
-        let hit = has_match(&base)
-            || harness::claude::sidecar::workflow_runs_dir(&r.path)
-                .and_then(|d| std::fs::read_dir(d).ok())
-                .into_iter()
-                .flatten()
-                .flatten()
-                .any(|run| has_match(&run.path()));
-        hit.then_some(r)
-    });
+    let refs = workflow_sessions();
+    let mut out = par_filter_map(refs, move |(r, store)| store.has_agent(&r, &want).then_some(r));
     out.sort_by_key(|r| std::cmp::Reverse(r.updated_at.or(r.created_at)));
     out
 }
 
-/// Fleet-wide ghost hunt by name-prefix: [`workflow_ghosts_of`] across every Claude session that
+/// Fleet-wide ghost hunt by name-prefix: [`workflow_ghosts_of`] across every session that
 /// recorded at least one workflow (the bounded set where the transcript-vs-state cross-check is
 /// meaningful), in parallel. For finding a swarm you remember by name that left no run record.
 pub fn find_ghost_launches_by_name(name: &str) -> Vec<(SessionRef, WorkflowLaunch)> {
-    let refs = sessions_for(Some(Harness::Claude));
+    let refs = workflow_sessions();
     let name = name.to_string();
-    let mut out: Vec<(SessionRef, WorkflowLaunch)> = par_filter_map(refs, move |r| {
-        if !harness::claude_workflow::has_workflow_records(&r.path) {
+    let mut out: Vec<(SessionRef, WorkflowLaunch)> = par_filter_map(refs, move |(r, store)| {
+        if !store.has_records(&r) {
             return None;
         }
-        let hits: Vec<(SessionRef, WorkflowLaunch)> = harness::claude_workflow::ghost_launches(&r.path)
+        let hits: Vec<(SessionRef, WorkflowLaunch)> = store
+            .ghosts(&r)
             .into_iter()
             .filter(|g| g.name.as_deref().is_some_and(|n| n.starts_with(name.as_str())))
             .map(|g| (r.clone(), g))
@@ -531,27 +541,19 @@ pub fn find_ghost_launches_by_name(name: &str) -> Vec<(SessionRef, WorkflowLaunc
 /// Transcript `Workflow` launches with **no recorded run** — the crash-forensics view: a power
 /// loss / hard kill can leave a launch in the transcript whose `workflows/wf_*.json` state file
 /// was never persisted (its sub-agent debris, if any, sits under `subagents/workflows/`).
-/// Non-Claude harnesses return empty.
+/// Empty where the adapter keeps no run store.
 pub fn workflow_ghosts_of(r: &SessionRef) -> Vec<WorkflowLaunch> {
-    match r.harness {
-        Harness::Claude => harness::claude_workflow::ghost_launches(&r.path),
-        _ => Vec::new(),
-    }
+    workflow_store(r.harness).map_or_else(Vec::new, |w| w.ghosts(r))
 }
 
 /// Resolve a workflow's ID/name selector without reading its undemanded rich bodies.
 pub fn workflow_id_of(r: &SessionRef, key: &str) -> Option<String> {
-    (r.harness == Harness::Claude)
-        .then(|| harness::claude_workflow::workflow_id(&r.path, key))
-        .flatten()
+    workflow_store(r.harness)?.run_id(r, key)
 }
 
 /// One workflow run by its run ID or unambiguous name; None when no run resolves.
 pub fn workflow_of(r: &SessionRef, run_id: &str) -> Option<Workflow> {
-    match r.harness {
-        Harness::Claude => harness::claude_workflow::workflow(&r.path, run_id),
-        _ => None,
-    }
+    workflow_store(r.harness)?.run(r, run_id)
 }
 
 /// Find a single session by id (optionally constrained to one harness), returning its ref + adapter.
@@ -593,13 +595,14 @@ pub fn find_cheap(id: &str, harness: Option<Harness>) -> Result<Option<(SessionR
 /// sidecars, never the main pool), so every front-end that resolves session ids — MCP
 /// `read_session`, `cv serve` routes, exports — can drill into an agent id directly.
 ///
-/// Cost discipline: gated on the literal `agent-` prefix (and a non-Claude harness constraint),
+/// Cost discipline: gated on the literal `agent-` prefix (and a harness constraint whose adapter
+/// keeps no run store),
 /// so a normal session-id miss pays **zero** extra work; only agent-shaped ids pay the same
 /// parallel filename scan `cv show <agent-id>` already does. Multiple parent sessions — or
 /// several agents matching a prefix under the one parent — are an error listing the candidates,
 /// mirroring `cv show`'s ambiguity handling rather than a silent "first one wins".
 fn find_subagent_session(id: &str, harness: Option<Harness>) -> Result<Option<FoundSession>> {
-    if !id.starts_with("agent-") || harness.is_some_and(|h| h != Harness::Claude) {
+    if !id.starts_with("agent-") || harness.is_some_and(|h| workflow_store(h).is_none()) {
         return Ok(None);
     }
     let parents = find_subagent_parents(id);
@@ -608,7 +611,7 @@ fn find_subagent_session(id: &str, harness: Option<Harness>) -> Result<Option<Fo
         [one] => one,
         // Copies of ONE agent under several sessions (`cv adopt` moved it into a live session):
         // the newest parent's copy is the one that continues, so it wins.
-        many if one_agent_across(many, id) => &many[0],
+        many if one_agent_across(many, id)? => &many[0],
         many => {
             let mut names: Vec<String> = many
                 .iter()
@@ -627,7 +630,7 @@ fn find_subagent_session(id: &str, harness: Option<Harness>) -> Result<Option<Fo
     let mut hits: Vec<SessionRef> = Vec::new();
     for s in subagent_tree_filtered_of(parent, SubagentDemand::Sessions, None, |candidate, _| {
         candidate.starts_with(id)
-    }) {
+    })? {
         if s.session.id == id {
             return Ok(harness::for_harness(s.session.harness).map(|a| (s.session, a)));
         }
@@ -647,19 +650,22 @@ fn find_subagent_session(id: &str, harness: Option<Harness>) -> Result<Option<Fo
 
 /// Whether every sub-agent matching `id` (`agent-` optional) under `parents` is the same agent:
 /// copies of one agent in several sessions, as `cv adopt` leaves them.
-pub fn one_agent_across(parents: &[SessionRef], id: &str) -> bool {
+pub fn one_agent_across(parents: &[SessionRef], id: &str) -> Result<bool> {
     let want = format!("agent-{}", id.strip_prefix("agent-").unwrap_or(id));
     let ids: std::collections::BTreeSet<String> = parents
         .iter()
-        .flat_map(|parent| {
+        .map(|parent| {
             subagent_tree_filtered_of(parent, SubagentDemand::Sessions, None, |candidate, _| {
                 candidate.starts_with(&want)
             })
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .map(|s| s.session.id)
         .filter(|s| s.starts_with(&want))
         .collect();
-    ids.len() == 1
+    Ok(ids.len() == 1)
 }
 
 /// A resolved session: its catalog ref plus the harness adapter that reads it.
@@ -745,13 +751,13 @@ fn ambiguous<'a>(id: &str, hits: impl Iterator<Item = &'a SessionRef>) -> anyhow
     )
 }
 
-/// Bounded text projections for API and search consumers.
 /// A hermetic world whose environment this thread's library calls read (see [`env`]).
 #[cfg(test)]
-pub(crate) fn test_world(tag: &str) -> cv_testkit::InProcess<env::Scope> {
+pub(crate) fn test_world(tag: &str) -> cv_testkit::InProcess<env::Isolated> {
     cv_testkit::World::in_process(tag, env::Env::enter_isolated)
 }
 
+/// Bounded text projections for API and search consumers.
 pub mod projection;
 
 #[cfg(test)]
@@ -809,6 +815,35 @@ mod copy_authority_tests {
         assert!(
             cataloged_sessions().is_empty(),
             "vanished qualified roots clear only their rows"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "sqlite")]
+    fn agent_lookups_read_the_catalog_not_a_rediscovery() {
+        let world = crate::test_world("agent-lookup");
+        world.write_session(
+            "parent",
+            &[serde_json::json!({"type":"user","sessionId":"parent","message":{"role":"user","content":"spawn"}})],
+        );
+        world.write_agent(
+            "parent",
+            "a1b2c3",
+            &serde_json::json!({}),
+            &[serde_json::json!({"type":"user","sessionId":"parent","isSidechain":true,"message":{"role":"user","content":"task"}})],
+        );
+        cv_testkit::settle(&world.home);
+        assert_eq!(sessions().len(), 1, "a warm catalog");
+        let before = HARNESS_DISCOVERIES.with(std::cell::Cell::get);
+        for _ in 0..3 {
+            let parents = find_subagent_parents("agent-a1b2");
+            assert_eq!(parents.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["parent"]);
+        }
+        assert!(find_subagent_parents("agent-ffff").is_empty());
+        assert_eq!(
+            HARNESS_DISCOVERIES.with(std::cell::Cell::get),
+            before,
+            "a lookup by agent id rediscovered the harness"
         );
     }
 
@@ -881,3 +916,6 @@ mod copy_authority_tests {
         assert_eq!(pick(vec![prefix, old.clone()], "same").unwrap().unwrap().path, old.path);
     }
 }
+
+/// Harness writer observations and corpus verification versions.
+pub mod writer_version;

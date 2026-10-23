@@ -95,90 +95,113 @@ pub enum Cost {
 pub struct FieldDef {
     pub id: FieldId,
     pub name: &'static str,
-    pub aliases: &'static [&'static str],
+    /// Other spellings. One carrying an implied operator (sugar) pairs with it: `before` means
+    /// `updated<`.
+    pub aliases: &'static [(&'static str, Option<Op>)],
     pub kind: Kind,
     pub cost: Cost,
     pub desc: &'static str,
     pub example: &'static str,
 }
 
-/// The capability flags accepted by `has:` (and surfaced in the reference).
-pub const HAS_FLAGS: &[(&str, &str)] = &[
-    ("subagents", "spawned at least one sub-agent (Claude forests)"),
-    ("errors", "has at least one error event"),
-    ("tools", "used at least one tool"),
-    ("images", "contains an image block"),
-    ("compacted", "context was compacted at least once"),
-    ("workflows", "ran at least one Workflow-tool run"),
-    // The affordance vocabulary (`crate::affordance::Kind`, `docs/design/AFFORDANCES.md`).
-    ("plan", "wrote or holds a todo list / plan, or switched plan mode"),
-    ("goal", "set or holds a standing goal"),
-    ("schedule", "created, holds or was fired by a cron job, wakeup or loop"),
-    ("background_job", "started, polled or was notified of a background job"),
-    ("subagent_spawn", "spawned a sub-agent (any harness)"),
-    ("subagent_return", "received a sub-agent's return"),
-    ("skill", "loaded or managed a skill"),
-    ("hook", "a user hook's output reached the model"),
-    ("question", "asked the person a question"),
+/// The capability flags accepted by `has:` (and surfaced in the reference), each with the tier its
+/// answer comes from. The `Cost::Counted` rows are the affordance vocabulary
+/// (`crate::affordance::Kind`, `docs/design/AFFORDANCES.md`) and must stay in step with it.
+pub const HAS_FLAGS: &[(&str, &str, Cost)] = &[
+    (
+        "subagents",
+        "spawned at least one sub-agent (its forest, as `agents` counts)",
+        Cost::Events,
+    ),
+    ("errors", "has at least one error event", Cost::Events),
+    ("tools", "used at least one tool", Cost::Events),
+    ("images", "contains an image block", Cost::Events),
+    ("compacted", "context was compacted at least once", Cost::Events),
+    ("workflows", "ran at least one Workflow-tool run", Cost::Events),
+    (
+        "plan",
+        "wrote or holds a todo list / plan, or switched plan mode",
+        Cost::Counted,
+    ),
+    ("goal", "set or holds a standing goal", Cost::Counted),
+    (
+        "schedule",
+        "created, holds or was fired by a cron job, wakeup or loop",
+        Cost::Counted,
+    ),
+    (
+        "background_job",
+        "started, polled or was notified of a background job",
+        Cost::Counted,
+    ),
+    ("subagent_spawn", "spawned a sub-agent (any harness)", Cost::Counted),
+    ("subagent_return", "received a sub-agent's return", Cost::Counted),
+    ("skill", "loaded or managed a skill", Cost::Counted),
+    ("hook", "a user hook's output reached the model", Cost::Counted),
+    ("question", "asked the person a question", Cost::Counted),
     (
         "approval",
         "asked for, was denied or recorded a permission / approval mode",
+        Cost::Counted,
     ),
     (
         "checkpoint",
         "left or restored a restorable point (file snapshot, shadow commit, saved chat)",
+        Cost::Counted,
     ),
-    ("branch", "rewound, undid, reset or cleared"),
-    ("fork", "was forked from another session"),
-    ("model_change", "switched model mid-session"),
+    ("branch", "rewound, undid, reset or cleared", Cost::Counted),
+    ("fork", "was forked from another session", Cost::Counted),
+    ("model_change", "switched model mid-session", Cost::Counted),
 ];
 
 /// The language. One row per field; everything else is generated from this.
 #[rustfmt::skip]
 pub const FIELDS: &[FieldDef] = &[
-    FieldDef { id: FieldId::Harness, name: "harness", aliases: &["h"], kind: Kind::HarnessEnum, cost: Cost::Catalog,
+    FieldDef { id: FieldId::Harness, name: "harness", aliases: &[("h", None)], kind: Kind::HarnessEnum, cost: Cost::Catalog,
         desc: "Which harness produced the session.", example: "harness:claude" },
-    FieldDef { id: FieldId::Model, name: "model", aliases: &["m"], kind: Kind::Str, cost: Cost::Parse,
+    FieldDef { id: FieldId::Model, name: "model", aliases: &[("m", None)], kind: Kind::Str, cost: Cost::Parse,
         desc: "Any turn's model id (substring). Parse-required — pair with a cheap term to stay fast.", example: "model:fable" },
-    FieldDef { id: FieldId::Cwd, name: "cwd", aliases: &["dir"], kind: Kind::Path, cost: Cost::Catalog,
+    FieldDef { id: FieldId::Cwd, name: "cwd", aliases: &[("dir", None)], kind: Kind::Path, cost: Cost::Catalog,
         desc: "Working directory (substring).", example: "cwd:/pug/clustervision" },
     FieldDef { id: FieldId::Title, name: "title", aliases: &[], kind: Kind::Str, cost: Cost::Catalog,
         desc: "Session title (substring).", example: "title:\"fix the bug\"" },
     FieldDef { id: FieldId::Id, name: "id", aliases: &[], kind: Kind::Str, cost: Cost::Catalog,
         desc: "Session id (substring/prefix).", example: "id:83e3" },
-    FieldDef { id: FieldId::Msgs, name: "msgs", aliases: &["messages"], kind: Kind::Num, cost: Cost::Catalog,
+    FieldDef { id: FieldId::Msgs, name: "msgs", aliases: &[("messages", None)], kind: Kind::Num, cost: Cost::Catalog,
         desc: "User+assistant message count.", example: "msgs>=50" },
     FieldDef { id: FieldId::Created, name: "created", aliases: &[], kind: Kind::Date, cost: Cost::Catalog,
         desc: "Creation time (date or RFC3339).", example: "created>2026-01-01" },
-    FieldDef { id: FieldId::Updated, name: "updated", aliases: &["before", "after", "until", "since"], kind: Kind::Date, cost: Cost::Catalog,
+    FieldDef { id: FieldId::Updated, name: "updated", aliases: &[("before", Some(Op::Lt)), ("after", Some(Op::Ge)), ("until", Some(Op::Lt)), ("since", Some(Op::Ge))], kind: Kind::Date, cost: Cost::Catalog,
         desc: "Last-updated time. (`before:`/`until:` are sugar for `updated<`; `after:`/`since:` for `updated>=`.)", example: "updated:2026-01-01..2026-04-01" },
-    FieldDef { id: FieldId::Git, name: "git", aliases: &["branch"], kind: Kind::Str, cost: Cost::Parse,
+    FieldDef { id: FieldId::Git, name: "git", aliases: &[("branch", None)], kind: Kind::Str, cost: Cost::Parse,
         desc: "Git branch or repo (substring). Parse-required.", example: "git:main" },
-    FieldDef { id: FieldId::Text, name: "text", aliases: &["content"], kind: Kind::Str, cost: Cost::Index,
+    FieldDef { id: FieldId::Text, name: "text", aliases: &[("content", None)], kind: Kind::Str, cost: Cost::Index,
         desc: "Full-text match over session content (tantivy). Needs `cv index`.", example: "text:\"SandboxDenied\"" },
     FieldDef { id: FieldId::Tool, name: "tool", aliases: &[], kind: Kind::Str, cost: Cost::Events,
         desc: "Used a tool by this name (events catalog).", example: "tool:Bash" },
-    FieldDef { id: FieldId::Touched, name: "touched", aliases: &["file"], kind: Kind::Path, cost: Cost::Events,
+    FieldDef { id: FieldId::Touched, name: "touched", aliases: &[("file", None)], kind: Kind::Path, cost: Cost::Events,
         desc: "Read or edited a file at this path (events catalog).", example: "touched:src/ir.rs" },
     FieldDef { id: FieldId::Has, name: "has", aliases: &[], kind: Kind::Flag, cost: Cost::Events,
         desc: "A capability flag (subagents, errors, tools, images, compacted, workflows; events tier) or an affordance (plan, schedule, background_job, …; counted tier: catalog-fast once `cv index` or any full read has counted the session, a parse otherwise).", example: "has:plan" },
     FieldDef { id: FieldId::Subtool, name: "subtool", aliases: &[], kind: Kind::Str, cost: Cost::Forest,
         desc: "A tool used by a *sub-agent* (not the orchestrator). Walks the forest.", example: "subtool:Bash" },
-    FieldDef { id: FieldId::Agent, name: "agent", aliases: &["subagent"], kind: Kind::Str, cost: Cost::Forest,
+    FieldDef { id: FieldId::Agent, name: "agent", aliases: &[("subagent", None)], kind: Kind::Str, cost: Cost::Forest,
         desc: "Spawned a sub-agent of this type (substring): Explore, general-purpose, …", example: "agent:Explore" },
-    FieldDef { id: FieldId::Agents, name: "agents", aliases: &["subagents"], kind: Kind::Num, cost: Cost::Forest,
+    FieldDef { id: FieldId::Agents, name: "agents", aliases: &[("subagents", None)], kind: Kind::Num, cost: Cost::Forest,
         desc: "Sub-agent forest size.", example: "agents>=5" },
-    FieldDef { id: FieldId::Workflow, name: "workflow", aliases: &["wf"], kind: Kind::Str, cost: Cost::Forest,
+    FieldDef { id: FieldId::Workflow, name: "workflow", aliases: &[("wf", None)], kind: Kind::Str, cost: Cost::Forest,
         desc: "Ran a `Workflow` matching this name/run-id (substring).", example: "workflow:census" },
     FieldDef { id: FieldId::Workflows, name: "workflows", aliases: &[], kind: Kind::Num, cost: Cost::Forest,
         desc: "Number of `Workflow`-tool runs.", example: "workflows>=1" },
-    FieldDef { id: FieldId::Compactions, name: "compactions", aliases: &["compacts"], kind: Kind::Num, cost: Cost::Forest,
+    FieldDef { id: FieldId::Compactions, name: "compactions", aliases: &[("compacts", None)], kind: Kind::Num, cost: Cost::Forest,
         desc: "Number of context-compaction boundaries.", example: "compactions>=2" },
 ];
 
 fn field_for(key: &str) -> Option<&'static FieldDef> {
     let k = key.to_ascii_lowercase();
-    FIELDS.iter().find(|f| f.name == k || f.aliases.contains(&k.as_str()))
+    FIELDS
+        .iter()
+        .find(|f| f.name == k || f.aliases.iter().any(|(a, _)| *a == k))
 }
 
 /// The one-word cost label shown in the reference + machine schema.
@@ -497,30 +520,30 @@ fn collect_costs(e: &Expr, out: &mut Vec<Cost>) {
     match e {
         Expr::All => {}
         Expr::Term(t) => {
-            let c = FIELDS
-                .iter()
-                .find(|f| f.id == t.field)
-                .map(|f| f.cost)
-                .unwrap_or(Cost::Catalog);
-            // `has:` is two tiers: an affordance (`has:plan`) is counted in the catalog, the
-            // capability flags (`has:errors`) come from events.
-            let c = match (&t.field, &t.val) {
-                (FieldId::Has, Val::Strs(v)) => {
-                    if v.iter().any(|flag| crate::affordance::Kind::parse(flag).is_some())
-                        && !out.contains(&Cost::Counted)
-                    {
-                        out.push(Cost::Counted);
-                    }
-                    if v.iter().all(|flag| crate::affordance::Kind::parse(flag).is_some()) {
-                        Cost::Counted
-                    } else {
-                        c
-                    }
-                }
-                _ => c,
+            // `has:` is two tiers (the tier column on [`HAS_FLAGS`]): an affordance (`has:plan`)
+            // is counted in the catalog, the capability flags (`has:errors`) come from events —
+            // a term needs every one of its flags' tiers.
+            let tiers: Vec<Cost> = match (&t.field, &t.val) {
+                (FieldId::Has, Val::Strs(v)) => v
+                    .iter()
+                    .map(|flag| {
+                        HAS_FLAGS
+                            .iter()
+                            .find(|(n, _, _)| n == flag)
+                            .map(|(_, _, tier)| *tier)
+                            .unwrap_or(Cost::Events)
+                    })
+                    .collect(),
+                _ => vec![FIELDS
+                    .iter()
+                    .find(|f| f.id == t.field)
+                    .map(|f| f.cost)
+                    .unwrap_or(Cost::Catalog)],
             };
-            if !out.contains(&c) {
-                out.push(c);
+            for tier in tiers {
+                if !out.contains(&tier) {
+                    out.push(tier);
+                }
             }
         }
         Expr::Not(b) => collect_costs(b, out),
@@ -575,37 +598,42 @@ fn eval_term(t: &Term, f: &Facts) -> anyhow::Result<Tri> {
         ),
         FieldId::Title => str_match(t.op, &t.val, f.r.title.as_deref().map(str::to_lowercase)),
         FieldId::Id => str_match(t.op, &t.val, Some(f.r.id.to_lowercase())),
-        FieldId::Msgs => num_match(t.op, &t.val, f.r.message_count as u64),
-        FieldId::Created => date_match(t.op, &t.val, f.r.created_at.or(f.r.updated_at)),
+        // An uncounted listing row cannot answer `msgs:`; the parse phase counts and decides.
+        FieldId::Msgs => match f.r.message_count {
+            Some(n) => num_match(t.op, &t.val, n as u64),
+            None => Tri::Unknown,
+        },
+        // Creation is never answered from the update time: a ref without it leaves the parse to
+        // decide, and a parsed session without it does not match.
+        FieldId::Created => match (f.r.created_at, f.session) {
+            (Some(at), _) => date_match(t.op, &t.val, Some(at)),
+            (None, Some(s)) => date_match(t.op, &t.val, s.created_at),
+            (None, None) => Tri::Unknown,
+        },
         FieldId::Updated => date_match(t.op, &t.val, f.r.updated_at.or(f.r.created_at)),
         // Parse-required.
-        FieldId::Model => {
-            if !matches!(&t.val, Val::Strs(v) if !v.is_empty()) {
-                return Ok(f.session.map_or(Tri::Unknown, |_| Tri::False));
+        FieldId::Model => or_over(&t.val, |needle| {
+            let resolved = f.ext.model(needle, t.op == Op::Eq)?;
+            if resolved != Tri::Unknown {
+                return Ok(resolved);
             }
-            or_over(&t.val, |needle| {
-                let resolved = f.ext.model(needle, t.op == Op::Eq)?;
-                if resolved != Tri::Unknown {
-                    return Ok(resolved);
+            Ok(match f.session {
+                None => Tri::Unknown,
+                Some(s) => {
+                    let hit = |m: Option<&str>| {
+                        m.is_some_and(|m| {
+                            let model = m.to_lowercase();
+                            if t.op == Op::Eq {
+                                model == needle
+                            } else {
+                                model.contains(needle)
+                            }
+                        })
+                    };
+                    Tri::of(hit(s.model.as_deref()) || s.messages.iter().any(|msg| hit(msg.model.as_deref())))
                 }
-                Ok(match f.session {
-                    None => Tri::Unknown,
-                    Some(s) => {
-                        let hit = |m: Option<&str>| {
-                            m.is_some_and(|m| {
-                                let model = m.to_lowercase();
-                                if t.op == Op::Eq {
-                                    model == needle
-                                } else {
-                                    model.contains(needle)
-                                }
-                            })
-                        };
-                        Tri::of(hit(s.model.as_deref()) || s.messages.iter().any(|msg| hit(msg.model.as_deref())))
-                    }
-                })
-            })?
-        }
+            })
+        })?,
         FieldId::Git => match f.session {
             None => Tri::Unknown,
             Some(s) if t.op == Op::Eq => Tri::of(s.git.as_ref().is_some_and(|g| {
@@ -740,20 +768,18 @@ fn date_match(op: Op, val: &Val, when: Option<DateTime<Utc>>) -> Tri {
 /// A throwaway ref view of a parsed session so `matches_session` can reuse the catalog-field logic.
 fn session_as_ref(s: &Session) -> SessionRef {
     SessionRef {
-        id: s.id.clone(),
-        harness: s.harness,
-        path: s.source_path.clone().unwrap_or_default(),
         cwd: s.cwd.clone(),
         title: s.title.clone(),
         created_at: s.created_at,
-        updated_at: s.updated_at,
-        // `SessionRef.message_count` is contractually user+assistant turns only (see ir.rs), so
+        updated_at: s.updated_at, // `SessionRef.message_count` is contractually user+assistant turns only (see ir.rs), so
         // `msgs:` must count the same way here as the catalog prefilter does.
-        message_count: s
-            .messages
-            .iter()
-            .filter(|m| matches!(m.role, crate::ir::Role::User | crate::ir::Role::Assistant))
-            .count(),
+        message_count: Some(
+            s.messages
+                .iter()
+                .filter(|m| matches!(m.role, crate::ir::Role::User | crate::ir::Role::Assistant))
+                .count(),
+        ),
+        ..SessionRef::new(s.id.clone(), s.harness, s.source_path.clone().unwrap_or_default())
     }
 }
 
@@ -953,26 +979,26 @@ fn parse_term(w: &Word) -> Result<Expr, String> {
                     def.name
                 ));
             }
-            // Sugar: before:/until: and after:/since: map onto updated< / updated>=. They only
-            // take `:` — an explicit comparison on sugar (`before>=x`) is contradictory, so it
-            // teaches instead of being silently overridden.
-            let op = match field.to_ascii_lowercase().as_str() {
-                f @ ("before" | "until" | "after" | "since") => {
-                    let sugar = if matches!(f, "before" | "until") {
-                        Op::Lt
-                    } else {
-                        Op::Ge
-                    };
+            // Sugar aliases (the `Option<Op>` on the row) map onto an updated comparison. They
+            // only take `:` — an explicit comparison on sugar (`before>=x`) is contradictory, so
+            // it teaches instead of being silently overridden.
+            let op = match def
+                .aliases
+                .iter()
+                .find(|(a, _)| *a == field.to_ascii_lowercase())
+                .and_then(|(_, sugar)| *sugar)
+            {
+                Some(sugar) => {
                     if op != Op::Contains {
                         return Err(format!(
-                            "{f}: is sugar for `updated{}` and only takes `:` — write `updated{}` for an explicit comparison — see `cv schema`",
+                            "{field}: is sugar for `updated{}` and only takes `:` — write `updated{}` for an explicit comparison — see `cv schema`",
                             sugar.as_str(),
                             op.as_str()
                         ));
                     }
                     sugar
                 }
-                _ => op,
+                None => op,
             };
             let val = parse_value(def, op, value, value_quoted)?;
             return Ok(Expr::Term(Term { field: def.id, op, val }));
@@ -1092,10 +1118,10 @@ fn parse_value(def: &FieldDef, op: Op, raw: &str, quoted: bool) -> Result<Val, S
                 return Err(format!("empty value for {} — see `cv schema`", def.name));
             }
             for fl in &flags {
-                if !HAS_FLAGS.iter().any(|(n, _)| n == fl) {
+                if !HAS_FLAGS.iter().any(|(n, _, _)| n == fl) {
                     return Err(format!(
                         "unknown has-flag {fl:?} (try {}) — see `cv schema`",
-                        HAS_FLAGS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("/")
+                        HAS_FLAGS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>().join("/")
                     ));
                 }
             }
@@ -1139,8 +1165,8 @@ fn parse_date(val: &str) -> Result<DateTime<Utc>, String> {
 
 /// Split a `field<op>value` word into (field, op, value). Returns None if there's no operator.
 fn split_op(w: &str) -> Result<Option<(&str, Op, &str)>, String> {
-    // Scan for the first operator char outside of any value. Field names are [a-z_], so the operator
-    // is the first non-field char.
+    // Scan for the first operator char outside of any value. Field names are alphanumeric plus
+    // `_`, so the operator is the first char outside that set.
     let bytes = w.as_bytes();
     let mut k = 0;
     while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
@@ -1212,11 +1238,12 @@ pub fn reference() -> String {
             w = w
         ));
         if !f.aliases.is_empty() {
-            s.push_str(&format!("      aliases: {}\n", f.aliases.join(", ")));
+            let names = f.aliases.iter().map(|(a, _)| *a).collect::<Vec<_>>().join(", ");
+            s.push_str(&format!("      aliases: {names}\n"));
         }
     }
     s.push_str("\nhas-flags: ");
-    s.push_str(&HAS_FLAGS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "));
+    s.push_str(&HAS_FLAGS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>().join(", "));
     s.push_str("\nharnesses: ");
     s.push_str(&Harness::ALL.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", "));
     s.push_str("\n\nEXAMPLES\n");
@@ -1255,12 +1282,14 @@ pub fn schema_json() -> serde_json::Value {
             };
             let cost = cost_label(f.cost);
             json!({
-                "name": f.name, "aliases": f.aliases, "type": kind, "ops": ops,
+                "name": f.name,
+                "aliases": f.aliases.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+                "type": kind, "ops": ops,
                 "cost": cost, "desc": f.desc, "example": f.example,
                 "values": if matches!(f.kind, Kind::HarnessEnum) {
                     json!(Harness::ALL.iter().map(|h| h.as_str()).collect::<Vec<_>>())
                 } else if matches!(f.kind, Kind::Flag) {
-                    json!(HAS_FLAGS.iter().map(|(n, _)| *n).collect::<Vec<_>>())
+                    json!(HAS_FLAGS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>())
                 } else { serde_json::Value::Null },
             })
         })
@@ -1278,7 +1307,6 @@ pub fn schema_json() -> serde_json::Value {
 pub mod facts;
 pub use facts::{
     filter_refs, filter_refs_limited, matches_full, matches_streamed, QueryReducer, SessionFacts, TextSets,
-    WindowPresence,
 };
 
 #[cfg(test)]

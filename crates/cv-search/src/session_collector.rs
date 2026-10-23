@@ -6,13 +6,13 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::schema::document::{DeserializeError, DocumentDeserialize, DocumentDeserializer};
-use tantivy::schema::{Field, OwnedValue, Value};
+use tantivy::schema::{Field, OwnedValue};
 use tantivy::store::StoreReader;
-use tantivy::{DocAddress, DocId, Score, SegmentReader, TantivyDocument};
+use tantivy::{DocAddress, DocId, Score, SegmentReader};
 
-/// cv emits id/kind first. Demand only the stored prefix needed for navigation,
-/// falling back at the call site for compatible indexes with different field order.
-/// Tantivy still decompresses the same bounded store block.
+/// Every document of a current index leads with its id, then its kind (the writer's order; an
+/// index of another format is rebuilt, never read). Demand only that stored prefix. Tantivy still
+/// decompresses the same bounded store block.
 pub(crate) struct StoredHead<const N: usize> {
     fields: [Option<(Field, OwnedValue)>; N],
 }
@@ -37,19 +37,16 @@ impl<const N: usize> StoredHead<N> {
             .map(|(_, value)| value)
     }
 }
-fn stored_id(store: &StoreReader, doc: DocId, id: Field) -> tantivy::Result<Option<String>> {
+/// A document's session id: its first stored field. A document that does not lead with one was
+/// not written by this index's writer, so the index is unusable, not partly readable.
+pub(crate) fn stored_id(store: &StoreReader, doc: DocId, id: Field) -> tantivy::Result<String> {
     let mut first: StoredHead<1> = store.get(doc)?;
-    if let Some((field, value)) = first.fields[0].take() {
-        if field == id {
-            return Ok(if let OwnedValue::Str(id) = value {
-                Some(id)
-            } else {
-                None
-            });
-        }
+    match first.fields[0].take() {
+        Some((field, OwnedValue::Str(value))) if field == id => Ok(value),
+        _ => Err(tantivy::TantivyError::InternalError(format!(
+            "search index document {doc} does not lead with its session id; rebuild it with `cv index --rebuild`"
+        ))),
     }
-    let full: TantivyDocument = store.get(doc)?;
-    Ok(full.get_first(id).and_then(|v| v.as_str()).map(str::to_owned))
 }
 
 #[derive(Clone, Debug)]
@@ -134,13 +131,8 @@ impl Winners {
     }
 }
 
-pub(crate) enum FilterDecision {
-    /// Authoritative current session metadata is uniform across its body documents.
-    Session(bool),
-    /// Legacy/body-only fallback may differ even between chunks of the same session.
-    Document(bool),
-}
-type SessionFilter = std::sync::Arc<dyn Fn(&str, &StoreReader, DocId) -> tantivy::Result<FilterDecision> + Send + Sync>;
+/// Whether a session is admitted, decided by its metadata: one answer per session id.
+pub(crate) type SessionFilter = std::sync::Arc<dyn Fn(&str) -> tantivy::Result<bool> + Send + Sync>;
 
 pub(crate) struct TopSessions {
     pub(crate) filter: Option<SessionFilter>,
@@ -231,53 +223,58 @@ pub(crate) struct SessionSegment {
     winners: Winners,
     error: Option<tantivy::TantivyError>,
 }
+#[cfg(not(test))]
+impl SessionSegment {
+    fn identity(&self, doc: DocId) -> tantivy::Result<String> {
+        stored_id(&self.store, doc, self.id)
+    }
+}
+#[cfg(test)]
+impl SessionSegment {
+    fn identity(&self, doc: DocId) -> tantivy::Result<String> {
+        if let Some(reads) = &self.stored_reads {
+            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.full_documents {
+            use tantivy::schema::Value;
+            let stored = self.store.get::<tantivy::TantivyDocument>(doc)?;
+            Ok(stored
+                .get_first(self.id)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned())
+        } else {
+            stored_id(&self.store, doc, self.id)
+        }
+    }
+}
 impl SegmentCollector for SessionSegment {
     type Fruit = tantivy::Result<Vec<Candidate>>;
     fn collect(&mut self, doc: DocId, score: Score) {
         if self.error.is_some() || !self.winners.competitive_score(score) {
             return;
         }
-        #[cfg(test)]
-        if let Some(reads) = &self.stored_reads {
-            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let identity = {
-            #[cfg(test)]
-            if self.full_documents {
-                self.store
-                    .get::<TantivyDocument>(doc)
-                    .map(|stored| stored.get_first(self.id).and_then(|v| v.as_str()).map(str::to_owned))
-            } else {
-                stored_id(&self.store, doc, self.id)
-            }
-            #[cfg(not(test))]
-            stored_id(&self.store, doc, self.id)
-        };
+        let identity = self.identity(doc);
         match identity {
             Ok(id) => {
-                let id = id.unwrap_or_default();
                 if let Some(filter) = &self.filter {
                     let accepted = if let Some(accepted) = self.filter_cache.get(&id) {
                         *accepted
                     } else {
-                        let decision = match filter(&id, &self.store, doc) {
-                            Ok(decision) => decision,
+                        let accepted = match filter(&id) {
+                            Ok(accepted) => accepted,
                             Err(error) => {
                                 self.error = Some(error);
                                 return;
                             }
                         };
-                        match decision {
-                            FilterDecision::Document(accepted) => accepted,
-                            FilterDecision::Session(accepted) => {
-                                // Only authoritative session decisions can be reused by id.
-                                if self.filter_cache.len() == 64 {
-                                    self.filter_cache.clear();
-                                }
-                                self.filter_cache.insert(id.clone(), accepted);
-                                accepted
-                            }
+                        // Bound per-segment decision memory. Clear-all avoids recency
+                        // bookkeeping for this opportunistic cache; misses recompute.
+                        if self.filter_cache.len() == 64 {
+                            self.filter_cache.clear();
                         }
+                        self.filter_cache.insert(id.clone(), accepted);
+                        accepted
                     };
                     if !accepted {
                         return;
@@ -339,10 +336,9 @@ impl SegmentCollector for IdSegment {
             return;
         }
         match stored_id(&self.store, doc, self.id) {
-            Ok(Some(id)) => {
+            Ok(id) => {
                 self.ids.insert(id);
             }
-            Ok(None) => {}
             Err(error) => self.error = Some(error),
         }
     }
@@ -360,8 +356,10 @@ impl SegmentCollector for IdSegment {
 mod tests {
     use super::*;
 
+    /// The id is the first stored field or the document is refused: no reordered or id-less
+    /// document is read through a fallback.
     #[test]
-    fn identity_projection_handles_field_order_missing_ids_and_numeric_heads() {
+    fn identity_projection_requires_the_leading_id() {
         let mut schema = tantivy::schema::Schema::builder();
         let id = schema.add_text_field("id", tantivy::schema::STRING | tantivy::schema::STORED);
         let title = schema.add_text_field("title", tantivy::schema::STORED);
@@ -373,19 +371,20 @@ mod tests {
             tantivy::doc!(title => "title", id => "later"),
             tantivy::doc!(number => 23i64, id => "numeric-head"),
             tantivy::doc!(title => "missing"),
-            TantivyDocument::default(),
+            tantivy::TantivyDocument::default(),
         ] {
             writer.add_document(document).unwrap();
         }
         writer.commit().unwrap();
         let searcher = index.reader().unwrap().searcher();
         let store = searcher.segment_reader(0).get_store_reader(1).unwrap();
-        for (doc, expected) in [Some("first"), Some("later"), Some("numeric-head"), None, None]
-            .into_iter()
-            .enumerate()
-        {
-            assert_eq!(stored_id(&store, doc as DocId, id).unwrap().as_deref(), expected);
+        assert_eq!(stored_id(&store, 0, id).unwrap(), "first");
+        for doc in 1..5 {
+            let error = stored_id(&store, doc, id).unwrap_err().to_string();
+            assert!(error.contains("cv index --rebuild"), "{doc}: {error}");
         }
+        let hits = searcher.search(&tantivy::query::AllQuery, &TopSessions::new(id, 10));
+        assert!(hits.is_err(), "a ranked search over an unusable document fails");
     }
 
     #[test]

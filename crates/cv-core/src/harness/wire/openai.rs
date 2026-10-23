@@ -4,6 +4,8 @@
 //! [`Quirks`] constant names the dialect.
 
 use crate::ir::Block;
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::lazy::Text;
 use serde_json::Value;
 
@@ -141,6 +143,8 @@ pub(crate) fn part_from_view(
         let nested = |key| -> anyhow::Result<Option<crate::json::JsonView<'_>>> {
             part.get(key)?.map(|v| v.get("url")).transpose().map(Option::flatten)
         };
+        // Presence wins before type checking: an image_url object without a string url
+        // shadows later aliases rather than falling through to an unrelated url field.
         let url = nested("image_url")?
             .or(part.get("image_url")?)
             .or(nested("imageUrl")?)
@@ -156,9 +160,6 @@ pub(crate) fn part_from_view(
                 let resolver = crate::lazy::Resolver::new(None);
                 let (prefix, _) = crate::harness::store::document::text_head(&text, &resolver, 5, false)?;
                 if prefix == "data:" {
-                    #[derive(Debug, thiserror::Error)]
-                    #[error("data URL media header complete")]
-                    struct HeaderComplete;
                     let mut skip = 5;
                     let mut media = String::new();
                     match text.try_for_each_chunk(&resolver, 4096, |chunk| {
@@ -168,14 +169,14 @@ pub(crate) fn part_from_view(
                                 continue;
                             }
                             if c == ';' {
-                                return Err(HeaderComplete.into());
+                                return Err(crate::stream::Stop.into());
                             }
                             media.push(c);
                         }
                         Ok(())
                     }) {
                         Ok(()) => {}
-                        Err(error) if error.is::<HeaderComplete>() => {}
+                        Err(error) if error.is::<crate::stream::Stop>() => {}
                         Err(error) => return Err(error),
                     }
                     (media.contains('/').then_some(media), Some("base64:inline".into()))
@@ -271,11 +272,6 @@ pub(crate) fn tool_call_from_view(call: crate::json::JsonView<'_>, spans: bool) 
     })
 }
 
-/// [`part_from_view`] over an owned value, every string inline.
-pub fn part_to_block(p: &Value, q: &Quirks) -> Option<Block> {
-    part_from_view(p.into(), q, &mut |v| v.text(false)).ok().flatten()
-}
-
 /// A tool call's `arguments`: a JSON-encoded **string** on the wire (possibly streamed/partial).
 /// A string goes through [`structured_arguments`]; absent/null is the empty object; an
 /// already-structured value is itself.
@@ -301,15 +297,12 @@ pub fn structured_arguments(s: &str) -> Value {
     }
 }
 
-/// Every entry of a `tool_calls` array (a JSON array value, or `None`).
-pub fn tool_calls(v: Option<&Value>) -> Vec<Block> {
-    v.and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|c| tool_call_from_view(c.into(), false).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+/// Every entry of a `tool_calls` array (a JSON array value; `None` or a non-array is none). An
+/// entry that fails to decode is the caller's error, not a silently shorter list.
+pub fn tool_calls(v: Option<&Value>) -> anyhow::Result<Vec<Block>> {
+    v.and_then(Value::as_array).map_or(Ok(Vec::new()), |a| {
+        a.iter().map(|c| tool_call_from_view(c.into(), false)).collect()
+    })
 }
 
 #[cfg(test)]
@@ -347,7 +340,7 @@ mod tests {
         let source = JsonSource::capture(&path).unwrap();
         for q in [&KIMI, &KIMI_CODE, &HERMES, &CODEX] {
             let selected = source
-                .read_range_value(0, bytes.len() as u64, |view| {
+                .read(ReadInput::Range(0, bytes.len() as u64), Validation::Value, |view| {
                     blocks_from_view(Some(view), q, &mut |v| v.source_text())
                 })
                 .unwrap();
@@ -373,7 +366,9 @@ mod tests {
             std::fs::write(&path, &bytes).unwrap();
             let source = JsonSource::capture(&path).unwrap();
             let selected = source
-                .read_range_value(0, bytes.len() as u64, |v| tool_call_from_view(v, true))
+                .read(ReadInput::Range(0, bytes.len() as u64), Validation::Value, |v| {
+                    tool_call_from_view(v, true)
+                })
                 .unwrap();
             assert_eq!(
                 serde_json::to_value(&selected).unwrap(),
@@ -465,13 +460,13 @@ mod tests {
             {"id": "c1", "type": "function", "function": {"name": "shell", "arguments": "{\"cmd\":\"ls\"}"}},
             {"call_id": "c2", "name": "grep", "arguments": "{}"}
         ]);
-        let b = tool_calls(Some(&calls));
+        let b = tool_calls(Some(&calls)).unwrap();
         assert!(
             matches!(&b[0], Block::ToolUse { id, name, input, .. } if id == "c1" && name == "shell" && input.resolve().unwrap()["cmd"] == "ls")
         );
         assert!(
             matches!(&b[1], Block::ToolUse { id, name, input, .. } if id == "c2" && name == "grep" && input.resolve().unwrap().as_ref() == &json!({}))
         );
-        assert!(tool_calls(Some(&json!("not an array"))).is_empty());
+        assert!(tool_calls(Some(&json!("not an array"))).unwrap().is_empty());
     }
 }

@@ -58,8 +58,9 @@ def generate_sqlite(harness, root, size, records, escaped, shape):
                 db.execute("INSERT INTO messages(session_id,role,content,timestamp,active,compacted) VALUES(?,?,?,?,1,0)",
                            (SID, "user" if shape == "prompt-only" else "assistant", payload(i), 1767225600 + i))
         elif harness == "goose":
-            db.executescript("CREATE TABLE sessions(id TEXT PRIMARY KEY,name TEXT,working_dir TEXT,created_at TEXT,updated_at TEXT); CREATE TABLE messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content_json TEXT,created_timestamp INTEGER); CREATE INDEX messages_session ON messages(session_id,created_timestamp,id);")
-            db.execute("INSERT INTO sessions VALUES(?,'scale fixture','/perf','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", (SID,))
+            # Both real corpus versions (1.51.0 and 1.54.0) include this empty extension state.
+            db.executescript("CREATE TABLE sessions(id TEXT PRIMARY KEY,name TEXT,working_dir TEXT,created_at TEXT,updated_at TEXT,extension_data TEXT DEFAULT '{}'); CREATE TABLE messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content_json TEXT,created_timestamp INTEGER); CREATE INDEX messages_session ON messages(session_id,created_timestamp,id);")
+            db.execute("INSERT INTO sessions(id,name,working_dir,created_at,updated_at) VALUES(?,'scale fixture','/perf','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", (SID,))
             if shape == "metadata":
                 db.execute("ALTER TABLE messages ADD COLUMN metadata_json TEXT")
                 for i in range(records):

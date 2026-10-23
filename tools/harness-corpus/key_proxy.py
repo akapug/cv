@@ -27,9 +27,9 @@ Every model call is one JSON line in --log: the path, the model the harness aske
 flag, the request's shape (message roles, or Responses item / Gemini part kinds), the offered tool
 NAMES, and "refused". Never content or headers. Past --max-calls a call is answered here with a 400
 in the harness's own error dialect (a 400, not a 429, so no harness sits retrying) and never sent.
-Two provider-error scenarios are answered here too, uncounted and logged as {"injected": true}: a
-chat request for model `corpus-error` gets a 400, and one whose last user message contains
-CORPUS-PROVIDER-ERROR gets a 500.
+Two provider-error scenarios are answered here too, uncounted and logged as {"injected": true}, on
+the chat and passthrough wires (each in its own error dialect): a request for model `corpus-error`
+gets a 400, and one whose last user message contains CORPUS-PROVIDER-ERROR gets a 500.
 """
 import argparse
 import json
@@ -58,6 +58,26 @@ CALLS = 0
 
 
 # --- budget and log ---------------------------------------------------------------------------
+
+def injection(req):
+    """The two provider-error scenarios, for every messages-shaped wire: `(status, message)` to answer
+    locally (logged as injected, never counted, never forwarded), else None."""
+    if req.get("model") == FAIL_MODEL:
+        status, message = 400, "corpus: this model always fails"
+    else:
+        # The marker must be in the LAST text of the last user message: a harness that resumes a failed
+        # session sends its old prompt and the new one as one user message, and only the new one counts.
+        users = [m for m in req.get("messages") or [] if isinstance(m, dict) and m.get("role") == "user"]
+        content = users[-1].get("content") if users else None
+        if isinstance(content, list):
+            texts = [p.get("text") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)]
+            content = texts[-1] if texts else ""
+        if not (isinstance(content, str) and FAIL_MARKER in content):
+            return None
+        status, message = 500, "corpus: injected provider error"
+    log_line({"injected": True, "status": status, "stream": bool(req.get("stream"))})
+    return status, message
+
 
 def log_line(entry):
     with LOCK, open(ARGS.log, "a") as f:
@@ -145,6 +165,10 @@ class Passthrough:
             except ValueError:
                 req = None
             if isinstance(req, dict) and "messages" in req:
+                if hit := injection(req):
+                    status, message = hit
+                    kind = "invalid_request_error" if status == 400 else "api_error"
+                    return h.reply_json(status, {"type": "error", "error": {"type": kind, "message": message}})
                 if not admit(h.path.split("?")[0], req.get("model"), req.get("stream"), roles(req["messages"]),
                              tool_names(req.get("tools"))):
                     return self.refuse(h)
@@ -190,14 +214,10 @@ class Chat(Passthrough):
         if not path.endswith("/chat/completions"):
             return h.reply_json(404, {"error": {"message": "only /chat/completions is served"}})
         req = json.loads(raw or b"{}")
-        users = [m for m in req.get("messages") or [] if m.get("role") == "user"]
-        if req.get("model") == FAIL_MODEL:
-            log_line({"injected": True, "status": 400, "stream": bool(req.get("stream"))})
-            return h.reply_json(400, {"error": {"message": "corpus: this model always fails",
-                                                "type": "invalid_request_error", "code": "corpus_error"}})
-        if users and FAIL_MARKER in json.dumps(users[-1].get("content")):
-            log_line({"injected": True, "status": 500, "stream": bool(req.get("stream"))})
-            return h.reply_json(500, {"error": {"message": "corpus: injected provider error", "type": "server_error"}})
+        if hit := injection(req):
+            status, message = hit
+            kind = "invalid_request_error" if status == 400 else "server_error"
+            return h.reply_json(status, {"error": {"message": message, "type": kind, "code": "corpus_error"}})
         if not admit(path, req.get("model"), req.get("stream"), roles(req.get("messages")), tool_names(req.get("tools"))):
             return self.refuse(h)
         body = json.dumps(self.adapt(req)).encode()

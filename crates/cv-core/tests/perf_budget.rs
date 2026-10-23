@@ -8,9 +8,15 @@
 //! - `CV_PERF_DUMP=<file> … -- --ignored dump_stream_hashes` hashes every session's streams, so
 //!   two builds can be shown to read a fleet identically.
 
+fn stable_hash(seed: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().chain([&0xff]).fold(seed, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+    })
+}
+
 use std::time::Instant;
 
-use cv_core::{Adapter, Flow, Message, ParseOptions, SessionRef, TryFnSink};
+use cv_core::{Adapter, Demand, Flow, Message, SessionRef, TryFnSink};
 
 /// The pass a counts recount runs per session: a lazy stream, every message counted.
 fn count_pass(adapter: &dyn Adapter, r: &SessionRef) -> (usize, cv_core::affordance::Counts) {
@@ -21,8 +27,10 @@ fn count_pass(adapter: &dyn Adapter, r: &SessionRef) -> (usize, cv_core::afforda
         counter.note(&m)?;
         Ok(Flow::Continue)
     });
-    let s = adapter.try_stream(r, &ParseOptions::lazy(), &mut sink).expect("stream");
-    (n, counter.finish(&s, &adapter.store_affordances(r)))
+    let s = adapter
+        .try_stream(r, &Demand::LEAN.with_spans(), &mut sink)
+        .expect("stream");
+    (n, counter.finish(&s, &adapter.store_affordances(r).unwrap()))
 }
 
 fn best_of<T>(runs: usize, mut f: impl FnMut() -> T) -> (f64, T) {
@@ -68,7 +76,6 @@ fn real_sessions() {
 #[test]
 #[ignore]
 fn dump_stream_hashes() {
-    use std::hash::{Hash, Hasher};
     use std::io::Write;
     let Ok(out) = std::env::var("CV_PERF_DUMP") else {
         eprintln!("set CV_PERF_DUMP");
@@ -99,13 +106,13 @@ fn dump_stream_hashes() {
                         continue;
                     };
                     let mut line = format!("{} {} {}", r.harness.as_str(), r.id, r.path.display());
-                    for opts in [ParseOptions::lazy(), ParseOptions::bulk(), ParseOptions::full()] {
-                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                    for opts in [Demand::LEAN.with_spans(), Demand::LEAN, Demand::RICH] {
+                        let mut h = 0xcbf2_9ce4_8422_2325u64;
                         let mut n = 0usize;
                         let result = {
                             let mut sink = |m: Message| {
                                 n += 1;
-                                serde_json::to_string(&m).unwrap().hash(&mut h);
+                                h = stable_hash(h, &serde_json::to_vec(&m).unwrap());
                                 Flow::Continue
                             };
                             adapter.stream(r, &opts, &mut sink)
@@ -113,8 +120,8 @@ fn dump_stream_hashes() {
                         match result {
                             Ok(mut s) => {
                                 s.messages.clear();
-                                serde_json::to_string(&s).unwrap().hash(&mut h);
-                                line.push_str(&format!(" {n}:{:016x}", h.finish()));
+                                h = stable_hash(h, &serde_json::to_vec(&s).unwrap());
+                                line.push_str(&format!(" {n}:{:016x}", h));
                             }
                             Err(e) => line.push_str(&format!(" err:{e}")),
                         }
@@ -141,7 +148,7 @@ fn corpus_blob(harness: &str, root: &std::path::Path, target: usize) -> (Box<dyn
     for e in walkdir::WalkDir::new(&corpus).sort_by_file_name() {
         let e = e.unwrap();
         let p = e.path();
-        if p.extension().is_some_and(|x| x == "jsonl") && !p.to_string_lossy().contains("/subagents/") {
+        if p.extension().is_some_and(|x| x == "jsonl") && !p.components().any(|c| c.as_os_str() == "subagents") {
             lines.extend(std::fs::read_to_string(p).unwrap().lines().map(str::to_string));
         }
     }

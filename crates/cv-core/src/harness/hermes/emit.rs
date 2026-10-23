@@ -16,11 +16,11 @@ use uuid::Uuid;
 /// reader (`harness/hermes.rs`) expects: a `sessions` row + OpenAI-shaped `messages` rows
 /// (role/content/tool_calls JSON/reasoning/timestamps as REAL unix secs). Multimodal content uses
 /// the `\x00json:` sentinel prefix.
-#[cfg(feature = "sqlite")]
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    crate::harness::wire::write::check_source_fields(session)?;
     use rusqlite::Connection;
 
+    // Reject unreadable sources before creating output; the commit guard covers later changes.
+    crate::harness::wire::write::check_source_fields(session)?;
     let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // `out_dir` is a directory — the Hermes home or a profile dir, which is what the adapter's
@@ -34,6 +34,31 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         new_id: new_id.clone(),
         resume_hint: Some(format!("hermes --resume {new_id}")),
     })
+}
+
+/// One Hermes FTS5 index over `messages` and its three sync triggers, as `hermes_state.py`
+/// spells them. The statement text is stored verbatim in the emitted `sqlite_master`, so the
+/// literal's line breaks and indentation are part of the output.
+fn fts_sql(table: &str, tokenize: &str) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING fts5(content{tokenize});
+         CREATE TRIGGER IF NOT EXISTS {table}_insert AFTER INSERT ON messages BEGIN
+             INSERT INTO {table}(rowid, content) VALUES (
+                 new.id,
+                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+             );
+         END;
+         CREATE TRIGGER IF NOT EXISTS {table}_delete AFTER DELETE ON messages BEGIN
+             DELETE FROM {table} WHERE rowid = old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS {table}_update AFTER UPDATE ON messages BEGIN
+             DELETE FROM {table} WHERE rowid = old.id;
+             INSERT INTO {table}(rowid, content) VALUES (
+                 new.id,
+                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+             );
+         END;"
+    )
 }
 
 fn write_database(session: &Session, opts: &EmitOptions, new_id: &str, conn: &mut rusqlite::Connection) -> Result<()> {
@@ -91,51 +116,15 @@ fn write_database(session: &Session, opts: &EmitOptions, new_id: &str, conn: &mu
 
     // FTS5 virtual tables + sync triggers, mirroring hermes_state.py's FTS_SQL / FTS_TRIGRAM_SQL.
     // Without these, a port into a *fresh* state.db is invisible to Hermes's search (which queries
-    // `messages_fts`). The unicode61 table is part of bundled FTS5 and always available; the trigram
-    // tokenizer is too in modern SQLite, but we still guard it so emit succeeds on any build that
-    // lacks it. Created BEFORE inserting rows so the AFTER INSERT triggers populate the index.
-    tx.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content);
-         CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
-             INSERT INTO messages_fts(rowid, content) VALUES (
-                 new.id,
-                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
-             );
-         END;
-         CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-             DELETE FROM messages_fts WHERE rowid = old.id;
-         END;
-         CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-             DELETE FROM messages_fts WHERE rowid = old.id;
-             INSERT INTO messages_fts(rowid, content) VALUES (
-                 new.id,
-                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
-             );
-         END;",
-    )
-    .context("creating hermes messages_fts (FTS5)")?;
-
-    // Trigram table for CJK/substring search. Guarded: if the trigram tokenizer isn't compiled in,
-    // skip it (and its triggers) rather than failing the whole emit. The unicode61 table above is
-    // enough for Hermes to find ASCII content; the trigram index is a CJK nicety.
-    let trigram_sql = "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(content, tokenize='trigram');
-         CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
-             INSERT INTO messages_fts_trigram(rowid, content) VALUES (
-                 new.id,
-                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
-             );
-         END;
-         CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
-             DELETE FROM messages_fts_trigram WHERE rowid = old.id;
-         END;
-         CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
-             DELETE FROM messages_fts_trigram WHERE rowid = old.id;
-             INSERT INTO messages_fts_trigram(rowid, content) VALUES (
-                 new.id,
-                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
-             );
-         END;";
-    if let Err(e) = tx.execute_batch(trigram_sql) {
+    // `messages_fts`). Created BEFORE inserting rows so the AFTER INSERT triggers populate the
+    // index. The unicode61 table is part of bundled FTS5 and always available. The trigram table
+    // (CJK/substring search) is guarded: if the trigram tokenizer isn't compiled in, skip it (and
+    // its triggers) rather than failing the whole emit; the unicode61 table is enough for Hermes
+    // to find ASCII content.
+    tx.execute_batch(&fts_sql("messages_fts", ""))
+        .context("creating hermes messages_fts (FTS5)")?;
+    let trigram_sql = fts_sql("messages_fts_trigram", ", tokenize='trigram'");
+    if let Err(e) = tx.execute_batch(&trigram_sql) {
         eprintln!("cv: hermes trigram FTS unavailable, skipping ({e}); unicode61 FTS still active");
     }
 
@@ -228,8 +217,8 @@ fn write_database(session: &Session, opts: &EmitOptions, new_id: &str, conn: &mu
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
     )?;
-    // Hermes synthesizes a boundary when reading a summary row. Persisting the linked IR marker
-    // as another row would duplicate it and change the native replay.
+    // cv synthesizes a boundary when reading a summary row. Persisting it (or a source's own
+    // marker linked to its summary) as another row would duplicate it and change the native replay.
     let summary_parents: std::collections::HashSet<&str> = session
         .messages
         .iter()
@@ -239,7 +228,7 @@ fn write_database(session: &Session, opts: &EmitOptions, new_id: &str, conn: &mu
     let mut base_ts = started;
     for msg in &session.messages {
         if msg.kind == MessageKind::CompactionBoundary
-            && msg.id.as_deref().is_some_and(|id| summary_parents.contains(id))
+            && (msg.is_synthesized() || msg.id.as_deref().is_some_and(|id| summary_parents.contains(id)))
         {
             continue;
         }
@@ -528,7 +517,7 @@ fn tool_calls(blocks: &[Block]) -> Result<Option<String>> {
     let mut bytes = vec![b'['];
     let mut first = true;
     for block in blocks {
-        let rewrapped = crate::affordance::rewrap_deferred(Harness::Hermes, block)?;
+        let rewrapped = crate::affordance::rewrap_deferred(super::DEFERRED_WRAPPER, block)?;
         let block = rewrapped.as_ref().unwrap_or(block);
         if let Block::ToolUse { id, name, input, .. } = block {
             if !first {
@@ -558,7 +547,7 @@ fn tool_calls(blocks: &[Block]) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn parsed(connection: &rusqlite::Connection, options: &crate::stream::ParseOptions) -> Result<Session> {
+    fn parsed(connection: &rusqlite::Connection, options: &crate::stream::Demand) -> Result<Session> {
         super::super::parse_conn_with(
             connection,
             &crate::SessionRef::new("fixed", Harness::Hermes, connection.path().expect("file store")),
@@ -583,8 +572,7 @@ mod tests {
 
     #[test]
     fn modern_native_exports_preserve_display_compaction_identity_and_sparse_metadata() -> Result<()> {
-        let store = std::env::temp_dir().join(format!("cv-hermes-export-source-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&store)?;
+        let store = cv_testkit::temp_dir("hermes-export-source");
         let source = rusqlite::Connection::open(store.join("state.db"))?;
         source.execute_batch(include_str!("../../../tests/fixtures/hermes/schema-v30.sql"))?;
         reconcile_columns(&source)?;
@@ -616,7 +604,7 @@ mod tests {
                     '{"call":"occurrence"}');
         "#,
         )?;
-        let complete = crate::stream::ParseOptions::complete();
+        let complete = crate::stream::Demand::COMPLETE;
         let session = parsed(&source, &complete)?;
         assert_eq!(
             session.messages.len(),
@@ -655,10 +643,10 @@ mod tests {
                     r.get(0)
                 })?;
             assert_eq!(native_rows, 7);
-            let display = parsed(&output, &crate::stream::ParseOptions::full())?;
+            let display = parsed(&output, &crate::stream::Demand::RICH)?;
             assert_eq!(
                 message_values(&display),
-                message_values(&parsed(&source, &crate::stream::ParseOptions::full())?)
+                message_values(&parsed(&source, &crate::stream::Demand::RICH)?)
             );
             if old_schema {
                 let other: String =
@@ -722,14 +710,16 @@ mod tests {
             |r| r.get(0),
         )?;
         assert_eq!(retained, 0);
-        let replay = parsed(&output, &crate::stream::ParseOptions::full())?;
+        let replay = parsed(&output, &crate::stream::Demand::RICH)?;
         assert_eq!(replay.messages.len(), 2);
         assert!(replay
             .messages
             .iter()
             .flat_map(|m| &m.content)
             .all(|b| !matches!(b, Block::Thinking { .. })));
-        assert!(matches!(&replay.messages[0].content[0], Block::Text { text } if text == "public answer"));
+        assert!(
+            matches!(&replay.messages[0].content[0], Block::Text { text } if text.matches_str("public answer") == Some(true))
+        );
         assert!(replay.messages.iter().all(|m| m
             .harness_extra(Harness::Hermes)
             .unwrap()

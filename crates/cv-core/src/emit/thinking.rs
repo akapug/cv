@@ -1,19 +1,13 @@
 //! Checked per-block projection: retained text stays borrowed, discarded text is never copied.
 use super::{thinking_fate_with_presence, thinking_placeholder, ThinkingFate, ThinkingMode};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::{lazy::Resolver, Block, Harness, Text};
 use anyhow::Result;
 use std::borrow::Cow;
 
-#[derive(Debug)]
-struct CharacterFound;
-impl std::fmt::Display for CharacterFound {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("requested text character found")
-    }
-}
-impl std::error::Error for CharacterFound {}
-/// Source strings have strict acceptance at capture; spans retain their full preflight and
-/// established lossy fallback. Checked callbacks revalidate provenance even at an early stop.
+/// Source strings and wire-form spans both require strict JSON string acceptance.
+/// Checked callbacks revalidate provenance even at an early stop.
 pub(crate) fn first_character(text: &Text, resolver: &Resolver, skip_whitespace: bool) -> Result<Option<char>> {
     let select = |chunk: &str| chunk.chars().find(|ch| !skip_whitespace || !ch.is_whitespace());
     if let Some(inline) = text.inline_str() {
@@ -23,12 +17,13 @@ pub(crate) fn first_character(text: &Text, resolver: &Resolver, skip_whitespace:
     match text.try_for_each_chunk(resolver, 64 * 1024, |chunk| {
         first = select(chunk);
         if first.is_some() {
-            return Err(CharacterFound.into());
+            return Err(crate::stream::Stop.into());
         }
         Ok(())
     }) {
         Ok(()) => Ok(None),
-        Err(error) if error.is::<CharacterFound>() => Ok(first),
+        // Only our early-stop sentinel means success; source validation errors still escape.
+        Err(error) if error.is::<crate::stream::Stop>() => Ok(first),
         Err(error) => Err(error),
     }
 }
@@ -59,6 +54,8 @@ pub(crate) fn fate(block: &Block, target: Harness, mode: ThinkingMode, resolver:
             *redacted,
         )
     };
+    // If absent plaintext already means Keep, presence cannot change the decision; avoid
+    // resolving a retained source field just to rediscover that it will be kept.
     if decide(false) == ThinkingFate::Keep {
         return Ok(ThinkingFate::Keep);
     }
@@ -118,7 +115,11 @@ mod tests {
         ] {
             std::fs::write(&path, serde_json::to_vec(&body)?)?;
             let source = JsonSource::capture(&path)?;
-            let text = source.read_range_value(0, source.len(), |v| v.source_text())?.unwrap();
+            let text = source
+                .read(ReadInput::Range(0, source.len()), Validation::Value, |v| {
+                    v.source_text()
+                })?
+                .unwrap();
             let resolver = Resolver::new(None);
             for skip_whitespace in [false, true] {
                 assert_eq!(
@@ -127,7 +128,7 @@ mod tests {
                 );
             }
             std::fs::write(&path, b"changed")?;
-            if text.is_span() {
+            if text.is_lazy() {
                 assert!(first_character(&text, &resolver, false).is_err());
                 assert!(first_character(&text, &resolver, true).is_err());
             }
@@ -136,23 +137,23 @@ mod tests {
         let bytes = format!("\"x{}\\ud800\"", "a".repeat(70_000));
         std::fs::write(&path, &bytes)?;
         let source = JsonSource::capture(&path)?;
-        assert!(source.read_range_value(0, source.len(), |v| v.source_text()).is_err());
-        // Raw spans keep the existing full preflight and literal fallback for malformed JSON.
-        let malformed = format!("\\u0020?{}\\ud800", "a".repeat(70_000));
-        std::fs::write(&path, &malformed)?;
+        assert!(source
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |v| v
+                .source_text())
+            .is_err());
+        // A wire-form span over the same malformed string is refused like source text.
         let resolver = Resolver::new(Some(path.clone()));
         let span = Text::Span(crate::lazy::Span {
             source: None,
-            offset: 0,
-            len: malformed.len() as u64,
+            offset: 1,
+            len: bytes.len() as u64 - 2,
             escaped: true,
         });
-        assert_eq!(span.try_resolve(&resolver)?.as_ref(), malformed);
-        assert_eq!(first_character(&span, &resolver, true)?, Some('\\'));
+        assert!(span.try_resolve(&resolver).is_err());
         let invalid_bound = Text::Span(crate::lazy::Span {
             source: None,
-            offset: 0,
-            len: malformed.len() as u64 + 1,
+            offset: 1,
+            len: bytes.len() as u64,
             escaped: true,
         });
         assert!(first_character(&invalid_bound, &resolver, false).is_err());

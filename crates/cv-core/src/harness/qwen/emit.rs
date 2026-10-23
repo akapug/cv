@@ -10,6 +10,7 @@
 //! (`--out ~/.qwen`, or a scratch dir: the file goes to its `projects/`).
 
 use crate::emit::*;
+use crate::harness::wire::genai;
 use crate::harness::{
     store::JsonlStage,
     wire::write::{self as wire, ObjectWriter},
@@ -26,7 +27,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-/// The project dir name for a cwd: every non-alphanumeric byte a dash (`/home/u/p` → `-home-u-p`).
+/// cv's Qwen project-directory spelling: replace each non-ASCII-alphanumeric character with
+/// one dash (`/home/u/p` → `-home-u-p`). This is lossy: the session record retains the exact cwd,
+/// and unique session IDs keep colliding directory spellings from overwriting one another.
 fn sanitize_cwd(cwd: &str) -> String {
     cwd.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -34,6 +37,9 @@ fn sanitize_cwd(cwd: &str) -> String {
 }
 
 /// `<home>/projects`, from the projects root, its `tmp/` sibling, or the home itself.
+///
+/// `--out` naming convention (same as lmstudio's `conversations`): the flag may name the CLI's
+/// store root or the store dir inside it; accept either and write where the CLI reads.
 fn projects_dir(out_dir: &Path) -> PathBuf {
     match out_dir.file_name().and_then(|n| n.to_str()) {
         Some("projects") => out_dir.to_path_buf(),
@@ -88,31 +94,14 @@ fn write_parts(writer: &mut dyn Write, parts: &[Part<'_>], resolver: &Resolver) 
         }
         let mut row = ObjectWriter::new(writer)?;
         match part {
-            Part::Text(text) => row.field_with("text", |w| wire::text(w, text, resolver))?,
+            Part::Text(text) => genai::text_fields(&mut row, text, false, None, resolver)?,
             Part::Thinking { text, signature } => {
-                row.field_with("text", |w| wire::text(w, text, resolver))?;
-                row.field("thought", true)?;
-                if let Some(signature) = signature {
-                    row.field("thoughtSignature", signature)?;
-                }
+                genai::text_fields(&mut row, text, true, signature.as_deref(), resolver)?
             }
-            Part::Other(Block::Image { media_type, .. }) => row.field_with("inlineData", |w| {
-                let mut data = ObjectWriter::new(w)?;
-                if let Some(mime) = media_type {
-                    data.field("mimeType", mime)?;
-                }
-                data.finish()
-            })?,
-            Part::Other(Block::File { mime, path, source }) => row.field_with("fileData", |w| {
-                let mut data = ObjectWriter::new(w)?;
-                if let Some(mime) = mime {
-                    data.field("mimeType", mime)?;
-                }
-                if let Some(uri) = source.as_deref().or(path.as_deref()) {
-                    data.field("fileUri", uri)?;
-                }
-                data.finish()
-            })?,
+            Part::Other(Block::Image { media_type, .. }) => genai::image_fields(&mut row, media_type.as_deref())?,
+            Part::Other(Block::File { mime, path, source }) => {
+                genai::file_fields(&mut row, mime.as_deref(), path.as_deref(), source.as_deref())?
+            }
             Part::Other(Block::ToolUse {
                 id,
                 name,
@@ -156,10 +145,13 @@ fn projected_texts<'a>(message: &'a Message, mode: ThinkingMode, resolver: &Reso
         .collect()
 }
 
-fn usage_metadata(m: &Message) -> Option<Value> {
-    let u = m.usage.as_ref()?;
+fn usage_metadata(m: &Message) -> Result<Option<Value>> {
+    let Some(u) = m.usage.as_ref() else { return Ok(None) };
     let cached = u.cache_read_tokens.unwrap_or(0);
-    let input = u.input_tokens.map(|i| i.saturating_add(cached));
+    let input = u
+        .input_tokens
+        .map(|i| i.checked_add(cached).context("Qwen prompt token count overflows u64"))
+        .transpose()?;
     let mut out = Map::new();
     if let Some(i) = input {
         out.insert("promptTokenCount".into(), json!(i));
@@ -170,12 +162,16 @@ fn usage_metadata(m: &Message) -> Option<Value> {
     if let Some(r) = u.reasoning_tokens {
         out.insert("thoughtsTokenCount".into(), json!(r));
     }
-    out.insert("cachedContentTokenCount".into(), json!(cached));
-    out.insert(
-        "totalTokenCount".into(),
-        json!(input.unwrap_or(0).saturating_add(u.output_tokens.unwrap_or(0))),
-    );
-    Some(Value::Object(out))
+    if let Some(cached) = u.cache_read_tokens {
+        out.insert("cachedContentTokenCount".into(), json!(cached));
+    }
+    if let (Some(input), Some(output)) = (input, u.output_tokens) {
+        let total = input
+            .checked_add(output)
+            .context("Qwen total token count overflows u64")?;
+        out.insert("totalTokenCount".into(), json!(total));
+    }
+    Ok(Some(Value::Object(out)))
 }
 
 /// The subtype a model-facing, harness-written user record carries: the one it was read with
@@ -315,6 +311,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         let ts = stamp(m.timestamp);
         i += 1;
         match (m.role, m.kind) {
+            // Qwen rebuilds its system prompt at launch; session messages cannot represent it.
             (_, MessageKind::SystemPrompt) => {}
             (Role::Assistant, _) => {
                 let parts = parts(&m.content, opts.thinking, &resolver)?;
@@ -327,7 +324,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                         row.field("model", model)?;
                     }
                     row.field_with("message", |w| message_parts(w, "model", &parts, &resolver))?;
-                    if let Some(usage) = usage_metadata(m) {
+                    if let Some(usage) = usage_metadata(m)? {
                         row.field("usageMetadata", usage)?;
                     }
                     Ok(())
@@ -463,7 +460,29 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                     })?;
                 }
             }
-            _ => {
+            // What remains arrives as model-facing injected input. Naming each kind keeps a
+            // future MessageKind from silently degrading to this record shape.
+            (
+                Role::System,
+                MessageKind::Prompt
+                | MessageKind::Reply
+                | MessageKind::ToolResult
+                | MessageKind::InjectedContext
+                | MessageKind::CompactionSummary
+                | MessageKind::SubagentSpawn
+                | MessageKind::SubagentReturn
+                | MessageKind::Carrier,
+            )
+            | (
+                Role::User,
+                MessageKind::Reply
+                | MessageKind::ToolResult
+                | MessageKind::InjectedContext
+                | MessageKind::CompactionSummary
+                | MessageKind::SubagentSpawn
+                | MessageKind::SubagentReturn
+                | MessageKind::Carrier,
+            ) => {
                 let parts = parts(&m.content, opts.thinking, &resolver)?;
                 if !parts.is_empty() {
                     let subtype = injected_subtype(m);
@@ -490,7 +509,10 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     Ok(EmitResult {
         path,
         new_id: new_id.clone(),
-        resume_hint: Some(format!("qwen --resume {new_id}  (run from {cwd_str})")),
+        resume_hint: Some(crate::harness::resume_in(
+            cwd.as_deref(),
+            format!("qwen --resume {}", crate::harness::shell_quote(&new_id)),
+        )),
     })
 }
 
@@ -501,18 +523,26 @@ mod tests {
     use crate::harness::{Adapter, Parse};
 
     #[test]
-    fn usage_wire_aggregates_saturate_large_component_counts() {
+    fn usage_wire_preserves_absence_and_rejects_overflow() {
         let mut message = Message::new(Role::Assistant);
         message.usage = Some(crate::ir::Usage {
-            input_tokens: Some(u64::MAX),
-            cache_read_tokens: Some(1),
             output_tokens: Some(2),
             ..Default::default()
         });
-        let value = usage_metadata(&message).unwrap();
-        assert_eq!(value["promptTokenCount"], u64::MAX);
-        assert_eq!(value["totalTokenCount"], u64::MAX);
-        assert_eq!(value["cachedContentTokenCount"], 1);
+        let value = usage_metadata(&message).unwrap().unwrap();
+        assert_eq!(value, json!({"candidatesTokenCount":2}));
+        message.usage.as_mut().unwrap().cache_read_tokens = Some(0);
+        assert_eq!(usage_metadata(&message).unwrap().unwrap()["cachedContentTokenCount"], 0);
+        message.usage.as_mut().unwrap().input_tokens = Some(u64::MAX);
+        assert!(usage_metadata(&message)
+            .unwrap_err()
+            .to_string()
+            .contains("overflows u64"));
+        message.usage.as_mut().unwrap().cache_read_tokens = Some(1);
+        assert!(usage_metadata(&message)
+            .unwrap_err()
+            .to_string()
+            .contains("overflows u64"));
     }
 
     fn corpus_home() -> PathBuf {

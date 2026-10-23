@@ -66,8 +66,14 @@ fn json_consumers_owned_and_source_full_outputs_match() {
     }
     let mut owned = String::new();
     let mut source = String::new();
-    cv_core::html::share_message(&fixture.owned.messages[1], 1, &mut owned).unwrap();
-    cv_core::html::share_message(&fixture.sourced.messages[1], 1, &mut source).unwrap();
+    cv_core::html::share_message(&fixture.owned.messages[1], 1, &mut owned, &fixture.sourced.resolver()).unwrap();
+    cv_core::html::share_message(
+        &fixture.sourced.messages[1],
+        1,
+        &mut source,
+        &fixture.sourced.resolver(),
+    )
+    .unwrap();
     assert_eq!(owned, source);
     let redacted_owned = cv_core::redact::redact(&fixture.owned).unwrap();
     let redacted_source = cv_core::redact::redact(&fixture.sourced).unwrap();
@@ -76,8 +82,12 @@ fn json_consumers_owned_and_source_full_outputs_match() {
         serde_json::to_value(redacted_source).unwrap()
     );
     let options = cv_core::distill::DistillOptions::default();
-    let owned = cv_core::distill::distill(&fixture.owned, &options).unwrap();
-    let source = cv_core::distill::distill(&fixture.sourced, &options).unwrap();
+    let owned = cv_core::distill::prepare_distill(&fixture.owned, &options)
+        .unwrap()
+        .distilled;
+    let source = cv_core::distill::prepare_distill(&fixture.sourced, &options)
+        .unwrap()
+        .distilled;
     assert_eq!(owned.pack(), source.pack());
     assert_eq!(owned.stats.source_est_tokens, source.stats.source_est_tokens);
     assert_eq!(
@@ -92,7 +102,9 @@ fn json_consumers_unreadable_sources_return_errors_before_emit_writes() {
     let fixture = Fixture::new();
     fixture.invalidate();
     let mut html = String::new();
-    assert!(cv_core::html::share_message(&fixture.sourced.messages[1], 0, &mut html).is_err());
+    assert!(
+        cv_core::html::share_message(&fixture.sourced.messages[1], 0, &mut html, &fixture.sourced.resolver()).is_err()
+    );
     assert!(cv_core::dataset::write_record(
         &fixture.sourced,
         &mut Vec::new(),
@@ -108,7 +120,7 @@ fn json_consumers_unreadable_sources_return_errors_before_emit_writes() {
     )
     .is_err());
     assert!(cv_core::redact::redact(&fixture.sourced).is_err());
-    assert!(cv_core::distill::distill(&fixture.sourced, &cv_core::distill::DistillOptions::default()).is_err());
+    assert!(cv_core::distill::prepare_distill(&fixture.sourced, &cv_core::distill::DistillOptions::default()).is_err());
     assert!(cv_core::distill::findings(&fixture.sourced, &cv_core::distill::DistillOptions::default()).is_err());
     for target in cv_core::emit::supported_targets() {
         let out = fixture.dir.join(target.as_str());
@@ -121,31 +133,38 @@ fn json_consumers_unreadable_sources_return_errors_before_emit_writes() {
     // Direct public harness writers also preflight; generic dispatch cannot mask a missed guard.
     type Emitter =
         fn(&Session, &std::path::Path, &cv_core::emit::EmitOptions) -> anyhow::Result<cv_core::harness::EmitResult>;
-    let direct: Vec<Emitter> = vec![
-        cv_core::harness::claude::emit,
-        cv_core::harness::codex::emit,
-        cv_core::harness::grok::emit,
-        cv_core::harness::opencode::emit,
-        cv_core::harness::openclaw::emit,
-        cv_core::harness::gemini::emit,
-        cv_core::harness::lmstudio::emit,
-        cv_core::harness::cline::emit,
-        cv_core::harness::roo::emit,
-        cv_core::harness::continuedev::emit,
-        cv_core::harness::qwen::emit,
+    let direct: &[(Harness, Emitter)] = &[
+        (Harness::Claude, cv_core::harness::claude::emit),
+        (Harness::Codex, cv_core::harness::codex::emit),
+        (Harness::Grok, cv_core::harness::grok::emit),
+        (Harness::OpenCode, cv_core::harness::opencode::emit),
+        (Harness::OpenClaw, cv_core::harness::openclaw::emit),
+        (Harness::Gemini, cv_core::harness::gemini::emit),
+        (Harness::LmStudio, cv_core::harness::lmstudio::emit),
+        (Harness::Cline, cv_core::harness::cline::emit),
+        (Harness::Roo, cv_core::harness::roo::emit),
+        (Harness::Continue, cv_core::harness::continuedev::emit),
+        (Harness::Qwen, cv_core::harness::qwen::emit),
+        #[cfg(feature = "sqlite")]
+        (Harness::Hermes, cv_core::harness::hermes::emit),
     ];
-    for (index, emit) in direct.iter().enumerate() {
-        let out = fixture.dir.join(format!("direct-{index}"));
-        assert!(emit(&fixture.sourced, &out, &cv_core::emit::EmitOptions::default()).is_err());
-        assert!(!out.exists());
-    }
-    #[cfg(feature = "sqlite")]
-    {
-        let out = fixture.dir.join("direct-hermes");
+    let declared: std::collections::HashSet<_> = direct.iter().map(|(target, _)| *target).collect();
+    assert_eq!(declared.len(), direct.len(), "duplicate direct emitter");
+    assert_eq!(
+        declared,
+        cv_core::emit::supported_targets().iter().copied().collect(),
+        "every registered writer needs a direct preflight check"
+    );
+    for (target, emit) in direct {
+        let out = fixture.dir.join(format!("direct-{target}"));
         assert!(
-            cv_core::harness::hermes::emit(&fixture.sourced, &out, &cv_core::emit::EmitOptions::default()).is_err()
+            emit(&fixture.sourced, &out, &cv_core::emit::EmitOptions::default()).is_err(),
+            "{target}"
         );
-        assert!(!out.exists());
+        assert!(
+            !out.exists(),
+            "{target} created output before rejecting a missing source"
+        );
     }
     assert!(cv_core::harness::wire::anthropic::assistant_blocks(
         &fixture.sourced.messages[1].content,
@@ -159,7 +178,13 @@ fn json_consumers_changed_source_is_an_error_in_full_and_mutable_paths() {
     let fixture = Fixture::new();
     std::fs::write(fixture.dir.join("input.json"), b"{}").unwrap();
     assert!(cv_core::redact::redact(&fixture.sourced).is_err());
-    assert!(cv_core::html::share_message(&fixture.sourced.messages[1], 1, &mut String::new()).is_err());
+    assert!(cv_core::html::share_message(
+        &fixture.sourced.messages[1],
+        1,
+        &mut String::new(),
+        &fixture.sourced.resolver()
+    )
+    .is_err());
     assert!(cv_core::dataset::write_record(
         &fixture.sourced,
         &mut Vec::new(),
@@ -167,7 +192,7 @@ fn json_consumers_changed_source_is_an_error_in_full_and_mutable_paths() {
         None
     )
     .is_err());
-    assert!(cv_core::distill::distill(&fixture.sourced, &cv_core::distill::DistillOptions::default()).is_err());
+    assert!(cv_core::distill::prepare_distill(&fixture.sourced, &cv_core::distill::DistillOptions::default()).is_err());
     assert!(serde_json::to_value(&fixture.sourced).is_err());
 }
 
@@ -175,7 +200,9 @@ fn json_consumers_changed_source_is_an_error_in_full_and_mutable_paths() {
 fn json_consumers_resumable_selection_does_not_read_elided_input() {
     let fixture = Fixture::new();
     let options = cv_core::distill::DistillOptions::default();
-    let mut distilled = cv_core::distill::distill(&fixture.owned, &options).unwrap();
+    let mut distilled = cv_core::distill::prepare_distill(&fixture.owned, &options)
+        .unwrap()
+        .distilled;
     distilled.tail_start = fixture.owned.messages.len();
     fixture.invalidate();
     assert!(cv_core::distill::resumable_session(&fixture.sourced, &distilled, &options).is_ok());

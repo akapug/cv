@@ -24,11 +24,17 @@
       },
       "tools": [],
       "usage_messages": 3,
+      "model_messages": 3,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "swe-2-medium",
@@ -103,6 +109,7 @@
         "webfetch"
       ],
       "usage_messages": 17,
+      "model_messages": 17,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -110,6 +117,61 @@
         "approval/state": 1,
         "checkpoint/create": 1,
         "plan/write": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "edit": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "exec": {
+            "calls": 3,
+            "edits": 0,
+            "reads": 0,
+            "commands": 3,
+            "errors": 0
+          },
+          "mcp_call_tool": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "mcp_list_tools": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "read": {
+            "calls": 4,
+            "edits": 0,
+            "reads": 4,
+            "commands": 0,
+            "errors": 0
+          },
+          "todo_write": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "webfetch": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 12,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "swe-2-medium",
@@ -141,6 +203,7 @@
         "run_subagent"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 1,
@@ -148,6 +211,19 @@
         "approval/state": 1,
         "subagent_return/return": 1,
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "run_subagent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "swe-2-medium",
@@ -179,11 +255,25 @@
         "find_file_by_name"
       ],
       "usage_messages": 3,
+      "model_messages": 3,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "find_file_by_name": {
+            "calls": 3,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 3,
+        "total_errors": 0
       },
       "lineage": {
         "parent": "smart-isthmus",
@@ -222,11 +312,25 @@
         "exec"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "exec": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "swe-2-medium",

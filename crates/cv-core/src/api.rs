@@ -9,63 +9,104 @@
 //! pointer, 500 broke).
 
 use crate::ir::{Harness, SessionRef};
-use crate::stream::{Flow, MessageSink};
-use crate::{Message, Session};
+use crate::Session;
 use serde_json::{json, Value};
 
 mod read;
+mod selection;
+mod window;
+pub use selection::MessageWindow;
+pub use window::WindowSink;
+
+/// A router's arms spelled once: the `match` that answers and the method/path patterns
+/// `cv schema --json` lists under `routes`, so the compatibility gate probes the code's own table.
+/// Each arm names its method; a binding or `_` prints as `{}`, a rest pattern as `*`.
+#[macro_export]
+macro_rules! routes {
+    (@seg $l:literal) => { $l };
+    (@seg ..) => { "*" };
+    (@seg $i:tt) => { "{}" };
+    (@post GET) => { false };
+    (@post POST) => { true };
+    ($vis:vis const $inventory:ident;
+     $(#[$meta:meta])* $fvis:vis fn $name:ident($post:ident, $parts:ident $(, $arg:ident: $ty:ty)*) -> $ret:ty {
+        $( $( $method:ident [$($seg:tt),*] )|+ => $body:expr, )*
+        _ => $fallback:expr $(,)?
+    }) => {
+        $vis const $inventory: &[&str] =
+            &[$( $( concat!(stringify!($method), " ", $("/", $crate::routes!(@seg $seg)),*) ),+ ),*];
+        $(#[$meta])*
+        $fvis fn $name($post: bool, $parts: &[&str] $(, $arg: $ty)*) -> $ret {
+            match ($post, $parts) {
+                $( $( ($crate::routes!(@post $method), [$($seg),*]) )|+ => $body, )*
+                _ => $fallback,
+            }
+        }
+    };
+}
 
 /// Route a decoded path (`["api", "session", "claude", "abc"]`) plus a raw query string.
 /// Never panics; an unknown path is a 404.
 pub fn route_json(parts: &[&str], query: &str) -> (u16, Value) {
     let _reads = crate::source::read_scope();
-    match parts {
-        ["api", "health"] => ok(json!({
+    read(false, parts, query)
+}
+
+routes! {
+    pub const ROUTES;
+    fn read(_post, parts, query: &str) -> (u16, Value) {
+        GET ["api", "health"] => ok(json!({
             "ok": true,
             "harnesses": Harness::ALL.iter().map(|h| h.as_str()).collect::<Vec<_>>(),
         })),
 
-        ["api", "sessions"] => sessions(query),
+        GET ["api", "sessions"] => sessions(query),
 
-        ["api", "session", harness, id] => session(harness, id),
+        GET ["api", "session", harness, id] => session(harness, id),
 
-        ["api", "session", harness, id, "head"] => session_head(harness, id),
+        GET ["api", "session", harness, id, "head"] => session_head(harness, id),
 
-        ["api", "session", harness, id, "messages"] => messages(harness, id, query),
+        GET ["api", "session", harness, id, "messages"] => messages(harness, id, query),
 
-        ["api", "session", harness, id, "events"] => session_events(harness, id, query),
+        GET ["api", "session", harness, id, "events"] => session_events(harness, id, query),
 
-        ["api", "session", harness, id, "compactions"] => compactions(harness, id),
+        GET ["api", "session", harness, id, "compactions"] => compactions(harness, id),
 
-        ["api", "touched"] => touched(query),
+        GET ["api", "touched"] => touched(query),
 
-        ["api", "session", harness, id, "subagents"] => subagents(harness, id),
+        GET ["api", "session", harness, id, "subagents"] => subagents(harness, id),
 
-        ["api", "session", harness, parent, "subagent", agent] => subagent(harness, parent, agent),
+        GET ["api", "session", harness, parent, "subagent", agent] => subagent(harness, parent, agent),
 
-        ["api", "session", harness, id, "workflow", wf, "script"] => workflow_script(harness, id, wf),
+        GET ["api", "session", harness, id, "workflow", wf, "script"] => workflow_script(harness, id, wf),
 
         // Removed in 0.15.0 with the coordination board: a pointer, not a silent 404.
-        ["api", "board", ..] | ["api", "claims", _] | ["api", "who", _] | ["api", "channels"] => err(
+        GET ["api", "board", ..] | GET ["api", "claims", _] | GET ["api", "who", _] | GET ["api", "channels"] => err(
             410,
             "removed in 0.15.0 with the coordination board — the task log is the fleet's record: \
              /api/tasks, /api/tasks/inbox/{who}, /api/task/{id}/events",
         ),
 
-        ["api", "tasks"] => tasks(query),
+        GET ["api", "tasks"] => tasks(query),
 
         // Removed in 0.15.0 with the land facet: a pointer, not a silent 404.
-        ["api", "tasks", "debt"] | ["api", "tasks", "stats"] => err(
+        GET ["api", "tasks", "debt"] | GET ["api", "tasks", "stats"] => err(
             410,
             "removed in 0.15.0 with the task land facet — completion is self-reported and labeled; \
              read /api/tasks and /api/task/{id}",
         ),
 
-        ["api", "tasks", "inbox", who] => tasks_inbox(who),
+        GET ["api", "tasks", "inbox", who] => tasks_inbox(who, query),
 
-        ["api", "task", id] => task_one(id, Query::parse(query).flag("events")),
+        // Removed in 0.17: the inbox page reads the task rows with their backlog columns.
+        GET ["api", "backlog"] => err(
+            410,
+            "removed in 0.17 — read /api/tasks?detail=1 (every open task, oldest first; all=1 adds closed ones)",
+        ),
 
-        ["api", "task", id, "events"] => task_events(id),
+        GET ["api", "task", id] => task_one(id, Query::parse(query).flag("events")),
+
+        GET ["api", "task", id, "events"] => task_events(id),
 
         _ => err(404, "not found"),
     }
@@ -85,23 +126,19 @@ pub fn route_staged(parts: &[&str], query: &str) -> anyhow::Result<Option<Staged
     let ["api", "session", harness, id, "messages"] = parts else {
         return Ok(None);
     };
-    let result = message_window(harness, id, query, true);
+    let result = message_window(harness, id, query);
     let mut output = crate::bytes::ByteStage::default();
-    let mut counted = Counted {
-        writer: &mut output,
-        bytes: 0,
-    };
+    let mut counted = crate::projection::Counted::new(&mut output);
+    let position = counted.position.clone();
     let status = match result {
         Ok((r, mut sink)) => {
-            let frames = sink
-                .staged
-                .take()
-                .expect("staged window destination")
-                .into_inner()
-                .map_err(|error| error.into_error())?
-                .finish()?;
+            let frames = sink.finish()?;
             let envelope = window_envelope(&r, &sink, Value::Array(Vec::new()));
-            crate::projection::write_json_array(&mut counted, &envelope, "messages", &frames)?;
+            let framing = crate::projection::Framing {
+                total: Some(sink.selected),
+                ..Default::default()
+            };
+            crate::projection::write_frames(&mut counted, &envelope, "messages", &frames, framing)?;
             anyhow::ensure!(
                 sink.reads.fresh(&mut crate::source::Probe::default()),
                 "API window source changed while staging response"
@@ -113,29 +150,12 @@ pub fn route_staged(parts: &[&str], query: &str) -> anyhow::Result<Option<Staged
             status
         }
     };
-    let bytes = counted.bytes;
+    let bytes = position.get();
     Ok(Some(StagedJson {
         status,
         body: output.finish()?,
         bytes,
     }))
-}
-struct Counted<W> {
-    writer: W,
-    bytes: u64,
-}
-impl<W: std::io::Write> std::io::Write for Counted<W> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let n = self.writer.write(bytes)?;
-        self.bytes = self
-            .bytes
-            .checked_add(n as u64)
-            .ok_or_else(|| std::io::Error::other("JSON response length overflow"))?;
-        Ok(n)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.writer.flush()
-    }
 }
 
 // --- the task log -------------------------------------------------------------------------------
@@ -149,10 +169,21 @@ fn with_tasks(f: impl FnOnce(&crate::task::ReplayOutcome) -> (u16, Value)) -> (u
     }
 }
 
-/// `GET /api/tasks?state=&assignee=&repo=&tag=&all=` — task projections, oldest first.
+/// [`with_tasks`] for a route that reads only the model: the log's stored fold and the events
+/// appended since ([`crate::task::fold`]), with the same warnings.
+fn with_folded(f: impl FnOnce(&crate::task::Folded) -> (u16, Value)) -> (u16, Value) {
+    match crate::task::fold() {
+        Ok(folded) => f(&folded),
+        Err(e) => err(500, &e.to_string()),
+    }
+}
+
+/// `GET /api/tasks?state=&assignee=&repo=&tag=&all=&detail=` — task projections, oldest first;
+/// `detail=1` adds the backlog columns (`opened_by`, `issue`, `body`, `notes`, `decision`, `blocked`).
 fn tasks(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
-    with_tasks(|outcome| {
+    let detail = params.flag("detail");
+    with_folded(|outcome| {
         let filter = crate::task::TaskFilter {
             state: params.get("state"),
             assignee: params.get("assignee"),
@@ -164,7 +195,16 @@ fn tasks(query: &str) -> (u16, Value) {
         };
         // An unknown state string is a clear 400 (naming the vocabulary), not a silent [].
         let tasks: Vec<crate::task::TaskRow> = match crate::task::list(&outcome.model, &filter) {
-            Ok(tasks) => tasks.into_iter().map(crate::task::TaskRow::full).collect(),
+            Ok(tasks) => tasks
+                .into_iter()
+                .map(|t| {
+                    if detail {
+                        crate::task::TaskRow::detailed(t, &outcome.model)
+                    } else {
+                        crate::task::TaskRow::full(t)
+                    }
+                })
+                .collect(),
             Err(e) => return err(400, &e),
         };
         ok(json!({ "tasks": tasks, "warnings": outcome.warnings }))
@@ -204,12 +244,34 @@ fn task_events(id: &str) -> (u16, Value) {
     })
 }
 
-/// `GET /api/tasks/inbox/{who}` — what needs this endpoint.
-fn tasks_inbox(who: &str) -> (u16, Value) {
+/// `GET /api/tasks/inbox/{who}?since=&all=` — what needs this endpoint; the whole store unless
+/// `since` windows it.
+fn tasks_inbox(who: &str, query: &str) -> (u16, Value) {
+    let now = chrono::Utc::now();
+    let window = match inbox_window(&Query::parse(query), None, now) {
+        Ok(window) => window,
+        Err(e) => return err(400, &e),
+    };
     with_tasks(|outcome| {
-        let entries = crate::task::inbox_page(outcome, who, None, None, false, chrono::Utc::now()).items;
+        let entries = crate::task::inbox_page(outcome, who, None, window, false, now).items;
         ok(json!({ "inbox": entries, "warnings": outcome.warnings }))
     })
+}
+
+/// The inbox window a query asks for: `all` lifts it, `since` (`2h`, `3d`, an instant) sets it,
+/// else `default` back from `now`. Every inbox route windows through this one reading.
+pub fn inbox_window(
+    params: &Query,
+    default: Option<chrono::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    if params.flag("all") {
+        return Ok(None);
+    }
+    match params.get("since") {
+        Some(since) => crate::task::parse_since(&since, now).map(Some),
+        None => Ok(default.map(|back| now - back)),
+    }
 }
 
 // --- sessions -----------------------------------------------------------------------------------
@@ -280,7 +342,7 @@ fn complete_session_json(adapter: &dyn crate::Adapter, reference: &SessionRef) -
         guard: true,
         ..crate::stream::Pass::RECORD
     };
-    let read = crate::stream::stream_counted(adapter, reference, &crate::ParseOptions::full(), &mut sink, pass)?;
+    let read = crate::stream::stream_counted(adapter, reference, &crate::Demand::RICH, &mut sink, pass)?;
     let mut session = read.session;
     session.messages = sink.messages;
     session.materialize()?;
@@ -324,38 +386,9 @@ fn session_head(harness: &str, id: &str) -> (u16, Value) {
         unreachable!("head metadata is an object")
     };
     for (key, value) in head {
-        // Parsed title/cwd replace catalog hints only when present, as before.
-        if matches!(key.as_str(), "title" | "cwd") && value.is_null() {
-            continue;
-        }
         map.insert(key, value);
     }
     ok(row)
-}
-
-/// Collects the message window `[start, end)` as serialized IR, never holding more than the
-/// window: out-of-window messages pass by as unmaterialized lazy handles, and the stream stops
-/// at `end` (after noting whether a message exists there — the `has_more` probe).
-struct WindowSink {
-    resolver: crate::Resolver,
-    primary: std::path::PathBuf,
-    /// Index of the next message to arrive.
-    idx: usize,
-    start: usize,
-    /// Exclusive window end; `None` streams to EOF.
-    end: Option<usize>,
-    msgs: Vec<Value>,
-    staged: Option<std::io::BufWriter<crate::bytes::ByteStage>>,
-    selected: usize,
-    /// A message at `end` exists (so the window isn't the tail of the session).
-    more: bool,
-    /// Session metadata the stream delivered (codex meta / the parse-bridge), when any did —
-    /// claude's native stream emits none.
-    meta: Option<Value>,
-    fail: Option<anyhow::Error>,
-    capture: bool,
-    checkpoint: Option<(usize, crate::stream::Checkpoint, Option<Value>)>,
-    reads: crate::source::ReadSet,
 }
 
 /// The `session` object a windowed read returns. Whatever a session knows about itself has to
@@ -376,80 +409,6 @@ fn session_meta_json(s: &Session) -> Value {
     meta
 }
 
-impl MessageSink for WindowSink {
-    fn dependency(&mut self, path: &std::path::Path) {
-        self.reads.record(path);
-    }
-    fn wants_checkpoint(&mut self, _: u64) -> bool {
-        self.capture && self.end.is_some_and(|end| end > self.start && self.idx == end)
-    }
-    fn checkpoint(&mut self, checkpoint: &mut crate::stream::Checkpoint) {
-        self.capture = false;
-        if read::bounded_size(&(&*checkpoint, &self.meta)).is_some() {
-            self.checkpoint = Some((self.idx, checkpoint.clone(), self.meta.clone()));
-        }
-    }
-
-    fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.fail.take()
-    }
-
-    fn meta(&mut self, s: &Session) {
-        if self.meta.is_none() {
-            self.meta = Some(session_meta_json(s));
-        }
-    }
-
-    fn message(&mut self, m: Message) -> Flow {
-        read::note_message_sources(&m, &self.primary, &mut self.reads);
-        let idx = self.idx;
-        self.idx += 1;
-        if idx < self.start {
-            return Flow::Continue; // before the window: skip without touching content bytes
-        }
-        if self.end.is_some_and(|e| idx >= e) {
-            self.more = true;
-            return Flow::Stop; // at the window's end: note the existence, read no further
-        }
-        if let Some(stage) = self.staged.as_mut() {
-            use std::io::Write;
-            let result = (|| -> anyhow::Result<()> {
-                if self.selected > 0 {
-                    stage.write_all(b",")?;
-                }
-                m.write_json(stage, &self.resolver)?;
-                Ok(())
-            })();
-            return match result {
-                Ok(()) => {
-                    self.selected += 1;
-                    Flow::Continue
-                }
-                Err(error) => {
-                    self.fail = Some(error);
-                    Flow::Stop
-                }
-            };
-        }
-        let mut m = m;
-        if let Err(error) = m.materialize(&self.resolver) {
-            self.fail = Some(error);
-            return Flow::Stop;
-        }
-        match serde_json::to_value(&m) {
-            Ok(v) => {
-                self.msgs.push(v);
-                self.selected += 1;
-                Flow::Continue
-            }
-            Err(e) => {
-                self.fail = Some(e.into());
-                Flow::Stop
-            }
-        }
-    }
-}
-
 /// `GET /api/session/{harness}/{id}/messages?start=&end=&extra=` — the window `[start, end)` of the
 /// session's messages as IR JSON, without parsing the rest of a huge transcript.
 ///
@@ -461,12 +420,7 @@ impl MessageSink for WindowSink {
 /// `extra=1` additionally keeps each message's harness `extra` map (e.g. `compactMetadata` on a
 /// compaction boundary) and the structured tool-result `details` sidecar — the structure view
 /// pages through with this on to find the seams.
-fn message_window(
-    harness: &str,
-    id: &str,
-    query: &str,
-    staged: bool,
-) -> Result<(SessionRef, WindowSink), (u16, Value)> {
+fn message_window(harness: &str, id: &str, query: &str) -> Result<(SessionRef, WindowSink), (u16, Value)> {
     let params = Query::parse(query);
     // Window bounds must parse cleanly — a typo'd index is a clear 400, not a silent full read.
     let idx_param = |key: &str| params.unsigned(key).map_err(|error| err(400, &error));
@@ -479,11 +433,10 @@ fn message_window(
 
     let (r, adapter) = lookup(harness, id)?;
 
-    let (shell, mut sink) =
-        match read::window_output(read::shared(), adapter.as_ref(), &r, start, end, want_extra, staged) {
-            Ok(value) => value,
-            Err(e) => return Err(err(500, &format!("stream failed: {e:#}"))),
-        };
+    let (shell, mut sink) = match read::window(read::shared(), adapter.as_ref(), &r, start, end, want_extra) {
+        Ok(value) => value,
+        Err(e) => return Err(err(500, &format!("stream failed: {e:#}"))),
+    };
     // Preserve first pushed metadata; readers which never push it use the returned shell.
     if sink.meta.is_none() {
         sink.meta = Some(session_meta_json(&shell));
@@ -503,11 +456,14 @@ fn window_envelope(r: &SessionRef, sink: &WindowSink, messages: Value) -> Value 
 }
 
 fn messages(harness: &str, id: &str, query: &str) -> (u16, Value) {
-    let (r, mut sink) = match message_window(harness, id, query, false) {
+    let (r, mut sink) = match message_window(harness, id, query) {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let messages = Value::Array(std::mem::take(&mut sink.msgs));
+    let messages = match sink.values() {
+        Ok(values) => Value::Array(values),
+        Err(e) => return err(500, &format!("stream failed: {e:#}")),
+    };
     ok(window_envelope(&r, &sink, messages))
 }
 
@@ -521,15 +477,11 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
         Ok(x) => x,
         Err(e) => return e,
     };
-    if events::needs_ingest(&r) {
-        if let Err(e) = events::ingest_ref(&r) {
-            return err(500, &format!("event ingest failed: {e:#}"));
-        }
-    }
-    let out: Vec<Value> = events::events_for(r.harness.as_str(), &r.id, kind.as_deref())
-        .iter()
-        .map(crate::rows::event_row)
-        .collect();
+    let rows = match events::read_ref(&r, kind.as_deref()) {
+        Ok(rows) => rows,
+        Err(e) => return err(500, &format!("event catalog: {e:#}")),
+    };
+    let out: Vec<Value> = rows.iter().map(crate::rows::event_row).collect();
     ok(json!(out))
 }
 
@@ -542,39 +494,29 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
 /// context it can no longer see. `pre_compaction_span` is the `[start, boundary)` range that was
 /// compacted away, in the same numbering `/messages` uses.
 fn compactions(harness: &str, id: &str) -> (u16, Value) {
-    let (r, _) = match lookup(harness, id) {
+    let (r, adapter) = match lookup(harness, id) {
         Ok(x) => x,
         Err(e) => return e,
     };
-    let boundaries = match crate::compaction::detect(&r, true) {
-        Ok(b) => b,
-        Err(e) => return err(500, &format!("compaction scan failed: {e:#}")),
-    };
-    let out: Vec<Value> = (0..boundaries.len())
-        .map(|n| {
-            let mut v = crate::compaction::row(&boundaries, n);
-            if let Some(obj) = v.as_object_mut() {
-                // An addition for the dashboard, never a rename: the CLI's keys stay the CLI's.
-                obj.insert("headline".into(), json!(boundaries[n].headline(n + 1)));
-            }
-            v
-        })
-        .collect();
-    // A bare array, like every other list this API serves.
-    ok(json!(out))
+    match read::compactions(read::shared(), adapter.as_ref(), &r) {
+        Ok(value) => ok(value),
+        Err(e) => err(500, &format!("compaction scan failed: {e:#}")),
+    }
 }
 
 /// `GET /api/touched?path=&edits_only=` — sessions whose tool events touched a file (exact or
-/// suffix path match), newest activity first, as `cv touched --json` rows. Empty on a cold catalog.
+/// suffix path match), newest activity first, as `cv touched --json` rows. Empty on a cold catalog;
+/// a catalog error is a 500, never an empty list.
 fn touched(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     let Some(path) = params.get("path") else {
         return err(400, "missing path parameter");
     };
-    let out: Vec<Value> = crate::events::sessions_touching(&path, params.flag("edits_only"))
-        .iter()
-        .map(crate::rows::touched_row)
-        .collect();
+    let rows = match crate::events::sessions_touching(&path, params.flag("edits_only")) {
+        Ok(rows) => rows,
+        Err(e) => return err(500, &format!("event catalog: {e:#}")),
+    };
+    let out: Vec<Value> = rows.iter().map(crate::rows::touched_row).collect();
     ok(json!(out))
 }
 
@@ -586,20 +528,13 @@ fn subagents(harness: &str, id: &str) -> (u16, Value) {
         Ok(x) => x,
         Err(e) => return e,
     };
-    let out: Vec<Value> = crate::subagent_tree_of(&r)
+    let forest = match crate::subagent_tree_of(&r) {
+        Ok(forest) => forest,
+        Err(error) => return err(500, &format!("forest read failed: {error:#}")),
+    };
+    let out: Vec<Value> = forest
         .iter()
-        .map(|s| {
-            let mut row = crate::rows::session_row(&s.session, size_of(&s.session));
-            let map = row.as_object_mut().expect("session_row is an object");
-            map.insert("agent_id".into(), json!(s.agent_id()));
-            map.insert("agent_type".into(), json!(s.agent_type));
-            map.insert("description".into(), json!(s.description));
-            map.insert("tool_use_id".into(), json!(s.tool_use_id));
-            map.insert("workflow".into(), json!(s.workflow));
-            map.insert("result_status".into(), json!(s.result_status));
-            map.insert("result_summary".into(), json!(s.result_summary));
-            row
-        })
+        .map(|s| crate::rows::subagent_row(s, size_of(&s.session)))
         .collect();
     ok(json!(out))
 }
@@ -613,12 +548,16 @@ fn subagent(harness: &str, parent: &str, agent: &str) -> (u16, Value) {
         Err((404, _)) => return err(404, "parent session not found"),
         Err(e) => return e,
     };
-    let Some(sr) = crate::subagent_tree_filtered_of(&r, crate::SubagentDemand::Sessions, None, |id, _| {
-        id == agent || id.strip_prefix("agent-") == Some(agent)
-    })
-    .into_iter()
-    .find(|s| s.session.id == agent || s.agent_id() == agent)
-    .map(|s| s.session) else {
+    // The full transcript id, Claude's bare `agentId`, or the agent part of a `<parent>/<agent>` id.
+    let forest = crate::subagent_tree_filtered_of(&r, crate::SubagentDemand::Sessions, None, |id, _| {
+        id == agent || id.strip_prefix("agent-") == Some(agent) || id.rsplit_once('/').is_some_and(|(_, a)| a == agent)
+    });
+    let forest = match forest {
+        Ok(forest) => forest,
+        Err(error) => return err(500, &format!("forest read failed: {error:#}")),
+    };
+    // The select closure kept only members whose transcript id names `agent`, so take the first.
+    let Some(sr) = forest.into_iter().next().map(|s| s.session) else {
         return err(404, "subagent not found");
     };
     match complete_session_json(adapter.as_ref(), &sr) {
@@ -731,25 +670,17 @@ fn err(status: u16, msg: &str) -> (u16, Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ParseOptions;
+    use crate::stream::{Flow, MessageSink};
+    use crate::{Demand, Message};
 
     fn window(start: usize, end: Option<usize>) -> WindowSink {
-        WindowSink {
-            resolver: crate::Resolver::new(None),
-            primary: std::path::PathBuf::new(),
-            staged: None,
-            selected: 0,
-            idx: 0,
+        WindowSink::page(
+            std::path::Path::new(""),
             start,
             end,
-            msgs: Vec::new(),
-            more: false,
-            meta: None,
-            fail: None,
-            capture: false,
-            checkpoint: None,
-            reads: crate::source::ReadSet::default(),
-        }
+            false,
+            crate::source::ReadSet::default(),
+        )
     }
 
     #[test]
@@ -773,13 +704,13 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> anyhow::Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> anyhow::Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 reference: &SessionRef,
-                _: &crate::ParseOptions,
+                _: &crate::Demand,
                 sink: &mut dyn crate::MessageSink,
             ) -> anyhow::Result<Session> {
                 sink.dependency(&self.0);
@@ -852,7 +783,7 @@ mod tests {
             Ok(())
         })
         .is_err());
-        assert!(selected.msgs.is_empty());
+        assert_eq!(selected.selected, 0);
         let mut before = window(1, Some(2));
         assert_eq!(before.message(message.clone()), Flow::Continue);
         assert!(before.take_error().is_none());
@@ -886,8 +817,8 @@ mod tests {
         let mut callbacks = 0usize;
         for start in (0..records).step_by(page) {
             let mut sink = window(start, Some(start + page));
-            adapter.try_stream(&r, &ParseOptions::lazy(), &mut sink).unwrap();
-            assert_eq!(sink.msgs.len(), page);
+            adapter.try_stream(&r, &Demand::LEAN.with_spans(), &mut sink).unwrap();
+            assert_eq!(sink.selected, page);
             assert_eq!(sink.more, start + page < records);
             callbacks += sink.idx;
         }
@@ -895,7 +826,7 @@ mod tests {
         assert_eq!(callbacks, expected);
         let mut head_callbacks = 0usize;
         adapter
-            .try_stream(&r, &ParseOptions::lazy(), &mut |_m| {
+            .try_stream(&r, &Demand::LEAN.with_spans(), &mut |_m| {
                 head_callbacks += 1;
                 Flow::Continue
             })
@@ -941,6 +872,9 @@ mod tests {
             assert_eq!(status, 410, "{parts:?}");
             assert!(v["error"].as_str().unwrap().contains("removed in 0.15.0"), "{v}");
         }
+        let (status, v) = route_json(&["api", "backlog"], "");
+        assert_eq!(status, 410);
+        assert!(v["error"].as_str().unwrap().contains("/api/tasks?detail=1"), "{v}");
         assert_eq!(route_json(&["api", "nope"], "").0, 404);
         assert_eq!(route_json(&["api", "sessions"], "harness=warpdrive").0, 400);
     }

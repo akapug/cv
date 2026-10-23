@@ -21,16 +21,57 @@ fn files(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
     Ok(out)
 }
 fn has_sources(session: &Session) -> bool {
-    session.messages.iter().flat_map(|m| &m.content).any(|b| match b {
-        Block::Text { text } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
-            matches!(text, crate::Text::Source(_))
-        }
-        Block::ToolUse { input, .. } => matches!(input, crate::Json::Source(_)),
-        _ => false,
+    session.messages.iter().flat_map(|m| &m.content).any(|block| {
+        block.text().is_some_and(|text| matches!(text, crate::Text::Source(_)))
+            || matches!(
+                block,
+                Block::ToolUse {
+                    input: crate::Json::Source(_),
+                    ..
+                }
+            )
     })
 }
+/// Wire guarantees only one target's preparation can make: the shared walker pins what every
+/// target must match, this hook pins what an individual one promises.
+fn check_target(target: Harness, prepared: &Session, expected: &Session) -> Result<()> {
+    match target {
+        Harness::LmStudio => {
+            let branches = prepared
+                .messages
+                .iter()
+                .filter(|m| m.kind == MessageKind::Branch)
+                .collect::<Vec<_>>();
+            assert_eq!(branches.len(), 2);
+            assert_eq!(
+                branches
+                    .iter()
+                    .map(|m| m.harness_extra(target).unwrap()["variant"].as_u64().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![0, 2]
+            );
+        }
+        Harness::Cline | Harness::Roo => {
+            assert_eq!(
+                prepared
+                    .messages
+                    .iter()
+                    .filter(|m| m.kind == MessageKind::Carrier)
+                    .count(),
+                expected
+                    .messages
+                    .iter()
+                    .filter(|m| m.kind == MessageKind::Carrier)
+                    .count()
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn check(adapter: &dyn Adapter, reference: &SessionRef, target: Harness, output: &Path, source: &Path) -> Result<()> {
-    let expected = crate::stream::collect_with(adapter, reference, &ParseOptions::complete())?;
+    let expected = crate::stream::collect_with(adapter, reference, &Demand::COMPLETE)?;
     assert!(!has_sources(&expected), "public complete must remain owned");
     let prepared = crate::emit::parse_for_emit(adapter, reference, target)?;
     assert!(has_sources(&prepared), "same-target preparation retained no sources");
@@ -43,35 +84,7 @@ fn check(adapter: &dyn Adapter, reference: &SessionRef, target: Harness, output:
         "complete serialized IR mismatch at {:?}",
         old.iter().zip(&new).position(|(a, b)| a != b)
     );
-    if target == Harness::LmStudio {
-        let branches = prepared
-            .messages
-            .iter()
-            .filter(|m| m.kind == MessageKind::Branch)
-            .collect::<Vec<_>>();
-        assert_eq!(branches.len(), 2);
-        assert_eq!(
-            branches
-                .iter()
-                .map(|m| m.harness_extra(target).unwrap()["variant"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![0, 2]
-        );
-    }
-    if matches!(target, Harness::Cline | Harness::Roo) {
-        assert_eq!(
-            prepared
-                .messages
-                .iter()
-                .filter(|m| m.kind == MessageKind::Carrier)
-                .count(),
-            expected
-                .messages
-                .iter()
-                .filter(|m| m.kind == MessageKind::Carrier)
-                .count()
-        );
-    }
+    check_target(target, &prepared, &expected)?;
     for mode in crate::emit::ThinkingMode::ALL {
         let opts = crate::emit::EmitOptions {
             new_id: Some("fixed".into()),

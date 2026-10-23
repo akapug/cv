@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use cv_core::ir::{Harness, Message, SessionRef};
-use cv_core::{Adapter, Flow, MessageSink, ParseOptions};
+use cv_core::{Adapter, Demand, Flow, MessageSink};
 use std::path::Path;
 
 // ---------- exit codes ----------
@@ -41,6 +41,75 @@ pub(crate) fn user_file_claim(path: &Path, force: bool) -> Result<cv_core::publi
 pub(crate) fn write_user_file(path: &Path, bytes: &[u8], force: bool) -> Result<()> {
     let claim = user_file_claim(path, force)?;
     cv_core::publish::publish_reader(path, "out", bytes, claim)
+}
+
+// ---------- waiting ----------
+
+/// Whether a command that could wait does (docs/INTERFACE-V2.md §2, "blocking is opt-in and
+/// announced"): `--follow` or `--for` asks for it, a terminal on stdout permits it, and a pipe
+/// without either gets the current state once. The announcement goes out before the first
+/// discovery, so it lands within a second on a cold fleet too.
+pub(crate) enum Wait {
+    /// Print the current state once and exit 0.
+    Once,
+    /// Keep polling until the `--for` deadline (with the length asked for), or forever.
+    Until(Option<(std::time::Instant, std::time::Duration)>),
+}
+
+impl Wait {
+    pub(crate) fn resolve(follow: bool, for_: Option<&str>) -> Result<Wait> {
+        let bound = for_.map(parse_for).transpose()?;
+        if follow || bound.is_some() || std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            Ok(Wait::Until(bound.map(|d| (std::time::Instant::now() + d, d))))
+        } else {
+            Ok(Wait::Once)
+        }
+    }
+
+    /// The one stderr line: what `cv <cmd>` is waiting for, or how to make it wait.
+    pub(crate) fn announce(&self, cmd: &str, what: &str) {
+        match self {
+            Wait::Once => eprintln!(
+                "cv {cmd}: stdout is not a terminal, so this is the current state once; \
+                 --follow keeps following {what}, --for <duration> bounds it"
+            ),
+            Wait::Until(None) => eprintln!("cv {cmd}: following {what}; stop with Ctrl-C or --for <duration>"),
+            Wait::Until(Some((_, length))) => eprintln!(
+                "cv {cmd}: following {what} for {}; Ctrl-C stops early",
+                fmt_duration(length.as_millis() as u64)
+            ),
+        }
+    }
+
+    /// Whether the `--for` deadline has passed (never, without one).
+    pub(crate) fn expired(&self) -> bool {
+        matches!(self, Wait::Until(Some((deadline, _))) if *deadline <= std::time::Instant::now())
+    }
+
+    /// Sleep one `interval`, cut short by the deadline; false once there is nothing left to wait for.
+    pub(crate) fn pause(&self, interval: std::time::Duration) -> bool {
+        let left = match self {
+            Wait::Once => return false,
+            Wait::Until(None) => interval,
+            Wait::Until(Some((deadline, _))) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                interval.min(left)
+            }
+        };
+        std::thread::sleep(left);
+        true
+    }
+}
+
+/// `--for 30s` / `5m` / `2h` (the task deadline grammar) as a duration; anything else is exit 2.
+fn parse_for(s: &str) -> Result<std::time::Duration> {
+    match cv_core::task::project::parse_duration(s).and_then(|d| d.to_std().ok()) {
+        Some(d) => Ok(d),
+        None => usage(format!("--for wants a duration such as 30s, 5m or 2h, not {s:?}")),
+    }
 }
 
 // ---------- harness / id resolution ----------
@@ -180,21 +249,31 @@ impl WindowArgs {
     }
 }
 
+/// A streaming window either has forward bounds or retains a tail until EOF.
+pub(crate) enum StreamWindow {
+    Range(usize, Option<usize>),
+    Tail(usize),
+}
+
 impl Window {
-    /// Resolve to `[start, end)`; `end == None` means "through the last message".
-    pub(crate) fn bounds(self, total: impl FnOnce() -> Result<usize>) -> Result<(usize, Option<usize>)> {
-        Ok(match self {
-            Window::First(n) => (0, Some(n)),
-            Window::Last(n) => {
-                let total = total()?;
-                (total.saturating_sub(n), None)
-            }
-            Window::Range(a, b) => (a, b),
-            Window::Around { center, context } => (
+    pub(crate) fn streaming(self) -> StreamWindow {
+        match self {
+            Window::First(n) => StreamWindow::Range(0, Some(n)),
+            Window::Last(n) => StreamWindow::Tail(n),
+            Window::Range(a, b) => StreamWindow::Range(a, b),
+            Window::Around { center, context } => StreamWindow::Range(
                 center.saturating_sub(context),
                 Some(center.saturating_add(context).saturating_add(1)),
             ),
-        })
+        }
+    }
+
+    /// Resolve to `[start, end)`; `end == None` means "through the last message".
+    pub(crate) fn bounds(self, total: impl FnOnce() -> Result<usize>) -> Result<(usize, Option<usize>)> {
+        match self.streaming() {
+            StreamWindow::Range(start, end) => Ok((start, end)),
+            StreamWindow::Tail(n) => Ok((total()?.saturating_sub(n), None)),
+        }
     }
 }
 
@@ -254,13 +333,6 @@ fn next_index(n: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Clamp a `[start, end)` window to `len` messages (a past-the-end window is empty, never a panic).
-#[cfg(test)]
-pub(crate) fn clamp(range: (usize, Option<usize>), len: usize) -> (usize, usize) {
-    let end = range.1.unwrap_or(len).min(len);
-    (range.0.min(end), end)
-}
-
 /// The IR message count of a session, by one streamed pass under lazy options (content stays on
 /// disk). `SessionRef::message_count` counts conversational turns only, so `--last N` can't use it.
 pub(crate) fn count_messages(adapter: &dyn Adapter, r: &SessionRef) -> Result<usize> {
@@ -272,7 +344,7 @@ pub(crate) fn count_messages(adapter: &dyn Adapter, r: &SessionRef) -> Result<us
         }
     }
     let mut c = Count(0);
-    adapter.try_stream(r, &ParseOptions::lazy(), &mut c)?;
+    adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut c)?;
     Ok(c.0)
 }
 
@@ -338,6 +410,8 @@ pub(crate) fn dim_cwd(p: Option<&Path>) -> String {
     p.map(home_rel).unwrap_or_else(|| "(no cwd)".into())
 }
 
+pub(crate) use cv_core::harness::shell_quote;
+
 pub(crate) fn dirs_home() -> Option<std::path::PathBuf> {
     cv_core::env::var_os("HOME").map(std::path::PathBuf::from)
 }
@@ -357,7 +431,8 @@ pub(crate) fn report(json: bool, human: &str, value: &serde_json::Value) -> Resu
 
 /// Dry-run honesty for a `--json` report: nothing was written, so every `paths` key is null, and
 /// the `minted` keys (the new id and what derives from it) are null too unless `--to` pinned the
-/// id — the core mints a throwaway id a real run would NOT reuse. `note` says which.
+/// id — the core mints a throwaway id a real run would NOT reuse. `note` says which; it is part of
+/// every report's shape (the `cv recipes` key list names it), null on a real run.
 pub(crate) fn dry_run_nulls(v: &mut serde_json::Value, pinned: bool, paths: &[&str], minted: &[&str]) {
     v["note"] = serde_json::Value::Null;
     if v["dry_run"] != true {
@@ -377,6 +452,19 @@ pub(crate) fn dry_run_nulls(v: &mut serde_json::Value, pinned: bool, paths: &[&s
         "dry run — nothing written; a real run mints a fresh session id (pass --to to pin one)"
     }
     .into();
+}
+
+/// `--interval <SECONDS>` on `scry` and `watch`: finite and not negative (a usage error, never a
+/// silent clamp); a positive value below the quarter-second floor polls at the floor.
+pub(crate) fn poll_interval(seconds: f64) -> Result<std::time::Duration> {
+    if !seconds.is_finite() {
+        return usage("--interval must be finite");
+    }
+    if seconds < 0.0 {
+        return usage(format!("--interval must not be negative (got {seconds})"));
+    }
+    std::time::Duration::try_from_secs_f64(seconds.max(0.25))
+        .map_err(|_| UsageError("--interval exceeds the supported duration".into()).into())
 }
 
 /// `--thinking <native|text|drop>`: what an emit does with the model's reasoning on the way out.
@@ -522,9 +610,6 @@ mod tests {
             ..Default::default()
         };
         assert!(bad.window().is_err());
-        assert_eq!(clamp((10, Some(20)), 5), (5, 5)); // past the end → empty, not a panic
-        assert_eq!(clamp((2, None), 5), (2, 5));
-        assert_eq!(clamp((0, Some(3)), 5), (0, 3));
     }
 
     #[test]
@@ -552,7 +637,7 @@ mod tests {
             title: None,
             created_at: None,
             updated_at: None,
-            message_count: 3,
+            message_count: Some(3),
         };
         let v = session_row(&r, Some(10));
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
@@ -573,5 +658,26 @@ mod tests {
         );
         assert!(v["title"].is_null(), "missing title is an explicit null");
         assert_eq!(v["size_bytes"], 10);
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn interval_rejects_negative_nonfinite_and_overflow_without_panicking() {
+        for seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -1.0, -0.001] {
+            assert!(
+                poll_interval(seconds)
+                    .unwrap_err()
+                    .downcast_ref::<UsageError>()
+                    .is_some(),
+                "{seconds}"
+            );
+        }
+        assert_eq!(poll_interval(0.0).unwrap(), Duration::from_millis(250));
+        assert_eq!(poll_interval(1.5).unwrap(), Duration::from_millis(1500));
     }
 }

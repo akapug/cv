@@ -1,53 +1,68 @@
 //! Bounded semantic body and label projections; no embedding model is needed to test them.
+use anyhow::{Context, Result};
 #[cfg(test)]
 use cv_core::Text;
 use cv_core::{Block, Flow, Message, MessageSink, Resolver, Role};
 
-const EMBED_HEAD_BYTES: usize = 64 * 1024;
-const FIRST_USER_RAW_HEAD: u64 = 512;
-const LABEL_CHARS: usize = 73; // label_from reads 72 characters plus one for its ellipsis.
+/// Read only the semantic projection demanded for one discovered session.
+/// `head` bytes of the body are read: what the model embeds ([`crate::semantic`]'s `input_chars`).
+pub(crate) fn read_corpus_doc(r: &cv_core::SessionRef, head: usize) -> Result<(Doc, cv_core::source::ReadSet)> {
+    let adapter = cv_core::harness::for_harness(r.harness).with_context(|| format!("no adapter for {}", r.harness))?;
+    let mut sink = DocSink::for_ref(r, &*adapter, head);
+    let meta = cv_core::stream::stream_counted(
+        &*adapter,
+        r,
+        &cv_core::Demand::LEAN.with_spans(),
+        &mut sink,
+        cv_core::stream::Pass::RECORD,
+    )
+    .with_context(|| format!("reading semantic corpus session {} ({})", r.id, r.harness))?
+    .session;
+    let title = cv_core::label_from(meta.title.as_deref(), sink.first_prompt.as_deref());
+    Ok((
+        Doc {
+            title: Some(title),
+            body: sink.body.into_string(),
+        },
+        sink.reads,
+    ))
+}
+
+/// What the **semantic** path ([`semantic::embed_all`]) distills from one session beside the
+/// discovered [`cv_core::SessionRef`] it embeds: the label hits show and the body it embeds.
+#[derive(Debug, Clone)]
+pub(crate) struct Doc {
+    pub title: Option<String>,
+    pub body: String,
+}
 
 use cv_core::projection::Head;
 
-/// Message::text's joining and non-whitespace test, retaining only the label's required chars.
-/// Inline whitespace beyond the head still counts when deciding which user message is first.
-#[derive(Default)]
-struct UserLabel {
-    head: String,
-    chars: usize,
-    joined_nonempty: bool,
-    meaningful: bool,
-}
-impl UserLabel {
-    fn push(&mut self, text: &str) {
-        if self.joined_nonempty {
-            self.keep("\n");
-        }
-        self.keep(text);
-        self.joined_nonempty |= !text.is_empty();
-        self.meaningful |= !text.trim().is_empty();
-    }
-    fn keep(&mut self, text: &str) {
-        for ch in text.chars().take(LABEL_CHARS - self.chars) {
-            self.head.push(ch);
-            self.chars += 1;
-        }
-    }
-}
-
+/// What a session's vector is made of: the head of its own exchange, as far as the model reads it
+/// ([`cv_core::MessageKind::is_exchange`], minus turns a fork copied from its source), as the
+/// full-text `body` field holds it, and its first [`cv_core::Message::prompt_title`].
 pub(super) struct DocSink {
     pub(super) body: Head,
-    pub(super) first_user_text: Option<String>,
+    pub(super) first_prompt: Option<String>,
+    /// Turns stamped before this were copied from another session ([`cv_core::Adapter::copied_before`]).
+    pub(super) copied_before: Option<chrono::DateTime<chrono::Utc>>,
     pub(super) reads: cv_core::source::ReadSet,
     resolver: Resolver,
     error: Option<anyhow::Error>,
     failed: bool,
 }
 impl DocSink {
-    pub(super) fn new(resolver: Resolver) -> Self {
+    fn for_ref(r: &cv_core::SessionRef, adapter: &dyn cv_core::Adapter, head: usize) -> Self {
+        let mut sink = Self::new(Resolver::new(Some(r.path.clone())), head);
+        sink.copied_before = adapter.copied_before(r, &mut sink);
+        sink
+    }
+
+    pub(super) fn new(resolver: Resolver, head: usize) -> Self {
         Self {
-            body: Head::new(EMBED_HEAD_BYTES),
-            first_user_text: None,
+            body: Head::new(head),
+            first_prompt: None,
+            copied_before: None,
             reads: Default::default(),
             resolver,
             error: None,
@@ -70,73 +85,44 @@ impl DocSink {
             cv_core::Text::Inline(_) => {}
         }
     }
-    /// Message::append_searchable's projection, plus persisted-output heads, within one budget.
-    fn append_searchable(&mut self, message: &Message) {
-        for block in &message.content {
-            if self.body.full() {
-                break;
+}
+
+impl cv_core::projection::Searchable for DocSink {
+    fn full(&self) -> bool {
+        self.body.full()
+    }
+    fn str(&mut self, text: &str) {
+        self.body.push(text);
+    }
+    fn text(&mut self, text: &cv_core::Text, resolver: &Resolver, _: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        self.read_text(text);
+        self.body.try_push_text(text, resolver)
+    }
+    fn json(&mut self, input: &cv_core::Json, _: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        if !self.body.full() {
+            if let cv_core::Json::Source(range) = input {
+                self.reads.record(range.path());
+                if let Some(reads) = range.dependencies() {
+                    self.reads.merge(reads);
+                }
             }
-            match block {
-                Block::Text { text } | Block::Thinking { text, .. } => {
-                    self.read_text(text);
-                    if let Err(error) = self.body.try_push_text(text, &self.resolver) {
-                        self.error = Some(error);
-                        return;
-                    }
-                    self.body.push("\n");
-                }
-                Block::ToolUse { name, input, .. } => {
-                    self.body.push(name);
-                    self.body.push(" ");
-                    if !self.body.full() {
-                        if let cv_core::json::Json::Source(range) = input {
-                            self.reads.record(range.path());
-                            if let Some(reads) = range.dependencies() {
-                                self.reads.merge(reads);
-                            }
-                        }
-                        if let Err(error) = self.body.push_json(input) {
-                            self.error = Some(error);
-                            return;
-                        }
-                    }
-                    self.body.push("\n");
-                }
-                Block::ToolResult { content, .. } => {
-                    self.read_text(content);
-                    if let Err(error) = self.body.try_push_text(content, &self.resolver) {
-                        self.error = Some(error);
-                        return;
-                    }
-                    self.body.push("\n");
-                    if !self.body.full() {
-                        if let Some(path) = block.persisted_output_path() {
-                            self.reads.record(std::path::Path::new(path));
-                            match cv_core::lazy::read_head_checked(std::path::Path::new(path), self.body.remaining()) {
-                                Ok(Some(text)) => {
-                                    self.body.push(&text);
-                                    self.body.push("\n");
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    self.error = Some(error);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-                Block::File { path, source, .. } => {
-                    if let Some(path) = path.as_deref().or(source.as_deref()) {
-                        self.body.push(path);
-                        self.body.push("\n");
-                    }
-                }
-                Block::Image { .. } => {}
+            self.body.push_json(input)?;
+        }
+        Ok(())
+    }
+    fn after_block(&mut self, block: &Block) -> Result<()> {
+        if let Some(path) = block.persisted_output_path() {
+            self.reads.record(std::path::Path::new(path));
+            let head = cv_core::lazy::read_head_checked(std::path::Path::new(path), self.body.remaining())?;
+            if let Some(text) = head.indexed_text(path) {
+                self.body.push(&text);
+                self.body.push("\n");
             }
         }
+        Ok(())
     }
 }
+
 impl MessageSink for DocSink {
     fn dependency(&mut self, path: &std::path::Path) {
         self.reads.record(path);
@@ -153,26 +139,28 @@ impl MessageSink for DocSink {
         if self.failed || self.error.is_some() {
             return Flow::Stop;
         }
-        if self.first_user_text.is_none() && message.role == Role::User {
-            let mut label = UserLabel::default();
+        // Role is only a coarse gate; prompt_title below rejects non-prompt message kinds.
+        if self.first_prompt.is_none() && message.role == Role::User {
             for block in &message.content {
                 if let Block::Text { text } = block {
                     self.read_text(text);
-                    match text.try_resolve_prefix(&self.resolver, FIRST_USER_RAW_HEAD) {
-                        Ok(text) => label.push(&text),
-                        Err(error) => {
-                            self.error = Some(error);
-                            return Flow::Stop;
-                        }
-                    }
                 }
             }
-            if label.meaningful {
-                self.first_user_text = Some(label.head);
+            match message.prompt_title(&self.resolver) {
+                Ok(title) => self.first_prompt = title,
+                Err(error) => {
+                    self.error = Some(error);
+                    return Flow::Stop;
+                }
             }
         }
-        self.append_searchable(&message);
-        if self.error.is_some() || (self.body.full() && self.first_user_text.is_some()) {
+        let copied = matches!((message.timestamp, self.copied_before), (Some(at), Some(before)) if at < before);
+        if message.kind.is_exchange() && !copied {
+            let resolver = std::mem::replace(&mut self.resolver, Resolver::new(None));
+            self.error = cv_core::projection::searchable(&message.content, &resolver, self, &mut || Ok(())).err();
+            self.resolver = resolver;
+        }
+        if self.error.is_some() || (self.body.full() && self.first_prompt.is_some()) {
             Flow::Stop
         } else {
             Flow::Continue
@@ -184,6 +172,9 @@ impl MessageSink for DocSink {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A head size for these tests; production derives it from the model (`input_chars`).
+    const TEST_HEAD: usize = 64 * 1024;
 
     fn text(value: impl Into<String>) -> Block {
         Block::Text {
@@ -204,7 +195,7 @@ mod tests {
         message
     }
     fn sink() -> DocSink {
-        DocSink::new(Resolver::new(None))
+        DocSink::new(Resolver::new(None), TEST_HEAD)
     }
     fn prefix(text: &str, limit: usize) -> &str {
         let mut end = limit.min(text.len());
@@ -241,12 +232,9 @@ mod tests {
                 Flow::Stop
             );
             assert!(projected.take_error().is_none());
-            assert_eq!(projected.body.as_str(), prefix(&decoded, EMBED_HEAD_BYTES));
-            assert!(projected.body.capacity() <= EMBED_HEAD_BYTES);
-            assert_eq!(
-                projected.first_user_text.as_deref(),
-                Some(decoded.chars().take(LABEL_CHARS).collect::<String>().as_str())
-            );
+            assert_eq!(projected.body.as_str(), prefix(&decoded, TEST_HEAD));
+            assert!(projected.body.capacity() <= TEST_HEAD);
+            assert_eq!(projected.first_prompt, Some(cv_core::ir::truncate(&decoded, 80)));
             assert!(projected.reads.fresh(&mut cv_core::source::Probe::default()));
             std::fs::write(dependency, "dependency changed or appeared").unwrap();
             assert!(!projected.reads.fresh(&mut cv_core::source::Probe::default()));
@@ -330,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_optional_output_absence_is_allowed_but_present_read_failure_is_not() {
+    fn semantic_optional_output_absent_or_unreadable_leaves_the_session_readable() {
         let dir = std::env::temp_dir().join(format!("cv-semantic-output-error-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
         let block = |path: &std::path::Path| Block::ToolResult {
@@ -345,12 +333,18 @@ mod tests {
         absent.message(message(Role::Assistant, vec![block(&dir.join("missing"))]));
         assert!(absent.take_error().is_none());
         assert_eq!(absent.body.as_str(), "stub\n");
+        // Not a regular file: the output is noted as unreadable and the session read on.
         let mut unreadable = sink();
         assert!(matches!(
             unreadable.message(message(Role::Assistant, vec![block(&dir)])),
-            Flow::Stop
+            Flow::Continue
         ));
-        assert!(unreadable.take_error().is_some());
+        assert!(unreadable.take_error().is_none());
+        assert!(
+            unreadable.body.as_str().contains("unreadable"),
+            "{}",
+            unreadable.body.as_str()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -362,14 +356,14 @@ mod tests {
         let text_path = dir.join("text");
         let sidecar = dir.join("missing");
         std::fs::write(&json_path, "{\"arg\":true}").unwrap();
-        std::fs::write(&text_path, "label").unwrap();
+        std::fs::write(&text_path, "\"label\"").unwrap();
         let mut m = message(
             Role::User,
             vec![
                 Block::Text {
                     text: Text::Span(cv_core::Span {
                         source: Some(text_path.clone()),
-                        offset: 0,
+                        offset: 1,
                         len: 5,
                         escaped: false,
                     }),
@@ -404,8 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_head_matches_materialized_projection_and_labels() {
-        // Independent owned projection; fake embedding consumer reads the same resulting head.
+    fn semantic_head_has_canonical_blocks_and_prompt_label() {
         let messages = [
             message(
                 Role::Assistant,
@@ -426,22 +419,15 @@ mod tests {
             ),
             message(Role::User, vec![text(""), text("first\nuser"), text("second")]),
         ];
-        let mut expected = String::new();
         let mut actual = sink();
-        for m in &messages {
-            m.append_searchable(&mut expected).unwrap();
-            actual.message(m.clone());
+        for m in messages {
+            actual.message(m);
         }
-        assert_eq!(actual.body.as_str(), expected);
         assert_eq!(
-            cv_core::label_from(None, actual.first_user_text.as_deref()),
-            cv_core::label_from(None, messages[1].text().as_deref())
+            actual.body.as_str(),
+            "tool {\"a\":[1,true,\"é\\n\\\"\"],\"z\":null}\nthought\na.rs\n\nfirst\nuser\nsecond\n"
         );
-        let fake_embed = |body: &str| {
-            body.bytes()
-                .fold(0u64, |sum, byte| sum.wrapping_mul(31).wrapping_add(byte as u64))
-        };
-        assert_eq!(fake_embed(actual.body.as_str()), fake_embed(&expected));
+        assert_eq!(actual.first_prompt.as_deref(), Some("first user second"));
     }
 
     #[test]
@@ -499,12 +485,9 @@ mod tests {
             ] {
                 let mut actual = sink();
                 actual.message(message(Role::User, vec![content]));
-                assert!(actual.body.len() <= EMBED_HEAD_BYTES);
-                assert_eq!(actual.body.capacity(), EMBED_HEAD_BYTES);
-                assert!(actual
-                    .first_user_text
-                    .as_ref()
-                    .is_none_or(|text| text.len() <= LABEL_CHARS * 4));
+                assert!(actual.body.len() <= TEST_HEAD);
+                assert_eq!(actual.body.capacity(), TEST_HEAD);
+                assert!(actual.first_prompt.is_none_or(|text| text.chars().count() <= 80));
             }
         }
     }
@@ -530,25 +513,68 @@ mod tests {
     }
 
     #[test]
-    fn semantic_head_first_user_is_bounded_across_blocks_and_late_whitespace() {
-        for blocks in [
-            vec![text(" ".repeat(10000)), text("late")],
-            vec![text("α".repeat(10000)), text("tail")],
-            (0..1000).map(|_| text("a")).collect(),
-            vec![text(""), text(""), text("hello")],
-        ] {
-            let m = message(Role::User, blocks);
-            let expected = cv_core::label_from(None, m.text().as_deref());
-            let mut actual = sink();
-            actual.message(m);
-            assert_eq!(cv_core::label_from(None, actual.first_user_text.as_deref()), expected);
-            assert!(actual.first_user_text.unwrap().len() <= LABEL_CHARS * 4);
-        }
+    fn semantic_head_embeds_the_exchange_and_titles_the_first_prompt() {
+        let mut instructions = message(Role::User, vec![text("# AGENTS.md instructions for /work")]);
+        instructions.kind = cv_core::MessageKind::InjectedContext;
         let mut actual = sink();
+        actual.message(instructions);
         actual.message(message(Role::User, vec![text(" ".repeat(10000))]));
-        assert!(actual.first_user_text.is_none());
+        assert!(actual.first_prompt.is_none());
         actual.message(message(Role::User, vec![text("chosen")]));
-        assert_eq!(actual.first_user_text.as_deref(), Some("chosen"));
+        assert_eq!(actual.first_prompt.as_deref(), Some("chosen"));
+        assert!(!actual.body.as_str().contains("AGENTS.md"));
+        assert!(actual.body.as_str().contains("chosen"));
+    }
+
+    #[test]
+    fn semantic_transcript_head_is_independent_of_json_escaping() {
+        let world = cv_testkit::World::new("semantic-decoded-head");
+        for scalar in ["x", "\\u0078"] {
+            let path = world.proj.join("session.jsonl");
+            let raw = scalar.repeat(100_000);
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"user\",\"uuid\":\"u\",\"sessionId\":\"head\",\"message\":{{\"role\":\"user\",\"content\":\"{raw}\"}}}}\n"
+                ),
+            )
+            .unwrap();
+            let r = cv_core::SessionRef::new("head", cv_core::Harness::Claude, &path);
+            let (doc, reads) = read_corpus_doc(&r, TEST_HEAD).unwrap();
+            assert_eq!(doc.body.len(), 64 * 1024);
+            assert!(doc.body.bytes().all(|byte| byte == b'x'));
+            assert!(reads.fresh(&mut cv_core::source::Probe::default()));
+        }
+    }
+
+    /// The committed Claude corpus copies one CLAUDE.md into 18 transcripts; a vector embeds it
+    /// only where the exchange says it (`dfa91e7c`'s reply quotes it), and the fork's copied
+    /// turns (`b3a058ca`) are its source's alone, as the full-text `body` field holds them.
+    #[test]
+    fn corpus_semantic_bodies_embed_the_exchange_not_copied_instructions() {
+        let home = cv_testkit::temp_dir("semantic-corpus-home");
+        let scope = (*cv_core::env::Env::current()).clone().enter();
+        scope.set("CLUSTERVISION_HOME", &home);
+        let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cv-core/tests/corpus/claude/2.1.296/.claude/projects/-home-corpus-project");
+        let mut quoted = Vec::new();
+        for path in std::fs::read_dir(&project).unwrap().map(|e| e.unwrap().path()) {
+            if path.extension().is_none_or(|x| x != "jsonl") {
+                continue;
+            }
+            let id = path.file_stem().unwrap().to_str().unwrap().to_owned();
+            let r = cv_core::SessionRef::new(&id, cv_core::Harness::Claude, &path);
+            let (doc, _) = crate::read_corpus_doc(&r, TEST_HEAD).unwrap();
+            if doc.body.contains("corpus test repository") {
+                quoted.push(id[..8].to_owned());
+            }
+            if id.starts_with("b3a058ca") {
+                assert!(!doc.body.contains("Which language did you use first"), "a copied turn");
+            }
+        }
+        assert_eq!(quoted, ["dfa91e7c"]);
+        drop(scope);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -572,7 +598,7 @@ mod tests {
             Flow::Continue
         ));
         let projected = format!("stub\n{output}\n");
-        assert_eq!(actual.body.as_str(), prefix(&projected, EMBED_HEAD_BYTES));
+        assert_eq!(actual.body.as_str(), prefix(&projected, TEST_HEAD));
         assert!(actual.body.full());
         let saved = actual.body.as_str().to_owned();
         assert!(matches!(
@@ -580,41 +606,37 @@ mod tests {
             Flow::Stop
         ));
         assert_eq!(actual.body.as_str(), saved);
-        assert_eq!(actual.first_user_text.as_deref(), Some("label"));
+        assert_eq!(actual.first_prompt.as_deref(), Some("label"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn semantic_head_lazy_spans_keep_raw_prefix_and_bound_lossy_expansion() {
+    fn semantic_head_lazy_spans_keep_a_bounded_prefix() {
         let dir = std::env::temp_dir().join(format!("cv-semantic-head-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
-        for (escaped, bytes) in [(true, b"\\u0061".repeat(20000)), (false, vec![0xff; 100000])] {
+        // A span covers a JSON string's body.
+        for (escaped, bytes) in [(true, b"\\u0061".repeat(20000)), (false, vec![b'a'; 100000])] {
             let path = dir.join("source");
-            std::fs::write(&path, &bytes).unwrap();
+            std::fs::write(&path, [&b"\""[..], &bytes, b"\""].concat()).unwrap();
             let resolver = Resolver::new(Some(path));
             let span = cv_core::Span {
                 source: None,
-                offset: 0,
+                offset: 1,
                 len: bytes.len() as u64,
                 escaped,
             };
-            let expected = resolver.try_resolve_prefix(&span, EMBED_HEAD_BYTES as u64).unwrap();
-            let mut actual = DocSink::new(Resolver::new(Some(dir.join("source"))));
-            let expected_label = cv_core::label_from(
-                None,
-                Some(&resolver.try_resolve_prefix(&span, FIRST_USER_RAW_HEAD).unwrap()),
-            );
-            actual.message(message(Role::User, vec![Block::Text { text: Text::Span(span) }]));
-            let mut projected = prefix(&expected, EMBED_HEAD_BYTES).to_owned();
-            if projected.len() < EMBED_HEAD_BYTES && expected.len() <= EMBED_HEAD_BYTES {
+            let expected = resolver.try_resolve_prefix(&span, TEST_HEAD as u64).unwrap();
+            let mut actual = DocSink::new(Resolver::new(Some(dir.join("source"))), TEST_HEAD);
+            let prompt = message(Role::User, vec![Block::Text { text: Text::Span(span) }]);
+            let expected_label = prompt.prompt_title(&resolver).unwrap();
+            actual.message(prompt);
+            let mut projected = prefix(&expected, TEST_HEAD).to_owned();
+            if projected.len() < TEST_HEAD && expected.len() <= TEST_HEAD {
                 projected.push('\n');
             }
             assert_eq!(actual.body.as_str(), projected);
-            assert!(actual.body.len() <= EMBED_HEAD_BYTES);
-            assert_eq!(
-                cv_core::label_from(None, actual.first_user_text.as_deref()),
-                expected_label
-            );
+            assert!(actual.body.len() <= TEST_HEAD);
+            assert_eq!(actual.first_prompt, expected_label);
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

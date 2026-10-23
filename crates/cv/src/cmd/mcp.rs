@@ -30,18 +30,18 @@
 //! 2. **Hand-written, MCP-only** — the two tools with no CLI equivalent, because they block or
 //!    hold a cursor:
 //!    - `await_omen(regex, …)` — block until another agent's session emits a matching message.
-//!    - `observe_stream(cwd_contains?, harness?, since_cursor?, max_messages=50, char_cap?)` — the
+//!    - `observe_stream(cwd_contains?, harness?, since_cursor?, max_messages?, char_cap?)` — the
 //!      non-blocking sibling: drains the *newly-appended* messages since an opaque cursor and
 //!      returns immediately with a fresh cursor, so a senior agent can poll a junior's activity on
-//!      its own cadence. Bounded + read-only.
+//!      its own cadence. Everything appended by default; the caller's bounds are stated in the
+//!      output. Read-only.
 //!
-//! `show` is windowed by default over MCP (`--last 50 --max-bytes 200000`) so a whole transcript is
-//! never what an agent accidentally pulls into its context.
+//! `show` returns what `cv show` does: the whole transcript unless the caller windows it.
 
 use super::mcp_tools::CliTools;
 use anyhow::Context as _;
 use cv_core::scan::{ceil_char, floor_char};
-use cv_core::watch::{Cursor, Filter, Watcher};
+use cv_core::watch::{Cursor, Filter, Poll, Readers, Watcher};
 use cv_core::Harness;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -239,7 +239,13 @@ pub(crate) fn cmd_mcp(tree: clap::Command) -> anyhow::Result<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
-    eprintln!("cv mcp: clustervision MCP server starting (stdio JSON-RPC)");
+    let on_terminal = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        "; stdin is a terminal: one JSON-RPC request per line, Ctrl-D stops it (a host registers it with \
+         `claude mcp add clustervision -- /abs/path/to/cv mcp`)"
+    } else {
+        ""
+    };
+    eprintln!("cv mcp: clustervision MCP server starting (stdio JSON-RPC){on_terminal}");
     let generated = match CliTools::from_owned_tree(tree) {
         Ok(c) => {
             eprintln!("cv mcp: generated {} tools from the CLI", c.commands().len());
@@ -352,7 +358,12 @@ pub(crate) fn cmd_mcp(tree: clap::Command) -> anyhow::Result<()> {
             }
             continue;
         }
-        let blocking = params.as_ref().and_then(|p| p.get("name")).and_then(Value::as_str) == Some("await_omen");
+        let blocking = params
+            .as_ref()
+            .and_then(|p| p.get("name"))
+            .and_then(Value::as_str)
+            .and_then(NativeTool::find)
+            .is_some_and(NativeTool::blocking);
         let admission = if blocking { &polls } else { &ordinary };
         // Side-effect notifications wait: silently dropping them would change the protocol.
         let Some(permit) = admission.acquire(id.is_none(), &cancelled) else {
@@ -589,8 +600,8 @@ fn instructions() -> String {
         "clustervision lets you read OTHER agents' sessions across harnesses and time. \
          Start with `ls` (add `cwd` to see what happened — or is happening — in the current project, \
          `query` for the filter calculus) and `search` for a past conversation by content; then `show` \
-         a transcript (windowed by default: `last` 50 messages, `max_bytes` 200000 — pass `first`, \
-         `last`, `range`, `around`+`context` or `max_bytes` to move the window) and `cat` one tool \
+         a transcript (whole by default — pass `first`, `last`, `range`, `around`+`context` or \
+         `max_bytes` to window it) and `cat` one tool \
          call's full output by its tool_use_id. `pack` builds task-relevant context out of the whole \
          corpus; `doctor` explains why a session's context window keeps filling; `workflow`, `show` \
          with `tree` or `subagents` open up sub-agent forests, and `show` with `kind` reads only what \
@@ -605,7 +616,9 @@ fn instructions() -> String {
 }
 
 /// Every tool: the CLI-generated commands first (they are the ones an agent reaches for), then the
-/// hand-written MCP-only tools. A generated name never shadows a hand-written one.
+/// hand-written MCP-only tools. A generated name never shadows a hand-written one, and none is
+/// dropped for colliding: `no_generated_tool_is_shadowed_by_a_hand_written_one` keeps the two
+/// name sets disjoint, so the filter below removes nothing in a released binary.
 fn tool_list() -> Value {
     let mut tools = base_tool_list();
     let Value::Array(list) = &mut tools else {
@@ -627,38 +640,74 @@ fn tool_list() -> Value {
     tools
 }
 
-pub(crate) fn base_tool_list() -> Value {
-    json!([
-        {
-            "name": "await_omen",
-            "description": "Block until another agent's session emits a message matching a regex, then return it. Watches live for new/appended messages (text, thinking, or tool results) across harnesses. Use to wait on a sibling agent — e.g. await_omen(regex='BUILD (PASSED|FAILED)', cwd_contains='/myproj'). Returns when matched or when timeout_secs elapses.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "regex": { "type": "string", "description": "Rust regex to match against newly-emitted message text." },
-                    "harness": { "type": "string", "description": "Only watch this harness." },
-                    "cwd_contains": { "type": "string", "description": "Only watch sessions whose cwd contains this substring." },
-                    "timeout_secs": { "type": "number", "description": "Give up after this many seconds (default 120)." },
-                    "interval_secs": { "type": "number", "description": "Poll interval (default 2)." }
-                },
-                "required": ["regex"]
-            }
-        },
-        {
-            "name": "observe_stream",
-            "description": "The NON-BLOCKING sibling of await_omen: drain the newly-appended messages from another agent's session(s) since an opaque cursor and return IMMEDIATELY with a fresh cursor — so a senior orchestrator can poll a junior agent's live activity on its own cadence (await_omen blocks until ONE regex matches; observe_stream tails the incremental stream of everything). The first call (no cursor) records a baseline and returns no backlog — pass the returned cursor to the next call to get only what was appended since. Read-only (never writes the board); bounded by max_messages + char_cap. Scope it with cwd_contains and/or harness, e.g. observe_stream(cwd_contains='/junior-proj').",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "cwd_contains": { "type": "string", "description": "Only observe sessions whose recorded cwd contains this substring." },
-                    "harness": { "type": "string", "description": "Only observe this harness (any name `cv ls --harness` takes)." },
-                    "since_cursor": { "type": "string", "description": "Opaque cursor from a previous observe_stream call. Omit on the first call to start from the current tail (baseline; returns no messages)." },
-                    "max_messages": { "type": "number", "description": "Max messages to return this call (default 50). Remaining unread messages are reported as more_pending; poll again with the returned cursor to drain them." },
-                    "char_cap": { "type": "number", "description": "Optional cap on total characters of message text returned; the last message is truncated to fit (default 16000)." }
-                }
-            }
+#[derive(Clone, Copy)]
+enum NativeTool {
+    AwaitOmen,
+    ObserveStream,
+}
+
+impl NativeTool {
+    const ALL: [Self; 2] = [Self::AwaitOmen, Self::ObserveStream];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::AwaitOmen => "await_omen",
+            Self::ObserveStream => "observe_stream",
         }
-    ])
+    }
+
+    fn find(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.name() == name)
+    }
+
+    fn blocking(self) -> bool {
+        matches!(self, Self::AwaitOmen)
+    }
+
+    fn call(self, args: &Value, cancelled: Cancellation<'_>) -> anyhow::Result<String> {
+        match self {
+            Self::AwaitOmen => await_omen(args, cancelled),
+            Self::ObserveStream => observe_stream(args, cancelled),
+        }
+    }
+
+    fn descriptor(self) -> Value {
+        match self {
+            Self::AwaitOmen => json!(        {
+                "name": self.name(),
+                "description": "Block until another agent's session emits a message matching a regex, then return it. Watches live for new/appended messages (text, thinking, or tool results) across harnesses. Use to wait on a sibling agent — e.g. await_omen(regex='BUILD (PASSED|FAILED)', cwd_contains='/myproj'). Returns when matched or when timeout_secs elapses.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "regex": { "type": "string", "description": "Rust regex to match against newly-emitted message text." },
+                        "harness": { "type": "string", "description": "Only watch this harness." },
+                        "cwd_contains": { "type": "string", "description": "Only watch sessions whose cwd contains this substring." },
+                        "timeout_secs": { "type": "number", "description": "Give up after this many seconds (default 120)." },
+                        "interval_secs": { "type": "number", "description": "Poll interval (default 2)." }
+                    },
+                    "required": ["regex"]
+                }
+            }),
+            Self::ObserveStream => json!(        {
+                "name": self.name(),
+                "description": "The NON-BLOCKING sibling of await_omen: drain the newly-appended messages from another agent's session(s) since an opaque cursor and return IMMEDIATELY with a fresh cursor — so a senior orchestrator can poll a junior agent's live activity on its own cadence (await_omen blocks until ONE regex matches; observe_stream tails the incremental stream of everything). The first call (no cursor) records a baseline and returns no backlog — pass the returned cursor to the next call to get only what was appended since. Read-only (never writes the board). Returns everything appended unless max_messages or char_cap bounds it. Scope it with cwd_contains and/or harness, e.g. observe_stream(cwd_contains='/junior-proj').",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cwd_contains": { "type": "string", "description": "Only observe sessions whose recorded cwd contains this substring." },
+                        "harness": { "type": "string", "description": "Only observe this harness (any name `cv ls --harness` takes)." },
+                        "since_cursor": { "type": "string", "description": "Opaque cursor from a previous observe_stream call. Omit on the first call to start from the current tail (baseline; returns no messages)." },
+                        "max_messages": { "type": "number", "description": "Max messages to return this call (default: all). Remaining unread messages are reported as more_pending; poll again with the returned cursor to drain them." },
+                        "char_cap": { "type": "number", "description": "Cap on total characters of message text returned (default: none). The message that crosses it is cut, ends in …, and is counted in `truncated`; the cursor moves past it." }
+                    }
+                }
+            }),
+        }
+    }
+}
+
+pub(crate) fn base_tool_list() -> Value {
+    Value::Array(NativeTool::ALL.into_iter().map(NativeTool::descriptor).collect())
 }
 
 fn ok_response(id: Value, result: Value) -> Value {
@@ -763,9 +812,10 @@ enum ToolOutput {
     Command(super::mcp_tools::CommandOutput),
 }
 fn call_tool(name: &str, args: &Value, cancelled: Cancellation<'_>) -> anyhow::Result<ToolOutput> {
+    if let Some(tool) = NativeTool::find(name) {
+        return tool.call(args, cancelled).map(ToolOutput::Text);
+    }
     match name {
-        "await_omen" => await_omen(args, cancelled).map(ToolOutput::Text),
-        "observe_stream" => observe_stream(args, cancelled).map(ToolOutput::Text),
         // Removed in 0.15.0 (the coordination board): a pointer, never a silent "unknown tool".
         n if n.starts_with("board_") => anyhow::bail!(
             "{n} was removed in 0.15.0 with the coordination board — the task log is the fleet's record: \
@@ -778,6 +828,11 @@ fn call_tool(name: &str, args: &Value, cancelled: Cancellation<'_>) -> anyhow::R
                  and labeled: `task_done` with `observed`, `task_note` for evidence"
             )
         }
+        // Removed in 0.17: it reads Claude Code's hook JSON on stdin, which no MCP call supplies.
+        "hook" => anyhow::bail!(
+            "hook was removed from the MCP roster in 0.17 — it is Claude Code's hook body (stdin JSON), \
+             which a tool call cannot supply; `hooks_install` wires it into Claude Code"
+        ),
         // Everything else is a CLI-generated command tool: shell out to `cv`.
         other => match cli() {
             Some(c) if c.find(other).is_some() => c.call_cancelled(other, args, cancelled).map(ToolOutput::Command),
@@ -785,6 +840,21 @@ fn call_tool(name: &str, args: &Value, cancelled: Cancellation<'_>) -> anyhow::R
             None => anyhow::bail!("unknown tool: {other} (the command tools failed to register at startup)"),
         },
     }
+}
+
+/// Check cancellation and the same observation deadline during discovery and polling.
+fn check_observation(
+    cancelled: Cancellation<'_>,
+    start: Instant,
+    timeout: Duration,
+    expired: &std::cell::Cell<bool>,
+) -> anyhow::Result<()> {
+    cancelled.check()?;
+    if start.elapsed() >= timeout {
+        expired.set(true);
+        anyhow::bail!("observation deadline reached");
+    }
+    Ok(())
 }
 
 /// Block until a newly-emitted message matches `regex` (or `timeout_secs` elapses). The polling loop
@@ -804,12 +874,7 @@ fn await_omen(args: &Value, cancelled: Cancellation<'_>) -> anyhow::Result<Strin
     let start = Instant::now();
     let expired = std::cell::Cell::new(false);
     let watcher = Watcher::try_with_discovery(filter, false, cv_core::discover_all, || {
-        cancelled.check()?;
-        if start.elapsed() >= timeout {
-            expired.set(true);
-            anyhow::bail!("observation deadline reached");
-        }
-        Ok(())
+        check_observation(cancelled, start, timeout, &expired)
     });
     let mut watcher = match watcher {
         Ok(watcher) => watcher,
@@ -849,14 +914,7 @@ fn await_poll(
     timeout: Duration,
 ) -> anyhow::Result<Option<Value>> {
     let expired = std::cell::Cell::new(false);
-    let check = || {
-        cancelled.check()?;
-        if start.elapsed() >= timeout {
-            expired.set(true);
-            anyhow::bail!("observation deadline reached");
-        }
-        Ok(())
-    };
+    let check = || check_observation(cancelled, start, timeout, &expired);
     let mut matched = None;
     let result = watcher.try_poll_messages(&check, |kind, reference, message| {
         let resolver = cv_core::Resolver::new(Some(reference.path.clone()));
@@ -890,6 +948,10 @@ fn await_poll(
 // observe_stream — the non-blocking tail of await_omen
 // ---------------------------------------------------------------------------
 
+/// The reader states behind every cursor this server issued, one per observed session
+/// ([`cv_core::watch::Readers`]): a cursor carries positions only.
+static READERS: std::sync::LazyLock<Readers> = std::sync::LazyLock::new(Readers::default);
+
 /// Non-blocking incremental tail: the messages appended to matching sessions since `since_cursor`
 /// plus a fresh cursor, returned at once. It is one `Watcher` poll with the watcher's state carried
 /// by the caller ([`cv_core::watch::Cursor`]) instead of by a process: the first call (no cursor)
@@ -907,12 +969,15 @@ fn observe_stream(args: &Value, cancelled: Cancellation<'_>) -> anyhow::Result<S
         harness: parse_harness(args)?,
         cwd_contains: arg_str(args, "cwd_contains")?.map(str::to_string),
     };
-    let max_messages = arg_usize(args, "max_messages", 50)?.max(1);
-    let char_cap = arg_usize(args, "char_cap", 16_000)?.max(1);
+    let max_messages = arg_usize(args, "max_messages", usize::MAX)?.max(1);
+    let char_cap = match args.get("char_cap") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(arg_usize(args, "char_cap", 0)?.max(1)),
+    };
     let prev = arg_str(args, "since_cursor")?.and_then(Cursor::decode);
     let baseline = prev.is_none();
     let mut watcher = match prev {
-        Some(c) => Watcher::from_cursor(filter, c, cv_core::sessions),
+        Some(c) => Watcher::from_cursor(filter, c, cv_core::sessions, &READERS),
         None => Watcher::try_with_discovery(filter, false, cv_core::sessions, check)?,
     };
 
@@ -921,12 +986,19 @@ fn observe_stream(args: &Value, cancelled: Cancellation<'_>) -> anyhow::Result<S
         baseline,
         max_messages,
         char_cap,
-        |message, resolver, room| {
-            let (mut text, truncated) = cv_core::projection::searchable_prefix_checked(message, resolver, room, check)?;
-            if truncated {
-                text.push('…');
+        |message, resolver, room| match room {
+            None => Ok((
+                cv_core::projection::searchable_text_checked(message, resolver, check)?,
+                false,
+            )),
+            Some(room) => {
+                let (mut text, truncated) =
+                    cv_core::projection::searchable_prefix_checked(message, resolver, room, check)?;
+                if truncated {
+                    text.push('…');
+                }
+                Ok((text, truncated))
             }
-            Ok(text)
         },
         check,
     )
@@ -937,8 +1009,8 @@ fn observe_poll(
     watcher: &mut Watcher,
     baseline: bool,
     max_messages: usize,
-    char_cap: usize,
-    project: impl FnMut(&cv_core::Message, &cv_core::Resolver, usize) -> anyhow::Result<String>,
+    char_cap: Option<usize>,
+    project: impl FnMut(&cv_core::Message, &cv_core::Resolver, Option<usize>) -> anyhow::Result<(String, bool)>,
 ) -> anyhow::Result<String> {
     observe_poll_checked(watcher, baseline, max_messages, char_cap, project, || Ok(()))
 }
@@ -947,58 +1019,77 @@ fn observe_poll_checked(
     watcher: &mut Watcher,
     baseline: bool,
     max_messages: usize,
-    char_cap: usize,
-    mut project: impl FnMut(&cv_core::Message, &cv_core::Resolver, usize) -> anyhow::Result<String>,
+    char_cap: Option<usize>,
+    mut project: impl FnMut(&cv_core::Message, &cv_core::Resolver, Option<usize>) -> anyhow::Result<(String, bool)>,
     mut check: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<String> {
     let mut out_msgs: Vec<Value> = Vec::new();
     let mut chars_used = 0usize;
+    let mut truncated = 0usize;
     let mut projection_error = None;
     let more_pending = !baseline
-        && watcher.try_poll_bounded_retained_checked(max_messages, &mut check, |ev| {
-            if projection_error.is_some() {
-                return 0;
-            }
-            let r = &ev.reference;
-            let resolver = cv_core::Resolver::new(Some(r.path.clone()));
-            let mut taken = 0;
-            for m in &ev.new_messages {
-                let room = char_cap.saturating_sub(chars_used);
-                if room == 0 {
-                    break;
+        && watcher.try_poll(
+            Poll {
+                max: max_messages,
+                strict: true,
+                retained: true,
+                checked: Some(&mut check),
+            },
+            |ev| {
+                if projection_error.is_some() {
+                    return 0;
                 }
-                let text = match project(m, &resolver, room) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        projection_error = Some(error);
+                let r = &ev.reference;
+                let resolver = cv_core::Resolver::new(Some(r.path.clone()));
+                let mut taken = 0;
+                for m in &ev.new_messages {
+                    let room = char_cap.map(|cap| cap.saturating_sub(chars_used));
+                    if room == Some(0) {
                         break;
                     }
-                };
-                chars_used += text.len();
-                out_msgs.push(json!({
-                    "harness": r.harness.as_str(),
-                    "session_id": r.id,
-                    "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
-                    "role": cv_core::render::role_label(m.role),
-                    "timestamp": m.timestamp.map(|t| t.to_rfc3339()),
-                    "text": text,
-                }));
-                taken += 1;
-            }
-            taken
-        })?;
+                    let text = match project(m, &resolver, room) {
+                        Ok((text, cut)) => {
+                            truncated += usize::from(cut);
+                            text
+                        }
+                        Err(error) => {
+                            projection_error = Some(error);
+                            break;
+                        }
+                    };
+                    chars_used += text.len();
+                    out_msgs.push(json!({
+                        "harness": r.harness.as_str(),
+                        "session_id": r.id,
+                        "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        "role": cv_core::render::role_label(m.role),
+                        "timestamp": m.timestamp.map(|t| t.to_rfc3339()),
+                        "text": text,
+                    }));
+                    taken += 1;
+                }
+                taken
+            },
+        )?;
     if let Some(error) = projection_error {
         return Err(error);
     }
 
     check()?;
-    Ok(serde_json::to_string_pretty(&json!({
+    let mut out = json!({
         "baseline": baseline,
         "messages": out_msgs,
         "count": out_msgs.len(),
         "more_pending": more_pending,
-        "cursor": watcher.to_cursor().encode(),
-    }))?)
+        "rereads": watcher.rereads(),
+        "cursor": watcher.to_cursor(&READERS).encode(),
+    });
+    // A caller's char_cap is stated beside what it cut.
+    if let Some(cap) = char_cap {
+        out["char_cap"] = cap.into();
+        out["truncated"] = truncated.into();
+    }
+    Ok(serde_json::to_string_pretty(&out)?)
 }
 
 /// All matchable text in a message: text + thinking + tool-result content.
@@ -1074,24 +1165,26 @@ mod projection_tests {
             .unwrap()
             .discover()
             .unwrap()
+            .refs
     }
 
     // Independent pre-change owned observer: whole searchable strings, then truncation.
     fn owned_observe_oracle(watcher: &mut Watcher, cap: usize) -> anyhow::Result<String> {
         let mut rows = Vec::new();
         let mut used = 0usize;
-        let more = watcher.try_poll_bounded(50, |event| {
+        let mut cut = 0usize;
+        let more = watcher.try_poll(Poll { max: 50, strict: true, ..Poll::default() }, |event| {
             let r=&event.reference; let mut taken=0;
             for m in event.new_messages {
                 let full=message_text(&m).unwrap(); let room=cap.saturating_sub(used);
                 if room==0 { break; }
-                let text=if full.len()>room {format!("{}…",&full[..floor_char(&full,room)])} else {full};
+                let text=if full.len()>room {cut+=1; format!("{}…",&full[..floor_char(&full,room)])} else {full};
                 used+=text.len();
                 rows.push(json!({"harness":r.harness.as_str(),"session_id":r.id,"cwd":r.cwd.as_ref().map(|p|p.to_string_lossy().to_string()),"role":cv_core::render::role_label(m.role),"timestamp":m.timestamp.map(|t|t.to_rfc3339()),"text":text}));taken+=1;
             } taken
         })?;
         Ok(serde_json::to_string_pretty(
-            &json!({"baseline":false,"messages":rows,"count":rows.len(),"more_pending":more,"cursor":watcher.to_cursor().encode()}),
+            &json!({"baseline":false,"messages":rows,"count":rows.len(),"more_pending":more,"rereads":watcher.rereads(),"cursor":watcher.to_cursor(&READERS).encode(),"char_cap":cap,"truncated":cut}),
         )?)
     }
 
@@ -1106,12 +1199,12 @@ mod projection_tests {
             let mut watcher = Watcher::with_discovery(Filter::default(), true, discover);
             if retained {
                 std::hint::black_box(
-                    observe_poll(&mut watcher, false, 50, 16000, |m, r, cap| {
-                        let (mut text, truncated) = cv_core::projection::searchable_prefix(m, r, cap)?;
+                    observe_poll(&mut watcher, false, 50, Some(16000), |m, r, cap| {
+                        let (mut text, truncated) = cv_core::projection::searchable_prefix(m, r, cap.unwrap())?;
                         if truncated {
                             text.push('…');
                         }
-                        Ok(text)
+                        Ok((text, truncated))
                     })
                     .unwrap(),
                 );
@@ -1127,14 +1220,22 @@ mod projection_tests {
         let world = crate::test_world("observe-prefix-mutation");
         let path = world.write_session("observe-mutation", &[json!({"type":"assistant", "sessionId":"observe-mutation", "uuid":"a", "message":{"role":"assistant","content":"hello"}})]);
         let mut watcher = Watcher::with_discovery(Filter::default(), true, discover);
-        let before = watcher.to_cursor().encode();
-        let result = watcher.try_poll_bounded_retained(50, |event| {
-            assert_eq!(event.new_messages.len(), 1);
-            std::fs::write(&path, b"changed").unwrap();
-            1
-        });
+        let before = watcher.to_cursor(&READERS).encode();
+        let result = watcher.try_poll(
+            Poll {
+                max: 50,
+                strict: true,
+                retained: true,
+                ..Poll::default()
+            },
+            |event| {
+                assert_eq!(event.new_messages.len(), 1);
+                std::fs::write(&path, b"changed").unwrap();
+                1
+            },
+        );
         assert!(result.is_err());
-        assert_eq!(watcher.to_cursor().encode(), before);
+        assert_eq!(watcher.to_cursor(&READERS).encode(), before);
     }
 
     #[cfg(feature = "probe-heap")]
@@ -1156,12 +1257,12 @@ mod projection_tests {
                     let mut watcher = Watcher::with_discovery(Filter::default(), true, discover);
                     let baseline = cv_testkit::heap::begin();
                     let output = if retained {
-                        observe_poll(&mut watcher, false, 50, 16000, |m, r, cap| {
-                            let (mut text, truncated) = cv_core::projection::searchable_prefix(m, r, cap)?;
+                        observe_poll(&mut watcher, false, 50, Some(16000), |m, r, cap| {
+                            let (mut text, truncated) = cv_core::projection::searchable_prefix(m, r, cap.unwrap())?;
                             if truncated {
                                 text.push('…');
                             }
-                            Ok(text)
+                            Ok((text, truncated))
                         })
                         .unwrap()
                     } else {
@@ -1199,16 +1300,126 @@ mod projection_tests {
             let mut old = Watcher::with_discovery(Filter::default(), true, discover);
             let oracle = owned_observe_oracle(&mut old, cap).unwrap();
             let mut watcher = Watcher::with_discovery(Filter::default(), true, discover);
-            let output = observe_poll(&mut watcher, false, 50, cap, |message, resolver, room| {
-                let (mut text, truncated) = cv_core::projection::searchable_prefix(message, resolver, room)?;
+            let output = observe_poll(&mut watcher, false, 50, Some(cap), |message, resolver, room| {
+                let (mut text, truncated) = cv_core::projection::searchable_prefix(message, resolver, room.unwrap())?;
                 if truncated {
                     text.push('…');
                 }
-                Ok(text)
+                Ok((text, truncated))
             })
             .unwrap();
-            assert_eq!(output, oracle, "cap={cap}");
+            // Each cursor names its own watcher's reader generations; everything else is equal.
+            let without_cursor = |text: &str| {
+                let mut v: Value = serde_json::from_str(text).unwrap();
+                v.as_object_mut().unwrap().remove("cursor");
+                v
+            };
+            assert_eq!(without_cursor(&output), without_cursor(&oracle), "cap={cap}");
         }
+    }
+
+    /// With no char_cap a poll returns every appended message whole and states no cap; with one,
+    /// it states the cap and how many messages it cut.
+    #[test]
+    fn observe_is_whole_unless_capped_and_says_what_a_cap_cut() {
+        let world = crate::test_world("observe-whole");
+        let body = "word ".repeat(10_000);
+        world.write_session("observe-whole", &[json!({"type":"assistant", "sessionId":"observe-whole", "uuid":"a", "message":{"role":"assistant","content":body}})]);
+        let poll = |cap: Option<usize>| -> Value {
+            let mut watcher = Watcher::with_discovery(Filter::default(), true, discover);
+            let out = observe_poll_checked(
+                &mut watcher,
+                false,
+                usize::MAX,
+                cap,
+                |m, r, room| match room {
+                    None => Ok((cv_core::projection::searchable_text_checked(m, r, || Ok(()))?, false)),
+                    Some(room) => cv_core::projection::searchable_prefix(m, r, room),
+                },
+                || Ok(()),
+            )
+            .unwrap();
+            serde_json::from_str(&out).unwrap()
+        };
+        let whole = poll(None);
+        assert_eq!(
+            whole["messages"][0]["text"].as_str().unwrap().trim_end(),
+            body.trim_end()
+        );
+        assert!(
+            whole.get("char_cap").is_none() && whole.get("truncated").is_none(),
+            "{whole}"
+        );
+        let capped = poll(Some(100));
+        assert_eq!(
+            (capped["char_cap"].as_u64(), capped["truncated"].as_u64()),
+            (Some(100), Some(1))
+        );
+    }
+
+    #[test]
+    fn observe_over_many_sessions_rereads_none_of_them() {
+        // 0.17 carried reader state for eight sessions in the cursor: past eight, every session
+        // that had changed once was read from its start again on every later call.
+        let world = crate::test_world("observe-many-sessions");
+        let line = |sid: &str, uuid: &str| json!({"type":"user","sessionId":sid,"uuid":uuid,"message":{"role":"user","content":"activity"}});
+        let ids: Vec<String> = (0..12).map(|i| format!("observed-{i:02}")).collect();
+        for id in &ids {
+            world.write_session(id, &[line(id, "a")]);
+        }
+        let call = |cursor: Option<&str>| -> (Value, usize) {
+            let mut watcher = match cursor {
+                Some(c) => Watcher::from_cursor(Filter::default(), Cursor::decode(c).unwrap(), discover, &READERS),
+                None => Watcher::with_discovery(Filter::default(), false, discover),
+            };
+            let out = observe_poll(&mut watcher, cursor.is_none(), 500, None, |m, _, _| {
+                Ok((message_text(m)?, false))
+            })
+            .unwrap();
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["rereads"], watcher.rereads(), "the output states its rereads");
+            (v, watcher.rereads())
+        };
+        let (base, _) = call(None);
+        for id in &ids {
+            world.write_session(id, &[line(id, "a"), line(id, "b")]);
+        }
+        let (grown, rereads) = call(base["cursor"].as_str());
+        assert_eq!(grown["count"], 12);
+        assert_eq!(
+            rereads, 0,
+            "each grown session resumes from its baseline's reader state"
+        );
+        let mut cursor = grown["cursor"].as_str().unwrap().to_string();
+        for _ in 0..3 {
+            let (quiet, rereads) = call(Some(&cursor));
+            assert_eq!(quiet["count"], 0);
+            assert_eq!(rereads, 0, "a session with a reader state is not read from its start");
+            cursor = quiet["cursor"].as_str().unwrap().to_string();
+        }
+        assert_eq!(
+            ids.iter().filter(|id| READERS.contains(&format!("claude:{id}"))).count(),
+            12,
+            "one reader state per observed session (READERS is process-wide: \
+             a total count races with other tests' sessions)"
+        );
+        // Carried to a process that never issued it, the cursor reads each changed session
+        // from its start once, and says so.
+        for id in &ids {
+            world.write_session(id, &[line(id, "a"), line(id, "b"), line(id, "c")]);
+        }
+        let elsewhere = Readers::default();
+        let mut watcher = Watcher::from_cursor(
+            Filter::default(),
+            Cursor::decode(&cursor).unwrap(),
+            discover,
+            &elsewhere,
+        );
+        let out: Value = serde_json::from_str(
+            &observe_poll(&mut watcher, false, 500, None, |m, _, _| Ok((message_text(m)?, false))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((out["count"].as_u64(), out["rereads"].as_u64()), (Some(12), Some(12)));
     }
 
     #[test]
@@ -1222,10 +1433,14 @@ mod projection_tests {
             )]
         }
         let mut watcher = Watcher::with_discovery(Filter::default(), true, unreadable);
-        let before = watcher.to_cursor().encode();
-        assert!(observe_poll(&mut watcher, false, 50, 16_000, |m, _, _| message_text(m)).is_err());
+        let before = watcher.to_cursor(&READERS).encode();
+        assert!(observe_poll(&mut watcher, false, 50, Some(16_000), |m, _, _| Ok((
+            message_text(m)?,
+            false
+        )))
+        .is_err());
         assert_eq!(
-            watcher.to_cursor().encode(),
+            watcher.to_cursor(&READERS).encode(),
             before,
             "a demanded read failure leaves cursor position unchanged"
         );
@@ -1260,9 +1475,9 @@ mod projection_tests {
             }
             let mut watcher = Watcher::with_discovery(Filter::default(), true, discover);
             let mut demanded = false;
-            let result = observe_poll(&mut watcher, false, 50, 16_000, |_, _, _| {
+            let result = observe_poll(&mut watcher, false, 50, Some(16_000), |_, _, _| {
                 demanded = true;
-                message_text(&source)
+                Ok((message_text(&source)?, false))
             });
             assert!(demanded, "must exercise a demanded callback projection");
             assert!(
@@ -1270,10 +1485,16 @@ mod projection_tests {
                 "cannot serialize a success cursor after failed projection"
             );
             let mut recovered = 0;
-            watcher.poll_bounded(50, |event| {
-                recovered += event.new_messages.len();
-                event.new_messages.len()
-            });
+            watcher.poll(
+                Poll {
+                    max: 50,
+                    ..Poll::default()
+                },
+                |event| {
+                    recovered += event.new_messages.len();
+                    event.new_messages.len()
+                },
+            );
             assert_eq!(recovered, 1, "failed projection must leave offered messages unread");
         }
     }
@@ -1538,6 +1759,7 @@ mod admission_tests {
                 .unwrap()
                 .discover()
                 .unwrap()
+                .refs
         }
         let mut watcher = Watcher::with_discovery(Filter::default(), true, discover_omen);
         let matched = await_poll(
@@ -1552,8 +1774,8 @@ mod admission_tests {
         assert_eq!(matched["matched_text"], "λ BUILD PASSED\n");
         assert_eq!(matched["id"], "omen");
         assert_eq!(matched["role"], "assistant");
-        let cursor = Cursor::decode(&watcher.to_cursor().encode()).unwrap();
-        let mut resumed = Watcher::from_cursor(Filter::default(), cursor, discover_omen);
+        let cursor = Cursor::decode(&watcher.to_cursor(&READERS).encode()).unwrap();
+        let mut resumed = Watcher::from_cursor(Filter::default(), cursor, discover_omen, &READERS);
         let mut tail = Vec::new();
         resumed
             .try_poll_messages(
@@ -1612,5 +1834,75 @@ mod admission_tests {
         drop(held);
         assert!(waiter.join().unwrap().is_some());
         assert_eq!(*pool.used.lock().unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod instructions_tests {
+    /// A generated tool whose name a hand-written one already holds is dropped from the roster
+    /// (`tool_list`); no command may be lost that way unnoticed, so none may collide at all.
+    #[test]
+    fn no_generated_tool_is_shadowed_by_a_hand_written_one() {
+        crate::on_main_sized_stack(|| {
+            let generated = super::CliTools::from_owned_tree(crate::build_cli()).expect("tool tree");
+            let hand_written: Vec<&str> = super::NativeTool::ALL.iter().map(|t| t.name()).collect();
+            let shadowed: Vec<String> = generated
+                .tool_list()
+                .iter()
+                .filter_map(|t| t["name"].as_str())
+                .filter(|name| hand_written.contains(name))
+                .map(str::to_string)
+                .collect();
+            assert!(
+                shadowed.is_empty(),
+                "generated tools shadowed by hand-written ones: {shadowed:?}"
+            );
+        });
+    }
+
+    /// The blurb is the one hand-written roster of the server's surface: every backticked word must
+    /// be a tool, a `prefix*` family of tools, an argument some tool takes, or values of one of
+    /// those arguments, all read from the live tool list. A renamed tool or flag fails here. (A
+    /// review once read `query` as a removed command; it is `ls`'s filter argument, and passes.)
+    #[test]
+    fn instructions_name_only_real_tools_and_arguments() {
+        crate::on_main_sized_stack(|| {
+            // As `serve` does at startup: the generated tools come from the clap tree.
+            let generated = super::CliTools::from_owned_tree(crate::build_cli()).expect("tool tree");
+            let _ = super::CLI.set(Some(generated));
+            let tools = super::tool_list();
+            let tools = tools.as_array().expect("tool list is an array");
+            let names: std::collections::HashSet<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+            let properties = || {
+                tools
+                    .iter()
+                    .filter_map(|t| t["inputSchema"]["properties"].as_object())
+                    .flat_map(|p| p.iter())
+            };
+            let arguments: std::collections::HashSet<&str> = properties().map(|(k, _)| k.as_str()).collect();
+            let values: std::collections::HashSet<String> = properties()
+                .flat_map(|(_, p)| {
+                    let listed = p["enum"].as_array().or_else(|| p["items"]["enum"].as_array());
+                    listed
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                })
+                .collect();
+            // `kind` is a free comma list `show` validates itself: its own parser is the oracle.
+            assert!(arguments.contains("kind"));
+            let kind = |word: &str| crate::cmd::view::parse_kinds(word).is_ok();
+            let text = super::instructions();
+            for word in text.split('`').skip(1).step_by(2) {
+                if let Some(prefix) = word.strip_suffix('*') {
+                    assert!(names.iter().any(|n| n.starts_with(prefix)), "no {word} tool");
+                } else if !names.contains(word) && !arguments.contains(word) {
+                    assert!(
+                        word.split(',').all(|v| values.contains(v)) || kind(word),
+                        "instructions name {word:?}: not a tool, an argument, or argument values"
+                    );
+                }
+            }
+        });
     }
 }

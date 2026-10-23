@@ -13,12 +13,13 @@
 //! - `POST /api/task/<id>/discuss`        `{text}` optional → a `NEEDS DISCUSSION:` note + the `discuss` tag
 //! - `POST /api/task/<id>/claim`          claim for `who`
 //! - `POST /api/task/<id>/release`
-//! - `POST /api/task/<id>/reopen`         a closed task comes back as a NEW task (the record stays)
 //! - `GET /api/events?since=&kind=&by=&not_by=&assignee=&task=`  JSON lines — the same query as
 //!   `cv task events`, so a poller and the page see one feed.
 //! - `GET /api/lanes?session=<id>`        the sub-agent forest of a session (`cv lanes --tasks`),
 //!   running first, each lane with the `tasks` its endpoint holds.
-//! - `GET /api/backlog?repo=&state=&tag=&all=1` every open task (`cv task list` with no window).
+//!
+//! The backlog pane reads the read API's `GET /api/tasks?detail=1`; `/api/backlog` and the
+//! web-only `reopen` answer 410 with the pointer.
 //!
 //! Every POST takes `who` in the body (else `?who=`, else the server's `--who`).
 
@@ -28,7 +29,7 @@ use cv_core::api::Query;
 use cv_core::task::{self, TaskEventKind, TaskStore};
 use serde_json::{json, Value};
 
-use super::task_ops::{self, DecisionSpec, EventFilter, Since};
+use super::task_ops::{self, EventFilter, Since};
 
 /// The inbox page: one inline HTML file, no external JS/CSS, no build step.
 pub(crate) const PAGE: &str = include_str!("serve_tasks_page.html");
@@ -39,18 +40,21 @@ pub(crate) enum Answer {
     Ndjson(String),
 }
 
-/// The inbox routes, or `None` when the path is not one of them (the read API answers it).
-pub(crate) fn route(post: bool, parts: &[&str], q: &Query, body: &Value, default_who: Option<&str>) -> Option<Answer> {
-    let json = |(status, v): (u16, Value)| Some(Answer::Json(status, v));
-    match (post, parts) {
-        (false, ["api", "inbox"]) => json(api_inbox(default_who, q)),
-        (false, ["api", "events"]) => Some(match api_events(q) {
+cv_core::routes! {
+    pub(crate) const ROUTES;
+    /// The inbox routes, or `None` when the path is not one of them (the read API answers it).
+    pub(crate) fn route(post, parts, q: &Query, body: &Value, default_who: Option<&str>) -> Option<Answer> {
+        GET ["api", "inbox"] => json(api_inbox(default_who, q)),
+        GET ["api", "events"] => Some(match api_events(q) {
             Ok(lines) => Answer::Ndjson(lines),
             Err(e) => Answer::Json(400, json!({"error": e.to_string()})),
         }),
-        (false, ["api", "lanes"]) => json(api_lanes(q)),
-        (false, ["api", "backlog"]) => json(api_backlog(q)),
-        (true, ["api", "task", id, verb]) => {
+        GET ["api", "lanes"] => json(api_lanes(q)),
+        POST ["api", "task", _, "reopen"] => json((
+            410,
+            json!({"error": "removed in 0.17 — a closed task stays closed; open a new task (`cv task open`) and note the old id"}),
+        )),
+        POST ["api", "task", id, verb] => {
             let who = body
                 .get("who")
                 .and_then(Value::as_str)
@@ -61,9 +65,13 @@ pub(crate) fn route(post: bool, parts: &[&str], q: &Query, body: &Value, default
                 Some(who) => api_act(id, verb, &who, body),
                 None => (400, json!({"error": "who? pass `who` in the body or start with --who"})),
             })
-        }
+        },
         _ => None,
     }
+}
+
+fn json((status, v): (u16, Value)) -> Option<Answer> {
+    Some(Answer::Json(status, v))
 }
 
 fn with_replay(f: impl FnOnce(cv_core::task::ReplayOutcome) -> (u16, Value)) -> (u16, Value) {
@@ -82,16 +90,9 @@ fn api_inbox(default_who: Option<&str>, q: &Query) -> (u16, Value) {
         return (400, json!({"error": "who must not be empty"}));
     }
     let now = Utc::now();
-    let window = if q.flag("all") {
-        None
-    } else {
-        match q.get("since") {
-            Some(s) => match task::parse_since(&s, now) {
-                Ok(t) => Some(t),
-                Err(e) => return (400, json!({"error": e})),
-            },
-            None => Some(now - chrono::Duration::days(14)),
-        }
+    let window = match cv_core::api::inbox_window(q, Some(chrono::Duration::days(14)), now) {
+        Ok(window) => window,
+        Err(e) => return (400, json!({"error": e})),
     };
     with_replay(|outcome| {
         let caller = task::default_endpoint();
@@ -150,61 +151,6 @@ fn api_lanes(q: &Query) -> (u16, Value) {
     )
 }
 
-/// `cv task list` with no time window: the whole open backlog (or everything with `all=1`),
-/// one compact row per task, newest activity first.
-fn api_backlog(q: &Query) -> (u16, Value) {
-    with_replay(|outcome| {
-        let filter = task::TaskFilter {
-            state: q.get("state"),
-            assignee: q.get("assignee"),
-            repo: q.get("repo").map(std::path::PathBuf::from),
-            include_terminal: q.flag("all"),
-            tag: q.get("tag"),
-            touched_since: None,
-            or_involving: None,
-            decisions: None,
-        };
-        let mut tasks = match task::list(&outcome.model, &filter) {
-            Ok(t) => t,
-            Err(e) => return (400, json!({"error": e})),
-        };
-        tasks.sort_by_key(|t| std::cmp::Reverse(t.last_ts));
-        let now = Utc::now();
-        let rows: Vec<Value> = tasks
-            .iter()
-            .map(|t| {
-                json!({
-                    "id": t.task_id,
-                    "short": super::task::prefix(&t.task_id, 13),
-                    "title": t.title,
-                    "state": task::effective_display(t),
-                    "assignee": t.assignee,
-                    "opened_by": t.opened_by,
-                    "repo": t.repo,
-                    "issue": t.issue,
-                    "tags": t.tags,
-                    "blocked": task::is_blocked(&outcome.model, t),
-                    "decision": t.decision.is_some(),
-                    "notes": t.notes.len(),
-                    "last_ts": t.last_ts,
-                    "age": task::age_short(t.last_ts, now),
-                    "body": t.body,
-                })
-            })
-            .collect();
-        let mut repos: Vec<String> = tasks
-            .iter()
-            .filter_map(|t| t.repo.as_ref().map(|p| p.display().to_string()))
-            .collect();
-        repos.sort();
-        repos.dedup();
-        (
-            200,
-            json!({"count": rows.len(), "repos": repos, "tasks": rows, "warnings": outcome.warnings}),
-        )
-    })
-}
-
 fn api_events(q: &Query) -> Result<String> {
     let outcome = task::replay()?;
     let now = Utc::now();
@@ -220,7 +166,8 @@ fn api_events(q: &Query) -> Result<String> {
         since: Since::parse(q.get("since").as_deref(), now)?,
         kinds: q
             .get("kind")
-            .map(|k| k.split(',').map(task_ops::kind_tag).collect())
+            .map(|k| task_ops::kind_tags(&k))
+            .transpose()?
             .unwrap_or_default(),
         by: q.get("by"),
         not_by: q.get("not_by"),
@@ -232,7 +179,7 @@ fn api_events(q: &Query) -> Result<String> {
 
 fn event_lines(outcome: &task::ReplayOutcome, filter: &EventFilter) -> Result<String> {
     // JSONL rows are events, with no warning envelope. Refuse an incomplete feed rather than
-    // silently omit quarantined history from a poller's view; page/backlog reads expose warnings.
+    // silently omit quarantined history from a poller's view; page/task reads expose warnings.
     if let Some(first) = outcome.warnings.first() {
         bail!(
             "task event feed unavailable: degraded log ({} warning(s); first: {first})",
@@ -268,7 +215,6 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
     let id = task::resolve_id(&outcome.model, id)
         .map_err(|e| anyhow::anyhow!(e))?
         .to_string();
-    let t = &outcome.model.tasks[&id];
     let by = format!("web:{who}");
     let text = |k: &str| {
         body.get(k)
@@ -282,7 +228,7 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
             let confirm = body.get("confirm").and_then(Value::as_bool).unwrap_or(false);
             let answer = task_ops::Answer::from_flags(text("choice"), accept, confirm)?;
             let out = task_ops::resolve(store, &outcome.model, &by, &id, answer, text("note"), false)?;
-            (vec![out.event], out.effective_state, out.replay_warnings)
+            (vec![out.event], out.effective_state, out.warnings)
         }
         "done" => {
             let out = task::append(
@@ -295,7 +241,7 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
                 },
                 Vec::new(),
             )?;
-            (vec![out.event], out.effective_state, out.replay_warnings)
+            (vec![out.event], out.effective_state, out.warnings)
         }
         "note" => {
             let Some(t) = text("text") else {
@@ -311,7 +257,7 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
                 },
                 Vec::new(),
             )?;
-            (vec![out.event], out.effective_state, out.replay_warnings)
+            (vec![out.event], out.effective_state, out.warnings)
         }
         "discuss" => {
             // One unit: the note and the `discuss` tag land together.
@@ -349,89 +295,11 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
                 },
                 Vec::new(),
             )?;
-            (vec![out.event], out.effective_state, out.replay_warnings)
+            (vec![out.event], out.effective_state, out.warnings)
         }
         "release" => {
             let out = task::append(store, Some(&id), &by, TaskEventKind::Released {}, Vec::new())?;
-            (vec![out.event], out.effective_state, out.replay_warnings)
-        }
-        "reopen" => {
-            if !t.state.is_terminal() {
-                bail!("task is still open");
-            }
-            // Terminal is terminal: the record of the close stays. The task comes back as a NEW
-            // task carrying the same title/body/assignee (and, for a decision, the same options),
-            // tagged `reopened`, and each side notes the other — all as ONE unit.
-            let assignee = t.assignee.clone().unwrap_or_else(|| who.to_string());
-            let mut events = match &t.decision {
-                Some(d) => task_ops::pose_events(
-                    &by,
-                    DecisionSpec {
-                        title: t.title.clone(),
-                        body: t.body.clone(),
-                        for_who: assignee,
-                        default_choice: d.default_choice.clone(),
-                        options: d.options.clone(),
-                        deadline: None,
-                        repo: t.repo.clone(),
-                        issue: t.issue.clone(),
-                        tags: vec!["reopened".into()],
-                        source: d.source.clone(),
-                        blocks: Vec::new(),
-                        provisional: false,
-                    },
-                )?,
-                None => {
-                    let opened = task::new_event(
-                        None,
-                        &by,
-                        TaskEventKind::Opened {
-                            title: t.title.clone(),
-                            body: t.body.clone(),
-                            repo: t.repo.clone(),
-                            issue: t.issue.clone(),
-                            channel: None,
-                            assignee: Some(assignee),
-                        },
-                    );
-                    let new_id = opened.task_id.clone();
-                    vec![
-                        opened,
-                        task::new_event(
-                            Some(&new_id),
-                            &by,
-                            TaskEventKind::Tagged {
-                                tags: vec!["reopened".into()],
-                            },
-                        ),
-                    ]
-                }
-            };
-            let new_id = events[0].task_id.clone();
-            events.push(task::new_event(
-                Some(&new_id),
-                &by,
-                TaskEventKind::Noted {
-                    text: format!(
-                        "reopened from {} ({})",
-                        super::task::prefix(&id, 13),
-                        task::effective_display(t)
-                    ),
-                    session_ref: None,
-                },
-            ));
-            // The closed one stays closed: a note never changes state.
-            events.push(task::new_event(
-                Some(&id),
-                &by,
-                TaskEventKind::Noted {
-                    text: format!("reopened as {}", super::task::prefix(&new_id, 13)),
-                    session_ref: None,
-                },
-            ));
-            let out = task::append_events(store, events, Vec::new())?;
-            let state = out.effective_states.get(&new_id).cloned();
-            (out.events, state, out.replay_warnings)
+            (vec![out.event], out.effective_state, out.warnings)
         }
         other => bail!("unknown action {other:?}"),
     };
@@ -464,73 +332,6 @@ mod tests {
         event.id = id.into();
         event.task_id = id.into();
         store.append_agent_event(event).unwrap();
-    }
-
-    #[test]
-    fn task_http_reopen_preserves_history_reports_new_state_and_accepts_non_uuid_ids() {
-        let world = cv_testkit::World::new("task-http-reopen");
-        for (case, id) in ["x", "éééééééé-task"].into_iter().enumerate() {
-            let store = TaskStore::at(world.base.join(case.to_string()));
-            open(&store, id);
-            let error = act_in(&store, id, "resolve", "ember", &json!({"accept_default":true})).unwrap_err();
-            assert!(error.to_string().contains("not a decision"), "{error}");
-            act_in(&store, id, "done", "ember", &json!({"observed":"finished"})).unwrap();
-            let answer = act_in(&store, id, "reopen", "web:ember", &json!({})).unwrap();
-            assert_eq!(answer["by"], "web:ember");
-            assert_eq!(answer["task_state"], "open");
-            let new_id = answer["events"][0]["task_id"].as_str().unwrap();
-            let outcome = store.replay().unwrap();
-            let old = &outcome.model.tasks[id];
-            let new = &outcome.model.tasks[new_id];
-            assert_eq!(old.state, task::TaskState::Done);
-            assert_eq!(new.state, task::TaskState::Open);
-            assert_eq!(new.title, old.title);
-            assert_eq!(new.body, old.body);
-            assert_eq!(new.assignee, old.assignee);
-            assert!(old.notes.last().unwrap().post_close);
-            assert!(new
-                .notes
-                .last()
-                .unwrap()
-                .text
-                .contains(super::super::task::prefix(id, 13)));
-        }
-    }
-
-    #[test]
-    fn task_http_reopened_decision_retains_options_and_body_without_reopening_old_record() {
-        let world = cv_testkit::World::new("task-http-decision-reopen");
-        let store = TaskStore::at(world.base.join("tasks"));
-        let body = "question 🌙".repeat(8192);
-        let (events, _) = task_ops::pose(
-            &store,
-            "orchestrator",
-            DecisionSpec {
-                title: "decision".into(),
-                body: body.clone(),
-                for_who: "ember".into(),
-                default_choice: " keep ".into(),
-                options: vec!["change".into(), "keep".into()],
-                provisional: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let old_id = &events[0].task_id;
-        act_in(&store, old_id, "resolve", "ember", &json!({"accept_default":true})).unwrap();
-        let answer = act_in(&store, old_id, "reopen", "web: ember", &json!({})).unwrap();
-        assert_eq!(answer["by"], "web:ember");
-        assert_eq!(answer["task_state"], "open");
-        let new_id = answer["events"][0]["task_id"].as_str().unwrap();
-        let outcome = store.replay().unwrap();
-        let old = &outcome.model.tasks[old_id];
-        let new = &outcome.model.tasks[new_id];
-        assert_eq!(old.state, task::TaskState::Resolved);
-        assert_eq!(new.state, task::TaskState::Open);
-        assert_eq!(new.body, body);
-        assert_eq!(new.decision.as_ref().unwrap().options, ["keep", "change"]);
-        assert!(new.decision.as_ref().unwrap().resolution.is_none());
-        assert!(!old.decision.as_ref().unwrap().resolution.as_ref().unwrap().provisional);
     }
 
     #[test]

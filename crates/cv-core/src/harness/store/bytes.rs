@@ -3,35 +3,60 @@ pub(crate) const MEMORY_LIMIT: usize = 1024 * 1024;
 /// Darwin can fault while writing mmap-backed input into the same vnode. All arena append
 /// writes pass through independently owned bounded scratch, including serializer fast paths
 /// that bypass their own BufWriter for large windows.
-struct AppendWriter<'a> {
-    file: &'a mut std::fs::File,
+pub(crate) struct ScratchWriter<'a> {
+    out: &'a mut dyn std::io::Write,
     scratch: Vec<u8>,
+    quote: bool,
+    pub(crate) len: usize,
 }
-impl std::io::Write for AppendWriter<'_> {
+impl<'a> ScratchWriter<'a> {
+    pub(crate) fn new(out: &'a mut dyn std::io::Write, quote: bool) -> Self {
+        Self {
+            out,
+            scratch: Vec::new(),
+            quote,
+            len: 0,
+        }
+    }
+}
+impl std::io::Write for ScratchWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        for part in bytes.chunks(64 * 1024) {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("scratch writer length overflow"))?;
+        for part in bytes.chunks(super::IO_CHUNK) {
             self.scratch.clear();
-            if self.scratch.capacity() < part.len() {
-                self.scratch.reserve_exact(part.len());
+            self.scratch.reserve(part.len() * if self.quote { 2 } else { 1 });
+            if self.quote {
+                // Canonical JSON already escaped control bytes; embedding it as a string
+                // only needs another escape layer for quotes and backslashes.
+                for &byte in part {
+                    if matches!(byte, b'"' | b'\\') {
+                        self.scratch.push(b'\\');
+                    }
+                    self.scratch.push(byte);
+                }
+            } else {
+                self.scratch.extend_from_slice(part);
             }
-            self.scratch.extend_from_slice(part);
-            self.file.write_all(&self.scratch)?;
+            self.out.write_all(&self.scratch)?;
         }
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
+        self.out.flush()
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct Spill {
-    file: Option<std::fs::File>,
+    pub(crate) file: Option<std::fs::File>,
     path: std::path::PathBuf,
     linked: bool,
 }
 impl Spill {
-    fn create(append: bool) -> std::io::Result<Self> {
+    pub(crate) fn create(append: bool) -> std::io::Result<Self> {
         let path = std::env::temp_dir().join(format!("cv-byte-source-{}", uuid::Uuid::new_v4()));
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).append(append).create_new(true);
@@ -43,15 +68,12 @@ impl Spill {
         let spill = Self {
             file: Some(options.open(&path)?),
             path,
-            linked: true,
+            // Unix unlinks the private path immediately so a reused path survives; other
+            // targets unlink on Drop.
+            linked: !cfg!(unix),
         };
         #[cfg(unix)]
-        let spill = {
-            let mut spill = spill;
-            std::fs::remove_file(&spill.path)?;
-            spill.linked = false;
-            spill
-        };
+        std::fs::remove_file(&spill.path)?;
         Ok(spill)
     }
 }
@@ -107,7 +129,7 @@ impl std::io::Write for ByteStage {
                 let capacity = self
                     .memory
                     .capacity()
-                    .max(64 * 1024)
+                    .max(super::IO_CHUNK)
                     .saturating_mul(2)
                     .min(MEMORY_LIMIT)
                     .max(required);
@@ -200,13 +222,7 @@ impl ByteSource {
         // Failed appends remain unreachable; truncating could invalidate mapped views.
         {
             use std::io::Write;
-            let mut writer = std::io::BufWriter::with_capacity(
-                64 * 1024,
-                AppendWriter {
-                    file: &mut file,
-                    scratch: Vec::new(),
-                },
-            );
+            let mut writer = std::io::BufWriter::with_capacity(super::IO_CHUNK, ScratchWriter::new(&mut file, false));
             let produced = f(&mut writer);
             // Flush before observing the published extent. Failed producer output remains an
             // unreachable append, and the producer's error takes precedence over a flush error.
@@ -219,9 +235,6 @@ impl ByteSource {
     }
     /// Length of the immutable backing without reading its payload.
     pub fn byte_len(&self) -> std::io::Result<u64> {
-        self.len()
-    }
-    pub(crate) fn len(&self) -> std::io::Result<u64> {
         match &self.bytes {
             Bytes::Memory(bytes) => Ok(bytes.len() as u64),
             Bytes::File(spill) => Ok(spill.file.as_ref().unwrap().metadata()?.len()),
@@ -236,11 +249,11 @@ impl ByteSource {
         }
     }
 
-    #[cfg(any(test, feature = "sqlite"))]
-    pub(crate) fn read(mut input: impl std::io::Read) -> std::io::Result<Self> {
+    /// Read an operation-owned source, spilling above the fixed memory budget.
+    pub fn read(mut input: impl std::io::Read) -> std::io::Result<Self> {
         use std::io::Write;
         let mut stage = ByteStage::new();
-        let mut chunk = [0; 64 * 1024];
+        let mut chunk = [0; super::IO_CHUNK];
         loop {
             let n = input.read(&mut chunk)?;
             if n == 0 {
@@ -281,7 +294,6 @@ impl ByteSource {
         }
     }
     /// Publish only after the owning operation has validated its successful completion.
-    #[allow(dead_code)] // Publication consumers land separately from SQLite byte-source extraction.
     pub fn copy_to(&self, out: &mut (impl std::io::Write + ?Sized)) -> std::io::Result<u64> {
         match &self.bytes {
             Bytes::Memory(bytes) => {
@@ -336,6 +348,21 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), b"different owner");
             std::fs::remove_file(path).unwrap();
         }
+    }
+    #[test]
+    fn private_spill_permissions_and_owned_cleanup() {
+        let owner = Spill::create(false).unwrap();
+        let file = owner.file.as_ref().unwrap().try_clone().unwrap();
+        let path = owner.path.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            assert!(!path.exists());
+        }
+        drop(file);
+        drop(owner);
+        assert!(!path.exists());
     }
     #[test]
     fn unpublished_stage_rollback_preserves_memory_and_spilled_prefixes() {

@@ -1,14 +1,20 @@
-//! Bounded event retention between a source pass and atomic catalog publication.
+//! Bounded event retention between a source pass and atomic catalog publication. Without the
+//! `sqlite` feature there is no catalog to publish to, so the spool counts rows and keeps none.
 use super::{Event, EventSink};
+#[cfg(feature = "sqlite")]
 use crate::spill::{Ordered, Record};
 use crate::stream::{Checkpoint, Flow, MessageSink};
 use crate::{Message, Session};
-use anyhow::{Context, Result};
+#[cfg(feature = "sqlite")]
+use anyhow::Context;
+use anyhow::Result;
 #[cfg(all(test, feature = "sqlite"))]
 use std::fs;
+#[cfg(feature = "sqlite")]
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
+#[cfg(feature = "sqlite")]
 #[derive(serde::Deserialize)]
 struct DiskEvent {
     msg_idx: usize,
@@ -20,16 +26,18 @@ struct DiskEvent {
     call: bool,
 }
 
+/// The kinds a spooled row may carry; decode admits exactly these.
+#[cfg(feature = "sqlite")]
+const KINDS: &[&str] = &["file_edit", "file_read", "command", "tool", "error"];
+
+#[cfg(feature = "sqlite")]
 fn decode(line: &str) -> Result<Event> {
     let row: DiskEvent = serde_json::from_str(line).context("decoding event spool row")?;
-    let kind = match row.kind.as_str() {
-        "file_edit" => "file_edit",
-        "file_read" => "file_read",
-        "command" => "command",
-        "tool" => "tool",
-        "error" => "error",
-        _ => anyhow::bail!("unknown event kind"),
-    };
+    let kind = KINDS
+        .iter()
+        .find(|kind| **kind == row.kind.as_str())
+        .copied()
+        .context("unknown event kind")?;
     Ok(Event {
         msg_idx: row.msg_idx,
         ts: row.ts,
@@ -41,6 +49,7 @@ fn decode(line: &str) -> Result<Event> {
     })
 }
 
+#[cfg(feature = "sqlite")]
 impl Record for Event {
     type ReadState = String;
     fn heap_bytes(&self) -> usize {
@@ -62,25 +71,42 @@ impl Record for Event {
 }
 
 /// A completed ordered event batch. Large batches share the bounded private spool with stats;
-/// staged rows remain unpublished until the source pass completes successfully.
+/// staged rows remain unpublished until the source pass completes successfully. A build without
+/// the catalog (`sqlite`) has nowhere to publish them: it counts each row and retains none.
 #[derive(Default)]
 pub struct EventSpool {
+    #[cfg(feature = "sqlite")]
     ordered: Ordered<Event>,
+    #[cfg(not(feature = "sqlite"))]
+    len: usize,
 }
 impl EventSpool {
     pub fn len(&self) -> usize {
-        self.ordered.len()
+        #[cfg(feature = "sqlite")]
+        return self.ordered.len();
+        #[cfg(not(feature = "sqlite"))]
+        return self.len;
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
     pub fn temporary_bytes(&self) -> Result<u64> {
-        self.ordered.temporary_bytes()
+        #[cfg(feature = "sqlite")]
+        return self.ordered.spilled_bytes();
+        #[cfg(not(feature = "sqlite"))]
+        return Ok(0);
     }
-    fn push(&mut self, event: Event) -> Result<()> {
-        self.ordered.push(event)
+    pub fn push(&mut self, event: Event) -> Result<()> {
+        #[cfg(feature = "sqlite")]
+        return self.ordered.push(event);
+        #[cfg(not(feature = "sqlite"))]
+        {
+            drop(event);
+            self.len += 1;
+            Ok(())
+        }
     }
-    #[cfg(any(test, feature = "sqlite"))]
+    #[cfg(feature = "sqlite")]
     pub(super) fn rows(self) -> Result<impl Iterator<Item = Result<Event>>> {
         self.ordered.rows()
     }
@@ -91,8 +117,7 @@ impl EventSpool {
 pub struct SpoolingSink {
     inner: EventSink,
     spool: EventSpool,
-    error: Option<anyhow::Error>,
-    failed: bool,
+    latch: crate::stream::Latch,
 }
 
 impl SpoolingSink {
@@ -104,12 +129,17 @@ impl SpoolingSink {
         EventSink::resume(cp).map(Self::with_inner)
     }
 
+    /// [`EventSink::with_source`].
+    pub fn with_source(mut self, source: PathBuf) -> Self {
+        self.inner = self.inner.with_source(source);
+        self
+    }
+
     fn with_inner(inner: EventSink) -> Self {
         Self {
             inner,
             spool: EventSpool::default(),
-            error: None,
-            failed: false,
+            latch: Default::default(),
         }
     }
 
@@ -125,17 +155,20 @@ impl SpoolingSink {
 
     /// Observe without copying the message; failures keep the batch unpublished.
     pub fn observe_message(&mut self, message: &Message) -> Flow {
-        if self.failed || self.error.is_some() {
+        if self.latch.failed() {
             return Flow::Stop;
         }
         if self.inner.observe_message(message) == Flow::Stop {
-            self.error = self.inner.take_error();
-            self.failed = true;
+            self.latch.capture(&mut self.inner);
+            // `EventSink` stops only once its latch holds a failure, so `capture` has latched
+            // it; should it ever stop without one, the extraction (not the spool) is to blame.
+            self.latch
+                .fail(anyhow::anyhow!("event extraction stopped without naming an error"));
             return Flow::Stop;
         }
         for event in self.inner.events.drain(..) {
             if let Err(error) = self.spool.push(event) {
-                self.error = Some(error);
+                self.latch.fail(error);
                 return Flow::Stop;
             }
         }
@@ -153,18 +186,22 @@ impl SpoolingSink {
 
 impl MessageSink for SpoolingSink {
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        let error = self.error.take().or_else(|| self.inner.take_error());
-        self.failed |= error.is_some();
-        error.or_else(|| self.failed.then(|| anyhow::anyhow!("event spool has already failed")))
+        self.latch.take_or(&mut self.inner, "event spool")
     }
     fn dependency(&mut self, path: &std::path::Path) {
-        if !self.failed && self.error.is_none() {
+        if !self.latch.failed() {
             self.inner.dependency(path);
         }
     }
 
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if !self.latch.failed() {
+            self.inner.append_only_dependency(path);
+        }
+    }
+
     fn meta(&mut self, session: &Session) {
-        if !self.failed && self.error.is_none() {
+        if !self.latch.failed() {
             self.inner.meta(session);
         }
     }
@@ -174,11 +211,15 @@ impl MessageSink for SpoolingSink {
     }
 
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
-        !self.failed && self.error.is_none() && self.inner.wants_checkpoint(offset)
+        !self.latch.failed() && self.inner.wants_checkpoint(offset)
+    }
+
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        !self.latch.failed() && self.inner.wants_final_checkpoint(offset)
     }
 
     fn checkpoint(&mut self, cp: &mut Checkpoint) {
-        if !self.failed && self.error.is_none() {
+        if !self.latch.failed() {
             self.inner.checkpoint(cp);
         }
     }
@@ -188,6 +229,7 @@ impl MessageSink for SpoolingSink {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn wide_patch_rows_spool_in_order_without_retaining_extraction_capacity() {
         let mut sink = SpoolingSink::new(None);
@@ -209,10 +251,24 @@ mod tests {
         }
     }
 
+    /// With nowhere to publish, a spool counts what it is handed and holds nothing: no row in
+    /// memory, no byte on disk, however many arrive.
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn a_spool_without_a_catalog_counts_rows_and_retains_none() {
+        let mut spool = EventSpool::default();
+        for i in 0..20_000 {
+            spool.push(event(i, Some(format!("/repo/distinct/{i}.rs")))).unwrap();
+        }
+        assert_eq!(spool.len(), 20_000);
+        assert_eq!(spool.temporary_bytes().unwrap(), 0);
+        assert_eq!(std::mem::size_of::<EventSpool>(), std::mem::size_of::<usize>());
+    }
+
     #[test]
     fn drained_spool_error_cannot_resume_delivery_or_publish_staged_rows() {
         let mut sink = SpoolingSink::new(None);
-        sink.error = Some(anyhow::anyhow!("temporary spool write failed"));
+        sink.latch.fail(anyhow::anyhow!("temporary spool write failed"));
         assert_eq!(sink.take_error().unwrap().to_string(), "temporary spool write failed");
         assert_eq!(sink.message(Message::new(crate::Role::User)), Flow::Stop);
         assert_eq!(sink.observe_message(&Message::new(crate::Role::User)), Flow::Stop);
@@ -235,6 +291,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     fn large_spool(start: usize, len: usize) -> EventSpool {
         let mut spool = EventSpool::default();
         for i in start..start + len {
@@ -243,6 +300,7 @@ mod tests {
         spool
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn spill_roundtrip_retains_bounded_memory_and_removes_owned_file() {
         let small = large_spool(0, 2);
@@ -270,6 +328,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn event_codec_rejects_corrupt_unknown_and_truncated_records() {
         use std::io::Cursor;
@@ -284,6 +343,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn extraction_and_resume_share_the_legacy_event_checkpoint() {
         use crate::{Block, Role};
@@ -337,7 +397,7 @@ mod tests {
         let path = world.write_session("ingest", &[record]);
         let r = SessionRef::new("ingest", Harness::Claude, &path);
         assert_eq!(ingest_ref(&r).unwrap(), 1);
-        let before = format!("{:?}", events_for("claude", "ingest", None));
+        let before = format!("{:?}", events_for("claude", "ingest", None).unwrap());
         let content = fs::read_to_string(&path).unwrap().replace("old.rs", "new-longer.rs");
         fs::write(&path, content).unwrap();
         let conn = crate::catalog::open_db().unwrap();
@@ -346,22 +406,20 @@ mod tests {
         )
         .unwrap();
         assert!(ingest_ref(&r).is_err());
-        assert_eq!(format!("{:?}", events_for("claude", "ingest", None)), before);
+        assert_eq!(format!("{:?}", events_for("claude", "ingest", None).unwrap()), before);
         assert!(needs_ingest(&r));
         conn.execute_batch("DROP TRIGGER reject_event;").unwrap();
         assert_eq!(ingest_ref(&r).unwrap(), 1);
         assert_eq!(
-            events_for("claude", "ingest", None)[0].target.as_deref(),
+            events_for("claude", "ingest", None).unwrap()[0].target.as_deref(),
             Some("/repo/new-longer.rs")
         );
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
-    fn ordered_publication_preserves_suffix_dedup_and_rolls_back_failures() {
-        use crate::events::{
-            events_for, needs_ingest, record_from_with_source, record_spooled_with_source, Provenance,
-        };
+    fn ordered_publication_replaces_the_suffix_and_rolls_back_failures() {
+        use crate::events::{events_for, needs_ingest, record_spooled_with_source, Provenance};
         use crate::{Harness, SessionRef};
         let world = crate::test_world("event-spool-transaction");
         let path = world.proj.join("events.jsonl");
@@ -370,26 +428,25 @@ mod tests {
         let source = crate::source::Probe::default()
             .snapshot(&r)
             .with_reads(&Default::default());
-        // The public slice API accepts arbitrary order and dedups across nonadjacent rows.
-        let prefix = event(0, None);
-        let original = vec![
+        let mut original = EventSpool::default();
+        for row in [
+            event(0, None),
             event(2, Some("old".into())),
-            prefix.clone(),
             event(2, Some("old".into())),
-        ];
-        record_from_with_source(&r, 0, &original, &source, &Provenance::default());
-        assert_eq!(events_for("claude", "events", None).len(), 2);
+        ] {
+            original.push(row).unwrap();
+        }
+        record_spooled_with_source(&r, 0, original, &source, &Provenance::default()).unwrap();
+        assert_eq!(events_for("claude", "events", None).unwrap().len(), 3);
         let mut spool = EventSpool::default();
         spool.push(event(2, None)).unwrap();
-        let mut duplicate = event(2, Some(String::new()));
-        duplicate.detail = Some("later duplicate must lose".into());
-        spool.push(duplicate).unwrap();
         spool.push(event(2, Some("new".into()))).unwrap();
         spool.push(event(3, Some("new".into()))).unwrap();
         record_spooled_with_source(&r, 2, spool, &source, &Provenance::default()).unwrap();
-        let rows = events_for("claude", "events", None);
+        let rows = events_for("claude", "events", None).unwrap();
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].msg_idx, 0);
+        assert_eq!(rows[3].msg_idx, 3);
         assert_eq!(rows[1].target, None);
         let before = format!("{rows:?}");
         assert!(!needs_ingest(&r));
@@ -405,14 +462,14 @@ mod tests {
                 spool.push(event(i, Some("invalid".into()))).unwrap();
             }
             assert!(record_spooled_with_source(&r, 2, spool, &changed, &Provenance::default()).is_err());
-            assert_eq!(format!("{:?}", events_for("claude", "events", None)), before);
+            assert_eq!(format!("{:?}", events_for("claude", "events", None).unwrap()), before);
             assert!(needs_ingest(&r));
         }
         // Force a disk decoding failure after a valid row; all earlier INSERTs still roll back.
         let mut spool = large_spool(2, 3000);
         spool.ordered.append_corrupt(b"{broken\n").unwrap();
         assert!(record_spooled_with_source(&r, 2, spool, &changed, &Provenance::default()).is_err());
-        assert_eq!(format!("{:?}", events_for("claude", "events", None)), before);
+        assert_eq!(format!("{:?}", events_for("claude", "events", None).unwrap()), before);
         assert!(needs_ingest(&r));
         // Force an SQL INSERT failure, again after the suffix DELETE.
         let conn = crate::catalog::open_db().unwrap();
@@ -422,7 +479,7 @@ mod tests {
         .unwrap();
         let spool = large_spool(2, 3000);
         assert!(record_spooled_with_source(&r, 2, spool, &changed, &Provenance::default()).is_err());
-        assert_eq!(format!("{:?}", events_for("claude", "events", None)), before);
+        assert_eq!(format!("{:?}", events_for("claude", "events", None).unwrap()), before);
         assert!(needs_ingest(&r));
     }
 }

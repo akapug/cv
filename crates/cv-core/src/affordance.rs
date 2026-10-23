@@ -3,7 +3,7 @@
 //! checkpoints, branches, forks and model switches (`docs/design/AFFORDANCES.md`).
 //!
 //! This is a **derived view**, not IR: [`of_session`] reads it off what the IR already says (tool
-//! names through the one [`classify_tool`] table, message kinds and origins, lineage, a short
+//! names through the one [`classify_tool_view`] table, message kinds and origins, lineage, a short
 //! record table), and [`Adapter::store_affordances`](crate::harness::Adapter::store_affordances)
 //! adds what lives only in a side store (Claude `tasks/`, Grok `plan.json`, …). The one IR-side
 //! piece is [`AffordanceSink`], which adapters wrap around their sink: it unwraps deferred-tool
@@ -11,6 +11,8 @@
 //! tool a [`MessageKind::SubagentSpawn`] and a synchronous spawn's result a
 //! [`MessageKind::SubagentReturn`].
 
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 pub(crate) mod input;
 mod text;
 
@@ -26,7 +28,7 @@ use std::collections::HashSet;
 macro_rules! kinds {
     ($( $(#[$m:meta])* $name:ident => $s:literal ),+ $(,)?) => {
         /// One word of the vocabulary. Serialized as its snake_case name.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, serde::Deserialize)]
         #[serde(rename_all = "snake_case")]
         pub enum Kind { $( $(#[$m])* $name, )+ }
 
@@ -168,26 +170,41 @@ pub fn plan_state(kind: Kind, tool: impl Into<String>, items: Vec<Item>) -> Opti
     (!items.is_empty()).then(|| Affordance::store(kind, tool, items_summary(&items), items))
 }
 
-/// The JSON files of `dir` (sorted by name, numerically when the stems are numbers), parsed;
-/// unreadable ones skipped. The shared reader behind the per-file side stores.
-pub fn json_files(dir: &std::path::Path) -> Vec<(String, Value)> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// Read an optional JSON side file. Absence is empty; I/O and decode failures retain its path.
+pub(crate) fn side_json(path: &std::path::Path) -> anyhow::Result<Option<Value>> {
+    use anyhow::Context;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
-    let mut files: Vec<(String, Value)> = rd
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .filter_map(|p| {
-            let stem = p.file_stem()?.to_str()?.to_string();
-            let v = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
-            Some((stem, v))
-        })
-        .collect();
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("decoding {}", path.display()))
+}
+
+/// The JSON files of `dir`, sorted by name (numeric stems sort numerically).
+/// Only a missing directory is empty; a failed entry, read or decode is an error.
+pub fn json_files(dir: &std::path::Path) -> anyhow::Result<Vec<(String, Value)>> {
+    let mut files = Vec::new();
+    for entry in crate::harness::side_entries(dir)? {
+        let path = entry.path();
+        if !path.extension().is_some_and(|x| x == "json") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 JSON filename: {}", path.display()))?;
+        if let Some(value) = side_json(&path)? {
+            files.push((stem.to_owned(), value));
+        }
+    }
     files.sort_by(|a, b| match (a.0.parse::<u64>(), b.0.parse::<u64>()) {
         (Ok(x), Ok(y)) => x.cmp(&y),
         _ => a.0.cmp(&b.0),
     });
-    files
+    Ok(files)
 }
 
 /// The session-bag key under which an adapter lists the approval modes a session ran under, in
@@ -247,6 +264,10 @@ pub enum Returns {
     ResultUnless(&'static str),
     /// The result is only an acknowledgement; the return arrives later as its own record.
     Later,
+    /// The result is the answer, and may ride inside the next prompt beside the user's own text
+    /// (Roo's `new_task`): that message stays a prompt, the result is named after this spawn tool
+    /// (the reader leaves it unnamed) and counted as a return detail.
+    ResultInPrompt(&'static str),
 }
 
 fn flag(input: JsonView<'_>, key: &str) -> Result<bool> {
@@ -260,48 +281,41 @@ fn flag(input: JsonView<'_>, key: &str) -> Result<bool> {
 /// The cron-style tools that take an action argument. Compare the complete string without
 /// materializing a potentially giant ignored action value.
 fn action_verb(input: JsonView<'_>) -> Result<&'static str> {
-    const WORDS: &[&str] = &[
-        "create",
-        "add",
-        "new",
-        "schedule",
-        "remove",
-        "delete",
-        "cancel",
-        "rm",
-        "list",
-        "ls",
-        "status",
-        "get",
-        "show",
-        "run",
-        "run_now",
-        "trigger",
-        "kill",
-        "stop",
-        "terminate",
+    const ACTIONS: [(&str, &str); 19] = [
+        ("create", "create"),
+        ("add", "create"),
+        ("new", "create"),
+        ("schedule", "create"),
+        ("remove", "delete"),
+        ("delete", "delete"),
+        ("cancel", "delete"),
+        ("rm", "delete"),
+        ("list", "list"),
+        ("ls", "list"),
+        ("status", "list"),
+        ("get", "list"),
+        ("show", "list"),
+        ("run", "fire"),
+        ("run_now", "fire"),
+        ("trigger", "fire"),
+        ("kill", "stop"),
+        ("stop", "stop"),
+        ("terminate", "stop"),
     ];
     let action = input
         .get("action")?
-        .map(|v| input::word(v, WORDS))
+        .map(|v| input::word(v, &ACTIONS.map(|(word, _)| word)))
         .transpose()?
         .flatten();
-    Ok(match action {
-        Some(0..=3) => "create",
-        Some(4..=7) => "delete",
-        Some(8..=12) => "list",
-        Some(13..=15) => "fire",
-        Some(16..=18) => "stop",
-        _ => "update",
-    })
+    Ok(action.map_or("update", |index| ACTIONS[index].1))
 }
 
 /// The one table: `(harness, tool name, input)` → `(kind, action)`, or `None` for a tool that is not
 /// an affordance. Scoped by harness only where a name means different things in different
 /// harnesses (`task` is a sub-agent in OpenCode; `Bash` is a background job only when told to be).
-/// Compatibility for already-owned side-store data and callers of the public Value API.
-/// Owned views cannot encounter source failures.
-pub fn classify_tool(h: Harness, name: &str, value: &Value) -> Option<(Kind, &'static str)> {
+/// Test shim over the view table with owned JSON: owned views cannot encounter source failures.
+#[cfg(test)]
+fn classify_tool(h: Harness, name: &str, value: &Value) -> Option<(Kind, &'static str)> {
     classify_tool_view(h, name, JsonView::from(value)).expect("owned JSON classification")
 }
 
@@ -310,97 +324,159 @@ pub fn classify_tool_json(h: Harness, name: &str, value: &Json) -> Result<Option
 }
 
 pub fn classify_tool_view(h: Harness, name: &str, input: JsonView<'_>) -> Result<Option<(Kind, &'static str)>> {
-    use Harness as H;
     use Kind::*;
     // OpenClaw names a deferred core tool `openclaw:core:<tool>`.
     let name = name.rsplit(':').next().unwrap_or(name);
-    Ok(Some(match (h, name) {
-        // plan: whole-list writes
-        (
-            _,
-            "TodoWrite" | "todo_write" | "todowrite" | "write_todos" | "todo__todo_write" | "SetTodoList" | "TodoList",
-        )
-        | (_, "update_plan" | "Checklist" | "update_todo_list")
-        | (H::Hermes, "todo") => (Plan, "write"),
-        (H::Hermes, "todo_list") => (Plan, "read"),
-        (_, "todoread") => (Plan, "read"),
-        // plan: item-wise task lists
-        (_, "TaskCreate") | (H::Qwen, "task_create") | (_, "tracker_create_task") => (Plan, "create"),
-        (_, "TaskUpdate") | (H::Qwen, "task_update") | (_, "tracker_update_task") => (Plan, "update"),
-        (_, "TaskList" | "TaskGet") if h != H::Kimi && h != H::KimiCode => (Plan, "read"),
-        (H::Qwen, "task_list" | "task_get") | (_, "tracker_list_tasks" | "tracker_get_task" | "tracker_visualize") => {
-            (Plan, "read")
-        }
-        (_, n) if n.starts_with("tracker_") => (Plan, "update"),
-        // plan mode
-        (_, "EnterPlanMode" | "enter_plan_mode") => (Plan, "enter"),
-        (_, "ExitPlanMode" | "exit_plan_mode") => (Plan, "exit"),
-        // goal
-        (_, "CreateGoal") => (Goal, "create"),
-        (_, "UpdateGoal" | "update_goal" | "SetGoalBudget") => (Goal, "update"),
-        (_, "GetGoal" | "get_goal") => (Goal, "read"),
-        // schedule
-        (_, "CronCreate" | "cron_create" | "scheduler_create" | "ScheduleWakeup" | "loop_wakeup") => {
-            (Schedule, "create")
-        }
-        (_, "CronDelete" | "cron_delete" | "scheduler_delete") => (Schedule, "delete"),
-        (_, "CronList" | "cron_list" | "scheduler_list") => (Schedule, "list"),
-        (H::Hermes, "cronjob" | "cronjob_manage") | (H::OpenClaw, "cron" | "automations") => {
-            (Schedule, action_verb(input)?)
-        }
-        // background jobs
-        (_, "Bash") if flag(input, "run_in_background")? => (BackgroundJob, "start"),
-        (_, "run_terminal_command") if flag(input, "background")? || flag(input, "is_background")? => {
-            (BackgroundJob, "start")
-        }
-        (_, "run_shell_command") if flag(input, "is_background")? => (BackgroundJob, "start"),
-        (H::Hermes, "terminal") | (H::OpenClaw, "exec") if flag(input, "background")? => (BackgroundJob, "start"),
-        (_, "Monitor" | "monitor") => (BackgroundJob, "start"),
-        (_, "BashOutput" | "TaskOutput" | "get_command_or_subagent_output" | "WaitFor" | "CheckBackgroundJob") => {
-            (BackgroundJob, "read")
-        }
-        (H::Kimi | H::KimiCode, "TaskList") => (BackgroundJob, "read"),
-        (_, "KillShell" | "TaskStop" | "kill_command_or_subagent") => (BackgroundJob, "stop"),
-        (H::Hermes, "process" | "process_manage") | (H::OpenClaw, "process") => match action_verb(input)? {
+    let process = |input| -> Result<(Kind, &'static str)> {
+        Ok(match action_verb(input)? {
             "stop" => (BackgroundJob, "stop"),
             _ => (BackgroundJob, "read"),
+        })
+    };
+    // The names a harness gives a meaning of its own; every other name reads the same in all.
+    let own = match h {
+        Harness::Hermes => match name {
+            "todo" => Some((Plan, "write")),
+            "todo_list" => Some((Plan, "read")),
+            "cronjob" | "cronjob_manage" => Some((Schedule, action_verb(input)?)),
+            "terminal" if flag(input, "background")? => Some((BackgroundJob, "start")),
+            "process" | "process_manage" => Some(process(input)?),
+            "clarify" => Some((Question, "ask")),
+            _ => None,
         },
-        // sub-agents
-        (_, n) if spawn_returns(h, n).is_some() => (SubagentSpawn, "spawn"),
-        // skills
-        (_, "Skill" | "activate_skill" | "load_skill" | "Skills") | (H::OpenCode | H::Qwen | H::Roo, "skill") => {
-            (Skill, "load")
+        Harness::OpenClaw => match name {
+            "cron" | "automations" => Some((Schedule, action_verb(input)?)),
+            "exec" if flag(input, "background")? => Some((BackgroundJob, "start")),
+            "process" => Some(process(input)?),
+            _ => None,
+        },
+        Harness::Qwen => match name {
+            "task_create" => Some((Plan, "create")),
+            "task_update" => Some((Plan, "update")),
+            "task_list" | "task_get" => Some((Plan, "read")),
+            "skill" => Some((Skill, "load")),
+            _ => None,
+        },
+        // Kimi's `TaskList` lists background tasks, and its `TaskGet` reads no plan.
+        Harness::Kimi | Harness::KimiCode => match name {
+            "TaskList" => Some((BackgroundJob, "read")),
+            "TaskGet" => return Ok(None),
+            "Agent" | "AgentSwarm" if h == Harness::KimiCode => Some((SubagentSpawn, "spawn")),
+            _ => None,
+        },
+        Harness::OpenCode => match name {
+            "skill" => Some((Skill, "load")),
+            "question" => Some((Question, "ask")),
+            _ => None,
+        },
+        Harness::Roo => match name {
+            "skill" => Some((Skill, "load")),
+            _ => None,
+        },
+        Harness::Claude
+        | Harness::Codex
+        | Harness::Grok
+        | Harness::Gemini
+        | Harness::Cursor
+        | Harness::LmStudio
+        | Harness::Cline
+        | Harness::Continue
+        | Harness::Goose
+        | Harness::Zed
+        | Harness::Devin
+        | Harness::ChatGptExport
+        | Harness::ClaudeExport
+        | Harness::OpenSession => None,
+    };
+    if own.is_some() {
+        return Ok(own);
+    }
+    Ok(Some(match name {
+        // plan: whole-list writes
+        "TodoWrite" | "todo_write" | "todowrite" | "write_todos" | "todo__todo_write" | "SetTodoList" | "TodoList"
+        | "update_plan" | "Checklist" | "update_todo_list" => (Plan, "write"),
+        "todoread" => (Plan, "read"),
+        // plan: item-wise task lists
+        "TaskCreate" | "tracker_create_task" => (Plan, "create"),
+        "TaskUpdate" | "tracker_update_task" => (Plan, "update"),
+        "TaskList" | "TaskGet" => (Plan, "read"),
+        "tracker_list_tasks" | "tracker_get_task" | "tracker_visualize" => (Plan, "read"),
+        // Unknown tracker operations count as plan updates; only the explicit rows above
+        // distinguish reads and creates. This prefix is a classification heuristic.
+        n if n.starts_with("tracker_") => (Plan, "update"),
+        // plan mode
+        "EnterPlanMode" | "enter_plan_mode" => (Plan, "enter"),
+        "ExitPlanMode" | "exit_plan_mode" => (Plan, "exit"),
+        // goal
+        "CreateGoal" => (Goal, "create"),
+        "UpdateGoal" | "update_goal" | "SetGoalBudget" => (Goal, "update"),
+        "GetGoal" | "get_goal" => (Goal, "read"),
+        // schedule
+        "CronCreate" | "cron_create" | "scheduler_create" | "ScheduleWakeup" | "loop_wakeup" => (Schedule, "create"),
+        "CronDelete" | "cron_delete" | "scheduler_delete" => (Schedule, "delete"),
+        "CronList" | "cron_list" | "scheduler_list" => (Schedule, "list"),
+        // background jobs
+        "Bash" if flag(input, "run_in_background")? => (BackgroundJob, "start"),
+        "run_terminal_command" if flag(input, "background")? || flag(input, "is_background")? => {
+            (BackgroundJob, "start")
         }
-        (_, "skill_manage") => (Skill, "manage"),
+        "run_shell_command" if flag(input, "is_background")? => (BackgroundJob, "start"),
+        "Monitor" | "monitor" => (BackgroundJob, "start"),
+        "BashOutput" | "TaskOutput" | "get_command_or_subagent_output" | "WaitFor" | "CheckBackgroundJob" => {
+            (BackgroundJob, "read")
+        }
+        "KillShell" | "TaskStop" | "kill_command_or_subagent" => (BackgroundJob, "stop"),
+        // sub-agents
+        n if spawn_returns(h, n).is_some() => (SubagentSpawn, "spawn"),
+        // skills
+        "Skill" | "activate_skill" | "load_skill" | "Skills" => (Skill, "load"),
+        "skill_manage" => (Skill, "manage"),
         // questions to the person
-        (_, "AskUserQuestion" | "ask_user" | "ask_user_question" | "ask_followup_question" | "ask_question")
-        | (_, "AskQuestion")
-        | (H::Hermes, "clarify")
-        | (H::OpenCode, "question") => (Question, "ask"),
+        "AskUserQuestion"
+        | "ask_user"
+        | "ask_user_question"
+        | "ask_followup_question"
+        | "ask_question"
+        | "AskQuestion" => (Question, "ask"),
         _ => return Ok(None),
     }))
 }
 
 /// Whether `(h, name)` spawns a sub-agent, and how its result relates to the return.
 pub fn spawn_returns(h: Harness, name: &str) -> Option<Returns> {
-    use Harness as H;
-    Some(match (h, name) {
+    let one = |tool: &str, returns| (name == tool).then_some(returns);
+    match h {
         // Claude marks a synchronous return itself (from `toolUseResult`), per record.
-        (H::Claude, "Agent" | "Task" | "Workflow") => Returns::Later,
-        (H::OpenCode, "task") => Returns::Result,
-        (H::OpenCode, "subagent") => Returns::ResultUnless("in the background"),
-        (H::Hermes, "delegate_task") => Returns::ResultUnless("\"dispatched\""),
-        (H::OpenClaw, "sessions_spawn") => Returns::Later,
-        (H::Goose, "delegate") => Returns::Result,
-        (H::Grok, "spawn_subagent") => Returns::Later,
-        (H::Kimi, "Agent") => Returns::ResultUnless("background"),
-        (H::Roo, "new_task") => Returns::Result,
-        (H::Cline, "spawn_agent") => Returns::Result,
-        (H::Cline, "team_spawn_teammate") => Returns::Later,
-        (H::Devin, "run_subagent") => Returns::Result,
-        (H::Continue, "Subagent") => Returns::Result,
-        _ => return None,
-    })
+        Harness::Claude => matches!(name, "Agent" | "Task" | "Workflow").then_some(Returns::Later),
+        Harness::OpenCode => match name {
+            "task" => Some(Returns::Result),
+            "subagent" => Some(Returns::ResultUnless("in the background")),
+            _ => None,
+        },
+        Harness::Cline => match name {
+            "spawn_agent" => Some(Returns::Result),
+            "team_spawn_teammate" => Some(Returns::Later),
+            _ => None,
+        },
+        Harness::Hermes => one("delegate_task", Returns::ResultUnless("\"dispatched\"")),
+        Harness::OpenClaw => one("sessions_spawn", Returns::Later),
+        Harness::Goose => one("delegate", Returns::Result),
+        Harness::Grok => one("spawn_subagent", Returns::Later),
+        Harness::Kimi => one("Agent", Returns::ResultUnless("background")),
+        Harness::Roo => one("new_task", Returns::ResultInPrompt("new_task")),
+        Harness::Devin => one("run_subagent", Returns::Result),
+        Harness::Continue => one("Subagent", Returns::Result),
+        Harness::Codex
+        | Harness::Gemini
+        | Harness::Cursor
+        | Harness::KimiCode
+        | Harness::Qwen
+        | Harness::LmStudio
+        | Harness::Zed
+        | Harness::ChatGptExport
+        | Harness::ClaudeExport
+        | Harness::OpenSession => None,
+    }
 }
 
 /// The deferred-tool wrapper Hermes, OpenClaw 10.1 and Qwen route lazily loaded tools through.
@@ -408,17 +484,17 @@ pub fn spawn_returns(h: Harness, name: &str) -> Option<Returns> {
 /// IR the call is the inner tool's, with this namespace.
 pub const DEFERRED: &str = "tool_call";
 
-/// The `(name key, arguments key)` of `h`'s deferred-tool wrapper.
-pub(crate) fn deferred_keys(h: Harness) -> (&'static str, &'static str) {
-    match h {
-        Harness::OpenClaw => ("id", "args"),
-        _ => ("name", "arguments"),
-    }
+/// The keys of a store's deferred-tool wrapper ([`DEFERRED`]): the inner tool's name and its
+/// arguments ([`crate::harness::Capabilities::deferred_wrapper`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredWrapper {
+    pub name_key: &'static str,
+    pub args_key: &'static str,
 }
 
 /// `tool_call{name, arguments}` (or OpenClaw's `{id, args}`) → the inner tool's call, namespaced
 /// [`DEFERRED`]. Anything else (including a wrapper without a string name) is left alone.
-pub fn unwrap_deferred(h: Harness, b: &mut Block) -> Result<()> {
+pub fn unwrap_deferred(wrapper: DeferredWrapper, b: &mut Block) -> Result<()> {
     if let Block::ToolUse {
         name, input, namespace, ..
     } = b
@@ -426,7 +502,7 @@ pub fn unwrap_deferred(h: Harness, b: &mut Block) -> Result<()> {
         if name != DEFERRED || namespace.is_some() {
             return Ok(());
         }
-        let (name_key, args_key) = deferred_keys(h);
+        let DeferredWrapper { name_key, args_key } = wrapper;
         let Some(inner) = input.with_view(|view| input::field_string(view, name_key))? else {
             return Ok(());
         };
@@ -451,7 +527,7 @@ pub fn unwrap_deferred(h: Harness, b: &mut Block) -> Result<()> {
 /// Complete replay boundary for stores that spell deferred calls as wrappers. The returned
 /// owned wire object demands every argument; ordinary classification uses the unwrapped source
 /// descriptor and never calls this materializing operation.
-pub fn rewrap_deferred(h: Harness, b: &Block) -> Result<Option<Block>> {
+pub fn rewrap_deferred(wrapper: DeferredWrapper, b: &Block) -> Result<Option<Block>> {
     Ok(match b {
         Block::ToolUse {
             id,
@@ -459,7 +535,7 @@ pub fn rewrap_deferred(h: Harness, b: &Block) -> Result<Option<Block>> {
             input,
             namespace: Some(ns),
         } if ns == DEFERRED => {
-            let (name_key, args_key) = deferred_keys(h);
+            let DeferredWrapper { name_key, args_key } = wrapper;
             let mut wrapped = serde_json::Map::new();
             wrapped.insert(name_key.into(), Value::String(name.clone()));
             wrapped.insert(args_key.into(), input.resolve()?.into_owned());
@@ -474,79 +550,80 @@ pub fn rewrap_deferred(h: Harness, b: &Block) -> Result<Option<Block>> {
     })
 }
 
-/// A sink wrapper an adapter puts around its sink. It unwraps `tool_call` (for the harnesses whose
-/// reader does not: Hermes, OpenClaw), then: a `Reply` that calls a spawn tool becomes a
+/// A sink wrapper an adapter puts around its sink. It unwraps the deferred `tool_call` wrapper (for
+/// an adapter whose reader leaves it, [`AffordanceSink::unwrapping`]), then: a `Reply` that calls a spawn tool becomes a
 /// [`MessageKind::SubagentSpawn`], and the tool-result turn answering a synchronous spawn a
 /// [`MessageKind::SubagentReturn`] with [`Origin::Subagent`]. The state is the set of open
 /// synchronous spawn ids, so it stays O(spawns).
 pub struct AffordanceSink<'a> {
     harness: Harness,
+    deferred: Option<DeferredWrapper>,
     inner: &'a mut dyn MessageSink,
     open: std::collections::HashMap<String, Returns>,
-    error: Option<anyhow::Error>,
-    failed: bool,
+    latch: crate::stream::Latch,
 }
 
 impl<'a> AffordanceSink<'a> {
     pub fn new(harness: Harness, inner: &'a mut dyn MessageSink) -> Self {
         AffordanceSink {
             harness,
+            deferred: None,
             inner,
             open: Default::default(),
-            error: None,
-            failed: false,
+            latch: Default::default(),
         }
+    }
+
+    /// Unwrap `wrapper`'s deferred calls too: an adapter whose reader leaves them passes its
+    /// [`crate::harness::Capabilities::deferred_wrapper`].
+    pub fn unwrapping(mut self, wrapper: Option<DeferredWrapper>) -> Self {
+        self.deferred = wrapper;
+        self
     }
 }
 
 impl MessageSink for AffordanceSink<'_> {
-    fn extra_projection(&self) -> crate::stream::ExtraProjection {
-        self.inner.extra_projection()
+    fn tier(&self) -> crate::stream::Tier {
+        self.inner.tier()
     }
     fn dependency(&mut self, path: &std::path::Path) {
-        if !self.failed {
+        if !self.latch.failed() {
             self.inner.dependency(path);
         }
     }
-    fn take_error(&mut self) -> Option<anyhow::Error> {
-        if let Some(error) = self.error.take().or_else(|| self.inner.take_error()) {
-            self.failed = true;
-            return Some(error);
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if !self.latch.failed() {
+            self.inner.append_only_dependency(path);
         }
-        self.failed
-            .then(|| anyhow::anyhow!("affordance consumer has already failed"))
+    }
+    fn take_error(&mut self) -> Option<anyhow::Error> {
+        self.latch.take_or(self.inner, "affordance consumer")
     }
 
     fn message(&mut self, mut m: Message) -> Flow {
-        if self.failed {
+        if self.latch.failed() {
             return Flow::Stop;
         }
-        if matches!(self.harness, Harness::Hermes | Harness::OpenClaw) {
+        if let Some(wrapper) = self.deferred {
             for block in &mut m.content {
-                if let Err(error) = unwrap_deferred(self.harness, block) {
-                    self.failed = true;
-                    self.error = Some(error);
+                if let Err(error) = unwrap_deferred(wrapper, block) {
+                    self.latch.fail(error);
                     return Flow::Stop;
                 }
             }
         }
         if let Err(error) = refine_spawn(self.harness, &mut m, &mut self.open) {
-            self.failed = true;
-            self.error = Some(error);
+            self.latch.fail(error);
             return Flow::Stop;
         }
-        match self.inner.try_message(m) {
-            Ok(flow) => flow,
-            Err(error) => {
-                self.failed = true;
-                self.error = Some(error);
-                Flow::Stop
-            }
-        }
+        self.inner.try_message(m).unwrap_or_else(|error| {
+            self.latch.fail(error);
+            Flow::Stop
+        })
     }
 
     fn meta(&mut self, s: &Session) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         self.inner.meta(s);
@@ -555,11 +632,15 @@ impl MessageSink for AffordanceSink<'_> {
     /// Never while a synchronous spawn waits for its result: which result returns it is state no
     /// checkpoint carries.
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
-        !self.failed && self.open.is_empty() && self.inner.wants_checkpoint(offset)
+        !self.latch.failed() && self.open.is_empty() && self.inner.wants_checkpoint(offset)
+    }
+
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        !self.latch.failed() && self.open.is_empty() && self.inner.wants_final_checkpoint(offset)
     }
 
     fn checkpoint(&mut self, cp: &mut crate::stream::Checkpoint) {
-        if !self.failed {
+        if !self.latch.failed() {
             self.inner.checkpoint(cp);
         }
     }
@@ -568,14 +649,6 @@ impl MessageSink for AffordanceSink<'_> {
 /// Match launch receipts without retaining their decoded payload. Keep only the marker overlap
 /// between chunks, and preserve checked source errors when an early match ends the demand.
 fn source_contains(source: &crate::lazy::SourceText, marker: &str) -> Result<bool> {
-    #[derive(Debug)]
-    struct Found;
-    impl std::fmt::Display for Found {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("receipt marker found")
-        }
-    }
-    impl std::error::Error for Found {}
     let mut window = Vec::new();
     let result = source.try_for_each_chunk(64 * 1024, |part| {
         window.extend_from_slice(part.as_bytes());
@@ -584,7 +657,7 @@ fn source_contains(source: &crate::lazy::SourceText, marker: &str) -> Result<boo
                 .windows(marker.len())
                 .any(|candidate| candidate == marker.as_bytes())
         {
-            return Err(Found.into());
+            return Err(crate::stream::Stop.into());
         }
         let keep = window.len().min(marker.len().saturating_sub(1));
         let start = window.len() - keep;
@@ -593,7 +666,7 @@ fn source_contains(source: &crate::lazy::SourceText, marker: &str) -> Result<boo
         Ok(())
     });
     match result {
-        Err(error) if error.is::<Found>() => Ok(true),
+        Err(error) if error.is::<crate::stream::Stop>() => Ok(true),
         Err(error) => Err(error),
         Ok(()) => Ok(marker.is_empty()),
     }
@@ -629,17 +702,29 @@ fn refine_spawn(h: Harness, m: &mut Message, open: &mut std::collections::HashMa
         }
         _ if !open.is_empty() && !m.content.is_empty() => {
             let all_results = m.content.iter().all(|b| matches!(b, Block::ToolResult { .. }));
-            if !all_results {
+            // This message can settle an open spawn when it is wholly results, or when a spawn
+            // expects its return inside the next prompt beside the user's own text (Roo).
+            let settles = all_results || open.values().any(|r| matches!(r, Returns::ResultInPrompt(_)));
+            if !settles {
                 return Ok(());
             }
             let mut returned = false;
-            for b in &m.content {
+            for b in &mut m.content {
                 if let Block::ToolResult {
-                    tool_use_id, content, ..
+                    tool_use_id,
+                    content,
+                    tool_name,
+                    ..
                 } = b
                 {
                     match open.remove(tool_use_id.as_str()) {
                         Some(Returns::Result) => returned = true,
+                        Some(Returns::ResultInPrompt(spawn)) => {
+                            returned = true;
+                            if !all_results {
+                                *tool_name = Some(spawn.into());
+                            }
+                        }
                         // A lazy span is a large result: an answer, not a launch receipt.
                         Some(Returns::ResultUnless(marker)) => {
                             returned |= match content {
@@ -652,7 +737,7 @@ fn refine_spawn(h: Harness, m: &mut Message, open: &mut std::collections::HashMa
                     }
                 }
             }
-            if returned {
+            if returned && all_results {
                 m.kind = MessageKind::SubagentReturn;
                 m.origin = Origin::Subagent;
             }
@@ -666,7 +751,7 @@ fn refine_spawn(h: Harness, m: &mut Message, open: &mut std::collections::HashMa
 /// the first array under `todos`/`plan`/`items`/`tasks`/`checklist`, each element's text under
 /// the first of `content`/`step`/`description`/`title`/`subject`/`text`/`task`/`name`; or a
 /// markdown checklist / numbered list in a string under one of those keys.
-pub fn items_of(v: &Value) -> Vec<Item> {
+pub(crate) fn items_of(v: &Value) -> Vec<Item> {
     items_of_view(JsonView::from(v)).expect("owned JSON items")
 }
 
@@ -712,46 +797,65 @@ pub fn items_of_view(view: JsonView<'_>) -> Result<Vec<Item>> {
     Ok(item_of_view(view)?.into_iter().collect())
 }
 
-pub fn item_of(v: &Value) -> Option<Item> {
+pub(crate) fn item_of(v: &Value) -> Option<Item> {
     item_of_view(JsonView::from(v)).expect("owned JSON item")
 }
 
-pub fn item_of_view(view: JsonView<'_>) -> Result<Option<Item>> {
-    const TEXT: &[&str] = &[
-        "content",
-        "subject",
-        "title",
-        "step",
-        "description",
-        "text",
-        "task",
-        "name",
-        "goal",
-    ];
-    // A plain-string item is trimmed; object content retains its original whitespace.
+/// The keys an item's text hides under, tried in order, wherever plan items are spelled.
+const ITEM_TEXT_KEYS: &[&str] = &[
+    "content",
+    "subject",
+    "title",
+    "step",
+    "description",
+    "text",
+    "task",
+    "name",
+    "goal",
+];
+
+fn item_text(view: JsonView<'_>) -> Result<Option<JsonView<'_>>> {
     if view.is_string()? {
-        return Ok(input::item_string(view, true)?.map(|content| Item { content, status: None }));
+        return Ok(Some(view));
     }
-    for &key in TEXT {
-        let Some(value) = view.get(key)? else {
-            continue;
-        };
-        if !value.is_string()? {
-            continue;
+    for key in ITEM_TEXT_KEYS {
+        if let Some(text) = view.get(key)? {
+            if text.is_string()? {
+                return Ok(Some(text));
+            }
         }
-        let Some(content) = input::item_string(value, false)? else {
-            return Ok(None);
-        };
-        let status = match view.get("status")? {
+    }
+    Ok(None)
+}
+
+/// Reducer presence check without allocating a potentially large plan item's text.
+pub(crate) fn item_present(view: JsonView<'_>) -> Result<bool> {
+    let Some(text) = item_text(view)? else { return Ok(false) };
+    let mut present = false;
+    text.for_each_str_chunk(|chunk| {
+        present |= !chunk.trim().is_empty();
+        Ok(())
+    })?;
+    Ok(present)
+}
+
+pub fn item_of_view(view: JsonView<'_>) -> Result<Option<Item>> {
+    let Some(text) = item_text(view)? else { return Ok(None) };
+    let Some(content) = input::item_string(text, view.is_string()?)? else {
+        return Ok(None);
+    };
+    let status = if view.is_string()? {
+        None
+    } else {
+        match view.get("status")? {
             Some(value) => Some(value),
             None => view.get("state")?,
         }
         .map(input::string)
         .transpose()?
-        .flatten();
-        return Ok(Some(Item { content, status }));
-    }
-    Ok(None)
+        .flatten()
+    };
+    Ok(Some(Item { content, status }))
 }
 
 /// `- [x] done`, `[ ] todo`, `[-] doing`, `1. step`, `* step` lines.
@@ -804,17 +908,7 @@ fn item_summary(view: JsonView<'_>) -> Result<Option<String>> {
     if view.is_string()? {
         return Ok(input::trimmed_prefix(view, 120)?.filter(|text| !text.is_empty()));
     }
-    for key in [
-        "content",
-        "subject",
-        "title",
-        "step",
-        "description",
-        "text",
-        "task",
-        "name",
-        "goal",
-    ] {
+    for key in ITEM_TEXT_KEYS {
         if let Some(value) = view.get(key)? {
             if value.is_string()? {
                 return input::nonblank_prefix(value, 120);
@@ -842,7 +936,7 @@ fn call_summary(kind: Kind, view: JsonView<'_>, items: &[Item]) -> Result<String
                     .transpose()?
                     .flatten()
                 {
-                    let mut text = input::Prefix::new(120);
+                    let mut text = crate::projection::Head::bounded(120);
                     text.push(&which);
                     text.push(" → ");
                     text.push(&status);
@@ -911,7 +1005,7 @@ fn call_summary(kind: Kind, view: JsonView<'_>, items: &[Item]) -> Result<String
             parts.push(status);
         }
     }
-    let mut text = input::Prefix::new(120);
+    let mut text = crate::projection::Head::bounded(120);
     for (index, part) in parts.iter().enumerate() {
         if index != 0 {
             text.push(" · ");
@@ -921,62 +1015,17 @@ fn call_summary(kind: Kind, view: JsonView<'_>, items: &[Item]) -> Result<String
     Ok(text.finish())
 }
 
-/// Record-shaped affordances: messages the harness wrote that no `MessageKind` names.
-fn record(
-    h: Harness,
-    m: &Message,
-    resolver: &crate::lazy::Resolver,
-) -> Result<Option<(Kind, &'static str, &'static str)>> {
-    use Harness as H;
-    let bag = m.harness_extra(h);
-    let bag_str = |k: &str| bag.and_then(|b| b.get(k)).and_then(Value::as_str);
-    let head = match m.content.first() {
+/// Record-shaped affordances: messages the harness wrote that no `MessageKind` names, as the
+/// adapter that owns the record reads them.
+fn record(h: Harness, m: &Message, resolver: &crate::lazy::Resolver) -> Result<Option<RecordHit>> {
+    let Some(adapter) = crate::harness::rootless(h) else {
+        return Ok(None);
+    };
+    let text = match m.content.first() {
         Some(Block::Text { text }) => Some(text),
         _ => None,
     };
-    let starts_with = |prefix| -> Result<bool> {
-        Ok(head
-            .map(|head| text::starts_with(head, resolver, prefix))
-            .transpose()?
-            .unwrap_or(false))
-    };
-    Ok(match h {
-        H::Claude if m.kind == MessageKind::InjectedContext && starts_with("<task-notification>")? => {
-            Some((Kind::BackgroundJob, "complete", "task-notification"))
-        }
-        H::Kimi if starts_with("<notification")? => Some((Kind::BackgroundJob, "complete", "notification")),
-        H::KimiCode => match bag_str("origin_kind").unwrap_or("") {
-            "task" | "background_task" => Some((Kind::BackgroundJob, "complete", "task")),
-            "skill_activation" => Some((Kind::Skill, "load", "skill_activation")),
-            "hook_result" => Some((Kind::Hook, "output", "hook_result")),
-            _ => None,
-        },
-        H::Hermes => match bag_str("display_kind").unwrap_or("") {
-            "process_complete" => Some((Kind::BackgroundJob, "complete", "process_complete")),
-            "skill_invocation" => Some((Kind::Skill, "load", "skill_invocation")),
-            _ => None,
-        },
-        // An MCP call Codex refused because the approval policy could not ask (`never`).
-        H::Codex
-            if bag_str("item_type") == Some("McpToolCall")
-                && head
-                    .map(|head| text::contains(head, resolver, "requires approval"))
-                    .transpose()?
-                    .unwrap_or(false) =>
-        {
-            Some((Kind::Approval, "deny", "McpToolCall"))
-        }
-        H::OpenCode
-            if bag
-                .and_then(|b| b.get("metadata"))
-                .and_then(|v| v.get("source"))
-                .and_then(Value::as_str)
-                == Some("shell") =>
-        {
-            Some((Kind::BackgroundJob, "complete", "synthetic"))
-        }
-        _ => None,
-    })
+    adapter.record_affordance(m, &FirstText { text, resolver })
 }
 
 /// A message's one-line summary from its complete first text or tool output. The reducer searches
@@ -1021,13 +1070,61 @@ enum Hit<'a> {
     },
 }
 
+/// How a harness words an error result that is the user (or a rule) refusing the call: the text
+/// starts with `prefix` and, when given, also contains `also`
+/// ([`crate::harness::Capabilities::denials`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Denial {
+    pub prefix: &'static str,
+    pub also: Option<&'static str>,
+}
+
+/// One affordance a message's harness bag records outside its blocks
+/// ([`crate::harness::Adapter::message_affordances`]): a row with no call of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BagHit {
+    pub kind: Kind,
+    pub action: &'static str,
+    pub tool: &'static str,
+    pub summary: String,
+}
+
+/// The affordance one of a harness's own records is (a skill load, a completion notice, a refused
+/// call) when no `MessageKind` names it ([`crate::harness::Adapter::record_affordance`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordHit {
+    pub kind: Kind,
+    pub action: &'static str,
+    pub tool: &'static str,
+}
+
+/// A message's leading text block, read through its resolver, for an adapter's record test.
+pub struct FirstText<'a> {
+    text: Option<&'a crate::lazy::Text>,
+    resolver: &'a crate::lazy::Resolver,
+}
+
+impl FirstText<'_> {
+    /// Whether the text, leading whitespace aside, starts with `prefix`; false with no text.
+    pub fn starts_with(&self, prefix: &str) -> Result<bool> {
+        self.text
+            .map_or(Ok(false), |text| text::starts_with(text, self.resolver, prefix))
+    }
+
+    /// Whether the text contains `needle`; false with no text.
+    pub fn contains(&self, needle: &'static str) -> Result<bool> {
+        self.text
+            .map_or(Ok(false), |text| text::contains(text, self.resolver, needle))
+    }
+}
+
 /// The first eight characters of a snapshot hash, for a summary.
-fn short(hash: &str) -> &str {
+pub(crate) fn short(hash: &str) -> &str {
     hash.get(..8).unwrap_or(hash)
 }
 
 /// The paths of a JSON list of strings, joined for a summary.
-fn joined(v: Option<&Value>) -> String {
+pub(crate) fn joined(v: Option<&Value>) -> String {
     v.and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
         .unwrap_or_default()
@@ -1055,6 +1152,23 @@ fn detail_hits<'a>(
         else {
             continue;
         };
+        let in_prompt = tool_name
+            .as_deref()
+            .and_then(|name| spawn_returns(h, name))
+            .is_some_and(|r| matches!(r, Returns::ResultInPrompt(_)));
+        if in_prompt && m.kind != MessageKind::SubagentReturn {
+            out.push(Hit::Detail {
+                kind: Kind::SubagentReturn,
+                action: "return",
+                tool: tool_name.as_deref(),
+                tool_use_id: Some(tool_use_id),
+                summary: if summaries {
+                    text::plain_summary(content, resolver)?
+                } else {
+                    String::new()
+                },
+            });
+        }
         if *is_error && text::denied(content, resolver, h)? {
             out.push(Hit::Detail {
                 kind: Kind::Approval,
@@ -1082,30 +1196,16 @@ fn detail_hits<'a>(
             });
         }
     }
-    if h != Harness::OpenCode {
-        return Ok(());
-    }
-    let Some(bag) = m.harness_extra(h) else {
-        return Ok(());
-    };
-    for p in bag.get("patches").and_then(Value::as_array).into_iter().flatten() {
-        let hash = p.get("hash").and_then(Value::as_str).unwrap_or("");
+    for hit in crate::harness::rootless(h)
+        .map(|a| a.message_affordances(m))
+        .unwrap_or_default()
+    {
         out.push(Hit::Detail {
-            kind: Kind::Checkpoint,
-            action: "create",
-            tool: Some("patch"),
+            kind: hit.kind,
+            action: hit.action,
+            tool: Some(hit.tool),
             tool_use_id: None,
-            summary: crate::ir::truncate(&format!("{} · {}", short(hash), joined(p.get("files"))), 120),
-        });
-    }
-    if let Some(snap) = bag.get("snapshot").filter(|v| !joined(v.get("files")).is_empty()) {
-        let hash = snap.get("start").and_then(Value::as_str).unwrap_or("");
-        out.push(Hit::Detail {
-            kind: Kind::Checkpoint,
-            action: "create",
-            tool: Some("snapshot"),
-            tool_use_id: None,
-            summary: crate::ir::truncate(&format!("{} · {}", short(hash), joined(snap.get("files"))), 120),
+            summary: hit.summary,
         });
     }
     Ok(())
@@ -1147,7 +1247,7 @@ fn hits<'a>(h: Harness, m: &'a Message, resolver: &crate::lazy::Resolver, summar
     let message = match by_kind {
         Some((kind, action)) => Some((kind, action, None)),
         None => record(h, m, resolver)?
-            .map(|(kind, action, tool)| (kind, action, Some(tool)))
+            .map(|hit| (hit.kind, hit.action, Some(hit.tool)))
             .or(match m.origin {
                 Origin::Hook => Some((Kind::Hook, "output", None)),
                 Origin::Scheduler => Some((Kind::Schedule, "fire", None)),
@@ -1162,7 +1262,19 @@ fn hits<'a>(h: Harness, m: &'a Message, resolver: &crate::lazy::Resolver, summar
 }
 
 /// A row the session carries once rather than at a message.
-fn session_row(kind: Kind, action: &'static str, tool: &str, summary: String, items: Vec<Item>) -> Affordance {
+/// The approval-mode row: the modes a session passed through, in order, under `tool`.
+pub(crate) fn mode_row(tool: &str, modes: &[&str]) -> Affordance {
+    let summary = format!("mode: {}", modes.join(" → "));
+    session_row(Kind::Approval, "state", tool, summary, Vec::new())
+}
+
+pub(crate) fn session_row(
+    kind: Kind,
+    action: &'static str,
+    tool: &str,
+    summary: String,
+    items: Vec<Item>,
+) -> Affordance {
     Affordance {
         kind,
         action,
@@ -1176,10 +1288,11 @@ fn session_row(kind: Kind, action: &'static str, tool: &str, summary: String, it
     }
 }
 
-/// The facts a harness keeps once per session, as rows: the fork, the approval mode (or OpenCode's
-/// permission ruleset), the restorable points an adapter tallied ([`CHECKPOINTS_KEY`]), and
-/// OpenCode's staged revert. Read off the session's metadata, so a streamed pass that saw no
-/// message of it still counts it ([`Counter::finish`]).
+/// The facts a harness keeps once per session, as rows: the fork, the approval modes an adapter
+/// noted ([`MODES_KEY`]), what the adapter reads off its own bag
+/// ([`crate::harness::Adapter::session_affordances`]), and the restorable points an adapter tallied
+/// ([`CHECKPOINTS_KEY`]). Read off the session's metadata, so a streamed pass that saw no message
+/// of it still counts it ([`Counter::finish`]).
 pub fn session_rows(s: &Session) -> Vec<Affordance> {
     let mut out = Vec::new();
     if let Some(from) = &s.lineage.forked_from {
@@ -1192,51 +1305,19 @@ pub fn session_rows(s: &Session) -> Vec<Affordance> {
     let Some(bag) = s.harness_extra(s.harness) else {
         return out;
     };
-    let modes: Vec<&str> = match (s.harness, bag.get("agent_mode")) {
-        // Devin's `agent_mode` is its permission mode (`bypass`, `normal`, `accept-edits`, `plan`).
-        (Harness::Devin, Some(Value::String(m))) => vec![m.as_str()],
-        _ => bag
-            .get(MODES_KEY)
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default(),
-    };
+    let modes: Vec<&str> = bag
+        .get(MODES_KEY)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
     if !modes.is_empty() {
-        let tool = if s.harness == Harness::Devin {
-            "agent_mode"
-        } else {
-            MODES_KEY
-        };
-        let summary = format!("mode: {}", modes.join(" → "));
-        out.push(session_row(Kind::Approval, "state", tool, summary, Vec::new()));
+        out.push(mode_row(MODES_KEY, &modes));
     }
-    if s.harness == Harness::OpenCode {
-        // The session's permission ruleset: `[{permission, pattern, action}]`.
-        let rules: Vec<Item> = bag
-            .get("permission")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|r| {
-                let what = r.get("permission").and_then(Value::as_str)?;
-                let pattern = r.get("pattern").and_then(Value::as_str).unwrap_or("*");
-                Some(Item {
-                    content: format!("{what} {pattern}"),
-                    status: r.get("action").and_then(Value::as_str).map(str::to_string),
-                })
-            })
-            .collect();
-        if !rules.is_empty() {
-            let summary = items_summary(&rules).replacen(" item", " rule", 1);
-            out.push(session_row(Kind::Approval, "state", "permission", summary, rules));
-        }
-        if let Some(rev) = bag.get("revert").and_then(Value::as_object) {
-            let to = rev.get("messageID").and_then(Value::as_str).unwrap_or("?");
-            let snap = rev.get("snapshot").and_then(Value::as_str).map(short).unwrap_or("");
-            let summary = format!("to {to} · snapshot {snap}");
-            out.push(session_row(Kind::Checkpoint, "restore", "revert", summary, Vec::new()));
-        }
-    }
+    out.extend(
+        crate::harness::rootless(s.harness)
+            .map(|a| a.session_affordances(s))
+            .unwrap_or_default(),
+    );
     if let Some(cp) = bag.get(CHECKPOINTS_KEY).and_then(Value::as_object) {
         let n = cp.get("count").and_then(Value::as_u64).unwrap_or(0);
         let files: Vec<Item> = cp
@@ -1342,10 +1423,11 @@ fn message_rows(harness: Harness, m: &Message, i: usize, resolver: &crate::lazy:
     Ok(out)
 }
 
-/// The view's version, stored beside the catalog's counts: bump it whenever a kind, a table row or
-/// a reader changes what [`Counter`] would count, so rows an older view counted read as "not
-/// counted" and are recounted, instead of answering `has:<new kind>` with a stale no.
-pub const VIEW_VERSION: u32 = 5;
+/// The view's version is the one stored-format version ([`crate::source::VERSION`]): bump that
+/// whenever a kind, a table row or a reader changes what [`Counter`] would count, so counts an
+/// older view recorded no longer decode and are recounted, instead of answering `has:<new kind>`
+/// with a stale no.
+pub const VIEW_VERSION: u32 = crate::source::VERSION;
 
 /// Affordance counts by kind: what the catalog stores per session so `has:<kind>` never parses.
 pub type Counts = std::collections::BTreeMap<Kind, u32>;
@@ -1406,7 +1488,7 @@ pub fn read(adapter: &dyn crate::harness::Adapter, r: &crate::ir::SessionRef) ->
     let s = crate::stream::stream_counted(
         adapter,
         r,
-        &crate::stream::ParseOptions::facts(),
+        &crate::stream::Demand::FACTS.with_spans(),
         &mut |m: Message| {
             match message_rows(r.harness, &m, index, &resolver) {
                 Ok(rows) => messages.extend(rows),
@@ -1427,7 +1509,7 @@ pub fn read(adapter: &dyn crate::harness::Adapter, r: &crate::ir::SessionRef) ->
     // Session facts can arrive at EOF; they still precede message rows, exactly as of_session.
     let mut rows = session_rows(&s);
     rows.extend(messages);
-    rows.extend(adapter.store_affordances(r));
+    rows.extend(adapter.store_affordances(r)?);
     Ok(rows)
 }
 
@@ -1453,6 +1535,70 @@ mod tests {
     /// The old whole-session oracle includes EOF session facts, inline summaries beyond the lazy
     /// prefix, result details and side-store rows. Streaming must preserve all of those in order.
     #[test]
+    fn leftovers_roo_mixed_return_keeps_prompt_and_counts_once() -> Result<()> {
+        let mut call = Message::new(Role::Assistant);
+        call.content.push(Block::ToolUse {
+            id: "child".into(),
+            name: "new_task".into(),
+            input: json!({}).into(),
+            namespace: None,
+        });
+        let mut mixed = Message::new(Role::User);
+        mixed.content = vec![
+            Block::ToolResult {
+                tool_use_id: "child".into(),
+                content: "child answer".into(),
+                is_error: false,
+                tool_name: None,
+                status: None,
+                details: None,
+            },
+            Block::Text {
+                text: "environment metadata".into(),
+            },
+        ];
+        let mut open = std::collections::HashMap::new();
+        refine_spawn(Harness::Roo, &mut call, &mut open)?;
+        refine_spawn(Harness::Roo, &mut mixed, &mut open)?;
+        assert!(open.is_empty(), "mixed returns consume their matching pending ID");
+        assert_eq!((mixed.kind, mixed.origin), (MessageKind::Prompt, Origin::Human));
+        let resolver = crate::lazy::Resolver::new(None);
+        let rows = message_rows(Harness::Roo, &mixed, 1, &resolver)?;
+        assert_eq!(rows.iter().filter(|r| r.kind == Kind::SubagentReturn).count(), 1);
+        assert_eq!(rows[0].tool_use_id.as_deref(), Some("child"));
+        let r = crate::SessionRef::new("roo", Harness::Roo, "unused");
+        let mut counter = Counter::new(&r);
+        counter.note(&call)?;
+        counter.note(&mixed)?;
+        assert_eq!(
+            counter.finish(&Session::new("roo", Harness::Roo), &[])[&Kind::SubagentReturn],
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn leftovers_claude_slash_skill_body_is_not_a_second_tool_activation() -> Result<()> {
+        let mut body = Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness);
+        body.content.push(Block::Text {
+            text: "Base directory for this skill: /skills/test\n\nDo the task".into(),
+        });
+        let resolver = crate::lazy::Resolver::new(None);
+        assert_eq!(message_rows(Harness::Claude, &body, 0, &resolver)?[0].kind, Kind::Skill);
+        body.harness_extra_mut(Harness::Claude)
+            .insert("sourceToolUseID".into(), json!("tool-call"));
+        assert!(message_rows(Harness::Claude, &body, 0, &resolver)?.is_empty());
+        body.kind = MessageKind::Prompt;
+        body.origin = Origin::Human;
+        body.extra.clear();
+        assert!(
+            message_rows(Harness::Claude, &body, 0, &resolver)?.is_empty(),
+            "literal human prose is not a skill activation"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn streamed_read_matches_full_session_and_side_store() {
         let _world = crate::test_world("affordance-stream");
         struct Fixture {
@@ -1465,16 +1611,19 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> anyhow::Result<Vec<crate::SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> anyhow::Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &crate::SessionRef,
-                opts: &crate::ParseOptions,
+                opts: &crate::Demand,
                 sink: &mut dyn MessageSink,
             ) -> anyhow::Result<Session> {
-                assert!(opts.extra, "the view must preserve full metadata");
+                assert!(
+                    opts.tier >= crate::stream::Tier::Facts,
+                    "the view must preserve full metadata"
+                );
                 let mut s = Session::new(r.id.clone(), r.harness);
                 sink.meta(&s);
                 // Many large irrelevant outputs must be dropped; only affordance rows survive.
@@ -1496,12 +1645,12 @@ mod tests {
                 let text = if opts.spans {
                     crate::Text::Span(crate::Span {
                         source: Some(self.text_path.clone()),
-                        offset: 0,
-                        len: std::fs::metadata(&self.text_path)?.len(),
+                        offset: 1,
+                        len: std::fs::metadata(&self.text_path)?.len() - 2,
                         escaped: false,
                     })
                 } else {
-                    std::fs::read_to_string(&self.text_path)?.into()
+                    serde_json::from_str::<String>(&std::fs::read_to_string(&self.text_path)?)?.into()
                 };
                 hook.content.push(Block::Text { text });
                 sink.message(hook);
@@ -1517,8 +1666,13 @@ mod tests {
                 sink.meta(&s);
                 Ok(s)
             }
-            fn store_affordances(&self, _: &crate::SessionRef) -> Vec<Affordance> {
-                vec![Affordance::store(Kind::Plan, "todo.json", "side store", Vec::new())]
+            fn store_affordances(&self, _: &crate::SessionRef) -> anyhow::Result<Vec<Affordance>> {
+                Ok(vec![Affordance::store(
+                    Kind::Plan,
+                    "todo.json",
+                    "side store",
+                    Vec::new(),
+                )])
             }
         }
         let r = crate::SessionRef::new(
@@ -1529,7 +1683,8 @@ mod tests {
         let text_path = std::env::temp_dir().join(format!("cv-affordance-stream-{}", uuid::Uuid::new_v4()));
         std::fs::write(
             &text_path,
-            format!("<summary>{}late closing tag</summary>", " ".repeat(8192)),
+            // A JSON string: the span covers its body.
+            format!("\"<summary>{}late closing tag</summary>\"", " ".repeat(8192)),
         )
         .unwrap();
         let fixture = Fixture {
@@ -1538,7 +1693,7 @@ mod tests {
         let adapter: &dyn crate::harness::Adapter = &fixture;
         let full = adapter.parse(&r).unwrap();
         let mut expected = of_session(&full).unwrap();
-        expected.extend(adapter.store_affordances(&r));
+        expected.extend(adapter.store_affordances(&r).unwrap());
         let actual = read(adapter, &r).unwrap();
         assert_eq!(
             serde_json::to_value(&actual).unwrap(),
@@ -1561,13 +1716,13 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<crate::SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &crate::SessionRef,
-                _: &crate::ParseOptions,
+                _: &crate::Demand,
                 sink: &mut dyn crate::MessageSink,
             ) -> Result<Session> {
                 sink.try_message(self.0.clone())?;
@@ -1600,7 +1755,9 @@ mod tests {
                 })
                 .unwrap();
             let text = capture
-                .read_backing_value(backing, offset, len, |view| view.source_text())
+                .read(ReadInput::Backing(backing, offset, len), Validation::Value, |view| {
+                    view.source_text()
+                })
                 .unwrap()
                 .unwrap();
             let make = |text| {
@@ -1692,6 +1849,10 @@ mod tests {
 
     #[test]
     fn deferred_source_child_remains_lazy_and_failure_stops_delivery() {
+        const NAME_ARGUMENTS: DeferredWrapper = DeferredWrapper {
+            name_key: "name",
+            args_key: "arguments",
+        };
         let path = std::env::temp_dir().join(format!("cv-deferred-source-{}", uuid::Uuid::new_v4()));
         let wrapped = json!({"name":"delegate_task", "arguments":{"prompt":"λ".repeat(400_000),"id":7}});
         let raw = serde_json::to_vec(&wrapped).unwrap();
@@ -1703,7 +1864,7 @@ mod tests {
             namespace: None,
             input: source.clone(),
         };
-        unwrap_deferred(Harness::Hermes, &mut block).unwrap();
+        unwrap_deferred(NAME_ARGUMENTS, &mut block).unwrap();
         let Block::ToolUse {
             input, name, namespace, ..
         } = &block
@@ -1713,7 +1874,7 @@ mod tests {
         assert!(matches!(input, Json::Source(_)));
         assert_eq!(name, "delegate_task");
         assert_eq!(namespace.as_deref(), Some(DEFERRED));
-        let replay = rewrap_deferred(Harness::Hermes, &block).unwrap().unwrap();
+        let replay = rewrap_deferred(NAME_ARGUMENTS, &block).unwrap().unwrap();
         let Block::ToolUse { input, .. } = replay else {
             unreachable!()
         };
@@ -1724,7 +1885,7 @@ mod tests {
             delivered += 1;
             Flow::Continue
         };
-        let mut sink = AffordanceSink::new(Harness::Hermes, &mut inner);
+        let mut sink = AffordanceSink::new(Harness::Hermes, &mut inner).unwrapping(Some(NAME_ARGUMENTS));
         let mut message = Message::new(Role::Assistant);
         message.content.push(Block::ToolUse {
             id: "c".into(),
@@ -1869,6 +2030,14 @@ mod tests {
                 json!({"id": "sessions_spawn", "args": {"task": "ok"}}),
             ),
         ] {
+            // Each adapter states its own spelling; Hermes is absent from a build without SQLite.
+            let wrapper = crate::harness::rootless(h).and_then(|a| a.capabilities().deferred_wrapper);
+            #[cfg(not(feature = "sqlite"))]
+            if h == Harness::Hermes {
+                assert_eq!(wrapper, None);
+                continue;
+            }
+            let wrapper = wrapper.unwrap_or_else(|| panic!("{h} names its deferred wrapper"));
             let orig = Block::ToolUse {
                 id: "c".into(),
                 name: DEFERRED.into(),
@@ -1876,13 +2045,13 @@ mod tests {
                 namespace: None,
             };
             let mut b = orig.clone();
-            unwrap_deferred(h, &mut b).unwrap();
+            unwrap_deferred(wrapper, &mut b).unwrap();
             let Block::ToolUse { name, namespace, .. } = &b else {
                 unreachable!()
             };
             assert_ne!(name, DEFERRED);
             assert_eq!(namespace.as_deref(), Some(DEFERRED));
-            let Some(Block::ToolUse { name, input, .. }) = rewrap_deferred(h, &b).unwrap() else {
+            let Some(Block::ToolUse { name, input, .. }) = rewrap_deferred(wrapper, &b).unwrap() else {
                 panic!("rewraps")
             };
             assert_eq!(name, DEFERRED);
@@ -2045,7 +2214,10 @@ mod tests {
             payload.push_str(&"é\n".repeat(50000));
             std::fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
             let source = crate::json::JsonSource::capture(&path).unwrap();
-            let backed = source.read_syntax(|view| view.source_text()).unwrap().unwrap();
+            let backed = source
+                .read(ReadInput::Document, Validation::Syntax, |view| view.source_text())
+                .unwrap()
+                .unwrap();
             let run = |text: crate::lazy::Text| {
                 let mut messages = Vec::new();
                 let mut target = |m| {
@@ -2078,7 +2250,10 @@ mod tests {
         }
         // Stale retained backing is an error, rather than silently classifying the result.
         let source = crate::json::JsonSource::capture(&path).unwrap();
-        let backed = source.read_syntax(|view| view.source_text()).unwrap().unwrap();
+        let backed = source
+            .read(ReadInput::Document, Validation::Syntax, |view| view.source_text())
+            .unwrap()
+            .unwrap();
         std::fs::write(&path, b"\"changed\"").unwrap();
         let crate::lazy::Text::Source(backed) = backed else {
             panic!("large receipt backing")

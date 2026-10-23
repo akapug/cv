@@ -13,6 +13,8 @@
 //! Reasoning is kept in a `<thinking>` wrapper — it's high-signal for distilling into smaller
 //! models, and a downstream filter can strip it if a given run wants answer-only SFT.
 
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 mod deferred;
 
 use crate::ir::{Block, Message, MessageKind, Role, Session};
@@ -44,9 +46,8 @@ fn training_role(m: &Message, chat: bool) -> Option<&'static str> {
             }
         }
         MessageKind::ToolResult => "tool",
-        // A sub-agent spawn or return (the only other kinds `Message::is_model_visible` admits)
-        // trains as the role that carried it.
-        _ => match m.role {
+        // A sub-agent spawn or return trains as the role that carried it.
+        MessageKind::SubagentSpawn | MessageKind::SubagentReturn => match m.role {
             Role::System => "system",
             Role::User => {
                 if chat {
@@ -64,6 +65,12 @@ fn training_role(m: &Message, chat: bool) -> Option<&'static str> {
             }
             Role::Tool => "tool",
         },
+        MessageKind::Notice
+        | MessageKind::CompactionBoundary
+        | MessageKind::ModelChange
+        | MessageKind::Error
+        | MessageKind::Branch
+        | MessageKind::Carrier => return None,
     })
 }
 
@@ -71,8 +78,8 @@ fn training_role(m: &Message, chat: bool) -> Option<&'static str> {
 const SPAN_CHUNK: usize = 1 << 20; // 1 MiB
 
 /// Stream one message's blocks as training text to `emit`, resolving span content **in chunks** (so a
-/// giant field is never materialized whole). Byte-identical to the old `parts.join("\n\n")`: the same
-/// parts, separated by `\n\n`, with empty/redacted text turns producing no part.
+/// giant field is never materialized whole). Parts are separated by `\n\n`, with empty/redacted
+/// text turns producing no part.
 fn render_blocks_into<'a>(
     blocks: impl IntoIterator<Item = &'a Block>,
     resolver: &crate::lazy::Resolver,
@@ -90,8 +97,8 @@ type RedactCtx<'a> = (&'a crate::redact::RedactOptions, &'a mut crate::redact::R
 /// Without `redact`, span content is chunk-resolved straight to `emit` (a giant field is never held
 /// whole). With `redact`, each text field is scrubbed **per block** — resolve (a span must be
 /// scanned whole to redact it), scrub, emit, drop — so the peak is one field, and nothing is cloned
-/// when a field is clean ([`scrub_cow`](crate::redact::scrub_cow) borrows). This replaced a
-/// clone-the-whole-`Message`-then-redact path; tool inputs materialize only for structural scrubbing.
+/// when a field is clean ([`scrub_cow`](crate::redact::scrub_cow) borrows). Tool inputs materialize
+/// only for structural scrubbing.
 fn render_blocks_impl<'a>(
     blocks: impl IntoIterator<Item = &'a Block>,
     resolver: &crate::lazy::Resolver,
@@ -224,9 +231,9 @@ fn render_blocks_impl<'a>(
 /// turns are empty; any tool/image/file block, or any span, makes it non-empty).
 fn message_is_empty(m: &Message) -> bool {
     !m.content.iter().any(|b| match b {
-        Block::Text { text } => text.is_span() || text.inline_str().is_some_and(|s| !s.trim().is_empty()),
+        Block::Text { text } => text.is_lazy() || text.inline_str().is_some_and(|s| !s.trim().is_empty()),
         Block::Thinking { text, redacted, .. } => {
-            !*redacted && (text.is_span() || text.inline_str().is_some_and(|s| !s.trim().is_empty()))
+            !*redacted && (text.is_lazy() || text.inline_str().is_some_and(|s| !s.trim().is_empty()))
         }
         _ => true,
     })
@@ -263,12 +270,18 @@ fn represents_system_prompt(message: &Message, prompt: &str, resolver: &crate::R
     Ok(equal && offset == prompt.len())
 }
 
-fn record_header(format: Format) -> &'static [u8] {
+const fn record_header(format: Format) -> &'static [u8] {
     match format {
         Format::Chatml => b"{\"messages\":[",
         Format::ShareGpt => b"{\"conversations\":[",
     }
 }
+
+/// `publish` skips a record header without knowing the format, so it reads into a buffer sized
+/// for any of them — checked against the table above.
+const RECORD_HEADER_BUF: usize = 32;
+const _: () = assert!(record_header(Format::Chatml).len() <= RECORD_HEADER_BUF);
+const _: () = assert!(record_header(Format::ShareGpt).len() <= RECORD_HEADER_BUF);
 
 /// Which export shape — the only difference is the array/role/content key names and the role labels.
 #[derive(Clone, Copy)]
@@ -474,7 +487,7 @@ impl StagedRecord {
             self.body.copy_to(writer)?;
         } else {
             let mut body = self.body.reader()?;
-            let mut header = [0; b"{\"conversations\":[".len()];
+            let mut header = [0; RECORD_HEADER_BUF];
             body.read_exact(&mut header[..self.skip_header])?;
             std::io::copy(&mut body, writer)?;
         }
@@ -511,8 +524,7 @@ pub fn stage_record(
         resolver: crate::lazy::Resolver,
         facts: Option<crate::query::QueryReducer<'a>>,
         messages: usize,
-        error: Option<anyhow::Error>,
-        failed: bool,
+        latch: crate::stream::Latch,
     }
     impl Sink<'_> {
         fn render(&mut self, mut message: Message) -> anyhow::Result<()> {
@@ -520,7 +532,7 @@ pub fn stage_record(
             if rendered && message.kind == MessageKind::SystemPrompt {
                 message.content.retain(|block| matches!(block, Block::Text { .. }));
                 self.systems
-                    .push(deferred::DeferredMessage::new(message, &mut self.sources))?;
+                    .push(deferred::DeferredMessage::stage(message, &mut self.sources))?;
             }
             Ok(())
         }
@@ -536,7 +548,7 @@ pub fn stage_record(
                     if training_role(&message, matches!(self.record.fmt, Format::Chatml)).is_some()
                         && !message_is_empty(&message)
                     {
-                        deferred.push(deferred::DeferredMessage::new(message, &mut self.sources))?;
+                        deferred.push(deferred::DeferredMessage::stage(message, &mut self.sources))?;
                     }
                     if !self.wait_query && self.messages >= self.min_messages {
                         for row in self.deferred.take().expect("deferred messages").rows()? {
@@ -552,14 +564,13 @@ pub fn stage_record(
             match result {
                 Ok(()) => crate::Flow::Continue,
                 Err(error) => {
-                    self.failed = true;
-                    self.error = Some(error);
+                    self.latch.fail(error);
                     crate::Flow::Stop
                 }
             }
         }
         fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.error.take()
+            self.latch.take("dataset")
         }
     }
     let mut bytes = std::io::BufWriter::with_capacity(64 * 1024, crate::harness::store::bytes::ByteStage::new());
@@ -573,20 +584,19 @@ pub fn stage_record(
         resolver: crate::lazy::Resolver::new(Some(r.path.clone())),
         facts: query.map(crate::query::QueryReducer::new),
         messages: 0,
-        error: None,
-        failed: false,
+        latch: Default::default(),
     };
     let counted_query = query.is_some_and(crate::SessionQuery::needs_counted);
     let read = crate::stream::stream_counted(
         adapter,
         r,
-        &crate::ParseOptions::lazy(),
+        &crate::Demand::LEAN.with_spans(),
         &mut sink,
         crate::stream::Pass::RECORD,
     );
     let (session, counted) = match read {
         Ok(done) => (done.session, done.counted),
-        Err(error) if sink.failed => return Err(error),
+        Err(error) if sink.latch.failed() => return Err(error),
         Err(error) => return Err(InputError(error).into()),
     };
     let counts = counted.filter(|_| counted_query).map(|c| c.counts);
@@ -703,21 +713,8 @@ mod tests {
 
     fn session(messages: Vec<Message>) -> Session {
         Session {
-            source_stamp: None,
-            id: "t".into(),
-            harness: Harness::Claude,
-            cwd: None,
-            title: None,
-            created_at: None,
-            updated_at: None,
-            model: None,
-            git: None,
             messages,
-            source_path: None,
-            extra: serde_json::Map::new(),
-            principal: None,
-            system_prompt: None,
-            lineage: crate::ir::Lineage::default(),
+            ..Session::new("t", Harness::Claude)
         }
     }
 
@@ -869,7 +866,7 @@ mod tests {
         );
         let r = crate::ir::SessionRef::new("dataset", Harness::Claude, path);
         let adapter = crate::harness::for_harness(r.harness).unwrap();
-        let full = crate::stream::collect_with(adapter.as_ref(), &r, &crate::ParseOptions::lazy()).unwrap();
+        let full = crate::stream::collect_with(adapter.as_ref(), &r, &crate::Demand::LEAN.with_spans()).unwrap();
         let opts = crate::redact::RedactOptions::default();
         for fmt in [Format::Chatml, Format::ShareGpt] {
             for redact in [None, Some(&opts)] {
@@ -1020,13 +1017,13 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> anyhow::Result<Vec<crate::ir::SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> anyhow::Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &crate::ir::SessionRef,
-                _: &crate::ParseOptions,
+                _: &crate::Demand,
                 sink: &mut dyn crate::MessageSink,
             ) -> anyhow::Result<Session> {
                 for message in &self.0 {
@@ -1051,7 +1048,11 @@ mod tests {
             })
             .unwrap();
         let text = source
-            .read_backing_value(backing.clone(), offset, len, |view| view.source_text())
+            .read(
+                ReadInput::Backing(backing.clone(), offset, len),
+                Validation::Value,
+                |view| view.source_text(),
+            )
             .unwrap()
             .unwrap();
         let mut first = Message::new(Role::User);
@@ -1107,13 +1108,13 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> anyhow::Result<Vec<crate::ir::SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> anyhow::Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &crate::ir::SessionRef,
-                _: &crate::ParseOptions,
+                _: &crate::Demand,
                 sink: &mut dyn crate::MessageSink,
             ) -> anyhow::Result<Session> {
                 let mut message = msg(
@@ -1166,13 +1167,13 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> anyhow::Result<Vec<crate::ir::SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> anyhow::Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 _: &crate::ir::SessionRef,
-                _: &crate::ParseOptions,
+                _: &crate::Demand,
                 sink: &mut dyn crate::MessageSink,
             ) -> anyhow::Result<Session> {
                 sink.try_message(msg(
@@ -1284,13 +1285,13 @@ mod tests {
         fn roots(&self) -> Vec<std::path::PathBuf> {
             Vec::new()
         }
-        fn discover(&self) -> anyhow::Result<Vec<crate::SessionRef>> {
-            Ok(Vec::new())
+        fn discover(&self) -> anyhow::Result<crate::Discovered> {
+            Ok(Default::default())
         }
         fn stream(
             &self,
             reference: &crate::SessionRef,
-            _: &crate::ParseOptions,
+            _: &crate::Demand,
             sink: &mut dyn crate::MessageSink,
         ) -> anyhow::Result<Session> {
             let mut meta = Session::new(reference.id.clone(), reference.harness);
@@ -1483,7 +1484,7 @@ mod tests {
         )?;
         let adapter = crate::harness::lmstudio::LmStudio::with_root(&world.base);
         let reference = crate::SessionRef::from_path(&path, Harness::LmStudio);
-        let collected = crate::stream::collect_with(&adapter, &reference, &crate::ParseOptions::lazy())?;
+        let collected = crate::stream::collect_with(&adapter, &reference, &crate::Demand::LEAN.with_spans())?;
         assert_eq!(collected.system_prompt.as_deref(), Some("Follow the house style."));
         assert!(collected
             .messages

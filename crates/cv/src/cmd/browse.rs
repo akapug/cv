@@ -4,9 +4,12 @@
 //! discovery when cold/stale); `cv ls --fresh` forces [`cv_core::discover_all`]'s full scan.
 
 use crate::util::{dim_cwd, parse_harness, session_row, short_id};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cv_core::ir::{truncate, SessionRef};
 use cv_core::sanitize::sanitize_line;
+
+const METADATA_BATCH_SIZE: usize = 256;
+const HEAP_WINDOW_RATIO: usize = 8;
 
 /// Apply a parsed query to a ref list in place. The two-phase filter itself is
 /// [`cv_core::query::filter_refs`] — shared with `cv serve`'s `/api/stats?q=`, so `ls`/`stats` and
@@ -17,11 +20,19 @@ fn apply_query(refs: &mut Vec<SessionRef>, query: &Option<cv_core::SessionQuery>
     crate::cmd::query::filter_refs(refs, q, &crate::cmd::query::text_sets(q)?)
 }
 
-/// Session rows for `--json` listings: the SAME refs the table would print (the `exists()` guard —
-/// a row whose file vanished since the probe is dropped — comes free from the `stat` that yields
-/// `size_bytes`), capped at `limit`.
+/// Session rows for `--json` listings, capped at `limit`. Fresh render-phase metadata supplies
+/// both presence and `size_bytes`; rows sharing a path reuse that observation within each batch.
 fn json_rows<'a>(refs: impl Iterator<Item = &'a SessionRef>, limit: usize) -> Vec<(&'a SessionRef, serde_json::Value)> {
-    refs.filter_map(|r| std::fs::metadata(&r.path).ok().map(|m| (r, m.len())))
+    // Several logical sessions can share one database. Recheck at this rendering boundary,
+    // then reuse metadata in small batches: a missing tail must not grow another fleet-sized map.
+    let mut probe = cv_core::source::Probe::default();
+    refs.enumerate()
+        .filter_map(|(index, r)| {
+            if index % METADATA_BATCH_SIZE == 0 {
+                probe = cv_core::source::Probe::default();
+            }
+            probe.size(&r.path).map(|size| (r, size))
+        })
         .take(limit)
         .map(|(r, size)| (r, session_row(r, Some(size))))
         .collect()
@@ -31,7 +42,8 @@ fn json_rows<'a>(refs: impl Iterator<Item = &'a SessionRef>, limit: usize) -> Ve
 #[derive(Eq, PartialEq, Ord, PartialOrd)]
 enum RankKey {
     Time(Option<chrono::DateTime<chrono::Utc>>),
-    Messages(usize),
+    /// `None` (uncounted) ranks after every counted session, including `Some(0)`.
+    Messages(Option<usize>),
 }
 struct RankedRef<'a> {
     key: RankKey,
@@ -92,7 +104,7 @@ fn ranked_json_rows<'a>(
     }
 }
 
-/// Reduce the stable inline prefix with the existing title policy. Once lazy text appears,
+/// Reduce the stable inline prefix with the title rule (`Message::prompt_title`). Once lazy text appears,
 /// preserve deferred user collection: resolution needs EOF source metadata and may fail after
 /// a source mutation, allowing a later user turn to become the title.
 struct TitleUsers {
@@ -116,12 +128,14 @@ impl TitleUsers {
             .or_else(|| session.title.clone())
             .or(self.fallback)
             .or_else(|| session.synth_title());
+        session.messages.clear();
         (session, title)
     }
 }
 impl cv_core::MessageSink for TitleUsers {
     fn message(&mut self, m: cv_core::Message) -> cv_core::Flow {
-        if m.role != cv_core::Role::User || m.kind == cv_core::MessageKind::InjectedContext || self.fallback.is_some() {
+        // Only a prompt can title a session (`Message::prompt_title`).
+        if m.role != cv_core::Role::User || m.kind != cv_core::MessageKind::Prompt || self.fallback.is_some() {
             return cv_core::Flow::Continue;
         }
         self.deferred |= m.content.iter().any(|block| {
@@ -144,18 +158,17 @@ impl cv_core::MessageSink for TitleUsers {
 }
 
 /// Read all metadata/counts through EOF, retaining only the title's deferred candidate suffix.
-fn enrich_head(adapter: &dyn cv_core::Adapter, r: &SessionRef) -> Option<(cv_core::Session, Option<String>)> {
+fn enrich_head(adapter: &dyn cv_core::Adapter, r: &SessionRef) -> Result<(cv_core::Session, Option<String>)> {
     let mut users = TitleUsers::new(r.harness);
     let session = cv_core::stream::stream_counted(
         adapter,
         r,
-        &cv_core::ParseOptions::lazy(),
+        &cv_core::Demand::LEAN.with_spans(),
         &mut users,
         cv_core::stream::Pass::RECORD,
-    )
-    .ok()?
+    )?
     .session;
-    Some(users.finish(session, r.title.as_deref()))
+    Ok(users.finish(session, r.title.as_deref()))
 }
 
 /// Select the requested listing window. Text listings retain their exact-total contract;
@@ -185,12 +198,7 @@ fn select_refs(
 
     if json {
         if let Some(q) = query {
-            let presence = if asc {
-                cv_core::query::WindowPresence::Any
-            } else {
-                cv_core::query::WindowPresence::Existing
-            };
-            cv_core::query::filter_refs_limited(refs, q, &crate::cmd::query::text_sets(q)?, limit, presence)?;
+            cv_core::query::filter_refs_limited(refs, q, &crate::cmd::query::text_sets(q)?, limit)?;
         }
     }
     let total = refs.len();
@@ -203,18 +211,30 @@ fn select_refs(
     Ok(total)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_ls(
-    harness: Option<String>,
-    cwd: Option<String>,
-    query: Option<String>,
-    limit: usize,
-    sort_by: &str,
-    asc: bool,    // print the shown window oldest-first (the feed order)
-    fresh: bool,  // force a full re-discovery instead of trusting the probed catalog
-    json: bool,   // emit the rows as one JSON array of session rows instead of the table
-    enrich: bool, // --json only: add transcript-derived git + display_title (one parse per emitted row)
-) -> Result<()> {
+pub(crate) struct LsArgs<'a> {
+    pub harness: Option<String>,
+    pub cwd: Option<String>,
+    pub query: Option<String>,
+    pub limit: usize,
+    pub sort_by: &'a str,
+    pub asc: bool,
+    pub fresh: bool,
+    pub json: bool,
+    pub enrich: bool,
+}
+
+pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
+    let LsArgs {
+        harness,
+        cwd,
+        query,
+        limit,
+        sort_by,
+        asc,
+        fresh,
+        json,
+        enrich,
+    } = args;
     let want = parse_harness(&harness)?;
     let query = crate::cmd::query::build(query)?;
     // An empty machine window requires no inventory or enrichment; still validate inputs.
@@ -238,7 +258,7 @@ pub(crate) fn cmd_ls(
         .collect();
     // Queried windows still require ordered predicate/error evaluation; text needs exact totals.
     // Heapify only a small unqueried machine window, preserving the existing row stat seam.
-    let heap_window = json && query.is_none() && limit.saturating_mul(8) < refs.len();
+    let heap_window = json && query.is_none() && limit.saturating_mul(HEAP_WINDOW_RATIO) < refs.len();
     let total = if heap_window {
         refs.len()
     } else {
@@ -266,21 +286,29 @@ pub(crate) fn cmd_ls(
                     // content on disk (memory-safe on the multi-MB "single-exchange giants" sesh
                     // warns about) while still carrying the session's git metadata and enough of the
                     // first user turn to synthesize a title.
-                    if let Some((session, display_title)) =
-                        cv_core::harness::for_harness(r.harness).and_then(|a| enrich_head(a.as_ref(), r))
-                    {
-                        let map = obj.as_object_mut().expect("json object");
-                        // `git`: the same object `cv show --json` emits (branch/commit/remote,
-                        // skip-none), omitted entirely when the transcript records no git context.
-                        if let Some(git) = &session.git {
-                            if let Ok(g) = serde_json::to_value(git) {
-                                map.insert("git".into(), g);
-                            }
+                    let enriched = cv_core::harness::for_harness(r.harness)
+                        .with_context(|| format!("no adapter for {}", r.harness))
+                        .and_then(|a| enrich_head(a.as_ref(), r));
+                    let map = obj.as_object_mut().expect("json object");
+                    match enriched {
+                        // A row whose transcript cannot be read says why, so a consumer can tell
+                        // it from "not enriched" (no key) and from "no title anywhere" (null).
+                        Err(error) => {
+                            map.insert("enrich_error".into(), serde_json::json!(format!("{error:#}")));
                         }
-                        // `display_title`: `title` with a first-real-user-text fallback. Explicit
-                        // null (not absent) when a session has neither, so consumers can tell "no
-                        // title anywhere" from "not enriched" (the key is absent without --enrich).
-                        map.insert("display_title".into(), serde_json::json!(display_title));
+                        Ok((session, display_title)) => {
+                            // `git`: the same object `cv show --json` emits (branch/commit/remote,
+                            // skip-none), omitted entirely when the transcript records no git context.
+                            if let Some(git) = &session.git {
+                                if let Ok(g) = serde_json::to_value(git) {
+                                    map.insert("git".into(), g);
+                                }
+                            }
+                            // `display_title`: `title` with a first-real-user-text fallback. Explicit
+                            // null (not absent) when a session has neither, so consumers can tell "no
+                            // title anywhere" from "not enriched" (the key is absent without --enrich).
+                            map.insert("display_title".into(), serde_json::json!(display_title));
+                        }
                     }
                 }
                 obj
@@ -304,7 +332,7 @@ pub(crate) fn cmd_ls(
             r.harness.as_str(),
             short_id(&r.id),
             crate::util::fmt_span(r.created_at, r.updated_at),
-            r.message_count,
+            r.message_count.map_or("–".to_string(), |n| n.to_string()),
             r.title
                 .as_deref()
                 .map(|t| truncate(&sanitize_line(t), 60))
@@ -350,7 +378,11 @@ pub(crate) fn cmd_stats(query: Option<String>, json: bool, tokens: bool) -> Resu
     }
 
     println!("✦ clustervision fleet stats\n");
-    println!("{total} session(s) · {} message(s)\n", s.messages);
+    let uncounted = match s.uncounted {
+        0 => String::new(),
+        n => format!(" · {n} not counted yet"),
+    };
+    println!("{total} session(s) · {} message(s){uncounted}\n", s.messages);
 
     println!("by harness:");
     for (h, n) in &s.by_harness {
@@ -448,6 +480,39 @@ tokens ({} session(s) + {} sub-agent transcript(s){}{}):",
 mod window_tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn machine_windows_recheck_shared_paths_and_keep_readable_old_timestamps() {
+        let world = crate::test_world("shared_window_metadata");
+        let path = world.base.join("shared.db");
+        let refs: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|id| SessionRef::new(id, cv_core::Harness::OpenCode, path.clone()))
+            .collect();
+        let query = cv_core::SessionQuery::parse("text:hit").unwrap();
+        let texts = cv_core::query::TextSets::resolve(&query, |_| refs.iter().map(|r| r.id.clone()).collect());
+        for content in ["one", "longer"] {
+            std::fs::write(&path, content).unwrap();
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)),
+                )
+                .unwrap();
+            assert!(cv_core::source::FileId::at(&path).is_none());
+            let mut selected = refs.clone();
+            cv_core::query::filter_refs_limited(&mut selected, &query, &texts, 2).unwrap();
+            let rows = json_rows(selected.iter(), 2);
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|(_, row)| row["size_bytes"] == content.len()));
+        }
+        // The rendering phase must not retain the query's earlier presence observation.
+        let mut selected = refs;
+        cv_core::query::filter_refs_limited(&mut selected, &query, &texts, 2).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(json_rows(selected.iter(), 2).is_empty());
+    }
+
     #[test]
     fn heap_machine_windows_match_stable_rank_presence_and_ties() {
         let world = crate::test_world("heap_json_windows");
@@ -461,7 +526,7 @@ mod window_tests {
                     present.clone()
                 };
                 let mut r = SessionRef::new(format!("row-{i}"), cv_core::Harness::Claude, path);
-                r.message_count = i % 7;
+                r.message_count = (i % 7 != 6).then_some(i % 7); // one in seven is uncounted
                 r.created_at = chrono::DateTime::from_timestamp(100 + (i % 4) as i64, 0);
                 r.updated_at = if i % 3 == 0 {
                     None
@@ -494,15 +559,58 @@ mod window_tests {
         (0..count)
             .map(|i| {
                 let mut reference = SessionRef::new(i.to_string(), cv_core::Harness::Claude, present.to_path_buf());
-                reference.message_count = match shape {
+                reference.message_count = Some(match shape {
                     "sorted" => count - i,
                     "reverse" => i,
                     "tied" => 7,
                     _ => ((i as u64 * 2_654_435_761) % 10_007) as usize,
-                };
+                });
                 reference
             })
             .collect()
+    }
+
+    #[cfg(feature = "probe-heap")]
+    #[test]
+    #[ignore = "isolated diagnostic; run with --test-threads=1 and --nocapture"]
+    fn listing_metadata_heap_control() {
+        let world = crate::test_world("listing_metadata_heap");
+        let mut first_peak = None;
+        for count in [20_000, 100_000] {
+            let refs: Vec<_> = (0..count)
+                .map(|i| {
+                    SessionRef::new(
+                        i.to_string(),
+                        cv_core::Harness::Claude,
+                        world.base.join(format!("missing-{i}")),
+                    )
+                })
+                .collect();
+            let start = cv_testkit::heap::begin();
+            let old: Vec<_> = refs
+                .iter()
+                .filter_map(|r| std::fs::metadata(&r.path).ok().map(|m| (r, m.len())))
+                .take(20)
+                .map(|(r, size)| session_row(r, Some(size)))
+                .collect();
+            let previous = cv_testkit::heap::end(start);
+            let start = cv_testkit::heap::begin();
+            let selected = json_rows(refs.iter(), 20);
+            let current = cv_testkit::heap::end(start);
+            assert!(old.is_empty() && selected.is_empty());
+            if let Some(first_peak) = first_peak {
+                assert!(
+                    current.peak_above_baseline_bytes <= first_peak * 2,
+                    "metadata cache grew with missing inventory"
+                );
+            } else {
+                first_peak = Some(current.peak_above_baseline_bytes);
+            }
+            eprintln!(
+                "listing metadata heap {}",
+                serde_json::json!({"refs":count,"previous":previous,"current":current})
+            );
+        }
     }
 
     #[cfg(feature = "probe-heap")]
@@ -588,7 +696,7 @@ mod window_tests {
                     })],
                 );
                 let mut r = SessionRef::new(format!("row-{i}"), cv_core::Harness::Claude, path);
-                r.message_count = i % 3;
+                r.message_count = Some(i % 3);
                 r.created_at = chrono::DateTime::from_timestamp(100 + (i / 2) as i64, 1);
                 r.updated_at = chrono::DateTime::from_timestamp(200 + (i / 3) as i64, 2);
                 r
@@ -603,6 +711,8 @@ mod window_tests {
                 for limit in [0, 1, 3, 6, usize::MAX] {
                     let mut baseline = refs.clone();
                     apply_query(&mut baseline, &query).unwrap();
+                    // An absent session occupies no window slot, ascending or not.
+                    baseline.retain(|r| r.path.exists());
                     match sort {
                         "created" => baseline.sort_by_key(|r| std::cmp::Reverse(r.created_at.or(r.updated_at))),
                         "messages" => baseline.sort_by_key(|r| std::cmp::Reverse(r.message_count)),
@@ -751,10 +861,10 @@ mod enrich_tests {
         fn roots(&self) -> Vec<std::path::PathBuf> {
             Vec::new()
         }
-        fn discover(&self) -> Result<Vec<SessionRef>> {
-            Ok(Vec::new())
+        fn discover(&self) -> Result<cv_core::Discovered> {
+            Ok(Default::default())
         }
-        fn stream(&self, _: &SessionRef, _: &cv_core::ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+        fn stream(&self, _: &SessionRef, _: &cv_core::Demand, sink: &mut dyn MessageSink) -> Result<Session> {
             for message in &self.messages {
                 self.callbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 assert_eq!(sink.message(message.clone()), Flow::Continue);
@@ -773,7 +883,7 @@ mod enrich_tests {
         let mut baseline = cv_core::stream::stream_counted(
             adapter,
             reference,
-            &cv_core::ParseOptions::lazy(),
+            &cv_core::Demand::LEAN.with_spans(),
             &mut old,
             cv_core::stream::Pass::RECORD,
         )
@@ -836,7 +946,7 @@ mod enrich_tests {
         let mut baseline = cv_core::stream::stream_counted(
             &old_adapter,
             &old_reference,
-            &cv_core::ParseOptions::lazy(),
+            &cv_core::Demand::LEAN.with_spans(),
             &mut old,
             cv_core::stream::Pass::RECORD,
         )
@@ -845,7 +955,7 @@ mod enrich_tests {
         baseline.messages = old.0;
         assert_eq!(title, baseline.synth_title());
         assert_eq!(title.as_deref(), Some("later fallback"));
-        assert_eq!(actual.messages.len(), 2); // Stable noise removed; deferred suffix unchanged.
+        assert!(actual.messages.is_empty());
         assert_eq!(adapter.callbacks.load(std::sync::atomic::Ordering::Relaxed), 3);
         assert_eq!(old_adapter.callbacks.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
@@ -856,7 +966,7 @@ mod enrich_tests {
         let primary = world.base.join("primary.jsonl");
         std::fs::write(&primary, "wrong source").unwrap();
         let body = world.base.join("resolved.txt");
-        std::fs::write(&body, "right EOF source").unwrap();
+        std::fs::write(&body, "\"right EOF source\"").unwrap();
         drop(cv_core::catalog::Writer::open().expect("scratch catalog"));
         let reference = SessionRef::new("span", Harness::Claude, primary);
         let mut metadata = Session::new("span", Harness::Claude);
@@ -870,7 +980,7 @@ mod enrich_tests {
                 user(["<system-reminder>noise</system-reminder>".into()]),
                 user([Text::Span(cv_core::Span {
                     source: None,
-                    offset: 0,
+                    offset: 1,
                     len: 16,
                     escaped: false,
                 })]),
@@ -882,7 +992,7 @@ mod enrich_tests {
         };
         let (actual, title) = compare_streams(&adapter, &reference);
         assert_eq!(title.as_deref(), Some("right EOF source"));
-        assert_eq!(actual.messages.len(), 2);
+        assert!(actual.messages.is_empty());
         assert!(cv_core::catalog::AffordanceTable::load().counts(&reference).is_some());
         adapter.metadata.title = Some("explicit EOF title".into());
         adapter.callbacks.store(0, std::sync::atomic::Ordering::Relaxed);

@@ -5,6 +5,7 @@
 //! and harness-specific extras ride along in [`Message::extra`] so conversions can be as lossless
 //! as the target allows.
 
+use crate::projection::Head;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -250,11 +251,55 @@ impl Lineage {
     }
 }
 
+/// A tool-call id for a call whose wire carries none, derived from where the call sits in its
+/// session (`cv:harmony:3.0.1`, `cv:cursor:12`). The `cv:` prefix declares it cv's: unique within
+/// the session and stable across reads, so a call and its result still pair, but never a value the
+/// harness wrote.
+pub fn derived_call_id(format: &str, position: impl std::fmt::Display) -> String {
+    format!("cv:{format}:{position}")
+}
+
 /// The namespace inside `extra` for facts cv itself produces rather than reads from a harness:
 /// parse diagnostics like `skipped_lines`, and the provenance cv stamps on a session it synthesized
 /// (`loom`, `splice`). It is spelled `"cv"`, which `Harness::parse` never yields, so it can never
 /// collide with a harness bag. See `docs/INTERFACE-V2.md` §4.
 pub const CV_NAMESPACE: &str = "cv";
+
+/// The one other top-level `extra` key: the verbatim native record a carrier (or a complete-mode
+/// turn) keeps under `Demand::COMPLETE`. Not a harness bag, and not Claude's: every adapter
+/// with complete-mode carriers writes it.
+pub const CARRIER_KEY: &str = "_record";
+
+impl Harness {
+    /// Whether this harness's complete-mode *turns* keep their verbatim record under
+    /// [`CARRIER_KEY`] once serialized (OpenCode: `CompleteRecord::attach_replay` on a turn naming
+    /// its `record_type`), so a record there does not make the message a carrier.
+    pub fn turns_keep_records(self) -> bool {
+        match self {
+            Harness::OpenCode => true,
+            Harness::Claude
+            | Harness::Codex
+            | Harness::Grok
+            | Harness::Gemini
+            | Harness::Hermes
+            | Harness::OpenClaw
+            | Harness::Cursor
+            | Harness::Kimi
+            | Harness::KimiCode
+            | Harness::Qwen
+            | Harness::LmStudio
+            | Harness::Cline
+            | Harness::Roo
+            | Harness::Continue
+            | Harness::Goose
+            | Harness::Zed
+            | Harness::Devin
+            | Harness::ChatGptExport
+            | Harness::ClaudeExport
+            | Harness::OpenSession => false,
+        }
+    }
+}
 
 impl Session {
     /// An empty session of `harness`: every optional field `None`, no messages, no extras. The one
@@ -303,75 +348,35 @@ impl Session {
         self.extra.get(h.as_str()).and_then(serde_json::Value::as_object)
     }
 
-    /// First non-empty user text, used as a fallback title / preview.
-    pub fn first_user_text(&self) -> Option<String> {
-        self.messages
-            .iter()
-            .filter(|m| m.role == Role::User)
-            .find_map(|m| m.text().filter(|t| !t.trim().is_empty()))
-    }
-
-    /// A short human label for listings.
+    /// A short human label for listings: [`Session::synth_title`] at most 72 characters long.
     pub fn label(&self) -> String {
-        match self.title.as_deref() {
-            Some(title) => label_from(Some(title), None),
-            None => label_from(None, self.first_user_text().as_deref()),
-        }
+        label_from(self.synth_title().as_deref(), None)
     }
 
-    /// The best title for a machine listing: the explicit [`title`](Session::title) when present,
-    /// otherwise one synthesized from the first user message that reads as a real prompt — skipping
-    /// harness-injected turns ([`MessageKind::InjectedContext`]: AGENTS.md instructions, environment
-    /// context), the `Caveat:` command preamble, bare `<system-reminder>`/command-wrapper turns, and peeling a
-    /// leading `<system-reminder>` block off an otherwise-real turn (tool results are [`Role::Tool`],
-    /// already excluded). `None` only when a session carries no explicit title and no user prose.
-    ///
-    /// Resolver-aware: [`Text::resolve_prefix`](crate::lazy::Text::resolve_prefix) reads at most
-    /// 8 KiB per Span/Source Text block; Inline blocks contribute their complete existing text.
-    /// A candidate joins all its Text blocks, so its allocation is not capped at 8 KiB. Safe to
-    /// call on a [`ParseOptions::lazy`](crate::ParseOptions::lazy) parse without dereferencing a
-    /// lazy [`Span`](crate::lazy::Span) as inline text. The result is transcript-derived text
+    /// The session's title: the explicit [`title`](Session::title) when present, otherwise its
+    /// first [`Message::prompt_title`], passing over a prompt whose lazy text cannot be read
+    /// ([`Session::title_with`] makes that an error). The result is transcript-derived text
     /// (untrusted): JSON consumers get it raw; a terminal seam must sanitize it.
     pub fn synth_title(&self) -> Option<String> {
-        if let Some(t) = &self.title {
-            return Some(t.clone());
-        }
-        // Read prefixes of Span/Source blocks; Inline text is already owned and contributes in
-        // full. Multiple Text blocks retain their existing joined-candidate semantics.
-        const HEAD: u64 = 8 * 1024;
         let resolver = self.resolver();
-        self.messages
-            .iter()
-            .filter(|m| m.role == Role::User && m.kind != MessageKind::InjectedContext)
-            .find_map(|m| {
-                let mut s = String::new();
-                for b in &m.content {
-                    if let Block::Text { text } = b {
-                        if !s.is_empty() {
-                            s.push('\n');
-                        }
-                        s.push_str(&text.try_resolve_prefix(&resolver, HEAD).unwrap_or_default());
-                    }
-                }
-                meaningful_prompt(&s)
-            })
-            .map(|t| truncate(&t, 80))
+        self.title.clone().or_else(|| {
+            self.messages
+                .iter()
+                .find_map(|m| m.prompt_title(&resolver).ok().flatten())
+        })
     }
 
-    /// All textual content concatenated — used to build a search index.
-    ///
-    /// The per-message projection lives in [`Message::append_searchable`]; this just prepends the
-    /// title and folds every message into one `String`.
-    pub fn searchable_text(&self) -> anyhow::Result<String> {
-        let mut out = String::new();
+    /// [`Session::synth_title`] reading lazy blocks through `resolver`, an unreadable one the error.
+    pub fn title_with(&self, resolver: &crate::lazy::Resolver) -> anyhow::Result<Option<String>> {
         if let Some(t) = &self.title {
-            out.push_str(t);
-            out.push('\n');
+            return Ok(Some(t.clone()));
         }
         for m in &self.messages {
-            m.append_searchable(&mut out)?;
+            if let Some(t) = m.prompt_title(resolver)? {
+                return Ok(Some(t));
+            }
         }
-        Ok(out)
+        Ok(None)
     }
 
     /// A [`Resolver`](crate::lazy::Resolver) for this session's lazy content spans, rooted at its
@@ -394,7 +399,7 @@ impl Session {
     /// Resolve every lazy content [`Span`](crate::lazy::Span) in place, so the session owns all its
     /// content inline. Whole-session consumers (cross-harness emit building output in memory, JSON
     /// serialization) call this; streaming consumers resolve per-block instead. After it, every
-    /// content `Text` is `Inline`, so `Deref`/`Display`/`searchable_text` are safe.
+    /// content `Text` is `Inline`, so `Deref`/`Display` are safe.
     pub fn materialize(&mut self) -> anyhow::Result<()> {
         let resolver = self.resolver();
         for m in &mut self.messages {
@@ -424,6 +429,33 @@ pub enum Role {
     /// we keep it distinct so conversions can re-encode it correctly.)
     Tool,
 }
+
+impl Role {
+    /// Every role, in declaration order: a new variant must be listed here (the array length
+    /// forces it) before the schema can publish it.
+    pub const ALL: [Role; 4] = [Role::System, Role::User, Role::Assistant, Role::Tool];
+
+    /// The canonical lowercase name (what `--json` prints); the same spelling serde derives.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        }
+    }
+}
+
+/// Every role as serde spells it, beside the enum: the vocabulary `cv schema --json` publishes.
+pub const ROLE_NAMES: [&str; Role::ALL.len()] = {
+    let mut names = [""; Role::ALL.len()];
+    let mut i = 0;
+    while i < Role::ALL.len() {
+        names[i] = Role::ALL[i].as_str();
+        i += 1;
+    }
+    names
+};
 
 /// What a message IS — every adapter sets it, every emitter reads it (`docs/INTERFACE-V2.md` §4).
 /// `Role` says who speaks; `MessageKind` says what the turn is; `Origin` says where it came from.
@@ -459,11 +491,30 @@ pub enum MessageKind {
     SubagentReturn,
     /// A branch / rewind / reset marker: what follows does not continue what precedes.
     Branch,
-    /// A verbatim non-conversational record carried only under `ParseOptions::complete`.
+    /// A verbatim non-conversational record carried only under `Demand::COMPLETE`.
     Carrier,
 }
 
 impl MessageKind {
+    /// Every kind, in declaration order: a new variant must be listed here (the array length
+    /// forces it) before the schema can publish it.
+    pub const ALL: [MessageKind; 14] = [
+        MessageKind::Prompt,
+        MessageKind::Reply,
+        MessageKind::ToolResult,
+        MessageKind::InjectedContext,
+        MessageKind::SystemPrompt,
+        MessageKind::Notice,
+        MessageKind::CompactionBoundary,
+        MessageKind::CompactionSummary,
+        MessageKind::ModelChange,
+        MessageKind::Error,
+        MessageKind::SubagentSpawn,
+        MessageKind::SubagentReturn,
+        MessageKind::Branch,
+        MessageKind::Carrier,
+    ];
+
     /// The kind a bare role implies when an adapter has not said otherwise: User→Prompt,
     /// Assistant→Reply, Tool→ToolResult, System→Notice. Adapters MUST set the precise kind; this
     /// exists for `Message::new` and for legacy IR JSON that predates `kind`.
@@ -477,7 +528,7 @@ impl MessageKind {
     }
 
     /// The canonical snake_case name (what `--json` prints).
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             MessageKind::Prompt => "prompt",
             MessageKind::Reply => "reply",
@@ -496,6 +547,22 @@ impl MessageKind {
         }
     }
 
+    /// Is this turn part of the exchange itself: what the person asked, what the model replied
+    /// or ran, what came back, what a sub-agent was handed or returned, an unanswered error?
+    /// Everything else is context around it (injected instructions, the system prompt, notices,
+    /// compaction summaries restating earlier turns) or bookkeeping.
+    pub fn is_exchange(self) -> bool {
+        matches!(
+            self,
+            MessageKind::Prompt
+                | MessageKind::Reply
+                | MessageKind::ToolResult
+                | MessageKind::SubagentSpawn
+                | MessageKind::SubagentReturn
+                | MessageKind::Error
+        )
+    }
+
     /// Was this turn part of what the model actually saw or said (as opposed to a harness-side
     /// notice, marker or carrier)? Prompts, replies, tool results, injected context and the
     /// system prompt are; everything else is bookkeeping around the conversation.
@@ -511,6 +578,17 @@ impl MessageKind {
         )
     }
 }
+
+/// Every kind as serde spells it, beside the enum: the vocabulary `cv schema --json` publishes.
+pub const MESSAGE_KIND_NAMES: [&str; MessageKind::ALL.len()] = {
+    let mut names = [""; MessageKind::ALL.len()];
+    let mut i = 0;
+    while i < MessageKind::ALL.len() {
+        names[i] = MessageKind::ALL[i].as_str();
+        i += 1;
+    }
+    names
+};
 
 /// Where a message came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -536,6 +614,33 @@ pub enum Origin {
 }
 
 impl Origin {
+    /// Every origin, in declaration order: a new variant must be listed here (the array length
+    /// forces it) before the schema can publish it.
+    pub const ALL: [Origin; 8] = [
+        Origin::Human,
+        Origin::Model,
+        Origin::Harness,
+        Origin::Hook,
+        Origin::Scheduler,
+        Origin::Subagent,
+        Origin::Import,
+        Origin::Unknown,
+    ];
+
+    /// The canonical snake_case name (what `--json` prints); the same spelling serde derives.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Origin::Human => "human",
+            Origin::Model => "model",
+            Origin::Harness => "harness",
+            Origin::Hook => "hook",
+            Origin::Scheduler => "scheduler",
+            Origin::Subagent => "subagent",
+            Origin::Import => "import",
+            Origin::Unknown => "unknown",
+        }
+    }
+
     /// The origin a bare role implies: User→Human, Assistant→Model, Tool→Harness (the harness ran
     /// the tool), System→Harness. Adapters override when the store says otherwise.
     pub fn for_role(role: Role) -> Self {
@@ -546,6 +651,17 @@ impl Origin {
         }
     }
 }
+
+/// Every origin as serde spells it, beside the enum: the vocabulary `cv schema --json` publishes.
+pub const ORIGIN_NAMES: [&str; Origin::ALL.len()] = {
+    let mut names = [""; Origin::ALL.len()];
+    let mut i = 0;
+    while i < Origin::ALL.len() {
+        names[i] = Origin::ALL[i].as_str();
+        i += 1;
+    }
+    names
+};
 
 /// One message/turn in a conversation.
 #[derive(Debug, Clone)]
@@ -563,55 +679,72 @@ pub struct Message {
     pub content: Vec<Block>,
     pub usage: Option<Usage>,
     /// Harness-specific message facts, nested under the harness name
-    /// (`extra["claude"]["attachment_type"]`). The only other top-level key allowed is
-    /// [`CARRIER_KEY`](crate::harness::claude::CARRIER_KEY) (`"_record"`, the verbatim record under
-    /// `ParseOptions::complete`). Shared concepts are first-class (`kind`, `origin`, `usage`,
+    /// (`extra["claude"]["attachment_type"]`); cv's own facts go under [`CV_NAMESPACE`]
+    /// ([`Message::synthesized`]). The only other top-level key allowed is
+    /// [`CARRIER_KEY`](crate::ir::CARRIER_KEY) (`"_record"`, the verbatim record under
+    /// `Demand::COMPLETE`). Shared concepts are first-class (`kind`, `origin`, `usage`,
     /// `Block::ToolResult::details`). See `docs/INTERFACE-V2.md` §4.
     pub extra: serde_json::Map<String, serde_json::Value>,
     /// Checked complete native backing; serializes through `extra._record`, never as a new field.
-    #[doc(hidden)]
-    pub complete_record: Option<std::sync::Arc<CompleteRecord>>,
+    pub(crate) complete_record: Option<std::sync::Arc<CompleteRecord>>,
 }
 
+/// serde by derive over the fields themselves. The destructuring is exhaustive, so a new field is
+/// a compile error here until it is serialized or deliberately skipped; `complete_record` reaches
+/// the output only as `extra._record`, through [`record::Extra`].
 impl Serialize for Message {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let count = 4
-            + usize::from(self.id.is_some())
-            + usize::from(self.parent_id.is_some())
-            + usize::from(self.timestamp.is_some())
-            + usize::from(self.model.is_some())
-            + usize::from(self.usage.is_some())
-            + usize::from(!self.extra.is_empty() || self.complete_record.is_some());
-        let mut out = serializer.serialize_struct("Message", count)?;
-        if let Some(value) = &self.id {
-            out.serialize_field("id", value)?;
+        let Message {
+            id,
+            parent_id,
+            role,
+            kind,
+            origin,
+            timestamp,
+            model,
+            content,
+            usage,
+            extra: _,
+            complete_record: _,
+        } = self;
+        #[derive(Serialize)]
+        #[serde(rename = "Message")]
+        struct Wire<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            id: Option<&'a String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            parent_id: Option<&'a String>,
+            role: &'a Role,
+            kind: &'a MessageKind,
+            origin: &'a Origin,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            timestamp: Option<&'a DateTime<Utc>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            model: Option<&'a String>,
+            content: &'a Vec<Block>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            usage: Option<&'a Usage>,
+            #[serde(skip_serializing_if = "record::Extra::is_empty")]
+            extra: record::Extra<'a>,
         }
-        if let Some(value) = &self.parent_id {
-            out.serialize_field("parent_id", value)?;
+        Wire {
+            id: id.as_ref(),
+            parent_id: parent_id.as_ref(),
+            role,
+            kind,
+            origin,
+            timestamp: timestamp.as_ref(),
+            model: model.as_ref(),
+            content,
+            usage: usage.as_ref(),
+            extra: record::Extra(self),
         }
-        out.serialize_field("role", &self.role)?;
-        out.serialize_field("kind", &self.kind)?;
-        out.serialize_field("origin", &self.origin)?;
-        if let Some(value) = &self.timestamp {
-            out.serialize_field("timestamp", value)?;
-        }
-        if let Some(value) = &self.model {
-            out.serialize_field("model", value)?;
-        }
-        out.serialize_field("content", &self.content)?;
-        if let Some(value) = &self.usage {
-            out.serialize_field("usage", value)?;
-        }
-        if !self.extra.is_empty() || self.complete_record.is_some() {
-            out.serialize_field("extra", &record::Extra(self))?;
-        }
-        out.end()
+        .serialize(serializer)
     }
 }
 
-/// Deserialize with `kind` / `origin` optional: IR JSON written before they existed (and
-/// hand-written test fixtures) get the role-implied defaults instead of failing.
+/// The wire form [`Message`]'s `Serialize` writes, read back; `kind` and `origin` are required
+/// (every cv since IR v2 writes them, and OpenSession 0.3 requires them).
 impl<'de> Deserialize<'de> for Message {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -621,10 +754,8 @@ impl<'de> Deserialize<'de> for Message {
             #[serde(default)]
             parent_id: Option<String>,
             role: Role,
-            #[serde(default)]
-            kind: Option<MessageKind>,
-            #[serde(default)]
-            origin: Option<Origin>,
+            kind: MessageKind,
+            origin: Origin,
             #[serde(default)]
             timestamp: Option<DateTime<Utc>>,
             #[serde(default)]
@@ -641,8 +772,8 @@ impl<'de> Deserialize<'de> for Message {
             id: w.id,
             parent_id: w.parent_id,
             role: w.role,
-            kind: w.kind.unwrap_or_else(|| MessageKind::for_role(w.role)),
-            origin: w.origin.unwrap_or_else(|| Origin::for_role(w.role)),
+            kind: w.kind,
+            origin: w.origin,
             timestamp: w.timestamp,
             model: w.model,
             content: w.content,
@@ -671,6 +802,10 @@ fn bag_mut<'a>(
     let slot = extra
         .entry(name)
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    debug_assert!(
+        slot.is_object(),
+        "extra[{name}] held {slot}: a non-object bag can only be a bug"
+    );
     if !slot.is_object() {
         *slot = serde_json::Value::Object(serde_json::Map::new());
     }
@@ -704,6 +839,26 @@ impl Message {
         m
     }
 
+    /// A contentless turn cv supplies for a harness boundary: inferred before a summary row,
+    /// or representing a structured boundary with no native text. It starts without an id;
+    /// adapters may retain the source record's identity and metadata. The representation is
+    /// declared in `extra["cv"]["synthesized"] = {kind, origin}`. Renderers label it by kind
+    /// ([`crate::render::turn_label`]), so the text a reader sees comes from cv, not the transcript.
+    pub fn synthesized(kind: MessageKind, origin: Origin) -> Self {
+        let mut m = Message::of_kind(Role::System, kind, origin);
+        let tag = serde_json::json!({ "kind": kind, "origin": origin });
+        bag_mut(&mut m.extra, CV_NAMESPACE).insert("synthesized".into(), tag);
+        m
+    }
+
+    /// Did cv synthesize this turn ([`Message::synthesized`])?
+    pub fn is_synthesized(&self) -> bool {
+        self.extra
+            .get(CV_NAMESPACE)
+            .and_then(|bag| bag.get("synthesized"))
+            .is_some()
+    }
+
     /// The harness-specific fact bag for `h` — `extra[h.as_str()]` as an object, created on demand.
     /// Adapters write here, never at the top level of `extra`.
     pub fn harness_extra_mut(&mut self, h: Harness) -> &mut serde_json::Map<String, serde_json::Value> {
@@ -713,6 +868,19 @@ impl Message {
     /// The harness-specific fact bag for `h`, if any facts were recorded.
     pub fn harness_extra(&self, h: Harness) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.extra.get(h.as_str()).and_then(serde_json::Value::as_object)
+    }
+
+    /// A verbatim meta record carried under `Demand::COMPLETE`, never a conversational turn:
+    /// `kind == Carrier`, or a [`CARRIER_KEY`] record on a message that is not a complete-mode turn
+    /// of a harness whose turns keep their record ([`Harness::turns_keep_records`]; such a turn
+    /// names its `record_type` in its bag and stays a turn).
+    pub fn is_carrier(&self) -> bool {
+        self.kind == MessageKind::Carrier
+            || (self.extra.contains_key(CARRIER_KEY)
+                && !Harness::ALL.into_iter().filter(|h| h.turns_keep_records()).any(|h| {
+                    self.harness_extra(h)
+                        .is_some_and(|extra| extra.contains_key("record_type"))
+                }))
     }
 
     /// Resolve this message's lazy content spans in place against `resolver`, so its content is owned
@@ -741,7 +909,7 @@ impl Message {
                 Block::ToolResult { content, .. } => content,
                 _ => continue,
             };
-            if text.is_span() {
+            if text.is_lazy() {
                 let owned = text.try_resolve(resolver)?.into_owned();
                 *text = crate::lazy::Text::Inline(owned);
             }
@@ -766,38 +934,14 @@ impl Message {
         }
     }
 
-    /// Append this message's searchable text to `out` — the single canonical projection behind
-    /// both [`Session::searchable_text`] (whole session) and
-    /// [`Message::append_searchable`] (streaming, per message).
-    /// Writes into the caller's buffer so neither path allocates intermediates.
+    /// Append this message's searchable text to `out`: [`crate::projection::searchable_text_checked`]
+    /// with no cancellation, resolving any span content through the default resolver.
     pub fn append_searchable(&self, out: &mut String) -> anyhow::Result<()> {
-        for b in &self.content {
-            match b {
-                Block::Text { text } | Block::Thinking { text, .. } => {
-                    out.push_str(text);
-                    out.push('\n');
-                }
-                Block::ToolUse { name, input, .. } => {
-                    out.push_str(name);
-                    out.push(' ');
-                    // Reuse the demanded output allocation while the canonical walker emits
-                    // source fields. No intermediate serialized copy of a giant input.
-                    crate::projection::append_json(out, input)?;
-                    out.push('\n');
-                }
-                Block::ToolResult { content, .. } => {
-                    out.push_str(content);
-                    out.push('\n');
-                }
-                Block::File { path, source, .. } => {
-                    if let Some(p) = path.as_deref().or(source.as_deref()) {
-                        out.push_str(p);
-                        out.push('\n');
-                    }
-                }
-                Block::Image { .. } => {}
-            }
-        }
+        out.push_str(&crate::projection::searchable_text_checked(
+            self,
+            &crate::lazy::Resolver::new(None),
+            || Ok(()),
+        )?);
         Ok(())
     }
 
@@ -818,7 +962,7 @@ impl Message {
 
 /// A unit of message content. Tagged by `type` — the word every harness uses on the wire — so a
 /// block's `type` is never confused with its message's `kind`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
     Text {
@@ -837,6 +981,9 @@ pub enum Block {
     },
     /// A tool/function invocation by the assistant.
     ToolUse {
+        /// The call id the wire gave it. Where the wire has none (Harmony text, a Cursor tool
+        /// record naming no call id), the reader derives one from the call's position,
+        /// [`derived_call_id`]: `cv:<format>:<position>`, a shape no harness writes.
         id: String,
         name: String,
         /// Complete arguments, owned or backed by a validated source range. Serialization keeps
@@ -883,6 +1030,32 @@ pub enum Block {
 }
 
 impl Block {
+    /// The text carried by this block, including thinking and tool output.
+    pub fn text(&self) -> Option<&crate::lazy::Text> {
+        match self {
+            Self::Text { text } | Self::Thinking { text, .. } | Self::ToolResult { content: text, .. } => Some(text),
+            _ => None,
+        }
+    }
+    pub fn text_mut(&mut self) -> Option<&mut crate::lazy::Text> {
+        match self {
+            Self::Text { text } | Self::Thinking { text, .. } | Self::ToolResult { content: text, .. } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// The block's serde `type` tag (`tool_use`, …): the one spelling of the wire word.
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            Block::Text { .. } => "text",
+            Block::Thinking { .. } => "thinking",
+            Block::ToolUse { .. } => "tool_use",
+            Block::ToolResult { .. } => "tool_result",
+            Block::Image { .. } => "image",
+            Block::File { .. } => "file",
+        }
+    }
+
     /// For a tool result whose real output was too large for the transcript and went to a file
     /// (Claude Code's `<persisted-output>` stub → `<session>/tool-results/<id>.txt`): where that
     /// file lives. The block's `content` is the stub the model saw; this is the rest.
@@ -921,7 +1094,28 @@ pub struct Usage {
     pub cost_usd: Option<f64>,
 }
 
+/// Equal iff serialized equal: a nonfinite cost serializes as `null`, so any two nonfinite costs
+/// are equal; an absent cost is omitted, so it stays distinct from one.
+impl PartialEq for Usage {
+    fn eq(&self, other: &Self) -> bool {
+        self.input_tokens == other.input_tokens
+            && self.output_tokens == other.output_tokens
+            && self.cache_read_tokens == other.cache_read_tokens
+            && self.cache_creation_tokens == other.cache_creation_tokens
+            && self.reasoning_tokens == other.reasoning_tokens
+            && match (self.cost_usd, other.cost_usd) {
+                (Some(a), Some(b)) => a == b || (!a.is_finite() && !b.is_finite()),
+                (a, b) => a.is_none() && b.is_none(),
+            }
+    }
+}
+
 impl Usage {
+    /// Whether the source recorded no token counts or cost (recorded zeroes are present).
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
     /// Every prompt token the call read: uncached input + cache reads + cache writes.
     pub fn prompt_tokens(&self) -> u64 {
         self.input_tokens
@@ -938,7 +1132,7 @@ impl Usage {
 
 /// A lightweight handle to a session discovered on disk, cheap to produce for listings/search
 /// without parsing the whole transcript.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRef {
     pub id: String,
     pub harness: Harness,
@@ -959,19 +1153,58 @@ pub struct SessionRef {
     /// this conversation", comparable across harnesses. Adapters that can't know it cheaply
     /// should compute it from the same records they'd parse into [`Role::User`]/[`Role::Assistant`]
     /// messages, not from a proxy like file count.
-    pub message_count: usize,
+    ///
+    /// `None` means **not counted yet**: a listing that read only the session's metadata (Zed,
+    /// Hermes, Goose, Kimi, Kimi Code, Codex, Grok, OpenCode and a Cursor composer whose bubbles
+    /// live in their own cells defer counting, because for them counting means decoding every
+    /// message, or an OpenCode message's parts) until a full read
+    /// or `cv index` certifies the number; a [`crate::stream::Demand::COMPLETE`] read, which also
+    /// carries rewound and superseded rows, never does. An adapter whose discovery reads every
+    /// turn record anyway (Claude, Cursor, Cline, Continue, Devin, Gemini, Qwen, LM Studio,
+    /// OpenClaw, OpenSession, the exports) always counts, by the rule its parser kinds turns
+    /// with, so `Some(0)` is a session with no turns, never a placeholder. Listings print a
+    /// dash and `--json` emits `null` for an uncounted session; sorting by messages puts
+    /// uncounted sessions last.
+    #[serde(default)]
+    pub message_count: Option<usize>,
 }
 
 impl Message {
+    /// The title rule: what every listing, index, hit and label calls a session that carries no
+    /// explicit title is its first turn that titles one. That is the exchange's prompt (what the
+    /// person typed, or the task another agent handed this thread: `Role::User`,
+    /// [`MessageKind::Prompt`]) once leading `<system-reminder>` blocks are peeled, unless what
+    /// remains is empty, the `Caveat:` local-command preamble or a bare command wrapper. Injected
+    /// context (instruction files, environment blocks) never titles a session.
+    ///
+    /// The title is the message's Text blocks joined by newlines, at most 80 characters. Reads at
+    /// most [`TITLE_HEAD`] raw bytes of each lazy block; an unreadable one is the error.
+    pub fn prompt_title(&self, resolver: &crate::lazy::Resolver) -> anyhow::Result<Option<String>> {
+        if self.role != Role::User || self.kind != MessageKind::Prompt {
+            return Ok(None);
+        }
+        let mut s = String::new();
+        for b in &self.content {
+            if let Block::Text { text } = b {
+                if !s.is_empty() {
+                    s.push('\n');
+                }
+                s.push_str(&text.try_resolve_prefix(resolver, TITLE_HEAD)?);
+            }
+        }
+        Ok(meaningful_prompt(&s).map(|t| truncate(&t, Head::TITLE)))
+    }
+
     /// Whether this message is a conversational turn in [`SessionRef::message_count`]'s sense: a
-    /// typed prompt or a model reply. Tool results, injected context, notices, errors and carriers
-    /// are not. The count a full parse writes back to the catalog ([`crate::catalog::fill_count`]).
+    /// typed prompt (one that spawns a sub-agent, an `@agent` mention, included) or a model reply
+    /// (one that spawns, included). Tool results, injected context, notices, errors and carriers
+    /// are not. The count a full read certifies in the catalog's counts record.
     pub fn is_turn(&self) -> bool {
         matches!(
             (self.role, self.kind),
-            (Role::User, MessageKind::Prompt)
+            (Role::User | Role::Assistant, MessageKind::SubagentSpawn)
+                | (Role::User, MessageKind::Prompt)
                 | (Role::Assistant, MessageKind::Reply)
-                | (Role::Assistant, MessageKind::SubagentSpawn)
         )
     }
 
@@ -987,6 +1220,49 @@ impl Message {
 }
 
 impl SessionRef {
+    /// The serialized field names in declaration order: the one spelling every row that re-spells
+    /// a session (`cv ls --json`, the search row, the catalog) derives from. A field added to the
+    /// struct without a name here fails `fields_are_the_serde_key_set`.
+    pub const FIELDS: &'static [&'static str] = &[
+        "id",
+        "harness",
+        "path",
+        "cwd",
+        "title",
+        "created_at",
+        "updated_at",
+        "message_count",
+    ];
+
+    /// The [`Self::FIELDS`] on which `self` and `other` differ, by name: what a stored copy of a ref
+    /// (an index's meta doc, an embedding row) compares, minus the fields it does not hold.
+    pub fn changed_fields<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = &'static str> + 'a {
+        let SessionRef {
+            id,
+            harness,
+            path,
+            cwd,
+            title,
+            created_at,
+            updated_at,
+            message_count,
+        } = self;
+        let same: [bool; Self::FIELDS.len()] = [
+            *id == other.id,
+            *harness == other.harness,
+            *path == other.path,
+            *cwd == other.cwd,
+            *title == other.title,
+            *created_at == other.created_at,
+            *updated_at == other.updated_at,
+            *message_count == other.message_count,
+        ];
+        Self::FIELDS
+            .iter()
+            .zip(same)
+            .filter_map(|(field, same)| (!same).then_some(*field))
+    }
+
     /// Compare copies of one logical session, with the preferred copy sorting first.
     /// Newest update (or creation) wins; harness and path break ties deterministically.
     pub fn preferred_copy_cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -1010,12 +1286,12 @@ impl SessionRef {
             title: None,
             created_at: None,
             updated_at: None,
-            message_count: 0,
+            message_count: None,
         }
     }
 
     /// A ref for a transcript named by path alone: the id is the file stem, the harness is the
-    /// caller's, and nothing else is known (no cwd/title/timestamps, `message_count` 0). The one
+    /// caller's, and nothing else is known (no cwd/title/timestamps, `message_count: None`). The one
     /// spelling for "read this file as a session" — a CLI given a path, a test over a fixture, a
     /// reshape verb opening the file it just wrote.
     pub fn from_path(path: impl Into<PathBuf>, harness: Harness) -> SessionRef {
@@ -1029,30 +1305,85 @@ impl SessionRef {
     }
 }
 
-/// A short human label from a title and/or first-user-text fallback — the projection
+/// One member of a session's sub-agent forest, in any harness: the agent's transcript as a
+/// [`SessionRef`] plus what the harness recorded *around* it (Claude's `*.meta.json` sidecar and
+/// workflow journal, Codex's spawn records, Devin's node tree). The row `cv events --subagents`,
+/// `cv tools`, lanes and `/api/session/{harness}/{id}/subagents` read.
+///
+/// A deep session fans out into hundreds of these, and the sidecars are where their *purpose* and
+/// *outcome* live.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentRef {
+    /// The transcript itself (Claude: id = `agent-<agentId>`), parseable like any other session.
+    pub session: SessionRef,
+    /// The agent kind (Claude's sidecar `agentType`: `general-purpose`, `Explore`,
+    /// `workflow-subagent`, a named custom agent, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// The human one-line task the parent gave it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The tool call in the *parent* transcript that spawned this agent: links the child back to
+    /// the exact turn that launched it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    /// The workflow run id (`wf_…`) this agent belongs to, or `None` for a directly-spawned
+    /// sub-agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// For workflow agents: the journaled outcome status (`done` / `partial` / `failed` / …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_status: Option<String>,
+    /// For workflow agents: the journaled result summary — the agent's structured return value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+}
+
+impl AgentRef {
+    /// The agent's own id: the agent part of a `<parent>/<agent>` transcript id (Kimi, Kimi Code),
+    /// else the transcript id with Claude's `agent-` prefix stripped, the key the workflow journal
+    /// and the transcript records use.
+    pub fn agent_id(&self) -> &str {
+        match self.session.id.rsplit_once('/') {
+            Some((_, agent)) => agent,
+            None => self.session.id.strip_prefix("agent-").unwrap_or(&self.session.id),
+        }
+    }
+}
+
+/// A short human label from a title and/or the first [`Message::prompt_title`] — the projection
 /// [`Session::label`] makes, exposed so streaming consumers can build it without a whole `Session`.
-pub fn label_from(title: Option<&str>, first_user_text: Option<&str>) -> String {
+pub fn label_from(title: Option<&str>, prompt: Option<&str>) -> String {
     title
-        .or(first_user_text)
+        .or(prompt)
         .map(|s| truncate(s, 72))
         .unwrap_or_else(|| "(untitled)".into())
 }
 
+/// How many raw bytes of each lazy text block [`Message::prompt_title`] reads: enough to peel the
+/// reminders a harness prepends to a prompt.
+pub const TITLE_HEAD: u64 = 8 * 1024;
+
 /// A user turn's text as a real prompt, or `None` when it's only harness noise. Peels any leading
-/// `<system-reminder>…</system-reminder>` blocks and surrounding whitespace, then rejects the
+/// `<system-reminder>…</system-reminder>` and Cursor `<timestamp>…</timestamp>` blocks
+/// and surrounding whitespace, then rejects the
 /// residual if it's empty, the `Caveat:` local-command preamble, or a bare command wrapper
-/// (`<command-name>`/`<command-message>`/`<local-command-stdout>`). Used by [`Session::synth_title`].
+/// (`<command-name>`/`<command-message>`/`<local-command-stdout>`). Used by [`Message::prompt_title`].
 fn meaningful_prompt(text: &str) -> Option<String> {
     let mut s = text.trim_start();
     loop {
         s = s.trim_start();
-        let Some(rest) = s.strip_prefix("<system-reminder>") else {
-            break;
-        };
-        let Some(end) = rest.find("</system-reminder>") else {
-            break;
-        };
-        s = &rest[end + "</system-reminder>".len()..];
+        let peeled = [
+            ("<system-reminder>", "</system-reminder>"),
+            ("<timestamp>", "</timestamp>"),
+        ]
+        .into_iter()
+        .find_map(|(open, close)| {
+            let rest = s.strip_prefix(open)?;
+            Some(&rest[rest.find(close)? + close.len()..])
+        });
+        let Some(rest) = peeled else { break };
+        s = rest;
     }
     let s = s.trim();
     if s.is_empty()
@@ -1357,6 +1688,185 @@ pub fn home_rel(p: &std::path::Path) -> String {
 mod tests {
     use super::*;
 
+    /// A head is `truncate` (of the trimmed text, for a trimmed head) however the text is chunked,
+    /// and it stops reading once the answer cannot change.
+    #[test]
+    fn head_is_truncate_with_one_lookahead() {
+        let texts = [
+            String::new(),
+            " \n ".into(),
+            "a".repeat(79),
+            "a".repeat(80),
+            "a".repeat(81),
+            format!("  {}  ", "é".repeat(80)),
+            format!("{}\n{}", "x".repeat(40), " ".repeat(500)),
+            format!("{}{}", " ".repeat(200), "late"),
+            format!("{} {}", "λ".repeat(80), " ".repeat(300)),
+        ];
+        for text in &texts {
+            let chars: Vec<char> = text.chars().collect();
+            for width in [1, 3, 7, chars.len().max(1)] {
+                for trim in [false, true] {
+                    let mut head = if trim { Head::trimmed(80) } else { Head::bounded(80) };
+                    for chunk in chars.chunks(width) {
+                        head.push(&chunk.iter().collect::<String>());
+                    }
+                    let expected = if trim { text.trim() } else { text.as_str() };
+                    assert_eq!(head.finish(), truncate(expected, 80), "{text:?} trim={trim}");
+                    assert_eq!(head.is_blank(), text.trim().is_empty());
+                    assert!(head.as_str().chars().count() <= Head::kept(80));
+                }
+            }
+        }
+    }
+
+    /// Every `Option` set and a record retained: serde emits one key per field (the destructuring
+    /// in `Serialize for Message` makes a new field a compile error), the record appears only as
+    /// `extra._record`, the streaming writer agrees byte for byte, and the output reads back.
+    #[test]
+    fn message_key_set_is_its_fields_and_the_record_rides_extra() {
+        let mut messages = vec![Message::new(Role::Assistant)];
+        let m = &mut messages[0];
+        m.id = Some("a".into());
+        m.parent_id = Some("p".into());
+        m.timestamp = Some(chrono::DateTime::from_timestamp(1, 0).unwrap());
+        m.model = Some("m".into());
+        m.content.push(Block::Text { text: "t".into() });
+        m.usage = Some(Usage::default());
+        m.extra.insert("claude".into(), serde_json::json!({"k": 1}));
+        CompleteRecord::attach(
+            &mut messages,
+            Harness::Claude,
+            crate::json::Json::Owned(serde_json::json!({"type": "assistant", "uuid": "a"})),
+            serde_json::Map::new(),
+        );
+        let m = &messages[0];
+        let value = serde_json::to_value(m).unwrap();
+        let keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "id",
+                "parent_id",
+                "role",
+                "kind",
+                "origin",
+                "timestamp",
+                "model",
+                "content",
+                "usage",
+                "extra"
+            ]
+        );
+        let extra: Vec<&str> = value["extra"].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(extra, ["claude", CARRIER_KEY]);
+        let mut written = Vec::new();
+        m.write_json(&mut written, &crate::lazy::Resolver::new(None)).unwrap();
+        assert_eq!(written, serde_json::to_vec(m).unwrap());
+        let back: Message = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), value);
+        let bare = serde_json::to_value(Message::new(Role::User)).unwrap();
+        let keys: Vec<&str> = bare.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["role", "kind", "origin", "content"]);
+        // `kind` and `origin` are part of the wire form: a message without them is not IR.
+        for missing in ["kind", "origin"] {
+            let mut partial = bare.clone();
+            partial.as_object_mut().unwrap().remove(missing);
+            assert!(serde_json::from_value::<Message>(partial).is_err(), "{missing}");
+        }
+    }
+
+    /// Every `Option` set, so serde emits every field: the key set is exactly `FIELDS`, in order.
+    #[test]
+    fn fields_are_the_serde_key_set() {
+        let full = SessionRef {
+            cwd: Some("/w".into()),
+            title: Some("t".into()),
+            created_at: Some(chrono::DateTime::from_timestamp(1, 0).unwrap()),
+            updated_at: Some(chrono::DateTime::from_timestamp(2, 0).unwrap()),
+            message_count: Some(3),
+            ..SessionRef::new("id", Harness::Claude, "/x.jsonl")
+        };
+        let value = serde_json::to_value(&full).unwrap();
+        let keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            SessionRef::FIELDS,
+            "SessionRef::FIELDS must name every serialized field, in order"
+        );
+    }
+
+    /// `changed_fields` names each field by its `FIELDS` spelling: changing one field changes
+    /// exactly that name.
+    #[test]
+    fn changed_fields_names_each_field_once() {
+        let base = SessionRef::new("id", Harness::Claude, "/x.jsonl");
+        let at = chrono::DateTime::from_timestamp(1, 0);
+        let edits: [(&str, SessionRef); 8] = [
+            (
+                "id",
+                SessionRef {
+                    id: "other".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "harness",
+                SessionRef {
+                    harness: Harness::Codex,
+                    ..base.clone()
+                },
+            ),
+            (
+                "path",
+                SessionRef {
+                    path: "/y.jsonl".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "cwd",
+                SessionRef {
+                    cwd: Some("/w".into()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "title",
+                SessionRef {
+                    title: Some("t".into()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "created_at",
+                SessionRef {
+                    created_at: at,
+                    ..base.clone()
+                },
+            ),
+            (
+                "updated_at",
+                SessionRef {
+                    updated_at: at,
+                    ..base.clone()
+                },
+            ),
+            (
+                "message_count",
+                SessionRef {
+                    message_count: Some(0),
+                    ..base.clone()
+                },
+            ),
+        ];
+        assert_eq!(edits.each_ref().map(|(name, _)| *name), SessionRef::FIELDS);
+        for (name, edited) in &edits {
+            assert_eq!(base.changed_fields(edited).collect::<Vec<_>>(), [*name]);
+        }
+        assert_eq!(base.changed_fields(&base.clone()).count(), 0);
+    }
+
     #[test]
     fn labels_skip_unused_bodies_and_empty_user_turns() {
         let mut session = Session::new("label", Harness::Claude);
@@ -1379,7 +1889,6 @@ mod tests {
             text: "actual prompt".into(),
         });
         session.messages.push(user);
-        assert_eq!(session.first_user_text().as_deref(), Some("actual prompt"));
         assert_eq!(session.label(), "actual prompt");
     }
 
@@ -1389,7 +1898,7 @@ mod tests {
         let path = world.base.join("gone.txt");
         let span = crate::Text::Span(crate::Span {
             source: None,
-            offset: 0,
+            offset: 1,
             len: 4,
             escaped: false,
         });
@@ -1401,7 +1910,7 @@ mod tests {
         assert!(session.materialize().is_err());
         assert!(matches!(&session.messages[0].content[0], Block::Text { text } if text == &span));
 
-        std::fs::write(&path, "text").unwrap();
+        std::fs::write(&path, "\"text\"").unwrap();
         let reads = session.source_reads();
         session.materialize().unwrap();
         assert!(reads.fresh(&mut crate::source::Probe::default()));
@@ -1468,18 +1977,19 @@ mod tests {
 
         let dir = cv_testkit::temp_dir("resolved-token-estimate");
         let source = dir.join("body");
+        // Spans cover valid JSON string bodies; malformed ones are refused, never estimated.
         for raw in [
             "hello π".as_bytes().to_vec(),
             br"\n\t\u03c0\ud83d\ude42".repeat(20_000),
-            [br"\u03c0".repeat(20_000), br"\q".to_vec()].concat(),
-            [b"abc".repeat(30_000), vec![0xff, 0xe2]].concat(),
+            br"\u03c0".repeat(20_000),
+            b"abc".repeat(30_000),
         ] {
-            std::fs::write(&source, &raw).unwrap();
+            std::fs::write(&source, [&b"\""[..], &raw, b"\""].concat()).unwrap();
             for escaped in [false, true] {
                 let resolver = Resolver::new(None);
                 let text = Text::Span(Span {
                     source: Some(source.clone()),
-                    offset: 0,
+                    offset: 1,
                     len: raw.len() as u64,
                     escaped,
                 });
@@ -1513,7 +2023,7 @@ mod tests {
             }
         }
         let resolver = Resolver::new(Some(source));
-        for (offset, len) in [(u64::MAX, 1), (0, u64::MAX)] {
+        for (offset, len) in [(u64::MAX, 1), (1, u64::MAX - 2)] {
             let block = Block::Text {
                 text: Text::Span(Span {
                     source: None,
@@ -1710,6 +2220,18 @@ mod tests {
             meaningful_prompt("<system-reminder>a</system-reminder><system-reminder>b</system-reminder> hi").as_deref(),
             Some("hi")
         );
+        assert_eq!(
+            meaningful_prompt("<timestamp>Monday, Oct 12, 2026, 7:50 PM (UTC-4)</timestamp>\nreal question").as_deref(),
+            Some("real question")
+        );
+        assert_eq!(
+            meaningful_prompt("<timestamp>metadata</timestamp><system-reminder>noise</system-reminder>"),
+            None
+        );
+        assert_eq!(
+            meaningful_prompt("<timestamp>unfinished").as_deref(),
+            Some("<timestamp>unfinished")
+        );
         // Pure noise (no residual prose) yields None.
         assert_eq!(
             meaningful_prompt("<system-reminder>only a reminder</system-reminder>"),
@@ -1745,7 +2267,12 @@ mod tests {
         let mut injected = user("# AGENTS.md instructions for /work");
         injected.kind = MessageKind::InjectedContext;
         s.messages.insert(0, injected);
+        // Nor is any other user-role turn around the exchange: only a prompt titles a session.
+        let mut summary = user("Summary of the conversation so far");
+        summary.kind = MessageKind::CompactionSummary;
+        s.messages.insert(0, summary);
         assert_eq!(s.synth_title().as_deref(), Some("ask about otters"));
+        assert_eq!(s.label(), "ask about otters");
         // A session with no user prose stays None.
         s.messages = vec![user("<system-reminder>only noise</system-reminder>")];
         assert_eq!(s.synth_title(), None);

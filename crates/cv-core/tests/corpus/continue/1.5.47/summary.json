@@ -19,11 +19,25 @@
         "Checklist"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "plan/write": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "Checklist": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -48,12 +62,26 @@
         "Subagent"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 1,
       "affordances": {
         "subagent_return/return": 1,
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "Subagent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 1
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 1
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -95,10 +123,38 @@
         "Bash"
       ],
       "usage_messages": 8,
+      "model_messages": 8,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "Bash": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 2,
+            "errors": 1
+          },
+          "Edit": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "Read": {
+            "calls": 3,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 6,
+        "total_errors": 1
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0
@@ -124,12 +180,26 @@
         "Subagent"
       ],
       "usage_messages": 3,
+      "model_messages": 3,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 1,
       "affordances": {
         "subagent_return/return": 1,
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "Subagent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 1
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 1
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -154,10 +224,24 @@
         "add"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "add": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0
@@ -179,10 +263,16 @@
       },
       "tools": [],
       "usage_messages": 3,
+      "model_messages": 3,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0
@@ -209,10 +299,31 @@
         "Bash"
       ],
       "usage_messages": 3,
+      "model_messages": 3,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "Bash": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          },
+          "Fetch": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0

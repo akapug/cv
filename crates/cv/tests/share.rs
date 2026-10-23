@@ -37,11 +37,11 @@ fn share_corpus(w: &World) {
             ]}
         }),
     ];
-    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
-    fs::write(w.home.join(".claude/projects/-work-proj/sharesess.jsonl"), body).unwrap();
+    w.write_session("sharesess", &lines);
 }
 
-/// No `src=`/`href=` attribute may point at the network. (Fragment anchors and data: are fine.)
+/// No `src=`/`href=` attribute may point at the network: absolute and protocol-relative values,
+/// quoted or not. (Fragment anchors and data: are fine.)
 fn assert_no_external_urls(html: &str) {
     let lower = html.to_lowercase();
     for needle in [
@@ -49,8 +49,16 @@ fn assert_no_external_urls(html: &str) {
         "src='http",
         "href=\"http",
         "href='http",
+        "src=http://",
+        "src=https://",
+        "href=http://",
+        "href=https://",
         "src=\"//",
+        "src='//",
         "href=\"//",
+        "href='//",
+        "src=//",
+        "href=//",
         "@import",
         "url(http",
     ] {
@@ -70,6 +78,15 @@ fn assert_well_formed(html: &str) {
         let close = html.matches(&format!("</{tag}>")).count();
         assert_eq!(open, close, "unbalanced <{tag}>: {open} open vs {close} close");
     }
+}
+
+/// The `(summary, body)` of the first `<details>` element whose body (after its `<summary>`) holds
+/// `needle`. A `<details>` folds natively, with no script, whatever classes it carries.
+fn fold_holding<'a>(html: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    html.split("<details")
+        .skip(1)
+        .filter_map(|d| d[..d.find("</details>")?].split_once("</summary>"))
+        .find(|(_, body)| body.contains(needle))
 }
 
 #[test]
@@ -99,9 +116,16 @@ fn share_redacts_by_default() {
     // flagship structure: title, harness badge, collapsible thinking + tool call, inline assets
     assert!(html.contains("quokka quest"), "session title missing");
     assert!(html.contains(">claude</span>"), "harness badge missing");
-    assert!(html.contains("fold think"), "thinking not collapsible");
-    assert!(html.contains("fold tool tool-use"), "tool call not collapsible");
-    assert!(html.contains("fold tool tool-res"), "tool result not collapsible");
+    let (summary, _) = fold_holding(&html, "the census &lt;tables&gt; need care").expect("thinking not collapsible");
+    assert!(summary.contains("thinking"), "thinking fold is labelled: {summary}");
+    let (summary, _) = fold_holding(&html, "./migrate").expect("tool call not collapsible");
+    assert!(summary.contains("Bash"), "tool call fold names its tool: {summary}");
+    let (summary, _) = fold_holding(&html, "migrated 7 quokkas").expect("tool result not collapsible");
+    assert!(summary.contains("result"), "tool result fold is labelled: {summary}");
+    assert!(
+        fold_holding(&html, PLANTED).is_none(),
+        "the prompt itself is never folded away"
+    );
     assert!(
         html.contains("<style>") && html.contains("<script>"),
         "inline assets missing"

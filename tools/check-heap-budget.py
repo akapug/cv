@@ -366,22 +366,70 @@ def queries(binary, root, env):
             bound(peaks, STORE_CEILING, STORE_GROWTH, f"query {harness} escaped={escaped}")
 
 
-def events(binary, root, env):
-    """Bound extraction through transactional publication, including a retained negative control."""
+EVENT_SHAPES = ("unfinished", "open-close", "native")
+
+
+def event_fixture(source, shape, records):
+    """Unfinished calls, a spilled completion set followed by reuse, and native reconciliation."""
+    expected = []
+    messages = 0
+    with source.open("w") as out:
+        def emit(row):
+            nonlocal messages
+            out.write(json.dumps(row, separators=(",", ":")) + "\n")
+            messages += 1
+
+        def claude(block, role="assistant"):
+            row = {"type": role, "sessionId": "events", "uuid": f"event-{messages}",
+                   "message": {"role": role, "content": [block]}}
+            if messages:
+                row["parentUuid"] = f"event-{messages - 1}"
+            emit(row)
+
+        def call(i, call_id):
+            expected.append((messages, "file_edit", f"/repo/file-{i}.rs"))
+            claude({"type": "tool_use", "id": call_id, "name": "Edit",
+                    "input": {"file_path": f"/repo/file-{i}.rs", "old_string": "a", "new_string": "b"}})
+
+        if shape == "native":
+            for i in range(records):
+                path, extra, call_id = f"/repo/file-{i}.rs", f"/repo/native-{i}.rs", f"call-{i}"
+                expected.append((messages, "file_edit", path))
+                emit({"type": "response_item", "payload": {"type": "function_call", "name": "apply_patch",
+                      "call_id": call_id, "arguments": json.dumps({"patch": f"*** Begin Patch\n*** Update File: {path}\n@@\n-a\n+b\n*** End Patch"})}})
+                expected.append((messages, "file_edit", extra))
+                emit({"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                      "type": "FileChange", "id": call_id, "status": "completed", "changes": {
+                          path: {"type": "update", "unified_diff": "@@\n-a\n+b\n"},
+                          extra: {"type": "add", "unified_diff": "+new\n"}}}}})
+                emit({"type": "response_item", "payload": {"type": "function_call_output",
+                      "call_id": call_id, "output": "Success"}})
+        else:
+            for i in range(records):
+                call(i, f"call-{i}")
+            if shape == "open-close":
+                for i in reversed(range(records)):
+                    claude({"type": "tool_result", "tool_use_id": f"call-{i}", "content": "ok"}, "user")
+                # Reuse a closed ID after clearing both correlation sets.
+                call(records, "call-0")
+    return "codex" if shape == "native" else "claude", messages, expected
+
+
+def events(binary, root, env, *, mmap=True):
+    """Bound extraction/publication for each correlation shape in both byte-source builds."""
+    for shape in EVENT_SHAPES:
+        case = root / shape
+        case.mkdir()
+        events_case(binary, case, env, shape, mmap=mmap)
+
+
+def events_case(binary, root, env, shape, *, mmap):
     peaks = {"events": [], "events-collected": []}
     for records in (20_000, 200_000):
         fixture = root / f"events-{records}"
         fixture.mkdir()
         source = fixture / "events.jsonl"
-        with source.open("w") as out:
-            for i in range(records):
-                row = {"type": "assistant", "sessionId": "events", "uuid": f"event-{i}",
-                       "message": {"role": "assistant", "content": [
-                           {"type": "tool_use", "id": f"call-{i}", "name": "Edit",
-                            "input": {"file_path": f"/repo/file-{i}.rs", "old_string": "a", "new_string": "b"}}]}}
-                if i:
-                    row["parentUuid"] = f"event-{i - 1}"
-                out.write(json.dumps(row, separators=(",", ":")) + "\n")
+        harness, messages, expected = event_fixture(source, shape, records)
         digests = []
         for operation in peaks:
             catalog = root / f"catalog-{operation}-{records}"
@@ -389,30 +437,28 @@ def events(binary, root, env):
             catalog.mkdir()
             temporary.mkdir()
             case_env = dict(env, CLUSTERVISION_HOME=str(catalog), TMPDIR=str(temporary))
-            row, peak = probe(binary, [operation, "claude", "events", source, "--root", fixture], case_env, True)
-            assert row["messages"] == records and row["detail"]["events"] == records, "events truncated or skipped"
+            row, peak = probe(binary, [operation, harness, "events", source, "--root", fixture], case_env, mmap)
+            assert row["messages"] == messages and row["detail"]["events"] == len(expected), "events truncated or skipped"
             # Count persisted rows and compare exact ordering/targets outside the measured Rust
             # process; extraction success alone cannot conceal a failed best-effort SQL write.
             with sqlite3.connect(f"file:{catalog / 'catalog.db'}?mode=ro", uri=True) as conn:
-                assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == records, "event publication incomplete"
-                assert conn.execute("SELECT count(*) FROM event_sync").fetchone()[0] == 1, "event stamp missing"
+                assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == len(expected), "event publication incomplete"
                 assert conn.execute("SELECT count(*) FROM source_dependencies WHERE consumer='events'").fetchone()[0] == 1, "source baseline missing"
                 digest = hashlib.sha256()
                 query = "SELECT e.msg_idx,e.kind,t.target FROM events e LEFT JOIN event_targets t ON t.id=e.target_id ORDER BY e.msg_idx"
                 for i, (msg_idx, kind, target) in enumerate(conn.execute(query)):
-                    assert (msg_idx, kind, target) == (i, "file_edit", f"/repo/file-{i}.rs"), "event ordering or target changed"
+                    assert (msg_idx, kind, target) == expected[i], "event ordering or target changed"
                     digest.update(json.dumps([msg_idx, kind, target]).encode())
                 digests.append(digest.digest())
             assert not list(temporary.iterdir()), "completed publication leaked its owned spool"
             written = row["detail"]["temporary_bytes_written"]
-            read = row["detail"]["temporary_bytes_read"]
-            assert written == read and (written > 0 if operation == "events" else written == 0), "spool I/O accounting changed"
+            assert written > 0 if operation == "events" else written == 0, "spool I/O accounting changed"
             peaks[operation].append(peak)
-            print(json.dumps({"case": operation, "records": records, "physical_input_bytes": source.stat().st_size,
-                              "persisted_events": records, "peak_live_rust_bytes": peak,
-                              "temporary_bytes_written": written, "temporary_bytes_read": read}), flush=True)
+            print(json.dumps({"case": f"{operation}-{shape}", "mmap": mmap, "records": records, "physical_input_bytes": source.stat().st_size,
+                              "persisted_events": len(expected), "peak_live_rust_bytes": peak,
+                              "temporary_bytes_written": written}), flush=True)
         assert digests[0] == digests[1], "bounded publication differs from the collector"
-    bound(peaks["events"], MIB, MIB // 4, "events extraction/publication")
+    bound(peaks["events"], MIB, MIB // 4, f"events {shape} extraction/publication mmap={mmap}")
     assert peaks["events-collected"][1] > 32 * MIB, "retained control no longer demonstrates the old memory cost"
     assert peaks["events-collected"][1] > peaks["events-collected"][0] + 16 * MIB, "retained control must grow with history"
 
@@ -522,34 +568,34 @@ def token_stats(binary, root, env, mmap, baseline=None):
         bound(peaks, 2 * MIB, MIB // 4, f"token stats {harness} mmap={mmap}")
 
 
-def raw_body(path, repeats, malformed):
+def raw_body(path, repeats):
+    """A JSON string of `repeats` escaped newlines: a span covers its body, quotes excluded."""
     block_repeats = 16 << 10
     block = b"x\\n" * block_repeats
     with path.open("wb") as out:
+        out.write(b'"')
         blocks, tail = divmod(repeats, block_repeats)
         for _ in range(blocks):
             out.write(block)
         out.write(b"x\\n" * tail)
-        if malformed:
-            out.write(b"\\q")
+        out.write(b'"')
 
 
 def chunks(binary, root, env, mmap):
-    for malformed in (False, True):
-        peaks = []
-        for size in SIZES:
-            repeats = (size + 2) // 3
-            path = root / f"raw-{size}-{malformed}.txt"
-            raw_body(path, repeats, malformed)
-            raw_bytes = path.stat().st_size
-            row, peak = probe(binary, ["chunks", "gemini", "unused", path, "--span", f"0:{raw_bytes}", "--escaped", "--chunk-bytes", CHUNK_BYTES], env, mmap)
-            expected = raw_bytes if malformed else repeats * 2
-            assert row["detail"]["decoded_bytes"] == expected, "decoder dropped or duplicated bytes"
-            assert row["detail"]["largest_chunk_bytes"] <= CHUNK_BYTES + 3, "decoder output chunk is unbounded"
-            peaks.append(peak)
-            print(json.dumps({"case": f"chunks-{'mmap' if mmap else 'ranged-read'}-{'malformed-tail' if malformed else 'valid'}",
-                              "raw_bytes": raw_bytes, "decoded_bytes": expected, "peak_live_rust_bytes": peak}), flush=True)
-        bound(peaks, CHUNK_CEILING, CHUNK_GROWTH, f"chunks mmap={mmap} malformed={malformed}")
+    peaks = []
+    for size in SIZES:
+        repeats = (size + 2) // 3
+        path = root / f"raw-{size}.txt"
+        raw_body(path, repeats)
+        body_bytes = path.stat().st_size - 2
+        row, peak = probe(binary, ["chunks", "gemini", "unused", path, "--span", f"1:{body_bytes}", "--escaped", "--chunk-bytes", CHUNK_BYTES], env, mmap)
+        expected = repeats * 2
+        assert row["detail"]["decoded_bytes"] == expected, "decoder dropped or duplicated bytes"
+        assert row["detail"]["largest_chunk_bytes"] <= CHUNK_BYTES + 3, "decoder output chunk is unbounded"
+        peaks.append(peak)
+        print(json.dumps({"case": f"chunks-{'mmap' if mmap else 'ranged-read'}-valid",
+                          "raw_bytes": body_bytes, "decoded_bytes": expected, "peak_live_rust_bytes": peak}), flush=True)
+    bound(peaks, CHUNK_CEILING, CHUNK_GROWTH, f"chunks mmap={mmap}")
 
 
 def main():
@@ -588,7 +634,12 @@ def main():
         elif args.only == "query":
             queries(args.probe.resolve(), root, env)
         elif args.only == "events":
-            events(args.probe.resolve(), root, env)
+            native_root = root / "mmap"
+            native_root.mkdir()
+            events(args.probe.resolve(), native_root, env)
+            portable_root = root / "positioned"
+            portable_root.mkdir()
+            events(args.no_mmap_probe.resolve(), portable_root, env, mmap=False)
         elif args.only == "stats":
             baseline = args.baseline_probe.resolve() if args.baseline_probe else None
             token_stats(args.probe.resolve(), root, env, True, baseline)

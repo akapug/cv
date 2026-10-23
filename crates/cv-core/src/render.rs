@@ -1,6 +1,8 @@
 //! Rendering an IR [`Session`] to human/LLM-friendly text. Shared by the `cv` CLI and `cv mcp`.
 
 use crate::ir::*;
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::path::Path;
@@ -9,19 +11,7 @@ use std::path::Path;
 /// discard staged output on error: a source or writer failure may follow an emitted prefix.
 pub fn write_markdown(s: &Session, out: &mut impl Write, resolver: &crate::Resolver) -> anyhow::Result<()> {
     let reads = crate::source::session_reads(s);
-    let label = match &s.title {
-        Some(title) => truncate(title, 72),
-        None => {
-            let mut label = None;
-            for message in s.messages.iter().filter(|m| m.role == Role::User) {
-                if let Some(candidate) = message_label(message, resolver)? {
-                    label = Some(candidate);
-                    break;
-                }
-            }
-            label.unwrap_or_else(|| "(untitled)".into())
-        }
-    };
+    let label = label_from(s.title_with(resolver)?.as_deref(), None);
     out.write_all(
         md_header(
             &label,
@@ -43,50 +33,24 @@ pub fn write_markdown(s: &Session, out: &mut impl Write, resolver: &crate::Resol
     Ok(())
 }
 
-/// The exact label projection of a message's concatenated plain text, retaining at most 73
-/// scalars. Complete checked demands preserve whitespace-only rejection and late source errors.
-pub fn message_label(m: &Message, resolver: &crate::Resolver) -> anyhow::Result<Option<String>> {
-    plain_text_preview(m, resolver, 72, true)
-}
-
 /// Exact character-bounded preview of concatenated plain-text blocks, including whitespace-only
 /// text. Checked demands scan discarded tails without retaining them.
 pub fn message_text_preview(m: &Message, resolver: &crate::Resolver, chars: usize) -> anyhow::Result<Option<String>> {
-    plain_text_preview(m, resolver, chars, false)
-}
-
-fn plain_text_preview(
-    m: &Message,
-    resolver: &crate::Resolver,
-    chars: usize,
-    require_meaningful: bool,
-) -> anyhow::Result<Option<String>> {
-    let mut head = String::new();
-    let mut remaining = chars.saturating_add(1);
+    let mut head = crate::projection::Head::bounded(chars);
     let mut nonempty = false;
-    let mut meaningful = false;
-    let mut append = |part: &str| {
-        if !meaningful {
-            meaningful = part.chars().any(|c| !c.is_whitespace());
-        }
-        for c in part.chars().take(remaining) {
-            head.push(c);
-            remaining -= 1;
-        }
-    };
     for block in &m.content {
         if let Block::Text { text } = block {
             if nonempty {
-                append("\n");
+                head.push("\n");
             }
             text.try_for_each_chunk(resolver, 64 * 1024, |part| {
                 nonempty |= !part.is_empty();
-                append(part);
+                head.push(part);
                 Ok(())
             })?;
         }
     }
-    Ok((if require_meaningful { meaningful } else { nonempty }).then(|| truncate(&head, chars)))
+    Ok(nonempty.then(|| head.finish()))
 }
 
 /// Write one Markdown section, preserving the owned renderer's exact formatting.
@@ -128,23 +92,19 @@ pub fn write_md_block(b: &Block, out: &mut impl Write, resolver: &crate::Resolve
             out.write_all(b"\n```\n\n")?;
         }
         Block::ToolResult { content, is_error, .. } => {
-            let mut head = String::new();
-            let mut remaining = 4001;
+            let mut head = crate::projection::Head::bounded(4000);
             content.try_for_each_chunk(resolver, 64 * 1024, |part| {
-                for c in part.chars().take(remaining) {
-                    head.push(c);
-                    remaining -= 1;
-                }
+                head.push(part);
                 Ok(())
             })?;
-            // Tool output is a literal code excerpt, so preserve its line structure.
-            // The extra scalar distinguishes an exact fit from a truncated result.
-            if remaining == 0 {
-                head.pop();
-                head.pop();
-                head.push('…');
+            // Tool output is a literal code excerpt, so preserve its line structure (the kept
+            // text, not `finish`'s flattening); the lookahead tells an exact fit from a cut.
+            let mut excerpt = head.as_str().to_owned();
+            if head.full() {
+                excerpt.pop();
+                excerpt.pop();
+                excerpt.push('…');
             }
-            let excerpt = head;
             // A tool can return Markdown containing its own fenced blocks. Keep that text
             // literal by choosing a fence longer than every run in the rendered excerpt.
             let longest = excerpt.split(|c| c != '`').map(str::len).max().unwrap_or(0);
@@ -195,23 +155,6 @@ pub fn md_header(
     out
 }
 
-/// One Markdown section per turn: `## <turn label>` then every block through [`md_block`].
-pub fn md_message(m: &Message, out: &mut String) -> anyhow::Result<()> {
-    let mut bytes = Vec::new();
-    write_md_message(m, &mut bytes, &crate::Resolver::new(None))?;
-    out.push_str(&String::from_utf8(bytes)?);
-    Ok(())
-}
-
-/// Append one block using the checked Markdown writer. Use `write_md_block` to avoid retaining
-/// the complete rendered block when writing a stream or staging a document.
-pub fn md_block(b: &Block, out: &mut String) -> anyhow::Result<()> {
-    let mut bytes = Vec::new();
-    write_md_block(b, &mut bytes, &crate::Resolver::new(None))?;
-    out.push_str(&String::from_utf8(bytes)?);
-    Ok(())
-}
-
 fn file_label(path: &Option<String>, source: &Option<String>) -> String {
     path.as_deref().or(source.as_deref()).unwrap_or("?").to_string()
 }
@@ -229,20 +172,22 @@ pub fn role_label(r: Role) -> &'static str {
 /// the role does (`system · compaction_boundary`, `user · compaction_summary`, `system · error`),
 /// and for injected context by the harness's own attachment kind when it recorded one
 /// (`system · injected_context/hook_success`). A plain prompt or reply is just `user` / `assistant`.
+/// A turn cv inferred rather than read ([`Message::synthesized`]) says so:
+/// `system · compaction_boundary · synthesized`.
 pub fn turn_label(m: &Message) -> String {
     let role = role_label(m.role);
-    if m.kind == MessageKind::for_role(m.role) {
-        return role.to_string();
-    }
-    let attachment_kind = m
-        .extra
-        .values()
-        .filter_map(serde_json::Value::as_object)
-        .find_map(|bag| bag.get("attachment_type"))
-        .and_then(serde_json::Value::as_str);
-    match (m.kind, attachment_kind) {
-        (MessageKind::InjectedContext, Some(k)) => format!("{role} · {}/{k}", m.kind.as_str()),
-        _ => format!("{role} · {}", m.kind.as_str()),
+    let label = if m.kind == MessageKind::for_role(m.role) {
+        role.to_string()
+    } else {
+        match (m.kind, crate::harness::attachment_kind(m)) {
+            (MessageKind::InjectedContext, Some(k)) => format!("{role} · {}/{k}", m.kind.as_str()),
+            _ => format!("{role} · {}", m.kind.as_str()),
+        }
+    };
+    if m.is_synthesized() {
+        format!("{label} · synthesized")
+    } else {
+        label
     }
 }
 
@@ -274,61 +219,6 @@ mod tests {
             .with_view(|view| Ok(view.source_text()?.unwrap()))
             .unwrap()
     }
-    fn old_md_block(b: &Block, out: &mut String) -> anyhow::Result<()> {
-        match b {
-            Block::Text { text } => {
-                out.push_str(text);
-                out.push_str("\n\n");
-            }
-            Block::Thinking { text, .. } => {
-                out.push_str("> 🧠 ");
-                out.push_str(&text.replace('\n', "\n> "));
-                out.push_str("\n\n");
-            }
-            Block::ToolUse { name, input, .. } => {
-                out.push_str(&format!("**🔧 {name}**\n\n```json\n"));
-                crate::projection::append_json(out, input)?;
-                out.push_str("\n```\n\n");
-            }
-            Block::ToolResult { content, is_error, .. } => {
-                out.push_str(&format!(
-                    "**↩ result{}**\n\n```\n{}\n```\n\n",
-                    if *is_error { " (error)" } else { "" },
-                    {
-                        let mut excerpt: String = content.chars().take(4000).collect();
-                        if content.chars().count() > 4000 {
-                            excerpt.pop();
-                            excerpt.push('…');
-                        }
-                        excerpt
-                    }
-                ));
-            }
-            Block::File { path, source, .. } => {
-                out.push_str(&format!("_[file: {}]_\n\n", file_label(path, source)));
-            }
-            Block::Image { .. } => out.push_str("_[image]_\n\n"),
-        }
-        Ok(())
-    }
-
-    fn old_markdown(session: &Session) -> String {
-        let mut out = md_header(
-            &session.label(),
-            session.harness,
-            &session.id,
-            session.cwd.as_deref(),
-            session.model.as_deref(),
-            session.created_at,
-        );
-        for message in &session.messages {
-            out.push_str(&format!("## {}\n\n", turn_label(message)));
-            for block in &message.content {
-                old_md_block(block, &mut out).unwrap();
-            }
-        }
-        out
-    }
     #[test]
     fn markdown_title_skips_empty_user_turns_and_propagates_candidate_errors() -> anyhow::Result<()> {
         let mut session = Session::new("title", Harness::Codex);
@@ -343,7 +233,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&"lazy title".repeat(2000))?)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let text = source
-            .read_range_value(0, source.len(), |view| view.source_text())?
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
+                view.source_text()
+            })?
             .unwrap();
         session.messages[1].content = vec![Block::Text { text }];
         std::fs::write(&path, b"changed title source")?;
@@ -458,13 +350,21 @@ mod tests {
         let resolver = session.resolver();
         let mut markdown = Vec::new();
         write_markdown(&session, &mut markdown, &resolver).unwrap();
-        assert_eq!(markdown, old_markdown(&owned).as_bytes());
-        assert_eq!(to_markdown(&session).unwrap(), old_markdown(&owned));
+        assert_eq!(to_markdown(&session).unwrap().as_bytes(), markdown);
+        let mut frozen = crate::emit::frozen::Frozen::new("render-markdown");
+        frozen.insert(
+            "titled",
+            serde_json::json!([markdown.len(), crate::digest::sha256_hex(&markdown)]),
+        );
         session.title = None;
         owned.title = None;
         markdown.clear();
         write_markdown(&session, &mut markdown, &resolver).unwrap();
-        assert_eq!(markdown, old_markdown(&owned).as_bytes());
+        frozen.insert(
+            "untitled",
+            serde_json::json!([markdown.len(), crate::digest::sha256_hex(&markdown)]),
+        );
+        frozen.check().unwrap();
         let mut compact = Vec::new();
         session.write_json(&mut compact, &resolver).unwrap();
         assert_eq!(compact, serde_json::to_vec(&owned).unwrap());
@@ -478,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_message_labels_match_join_trim_and_truncate_oracle() {
+    fn checked_message_previews_match_join_and_truncate_oracle() {
         for pieces in [
             vec!["", ""],
             vec!["\u{2003}\n", "\t"],
@@ -490,24 +390,10 @@ mod tests {
                 m.content.push(Block::Text { text: text.into() });
             }
             assert_eq!(
-                message_label(&m, &crate::Resolver::new(None)).unwrap(),
-                m.text().filter(|t| !t.trim().is_empty()).map(|t| truncate(&t, 72))
-            );
-            assert_eq!(
                 message_text_preview(&m, &crate::Resolver::new(None), 80).unwrap(),
                 m.text().map(|t| truncate(&t, 80))
             );
         }
-        let text = format!("{}🌙", " ".repeat(100000));
-        let source = Source::new(&serde_json::to_vec(&serde_json::json!({"text":text})).unwrap());
-        let mut m = Message::new(Role::User);
-        m.content.push(Block::Text {
-            text: source_text(&source.json(), "text"),
-        });
-        assert_eq!(
-            message_label(&m, &crate::Resolver::new(None)).unwrap(),
-            Some(truncate(&text, 72))
-        );
     }
 
     #[test]
@@ -537,7 +423,7 @@ mod tests {
             first.content.push(Block::Text {
                 text: source_text(&source.json(), "text"),
             });
-            assert!(matches!(&first.content[0], Block::Text { text } if text.is_span()));
+            assert!(matches!(&first.content[0], Block::Text { text } if text.is_lazy()));
             session.messages = vec![first, Message::new(Role::Assistant)];
             let mut writer = Mutating {
                 stage: crate::bytes::ByteStage::new(),

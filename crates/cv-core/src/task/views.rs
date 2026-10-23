@@ -34,9 +34,44 @@ pub struct TaskRow {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+    /// The backlog columns (`GET /api/tasks?detail=1`, what the inbox page lists); absent elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision: Option<bool>,
+    /// Blocked by a task that has not finished ([`project::is_blocked`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<bool>,
 }
 
 impl TaskRow {
+    /// Every key a row can carry, in emitted order (`cv schema --json` publishes it as
+    /// `task_row`): the lean row omits the timestamps and the backlog columns, and `tags` /
+    /// `blocked_by` ride only when non-empty.
+    pub const KEYS: &'static [&'static str] = &[
+        "id",
+        "title",
+        "effective_state",
+        "assignee",
+        "repo",
+        "opened_at",
+        "last_ts",
+        "tags",
+        "blocked_by",
+        "opened_by",
+        "issue",
+        "body",
+        "notes",
+        "decision",
+        "blocked",
+    ];
+
     /// The lean row (MCP `task_list`): no timestamps on the wire.
     pub fn brief(t: &TaskProjection) -> TaskRow {
         TaskRow {
@@ -49,6 +84,12 @@ impl TaskRow {
             last_ts: None,
             tags: t.tags.clone(),
             blocked_by: t.blocked_by.clone(),
+            opened_by: None,
+            issue: None,
+            body: None,
+            notes: None,
+            decision: None,
+            blocked: None,
         }
     }
 
@@ -58,6 +99,19 @@ impl TaskRow {
             opened_at: Some(t.opened_at),
             last_ts: Some(t.last_ts),
             ..TaskRow::brief(t)
+        }
+    }
+
+    /// The timestamped row plus the backlog columns (`GET /api/tasks?detail=1`).
+    pub fn detailed(t: &TaskProjection, model: &super::reduce::TaskReadModel) -> TaskRow {
+        TaskRow {
+            opened_by: Some(t.opened_by.clone()),
+            issue: t.issue.clone(),
+            body: Some(t.body.clone()),
+            notes: Some(t.notes.len()),
+            decision: Some(t.decision.is_some()),
+            blocked: Some(project::is_blocked(model, t)),
+            ..TaskRow::full(t)
         }
     }
 }
@@ -123,5 +177,42 @@ mod tests {
                 "last_ts"
             ],
         );
+        // The detailed row's order is pinned as a literal too, not against TaskRow::KEYS: the
+        // const lives beside the struct, so struct and const could drift together unseen.
+        let detailed = serde_json::to_value(TaskRow::detailed(t, &model)).unwrap();
+        let keys: Vec<&str> = detailed.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "id",
+                "title",
+                "effective_state",
+                "assignee",
+                "repo",
+                "opened_at",
+                "last_ts",
+                "opened_by",
+                "body",
+                "notes",
+                "decision",
+                "blocked"
+            ],
+            "the backlog columns ride the timestamped row, in shipped order (issue/tags/blocked_by ride only when set)"
+        );
+    }
+
+    /// A detailed row with every optional column set emits exactly `TaskRow::KEYS`, in order.
+    #[test]
+    fn keys_are_the_serde_key_set() {
+        let (model, id) = model_with_claimed_task();
+        let row = TaskRow {
+            issue: Some("#1".into()),
+            tags: vec!["t".into()],
+            blocked_by: vec!["b".into()],
+            ..TaskRow::detailed(&model.tasks[&id], &model)
+        };
+        let value = serde_json::to_value(row).unwrap();
+        let keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, TaskRow::KEYS);
     }
 }

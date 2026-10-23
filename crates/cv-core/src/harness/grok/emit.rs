@@ -20,7 +20,8 @@ use std::fs;
 use std::path::Path;
 use uuid::Uuid;
 
-/// Percent-encode everything except unreserved chars, so `/` → `%2F` (matching Grok's dir layout).
+/// Encode Grok's directory delimiters (including `.`), spaces, percent signs and controls;
+/// this is Grok's path spelling, not the standard URI unreserved-character set.
 const GROK_ENCODE: &AsciiSet = &CONTROLS.add(b'/').add(b' ').add(b'.').add(b'%').add(b':').add(b'\\');
 
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
@@ -60,6 +61,8 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     summary.insert("num_messages".into(), json!(num_turns));
     summary.insert("next_trace_turn".into(), json!(0));
     summary.insert("chat_format_version".into(), json!(1));
+    // Agent persona, independent of current_model_id; its spelling happens to match the
+    // fallback model but the two fields can vary independently.
     summary.insert("agent_name".into(), json!("grok-build"));
     if let Some(home) = crate::env::var_os("HOME") {
         summary.insert(
@@ -186,7 +189,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                             line.finish()
                         })?;
                         updates.push(json!({
-                            "timestamp": epoch_ms(msg.timestamp.or(session.updated_at)),
+                            "timestamp": epoch_ms(msg.timestamp.or(session.created_at).or(session.updated_at)),
                             "method": "session/update",
                             "params": {
                                 "sessionId": new_id,
@@ -203,14 +206,17 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         }
     }
     // Checked source production completes before any destination file or directory is touched.
+    // The three files publish as one set, `summary.json` last: discovery finds a session by its
+    // summary, so a crash midway leaves nothing Grok or cv would list.
     fs::create_dir_all(&session_dir).with_context(|| format!("creating {}", session_dir.display()))?;
     let summary = serde_json::to_string_pretty(&summary)?;
-    crate::publish::publish_reader(&summary_path, "stage", summary.as_bytes(), opts.claim())?;
-    let chat_path = session_dir.join("chat_history.jsonl");
-    lines.publish(&chat_path, opts.claim())?;
+    let mut set = crate::publish::Set::new();
+    lines.stage_into(&mut set, &session_dir.join("chat_history.jsonl"), opts.claim())?;
     if !updates.is_empty() {
-        updates.publish(&session_dir.join("updates.jsonl"), opts.claim())?;
+        updates.stage_into(&mut set, &session_dir.join("updates.jsonl"), opts.claim())?;
     }
+    set.stage(&summary_path, "stage", summary.as_bytes(), opts.claim())?;
+    set.publish()?;
 
     Ok(EmitResult {
         path: session_dir,

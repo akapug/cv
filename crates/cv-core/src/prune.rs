@@ -31,32 +31,28 @@
 //! `--range` indices or `--window` sizing. Model-visible `attachment` records (those with
 //! `rendered[]`) DO count toward byte estimates — that text is in the prompt.
 
+use crate::harness::claude::record::Facts;
+use crate::harness::claude::skills::{self, SkillsPolicy, SkillsReport};
 use crate::harness::store::{
     bytes::{ByteSource, ByteStage},
     jsonl::ranges::{self, Range},
 };
+use crate::json::{ReadInput, Validation};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Marker prefix stamped where a payload used to be; carries enough to retrieve the original. The
 /// sidecar's public contract: `cv cat` keys retrieval on the id after it.
 pub const MARKER_PREFIX: &str = "[PRUNED id=";
-// NOTE: `--declassify` is a token-AGNOSTIC primitive. cv-core ships NO built-in token list — the
-// terms are always caller-supplied (CLI `--declassify-tokens` / `--declassify-tokens-file`, i.e.
-// external config/data). This keeps cv itself free of any domain "shitlist" (Ember, PR #9): a
-// list of security badwords baked into the source would (a) be un-adaptable and (b) trip the very
-// classifier this feature exists to dodge whenever an agent reads cv's own code. `declassify` with
-// no tokens is a safe no-op. Composing a security-declassify tool = supply your token file.
 /// Suffix distinguishing a flattened `toolUseResult` mirror entry from its `content` sibling.
 const TUR_SUFFIX: &str = "#tur";
 /// Prune estimates over raw records (it never parses to the IR), so it walks `message.content`
 /// itself, pricing each field with the shared [`crate::ir::TokenKind`] rates, [`IMAGE_TOKENS`] per
 /// image and [`BLOCK_TOKENS`] per block — the numbers the IR-side estimator produces.
 use crate::ir::{TokenKind, BLOCK_TOKENS, IMAGE_TOKENS};
-const LARGE_RECORD: u64 = 1024 * 1024;
 
 /// Knobs for [`prune_session`].
 #[derive(Debug, Clone)]
@@ -74,7 +70,7 @@ pub struct PruneOptions {
     /// relinked. Lossless (stashed in the sidecar like any other payload). Off by default — it
     /// changes more than tool output.
     pub thinking: bool,
-    /// Explicit new session id; otherwise a fresh UUIDv4.
+    /// Explicit new session id; otherwise a fresh UUIDv7.
     pub new_id: Option<String>,
     /// Also copy the session's `subagents/`/`workflows/` resource dir under the new id. Off by
     /// default — `claude --resume` doesn't need it, and for big sessions it can be hundreds of MB /
@@ -109,6 +105,9 @@ pub struct PruneOptions {
     pub declassify_tokens: Vec<String>,
     /// Snip a message iff it holds at least this many DISTINCT `declassify_tokens` (default 2).
     pub declassify_min_hits: usize,
+    /// Which skills the new session restores at its next compaction or resume (see
+    /// [`crate::harness::claude::skills`]). `Keep` (the default) copies the records as they are.
+    pub skills_policy: SkillsPolicy,
     /// Compute and report without writing anything.
     pub dry_run: bool,
     /// Replace an existing `<new-id>.jsonl` (and its sidecar) by atomic rename. Without it, an
@@ -131,6 +130,7 @@ impl Default for PruneOptions {
             declassify: false,
             declassify_tokens: Vec::new(), // token-agnostic: caller supplies the terms (no baked-in list)
             declassify_min_hits: 2,
+            skills_policy: SkillsPolicy::Keep,
             dry_run: false,
             force: false,
         }
@@ -179,6 +179,9 @@ pub struct PruneResult {
     /// Data-safety warnings (e.g. a `--window` tail that exceeds its budget because a single turn is
     /// bigger than the whole budget). Also echoed to stderr.
     pub warnings: Vec<String>,
+    /// What `skills_policy` dropped from the new session's restored skills.
+    #[serde(skip_serializing_if = "SkillsReport::is_keep")]
+    pub skills: SkillsReport,
     pub dry_run: bool,
 }
 
@@ -222,37 +225,38 @@ pub fn sidecar_line(id: &str, name: &str, input: &Value, content: &str) -> Strin
     serde_json::to_string(&BorrowedSidecarEntry::text(id, name, input, content)).unwrap_or_default()
 }
 
-/// Sub-agent (Task tool) lines carry `isSidechain: true`; their usage belongs to the sub-agent's
-/// own context window, not the main thread's.
-pub(crate) fn is_sidechain(v: &Value) -> bool {
-    v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false)
+/// What prune decides one record on: the codec's typed [`Facts`] plus prune's own pricing.
+#[derive(Debug, Clone, Default)]
+struct Decision {
+    facts: Facts,
+    /// The record's estimated prompt contribution (only under `--window`/`--revive`); after a
+    /// snip, the estimate of what is left.
+    est: Est,
+    /// A tool payload (`toolUseResult` or a `tool_result` body) larger than `--min-size`.
+    payload: bool,
+    thinking: bool,
 }
 
-/// Classify a line as a main-thread conversational turn: `Some(is_user)` for a real user/assistant
-/// turn, `None` for everything else — bookkeeping records, sidechain (sub-agent) lines, and Claude
-/// Code's synthetic assistant notices (see [`is_synthetic_assistant`]), which are never sent to the
-/// API and must not shift turn indices or eat `--keep-last` budget.
-pub(crate) fn turn_kind(v: &Value) -> Option<bool> {
-    if is_sidechain(v) {
-        return None;
+impl Decision {
+    /// Sub-agent (Task tool) lines carry `isSidechain: true`; their usage belongs to the
+    /// sub-agent's own context window, not the main thread's.
+    fn sidechain(&self) -> bool {
+        self.facts.sidechain
     }
-    match v.get("type").and_then(Value::as_str) {
-        Some("user") => Some(true),
-        Some("assistant") if !is_synthetic_assistant(v) => Some(false),
-        _ => None,
+    /// A main-thread conversational turn: `Some(is_user)`; `None` for bookkeeping, sidechain
+    /// lines and Claude Code's synthetic notices, which never shift turn indices or eat
+    /// `--keep-last` budget.
+    fn turn_kind(&self) -> Option<bool> {
+        self.facts.turn_kind()
     }
-}
-
-/// A main-thread conversational turn (sidechain lines and synthetic notices don't count).
-fn is_main_turn(v: &Value) -> bool {
-    turn_kind(v).is_some()
-}
-
-/// Claude Code's client-side assistant notices — an `isApiErrorMessage` ("Prompt is too long", …)
-/// or any `message.model == "<synthetic>"` row ("No response requested."). Not model output.
-fn is_synthetic_assistant(v: &Value) -> bool {
-    v.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false)
-        || v.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
+    fn is_main_turn(&self) -> bool {
+        self.turn_kind().is_some()
+    }
+    /// The prompt size the record carries: `_cv_orig_ctx` (the real count a prior revive
+    /// stashed) over the live usage, which revive may have overwritten with a pinned figure.
+    fn recorded(&self) -> u64 {
+        self.facts.orig_ctx.or(self.facts.usage_in).unwrap_or(0)
+    }
 }
 
 /// Session-level records written once (or rarely) that a windowed tail must not lose — the label
@@ -281,7 +285,7 @@ const SINGLETON_RECORDS: &[&str] = &[
 /// it does not measure the standalone request after rewriting or guarantee its size on resume.
 /// Older compaction segments cannot be treated as a clean shared prefix. Sidechain usage belongs
 /// to a different prompt and is excluded from this main-thread calculation.
-fn usage_window_cutoff(parsed: &[Option<Value>], budget: u64) -> Option<(usize, u64, bool)> {
+fn usage_window_cutoff(parsed: &[Option<Decision>], budget: u64) -> Option<(usize, u64, bool)> {
     // Per main-thread turn that carries a usage record: (turn index, cumulative usage, starts a new
     // compaction segment). Cumulative usage is monotonic WITHIN a segment but resets across a
     // compaction boundary, so we can't subtract across the whole session — we work in per-turn deltas.
@@ -289,33 +293,18 @@ fn usage_window_cutoff(parsed: &[Option<Value>], budget: u64) -> Option<(usize, 
     let mut recs: Vec<(usize, u64, bool)> = Vec::new();
     let mut boundary_pending = false;
     for v in parsed.iter().flatten() {
-        if is_sidechain(v) {
+        if v.sidechain() {
             continue;
         }
-        match v.get("type").and_then(Value::as_str) {
-            _ if turn_kind(v).is_some() => {
-                // Prefer `_cv_orig_ctx` (the real count a prior revive stashed) over the live usage,
-                // which revive may have overwritten with a pinned figure.
-                let tot = v
-                    .get("_cv_orig_ctx")
-                    .and_then(Value::as_u64)
-                    .or_else(|| {
-                        v.get("message")
-                            .and_then(|m| m.get("usage"))
-                            .and_then(Value::as_object)
-                            .map(usage_total)
-                    })
-                    .unwrap_or(0);
-                if tot > 0 {
-                    recs.push((ti, tot, boundary_pending));
-                    boundary_pending = false;
-                }
-                ti += 1;
+        if v.is_main_turn() {
+            let tot = v.recorded();
+            if tot > 0 {
+                recs.push((ti, tot, boundary_pending));
+                boundary_pending = false;
             }
-            Some("system") if v.get("subtype").and_then(Value::as_str) == Some("compact_boundary") => {
-                boundary_pending = true;
-            }
-            _ => {}
+            ti += 1;
+        } else if v.facts.is_compact_boundary() {
+            boundary_pending = true;
         }
     }
     if recs.is_empty() {
@@ -364,7 +353,7 @@ fn usage_window_cutoff(parsed: &[Option<Value>], budget: u64) -> Option<(usize, 
 /// Claude's recorded usage (falling back to a byte estimate only when usage is absent), snapped back
 /// to a user turn so the tail opens on a prompt. Neither set ⇒ the whole session.
 fn select_kept_turns(
-    parsed: &[Option<Value>],
+    parsed: &[Option<Decision>],
     opts: &PruneOptions,
     total_turns: usize,
 ) -> (usize, usize, Option<u64>, bool) {
@@ -376,7 +365,7 @@ fn select_kept_turns(
         return (0, total_turns, None, false);
     };
 
-    let is_user: Vec<bool> = parsed.iter().flatten().filter_map(turn_kind).collect();
+    let is_user: Vec<bool> = parsed.iter().flatten().filter_map(Decision::turn_kind).collect();
     let snap = |mut start: usize| {
         // Snap back to a user turn so the tail opens on a prompt, not a bare assistant reply.
         while start > 0 && !is_user.get(start).copied().unwrap_or(true) {
@@ -395,12 +384,12 @@ fn select_kept_turns(
     // Model-visible attachments (system reminders) ride with the turn they precede.
     let mut per_turn: Vec<u64> = Vec::new();
     let mut pending = 0u64;
-    for v in parsed.iter().flatten().filter(|v| !is_sidechain(v)) {
-        if is_main_turn(v) {
-            per_turn.push(fact_est(v).total() + pending);
+    for v in parsed.iter().flatten().filter(|v| !v.sidechain()) {
+        if v.is_main_turn() {
+            per_turn.push(v.est.total() + pending);
             pending = 0;
         } else {
-            pending += fact_est(v).total();
+            pending += v.est.total();
         }
     }
     // Trailing rendered reminders still belong to the retained tail even without a following
@@ -433,13 +422,25 @@ fn select_kept_turns(
     (start, total_turns, None, overshoot || retained > budget)
 }
 
-/// Prune `src_path` (a Claude `<id>.jsonl`) into a new session. Returns what happened.
-pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult> {
+/// Prune `src_path`, a `harness` transcript whose adapter declares derived copies
+/// ([`crate::harness::Adapter::identity`]: Claude's `<id>.jsonl`), into a new session. Returns
+/// what happened.
+pub fn prune_session(harness: crate::ir::Harness, src_path: &Path, opts: &PruneOptions) -> Result<PruneResult> {
+    prune_session_after_stage(harness, src_path, opts, || Ok(()))
+}
+
+fn prune_session_after_stage(
+    harness: crate::ir::Harness,
+    src_path: &Path,
+    opts: &PruneOptions,
+    after_stage: impl FnOnce() -> Result<()>,
+) -> Result<PruneResult> {
     if let Some(id) = &opts.new_id {
-        crate::restamp::validate_output_id(id)?;
+        crate::publish::validate_output_id(id)?;
     }
-    let reference = crate::ir::SessionRef::from_path(src_path, crate::ir::Harness::Claude);
+    let reference = crate::ir::SessionRef::from_path(src_path, harness);
     let subagent = crate::rewind::is_subagent(&reference);
+    let identity = crate::derive::identity(reference.harness)?;
     let source = crate::json::JsonSource::capture(src_path)?;
     let file = std::fs::File::open(src_path)?;
     source.check_metadata(file.metadata()?)?;
@@ -447,9 +448,9 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     let mut lines = Vec::new();
     let mut parsed = Vec::new();
     let mut tool_names = HashMap::new();
-    let mut id_spans = HashMap::new();
     // Retain only decision facts; payload trees live for one record. Preserve the old global
     // trim_end contract (including whitespace-only trailing records) without copying the file.
+    let mut line_no = 0usize;
     for record in ranges::records(
         &file,
         Range {
@@ -458,43 +459,42 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         },
     )? {
         let (range, _) = record?;
-        let facts = if range.len >= LARGE_RECORD {
-            match source.read_range_value(range.offset, range.len, |view| {
-                let spans = crate::restamp::source_id_spans(view)?;
-                let facts = decision_facts_source(view, range, opts, &mut tool_names)?;
-                id_spans.insert(range.offset, spans);
-                Ok(facts)
-            }) {
-                Ok(facts) => Some(facts),
-                Err(e) if e.is::<crate::json::InvalidJson>() => {
-                    // Value-compatible validation already rejected this row. Malformed JSON
-                    // passes through, but invalid UTF-8 remains fatal even in ignored fields.
-                    if !ranges::valid_utf8(&mut ranges::reader(&file, range)?)? {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "stream did not contain valid UTF-8",
-                        )
-                        .into());
-                    }
-                    None
+        line_no += 1;
+        // An empty line is blank like any JSON-whitespace row (a JSON range cannot be empty).
+        let read = (range.len != 0).then(|| {
+            source.read(ReadInput::Range(range.offset, range.len), Validation::Value, |view| {
+                decide(view, range, opts, &mut tool_names)
+            })
+        });
+        let facts = match read.transpose() {
+            Ok(facts) => facts,
+            Err(e) if e.is::<crate::json::InvalidJson>() => {
+                // Value-compatible validation rejected this row. Invalid UTF-8 is fatal first,
+                // under its own name; then only a blank row (JSON whitespace) passes, copied
+                // verbatim. Anything else is a line the new session could not read back, so it
+                // is refused before anything is staged, whether or not a window would drop it.
+                if !ranges::valid_utf8(&mut ranges::reader(&file, range)?)? {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "stream did not contain valid UTF-8",
+                    )
+                    .into());
                 }
-                Err(e) => return Err(e),
+                if ranges::trim(&file, range)?.len != 0 {
+                    return Err(e.context(format!(
+                        "{}: line {line_no} is not a complete JSON record; repair it, or cut before it \
+                         with `cv rewind --at <MSG_IDX>`",
+                        src_path.display()
+                    )));
+                }
+                None
             }
-        } else {
-            let line = read_line(&file, range)?;
-            let value = serde_json::from_str::<Value>(&line).ok();
-            if let Some(v) = &value {
-                collect_tool_names(v, range, &mut tool_names);
-            }
-            value
-                .as_ref()
-                .map(|v| decision_facts(v, opts.window.is_some() || opts.revive))
+            Err(e) => return Err(e),
         };
-        let facts = facts.map(|mut facts| {
-            if subagent {
-                crate::rewind::normalize_subagent_record(&mut facts);
-            }
-            facts
+        let facts = facts.map(|mut decision| {
+            // A sub-agent transcript pruned on its own is its own main thread.
+            decision.facts.sidechain &= !subagent;
+            decision
         });
         parsed.push(facts);
         lines.push(range);
@@ -510,17 +510,17 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
             break;
         }
     }
-    // split on an empty trimmed file historically produces one empty line.
+    // An empty or blank-only source has nothing to keep: it once published a one-newline session
+    // (an empty file) or failed on an empty JSON range (blank lines).
     if lines.is_empty() {
-        lines.push(Range { offset: 0, len: 0 });
-        parsed.push(None);
+        bail!("{} holds no records; nothing to prune", src_path.display());
     }
     source.check()?;
 
     let source_id = parsed
         .iter()
         .flatten()
-        .find_map(|v| v.get("sessionId")?.as_str().map(String::from))
+        .find_map(|v| v.facts.session_id.clone())
         .unwrap_or_default();
     let parent_session_id = subagent.then(|| source_id.clone()).filter(|id| !id.is_empty());
     let source_id = if subagent { reference.id.clone() } else { source_id };
@@ -562,7 +562,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     // Conversational-turn index per line, so keep-last can spare the most recent turns. A line is
     // "old" (eligible to snip) iff its turn index is before the keep-last window. Sidechain lines
     // are positioned by the surrounding main-thread turn but never counted.
-    let total_turns = parsed.iter().flatten().filter(|v| is_main_turn(v)).count();
+    let total_turns = parsed.iter().flatten().filter(|v| v.is_main_turn()).count();
     let keep_from = total_turns.saturating_sub(opts.keep_last);
 
     // `--window`/`--range`: select which conversational turns survive; the rest are dropped and the
@@ -575,7 +575,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     if windowing {
         let mut last: HashMap<&str, usize> = HashMap::new();
         for (i, v) in parsed.iter().enumerate() {
-            if let Some(t) = v.as_ref().and_then(|v| v.get("type")).and_then(Value::as_str) {
+            if let Some(t) = v.as_ref().map(|v| v.facts.ty.as_str()) {
                 if SINGLETON_RECORDS.contains(&t) {
                     last.insert(t, i);
                 }
@@ -596,14 +596,13 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     // Revive weighs each record's estimate before and after pruning against recorded usage. Records
     // map one-to-one onto output records unless turns are dropped.
     let before: Option<Vec<Option<Est>>> =
-        (opts.revive && !windowing).then(|| parsed.iter().map(|f| f.as_ref().map(fact_est)).collect());
+        (opts.revive && !windowing).then(|| parsed.iter().map(|f| f.as_ref().map(|f| f.est)).collect());
     let mut output = std::io::BufWriter::with_capacity(64 * 1024, ByteStage::new());
     let mut output_facts = Vec::new();
     let mut output_pruned = Vec::new();
     let mut sidecar_stage = std::io::BufWriter::with_capacity(64 * 1024, ByteStage::new());
     let mut sidecar_count = 0usize;
     let mut rooted = false;
-    let mut sidecar: Vec<SidecarEntry> = Vec::new();
     let mut pruned_count = 0usize;
     let mut image_blocks = 0usize;
     let mut est_tokens_saved = 0u64;
@@ -611,22 +610,39 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
 
     for (idx, (facts, range)) in parsed.into_iter().zip(lines.iter()).enumerate() {
         let Some(facts) = facts else {
-            // Keep malformed/blank records byte-identical without owning their bodies.
-            // Planning validated UTF-8; captured source guards cover this staged copy too.
+            // Blank records (the parse loop refused every other unreadable row) use the same
+            // writer with no accepted rewrite nodes.
+            let mut scan = MarkerWriter::new(&mut output);
+            let selected = crate::derive::Select {
+                range: *range,
+                newline: true,
+                record: None,
+                blank: true,
+                ids: Vec::new(),
+                replacements: Vec::new(),
+                root: false,
+            };
+            crate::derive::derive(
+                &source,
+                &file,
+                std::iter::once(Ok(selected)),
+                &crate::derive::Rewrite {
+                    session_id: &new_id,
+                    standalone: subagent,
+                    identity,
+                },
+                &mut scan,
+            )?;
             if opts.revive {
-                let mut scan = MarkerWriter::new(&mut output);
-                std::io::copy(&mut ranges::reader(&file, *range)?, &mut scan)?;
                 output_facts.push(None);
                 output_pruned.push(scan.found);
-            } else {
-                std::io::copy(&mut ranges::reader(&file, *range)?, &mut output)?;
             }
-            output.write_all(b"\n")?;
             continue;
         };
-        let ty = facts.get("type").and_then(Value::as_str).unwrap_or("");
-        let is_turn_line = ty == "user" || ty == "assistant";
-        let is_turn = turn_kind(&facts).is_some();
+        let mut facts = facts;
+        let (user, assistant) = (facts.facts.ty == "user", facts.facts.ty == "assistant");
+        let is_turn_line = user || assistant;
+        let is_turn = facts.is_main_turn();
         let this_turn = turn;
         if is_turn {
             turn += 1;
@@ -658,269 +674,66 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
             }
         }
 
-        let needs_root = (subagent || (windowing && keep_start > 0)) && !rooted && is_main_turn(&facts);
-        if subagent && range.len >= LARGE_RECORD {
-            let plan = if is_turn_line && (opts.declassify || (is_old && (ty == "user" || opts.thinking))) {
-                source_turn_prune(
-                    &source,
-                    *range,
-                    opts,
-                    &new_id,
-                    idx,
-                    &tool_names,
-                    is_old && ty == "user",
-                    is_old && ty == "assistant" && opts.thinking,
-                )?
-            } else {
-                None
-            };
-            let mut replacements = Vec::new();
-            if needs_root {
-                rooted = true;
-            }
-            let record = source.validated_range(range.offset, range.len)?;
-            if needs_root {
-                if let Some(parent) = source_parent_override(&record)? {
-                    replacements.push(parent);
-                }
-            }
-            let mut facts = facts;
-            if let Some(plan) = plan {
-                replacements.extend(plan.replacements);
-                pruned_count += plan.payloads.len();
-                est_tokens_saved += plan.saved;
-                image_blocks += plan.images;
-                if !opts.drop {
-                    for payload in &plan.payloads {
-                        write_source_payload(payload, &mut sidecar_stage)?;
-                        sidecar_count += 1;
-                    }
-                }
-                if opts.revive {
-                    if let Some(facts) = facts.as_object_mut() {
-                        plan.estimate.store(facts);
-                    }
-                }
-            }
-            let mut scan = MarkerWriter::new(&mut output);
-            record.with_view(|view| write_subagent_source(view, &replacements, &new_id, &mut scan))?;
-            scan.write_all(b"\n")?;
-            if opts.revive {
-                output_facts.push(Some(facts));
-                output_pruned.push(scan.found);
-            }
-            continue;
-        }
-        let may_mutate =
-            (is_old && ty == "user" && facts.get("_prune_payload").and_then(Value::as_bool).unwrap_or(true))
-                || (is_old
-                    && ty == "assistant"
-                    && opts.thinking
-                    && facts.get("_prune_thinking").and_then(Value::as_bool).unwrap_or(true))
-                || (is_turn_line && opts.declassify)
-                || (needs_root && facts.get("_prune_parent").and_then(Value::as_bool).unwrap_or(true));
-        if range.len >= LARGE_RECORD && !may_mutate {
-            let mut scan = MarkerWriter::new(&mut output);
-            crate::restamp::write_restamped_spans(
-                &source,
-                &file,
-                range.offset,
-                range.len,
-                &new_id,
-                &mut id_spans.remove(&range.offset).unwrap_or_default(),
-                &mut scan,
-            )?;
-            scan.write_all(b"\n")?;
-            let pruned = scan.found;
-            if needs_root {
-                rooted = true;
-            }
-            if opts.revive {
-                output_facts.push(Some(facts));
-                output_pruned.push(pruned);
-            }
-            continue;
-        }
-        if range.len >= LARGE_RECORD && is_turn_line {
-            if needs_root {
-                rooted = true;
-            }
-            if let Some(mut plan) = source_turn_prune(
+        let needs_root = (subagent || (windowing && keep_start > 0)) && !rooted && facts.is_main_turn();
+        rooted |= needs_root;
+        let may_prune = is_turn_line
+            && (opts.declassify
+                || (is_old && user && facts.payload)
+                || (is_old && assistant && opts.thinking && facts.thinking));
+        let plan = if may_prune {
+            source_turn_prune(
                 &source,
                 *range,
                 opts,
                 &new_id,
                 idx,
                 &tool_names,
-                is_old && ty == "user",
-                is_old && ty == "assistant" && opts.thinking,
-            )? {
-                if needs_root {
-                    if let Some(parent) = source_parent_override(&plan.record)? {
-                        plan.replacements.push(parent);
-                    }
-                }
-                plan.record
-                    .with_view(|view| view.write_canonical_replacing(&plan.replacements, &mut output))?;
-                output.write_all(b"\n")?;
-                pruned_count += plan.payloads.len();
-                est_tokens_saved += plan.saved;
-                image_blocks += plan.images;
-                if !opts.drop {
-                    for payload in &plan.payloads {
-                        write_source_payload(payload, &mut sidecar_stage)?;
-                        sidecar_count += 1;
-                    }
-                }
-                if opts.revive {
-                    let mut facts = facts;
-                    if let Some(facts) = facts.as_object_mut() {
-                        plan.estimate.store(facts);
-                    }
-                    output_facts.push(Some(facts));
-                    output_pruned.push(true);
-                }
-            } else {
-                let record = source.validated_range(range.offset, range.len)?;
-                if needs_root && source_parent_override(&record)?.is_some() {
-                    let pruned = write_source_reroot(
-                        &record,
-                        &source,
-                        &new_id,
-                        &id_spans.remove(&range.offset).unwrap_or_default(),
-                        &mut output,
-                    )?;
-                    if opts.revive {
-                        output_pruned.push(pruned);
-                        output_facts.push(Some(facts));
-                    }
-                } else {
-                    // No mutation was selected; preserve the exact untouched raw record.
-                    let mut scan = MarkerWriter::new(&mut output);
-                    crate::restamp::write_restamped_spans(
-                        &source,
-                        &file,
-                        range.offset,
-                        range.len,
-                        &new_id,
-                        &mut id_spans.remove(&range.offset).unwrap_or_default(),
-                        &mut scan,
-                    )?;
-                    scan.write_all(b"\n")?;
-                    if opts.revive {
-                        output_pruned.push(scan.found);
-                        output_facts.push(Some(facts));
-                    }
+                is_old && user,
+                is_old && assistant && opts.thinking,
+            )?
+        } else {
+            None
+        };
+        let mut selection = crate::derive::Select {
+            range: *range,
+            newline: true,
+            record: Some(source.validated_range(range.offset, range.len)?),
+            blank: false,
+            ids: std::mem::take(&mut facts.facts.ids),
+            replacements: Vec::new(),
+            root: needs_root,
+        };
+        if let Some(plan) = plan {
+            selection.record = Some(plan.record);
+            selection.replacements = plan.replacements;
+            pruned_count += plan.payloads.len();
+            est_tokens_saved += plan.saved;
+            image_blocks += plan.images;
+            if !opts.drop {
+                for payload in &plan.payloads {
+                    write_source_payload(payload, &mut sidecar_stage)?;
+                    sidecar_count += 1;
                 }
             }
-            continue;
-        }
-        if range.len >= LARGE_RECORD
-            && needs_root
-            && !opts.declassify
-            && !(is_old
-                && ty == "assistant"
-                && opts.thinking
-                && facts.get("_prune_thinking").and_then(Value::as_bool).unwrap_or(true))
-        {
-            rooted = true;
-            let record = source.validated_range(range.offset, range.len)?;
-            let pruned = write_source_reroot(
-                &record,
-                &source,
-                &new_id,
-                &id_spans.remove(&range.offset).unwrap_or_default(),
-                &mut output,
-            )?;
             if opts.revive {
-                output_facts.push(Some(facts));
-                output_pruned.push(pruned);
-            }
-            continue;
-        }
-        let line = read_line(&file, *range)?;
-        let mut v: Value = serde_json::from_str(&line)?;
-
-        // Unique per-line key for sidecar ids when a block has no id of its own: the line's uuid,
-        // or its file line index as a last resort — never a shared constant (collisions would make
-        // earlier sidecar payloads unretrievable).
-        let line_key = v
-            .get("uuid")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or_else(|| format!("L{idx}"));
-
-        let mut modified = subagent && crate::rewind::normalize_subagent_record(&mut v);
-        if is_old && ty == "user" {
-            // Only old user messages carry snippable tool results.
-            let current_tools = materialize_tool_inputs(&source, &v, &tool_names)?;
-            prune_user_line(
-                &mut v,
-                opts,
-                &current_tools,
-                &new_id,
-                &line_key,
-                &mut sidecar,
-                &mut pruned_count,
-                &mut image_blocks,
-                &mut est_tokens_saved,
-                &mut modified,
-            );
-        } else if is_old && ty == "assistant" && opts.thinking {
-            // `--thinking`: flatten the OLDEST assistant reasoning (recent thinking, within
-            // keep-last, stays verbatim so the resumed agent keeps its live train of thought).
-            prune_assistant_thinking(
-                &mut v,
-                opts,
-                &line_key,
-                &mut sidecar,
-                &mut pruned_count,
-                &mut est_tokens_saved,
-                &mut modified,
-            );
-        }
-
-        // `--declassify`: snip security-dense message PROSE (user string or assistant text blocks)
-        // wherever it appears — a classifier scores the WHOLE loaded context, so a trigger span
-        // ANYWHERE downgrades a restricted (e.g. Fable) seat; recency does NOT protect it (unlike the
-        // tool/thinking passes above, which keep recent payloads verbatim for continuity). Retrievable.
-        if is_turn_line && opts.declassify {
-            prune_declassify_text(
-                &mut v,
-                opts,
-                &new_id,
-                &line_key,
-                &mut sidecar,
-                &mut pruned_count,
-                &mut est_tokens_saved,
-                &mut modified,
-            );
-        }
-        drop_omitted_blocks(&mut v);
-
-        // An untouched line is the source's bytes with only its session id replaced
-        // ([`crate::restamp_line`]); a snipped line is re-serialized (values preserved; key order
-        // and whitespace may normalize) and then stamped the same way.
-        let out = if modified { v.to_string() } else { line };
-        let mut out = crate::restamp_line(&out, &new_id).unwrap_or(out);
-        if (subagent || (windowing && keep_start > 0)) && !rooted && is_main_turn(&v) {
-            rooted = true;
-            if v.get("parentUuid").is_some_and(|p| !p.is_null()) {
-                // Reparse the stamped line so the new session id survives normalization.
-                let mut stamped: Value = serde_json::from_str(&out)?;
-                stamped["parentUuid"] = Value::Null;
-                out = stamped.to_string();
+                facts.est = plan.estimate;
             }
         }
+        let mut scan = MarkerWriter::new(&mut output);
+        crate::derive::derive(
+            &source,
+            &file,
+            std::iter::once(Ok(selection)),
+            &crate::derive::Rewrite {
+                session_id: &new_id,
+                standalone: subagent,
+                identity,
+            },
+            &mut scan,
+        )?;
         if opts.revive {
-            output_facts.push(Some(decision_facts(&v, true)));
-            output_pruned.push(out.contains(MARKER_PREFIX));
-        }
-        writeln!(output, "{out}")?;
-        for entry in sidecar.drain(..) {
-            serde_json::to_writer(&mut sidecar_stage, &entry)?;
-            sidecar_stage.write_all(b"\n")?;
-            sidecar_count += 1;
+            output_facts.push(Some(facts));
+            output_pruned.push(scan.found);
         }
     }
 
@@ -946,7 +759,8 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     } else {
         output
     };
-    let new_size = output.len()?;
+    let (output, skills) = skills::apply(output, opts.skills_policy, skills::config_dir_of(src_path).as_deref())?;
+    let new_size = output.byte_len()?;
     let sidecar = sidecar_stage.into_inner().map_err(|e| e.into_error())?.finish()?;
 
     let sidecar_out = (!opts.drop && sidecar_count > 0).then(|| sidecar_path.clone());
@@ -968,22 +782,21 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
             .as_ref()
             .map(|dst| stage_resources(&resource_dir.join(src_stem), dst))
             .transpose()?;
+        after_stage()?;
         source.check_metadata(file.metadata()?)?;
         source.check()?;
-        // Serialization and writes complete before publication. The sidecar is published first,
-        // so a transcript never names markers its sidecar cannot answer; a transcript that then
-        // fails to publish takes its sidecar back with it.
-        let sidecar_published = sidecar_out
-            .as_ref()
-            .zip(sidecar_file)
-            .map(|(p, staged)| staged.publish(p, claim).map(|file| (p, file)))
-            .transpose()?;
-        if let Err(error) = transcript.publish(&new_path, claim) {
-            if let Some((p, file)) = &sidecar_published {
-                crate::publish::retract(p, file);
-            }
-            return Err(error);
+        // A sub-agent's copy is a standalone session.
+        let agent = crate::derive::agent_of(src_path);
+        crate::derive::verify(harness, &source, &file, agent, transcript.path(), &new_path, None)?;
+        // Serialization and writes complete before publication. Sidecar and transcript publish
+        // as one set, the sidecar first, so a transcript never names markers its sidecar cannot
+        // answer.
+        let mut set = crate::publish::Set::new();
+        if let Some((p, staged)) = sidecar_out.as_ref().zip(sidecar_file) {
+            set.add(staged, p, claim);
         }
+        set.add(transcript, &new_path, claim);
+        set.publish()?;
         if opts.force && sidecar_out.is_none() {
             // The replaced session's own sidecar would answer `cv cat <new-id>` with its payloads.
             match std::fs::remove_file(&sidecar_path) {
@@ -1017,6 +830,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         revive_tokens,
         revive_old_tokens,
         warnings,
+        skills,
         dry_run: opts.dry_run,
     })
 }
@@ -1032,201 +846,60 @@ fn stage(destination: &Path, bytes: &ByteSource, mode: u32) -> Result<crate::pub
     Ok(staged)
 }
 
-fn read_line(file: &std::fs::File, range: Range) -> Result<String> {
-    let mut line = String::with_capacity(usize::try_from(range.len)?);
-    ranges::reader(file, range)?.read_to_string(&mut line)?;
-    Ok(line)
-}
-
-fn decision_facts_source(
+/// One record's [`Decision`]: the codec's facts, the payload/thinking flags against `opts`, the
+/// estimate when `--window`/`--revive` will weigh it, and each assistant `tool_use` block's
+/// name and position into `tools` (results carry only the id).
+fn decide(
     view: crate::json::JsonView<'_>,
     range: Range,
     opts: &PruneOptions,
     tools: &mut HashMap<String, (String, Range, usize)>,
-) -> Result<Value> {
+) -> Result<Decision> {
     use crate::harness::store::document::Fields;
-    let keys = [
-        "type",
-        "subtype",
-        "isSidechain",
-        "isApiErrorMessage",
-        "sessionId",
-        "_cv_orig_ctx",
-        "message",
-        "parentUuid",
-        "toolUseResult",
-        "rendered",
-        "uuid",
-        "logicalParentUuid",
-    ];
-    let Some(fields) = Fields::parse(view, &keys)? else {
-        return Ok(decision_facts(&Value::Null, false));
-    };
-    let mut facts = fields.project(&keys[..6])?;
-    let (uuid, parent, logical) = (
-        fields.value("uuid")?,
-        fields.value("parentUuid")?,
-        fields.value("logicalParentUuid")?,
-    );
-    link_facts(&mut facts, uuid.as_ref(), parent.as_ref(), logical.as_ref());
-    let ty = facts.get("type").and_then(Value::as_str).unwrap_or("");
-    let mut message = serde_json::Map::new();
-    let mut content = None;
-    if let Some(native) = fields.get("message") {
-        if let Some(native) = Fields::parse(native, &["model", "usage", "content"])? {
-            if let Some(model) = native.value("model")? {
-                message.insert("model".into(), model);
-            }
-            if let Some(usage) = native.get("usage") {
-                if let Some(usage) = source_usage_total(usage)? {
-                    message.insert("usage".into(), serde_json::json!({"input_tokens":usage}));
-                }
-            }
-            content = native.get("content");
-        }
+    let (facts, body) = Facts::parse(view)?;
+    let large = |v: crate::json::JsonView<'_>| value_byte_size_source(v).map(|n| n > opts.min_size);
+    let mut payload = body.tool_use_result.map(large).transpose()?.unwrap_or(false);
+    for result in &body.results {
+        payload |= large(*result)?;
     }
-    let mut payload = fields
-        .get("toolUseResult")
-        .map(|v| value_byte_size_source(v).map(|n| n > opts.min_size))
-        .transpose()?
-        .unwrap_or(false);
-    let mut thinking = false;
-    if let Some(blocks) = content.map(|c| c.array()).transpose()?.flatten() {
-        for (index, block) in blocks.enumerate() {
-            let Some(block) = Fields::parse(block?, &["type", "id", "name", "content"])? else {
-                continue;
-            };
-            match block.string("type")?.as_deref() {
-                Some("tool_use") if ty == "assistant" => {
-                    if let Some(id) = block.string("id")? {
-                        tools.insert(id, (block.string("name")?.unwrap_or_default(), range, index));
-                    }
-                }
-                Some("tool_result") => {
-                    payload |= block
-                        .get("content")
-                        .map(|v| value_byte_size_source(v).map(|n| n > opts.min_size))
-                        .transpose()?
-                        .unwrap_or(false);
-                }
-                Some("thinking") => thinking = true,
-                _ => {}
+    let thinking = facts.blocks.iter().any(|b| b.ty.as_deref() == Some("thinking"));
+    if facts.ty == "assistant" {
+        for (index, block) in facts.blocks.iter().enumerate() {
+            if let (Some("tool_use"), Some(id)) = (block.ty.as_deref(), &block.id) {
+                tools.insert(id.clone(), (block.name.clone().unwrap_or_default(), range, index));
             }
         }
     }
-    let estimate = if opts.window.is_some() || opts.revive {
-        match ty {
-            "user" | "assistant" => content
-                .map(|c| est_content_source(c, &[]))
-                .transpose()?
-                .unwrap_or_default(),
+    let mut est = Est::default();
+    if opts.window.is_some() || opts.revive {
+        match facts.ty.as_str() {
+            "user" | "assistant" => {
+                if let Some(content) = body.content {
+                    est = est_content_source(content, &[])?;
+                }
+            }
             "attachment" => {
-                let mut estimate = Est::default();
-                if let Some(items) = fields.get("rendered").map(|v| v.array()).transpose()?.flatten() {
+                if let Some(items) = body.rendered.map(|v| v.array()).transpose()?.flatten() {
                     for item in items {
                         if let Some(item) = Fields::parse(item?, &["content"])? {
                             if let Some(text) = item.get("content") {
                                 if text.is_string()? {
-                                    estimate.tokens += BLOCK_TOKENS + source_string_tokens(text)?;
+                                    est.tokens += BLOCK_TOKENS + source_string_tokens(text)?;
                                 }
                             }
                         }
                     }
                 }
-                estimate
             }
-            _ => Est::default(),
-        }
-    } else {
-        Est::default()
-    };
-    let parent = fields
-        .get("parentUuid")
-        .map(|v| v.is_null().map(|n| !n))
-        .transpose()?
-        .unwrap_or(false);
-    facts.insert("message".into(), Value::Object(message));
-    estimate.store(&mut facts);
-    facts.insert("_prune_payload".into(), Value::from(payload));
-    facts.insert("_prune_thinking".into(), Value::from(thinking));
-    facts.insert("_prune_parent".into(), Value::from(parent));
-    Ok(Value::Object(facts))
-}
-
-/// Retain only the counters and the last non-auxiliary iteration that usage_total consumes.
-fn source_usage_total(view: crate::json::JsonView<'_>) -> Result<Option<u64>> {
-    use crate::harness::store::document::Fields;
-    let Some(fields) = Fields::parse(
-        view,
-        &[
-            "input_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-            "iterations",
-        ],
-    )?
-    else {
-        return Ok(None);
-    };
-    let mut usage = serde_json::Map::new();
-    for key in USAGE_CTX_KEYS {
-        if let Some(value) = fields
-            .get(key)
-            .map(|v| v.as_number())
-            .transpose()?
-            .flatten()
-            .and_then(|n| n.as_u64())
-        {
-            usage.insert(key.into(), Value::from(value));
+            _ => {}
         }
     }
-    if ctx_sum(&usage) > 0 {
-        if let Some(iterations) = fields.get("iterations").map(|v| v.array()).transpose()?.flatten() {
-            let mut last = None;
-            for iteration in iterations {
-                let Some(fields) = Fields::parse(
-                    iteration?,
-                    &[
-                        "type",
-                        "input_tokens",
-                        "cache_read_input_tokens",
-                        "cache_creation_input_tokens",
-                        "output_tokens",
-                    ],
-                )?
-                else {
-                    last = Some(Value::Null);
-                    continue;
-                };
-                let mut record = serde_json::Map::new();
-                if let Some(kind) = fields.string("type")? {
-                    record.insert("type".into(), Value::String(kind));
-                }
-                if matches!(
-                    record.get("type").and_then(Value::as_str),
-                    Some("advisor_message" | "compaction")
-                ) {
-                    continue;
-                }
-                for key in USAGE_CTX_KEYS.into_iter().chain(["output_tokens"]) {
-                    if let Some(value) = fields
-                        .get(key)
-                        .map(|v| v.as_number())
-                        .transpose()?
-                        .flatten()
-                        .and_then(|n| n.as_u64())
-                    {
-                        record.insert(key.into(), Value::from(value));
-                    }
-                }
-                last = Some(Value::Object(record));
-            }
-            if let Some(last) = last {
-                usage.insert("iterations".into(), Value::Array(vec![last]));
-            }
-        }
-    }
-    Ok(Some(usage_total(&usage)))
+    Ok(Decision {
+        facts,
+        est,
+        payload,
+        thinking,
+    })
 }
 
 /// A string view priced at `kind`, read in chunks (prune markers at their own rate).
@@ -1465,63 +1138,32 @@ fn source_turn_prune(
                 continue;
             }
             kept_blocks.push(original_block.to_json()?);
-            if opts.declassify {
-                if let Some(value) = projected.as_mut() {
-                    // This pass sees the generated thinking marker, as the owned pass does.
-                    let text = value.get("text").and_then(Value::as_str).unwrap_or("");
-                    let hits = declassify_hits(text, opts);
-                    if hits >= opts.declassify_min_hits {
-                        let size = text.len();
-                        let lines = text.lines().count().max(1);
-                        let id = format!("{key}#declass{index}");
-                        let marker = build_marker(
-                            &id,
-                            "declassified",
-                            &Value::Null,
-                            "text",
-                            size,
-                            lines,
-                            new_id,
-                            opts.drop,
-                        );
-                        saved += str_tokens(text).saturating_sub(str_tokens(&marker));
-                        declassified.push(source_payload(
-                            value.clone().into(),
-                            id,
-                            "content",
-                            "declassified",
-                            size,
-                            lines,
-                        ));
-                        *value = serde_json::json!({"type":"text", "text":marker});
-                    }
-                } else if ty.as_deref() == Some("text") {
-                    let text = block.get("text");
-                    let (stats, hits) = source_declassify_stats(text, opts)?;
-                    if hits >= opts.declassify_min_hits {
-                        let id = format!("{key}#declass{index}");
-                        let marker = build_marker(
-                            &id,
-                            "declassified",
-                            &Value::Null,
-                            "text",
-                            stats.bytes,
-                            stats.lines(),
-                            new_id,
-                            opts.drop,
-                        );
-                        saved += crate::ir::est_tokens_bytes(stats.bytes, TokenKind::Text)
-                            .saturating_sub(str_tokens(&marker));
-                        declassified.push(source_payload(
-                            original_block.to_json()?,
-                            id,
-                            "content",
-                            "declassified",
-                            stats.bytes,
-                            stats.lines(),
-                        ));
-                        projected = Some(serde_json::json!({"type":"text", "text":marker}));
-                    }
+            if opts.declassify && ty.as_deref() == Some("text") {
+                let text = block.get("text");
+                let (stats, hits) = source_declassify_stats(text, opts)?;
+                if hits >= opts.declassify_min_hits {
+                    let id = format!("{key}#declass{index}");
+                    let marker = build_marker(
+                        &id,
+                        "declassified",
+                        &Value::Null,
+                        "text",
+                        stats.bytes,
+                        stats.lines(),
+                        new_id,
+                        opts.drop,
+                    );
+                    saved +=
+                        crate::ir::est_tokens_bytes(stats.bytes, TokenKind::Text).saturating_sub(str_tokens(&marker));
+                    declassified.push(source_payload(
+                        original_block.to_json()?,
+                        id,
+                        "content",
+                        "declassified",
+                        stats.bytes,
+                        stats.lines(),
+                    ));
+                    projected = Some(serde_json::json!({"type":"text", "text":marker}));
                 }
             }
             if let Some(projected) = projected {
@@ -1678,13 +1320,6 @@ fn source_turn_prune(
                 replacements.push((content.to_json()?, Value::Array(array)));
             }
         }
-        for key in ["sessionId", "session_id"] {
-            if let Some(value) = top.get(key) {
-                if value.is_string()? {
-                    replacements.push((value.to_json()?, Value::String(new_id.into())));
-                }
-            }
-        }
         let mut estimate = if opts.revive && !content.map(|value| value.is_array()).transpose()?.unwrap_or(false) {
             match projected_content.as_ref() {
                 Some(value) => est_content(value),
@@ -1711,18 +1346,16 @@ fn source_turn_prune(
                 })?;
             }
         }
-        Ok(Some((replacements, payloads, saved, estimate, images)))
-    })?;
-    Ok(
-        planned.map(|(replacements, payloads, saved, estimate, images)| SourcePrune {
-            record,
+        Ok(Some(SourcePrune {
+            record: record.clone(),
             replacements,
             payloads,
             saved,
             estimate,
             images,
-        }),
-    )
+        }))
+    })?;
+    Ok(planned)
 }
 fn source_payload(
     original: crate::Json,
@@ -1745,253 +1378,6 @@ fn source_payload(
             kind: "text".into(),
         },
     }
-}
-
-fn declassify_hits(text: &str, opts: &PruneOptions) -> usize {
-    let lower = text.to_lowercase();
-    opts.declassify_tokens
-        .iter()
-        .filter(|token| !token.is_empty() && lower.contains(token.as_str()))
-        .count()
-}
-
-/// Match lowercase substrings with token-sized overlap, retaining valid UTF-8 boundaries.
-struct DeclassMatcher<'a> {
-    tokens: &'a [String],
-    matched: Vec<bool>,
-    overlap: usize,
-    tail: String,
-}
-impl<'a> DeclassMatcher<'a> {
-    fn new(tokens: &'a [String]) -> Self {
-        Self {
-            tokens,
-            matched: vec![false; tokens.len()],
-            overlap: tokens.iter().map(String::len).max().unwrap_or(0).saturating_sub(1),
-            tail: String::new(),
-        }
-    }
-    fn feed(&mut self, lowered: &str) {
-        self.tail.push_str(lowered);
-        for (hit, token) in self.matched.iter_mut().zip(self.tokens) {
-            *hit |= !token.is_empty() && self.tail.contains(token);
-        }
-        let mut start = self.tail.len().saturating_sub(self.overlap);
-        while !self.tail.is_char_boundary(start) {
-            start -= 1;
-        }
-        self.tail.drain(..start);
-    }
-    fn copy_from(&mut self, source: &Self) {
-        self.matched.clone_from(&source.matched);
-        self.tail.clone_from(&source.tail);
-    }
-    fn complete(&self) -> bool {
-        self.matched
-            .iter()
-            .zip(self.tokens)
-            .all(|(hit, token)| token.is_empty() || *hit)
-    }
-    fn hits(&self) -> usize {
-        self.matched.iter().filter(|hit| **hit).count()
-    }
-    fn fold_chunks(&mut self, mut text: &str) {
-        while !text.is_empty() && !self.complete() {
-            let mut end = text.len().min(64 * 1024);
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            self.feed(&text[..end].to_lowercase());
-            text = &text[end..];
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SigmaClass {
-    Cased,
-    Ignorable,
-    Boundary,
-}
-
-/// Query the running std's own context rules, rather than maintaining another Unicode table.
-/// Final sigma ignores Case_Ignorable even when it is also Cased (e.g. U+0345):
-///                         `{c}Σ` ends ς    `A{c}Σ` ends ς
-/// Cased && !Ignorable          true              true
-/// Ignorable                   false             true
-/// !Cased && !Ignorable         false             false
-/// The impossible true/false combination cannot occur. These constant-size probes therefore
-/// classify the three behaviors exactly, including titlecase and overlapping properties.
-fn sigma_class(character: char) -> SigmaClass {
-    if format!("{character}Σ").to_lowercase().ends_with('ς') {
-        SigmaClass::Cased
-    } else if format!("A{character}Σ").to_lowercase().ends_with('ς') {
-        SigmaClass::Ignorable
-    } else {
-        SigmaClass::Boundary
-    }
-}
-
-/// Only capital Σ needs contextual lowercase. A pending sigma can precede an arbitrarily long
-/// ignorable run: advance two bounded matcher states instead of retaining that run's text.
-struct SigmaMatcher<'a> {
-    current: DeclassMatcher<'a>,
-    normal: DeclassMatcher<'a>,
-    final_sigma: DeclassMatcher<'a>,
-    pending: bool,
-    before_cased: bool,
-    classes: [Option<(char, SigmaClass)>; 128],
-}
-impl<'a> SigmaMatcher<'a> {
-    fn new(tokens: &'a [String]) -> Self {
-        Self {
-            current: DeclassMatcher::new(tokens),
-            normal: DeclassMatcher::new(tokens),
-            final_sigma: DeclassMatcher::new(tokens),
-            pending: false,
-            before_cased: false,
-            classes: [None; 128],
-        }
-    }
-    fn class(&mut self, character: char) -> SigmaClass {
-        let index = character as usize % self.classes.len();
-        if let Some((cached, class)) = self.classes[index] {
-            if cached == character {
-                return class;
-            }
-        }
-        let class = sigma_class(character);
-        self.classes[index] = Some((character, class));
-        class
-    }
-    fn complete(&self) -> bool {
-        if self.pending {
-            self.normal.complete() && self.final_sigma.complete()
-        } else {
-            self.current.complete()
-        }
-    }
-    fn resolve(&mut self, class: SigmaClass) {
-        if self.pending && class != SigmaClass::Ignorable {
-            if class == SigmaClass::Cased {
-                std::mem::swap(&mut self.current, &mut self.normal);
-            } else {
-                std::mem::swap(&mut self.current, &mut self.final_sigma);
-            }
-            self.pending = false;
-        }
-    }
-    fn run(&mut self, text: &str) {
-        if text.is_empty() || self.complete() {
-            return;
-        }
-        // Runs contain no capital sigma, so std lowercase needs no outside context. Only
-        // their first/last non-ignorable original scalars affect neighboring sigmas; ASCII
-        // runs usually inspect just their endpoints rather than every payload character.
-        let first = text
-            .chars()
-            .map(|c| self.class(c))
-            .find(|c| *c != SigmaClass::Ignorable);
-        if let Some(first) = first {
-            self.resolve(first);
-        }
-        if self.pending {
-            // Both branches see the same ignorable run; lowercase each bounded piece once.
-            let mut rest = text;
-            while !rest.is_empty() && !self.complete() {
-                let mut end = rest.len().min(64 * 1024);
-                while !rest.is_char_boundary(end) {
-                    end -= 1;
-                }
-                let lowered = rest[..end].to_lowercase();
-                if !self.normal.complete() {
-                    self.normal.feed(&lowered);
-                }
-                if !self.final_sigma.complete() {
-                    self.final_sigma.feed(&lowered);
-                }
-                rest = &rest[end..];
-            }
-        } else {
-            self.current.fold_chunks(text);
-        }
-        if let Some(last) = text
-            .chars()
-            .rev()
-            .map(|c| self.class(c))
-            .find(|c| *c != SigmaClass::Ignorable)
-        {
-            self.before_cased = last == SigmaClass::Cased;
-        }
-    }
-    fn push(&mut self, mut text: &str) {
-        while !text.is_empty() && !self.complete() {
-            let Some(index) = text.find('Σ') else {
-                self.run(text);
-                return;
-            };
-            self.run(&text[..index]);
-            if self.complete() {
-                return;
-            }
-            // Capital sigma is itself non-ignorable and cased, resolving any earlier sigma.
-            self.resolve(SigmaClass::Cased);
-            if self.before_cased {
-                self.normal.copy_from(&self.current);
-                self.final_sigma.copy_from(&self.current);
-                self.normal.feed("σ");
-                self.final_sigma.feed("ς");
-                self.pending = true;
-            } else {
-                self.current.feed("σ");
-            }
-            self.before_cased = true;
-            text = &text[index + 'Σ'.len_utf8()..];
-        }
-    }
-    fn finish(mut self) -> usize {
-        if self.pending {
-            std::mem::swap(&mut self.current, &mut self.final_sigma);
-        }
-        self.current.hits()
-    }
-}
-
-/// Piece-local sigma choices differ only at the complete UTF-8 scalar σ/ς. A valid String
-/// needle containing neither cannot cover that position. Sensitive rosters use the same
-/// bounded contextual matcher directly; stats and checked decoding always traverse the full
-/// value, including after matcher completion, without replaying its source.
-fn source_declassify_stats(
-    text: Option<crate::json::JsonView<'_>>,
-    opts: &PruneOptions,
-) -> Result<(SourceTextStats, usize)> {
-    let mut stats = SourceTextStats::default();
-    let sigma_sensitive = opts
-        .declassify_tokens
-        .iter()
-        .any(|token| token.contains('σ') || token.contains('ς'));
-    let hits = if sigma_sensitive {
-        let mut matcher = SigmaMatcher::new(&opts.declassify_tokens);
-        if let Some(text) = text {
-            text.for_each_str_chunk(|part| {
-                stats.append(part);
-                matcher.push(part);
-                Ok(())
-            })?;
-        }
-        matcher.finish()
-    } else {
-        let mut matcher = DeclassMatcher::new(&opts.declassify_tokens);
-        if let Some(text) = text {
-            text.for_each_str_chunk(|part| {
-                stats.append(part);
-                matcher.fold_chunks(part);
-                Ok(())
-            })?;
-        }
-        matcher.hits()
-    };
-    Ok((stats, hits))
 }
 
 #[derive(Default)]
@@ -2132,91 +1518,20 @@ fn tur_is_image_source(value: crate::json::JsonView<'_>) -> Result<bool> {
     Ok(file.get("base64").is_some() || file.string("type")?.is_some_and(|ty| ty.starts_with("image/")))
 }
 
-fn source_parent_override(record: &crate::json::Json) -> Result<Option<(crate::json::Json, Value)>> {
-    record.with_view(|view| {
-        let Some(parent) = view.get("parentUuid")? else {
-            return Ok(None);
-        };
-        if parent.is_null()? {
-            return Ok(None);
-        }
-        Ok(Some((parent.to_json()?, Value::Null)))
-    })
-}
-fn write_source_reroot(
-    record: &crate::json::Json,
-    source: &crate::json::JsonSource,
-    new_id: &str,
-    ids: &[(u64, u64)],
-    output: &mut impl Write,
-) -> Result<bool> {
-    let mut replacements = Vec::new();
-    if let Some(parent) = source_parent_override(record)? {
-        replacements.push(parent);
-    }
-    // Rerooting follows restamp of the untouched row: duplicate id fields reject that stamp.
-    // Preserve the captured accepted id roster rather than stamping the normalized object.
-    for &(start, end) in ids {
-        replacements.push((
-            source.validated_range(start, end - start)?,
-            Value::String(new_id.into()),
-        ));
-    }
-    let mut scan = MarkerWriter::new(output);
-    record.with_view(|view| view.write_canonical_replacing(&replacements, &mut scan))?;
-    scan.write_all(b"\n")?;
-    Ok(scan.found)
-}
-
-/// Stream a selected native child's record as a standalone record, retaining checked large
-/// payloads and applying the same top-level normalization as rewind's owned record path.
-fn write_subagent_source(
-    view: crate::json::JsonView<'_>,
-    replacements: &[(crate::json::Json, Value)],
-    new_id: &str,
-    writer: &mut impl Write,
-) -> Result<()> {
-    if !view.is_object()? {
-        return view.write_canonical_replacing(replacements, writer);
-    }
-    writer.write_all(b"{")?;
-    let mut first = true;
-    view.for_each_entry(|key, child| {
-        if key == "agentId" {
-            return Ok(());
-        }
-        if !first {
-            writer.write_all(b",")?;
-        }
-        first = false;
-        serde_json::to_writer(&mut *writer, key)?;
-        writer.write_all(b":")?;
-        if key == "isSidechain" && child.as_bool()? == Some(true) {
-            writer.write_all(b"false")?;
-        } else if matches!(key, "sessionId" | "session_id") && child.is_string()? {
-            serde_json::to_writer(&mut *writer, new_id)?;
-        } else {
-            child.write_canonical_replacing(replacements, writer)?;
-        }
-        Ok(())
-    })?;
-    writer.write_all(b"}")?;
-    Ok(())
-}
-
+/// One sidecar line, written field by field in [`SidecarEntry`]'s order, the original payload
+/// through the shared canonical source writer.
 fn write_source_payload(payload: &SourcePayload, writer: &mut impl Write) -> Result<()> {
-    // Serialize the established struct layout, then replace only its own null content slot with
-    // the shared canonical source writer. The slot follows input; rfind excludes nested inputs.
-    let encoded = serde_json::to_vec(&payload.entry)?;
-    let anchor = b",\"content\":null,\"size\":";
-    let at = encoded
-        .windows(anchor.len())
-        .rposition(|bytes| bytes == anchor)
-        .context("missing sidecar content slot")?;
-    let start = at + b",\"content\":".len();
-    writer.write_all(&encoded[..start])?;
-    payload.original.write_canonical(writer)?;
-    writer.write_all(&encoded[start + 4..])?;
+    let e = &payload.entry;
+    let mut o = crate::harness::wire::write::ObjectWriter::new(writer)?;
+    o.field("id", &e.id)?;
+    o.field("slot", &e.slot)?;
+    o.field("name", &e.name)?;
+    o.field("input", &e.input)?;
+    o.field_with("content", |mut w| payload.original.write_canonical(&mut w))?;
+    o.field("size", e.size)?;
+    o.field("line_count", e.line_count)?;
+    o.field("kind", &e.kind)?;
+    o.finish()?;
     writer.write_all(b"\n")?;
     Ok(())
 }
@@ -2246,73 +1561,24 @@ impl<W: Write> Write for MarkerWriter<'_, W> {
             boundary.extend_from_slice(&bytes[..bytes.len().min(marker.len() - 1)]);
             self.found =
                 boundary.windows(marker.len()).any(|p| p == marker) || bytes.windows(marker.len()).any(|p| p == marker);
-            self.tail.extend_from_slice(bytes);
-            let keep = (marker.len() - 1).min(self.tail.len());
-            self.tail.drain(..self.tail.len() - keep);
+            // Keep only a marker's worth of stream bytes: the head of a chunk never joins the
+            // tail wholesale, so the copy stays bounded by `keep`, not by the stream.
+            let keep = marker.len() - 1;
+            if self.tail.len() + bytes.len() <= keep {
+                self.tail.extend_from_slice(bytes);
+            } else if bytes.len() >= keep {
+                self.tail.clear();
+                self.tail.extend_from_slice(&bytes[bytes.len() - keep..]);
+            } else {
+                self.tail.drain(..self.tail.len() + bytes.len() - keep);
+                self.tail.extend_from_slice(bytes);
+            }
         }
         Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.output.flush()
     }
-}
-
-/// Compact decision roster: no message content, thinking, image or tool-result payloads.
-fn decision_facts(v: &Value, estimate: bool) -> Value {
-    let mut facts = serde_json::Map::new();
-    for key in [
-        "type",
-        "subtype",
-        "isSidechain",
-        "isApiErrorMessage",
-        "sessionId",
-        "_cv_orig_ctx",
-    ] {
-        if let Some(value) = v.get(key) {
-            facts.insert(key.into(), value.clone());
-        }
-    }
-    link_facts(
-        &mut facts,
-        v.get("uuid"),
-        v.get("parentUuid"),
-        v.get("logicalParentUuid"),
-    );
-    let mut message = serde_json::Map::new();
-    if let Some(model) = v.pointer("/message/model") {
-        message.insert("model".into(), model.clone());
-    }
-    if let Some(usage) = v.pointer("/message/usage").and_then(Value::as_object) {
-        message.insert("usage".into(), serde_json::json!({"input_tokens": usage_total(usage)}));
-    }
-    facts.insert("message".into(), Value::Object(message));
-    if estimate { line_est(v) } else { Est::default() }.store(&mut facts);
-    Value::Object(facts)
-}
-
-/// The record's place in the conversation tree (`_uuid`, `_parent`), so revive can tell the
-/// branch Claude Code resumes from abandoned ones.
-fn link_facts(
-    facts: &mut serde_json::Map<String, Value>,
-    uuid: Option<&Value>,
-    parent: Option<&Value>,
-    logical: Option<&Value>,
-) {
-    if let Some(uuid) = uuid.filter(|u| u.is_string()) {
-        facts.insert("_uuid".into(), uuid.clone());
-    }
-    // A root records `parentUuid: null`; a record with no `parentUuid` at all carries no tree.
-    if let Some(parent) = parent {
-        let parent = Some(parent)
-            .filter(|p| p.is_string())
-            .or(logical.filter(|p| p.is_string()));
-        facts.insert("_parent".into(), parent.cloned().unwrap_or(Value::Null));
-    }
-}
-
-/// A record's stored estimate, or one computed from the record itself.
-fn fact_est(v: &Value) -> Est {
-    Est::load(v).unwrap_or_else(|| line_est(v))
 }
 
 /// Rewrite trailing recorded usage using an estimated post-prune prompt size (`--revive`).
@@ -2325,7 +1591,7 @@ fn fact_est(v: &Value) -> Est {
 fn revive_staged(
     source: &crate::json::JsonSource,
     output: ByteSource,
-    parsed: &[Option<Value>],
+    parsed: &[Option<Decision>],
     pruned: &[bool],
     before: Option<&[Option<Est>]>,
     windowed: bool,
@@ -2336,12 +1602,7 @@ fn revive_staged(
     } else {
         parsed
             .iter()
-            .rposition(|p| {
-                p.as_ref().is_some_and(|v| {
-                    v.get("type").and_then(Value::as_str) == Some("system")
-                        && v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
-                })
-            })
+            .rposition(|p| p.as_ref().is_some_and(|v| v.facts.is_compact_boundary()))
             .map_or(0, |i| i + 1)
     };
     let honest = before
@@ -2359,8 +1620,8 @@ fn revive_staged(
     for (i, facts) in parsed.iter().enumerate() {
         let total = facts
             .as_ref()
-            .filter(|v| !is_sidechain(v))
-            .and_then(|v| v.pointer("/message/usage").and_then(Value::as_object).map(usage_total))
+            .filter(|v| !v.sidechain())
+            .and_then(|v| v.facts.usage_in)
             .unwrap_or(0);
         let rewrite = i >= window && total > honest;
         let mut start = None;
@@ -2373,7 +1634,7 @@ fn revive_staged(
             let newline = memchr::memchr(b'\n', bytes);
             let n = newline.map_or(bytes.len(), |i| i + 1);
             if rewrite {
-                let non_whitespace = |byte: &u8| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+                let non_whitespace = |byte: &u8| !crate::harness::store::json::is_whitespace(byte);
                 if start.is_none() {
                     start = bytes[..n]
                         .iter()
@@ -2394,9 +1655,11 @@ fn revive_staged(
         }
         if rewrite {
             let start = start.context("usage row has no JSON value")?;
-            source.read_backing_value(output.clone(), start, end - start, |view| {
-                write_source_usage(view, total, honest, &mut stage)
-            })?;
+            source.read(
+                ReadInput::Backing(output.clone(), start, end - start),
+                Validation::Value,
+                |view| write_source_usage(view, total, honest, &mut stage),
+            )?;
             stage.write_all(b"\n")?;
             rewritten += 1;
             stale_max = stale_max.max(total);
@@ -2492,28 +1755,23 @@ const UNKNOWN_OVERHEAD_TOKENS: u64 = 20_000;
 /// Removed thinking signatures are credited only for [`SIGNATURES_COUNTED`] models; everywhere
 /// else they are still counted as present (the estimate errs high). `None` when the window holds
 /// no turns.
-fn anchored_window_tokens(parsed: &[Option<Value>], before: &[Option<Est>], window: usize) -> Option<u64> {
+fn anchored_window_tokens(parsed: &[Option<Decision>], before: &[Option<Est>], window: usize) -> Option<u64> {
     // Claude Code resumes the branch ending at the newest turn; records on abandoned branches
     // (edits, rewinds) are not sent, so their pruning frees nothing.
     let chain = resumed_branch(parsed, window);
     let main = |i: usize| {
         parsed[i]
             .as_ref()
-            .filter(|v| !is_sidechain(v) && chain.as_ref().is_none_or(|c| c.contains(&i)))
+            .filter(|v| !v.sidechain() && chain.as_ref().is_none_or(|c| c.contains(&i)))
     };
     let lines = |lo: usize, hi: usize| (lo..hi).filter(move |i| main(*i).is_some());
     let pre = |i: usize| before[i].unwrap_or_default();
-    let post = |i: usize| main(i).map(fact_est).unwrap_or_default();
+    let post = |i: usize| main(i).map(|v| v.est).unwrap_or_default();
     lines(window, parsed.len()).next()?;
     // One entry per provider response: the first record carrying its prompt size.
     let mut responses: Vec<(usize, u64)> = Vec::new();
     for i in lines(window, parsed.len()) {
-        let v = main(i)?;
-        let total = v
-            .get("_cv_orig_ctx")
-            .and_then(Value::as_u64)
-            .or_else(|| v.pointer("/message/usage").and_then(Value::as_object).map(usage_total))
-            .unwrap_or(0);
+        let total = main(i)?.recorded();
         if total > 0 && responses.last().is_none_or(|(_, t)| *t != total) {
             responses.push((i, total));
         }
@@ -2524,14 +1782,10 @@ fn anchored_window_tokens(parsed: &[Option<Value>], before: &[Option<Est>], wind
     let model = (window..parsed.len())
         .rev()
         .filter_map(main)
-        .find_map(|v| {
-            v.pointer("/message/model")
-                .and_then(Value::as_str)
-                .filter(|m| *m != "<synthetic>")
-        })
+        .find_map(|v| v.facts.model.as_deref().filter(|m| *m != "<synthetic>"))
         .unwrap_or("");
     let scale = crate::ir::tokenizer_scale(model);
-    let size = |e: Est| e.tokens + e.signature + e.images * IMAGE_TOKENS;
+    let size = Est::total;
     let signature_credit = if SIGNATURES_COUNTED.contains(&model) {
         SIGNATURE_CREDIT
     } else {
@@ -2587,26 +1841,26 @@ fn anchored_window_tokens(parsed: &[Option<Value>], before: &[Option<Est>], wind
 
 /// Record indices on the branch ending at the window's newest turn, walking `parentUuid` (or
 /// `logicalParentUuid`) back. `None` when the newest turn records no `parentUuid` (no tree to walk).
-fn resumed_branch(parsed: &[Option<Value>], window: usize) -> Option<HashSet<usize>> {
-    let id = |i: usize, key: &str| parsed[i].as_ref()?.get(key)?.as_str();
+fn resumed_branch(parsed: &[Option<Decision>], window: usize) -> Option<HashSet<usize>> {
+    let facts = |i: usize| parsed[i].as_ref().map(|v| &v.facts);
     let mut by_id = HashMap::new();
     for i in window..parsed.len() {
-        if let Some(uuid) = id(i, "_uuid") {
+        if let Some(uuid) = facts(i).and_then(|f| f.uuid.as_deref()) {
             by_id.insert(uuid, i);
         }
     }
     let leaf = (window..parsed.len()).rev().find(|&i| {
         parsed[i].as_ref().is_some_and(|v| {
-            !is_sidechain(v)
-                && matches!(v.get("type").and_then(Value::as_str), Some("user" | "assistant"))
-                && v.get("_uuid").is_some()
+            !v.sidechain() && matches!(v.facts.ty.as_str(), "user" | "assistant") && v.facts.uuid.is_some()
         })
     })?;
-    parsed[leaf].as_ref()?.get("_parent")?;
+    facts(leaf)?.link()?;
     let mut chain = HashSet::new();
     let mut at = Some(leaf);
     while let Some(i) = at.filter(|i| chain.insert(*i)) {
-        at = id(i, "_parent").and_then(|p| by_id.get(p).copied());
+        at = facts(i)
+            .and_then(|f| f.link().flatten())
+            .and_then(|p| by_id.get(p).copied());
     }
     Some(chain)
 }
@@ -2626,13 +1880,13 @@ fn resumed_branch(parsed: &[Option<Value>], window: usize) -> Option<HashSet<usi
 ///  * Lines after the last record (or when there are no records at all): byte estimate.
 ///
 /// Sidechain lines contribute neither usage nor bytes — they aren't re-sent on the main thread.
-fn honest_window_tokens(parsed: &[Option<Value>], pruned: &[bool], window: usize, first_trusted: bool) -> u64 {
+fn honest_window_tokens(parsed: &[Option<Decision>], pruned: &[bool], window: usize, first_trusted: bool) -> u64 {
     let span_est = |lo: usize, hi: usize| -> u64 {
         parsed[lo..hi]
             .iter()
             .flatten()
-            .filter(|v| !is_sidechain(v))
-            .map(|v| fact_est(v).total())
+            .filter(|v| !v.sidechain())
+            .map(|v| v.est.total())
             .sum()
     };
     let mut sum = 0u64;
@@ -2641,20 +1895,14 @@ fn honest_window_tokens(parsed: &[Option<Value>], pruned: &[bool], window: usize
     let mut span_start = window;
     for i in window..parsed.len() {
         let Some(v) = &parsed[i] else { continue };
-        if v.get("type").and_then(Value::as_str) == Some("system")
-            && v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
-        {
+        if v.facts.is_compact_boundary() {
             seg_start = true;
             continue;
         }
-        if is_sidechain(v) {
+        if v.sidechain() {
             continue;
         }
-        let total = v
-            .get("_cv_orig_ctx")
-            .and_then(Value::as_u64)
-            .or_else(|| v.pointer("/message/usage").and_then(Value::as_object).map(usage_total))
-            .unwrap_or(0);
+        let total = v.recorded();
         if total == 0 {
             continue;
         }
@@ -2672,41 +1920,6 @@ fn honest_window_tokens(parsed: &[Option<Value>], pruned: &[bool], window: usize
     sum + span_est(span_start, parsed.len())
 }
 
-/// The three context-bearing counters of a Claude `usage` object (input + both cache buckets).
-const USAGE_CTX_KEYS: [&str; 3] = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
-
-fn ctx_sum(m: &serde_json::Map<String, Value>) -> u64 {
-    USAGE_CTX_KEYS
-        .iter()
-        .map(|k| m.get(*k).and_then(Value::as_u64).unwrap_or(0))
-        .sum()
-}
-
-/// The context-token count of a Claude `usage` object — read the way Claude Code reads it.
-///
-/// Since 2.1.277 Claude Code sizes the loaded context from a record's `usage.iterations` when that
-/// array is present: it takes the LAST iteration that is not an auxiliary request (`advisor_message`
-/// / `compaction`), and if that one is a well-formed request iteration (`message` /
-/// `fallback_message`, all four counts present, non-zero context) reads input + both cache buckets
-/// from IT — the top-level counters are only the fallback (and the whole thing short-circuits to the
-/// top-level when the top-level total is zero). `--window` sizing, the honest-figure arithmetic and
-/// `--revive`'s stale-record detection all go through here so cv reasons about the same number the
-/// resume gate will see.
-fn usage_total(usage: &serde_json::Map<String, Value>) -> u64 {
-    let top = ctx_sum(usage);
-    if top == 0 {
-        return 0;
-    }
-    usage
-        .get("iterations")
-        .and_then(Value::as_array)
-        .and_then(|iters| iters.iter().rev().find(|it| !is_aux_iteration(it)))
-        .and_then(Value::as_object)
-        .filter(|it| is_request_iteration(it))
-        .map(ctx_sum)
-        .unwrap_or(top)
-}
-
 /// `advisor_message` / `compaction` iterations are side requests Claude Code skips when reading
 /// context size.
 fn is_aux_iteration(it: &Value) -> bool {
@@ -2714,23 +1927,6 @@ fn is_aux_iteration(it: &Value) -> bool {
         it.get("type").and_then(Value::as_str),
         Some("advisor_message" | "compaction")
     )
-}
-
-/// A request iteration Claude Code will read the context size from: `message` / `fallback_message`
-/// with all four counts present as non-negative numbers and a non-zero context total.
-fn is_request_iteration(it: &serde_json::Map<String, Value>) -> bool {
-    matches!(
-        it.get("type").and_then(Value::as_str),
-        Some("message" | "fallback_message")
-    ) && [
-        "input_tokens",
-        "output_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-    ]
-    .iter()
-    .all(|k| it.get(*k).and_then(Value::as_u64).is_some())
-        && ctx_sum(it) > 0
 }
 
 /// Pin a `usage` record to `honest` context tokens everywhere Claude Code might read it: the
@@ -2759,582 +1955,20 @@ fn pin_usage(u: &mut serde_json::Map<String, Value>, honest: u64) {
     }
 }
 
+mod declassify;
+use declassify::source_declassify_stats;
 /// Snip the eligible payloads on one (old) user line, in place. `line_key` (the line's uuid or a
 /// file-position fallback) keys sidecar ids for blocks that carry no `tool_use_id` of their own.
-#[allow(clippy::too_many_arguments)]
-fn prune_user_line(
-    v: &mut Value,
-    opts: &PruneOptions,
-    tool_names: &HashMap<String, (String, Value)>,
-    new_id: &str,
-    line_key: &str,
-    sidecar: &mut Vec<SidecarEntry>,
-    count: &mut usize,
-    images: &mut usize,
-    tokens_saved: &mut u64,
-    modified: &mut bool,
-) {
-    // (1) tool_result blocks in message.content (the context-bearing payloads).
-    let mut mirror_base: Option<String> = None; // sidecar-id base for the toolUseResult mirror
-    let mut mirror_tuid: Option<String> = None; // real tool_use_id for the name/input lookup
-    if let Some(blocks) = v.pointer_mut("/message/content").and_then(Value::as_array_mut) {
-        for (bi, block) in blocks.iter_mut().enumerate() {
-            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                continue;
-            }
-            let tuid = block.get("tool_use_id").and_then(Value::as_str).map(String::from);
-            // Sidecar id: the tool_use_id when present, else `{line uuid}#tr{block idx}` — unique
-            // per block, never a shared constant (which made colliding entries unretrievable).
-            let entry_id = tuid.clone().unwrap_or_else(|| format!("{line_key}#tr{bi}"));
-            if mirror_base.is_none() {
-                mirror_base = Some(entry_id.clone());
-                mirror_tuid = tuid.clone();
-            }
-            // Decide using a borrow; commit by cloning the payload out (releasing the borrow), then
-            // overwrite the block — so we never hold a read of `block` across the mutation.
-            let committed = match block.get("content") {
-                Some(c) if !c.is_null() && !c.as_str().is_some_and(|s| s.starts_with(MARKER_PREFIX)) => {
-                    let size = value_byte_size(c);
-                    if size <= opts.min_size {
-                        None
-                    } else {
-                        let (kind, text, img) = classify(c);
-                        if kind == "none" {
-                            None
-                        } else {
-                            Some((c.clone(), size, kind, text, img))
-                        }
-                    }
-                }
-                _ => None,
-            };
-            let Some((content, size, kind, text, img)) = committed else {
-                continue;
-            };
-            let line_count = if text.is_empty() { 1 } else { text.lines().count() };
-            let (name, input) = tuid
-                .as_deref()
-                .and_then(|t| tool_names.get(t).cloned())
-                .unwrap_or_else(|| ("unknown".into(), Value::Null));
-            let marker = build_marker(&entry_id, &name, &input, &kind, size, line_count, new_id, opts.drop);
-
-            *tokens_saved += tool_result_tokens(&content).saturating_sub(str_tokens(&marker));
-            *images += img;
-            if !opts.drop {
-                sidecar.push(SidecarEntry {
-                    id: entry_id,
-                    slot: "content".into(),
-                    name,
-                    input,
-                    content,
-                    size,
-                    line_count,
-                    kind,
-                });
-            }
-            block["content"] = Value::String(marker);
-            *modified = true;
-            *count += 1;
-        }
-    }
-
-    // (2) the top-level toolUseResult mirror (disk-only; shrinks the file, not context). Clone it out
-    // first so the borrow is released before we overwrite the field.
-    let tur_committed = match v.get("toolUseResult") {
-        Some(t) if !t.is_null() && !t.as_str().is_some_and(|s| s.starts_with(MARKER_PREFIX)) => {
-            let size = value_byte_size(t);
-            (size > opts.min_size).then(|| (t.clone(), size))
-        }
-        _ => None,
-    };
-    if let Some((tur, size)) = tur_committed {
-        let base = mirror_base.unwrap_or_else(|| line_key.to_string());
-        let id = format!("{base}{TUR_SUFFIX}");
-        let kind = if tur_is_image(&tur) { "image" } else { "text" };
-        let (name, input) = mirror_tuid
-            .as_deref()
-            .and_then(|t| tool_names.get(t).cloned())
-            .unwrap_or_else(|| ("unknown".into(), Value::Null));
-        let line_count = tur.as_str().map(|s| s.lines().count()).unwrap_or(1);
-        let marker = build_marker(&id, &name, &input, kind, size, line_count, new_id, opts.drop);
-        if !opts.drop {
-            sidecar.push(SidecarEntry {
-                id,
-                slot: "toolUseResult".into(),
-                name,
-                input,
-                content: tur,
-                size,
-                line_count,
-                kind: kind.into(),
-            });
-        }
-        v["toolUseResult"] = Value::String(marker);
-        *modified = true;
-        *count += 1;
-    }
-}
-
-/// Omit every `thinking` block on one (old) assistant line: a marker would give the model
-/// nothing. The original block is stashed verbatim in the sidecar under `<line_key>#think<i>`
-/// (`line_key` = the line's uuid, or a file-position fallback), where `cv cat` finds it. A record
-/// left empty is removed after staging and its children relinked
-/// ([`crate::harness::claude::replay::drop_empty_records`]).
-#[allow(clippy::too_many_arguments)]
-fn prune_assistant_thinking(
-    v: &mut Value,
-    opts: &PruneOptions,
-    line_key: &str,
-    sidecar: &mut Vec<SidecarEntry>,
-    count: &mut usize,
-    tokens_saved: &mut u64,
-    modified: &mut bool,
-) {
-    let Some(blocks) = v.pointer_mut("/message/content").and_then(Value::as_array_mut) else {
-        return;
-    };
-    // An omitted block leaves `null` until [`drop_omitted_blocks`], so later passes keep the
-    // source's block indices (their sidecar ids name them).
-    for (i, slot) in blocks.iter_mut().enumerate() {
-        if slot.get("type").and_then(Value::as_str) != Some("thinking") {
-            continue;
-        }
-        let block = slot.take();
-        // Every old thinking block goes, whatever its size — `--min-size` is a payload gate and does
-        // not apply here: a signature-only block still costs hundreds of tokens on the wire.
-        let size = value_byte_size(&block);
-        let line_count = block
-            .get("thinking")
-            .and_then(Value::as_str)
-            .map_or(1, |t| t.lines().count().max(1));
-        *tokens_saved += est_block(&block).total();
-        if !opts.drop {
-            sidecar.push(SidecarEntry {
-                id: format!("{line_key}#think{i}"),
-                slot: "thinking".into(),
-                name: "thinking".into(),
-                input: Value::Null,
-                content: block,
-                size,
-                line_count,
-                kind: "text".into(),
-            });
-        }
-        *modified = true;
-        *count += 1;
-    }
-}
-
-/// Remove the slots [`prune_assistant_thinking`] emptied.
-fn drop_omitted_blocks(v: &mut Value) {
-    if let Some(blocks) = v.pointer_mut("/message/content").and_then(Value::as_array_mut) {
-        blocks.retain(|block| !block.is_null());
-    }
-}
-
-/// `--declassify`: snip a message's TEXT when its security-token density is high, so the resumed
-/// session does not carry classifier-tripping PROSE into a fresh seat's context. Handles both message
-/// shapes: a user turn's bare-string `content`, and an assistant turn's array of `text` blocks. The
-/// original text is stashed in the sidecar verbatim (lossless, readable with `cv cat`, under `<line_key>#declass`)
-/// and replaced with a `[PRUNED …]` marker. A block is snipped iff it contains at least
-/// `declassify_min_hits` DISTINCT `declassify_tokens` (case-insensitive substring match).
-#[allow(clippy::too_many_arguments)]
-fn prune_declassify_text(
-    v: &mut Value,
-    opts: &PruneOptions,
-    new_id: &str,
-    line_key: &str,
-    sidecar: &mut Vec<SidecarEntry>,
-    count: &mut usize,
-    tokens_saved: &mut u64,
-    modified: &mut bool,
-) {
-    // Distinct security terms present (case-insensitive substring). Density, not raw frequency, so a
-    // single benign mention ("the security fix shipped") never trips the snip.
-    let distinct_hits = |s: &str| declassify_hits(s, opts);
-    let Some(content) = v.pointer_mut("/message/content") else {
-        return;
-    };
-    match content {
-        // User turn: `content` is a bare string.
-        Value::String(s) => {
-            if distinct_hits(s) < opts.declassify_min_hits {
-                return;
-            }
-            let size = s.len();
-            let line_count = s.lines().count().max(1);
-            let original = Value::String(std::mem::take(s));
-            let id = format!("{line_key}#declass");
-            let marker = build_marker(
-                &id,
-                "declassified",
-                &Value::Null,
-                "text",
-                size,
-                line_count,
-                new_id,
-                opts.drop,
-            );
-            *tokens_saved += str_tokens(original.as_str().unwrap_or("")).saturating_sub(str_tokens(&marker));
-            if !opts.drop {
-                sidecar.push(SidecarEntry {
-                    id,
-                    slot: "content".into(),
-                    name: "declassified".into(),
-                    input: Value::Null,
-                    content: original,
-                    size,
-                    line_count,
-                    kind: "text".into(),
-                });
-            }
-            *content = Value::String(marker);
-            *modified = true;
-            *count += 1;
-        }
-        // Assistant turn: `content` is an array of blocks; snip dense `text` blocks in place.
-        Value::Array(blocks) => {
-            for (i, block) in blocks.iter_mut().enumerate() {
-                if block.get("type").and_then(Value::as_str) != Some("text") {
-                    continue;
-                }
-                let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-                if distinct_hits(text) < opts.declassify_min_hits {
-                    continue;
-                }
-                let size = text.len();
-                let line_count = text.lines().count().max(1);
-                let original = block.clone();
-                let id = format!("{line_key}#declass{i}");
-                let marker = build_marker(
-                    &id,
-                    "declassified",
-                    &Value::Null,
-                    "text",
-                    size,
-                    line_count,
-                    new_id,
-                    opts.drop,
-                );
-                *tokens_saved += str_tokens(text).saturating_sub(str_tokens(&marker));
-                if !opts.drop {
-                    sidecar.push(SidecarEntry {
-                        id,
-                        slot: "content".into(),
-                        name: "declassified".into(),
-                        input: Value::Null,
-                        content: original,
-                        size,
-                        line_count,
-                        kind: "text".into(),
-                    });
-                }
-                *block = serde_json::json!({ "type": "text", "text": marker });
-                *modified = true;
-                *count += 1;
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Retrieve a stashed original from a prune sidecar by its `tool_use_id` (or `<id>#tur`). Returns the
-/// verbatim value (string, content-block array incl. images, or the raw toolUseResult object). Errors
-/// if the id matches more than one entry — a duplicated id means the sidecar can't say which payload
-/// is which, and silently returning one of them would misattribute data.
-pub fn retrieve(sidecar_path: &Path, id: &str) -> Result<Value> {
-    let source = crate::json::JsonSource::capture(sidecar_path)
-        .with_context(|| format!("reading sidecar {}", sidecar_path.display()))?;
-    let file =
-        std::fs::File::open(sidecar_path).with_context(|| format!("reading sidecar {}", sidecar_path.display()))?;
-    retrieve_captured(&source, &file, sidecar_path, id)
-}
-
-fn retrieve_captured(source: &crate::json::JsonSource, file: &std::fs::File, path: &Path, id: &str) -> Result<Value> {
-    let result = (|| {
-        source.check_metadata(file.metadata()?)?;
-        #[cfg(feature = "mmap")]
-        let mapped = crate::harness::store::document::Source::map_file(file)?;
-        #[cfg(feature = "mmap")]
-        let text = std::str::from_utf8(mapped.bytes())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8"))?;
-        #[cfg(not(feature = "mmap"))]
-        let context = crate::harness::store::document::range::RangeSource::from_captured(source.clone())?;
-        #[cfg(not(feature = "mmap"))]
-        let extent = Range {
-            offset: 0,
-            len: source.len(),
-        };
-        #[cfg(not(feature = "mmap"))]
-        if !ranges::valid_utf8(&mut ranges::reader(file, extent)?)? {
-            return Err(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8").into(),
-            );
-        }
-        let mut available = Vec::new();
-        let mut found = None;
-        let mut duplicates = 0usize;
-        #[cfg(feature = "mmap")]
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let offset = (line.as_ptr() as usize - text.as_ptr() as usize) as u64;
-            let projected = source.read_borrowed_range_syntax(offset, line, |view| {
-                project_sidecar_entry(view, id, available.len() < 20)
-            });
-            accept_sidecar_entry(projected, &mut available, &mut found, &mut duplicates)?;
-        }
-        #[cfg(not(feature = "mmap"))]
-        for row in ranges::records(file, extent)? {
-            let (row, _) = row?;
-            if row.len == 0 {
-                continue;
-            }
-            let projected = source.read_positioned_range_syntax(&context, row.offset, row.len, |view| {
-                project_sidecar_entry(view, id, available.len() < 20)
-            });
-            accept_sidecar_entry(projected, &mut available, &mut found, &mut duplicates)?;
-        }
-        if duplicates > 0 {
-            bail!(
-                "id {id:?} appears {} times in sidecar {} — ambiguous, refusing to guess which payload you meant",
-                duplicates + 1,
-                path.display()
-            );
-        }
-        let Some(content) = found else {
-            let mut message = format!("id {id:?} not found in sidecar. available: ");
-            for (i, available) in available.iter().enumerate() {
-                if i != 0 {
-                    message.push_str(", ");
-                }
-                available.with_view(|view| {
-                    view.for_each_str_chunk(|part| {
-                        message.push_str(part);
-                        Ok(())
-                    })?;
-                    Ok(())
-                })?;
-            }
-            bail!(message);
-        };
-        // Only the unambiguous requested output becomes owned, after scanning every row.
-        Ok(content.resolve()?.into_owned())
-    })();
-    let result = result.map_err(|error: anyhow::Error| {
-        if error.downcast_ref::<std::io::Error>().is_some() {
-            error.context(format!("reading sidecar {}", path.display()))
-        } else {
-            error
-        }
-    });
-    // Guard failures take precedence even when a malformed row or callback stopped the scan.
-    source.check_metadata(file.metadata()?)?;
-    source.check()?;
-    result
-}
-
-fn accept_sidecar_entry(
-    projected: Result<(Option<crate::Json>, Option<crate::Json>)>,
-    available: &mut Vec<crate::Json>,
-    found: &mut Option<crate::Json>,
-    duplicates: &mut usize,
-) -> Result<()> {
-    let (shown_id, content) = match projected {
-        Ok(entry) => entry,
-        Err(error)
-            if error.downcast_ref::<crate::json::InvalidJson>().is_some()
-                || error
-                    .downcast_ref::<crate::harness::store::document::InvalidStruct>()
-                    .is_some() =>
-        {
-            return Ok(())
-        }
-        Err(error) => return Err(error),
-    };
-    if let Some(id) = shown_id {
-        available.push(id);
-    }
-    if let Some(content) = content {
-        if found.is_some() {
-            *duplicates += 1;
-        } else {
-            *found = Some(content);
-        }
-    }
-    Ok(())
-}
-
-fn project_sidecar_entry(
-    view: crate::json::JsonView<'_>,
-    id: &str,
-    keep_id: bool,
-) -> Result<(Option<crate::Json>, Option<crate::Json>)> {
-    use crate::harness::store::document::{Fields, InvalidStruct};
-    const KEYS: &[&str] = &["id", "slot", "name", "input", "content", "size", "line_count", "kind"];
-    let fields = Fields::parse_struct(view, KEYS)?.ok_or(InvalidStruct("expected sidecar entry"))?;
-    let field = |key| fields.get(key).ok_or(InvalidStruct("missing sidecar field"));
-    // Unknown fields retain derived serde's IgnoredAny semantics. Only Value fields receive
-    // strict Value acceptance, with the enclosing struct's consumed recursion level.
-    for key in ["input", "content"] {
-        if !field(key)?.accepts_value_at_depth(1)? {
-            return Err(InvalidStruct("invalid sidecar value").into());
-        }
-    }
-    for key in ["slot", "name", "kind", "id"] {
-        let value = field(key)?;
-        if !value.is_string()? || !value.accepts_value_at_depth(1)? {
-            return Err(InvalidStruct("invalid sidecar string").into());
-        }
-    }
-    for key in ["size", "line_count"] {
-        let value = field(key)?;
-        if value.is_string()? || value.is_object()? || value.is_array()? {
-            return Err(InvalidStruct("invalid sidecar integer").into());
-        }
-        if !value.accepts_value_at_depth(1)? {
-            return Err(InvalidStruct("invalid sidecar integer").into());
-        }
-        let number = value.resolve()?;
-        if number.as_u64().and_then(|n| usize::try_from(n).ok()).is_none() {
-            return Err(InvalidStruct("invalid sidecar integer").into());
-        }
-    }
-    let shown = if keep_id { Some(field("id")?.to_json()?) } else { None };
-    let mut at = 0usize;
-    let mut matches = true;
-    field("id")?.for_each_str_chunk(|part| {
-        if matches {
-            matches = at.checked_add(part.len()).and_then(|end| id.as_bytes().get(at..end)) == Some(part.as_bytes());
-            if matches {
-                at += part.len();
-            }
-        }
-        Ok(())
-    })?;
-    let content = if matches && at == id.len() {
-        Some(field("content")?.to_json()?)
-    } else {
-        None
-    };
-    Ok((shown, content))
-}
+mod retrieve;
+pub use retrieve::retrieve;
+#[cfg(test)]
+use retrieve::retrieve_captured;
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
+/// A new session id: v7 (time-ordered), as cv mints every other id.
 pub(crate) fn new_uuid() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-/// Tool inputs can themselves contain giant file contents. Keep their source record and block
-/// position, then materialize only the inputs needed by the current tool-result record.
-fn collect_tool_names(v: &Value, range: Range, map: &mut HashMap<String, (String, Range, usize)>) {
-    if v.get("type").and_then(Value::as_str) != Some("assistant") {
-        return;
-    }
-    let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
-        return;
-    };
-    for (index, b) in blocks.iter().enumerate() {
-        if b.get("type").and_then(Value::as_str) == Some("tool_use") {
-            if let Some(id) = b.get("id").and_then(Value::as_str) {
-                map.insert(
-                    id.to_owned(),
-                    (
-                        b.get("name").and_then(Value::as_str).unwrap_or("").to_owned(),
-                        range,
-                        index,
-                    ),
-                );
-            }
-        }
-    }
-}
-
-fn materialize_tool_inputs(
-    source: &crate::json::JsonSource,
-    v: &Value,
-    tools: &HashMap<String, (String, Range, usize)>,
-) -> Result<HashMap<String, (String, Value)>> {
-    let mut result = HashMap::new();
-    if let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) {
-        for block in blocks {
-            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                continue;
-            }
-            let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else {
-                continue;
-            };
-            if result.contains_key(id) {
-                continue;
-            }
-            if tools.contains_key(id) {
-                // Retain only this indexed call's input; unrelated original assistant bodies
-                // may already have been streamed into a sidecar by the preceding turn pass.
-                result.insert(id.to_owned(), source_tool_metadata(source, Some(id), tools)?);
-            }
-        }
-    }
-    Ok(result)
-}
-
-/// Classify a tool_result content value → (kind, projected text, image count).
-fn classify(content: &Value) -> (String, String, usize) {
-    match content {
-        Value::String(s) => ("text".into(), s.clone(), 0),
-        Value::Array(arr) => {
-            let mut text = String::new();
-            let mut images = 0;
-            for b in arr {
-                match b.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            text.push_str(t);
-                        }
-                    }
-                    Some("image") => images += 1,
-                    _ => {}
-                }
-            }
-            let kind = match (images > 0, !text.is_empty()) {
-                (true, true) => "mixed",
-                (true, false) => "image",
-                (false, true) => "text",
-                // a non-empty array of other block types is still stored verbatim (lossless)
-                (false, false) if !arr.is_empty() => "text",
-                _ => "none",
-            };
-            (kind.into(), text, images)
-        }
-        _ => ("none".into(), String::new(), 0),
-    }
-}
-
-fn tur_is_image(tur: &Value) -> bool {
-    if tur.get("type").and_then(Value::as_str) == Some("image") {
-        return true;
-    }
-    if let Some(file) = tur.get("file") {
-        if file.get("base64").is_some() {
-            return true;
-        }
-        if file
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|t| t.starts_with("image/"))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn value_byte_size(v: &Value) -> usize {
-    match v {
-        Value::String(s) => s.len(),
-        other => other.to_string().len(),
-    }
+    uuid::Uuid::now_v7().to_string()
 }
 
 fn str_tokens(s: &str) -> u64 {
@@ -3360,116 +1994,14 @@ impl Est {
     fn total(self) -> u64 {
         self.tokens + self.signature + self.images * IMAGE_TOKENS
     }
-    fn store(self, facts: &mut serde_json::Map<String, Value>) {
-        facts.insert("_prune_est".into(), Value::from(self.tokens));
-        facts.insert("_prune_sig".into(), Value::from(self.signature));
-        facts.insert("_prune_img".into(), Value::from(self.images));
-    }
-    fn load(facts: &Value) -> Option<Est> {
-        let part = |key: &str| facts.get(key).and_then(Value::as_u64);
-        Some(Est {
-            tokens: part("_prune_est")?,
-            signature: part("_prune_sig").unwrap_or(0),
-            images: part("_prune_img").unwrap_or(0),
-        })
-    }
 }
 
-/// Estimated tokens one line contributes to the loaded prompt: `message.content` for a turn,
-/// `rendered[].content` for a model-visible attachment (Claude Code appends exactly that text to
-/// the prompt; an attachment with nothing rendered costs nothing), zero for bookkeeping. Sidechain
-/// filtering is the caller's job.
-fn line_est(v: &Value) -> Est {
-    match v.get("type").and_then(Value::as_str) {
-        Some("user" | "assistant") => v.pointer("/message/content").map(est_content).unwrap_or_default(),
-        Some("attachment") => Est {
-            tokens: v
-                .get("rendered")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|i| i.get("content").and_then(Value::as_str))
-                        .map(|text| BLOCK_TOKENS + str_tokens(text))
-                        .sum()
-                })
-                .unwrap_or(0),
-            ..Est::default()
-        },
-        _ => Est::default(),
-    }
-}
-
-/// Estimated tokens of a `message.content` value.
+/// The same estimator handles owned replacement nodes through an owned view.
 fn est_content(content: &Value) -> Est {
-    match content {
-        Value::String(s) => Est {
-            tokens: BLOCK_TOKENS + str_tokens(s),
-            ..Est::default()
-        },
-        Value::Array(blocks) => {
-            let mut total = Est::default();
-            for block in blocks {
-                total.add(est_block(block));
-            }
-            total
-        }
-        other => Est {
-            tokens: crate::ir::est_str_tokens(&other.to_string(), TokenKind::ToolResult),
-            ..Est::default()
-        },
-    }
+    est_content_source(content.into(), &[]).expect("owned JSON has no fallible backing")
 }
-
-/// A tool result's `content`, as [`est_block`] prices it inside its block.
-fn tool_result_tokens(content: &Value) -> u64 {
-    est_block(&serde_json::json!({"type": "tool_result", "content": content}))
-        .total()
-        .saturating_sub(BLOCK_TOKENS)
-}
-
-/// One content block: [`BLOCK_TOKENS`] plus each field at its [`TokenKind`] rate.
 fn est_block(block: &Value) -> Est {
-    use crate::ir::{est_str_tokens, est_tokens_bytes};
-    let field = |key: &str| block.get(key).and_then(Value::as_str).unwrap_or("");
-    let mut est = Est {
-        tokens: BLOCK_TOKENS,
-        ..Est::default()
-    };
-    match block.get("type").and_then(Value::as_str) {
-        Some("text") => est.tokens += str_tokens(field("text")),
-        Some("image") => est.images += 1,
-        Some("tool_use") => {
-            est.tokens += est_tokens_bytes(
-                block.get("input").map_or(0, |input| input.to_string().len()),
-                TokenKind::ToolInput,
-            )
-        }
-        Some("tool_result") => match block.get("content") {
-            Some(Value::String(text)) => est.tokens += est_str_tokens(text, TokenKind::ToolResult),
-            Some(Value::Array(items)) => {
-                for item in items {
-                    match item.get("type").and_then(Value::as_str) {
-                        Some("image") => est.images += 1,
-                        Some("text") => {
-                            let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-                            est.tokens += est_str_tokens(text, TokenKind::ToolResult);
-                        }
-                        _ => est.tokens += est_str_tokens(&item.to_string(), TokenKind::ToolResult),
-                    }
-                }
-            }
-            Some(Value::Null) | None => {}
-            Some(other) => est.tokens += est_str_tokens(&other.to_string(), TokenKind::ToolResult),
-        },
-        Some("thinking") => {
-            est.tokens += str_tokens(field("thinking"));
-            est.signature += est_tokens_bytes(field("signature").len(), TokenKind::Signature);
-        }
-        Some("redacted_thinking") => est.signature += est_tokens_bytes(field("data").len(), TokenKind::Signature),
-        _ => est.tokens += est_str_tokens(&block.to_string(), TokenKind::ToolResult),
-    }
-    est
+    est_block_source(block.into(), &[]).expect("owned JSON has no fallible backing")
 }
 
 /// A compact key=value summary of the tool's most telling arguments, for the marker.
@@ -3578,7 +2110,7 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 #[path = "prune/sidecar_tests.rs"]

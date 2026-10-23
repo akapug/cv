@@ -12,15 +12,63 @@
 //! parser lives here: [`super`] (the sub-agent forest) and [`super::super::claude_workflow`]
 //! (the Workflow objects) used to each carry their own copy of both.
 
-use crate::stream::Flow;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 /// The journal a `Workflow` run writes into its run dir.
 pub const JOURNAL: &str = "journal.jsonl";
+
+/// An optional JSON-object sidecar. Only a missing file has no metadata.
+pub fn read(path: &Path) -> anyhow::Result<serde_json::Map<String, Value>> {
+    use anyhow::Context;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))
+}
+
+/// Optional enrichment reports a named diagnostic when its sidecar cannot be read.
+pub fn read_or_default(path: &Path) -> serde_json::Map<String, Value> {
+    read(path).unwrap_or_else(|error| {
+        crate::env::warn_once("agent metadata", format!("{}: {error:#}", path.display()));
+        Default::default()
+    })
+}
+
+/// The type Claude Code gives a sub-agent spawned without one.
+pub const DEFAULT_AGENT_TYPE: &str = "general-purpose";
+
+/// The meta sidecar cv writes for a sub-agent it publishes (`cv distill`, `cv adopt --model`):
+/// the source's own object at `path` ([`read_or_default`]), with `agentType` set to
+/// [`DEFAULT_AGENT_TYPE`] only where the source names none. Every other key is the source's.
+pub fn agent_meta(path: &Path) -> serde_json::Map<String, Value> {
+    let mut meta = read_or_default(path);
+    if !meta.get("agentType").is_some_and(Value::is_string) {
+        meta.insert("agentType".into(), Value::from(DEFAULT_AGENT_TYPE));
+    }
+    meta
+}
+
+/// For a Claude sub-agent transcript `s` read by its path: the launch description and agent type
+/// its `<stem>.meta.json` sidecar records, copied into the bag where the parse left them unset (a
+/// sub-agent reached through its parent's forest has them from there instead). Any other
+/// harness's session is left as it is.
+pub fn label_from_meta(s: &mut crate::ir::Session, transcript: &Path) {
+    if s.harness != crate::ir::Harness::Claude {
+        return;
+    }
+    let meta = read_or_default(&transcript.with_extension("meta.json"));
+    for (k, key) in [("description", "agent_description"), ("agentType", "agent_type")] {
+        if let Some(v) = meta.get(k).and_then(Value::as_str) {
+            s.harness_extra_mut(crate::ir::Harness::Claude)
+                .entry(key)
+                .or_insert_with(|| Value::from(v));
+        }
+    }
+}
 
 /// `<dir>/<stem>/` for a transcript at `<dir>/<stem>.jsonl`: the session's sidecar root.
 pub fn session_dir(transcript: &Path) -> Option<PathBuf> {
@@ -51,21 +99,34 @@ pub fn workflows_dir(transcript: &Path) -> Option<PathBuf> {
 /// A run dir's `journal.jsonl` reduced to `agentId → full result Value`. The LAST `result` record
 /// per agent wins: a `result` supersedes the earlier `started`, and a re-issued agent journals more
 /// than once. Empty when the journal is absent or unreadable; a corrupt line is skipped the way
-/// every adapter skips one (`for_each_json_line`).
-pub fn journal_results(run_dir: &Path) -> BTreeMap<String, Value> {
+/// every adapter skips one (the shared JSONL lifecycle).
+pub fn journal_results_checked(run_dir: &Path) -> anyhow::Result<BTreeMap<String, Value>> {
     let mut map = BTreeMap::new();
-    let Ok(file) = fs::File::open(run_dir.join(JOURNAL)) else {
-        return map;
-    };
-    super::super::for_each_json_line(BufReader::new(file), |v| {
-        if v.get("type").and_then(Value::as_str) == Some("result") {
-            if let (Some(id), Some(r)) = (v.get("agentId").and_then(Value::as_str), v.get("result")) {
-                map.insert(id.to_string(), r.clone());
+    let read = crate::harness::store::jsonl::for_each_record(&run_dir.join(JOURNAL), |view| {
+        let Some(fields) = crate::harness::store::document::Fields::parse(view, &["type", "agentId", "result"])? else {
+            return Ok(());
+        };
+        if fields.string("type")?.as_deref() == Some("result") {
+            if let (Some(id), Some(result)) = (fields.string("agentId")?, fields.get("result")) {
+                map.insert(id, result.resolve()?.into_owned());
             }
         }
-        Flow::Continue
+        Ok(())
     });
-    map
+    if let Err(error) = read {
+        if !super::super::is_not_found(&error) {
+            return Err(error);
+        }
+    }
+    Ok(map)
+}
+
+/// Optional workflow enrichment keeps its failure visible.
+pub fn journal_results(run_dir: &Path) -> BTreeMap<String, Value> {
+    journal_results_checked(run_dir).unwrap_or_else(|error| {
+        crate::env::warn_once("workflow journal", format!("{}: {error:#}", run_dir.display()));
+        Default::default()
+    })
 }
 
 /// The `(status, summary)` a journaled result carries. Workflows write two shapes: a structured
@@ -91,6 +152,7 @@ pub fn result_summary(result: &Value) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     #[test]

@@ -1,72 +1,82 @@
 //! Consumer source stamps and bounded temporary serialization for the durable archive.
 use super::*;
 mod spool;
-use spool::{FirstUser, Prefix, Spool};
-use std::io::{BufReader, BufWriter, Read};
+use crate::cmd::session_json::write_session;
+use cv_core::projection::{Counted, Prefix};
+use spool::{FirstUser, Spool, Spooled};
+use std::io::{BufWriter, Read};
 
-const STATE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "/archive-full2");
-const STATE_BYTES: u64 = 1024 * 1024;
-
+/// A published archive file: its identity, plus off Unix (where `FileId` has no inode or
+/// ctime) a content digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Artifact {
-    bytes: u64,
-    modified_ns: u64,
-    identity: Option<(u64, u64, i64, i64)>,
+    id: cv_core::source::FileId,
     hash: Option<String>,
 }
 impl Artifact {
     fn of(path: &Path) -> Option<Self> {
-        let md = fs::metadata(path).ok()?;
-        let modified_ns = md
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos() as u64;
-        #[cfg(unix)]
-        let identity = {
-            use std::os::unix::fs::MetadataExt;
-            Some((md.dev(), md.ino(), md.ctime(), md.ctime_nsec()))
-        };
-        #[cfg(not(unix))]
-        let identity = None;
-        let hash = if identity.is_none() {
-            let mut input = fs::File::open(path).ok()?;
-            let mut digest = cv_core::digest::Sha256::new();
-            let mut bytes = [0; 64 * 1024];
-            loop {
-                let n = input.read(&mut bytes).ok()?;
-                if n == 0 {
-                    break;
+        let id = cv_core::source::FileId::of(&fs::metadata(path).ok()?)?;
+        let hash = match cfg!(unix) {
+            true => None,
+            false => {
+                let (mut input, mut digest) = (fs::File::open(path).ok()?, cv_core::digest::Sha256::new());
+                let mut bytes = [0; 64 * 1024];
+                loop {
+                    match input.read(&mut bytes) {
+                        Ok(0) => break Some(digest.finish_hex()),
+                        Ok(n) => digest.update(&bytes[..n]),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => return None,
+                    }
                 }
-                digest.update(&bytes[..n]);
             }
-            Some(digest.finish_hex())
-        } else {
-            None
         };
-        Some(Self {
-            bytes: md.len(),
-            modified_ns,
-            identity,
-            hash,
-        })
+        Some(Self { id, hash })
     }
     fn matches(&self, path: &Path) -> bool {
         Self::of(path).as_ref() == Some(self)
     }
 }
 
+/// What the archive keeps about one archived source, as the payload of its
+/// [`cv_core::source::Record`] (written to `archive-source/<harness>/<id>.json`): a record of
+/// another cv version does not decode, and its session is archived again.
+/// On disk the read state is held without its baseline (`Stored<Held>`): the record's baseline
+/// is the one copy, rejoined on load.
 #[derive(Serialize, Deserialize)]
-struct Stored {
-    version: String,
+struct Stored<R = cv_core::watch::ReadState> {
     total: usize,
     artifact: Artifact,
-    read: cv_core::watch::ReadState,
-    #[serde(default)]
+    read: R,
     prefix: Option<Prefix>,
-    #[serde(default)]
+    /// The turns among the `prefix` messages, for the next pass that copies them.
+    prefix_turns: usize,
     first_user: Option<FirstUser>,
+}
+
+impl cv_core::source::Payload for Stored<cv_core::watch::Held> {
+    const TAG: &'static str = "archive";
+}
+
+impl<R> Stored<R> {
+    fn map_read<S>(self, f: impl FnOnce(R) -> S) -> Stored<S> {
+        let Stored {
+            total,
+            artifact,
+            read,
+            prefix,
+            prefix_turns,
+            first_user,
+        } = self;
+        Stored {
+            total,
+            artifact,
+            read: f(read),
+            prefix,
+            prefix_turns,
+            first_user,
+        }
+    }
 }
 
 pub(super) struct StoredPass {
@@ -92,17 +102,14 @@ impl Temporary {
         fs::create_dir_all(parent)?;
         Ok(Self(cv_core::publish::Staged::create(parent, "archive", 0o600)?))
     }
+    #[cfg(test)]
     fn path(&self) -> &Path {
         self.0.path()
     }
-    fn write_json(&mut self, value: &impl Serialize, pretty: bool) -> Result<()> {
-        let mut writer = BufWriter::with_capacity(64 * 1024, self.0.file());
-        if pretty {
-            serde_json::to_writer_pretty(&mut writer, value)?;
-        } else {
-            serde_json::to_writer(&mut writer, value)?;
-        }
-        writer.flush()?;
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        let file = self.0.file();
+        file.write_all(bytes)?;
+        file.flush()?;
         Ok(())
     }
     fn publish(self, dest: &Path) -> Result<()> {
@@ -111,44 +118,62 @@ impl Temporary {
     }
 }
 
-fn equal_files(left: &Path, right: &Path) -> bool {
-    fn compare(left: &Path, right: &Path) -> std::io::Result<bool> {
-        let mut left = fs::File::open(left)?;
-        let mut right = fs::File::open(right)?;
-        if left.metadata()?.len() != right.metadata()?.len() {
+/// Compare the digest captured during serialization with only the previous artifact.
+fn equal_artifact(path: &Path, len: u64, digest: &str) -> bool {
+    let compare = || -> std::io::Result<bool> {
+        let mut input = fs::File::open(path)?;
+        if input.metadata()?.len() != len {
             return Ok(false);
         }
-        let mut a = [0; 64 * 1024];
-        let mut b = [0; 64 * 1024];
+        let mut hash = cv_core::digest::Sha256::new();
+        let mut bytes = [0; 64 * 1024];
         loop {
-            let n = left.read(&mut a)?;
-            right.read_exact(&mut b[..n])?;
-            if a[..n] != b[..n] {
-                return Ok(false);
-            }
+            let n = match input.read(&mut bytes) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
             if n == 0 {
-                return Ok(true);
+                return Ok(hash.finish_hex() == digest);
             }
+            hash.update(&bytes[..n]);
         }
-    }
-    compare(left, right).unwrap_or(false)
+    };
+    compare().unwrap_or(false)
 }
 
-fn entry(session: &Session) -> CatalogEntry {
+/// The catalog row of an archived session: `message_count` becomes its turns, `messages_written`
+/// the raw count of messages the pass wrote.
+fn entry(session: &Session, title: Option<String>, turns: usize, written: usize) -> CatalogEntry {
     CatalogEntry {
-        harness: session.harness.as_str().into(),
-        id: session.id.clone(),
-        cwd: session.cwd.clone(),
-        title: session.title.clone().or_else(|| Some(session.label())),
-        message_count: session.messages.len(),
-        created_at: session.created_at,
-        updated_at: session.updated_at,
+        session: SessionRef {
+            cwd: session.cwd.clone(),
+            title,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            message_count: Some(turns),
+            ..SessionRef::new(
+                &session.id,
+                session.harness,
+                Archive::rel_session_path(session.harness, &session.id),
+            )
+        },
+        messages_written: written,
         archived_at: Utc::now(),
-        path: Archive::rel_session_path(session.harness, &session.id),
     }
 }
 
 impl Archive {
+    /// The identities of what an archive pass left for `r` (its session file and resume state),
+    /// when both exist and the platform's file identity is exact enough to stand for their
+    /// content (Unix: inode and ctime). Elsewhere `None`: every pass validates in full.
+    pub(super) fn outputs(&self, r: &SessionRef) -> Option<[cv_core::source::FileId; 2]> {
+        if !cfg!(unix) {
+            return None;
+        }
+        let id = |path: PathBuf| cv_core::source::FileId::of(&fs::metadata(path).ok()?);
+        Some([id(self.session_path(r.harness, &r.id))?, id(self.source_path(r))?])
+    }
+
     fn source_path(&self, r: &SessionRef) -> PathBuf {
         self.home
             .join("archive-source")
@@ -156,45 +181,36 @@ impl Archive {
             .join(format!("{}.json", archive_stem(&r.id)))
     }
 
+    /// The resume state a previous archive pass left for `r`, when it still applies. A miss
+    /// re-reads the source: no state yet (`NotFound`), one another cv version wrote (it does not decode, or names another version) or for another artifact. A state that
+    /// is there but cannot be read degrades once per process, like every accelerator.
     fn stored(&self, r: &SessionRef) -> Option<Stored> {
         let path = self.source_path(r);
-        if fs::metadata(&path).ok()?.len() > STATE_BYTES {
+        let file = match fs::File::open(&path).and_then(|file| Ok((file.metadata()?, file))) {
+            Ok(opened) => opened,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                cv_core::env::warn_once("the archive's resume state", format!("{}: {error}", path.display()));
+                return None;
+            }
+        };
+        // No size cap: the state is this session's own certificate, so declining a large one
+        // would re-read and re-archive the session on every pass.
+        let (metadata, mut file) = file;
+        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        if let Err(error) = file.read_to_end(&mut bytes) {
+            cv_core::env::warn_once("the archive's resume state", format!("{}: {error}", path.display()));
             return None;
         }
-        let stored: Stored = serde_json::from_reader(BufReader::new(fs::File::open(path).ok()?)).ok()?;
-        (stored.version == STATE_VERSION && stored.artifact.matches(&self.session_path(r.harness, &r.id)))
+        let record = cv_core::source::Record::<Stored<cv_core::watch::Held>>::decode(&bytes)?;
+        let baseline = record.baseline;
+        let stored = record
+            .payload
+            .map_read(|held| cv_core::watch::ReadState::join(baseline, held));
+        stored
+            .artifact
+            .matches(&self.session_path(r.harness, &r.id))
             .then_some(stored)
-    }
-
-    /// Serialize without a whole JSON/comparison Vec. Artifact rename and catalog append share
-    /// the existing cross-process archive lock; a failure never exposes a partial JSON file.
-    #[cfg(test)]
-    pub(super) fn store_streaming(&self, session: &Session) -> Result<StoreOutcome> {
-        self.store_artifact(session, false).map(|(outcome, _)| outcome)
-    }
-
-    #[cfg(test)]
-    fn store_artifact(&self, session: &Session, repair_catalog: bool) -> Result<(StoreOutcome, Artifact)> {
-        let dest = self.session_path(session.harness, &session.id);
-        let mut temporary = Temporary::new(&dest)?;
-        temporary
-            .write_json(session, true)
-            .with_context(|| format!("serializing session {}", session.id))?;
-        let _lock = self.lock_catalog()?;
-        let outcome = if equal_files(temporary.path(), &dest) {
-            // Repair an artifact whose bytes were published before a crash/error prevented the
-            // catalog append. The identity comparison and repair share the writer lock.
-            if repair_catalog {
-                self.upsert_catalog_locked(entry(session))?;
-            }
-            StoreOutcome::Skipped
-        } else {
-            temporary.publish(&dest)?;
-            self.upsert_catalog_locked(entry(session))?;
-            StoreOutcome::Archived
-        };
-        let artifact = Artifact::of(&dest).context("archive artifact disappeared during publication")?;
-        Ok((outcome, artifact))
     }
 
     /// Skip unchanged sources before parsing. A verified append replaces the archived suffix
@@ -218,7 +234,7 @@ impl Archive {
                 prefix_bytes: 0,
             });
         }
-        let mut spool = Spool::new(r);
+        let mut spool = Spool::new(&r.path);
         let mut pass = cv_core::watch::read_session_into(
             adapter,
             r,
@@ -233,17 +249,22 @@ impl Archive {
                 && stored
                     .prefix
                     .as_ref()
-                    .is_some_and(|prefix| prefix.valid(stored.artifact.bytes, pass.prefix))
+                    .is_some_and(|prefix| prefix.valid(stored.artifact.id.len, pass.prefix))
         });
         if pass.resumed && old.is_none() {
             // Older state has no canonical prefix range, or its artifact changed. The existing
             // checked adapter handles the whole fallback; discard only this owned partial spool.
-            spool = Spool::new(r);
+            spool = Spool::new(&r.path);
             pass = cv_core::watch::read_session_into(adapter, r, None, 0, &mut spool)?;
         }
-        let (spooled, messages, mut first_user, spool_bytes) = spool.finish()?;
-        #[cfg(not(test))]
-        let _ = spool_bytes;
+        let Spooled {
+            bytes: spooled,
+            messages,
+            turns,
+            mut first_user,
+        } = spool.finish()?;
+        #[cfg(test)]
+        let spool_bytes = spooled.byte_len()?;
         #[cfg(test)]
         let prefix_bytes = old
             .and_then(|stored| stored.prefix.as_ref())
@@ -252,6 +273,13 @@ impl Archive {
             messages.checked_add(pass.prefix) == Some(pass.total),
             "archive spool length does not match the completed read"
         );
+        anyhow::ensure!(
+            pass.prefix == 0 || old.is_some(),
+            "archive resumed without the prefix it copies"
+        );
+        let old_turns = old.map_or(0, |stored| stored.prefix_turns);
+        // The spool sees only the suffix: translate its one-based prompt ordinal to the
+        // full artifact. A saved prompt inside the stable prefix precedes any suffix prompt.
         if let Some(first) = first_user.as_mut() {
             first.ordinal += pass.prefix;
         }
@@ -270,9 +298,9 @@ impl Archive {
         let suffix_bytes = pass.suffix_bytes;
         let session = pass.session;
         let mut temporary = Temporary::new(&dest)?;
-        let prefix = {
-            let mut writer = BufWriter::with_capacity(64 * 1024, temporary.0.file());
-            let prefix = spool::write_session(
+        let (prefix, len, digest) = {
+            let mut writer = Counted::new(BufWriter::with_capacity(64 * 1024, temporary.0.file())).hashing();
+            let prefix = write_session(
                 &mut writer,
                 &session,
                 &spooled,
@@ -282,7 +310,11 @@ impl Archive {
                 total,
             )?;
             writer.flush()?;
-            prefix
+            (
+                prefix,
+                writer.position.get(),
+                writer.into_digest().expect("hashing writer"),
+            )
         };
         let (outcome, artifact) = {
             let _lock = self.lock_catalog()?;
@@ -292,15 +324,14 @@ impl Archive {
                     "archive artifact changed during prefix copy"
                 );
             }
-            let mut entry = entry(&session);
-            entry.message_count = total;
-            entry.title = session.title.clone().or_else(|| {
+            let title = session.title.clone().or_else(|| {
                 Some(cv_core::label_from(
                     None,
                     first_user.as_ref().and_then(|first| first.head.as_deref()),
                 ))
             });
-            let outcome = if equal_files(temporary.path(), &dest) {
+            let entry = entry(&session, title, old_turns + turns.before(messages), total);
+            let outcome = if equal_artifact(&dest, len, &digest) {
                 if previous.is_none() {
                     self.upsert_catalog_locked(entry)?;
                 }
@@ -312,24 +343,32 @@ impl Archive {
             };
             (
                 outcome,
-                Artifact::of(&dest).context("archive artifact disappeared during publication")?,
+                Artifact::of(&dest).context("cannot inspect archive artifact after publication")?,
             )
         };
-        if read.fits_cache(STATE_BYTES as usize - 1024) && read.fresh_with(adapter, r) {
+        // The new prefix's turns: the copied prefix's, then the spooled ones up to its end.
+        let prefix = prefix.filter(|prefix| prefix.messages >= pass.prefix);
+        let prefix_turns = prefix
+            .as_ref()
+            .map_or(0, |prefix| old_turns + turns.before(prefix.messages - pass.prefix));
+        // Freshness is checked once, under the catalog lock, right before the state publishes.
+        {
+            let (baseline, held) = read.clone().split();
             let stored = Stored {
-                version: STATE_VERSION.into(),
                 total,
                 artifact,
-                read: read.clone(),
+                read: held,
                 first_user: first_user
                     .filter(|first| prefix.as_ref().is_some_and(|prefix| first.ordinal <= prefix.messages)),
                 prefix,
+                prefix_turns,
             };
             let dest = self.source_path(r);
             let mut temporary = Temporary::new(&dest)?;
-            temporary.write_json(&stored, false)?;
+            let record = cv_core::source::Record::new(baseline, stored);
+            temporary.write_all(&record.encode())?;
             let _lock = self.lock_catalog()?;
-            if stored.artifact.matches(&self.session_path(r.harness, &r.id)) && read.fresh_with(adapter, r) {
+            if record.payload.artifact.matches(&self.session_path(r.harness, &r.id)) && read.fresh_with(adapter, r) {
                 temporary.publish(&dest)?;
             }
         }
@@ -424,6 +463,26 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_state_past_one_mib_is_kept_and_an_unchanged_source_is_skipped() {
+        let (root, a, r, mut body) = setup(Harness::Claude);
+        // The session's cwd rides in every checkpoint, so the state encodes above 1 MiB.
+        let cwd = format!("/{}", "w".repeat(1024 * 1024));
+        let wide = serde_json::json!({"type":"user","uuid":"wide","sessionId":"read","cwd":cwd,
+            "message":{"role":"user","content":"wide"}});
+        body.insert_str(0, &format!("{wide}\n"));
+        fs::write(&r.path, &body).unwrap();
+        let adapter = cv_core::harness::for_harness(r.harness).unwrap();
+        let first = a.store_ref(adapter.as_ref(), &r).unwrap();
+        assert!(matches!(first.outcome, StoreOutcome::Archived));
+        assert!(fs::metadata(a.source_path(&r)).unwrap().len() > 1024 * 1024);
+        let again = a.store_ref(adapter.as_ref(), &r).unwrap();
+        assert!(matches!(again.outcome, StoreOutcome::Skipped));
+        assert_eq!(again.parsed_messages, 0, "an unchanged source is not re-read");
+        exact(&a, adapter.as_ref(), &r);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn directory_wire_archive_reuses_suffix_and_keeps_pretty_output_exact() {
         use std::io::Write as _;
         let root = std::env::temp_dir().join(format!("cv-archive-directory-{}", uuid::Uuid::new_v4()));
@@ -454,9 +513,22 @@ mod tests {
             .unwrap();
         let appended = a.store_ref(adapter.as_ref(), &r).unwrap();
         assert!(appended.resumed);
-        assert!(appended.parsed_messages < 2048);
+        assert!(appended.parsed_messages < appended.total);
         assert_eq!(appended.total, 4100);
         exact(&a, adapter.as_ref(), &r);
+        let turns = adapter
+            .parse(&r)
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.is_turn())
+            .count();
+        let row = &a.load_catalog().unwrap()[0];
+        assert_eq!(
+            (row.session.message_count, row.messages_written),
+            (Some(turns), 4100),
+            "a resumed archive counts the copied prefix's turns"
+        );
         fs::write(&controls, "{\"cwd\":\"/changed\"}").unwrap();
         let changed = a.store_ref(adapter.as_ref(), &r).unwrap();
         assert!(!changed.resumed);
@@ -470,13 +542,8 @@ mod tests {
     }
 
     #[test]
-    fn streamed_artifact_write_is_idempotent_and_owned_temps_clean_up() {
+    fn owned_artifact_temps_clean_up() {
         let (root, a, r, _) = setup(Harness::Claude);
-        let adapter = cv_core::harness::for_harness(r.harness).unwrap();
-        let session = adapter.parse(&r).unwrap();
-        assert_eq!(a.store(&session).unwrap(), StoreOutcome::Archived);
-        assert_eq!(a.store(&session).unwrap(), StoreOutcome::Skipped);
-        exact(&a, adapter.as_ref(), &r);
         let dest = a.session_path(r.harness, &r.id);
         let temporary = Temporary::new(&dest).unwrap();
         let own = temporary.path().to_owned();
@@ -512,7 +579,7 @@ mod tests {
         fs::write(&r.path, &body).unwrap();
         let appended = a.store_ref(adapter.as_ref(), &r).unwrap();
         assert!(appended.resumed);
-        assert!(appended.parsed_messages < 1024);
+        assert!(appended.parsed_messages < appended.total);
         assert!(appended.suffix_bytes < 300 * 1024);
         exact(&a, adapter.as_ref(), &r);
         eprintln!("archive repeated polls: 0 parses; append: {} messages/{} primary suffix bytes instead of {} messages/{} bytes", appended.parsed_messages, appended.suffix_bytes, appended.total, body.len());
@@ -585,13 +652,13 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &SessionRef,
-                _: &cv_core::ParseOptions,
+                _: &cv_core::Demand,
                 sink: &mut dyn cv_core::MessageSink,
             ) -> Result<Session> {
                 let mut session = Session::new(&r.id, r.harness);
@@ -661,7 +728,8 @@ mod tests {
         let repaired = a.store_ref(adapter.as_ref(), &r).unwrap();
         assert_eq!(repaired.total, 8193);
         assert!(a.stored(&r).unwrap().read.fresh(&r));
-        assert_eq!(a.load_catalog().unwrap()[0].message_count, 8193);
+        let row = &a.load_catalog().unwrap()[0];
+        assert_eq!((row.messages_written, row.session.message_count), (8193, Some(8193)));
         exact(&a, adapter.as_ref(), &r);
         fs::remove_dir_all(root).unwrap();
     }

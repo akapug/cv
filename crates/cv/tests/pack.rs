@@ -24,7 +24,7 @@ fn pack_corpus(w: &World) {
         "wombatsess",
         &[
             serde_json::json!({"type": "ai-title", "aiTitle": "wombat cache design"}),
-            user_line("w1", "2026-02-01T10:00:00Z", "let's design the wombat caching layer for the parser"),
+            user_line("wombatsess", "w1", "2026-02-01T10:00:00Z", "let's design the wombat caching layer for the parser"),
             assistant_line(
                 "w2",
                 "2026-02-01T10:01:00Z",
@@ -42,13 +42,18 @@ fn pack_corpus(w: &World) {
                     {"type": "tool_result", "tool_use_id": "wt1", "content": "edited ok", "is_error": false}
                 ]}
             }),
-            user_line("w4", "2026-02-01T10:03:00Z", "great, ship the wombat cache"),
+            user_line("wombatsess", "w4", "2026-02-01T10:03:00Z", "great, ship the wombat cache"),
         ],
     );
     w.write_session(
         "quokkasess",
         &[
-            user_line("q1", "2026-03-01T09:00:00Z", "how many quokkas in the census"),
+            user_line(
+                "quokkasess",
+                "q1",
+                "2026-03-01T09:00:00Z",
+                "how many quokkas in the census",
+            ),
             assistant_line(
                 "q2",
                 "2026-03-01T09:05:00Z",
@@ -60,6 +65,7 @@ fn pack_corpus(w: &World) {
         "gammasess",
         &[
             user_line(
+                "gammasess",
                 "g1",
                 "2026-04-01T09:00:00Z",
                 "the parser chokes on empty caching headers",
@@ -120,12 +126,32 @@ fn pack_md_no_index_fallback_and_content() {
 }
 
 #[test]
+fn pack_header_states_its_bounds_and_what_they_cut() {
+    let w = World::new("bounds");
+    pack_corpus(&w);
+    let (out, _) = w.cv_ok(&["pack", "wombat caching layer"]);
+    assert!(
+        out.contains("Bounds: each excerpt message to 1600 bytes (`--excerpt-bytes`; 0 cut, marked …)"),
+        "{out}"
+    );
+    let (out, _) = w.cv_ok(&["pack", "wombat caching layer", "--excerpt-bytes", "20"]);
+    assert!(out.contains("to 20 bytes (`--excerpt-bytes`;"), "{out}");
+    assert!(
+        !out.contains("`--excerpt-bytes`; 0 cut"),
+        "a 20-byte budget cuts:\n{out}"
+    );
+    assert!(out.contains("…"), "{out}");
+    let (ok, code, _, err) = w.cv(&["pack", "wombat", "--context-bytes", "100"]);
+    assert!(!ok && code == 2 && err.contains("CV_PACK_LLM"), "{code} {err}");
+}
+
+#[test]
 fn pack_uses_index_when_present_and_respects_limit() {
     let w = World::new("idx");
     pack_corpus(&w);
 
-    let (out, _) = w.cv_ok(&["index"]);
-    assert!(out.contains("indexed 3 top-level session(s)"), "{out}");
+    let (out, _) = w.cv_ok(&["index", "--json"]);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["indexed"], 3);
 
     // Indexed recall: no live-scan note.
     let (out, err) = w.cv_ok(&["pack", "wombat caching layer"]);
@@ -143,16 +169,36 @@ fn pack_uses_index_when_present_and_respects_limit() {
     );
 
     // A task matching nothing: friendly empty result, exit 0.
-    let (out, _) = w.cv_ok(&["pack", "xyzzyplugh"]);
-    assert!(out.contains("no relevant past sessions"), "{out}");
+    let (out, _) = w.cv_ok(&["pack", "xyzzyplugh", "--json"]);
+    assert!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["content"].is_null());
 
     // --out writes the bundle to a file instead of stdout.
     let dest = w.base.join("pack.md");
-    let (out, err) = w.cv_ok(&["pack", "wombat caching layer", "--out", dest.to_str().unwrap()]);
-    assert!(out.trim().is_empty(), "--out must not also print the bundle:\n{out}");
-    assert!(err.contains("wrote context pack"), "{err}");
+    let (out, _) = w.cv_ok(&[
+        "pack",
+        "wombat caching layer",
+        "--json",
+        "--out",
+        dest.to_str().unwrap(),
+    ]);
+    let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(result["path"], dest.to_str().unwrap());
+    assert!(result["content"].is_null());
     let written = fs::read_to_string(&dest).unwrap();
     assert!(written.contains("# Context pack"), "{written}");
+}
+
+#[test]
+fn pack_json_content_matches_plain_bundle() {
+    let w = World::new("json-content");
+    pack_corpus(&w);
+    for format in ["md", "prompt"] {
+        let (plain, _) = w.cv_ok(&["pack", "wombat caching layer", "--format", format]);
+        let (json, _) = w.cv_ok(&["pack", "wombat caching layer", "--format", format, "--json"]);
+        let result: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(result["content"], plain);
+        assert!(result["path"].is_null());
+    }
 }
 
 // ───────────────────────────── prompt format ─────────────────────────────
@@ -202,22 +248,15 @@ fn pack_session_emits_resumable_claude_session_that_round_trips() {
         "wombat caching layer",
         "--format",
         "session",
+        "--json",
         "--harness",
         "claude",
     ]);
-    assert!(out.contains("✦ wrote "), "{out}");
-    assert!(out.contains("claude --resume"), "resume hint expected:\n{out}");
-
-    // Pull the written path + new id out of the "✦ wrote <path> (<id>)" line.
-    let wrote = out.lines().find(|l| l.contains("✦ wrote")).unwrap();
-    let path = wrote
-        .trim_start_matches("✦ wrote ")
-        .split(" (")
-        .next()
-        .unwrap()
-        .to_string();
-    let new_id = wrote.rsplit(" (").next().unwrap().trim_end_matches(')').to_string();
-    assert!(path.ends_with(".jsonl"), "{wrote}");
+    let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(result["resume_hint"].as_str().unwrap().contains("claude --resume"));
+    let path = result["path"].as_str().unwrap().to_string();
+    let new_id = result["id"].as_str().unwrap().to_string();
+    assert!(path.ends_with(".jsonl"), "{out}");
     assert!(PathBuf::from(&path).exists(), "emitted file missing: {path}");
 
     // Round-trip: the target adapter re-parses what pack emitted.
@@ -229,7 +268,7 @@ fn pack_session_emits_resumable_claude_session_that_round_trips() {
         title: None,
         created_at: None,
         updated_at: None,
-        message_count: 0,
+        message_count: None,
     };
     use cv_core::harness::Parse;
     let parsed = cv_core::harness::claude::Claude::detect()
@@ -258,8 +297,12 @@ fn pack_rejects_bad_arguments() {
     let w = World::new("args");
     pack_corpus(&w);
 
-    let (_, err) = w.cv_fails(&["pack", "x", "--format", "docx"]);
-    assert!(err.contains("unknown format"), "{err}");
+    let (_, code, _, err) = w.cv(&["pack", "x", "--format", "docx"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("docx") && err.contains("session"),
+        "clap names the value and the choices:\n{err}"
+    );
 
     // --harness is the target-harness flag, and only --format session has a target.
     let (_, err) = w.cv_fails(&["pack", "x", "--harness", "claude"]);

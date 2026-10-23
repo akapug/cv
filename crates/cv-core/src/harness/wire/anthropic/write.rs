@@ -6,12 +6,65 @@ use crate::{
 };
 use anyhow::Result;
 use std::io::Write;
+/// Native file references share the same tagged source shape for images and documents.
+fn source_reference(source: &mut ObjectWriter<'_>, reference: &str) -> Result<()> {
+    if let Some(id) = reference.strip_prefix("file:") {
+        source.field("type", "file")?;
+        source.field("file_id", id)
+    } else {
+        source.field("type", "url")?;
+        source.field("url", reference)
+    }
+}
+
+/// Public owned codecs retain Span descriptors; checked emitters resolve text directly.
+enum LeafPublication<'a> {
+    Owned,
+    Checked(&'a Resolver),
+}
+impl LeafPublication<'_> {
+    fn text(&self, writer: &mut dyn Write, text: &Text) -> Result<()> {
+        match self {
+            Self::Checked(resolver) => wire::text(writer, text, resolver),
+            Self::Owned => match text {
+                Text::Inline(value) => {
+                    serde_json::to_writer(writer, value)?;
+                    Ok(())
+                }
+                Text::Span(span) => {
+                    serde_json::to_writer(writer, span)?;
+                    Ok(())
+                }
+                Text::Source(source) => {
+                    serde_json::to_writer(writer, &source.try_resolve()?)?;
+                    Ok(())
+                }
+            },
+        }
+    }
+}
+
 pub(crate) fn block(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, resolver: &Resolver) -> Result<()> {
+    publish(writer, b, q, user, LeafPublication::Checked(resolver))
+}
+
+/// Compatibility entry points already request an owned Value. They buffer its encoded form
+/// before parsing it; hot emitters call `block` directly and never take this allocation path.
+pub(super) fn owned(b: &Block, q: &Quirks, user: bool) -> Result<Option<Value>> {
+    if !user && matches!(b, Block::ToolResult { .. }) {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    publish(&mut bytes, b, q, user, LeafPublication::Owned)?;
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn publish(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, leaf: LeafPublication<'_>) -> Result<()> {
     let mut o = ObjectWriter::new(writer)?;
     match b {
         Block::Text { text } => {
             o.field("type", "text")?;
-            o.field_with("text", |w| wire::text(w, text, resolver))?;
+            o.field_with("text", |w| leaf.text(w, text))?;
         }
         Block::Thinking {
             text,
@@ -27,7 +80,7 @@ pub(crate) fn block(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, r
             }
             _ => {
                 o.field("type", "thinking")?;
-                o.field_with(q.thinking.0, |w| wire::text(w, text, resolver))?;
+                o.field_with(q.thinking.0, |w| leaf.text(w, text))?;
                 if let Some(sig) = signature {
                     o.field(q.thinking.1, sig)?;
                 }
@@ -48,7 +101,7 @@ pub(crate) fn block(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, r
             anyhow::ensure!(user, "tool result is a user block");
             o.field("type", "tool_result")?;
             o.field("tool_use_id", tool_use_id)?;
-            o.field_with("content", |w| wire::text(w, content, resolver))?;
+            o.field_with("content", |w| leaf.text(w, content))?;
             o.field("is_error", is_error)?;
         }
         Block::Image { media_type, data_ref } => {
@@ -67,17 +120,10 @@ pub(crate) fn block(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, r
                         s.field("media_type", mt)?;
                     }
                     match data_ref.as_deref() {
-                        Some(r) if r.starts_with("file:") => {
-                            s.field("type", "file")?;
-                            s.field("file_id", &r[5..])?;
-                        }
                         Some("base64:inline") => {
                             s.field("type", "base64")?;
                         }
-                        Some(r) => {
-                            s.field("type", "url")?;
-                            s.field("url", r)?;
-                        }
+                        Some(r) => source_reference(&mut s, r)?,
                         None => {}
                     }
                     s.finish()
@@ -94,16 +140,8 @@ pub(crate) fn block(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, r
                 if let Some(mt) = mime {
                     s.field("media_type", mt)?;
                 }
-                match source.as_deref() {
-                    Some(r) if r.starts_with("file:") => {
-                        s.field("type", "file")?;
-                        s.field("file_id", &r[5..])?;
-                    }
-                    Some(r) => {
-                        s.field("type", "url")?;
-                        s.field("url", r)?;
-                    }
-                    None => {}
+                if let Some(reference) = source.as_deref() {
+                    source_reference(&mut s, reference)?;
                 }
                 s.finish()
             })?;
@@ -125,12 +163,32 @@ pub(crate) fn block(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, r
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
-    fn checked_blocks_match_owned_codec_across_quirks_and_roles() -> Result<()> {
+    fn block_contracts_match_frozen_dialects_roles_and_leaf_publication() -> Result<()> {
+        let world = cv_testkit::World::new("anthropic-wire-frozen");
+        let path = world.base.join("text.json");
+        let encoded = serde_json::to_vec("source \"λ\"\n")?;
+        std::fs::write(&path, &encoded)?;
+        let source_json = crate::Json::source(&path, 0, encoded.len() as u64)?;
+        let crate::Json::Source(range) = &source_json else {
+            unreachable!("captured source")
+        };
+        let source = Text::Source(crate::lazy::SourceText::new(range.clone()));
+        let span = Text::Span(crate::lazy::Span {
+            source: None,
+            offset: 1,
+            len: encoded.len() as u64 - 2,
+            escaped: true,
+        });
+        let resolver = Resolver::new(Some(path));
         let content = vec![
             Block::Text {
                 text: "a\"\\\nλ".into(),
             },
+            Block::Text { text: "".into() },
+            Block::Text { text: span.clone() },
+            Block::Text { text: source.clone() },
             Block::Thinking {
                 text: "thought".into(),
                 signature: Some(String::new()),
@@ -138,9 +196,21 @@ mod tests {
                 redacted: false,
             },
             Block::Thinking {
-                text: String::new().into(),
+                text: span.clone(),
+                signature: Some("signed".into()),
+                encrypted: None,
+                redacted: false,
+            },
+            Block::Thinking {
+                text: source.clone(),
                 signature: None,
                 encrypted: Some("opaque".into()),
+                redacted: true,
+            },
+            Block::Thinking {
+                text: "".into(),
+                signature: Some("hidden".into()),
+                encrypted: None,
                 redacted: true,
             },
             Block::ToolUse {
@@ -149,11 +219,33 @@ mod tests {
                 input: json!({"n":1.25,"s":"arg"}).into(),
                 namespace: None,
             },
+            Block::ToolUse {
+                id: "source-call".into(),
+                name: "Read".into(),
+                input: source_json,
+                namespace: None,
+            },
             Block::ToolResult {
                 tool_use_id: "call".into(),
                 content: "result".into(),
                 tool_name: None,
                 is_error: true,
+                status: None,
+                details: None,
+            },
+            Block::ToolResult {
+                tool_use_id: "span".into(),
+                content: span,
+                tool_name: None,
+                is_error: false,
+                status: None,
+                details: None,
+            },
+            Block::ToolResult {
+                tool_use_id: "source".into(),
+                content: source,
+                tool_name: None,
+                is_error: false,
                 status: None,
                 details: None,
             },
@@ -165,23 +257,52 @@ mod tests {
                 media_type: None,
                 data_ref: Some("base64:inline".into()),
             },
+            Block::Image {
+                media_type: Some("image/webp".into()),
+                data_ref: Some("https://example.invalid/image".into()),
+            },
+            Block::Image {
+                media_type: None,
+                data_ref: None,
+            },
             Block::File {
                 mime: Some("text/plain".into()),
-                path: Some("document".into()),
+                path: Some("document λ".into()),
                 source: Some("https://example.invalid/doc".into()),
             },
+            Block::File {
+                mime: None,
+                path: None,
+                source: Some("file:doc".into()),
+            },
+            Block::File {
+                mime: None,
+                path: None,
+                source: None,
+            },
         ];
-        for q in [ANTHROPIC, CLAUDE_AI, OPENCLAW, GOOSE, ZED] {
+        let mut observed = Vec::new();
+        for (dialect, q) in [ANTHROPIC, CLAUDE_AI, OPENCLAW, GOOSE, ZED].into_iter().enumerate() {
             for user in [false, true] {
-                for b in &content {
-                    if let Some(expected) = super::super::block_to(b, &q, user)? {
-                        let mut bytes = Vec::new();
-                        block(&mut bytes, b, &q, user, &Resolver::new(None))?;
-                        assert_eq!(bytes, serde_json::to_vec(&expected)?, "{q:?}, user={user}, block={b:?}");
-                    }
+                for (case, b) in content.iter().enumerate() {
+                    let owned = super::super::block_to(b, &q, user)?
+                        .map(|v| serde_json::to_string(&v))
+                        .transpose()?;
+                    let mut bytes = Vec::new();
+                    let (checked, error) = match block(&mut bytes, b, &q, user, &resolver) {
+                        Ok(()) => (Some(String::from_utf8(bytes)?), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
+                    observed.push(json!({"dialect":dialect,"user":user,"case":case,"owned":owned,"checked":checked,"error":error}));
                 }
             }
         }
+        let expected: Vec<Value> = include_str!("../../../../tests/fixtures/wire/anthropic-blocks.jsonl")
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(observed, expected);
+
         Ok(())
     }
 }

@@ -38,6 +38,8 @@
 //! OWNED BY the redact work.
 
 use crate::ir::{Block, Message, Session};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use regex::{Captures, Regex};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -46,8 +48,6 @@ use std::sync::OnceLock;
 /// Knobs for [`redact_with`]. Defaults scrub everything.
 #[derive(Debug, Clone, Default)]
 pub struct RedactOptions {
-    /// If `false` (the default), email addresses are redacted. Set `true` to keep them.
-    pub keep_emails: bool,
     /// Which classes of secret to scrub. Defaults to all of them; narrow it to scrub only some
     /// (e.g. only PEM private keys while leaving identities/fixtures intact).
     pub classes: RedactClasses,
@@ -173,7 +173,7 @@ pub fn redact_with(session: &Session, opts: &RedactOptions) -> anyhow::Result<(S
         scrub_value(v, opts, &mut stats);
     }
     for msg in &mut out.messages {
-        redact_message_with_resolver(msg, opts, &mut stats, &resolver)?;
+        redact_message(msg, opts, &mut stats, &resolver)?;
     }
 
     Ok((out, stats))
@@ -187,11 +187,7 @@ pub fn redact_text(s: &str) -> String {
 
 /// Redact secrets from a single message in place. Public so streaming consumers (dataset export) can
 /// scrub one message at a time without materializing the whole session.
-pub fn redact_message(msg: &mut Message, opts: &RedactOptions, stats: &mut RedactStats) -> anyhow::Result<()> {
-    redact_message_with_resolver(msg, opts, stats, &crate::Resolver::new(None))
-}
-
-fn redact_message_with_resolver(
+pub fn redact_message(
     msg: &mut Message,
     opts: &RedactOptions,
     stats: &mut RedactStats,
@@ -248,10 +244,10 @@ fn redact_message_with_resolver(
     Ok(())
 }
 
-/// Recursively scrub string values inside a JSON value, leaving keys and structure intact. Public
-/// so per-block redacting renderers (dataset export) can scrub a tool input without going through
-/// [`redact_message`] on a cloned message.
-pub fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
+/// Recursively scrub string values inside a JSON value, leaving keys and structure intact.
+/// Crate-visible so per-block redacting renderers (dataset export) can scrub a tool input without
+/// going through [`redact_message`] on a cloned message.
+pub(crate) fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
     match v {
         Value::String(s) => {
             if let Cow::Owned(scrubbed) = scrub_cow(s, opts, stats) {
@@ -290,7 +286,7 @@ fn scrub(s: &str, opts: &RedactOptions, stats: &mut RedactStats) -> String {
 /// Each enabled [`Rule`] keeps its earliest guarded hit at or after the cursor; the leftmost hit
 /// wins, and at a tie the earlier rule (the order of [`rules`]) wins. An existing placeholder is a
 /// rule too (the first), consumed verbatim, which is what makes the transform idempotent.
-pub fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
+pub(crate) fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
     let rules: Vec<&Rule> = rules().iter().filter(|r| r.kind.enabled(opts)).collect();
     let mut next: Vec<Option<Hit>> = rules.iter().map(|r| r.next_hit(s, 0)).collect();
     // The redacted output, allocated lazily on the first match; `copied` is how much of `s` has
@@ -308,7 +304,7 @@ pub fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) 
         let Hit { start, keep, end, kind } = *hit;
         cur = end.max(start + 1);
         let Some(label) = kind.label() else { continue }; // a placeholder: leave it in place
-        let o = out.get_or_insert_with(|| String::with_capacity(s.len()));
+        let o = out.get_or_insert_with(String::new);
         // The clean stretch plus any prefix the rule preserves (e.g. `Authorization: `).
         o.push_str(&s[copied..keep]);
         o.push_str(PLACEHOLDER_OPEN);
@@ -347,7 +343,7 @@ impl Kind {
             Kind::Assignment => c.assignments,
             Kind::ApiKey => c.api_keys,
             Kind::Jwt => c.jwts,
-            Kind::Email => c.emails && !opts.keep_emails,
+            Kind::Email => c.emails,
             Kind::Blob => c.blobs,
         }
     }
@@ -742,21 +738,7 @@ mod tests {
 
     fn empty_session() -> Session {
         Session {
-            source_stamp: None,
-            id: "t".into(),
-            harness: Harness::Claude,
-            cwd: None,
-            title: None,
-            created_at: None,
-            updated_at: None,
-            model: None,
-            git: None,
-            messages: Vec::new(),
-            source_path: None,
-            extra: serde_json::Map::new(),
-            principal: None,
-            system_prompt: None,
-            lineage: crate::ir::Lineage::default(),
+            ..Session::new("t", Harness::Claude)
         }
     }
 
@@ -833,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_emails_option() {
+    fn emails_class_off_keeps_emails() {
         let mut sess = empty_session();
         let mut m = Message::new(Role::User);
         m.content.push(Block::Text {
@@ -843,8 +825,10 @@ mod tests {
         let (out, _stats) = redact_with(
             &sess,
             &RedactOptions {
-                keep_emails: true,
-                ..Default::default()
+                classes: RedactClasses {
+                    emails: false,
+                    ..Default::default()
+                },
             },
         )
         .unwrap();
@@ -857,7 +841,6 @@ mod tests {
         // The exact ask: scrub PEM blocks, leave email/identity and api-key fixtures untouched.
         let opts = RedactOptions {
             classes: RedactClasses::parse_only("private_key").unwrap(),
-            ..Default::default()
         };
         let text = "mail me@example.com key sk-abcDEF1234567890ghijkl\n-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\ndone";
         let mut stats = RedactStats::default();
@@ -1375,7 +1358,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&value)?)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let text = source
-            .read_range_value(0, source.len(), |view| view.get("text")?.unwrap().source_text())?
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
+                view.get("text")?.unwrap().source_text()
+            })?
             .unwrap();
         let raw = crate::Json::source(&path, 0, source.len())?;
         let mut session = Session::new("redaction", crate::Harness::OpenCode);
@@ -1410,7 +1395,13 @@ mod tests {
         let mut stale = session.messages[0].clone();
         std::fs::write(&path, b"replacement")?;
         let mut failed_stats = RedactStats::default();
-        assert!(redact_message(&mut stale, &RedactOptions::default(), &mut failed_stats).is_err());
+        assert!(redact_message(
+            &mut stale,
+            &RedactOptions::default(),
+            &mut failed_stats,
+            &session.resolver()
+        )
+        .is_err());
         assert_eq!(failed_stats.total(), 0);
         Ok(())
     }
@@ -1420,20 +1411,29 @@ mod tests {
         let world = crate::test_world("redact-implicit-span");
         let path = world.base.join("body.txt");
         let secret = fixture("sk-", "testabcdefghijklmnopqrstuvwxyz");
-        std::fs::write(&path, &secret)?;
+        std::fs::write(&path, serde_json::to_string(&secret)?)?;
         let mut session = Session::new("implicit", crate::Harness::Claude);
         session.source_path = Some(path);
         let mut message = Message::new(crate::Role::User);
         message.content.push(Block::Text {
             text: crate::Text::Span(crate::lazy::Span {
                 source: None,
-                offset: 0,
+                offset: 1,
                 len: secret.len() as u64,
                 escaped: false,
             }),
         });
         session.messages.push(message);
         assert!(!serde_json::to_string(&redact(&session)?)?.contains(&secret));
+        let resolver = session.resolver();
+        let mut message = session.messages[0].clone();
+        redact_message(
+            &mut message,
+            &RedactOptions::default(),
+            &mut RedactStats::default(),
+            &resolver,
+        )?;
+        assert!(!serde_json::to_string(&message)?.contains(&secret));
         Ok(())
     }
 
@@ -1450,47 +1450,19 @@ mod tests {
     }
 
     #[test]
-    fn blob_suffix_offsets_match_the_previous_suffix_table() {
-        fn legacy(re: &Regex, s: &str) -> Option<(usize, usize)> {
-            let mut from = 0;
-            while let Some(m) = re.find_at(s, from) {
-                let (start, end) = (m.start(), m.end());
-                let mut pure = vec![(true, true, true); end - start + 1];
-                for q in (start..end).rev() {
-                    let (h, u, d) = pure[q + 1 - start];
-                    let c = s.as_bytes()[q];
-                    pure[q - start] = (
-                        h && c.is_ascii_hexdigit(),
-                        u && is_token_char(c),
-                        d && is_base64_std_char(c),
-                    );
-                }
-                for p in start..end.saturating_sub(31) {
-                    let (h, u, d) = pure[p - start];
-                    if (h || u || d)
-                        && end - p >= if h { 32 } else { 40 }
-                        && boundary_before(s, p)
-                        && keyword_before(s, p, 48)
-                    {
-                        return Some((p, end));
-                    }
-                }
-                from = end;
-            }
-            None
-        }
+    fn blob_suffix_offsets_match_the_recorded_table() {
         let rule = rules().iter().find(|r| r.kind == Kind::Blob).unwrap();
+        let mut frozen = crate::emit::frozen::Frozen::new("redact-blob-offsets");
         for prefix in ["", "key ", "secret = ", "ordinary ", "clé key "] {
             for stem in ["abcdef", "abcdefghi", "abc-def_", "abc/def+", "abc==="] {
                 for repeats in [1, 5, 8, 20, 1000] {
                     let input = format!("{prefix}{}", stem.repeat(repeats));
-                    assert_eq!(
-                        next_blob(&rule.re, &input, 0).map(|h| (h.start, h.end)),
-                        legacy(&rule.re, &input)
-                    );
+                    let actual = next_blob(&rule.re, &input, 0).map(|h| (h.start, h.end));
+                    frozen.insert(format!("{prefix:?} {stem} x{repeats}"), serde_json::json!(actual));
                 }
             }
         }
+        frozen.check().unwrap();
         assert!(matches!(
             scrub_cow(
                 &"x".repeat(1_000_000),

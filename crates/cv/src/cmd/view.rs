@@ -1,23 +1,17 @@
 //! `cv show` (and its `--tree` / `--kind` views) / `cv export` — reading sessions,
 //! plus the streaming renderer (`stream_session_render`) and its header/message helpers.
 
+use super::frames::Frames;
 use crate::util::{
     continue_hint, count_messages, home_rel, parse_harness, resolve, resolve_found, short_id, split_harness_id, usage,
-    Window, WindowArgs,
+    StreamWindow, Window, WindowArgs,
 };
 use anyhow::{bail, Context, Result};
-use cv_core::ir::{truncate, Block, Harness, Message, MessageKind, Role, Session, SessionRef};
+use cv_core::ir::{truncate, Block, Harness, Message, MessageKind, Session, SessionRef};
 use cv_core::render::turn_label;
 use cv_core::Adapter;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::PathBuf;
-
-/// A piped `cv show` with no selector prints at most this much before switching to head + tail:
-/// agents read cv through pipes constantly, and a full transcript in a tool result is the
-/// context-window failure mode this exists to prevent.
-const PIPE_GUARD_BYTES: usize = 200 * 1024;
-/// How many messages each end of the head + tail view shows.
-const PIPE_GUARD_EDGE: usize = 20;
 
 /// The views `cv show` offers instead of the plain transcript (each flag documented on `Cmd::Show`).
 pub(crate) struct ShowView {
@@ -30,8 +24,8 @@ pub(crate) struct ShowView {
 }
 
 /// What `--kind` selects: each family has one compact view.
-enum KindView {
-    /// `prompt` / `answer`: what the person said (`orchestrate::print_prompts`).
+pub(super) enum KindView {
+    /// `prompt` / `answer`: what the person said (`session_reports::print_prompts`).
     Said { prompts: bool, answers: bool },
     /// `compaction_boundary` / `compaction_summary`: the compaction seams, each boundary paired
     /// with its summary (`compaction::print_compactions`).
@@ -41,7 +35,13 @@ enum KindView {
     Affordances(std::collections::HashSet<cv_core::affordance::Kind>),
 }
 
-fn parse_kinds(spec: &str) -> Result<KindView> {
+pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Family {
+        Said,
+        Compactions,
+        Affordances,
+    }
     const SAID: [&str; 2] = ["prompt", "answer"];
     const SEAMS: [&str; 2] = ["compaction_boundary", "compaction_summary"];
     let kinds: Vec<&str> = spec.split(',').map(str::trim).filter(|k| !k.is_empty()).collect();
@@ -53,11 +53,11 @@ fn parse_kinds(spec: &str) -> Result<KindView> {
     );
     let family = |k: &str| {
         if SAID.contains(&k) {
-            Some(0)
+            Some(Family::Said)
         } else if SEAMS.contains(&k) {
-            Some(1)
+            Some(Family::Compactions)
         } else if k == "affordances" || cv_core::affordance::Kind::parse(k).is_some() {
-            Some(2)
+            Some(Family::Affordances)
         } else {
             None
         }
@@ -65,15 +65,15 @@ fn parse_kinds(spec: &str) -> Result<KindView> {
     if let Some(k) = kinds.iter().find(|k| family(k).is_none()) {
         return usage(format!("no `--kind` view for {k:?} — {accepted}"));
     }
-    let families: std::collections::BTreeSet<u8> = kinds.iter().filter_map(|k| family(k)).collect();
+    let families: std::collections::BTreeSet<Family> = kinds.iter().filter_map(|k| family(k)).collect();
     match families.iter().copied().collect::<Vec<_>>().as_slice() {
         [] => usage(format!("`--kind` is empty — {accepted}")),
-        [0] => Ok(KindView::Said {
+        [Family::Said] => Ok(KindView::Said {
             prompts: kinds.contains(&"prompt"),
             answers: kinds.contains(&"answer"),
         }),
-        [1] => Ok(KindView::Compactions),
-        [2] => Ok(KindView::Affordances(
+        [Family::Compactions] => Ok(KindView::Compactions),
+        [Family::Affordances] => Ok(KindView::Affordances(
             cv_core::affordance::parse_kinds(&kinds).expect("every word checked above"),
         )),
         _ => usage(format!("`--kind {spec}` mixes two views — {accepted}")),
@@ -167,7 +167,7 @@ pub(crate) fn cmd_show(
                 let range = show_range(&r, window, pre_compaction)?
                     .map(|w| w.bounds(|| count_messages(adapter.as_ref(), &r)))
                     .transpose()?;
-                crate::cmd::orchestrate::print_prompts(&r, adapter.as_ref(), range, prompts, answers, json)
+                crate::cmd::session_reports::print_prompts(&r, adapter.as_ref(), range, prompts, answers, json)
             }
             KindView::Affordances(kinds) => {
                 if window.max_bytes.is_some() {
@@ -236,10 +236,7 @@ pub(crate) fn cmd_show(
     if json {
         return print_session_json(adapter.as_ref(), &r, range, window.max_bytes, false, None).map(|_| ());
     }
-    // The pipe guard applies only to a selector-less, budget-less render (an explicit window or
-    // budget is the caller saying what they want).
-    let guard = selector.is_none() && pre_compaction.is_none() && window.max_bytes.is_none();
-    render_text(adapter.as_ref(), &r, range, window.max_bytes, guard)
+    render_text(adapter.as_ref(), &r, range, window.max_bytes)
 }
 
 /// The window `show` reads: the selector's, or — under `--pre-compaction <N>` — the span before
@@ -274,113 +271,35 @@ fn show_range(r: &SessionRef, window: &WindowArgs, pre_compaction: Option<usize>
     Ok(Some(Window::Range(start, Some(end))))
 }
 
-/// Collect a full-fidelity JSON window while reading through EOF for final session metadata.
-/// Discarded messages die in the sink; `Last` keeps only its bounded tail. Lazy content retains
-/// full extras, then selected messages are materialized before budgeting and serialization.
+/// The CLI's window over `r`: the selector's bounds or the last `n`, cut at the byte budget.
+fn window_sink(r: &SessionRef, window: Option<Window>, max_bytes: Option<usize>) -> Result<cv_core::api::WindowSink> {
+    use cv_core::api::WindowSink;
+    let sink = match window.map_or(StreamWindow::Range(0, None), Window::streaming) {
+        StreamWindow::Tail(n) => WindowSink::new(&r.path, 0, None).tail(n),
+        StreamWindow::Range(start, end) => WindowSink::new(&r.path, start, end),
+    };
+    Ok(sink.budget(max_bytes))
+}
+
+/// Collect a full-fidelity JSON window, materialized, while reading through EOF for final
+/// session metadata: redaction's cross-field rules need the decoded tree.
 fn session_json_window(
     adapter: &dyn Adapter,
     r: &SessionRef,
     window: Option<Window>,
     max_bytes: Option<usize>,
 ) -> Result<(Session, Option<usize>)> {
-    struct Selection {
-        resolver: cv_core::Resolver,
-        seen: usize,
-        start: usize,
-        end: Option<usize>,
-        tail: Option<usize>,
-        messages: std::collections::VecDeque<Message>,
-        max_bytes: Option<usize>,
-        bytes: usize,
-        next: Option<usize>,
-        error: Option<anyhow::Error>,
-    }
-    impl Selection {
-        fn keep(&mut self, mut m: Message, index: usize) {
-            if self.next.is_some() || self.error.is_some() {
-                return;
-            }
-            if let Err(error) = m.materialize(&self.resolver) {
-                self.error = Some(error);
-                return;
-            }
-            if let Some(budget) = self.max_bytes {
-                match serde_json::to_vec(&m) {
-                    Ok(v) => {
-                        if !self.messages.is_empty() && self.bytes + v.len() > budget {
-                            self.next = Some(index);
-                            return;
-                        }
-                        self.bytes += v.len();
-                    }
-                    Err(e) => {
-                        self.error = Some(e.into());
-                        return;
-                    }
-                }
-            }
-            self.messages.push_back(m);
-        }
-    }
-    impl cv_core::MessageSink for Selection {
-        fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.error.take()
-        }
-        fn message(&mut self, m: Message) -> cv_core::Flow {
-            let index = self.seen;
-            self.seen += 1;
-            if let Some(n) = self.tail {
-                if n > 0 {
-                    self.messages.push_back(m);
-                    if self.messages.len() > n {
-                        self.messages.pop_front();
-                    }
-                }
-            } else if index >= self.start && self.end.is_none_or(|end| index < end) {
-                self.keep(m, index);
-            }
-            // Even past the selected window, read session facts written later in the source.
-            cv_core::Flow::Continue
-        }
-    }
-    let (start, end, tail) = match window {
-        Some(Window::Last(n)) => (0, None, Some(n)),
-        Some(w) => {
-            let (start, end) = w.bounds(|| unreachable!("Last is handled by the tail"))?;
-            (start, end, None)
-        }
-        None => (0, None, None),
-    };
-    let mut sink = Selection {
-        resolver: cv_core::Resolver::new(Some(r.path.clone())),
-        seen: 0,
-        start,
-        end,
-        tail,
-        messages: Default::default(),
-        max_bytes,
-        bytes: 0,
-        next: None,
-        error: None,
-    };
+    let mut sink = window_sink(r, window, max_bytes)?.keeping();
     let mut session = cv_core::stream::stream_counted(
         adapter,
         r,
-        &cv_core::ParseOptions::lazy_extra(),
+        &cv_core::Demand::RICH.with_spans(),
         &mut sink,
         cv_core::stream::Pass::RECORD,
     )?
     .session;
-    if sink.tail.is_some() {
-        let start = sink.seen - sink.messages.len();
-        for (i, m) in std::mem::take(&mut sink.messages).into_iter().enumerate() {
-            sink.keep(m, start + i);
-        }
-    }
-    if let Some(e) = sink.error {
-        return Err(e);
-    }
-    session.messages = sink.messages.into_iter().collect();
+    sink.finish()?;
+    session.messages = sink.take_kept();
     Ok((session, sink.next))
 }
 
@@ -404,131 +323,17 @@ fn staged_session_json_inner(
     document: bool,
     checked: bool,
 ) -> Result<(cv_core::bytes::ByteSource, Option<usize>)> {
-    use cv_core::bytes::ByteStage;
-    use std::io::BufWriter;
-    struct Selection {
-        resolver: cv_core::Resolver,
-        seen: usize,
-        start: usize,
-        end: Option<usize>,
-        tail: Option<usize>,
-        tail_messages: std::collections::VecDeque<Message>,
-        stage: BufWriter<ByteStage>,
-        budget: Option<usize>,
-        bytes: usize,
-        count: usize,
-        next: Option<usize>,
-        error: Option<anyhow::Error>,
-    }
-    impl Selection {
-        fn accept(&mut self, message: Message, index: usize) -> Result<()> {
-            if self.next.is_some() {
-                return Ok(());
-            }
-            // Pending bytes belong to the same logical spool; do not flush each frame.
-            let before = self.stage.get_ref().len() + self.stage.buffer().len() as u64;
-            let remaining = (self.count > 0)
-                .then(|| self.budget.map(|budget| budget.saturating_sub(self.bytes)))
-                .flatten();
-            let size = super::session_json::write_budgeted_message_frame(
-                &mut self.stage,
-                &message,
-                &self.resolver,
-                remaining,
-            )?;
-            if self.count > 0
-                && self
-                    .budget
-                    .is_some_and(|budget| size > budget.saturating_sub(self.bytes))
-            {
-                self.stage.flush()?;
-                self.stage.get_mut().truncate(before)?;
-                self.next = Some(index);
-                return Ok(());
-            }
-            self.bytes = self.bytes.checked_add(size).context("JSON budget size overflow")?;
-            self.count += 1;
-            Ok(())
-        }
-    }
-    impl cv_core::MessageSink for Selection {
-        fn extra_projection(&self) -> cv_core::stream::ExtraProjection {
-            if self.tail.is_some()
-                || (self.error.is_none()
-                    && self.next.is_none()
-                    && self.seen >= self.start
-                    && self.end.is_none_or(|end| self.seen < end))
-            {
-                cv_core::stream::ExtraProjection::Full
-            } else {
-                cv_core::stream::ExtraProjection::Facts
-            }
-        }
-        fn meta(&mut self, session: &Session) {
-            self.resolver = session.resolver();
-        }
-        fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.error.take()
-        }
-        fn message(&mut self, message: Message) -> cv_core::Flow {
-            let index = self.seen;
-            self.seen += 1;
-            if self.error.is_none()
-                && (self.tail.is_some_and(|n| n > 0)
-                    || (self.tail.is_none() && index >= self.start && self.end.is_none_or(|end| index < end)))
-            {
-                if let Some(n) = self.tail {
-                    self.tail_messages.push_back(message);
-                    if self.tail_messages.len() > n {
-                        self.tail_messages.pop_front();
-                    }
-                } else if let Err(error) = self.accept(message, index) {
-                    self.error = Some(error);
-                }
-            }
-            cv_core::Flow::Continue
-        }
-    }
-    let (start, end, tail) = match window {
-        Some(Window::Last(n)) => (0, None, Some(n)),
-        Some(w) => {
-            let (start, end) = w.bounds(|| unreachable!())?;
-            (start, end, None)
-        }
-        None => (0, None, None),
-    };
-    let mut sink = Selection {
-        resolver: cv_core::Resolver::new(Some(r.path.clone())),
-        seen: 0,
-        start,
-        end,
-        tail,
-        tail_messages: Default::default(),
-        stage: BufWriter::with_capacity(64 * 1024, ByteStage::default()),
-        budget: max_bytes,
-        bytes: 0,
-        count: 0,
-        next: None,
-        error: None,
-    };
+    let mut sink = window_sink(r, window, max_bytes)?;
     let pass = cv_core::stream::Pass {
         guard: checked,
         ..cv_core::stream::Pass::RECORD
     };
-    let read = cv_core::stream::stream_counted(adapter, r, &cv_core::ParseOptions::lazy_extra(), &mut sink, pass)?;
-    let (session, guard) = (read.session, read.guard);
-    if let Some(error) = sink.error.take() {
-        return Err(error);
-    }
-    let start = sink.seen - sink.tail_messages.len();
-    for (i, message) in std::mem::take(&mut sink.tail_messages).into_iter().enumerate() {
-        sink.accept(message, start + i)?;
-    }
-    let frames = sink.stage.into_inner().map_err(|error| error.into_error())?.finish()?;
-    let mut output = BufWriter::with_capacity(64 * 1024, ByteStage::default());
-    super::session_json::write_document(&mut output, &session, &frames, sink.count, document)?;
+    let read = cv_core::stream::stream_counted(adapter, r, &cv_core::Demand::RICH.with_spans(), &mut sink, pass)?;
+    let frames = sink.finish()?;
+    let mut output = std::io::BufWriter::with_capacity(64 * 1024, cv_core::bytes::ByteStage::default());
+    super::session_json::write_document(&mut output, &read.session, &frames, sink.selected, document)?;
     output.write_all(b"\n")?;
-    if let Some(guard) = guard {
+    if let Some(guard) = read.guard {
         guard.verify(r)?;
     }
     Ok((
@@ -586,77 +391,10 @@ fn print_session_json(
     Ok(stats)
 }
 
-/// The rendered-transcript path of `cv show`, with the pipe guard: a selector-less render to a
-/// non-terminal stdout that would exceed [`PIPE_GUARD_BYTES`] becomes the first and last
-/// [`PIPE_GUARD_EDGE`] messages with a hint line between them.
-fn render_text(
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    range: Option<Window>,
-    max_bytes: Option<usize>,
-    guard: bool,
-) -> Result<()> {
+/// The rendered-transcript path of `cv show`: the window and byte budget the caller asked for,
+/// else the whole transcript, on a terminal and a pipe alike.
+fn render_text(adapter: &dyn Adapter, r: &SessionRef, range: Option<Window>, max_bytes: Option<usize>) -> Result<()> {
     let stdout = std::io::stdout();
-    if guard && !stdout.is_terminal() {
-        // Render into memory under the guard's budget; if it all fits, that IS the output.
-        let mut buf = Vec::new();
-        let probe = stream_session_render(
-            adapter,
-            r,
-            &mut buf,
-            show_header,
-            show_message,
-            RenderOpts {
-                range: None,
-                max_bytes: Some(PIPE_GUARD_BYTES),
-            },
-        )?;
-        let mut out = std::io::BufWriter::new(stdout.lock());
-        if probe.next.is_none() {
-            out.write_all(&buf)?;
-            out.flush()?;
-            return Ok(());
-        }
-        let total = count_messages(adapter, r)?;
-        if total <= 2 * PIPE_GUARD_EDGE {
-            // Too few messages to elide any — the size is in the messages themselves.
-            stream_session_render(adapter, r, &mut out, show_header, show_message, RenderOpts::default())?;
-            out.flush()?;
-            return Ok(());
-        }
-        stream_session_render(
-            adapter,
-            r,
-            &mut out,
-            show_header,
-            show_message,
-            RenderOpts {
-                range: Some(Window::Range(0, Some(PIPE_GUARD_EDGE))),
-                max_bytes: None,
-            },
-        )?;
-        writeln!(
-            out,
-            "… {} messages omitted ({total} total; the full render exceeds {} KB on a pipe) — read them with \
-             --first N, --last N, --range A..B, or --around N; --max-bytes N caps output\n",
-            total - 2 * PIPE_GUARD_EDGE,
-            PIPE_GUARD_BYTES / 1024,
-        )?;
-        stream_session_render(
-            adapter,
-            r,
-            &mut out,
-            |_| String::new(),
-            show_message,
-            RenderOpts {
-                range: Some(Window::Range(total - PIPE_GUARD_EDGE, None)),
-                max_bytes: None,
-            },
-        )?;
-        out.flush()?;
-        return Ok(());
-    }
-
     let mut out = std::io::BufWriter::new(stdout.lock());
     let outcome = stream_session_render(
         adapter,
@@ -687,7 +425,7 @@ fn agent_parents_for_harness(parents: Vec<SessionRef>, want: Option<Harness>) ->
 fn show_agent_fleetwide(agent_id: &str, want: Option<Harness>, json: bool, window: &WindowArgs) -> Result<bool> {
     let parents = agent_parents_for_harness(cv_core::find_subagent_parents(agent_id), want);
     // Copies of one agent across sessions (`cv adopt`) read through the newest parent's copy.
-    let parents = if parents.len() > 1 && cv_core::one_agent_across(&parents, agent_id) {
+    let parents = if parents.len() > 1 && cv_core::one_agent_across(&parents, agent_id)? {
         eprintln!(
             "✦ {} sessions hold a copy of this agent (adopted); reading the newest — `cv show <session> --agent {agent_id}` for another",
             parents.len()
@@ -735,9 +473,9 @@ fn show_agent_fleetwide(agent_id: &str, want: Option<Harness>, json: bool, windo
 
 /// List the sub-agent forest a session spawned (the `--subagents` view): every direct/`Workflow`
 /// sub-agent with its type, journaled outcome, and final return value. `json` emits the structured
-/// [`SubagentInfo`] forest (each annotated with its return) for machine consumption.
+/// [`AgentRef`] forest (each annotated with its return) for machine consumption.
 fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
-    let subs = cv_core::subagent_tree_of(r);
+    let subs = cv_core::subagent_tree_of(r)?;
 
     if json {
         // Enrich each with its final return value (direct agents report via the parent tool_result;
@@ -752,14 +490,14 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
                     obj.insert("agent_id".into(), serde_json::Value::String(s.agent_id().to_string()));
                     // Direct agents have no journaled summary — attach their final return value.
                     if s.result_summary.is_none() {
-                        if let Some(ret) = cv_core::harness::claude::subagent_return(&s.session.path) {
+                        if let Some(ret) = cv_core::harness::claude::subagent_return(&s.session.path)? {
                             obj.insert("return".into(), serde_json::Value::String(ret));
                         }
                     }
                 }
-                v
+                Ok(v)
             })
-            .collect();
+            .collect::<Result<_>>()?;
         println!("{}", serde_json::to_string_pretty(&enriched)?);
         return Ok(());
     }
@@ -777,7 +515,7 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
         // the last text turn of its transcript. Transcript-derived, so sanitized at the seam (G5);
         // the `--json` path stays raw.
         if s.result_summary.is_none() {
-            if let Some(ret) = cv_core::harness::claude::subagent_return(&s.session.path) {
+            if let Some(ret) = cv_core::harness::claude::subagent_return(&s.session.path)? {
                 println!("  ↩ {}", truncate(&cv_core::sanitize::sanitize_line(&ret), 400));
             }
         }
@@ -787,20 +525,15 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
 
 /// One sub-agent of `parent` by its `agent-…` id, bare agentId, or a unique prefix of either — the
 /// resolution `cv show --agent` and `cv rewind --agent` share. No match / several → exit 2.
-pub(crate) fn resolve_subagent(parent: &SessionRef, agent_id: &str) -> Result<cv_core::SubagentInfo> {
+pub(crate) fn resolve_subagent(parent: &SessionRef, agent_id: &str) -> Result<cv_core::AgentRef> {
+    // A member id is the agent's own (Claude's `agent-<id>`) or `<parent>/<agent>` (Kimi, Kimi
+    // Code): either spelling's agent part is what a caller types.
     let subs = cv_core::subagent_tree_filtered_of(parent, cv_core::SubagentDemand::Rich, None, |id, _| {
-        id.starts_with(agent_id) || id.strip_prefix("agent-").is_some_and(|bare| bare.starts_with(agent_id))
-    });
-    // Match on the full session id (`agent-…`), the bare agentId, or a prefix of either.
-    let matches: Vec<&cv_core::SubagentInfo> = subs
-        .iter()
-        .filter(|s| {
-            s.session.id == agent_id
-                || s.agent_id() == agent_id
-                || s.session.id.starts_with(agent_id)
-                || s.agent_id().starts_with(agent_id)
+        [id, id.rsplit('/').next().unwrap_or(id)].into_iter().any(|id| {
+            id.starts_with(agent_id) || id.strip_prefix("agent-").is_some_and(|bare| bare.starts_with(agent_id))
         })
-        .collect();
+    })?;
+    let matches: Vec<&cv_core::AgentRef> = subs.iter().collect();
     match matches.as_slice() {
         [one] => Ok((*one).clone()),
         [] => usage(format!(
@@ -862,7 +595,13 @@ fn show_one_subagent(
         status,
         wf,
     );
-    render_text(adapter, &sub.session, range, window.max_bytes, false)
+    render_text(adapter, &sub.session, range, window.max_bytes)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ExportFormat {
+    Markdown,
+    OpenSession,
 }
 
 /// Complete export staged privately before HTTP download publication. Uses the native
@@ -870,25 +609,25 @@ fn show_one_subagent(
 pub(crate) fn stage_export(
     adapter: &dyn Adapter,
     r: &SessionRef,
-    format: &str,
+    format: ExportFormat,
 ) -> Result<(cv_core::bytes::ByteSource, u64)> {
     let _reads = cv_core::source::read_scope();
-    if format == "opensession" {
+    if matches!(format, ExportFormat::OpenSession) {
         let (body, next) = staged_session_json_inner(adapter, r, None, None, true, true)?;
         anyhow::ensure!(next.is_none(), "full export unexpectedly truncated");
         let bytes = body.byte_len()?;
         return Ok((body, bytes));
     }
-    anyhow::ensure!(format == "markdown", "unsupported export format");
     let mut output = std::io::BufWriter::with_capacity(64 * 1024, cv_core::bytes::ByteStage::default());
+    let resolver = cv_core::Resolver::new(Some(r.path.clone()));
     let outcome = stream_session_render_inner(
         adapter,
         r,
         &mut output,
         md_header,
-        md_message,
+        |m| md_message(m, &resolver),
         RenderOpts::default(),
-        true,
+        Mode::CheckedMarkdown,
     )?;
     anyhow::ensure!(outcome.next.is_none(), "full export unexpectedly truncated");
     let stage = output.into_inner().map_err(|error| error.into_error())?;
@@ -910,6 +649,7 @@ pub(crate) fn cmd_export(
     // `--redact`: the same scrubber `cv share` runs (API keys, private keys, JWTs, emails,
     // assignments, high-entropy blobs), applied per block before anything is rendered; the
     // per-class counts go to stderr so stdout stays the document.
+    let resolver = cv_core::Resolver::new(Some(r.path.clone()));
     let opts = RedactOptions::default();
     let stats = std::cell::RefCell::new(RedactStats::default());
     match format {
@@ -917,7 +657,7 @@ pub(crate) fn cmd_export(
             if !redact && range.is_none() && window.max_bytes.is_none() {
                 // The same checked complete document serves native save and HTTP download.
                 // Finish every source demand before stdout can receive even a header prefix.
-                let (body, _) = stage_export(adapter.as_ref(), &r, "markdown")?;
+                let (body, _) = stage_export(adapter.as_ref(), &r, ExportFormat::Markdown)?;
                 let mut out = std::io::BufWriter::new(std::io::stdout().lock());
                 body.copy_to(&mut out)?;
                 out.flush()?;
@@ -938,11 +678,11 @@ pub(crate) fn cmd_export(
                 },
                 |m| {
                     if !redact {
-                        return md_message(m);
+                        return md_message(m, &resolver);
                     }
                     let mut m = m.clone();
-                    redact_message(&mut m, &opts, &mut stats.borrow_mut())?;
-                    md_message(&m)
+                    redact_message(&mut m, &opts, &mut stats.borrow_mut(), &resolver)?;
+                    md_message(&m, &resolver)
                 },
                 RenderOpts {
                     range,
@@ -956,6 +696,14 @@ pub(crate) fn cmd_export(
         }
         // `--format json` IS OpenSession 0.3: the IR, plus the version marker.
         "json" => {
+            if !redact && range.is_none() && window.max_bytes.is_none() {
+                // Checked and complete, like the Markdown document above.
+                let (body, _) = stage_export(adapter.as_ref(), &r, ExportFormat::OpenSession)?;
+                let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+                body.copy_to(&mut out)?;
+                out.flush()?;
+                return Ok(());
+            }
             let st = print_session_json(
                 adapter.as_ref(),
                 &r,
@@ -1006,7 +754,7 @@ fn read_tree(r: &SessionRef, adapter: &dyn Adapter) -> Result<(Session, Vec<Tree
     struct TreeSink {
         rows: Vec<TreeRow>,
         resolver: cv_core::Resolver,
-        first_user: Option<String>,
+        first_prompt: Option<String>,
         error: Option<anyhow::Error>,
     }
     impl cv_core::MessageSink for TreeSink {
@@ -1018,8 +766,8 @@ fn read_tree(r: &SessionRef, adapter: &dyn Adapter) -> Result<(Session, Vec<Tree
         }
         fn message(&mut self, m: Message) -> cv_core::Flow {
             let result = (|| -> Result<()> {
-                if self.first_user.is_none() && m.role == Role::User {
-                    self.first_user = cv_core::render::message_label(&m, &self.resolver)?;
+                if self.first_prompt.is_none() {
+                    self.first_prompt = m.prompt_title(&self.resolver)?;
                 }
                 let preview = cv_core::render::message_text_preview(&m, &self.resolver, 80)?;
                 let line = tree_line_with_preview(&m, preview);
@@ -1040,27 +788,27 @@ fn read_tree(r: &SessionRef, adapter: &dyn Adapter) -> Result<(Session, Vec<Tree
     let mut sink = TreeSink {
         rows: Vec::new(),
         resolver: cv_core::Resolver::new(Some(r.path.clone())),
-        first_user: None,
+        first_prompt: None,
         error: None,
     };
     let pass = cv_core::stream::Pass {
         guard: true,
         ..cv_core::stream::Pass::RECORD
     };
-    let read = cv_core::stream::stream_counted(adapter, r, &cv_core::ParseOptions::facts(), &mut sink, pass)?;
+    let read = cv_core::stream::stream_counted(adapter, r, &cv_core::Demand::FACTS.with_spans(), &mut sink, pass)?;
     let session = read.session;
     if let Some(error) = sink.error {
         return Err(error);
     }
     read.guard.expect("guarded pass").verify(r)?;
-    Ok((session, sink.rows, sink.first_user))
+    Ok((session, sink.rows, sink.first_prompt))
 }
 
 fn print_tree(r: &SessionRef, adapter: &dyn Adapter) -> Result<()> {
-    let (session, rows, first_user) = read_tree(r, adapter)?;
+    let (session, rows, first_prompt) = read_tree(r, adapter)?;
     println!(
         "# {}",
-        cv_core::label_from(session.title.as_deref(), first_user.as_deref())
+        cv_core::label_from(session.title.as_deref(), first_prompt.as_deref())
     );
     println!("{} · {} · {} msg", session.harness, session.id, rows.len());
     println!();
@@ -1073,23 +821,23 @@ fn print_tree(r: &SessionRef, adapter: &dyn Adapter) -> Result<()> {
             println!("{:>4}. {}", i + 1, row.line);
         }
     }
-    render_subagent_forest(r);
+    render_subagent_forest(r)?;
     Ok(())
 }
 
 /// Print the sub-agent forest under a session: directly-spawned sub-agents, then each workflow's
 /// agents grouped together with the journaled `status: summary` outcome. Reads only the cheap
 /// metadata/journal sidecars (no transcript bodies).
-fn render_subagent_forest(r: &SessionRef) {
+fn render_subagent_forest(r: &SessionRef) -> Result<()> {
     use std::collections::BTreeMap;
-    let subs = cv_core::subagent_tree_of(r);
+    let subs = cv_core::subagent_tree_of(r)?;
     if subs.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let direct: Vec<&cv_core::SubagentInfo> = subs.iter().filter(|s| s.workflow.is_none()).collect();
+    let direct: Vec<&cv_core::AgentRef> = subs.iter().filter(|s| s.workflow.is_none()).collect();
     // Workflow agents grouped by run id (BTreeMap → stable run order).
-    let mut by_wf: BTreeMap<&str, Vec<&cv_core::SubagentInfo>> = BTreeMap::new();
+    let mut by_wf: BTreeMap<&str, Vec<&cv_core::AgentRef>> = BTreeMap::new();
     for s in subs.iter().filter(|s| s.workflow.is_some()) {
         by_wf.entry(s.workflow.as_deref().unwrap_or("")).or_default().push(s);
     }
@@ -1114,12 +862,13 @@ fn render_subagent_forest(r: &SessionRef) {
             println!("    • {}", subagent_line(s));
         }
     }
+    Ok(())
 }
 
 /// One line describing a sub-agent — `cv show --tree`'s forest and `cv show --subagents` share it: short
 /// id, type, the journaled status (workflow agents), message count, and the journaled summary or,
 /// failing that, the task description — capped and sanitized (both are transcript-derived).
-fn subagent_line(s: &cv_core::SubagentInfo) -> String {
+fn subagent_line(s: &cv_core::AgentRef) -> String {
     let id = short_id(s.agent_id());
     let kind = s.agent_type.as_deref().unwrap_or("agent");
     let status = s
@@ -1134,10 +883,15 @@ fn subagent_line(s: &cv_core::SubagentInfo) -> String {
         .or(s.description.as_deref())
         .map(|t| truncate(&cv_core::sanitize::sanitize_line(t), 88))
         .unwrap_or_default();
-    format!("{id}  {kind}{status}  {} msg  {blurb}", s.session.message_count)
+    format!(
+        "{id}  {kind}{status}  {} msg  {blurb}",
+        s.session.message_count.map_or("–".to_string(), |n| n.to_string())
+    )
 }
 
-/// Render messages as an indented DAG by `parent_id`. Roots (no/unknown parent) sit at depth 0.
+/// Render messages as a DAG by `parent_id`, indented by the forks above each row: an only child
+/// keeps its parent's depth and each child of a fork sits one deeper, so a straight chain is flat
+/// and the output stays linear in the session. Roots (no/unknown parent) sit at depth 0.
 fn walk_tree(rows: &[TreeRow], mut visit: impl FnMut(usize, usize)) {
     let mut by_id = std::collections::HashMap::new();
     for (i, row) in rows.iter().enumerate() {
@@ -1171,7 +925,8 @@ fn walk_tree(rows: &[TreeRow], mut visit: impl FnMut(usize, usize)) {
                 continue;
             }
             visit(index, depth);
-            stack.extend(children[index].iter().rev().map(|&child| (child, depth + 1)));
+            let below = depth + usize::from(children[index].len() > 1);
+            stack.extend(children[index].iter().rev().map(|&child| (child, below)));
         }
     }
 }
@@ -1257,11 +1012,18 @@ pub(crate) struct RenderOutcome {
     pub next: Option<usize>,
 }
 
+/// How a render delivers: to its writer, or as a complete checked Markdown export.
+enum Mode {
+    Plain,
+    CheckedMarkdown,
+}
+
 /// Render a session to `out` by **streaming** — each message is rendered and written as it arrives,
 /// then dropped, so a multi-GB transcript renders at O(largest message) instead of materializing the
 /// whole `Session`. The header needs the label and model, which come from the first user/assistant
-/// turns, so it's held behind a small bounded buffer (`HOLDBACK` messages) until those are known and
-/// then flushed ahead of the body — header info lives in the first turns, so the buffer stays tiny.
+/// turns, so it's held behind the shared holdback rule (`frames::Frames::ready`: model and title
+/// known, else a bounded message count) and then flushed ahead of the body — header info lives in
+/// the first turns, so the buffer stays tiny.
 pub(crate) fn stream_session_render<W: std::io::Write>(
     adapter: &dyn Adapter,
     r: &SessionRef,
@@ -1270,7 +1032,7 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
     render_msg: impl Fn(&Message) -> Result<String>,
     opts: RenderOpts,
 ) -> Result<RenderOutcome> {
-    stream_session_render_inner(adapter, r, out, header, render_msg, opts, false)
+    stream_session_render_inner(adapter, r, out, header, render_msg, opts, Mode::Plain)
 }
 
 fn stream_session_render_inner<W: std::io::Write>(
@@ -1280,10 +1042,10 @@ fn stream_session_render_inner<W: std::io::Write>(
     header: impl Fn(&HeaderInfo) -> String,
     render_msg: impl Fn(&Message) -> Result<String>,
     opts: RenderOpts,
-    checked: bool,
+    mode: Mode,
 ) -> Result<RenderOutcome> {
-    use cv_core::{Flow, MessageSink, ParseOptions};
-    const HOLDBACK: usize = 24;
+    use cv_core::{Demand, Flow, MessageSink};
+    let checked = matches!(mode, Mode::CheckedMarkdown);
     anyhow::ensure!(
         !checked || (opts.range.is_none() && opts.max_bytes.is_none()),
         "checked Markdown export requires a complete render"
@@ -1302,36 +1064,28 @@ fn stream_session_render_inner<W: std::io::Write>(
     /// message model — so [`Sink::finish_tail`] replays the window exactly as a second pass that
     /// started at `total - n` would have.
     struct Tail {
-        n: usize,
-        ring: std::collections::VecDeque<Message>,
-        seen: usize,
         metas: Vec<(usize, Meta)>,
         first_model: Option<(usize, String)>,
     }
 
     struct Sink<'w, W, H, R> {
-        out: &'w mut W,
+        frames: Frames<'w, W>,
         harness: Harness,
         id: String,
         cwd: Option<PathBuf>,
         title: Option<String>,
         model: Option<String>,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
-        first_user: Option<String>,
+        first_prompt: Option<String>,
         header: H,
         render_msg: R,
-        buf: Vec<String>,
         // Complete Markdown downloads hold the same header window in bounded private staging.
         checked_markdown: bool,
         checked_buf: Option<std::io::BufWriter<cv_core::bytes::ByteStage>>,
-        printed: bool,
-        result: std::io::Result<()>,
         resolver: cv_core::Resolver,
         // Windowed view: 0-based message index we're at, plus the [start, end) bounds. Messages
         // outside the window are never materialized — their on-disk content is never touched.
-        idx: usize,
-        start: usize,
-        end: Option<usize>,
+        window: cv_core::api::MessageWindow<Message>,
         // Byte budget: rendered bytes so far (header + messages) and where the cut landed.
         max_bytes: Option<usize>,
         bytes: usize,
@@ -1357,9 +1111,9 @@ fn stream_session_render_inner<W: std::io::Write>(
         /// with each meta delivered before the message it preceded.
         fn finish_tail(&mut self) {
             let Some(t) = self.tail.take() else { return };
-            let start = t.seen - t.ring.len();
-            self.start = start;
-            self.idx = start;
+            let messages = self.window.finish();
+            let start = self.window.start;
+            self.window.idx = start;
             let mut metas = t.metas.into_iter().peekable();
             let mut pre_model = t.first_model.filter(|(i, _)| *i < start);
             while let Some((at, m)) = metas.next_if(|(at, _)| *at <= start) {
@@ -1371,7 +1125,7 @@ fn stream_session_render_inner<W: std::io::Write>(
             if let Some((_, md)) = pre_model {
                 self.model.get_or_insert(md);
             }
-            for (k, m) in t.ring.into_iter().enumerate() {
+            for (k, (_, m)) in messages.into_iter().enumerate() {
                 while let Some((_, s)) = metas.next_if(|(at, _)| *at <= start + k) {
                     self.apply_meta(s);
                 }
@@ -1383,59 +1137,43 @@ fn stream_session_render_inner<W: std::io::Write>(
                 self.apply_meta(s);
             }
         }
-        fn write(&mut self, s: &str) {
-            if self.result.is_ok() {
-                self.result = self.out.write_all(s.as_bytes());
-            }
-        }
-        fn flush_header(&mut self) {
-            if self.printed {
-                return;
-            }
-            let info = HeaderInfo {
+        fn header_now(&self) -> String {
+            (self.header)(&HeaderInfo {
                 harness: self.harness,
                 id: self.id.clone(),
                 cwd: self.cwd.clone(),
-                label: cv_core::label_from(self.title.as_deref(), self.first_user.as_deref()),
+                label: cv_core::label_from(self.title.as_deref(), self.first_prompt.as_deref()),
                 model: self.model.clone(),
                 created_at: self.created_at,
-            };
-            let head = (self.header)(&info);
-            self.bytes += head.len();
-            self.write(&head);
-            let buffered = std::mem::take(&mut self.buf);
-            for s in buffered {
-                self.write(&s);
+            })
+        }
+        fn flush_header(&mut self) {
+            if self.frames.printed {
+                return;
             }
+            let head = self.header_now();
+            self.bytes += head.len();
+            self.frames.start(&head);
             if let Some(mut buffered) = self.checked_buf.take() {
-                if self.result.is_ok() {
-                    self.result = buffered.flush().and_then(|()| {
+                if self.frames.result.is_ok() {
+                    self.frames.result = buffered.flush().and_then(|()| {
                         buffered
                             .into_inner()
                             .map_err(|e| e.into_error())?
                             .finish()?
-                            .copy_to(self.out)
+                            .copy_to(self.frames.out)
                             .map(|_| ())
                     });
                 }
             }
-            self.printed = true;
+            self.frames.printed = true;
         }
     }
     impl<W: std::io::Write, H: Fn(&HeaderInfo) -> String, R: Fn(&Message) -> Result<String>> MessageSink
         for Sink<'_, W, H, R>
     {
         fn take_error(&mut self) -> Option<anyhow::Error> {
-            if self.result.is_err() {
-                std::mem::replace(
-                    &mut self.result,
-                    Err(std::io::Error::other("view output has already failed")),
-                )
-                .err()
-                .map(Into::into)
-            } else {
-                None
-            }
+            self.frames.take_error()
         }
         fn meta(&mut self, s: &Session) {
             // Authoritative *parsed* session metadata, delivered before the body by the bridge
@@ -1450,7 +1188,7 @@ fn stream_session_render_inner<W: std::io::Write>(
                 created_at: s.created_at,
             };
             match self.tail.as_mut() {
-                Some(t) => t.metas.push((t.seen, meta)),
+                Some(t) => t.metas.push((self.window.idx, meta)),
                 None => self.apply_meta(meta),
             }
         }
@@ -1458,27 +1196,20 @@ fn stream_session_render_inner<W: std::io::Write>(
             if let Some(t) = self.tail.as_mut() {
                 if t.first_model.is_none() {
                     if let Some(md) = &m.model {
-                        t.first_model = Some((t.seen, md.clone()));
+                        t.first_model = Some((self.window.idx, md.clone()));
                     }
                 }
-                t.seen += 1;
-                if t.n > 0 {
-                    t.ring.push_back(m);
-                    if t.ring.len() > t.n {
-                        t.ring.pop_front();
-                    }
-                }
+                self.window.push(m);
                 return Flow::Continue;
             }
-            if self.result.is_err() || self.next.is_some() {
+            if self.frames.result.is_err() || self.next.is_some() {
                 return Flow::Stop;
             }
-            let idx = self.idx;
-            self.idx += 1;
+            let idx = self.window.idx;
 
             // Past the window's end: nothing left to render — stop early so we never read the
             // rest of the file (the whole point of a windowed show on a huge session).
-            if let Some(end) = self.end {
+            if let Some(end) = self.window.end {
                 if idx >= end {
                     return Flow::Stop;
                 }
@@ -1493,17 +1224,17 @@ fn stream_session_render_inner<W: std::io::Write>(
             }
 
             // Before the window: skip entirely. We do NOT materialize, so no span content is read.
-            if idx < self.start {
+            let Some((_, m)) = self.window.push(m) else {
                 return Flow::Continue;
-            }
+            };
 
             if self.checked_markdown {
                 let result = (|| -> Result<()> {
-                    if self.first_user.is_none() && m.role == Role::User {
-                        self.first_user = cv_core::render::message_label(&m, &self.resolver)?;
+                    if self.first_prompt.is_none() {
+                        self.first_prompt = m.prompt_title(&self.resolver)?;
                     }
-                    if self.printed {
-                        cv_core::render::write_md_message(&m, self.out, &self.resolver)?;
+                    if self.frames.printed {
+                        cv_core::render::write_md_message(&m, self.frames.out, &self.resolver)?;
                     } else {
                         cv_core::render::write_md_message(
                             &m,
@@ -1514,15 +1245,15 @@ fn stream_session_render_inner<W: std::io::Write>(
                     Ok(())
                 })();
                 if let Err(error) = result {
-                    self.result = Err(std::io::Error::other(error));
+                    self.frames.result = Err(std::io::Error::other(error));
                     return Flow::Stop;
                 }
                 self.rendered += 1;
-                let title_known = self.title.is_some() || self.first_user.is_some();
-                if !self.printed && ((self.model.is_some() && title_known) || self.rendered >= HOLDBACK) {
+                let title_known = self.title.is_some() || self.first_prompt.is_some();
+                if !self.frames.printed && Frames::<W>::ready(self.model.is_some(), title_known, self.rendered) {
                     self.flush_header();
                 }
-                return if self.result.is_err() {
+                return if self.frames.result.is_err() {
                     Flow::Stop
                 } else {
                     Flow::Continue
@@ -1532,20 +1263,22 @@ fn stream_session_render_inner<W: std::io::Write>(
             // In-window: resolve this message's lazy content spans (peak = one message) and render.
             let mut m = m;
             if let Err(error) = m.try_materialize_text(&self.resolver) {
-                self.result = Err(std::io::Error::other(error));
+                self.frames.result = Err(std::io::Error::other(error));
                 return Flow::Stop;
             }
-            if self.first_user.is_none() && m.role == Role::User {
-                if let Some(t) = m.text() {
-                    if !t.trim().is_empty() {
-                        self.first_user = Some(t);
+            if self.first_prompt.is_none() {
+                match m.prompt_title(&self.resolver) {
+                    Ok(title) => self.first_prompt = title,
+                    Err(error) => {
+                        self.frames.result = Err(std::io::Error::other(error));
+                        return Flow::Stop;
                     }
                 }
             }
             let rendered = match (self.render_msg)(&m) {
                 Ok(rendered) => rendered,
                 Err(error) => {
-                    self.result = Err(std::io::Error::other(error));
+                    self.frames.result = Err(std::io::Error::other(error));
                     return Flow::Stop;
                 }
             };
@@ -1560,16 +1293,12 @@ fn stream_session_render_inner<W: std::io::Write>(
             }
             self.bytes += rendered.len();
             self.rendered += 1;
-            if self.printed {
-                self.write(&rendered);
-            } else {
-                self.buf.push(rendered);
-                let title_known = self.title.is_some() || self.first_user.is_some();
-                if (self.model.is_some() && title_known) || self.buf.len() >= HOLDBACK {
-                    self.flush_header();
-                }
+            self.frames.push(rendered);
+            let title_known = self.title.is_some() || self.first_prompt.is_some();
+            if !self.frames.printed && Frames::<W>::ready(self.model.is_some(), title_known, self.rendered) {
+                self.flush_header();
             }
-            if self.result.is_err() {
+            if self.frames.result.is_err() {
                 Flow::Stop
             } else {
                 Flow::Continue
@@ -1577,42 +1306,33 @@ fn stream_session_render_inner<W: std::io::Write>(
         }
     }
 
-    let (start, end, tail) = match opts.range {
-        None => (0, None, None),
-        Some(Window::Last(n)) => (0, None, Some(n)),
-        Some(w) => {
-            let (s, e) = w.bounds(|| unreachable!("only `Last` needs the total, and it streams instead"))?;
-            (s, e, None)
-        }
+    let (start, end, tail) = match opts.range.map_or(StreamWindow::Range(0, None), Window::streaming) {
+        StreamWindow::Tail(n) => (0, None, Some(n)),
+        StreamWindow::Range(start, end) => (start, end, None),
     };
     let mut sink = Sink {
-        out,
+        frames: Frames::new(out),
         harness: r.harness,
         id: r.id.clone(),
         cwd: r.cwd.clone(),
         title: r.title.clone(),
         model: None,
         created_at: r.created_at,
-        first_user: None,
+        first_prompt: None,
         header,
         render_msg,
-        buf: Vec::new(),
         checked_markdown: checked,
         checked_buf: checked.then(|| std::io::BufWriter::with_capacity(64 * 1024, cv_core::bytes::ByteStage::new())),
-        printed: false,
-        result: Ok(()),
         resolver: cv_core::Resolver::new(Some(r.path.clone())),
-        idx: 0,
-        start,
-        end,
+        window: match tail {
+            Some(n) => cv_core::api::MessageWindow::new(start, end).tail(n),
+            None => cv_core::api::MessageWindow::new(start, end),
+        },
         max_bytes: opts.max_bytes,
         bytes: 0,
         rendered: 0,
         next: None,
-        tail: tail.map(|n| Tail {
-            n,
-            ring: Default::default(),
-            seen: 0,
+        tail: tail.map(|_| Tail {
             metas: Vec::new(),
             first_model: None,
         }),
@@ -1621,9 +1341,9 @@ fn stream_session_render_inner<W: std::io::Write>(
     // in-window messages materialize (the sink already resolves per message). A full show reads
     // every byte regardless — spans would only add resolve overhead there (floor = C).
     let parse_opts = if checked || opts.range.is_some() {
-        ParseOptions::lazy()
+        Demand::LEAN.with_spans()
     } else {
-        ParseOptions::bulk()
+        Demand::LEAN
     };
     let pass = cv_core::stream::Pass {
         guard: checked,
@@ -1632,7 +1352,7 @@ fn stream_session_render_inner<W: std::io::Write>(
     let guard = cv_core::stream::stream_counted(adapter, r, &parse_opts, &mut sink, pass)?.guard;
     sink.finish_tail();
     sink.flush_header(); // short sessions (no assistant turn / < HOLDBACK msgs) flush here
-    sink.result?;
+    sink.frames.result?;
     if let Some(guard) = guard {
         guard.verify(r)?;
     }
@@ -1666,7 +1386,7 @@ pub(crate) fn show_message(m: &Message) -> Result<String> {
             Block::Thinking { text, .. } => s.push_str(&format!("[thinking] {}\n", truncate(text, 200))),
             Block::ToolUse { id, name, input, .. } => s.push_str(&format!(
                 "[tool_use {name} {id}] {}\n",
-                truncate(&input.canonical_prefix(4 * 201)?.0, 200)
+                input.with_view(|view| cv_core::projection::Head::of_json(view, 200))?
             )),
             Block::ToolResult {
                 tool_use_id,
@@ -1715,16 +1435,17 @@ fn md_header(h: &HeaderInfo) -> String {
     )
 }
 
-/// One `cv export md` section: [`cv_core::render::md_message`] as a `String`.
-fn md_message(m: &Message) -> Result<String> {
-    let mut out = String::new();
-    cv_core::render::md_message(m, &mut out)?;
-    Ok(out)
+/// One `cv export md` section: [`cv_core::render::write_md_message`] as a `String`.
+fn md_message(m: &Message, resolver: &cv_core::Resolver) -> Result<String> {
+    let mut out = Vec::new();
+    cv_core::render::write_md_message(m, &mut out, resolver)?;
+    Ok(String::from_utf8(out)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cv_core::ir::Role;
 
     #[test]
     fn fleetwide_agent_selection_honors_harness_and_zero_compaction_is_usage_error() {
@@ -1741,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn lazy_tree_rows_preserve_owned_previews_and_first_user_label() -> Result<()> {
+    fn lazy_tree_rows_preserve_owned_previews_and_first_prompt_label() -> Result<()> {
         let world = crate::test_world("tree-row-projection");
         let text = "🌙\\\"\n".repeat(30000);
         let path = world.write_session("tree-preview", &[
@@ -1754,10 +1475,10 @@ mod tests {
         let r = SessionRef::new("tree-preview", Harness::Claude, path);
         let adapter = cv_core::harness::for_harness(Harness::Claude).unwrap();
         let owned = adapter.parse(&r)?;
-        let (session, rows, first_user) = read_tree(&r, adapter.as_ref())?;
+        let (session, rows, first_prompt) = read_tree(&r, adapter.as_ref())?;
         assert_eq!(rows.len(), owned.messages.len());
         assert_eq!(
-            cv_core::label_from(session.title.as_deref(), first_user.as_deref()),
+            cv_core::label_from(session.title.as_deref(), first_prompt.as_deref()),
             owned.label()
         );
         for (row, message) in rows.iter().zip(&owned.messages) {
@@ -1792,9 +1513,11 @@ mod tests {
         ];
         let mut order = Vec::new();
         walk_tree(&rows, |index, depth| order.push((index, depth)));
+        // `root` forks (a, b sit one deeper); `a`'s only child keeps its depth; `cycle2` forks
+        // into `cycle1` (already visited) and `tail`.
         assert_eq!(
             order,
-            [(0, 0), (1, 1), (3, 2), (2, 1), (4, 0), (5, 0), (6, 0), (7, 1), (8, 2)]
+            [(0, 0), (1, 1), (3, 1), (2, 1), (4, 0), (5, 0), (6, 0), (7, 0), (8, 1)]
         );
         let rows = (0..5000)
             .map(|i| TreeRow {
@@ -1804,9 +1527,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut count = 0;
+        // A straight chain is flat: no row is indented, so the output is linear in the chain.
         walk_tree(&rows, |index, depth| {
             assert_eq!(index, count);
-            assert_eq!(depth, count);
+            assert_eq!(depth, 0);
             count += 1;
         });
         assert_eq!(count, rows.len());
@@ -1832,7 +1556,7 @@ mod tests {
             &reference,
             &mut native,
             md_header,
-            md_message,
+            |m| md_message(m, &cv_core::Resolver::new(Some(reference.path.clone()))),
             RenderOpts::default(),
         )?;
         struct Lazy;
@@ -1843,13 +1567,13 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &SessionRef,
-                opts: &cv_core::ParseOptions,
+                opts: &cv_core::Demand,
                 sink: &mut dyn cv_core::MessageSink,
             ) -> Result<Session> {
                 assert!(opts.spans, "complete Markdown download eagerly decoded leaves");
@@ -1858,7 +1582,7 @@ mod tests {
                     .try_stream(r, opts, sink)
             }
         }
-        let (body, bytes) = stage_export(&Lazy, &reference, "markdown")?;
+        let (body, bytes) = stage_export(&Lazy, &reference, ExportFormat::Markdown)?;
         let mut checked = Vec::new();
         body.copy_to(&mut checked)?;
         assert_eq!(checked, native);
@@ -1882,13 +1606,13 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &SessionRef,
-                opts: &cv_core::ParseOptions,
+                opts: &cv_core::Demand,
                 sink: &mut dyn cv_core::MessageSink,
             ) -> Result<Session> {
                 sink.dependency(&self.0);
@@ -1899,7 +1623,7 @@ mod tests {
             }
         }
         let r = SessionRef::new("download-guard", Harness::Claude, path);
-        for format in ["markdown", "opensession"] {
+        for format in [ExportFormat::Markdown, ExportFormat::OpenSession] {
             std::fs::write(&auxiliary, "before")?;
             let mut published = Vec::new();
             let result = stage_export(&ChangesDependency(auxiliary.clone()), &r, format).and_then(|(body, _)| {
@@ -1938,8 +1662,8 @@ mod tests {
         let adapter = cv_core::harness::for_harness(Harness::Claude).unwrap();
         struct FactsCollect(cv_core::stream::CollectSink);
         impl cv_core::MessageSink for FactsCollect {
-            fn extra_projection(&self) -> cv_core::stream::ExtraProjection {
-                cv_core::stream::ExtraProjection::Facts
+            fn tier(&self) -> cv_core::stream::Tier {
+                cv_core::stream::Tier::Facts
             }
             fn message(&mut self, m: Message) -> cv_core::Flow {
                 self.0.message(m)
@@ -1949,7 +1673,7 @@ mod tests {
         let expected_counts = cv_core::stream::stream_counted(
             adapter.as_ref(),
             &r,
-            &cv_core::ParseOptions::lazy_extra(),
+            &cv_core::Demand::RICH.with_spans(),
             &mut rich,
             Default::default(),
         )?
@@ -1958,7 +1682,7 @@ mod tests {
         let actual_counts = cv_core::stream::stream_counted(
             adapter.as_ref(),
             &r,
-            &cv_core::ParseOptions::lazy_extra(),
+            &cv_core::Demand::RICH.with_spans(),
             &mut facts,
             Default::default(),
         )?
@@ -1974,8 +1698,8 @@ mod tests {
         );
         let mut complete = FactsCollect(Default::default());
         let mut complete_full = cv_core::stream::CollectSink::default();
-        adapter.try_stream(&r, &cv_core::ParseOptions::complete(), &mut complete)?;
-        adapter.try_stream(&r, &cv_core::ParseOptions::complete(), &mut complete_full)?;
+        adapter.try_stream(&r, &cv_core::Demand::COMPLETE, &mut complete)?;
+        adapter.try_stream(&r, &cv_core::Demand::COMPLETE, &mut complete_full)?;
         assert_eq!(
             serde_json::to_value(&complete.0.messages)?,
             serde_json::to_value(&complete_full.messages)?
@@ -2036,7 +1760,7 @@ mod tests {
         let old = cv_core::stream::stream_counted(
             adapter.as_ref(),
             &r,
-            &cv_core::ParseOptions::full(),
+            &cv_core::Demand::RICH,
             &mut rich,
             Default::default(),
         )?
@@ -2044,7 +1768,7 @@ mod tests {
         let new = cv_core::stream::stream_counted(
             adapter.as_ref(),
             &r,
-            &cv_core::ParseOptions::lazy_extra(),
+            &cv_core::Demand::RICH.with_spans(),
             &mut lazy,
             Default::default(),
         )?
@@ -2154,13 +1878,13 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 vec![]
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(vec![])
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &SessionRef,
-                _: &cv_core::ParseOptions,
+                _: &cv_core::Demand,
                 sink: &mut dyn cv_core::MessageSink,
             ) -> Result<Session> {
                 let mut session = Session::new(&r.id, r.harness);
@@ -2228,13 +1952,13 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 _: &SessionRef,
-                _: &cv_core::ParseOptions,
+                _: &cv_core::Demand,
                 sink: &mut dyn cv_core::MessageSink,
             ) -> Result<Session> {
                 cv_core::stream::replay(self.0.clone(), sink)
@@ -2303,13 +2027,13 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 _: &SessionRef,
-                _: &cv_core::ParseOptions,
+                _: &cv_core::Demand,
                 sink: &mut dyn cv_core::MessageSink,
             ) -> Result<Session> {
                 cv_core::stream::replay(self.0.clone(), sink)
@@ -2402,7 +2126,9 @@ mod tests {
         let range = window.map(|w| w.bounds(|| Ok(session.messages.len())).unwrap());
         let start = range.map(|(start, _)| start).unwrap_or(0);
         if let Some(range) = range {
-            let (start, end) = crate::util::clamp(range, session.messages.len());
+            // A past-the-end window is empty, never a panic.
+            let end = range.1.unwrap_or(session.messages.len()).min(session.messages.len());
+            let start = range.0.min(end);
             session.messages = session.messages.drain(start..end).collect();
         }
         let mut next = None;
@@ -2446,13 +2172,7 @@ mod tests {
             for budget in [None, Some(0), Some(1024), Some(1 << 20)] {
                 let (expected, expected_next) = full_json_window(adapter, r, window, budget);
                 for document in [false, true] {
-                    super::super::session_json::take_frame_serializations();
                     let (staged, next) = staged_session_json(adapter, r, window, budget, document).unwrap();
-                    assert_eq!(
-                        super::super::session_json::take_frame_serializations(),
-                        expected.messages.len() + usize::from(expected_next.is_some()),
-                        "each accepted/rejected message is staged once"
-                    );
                     let mut bytes = Vec::new();
                     staged.copy_to(&mut bytes).unwrap();
                     let mut oracle = if document {
@@ -2481,8 +2201,8 @@ mod tests {
 
     #[test]
     fn json_windows_match_full_parse_with_late_metadata_and_extras() {
-        let _world = crate::test_world("json_windows_match_full_parse_with_late_metadata_and_extras");
-        let home = temp_home("json-window");
+        let world = crate::test_world("json_windows_match_full_parse_with_late_metadata_and_extras");
+        let home = world.base.clone();
         let r = claude_fixture(&home);
         let mut f = std::fs::OpenOptions::new().append(true).open(&r.path).unwrap();
         for record in [
@@ -2519,13 +2239,13 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &SessionRef,
-                _: &cv_core::ParseOptions,
+                _: &cv_core::Demand,
                 sink: &mut dyn cv_core::MessageSink,
             ) -> Result<Session> {
                 let mut session = Session::new(&r.id, r.harness);
@@ -2562,16 +2282,16 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &SessionRef,
-                opts: &cv_core::ParseOptions,
+                opts: &cv_core::Demand,
                 sink: &mut dyn cv_core::MessageSink,
             ) -> Result<Session> {
-                assert!(opts.extra);
+                assert!(opts.tier >= cv_core::stream::Tier::Facts);
                 let mut s = Session::new(r.id.clone(), r.harness);
                 s.title = Some("early title".into());
                 sink.meta(&s);
@@ -2608,8 +2328,8 @@ mod tests {
 
     #[test]
     fn gemini_json_windows_preserve_lazy_content_and_replayed_metadata() {
-        let _world = crate::test_world("gemini_json_windows_preserve_lazy_content_and_replayed_metadata");
-        let home = temp_home("gemini-json-window");
+        let world = crate::test_world("gemini_json_windows_preserve_lazy_content_and_replayed_metadata");
+        let home = world.base.clone();
         std::fs::create_dir_all(home.join("chats")).unwrap();
         let adapter = cv_core::harness::gemini::Gemini::with_home(&home);
         let giant = "escaped\n\t\"\\🌙".repeat(1200);
@@ -2653,7 +2373,6 @@ mod tests {
             assert_eq!(first.title.as_deref(), metadata["summary"].as_str());
             assert_eq!(first.messages.len(), 1);
         }
-        std::fs::remove_dir_all(home).unwrap();
     }
 
     /// `--kind` picks one view family: what the person said, the compaction seams, or the
@@ -2684,12 +2403,6 @@ mod tests {
         assert!(err.contains("background_job"), "{err}");
     }
 
-    fn temp_home(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("cv-view-render-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
     fn render(r: &SessionRef, range: Option<(usize, Option<usize>)>) -> String {
         let range = range.map(|(a, b)| Window::Range(a, b));
         render_with(r, RenderOpts { range, max_bytes: None }).0
@@ -2707,7 +2420,7 @@ mod tests {
     fn assert_window_matches_full_parse(r: &SessionRef, range: (usize, Option<usize>)) -> String {
         let adapter = cv_core::harness::for_harness(r.harness).unwrap();
         let mut all = cv_core::CollectSink::default();
-        adapter.stream(r, &cv_core::ParseOptions::bulk(), &mut all).unwrap();
+        adapter.stream(r, &cv_core::Demand::LEAN, &mut all).unwrap();
         let end = range.1.unwrap_or(usize::MAX).min(all.messages.len());
         let want: String = all.messages[range.0..end]
             .iter()
@@ -2766,7 +2479,7 @@ mod tests {
             title: Some("render window".into()),
             created_at: None,
             updated_at: None,
-            message_count: 11,
+            message_count: Some(11),
         }
     }
 
@@ -2774,7 +2487,8 @@ mod tests {
     /// full parse, and its header carries the model the skipped prefix provides.
     #[test]
     fn windowed_render_is_byte_identical_to_the_full_parse() {
-        let home = temp_home("claude");
+        let world = crate::test_world("windowed_render_is_byte_identical_to_the_full_parse");
+        let home = world.base.clone();
         let r = claude_fixture(&home);
         let full_header = {
             let full = render(&r, None);
@@ -2785,7 +2499,6 @@ mod tests {
             assert_eq!(header, full_header, "range {range:?} header");
             assert!(header.contains("claude-test"), "header model expected in {range:?}");
         }
-        std::fs::remove_dir_all(&home).ok();
     }
 
     /// `--max-bytes`: the render stops before the message that would overflow the budget and
@@ -2793,7 +2506,8 @@ mod tests {
     /// that fits everything reports no cut.
     #[test]
     fn byte_budget_cuts_and_reports_the_next_index() {
-        let home = temp_home("budget");
+        let world = crate::test_world("byte_budget_cuts_and_reports_the_next_index");
+        let home = world.base.clone();
         let r = claude_fixture(&home);
 
         // Message 2 is the ~9 KB giant: a 1 KB budget renders messages 0 and 1, then stops.
@@ -2833,15 +2547,14 @@ mod tests {
         );
         assert_eq!(oc.rendered, 8);
         assert_eq!(oc.next, None);
-
-        std::fs::remove_dir_all(&home).ok();
     }
 
     /// `--last n` keeps a ring of the last `n` messages in one pass; it must render exactly what the
     /// counted `total - n ..` range renders, budget cut and continuation index included.
     #[test]
     fn last_n_renders_what_the_counted_range_does() {
-        let home = temp_home("last");
+        let world = crate::test_world("last_n_renders_what_the_counted_range_does");
+        let home = world.base.clone();
         let r = claude_fixture(&home);
         for n in [0usize, 1, 3, 10, 11, 50] {
             for max_bytes in [None, Some(1024)] {
@@ -2863,7 +2576,6 @@ mod tests {
                 assert_eq!(ring, counted, "--last {n} (budget {max_bytes:?})");
             }
         }
-        std::fs::remove_dir_all(&home).ok();
     }
 
     /// A store whose metadata arrives after the body (codex delivers `meta` at EOF when no model is
@@ -2880,13 +2592,13 @@ mod tests {
             fn roots(&self) -> Vec<PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                Ok(Default::default())
             }
             fn stream(
                 &self,
                 r: &SessionRef,
-                _: &cv_core::ParseOptions,
+                _: &cv_core::Demand,
                 sink: &mut dyn cv_core::MessageSink,
             ) -> Result<Session> {
                 let mut s = Session::new(r.id.clone(), Harness::Codex);
@@ -2920,7 +2632,7 @@ mod tests {
             title: Some("discovery title".into()),
             created_at: None,
             updated_at: None,
-            message_count: 0,
+            message_count: None,
         };
         let total = 60usize;
         let a = Late(total);
@@ -2984,10 +2696,10 @@ mod tests {
                 shown.starts_with(&format!("── {label} ──\n")) && shown.contains(&text),
                 "{shown}"
             );
-            let md = md_message(m).unwrap();
+            let md = md_message(m, &cv_core::Resolver::new(None)).unwrap();
             assert!(md.starts_with(&format!("## {label}\n\n")) && md.contains(&text), "{md}");
             let mut html = String::new();
-            cv_core::html::share_message(m, 0, &mut html).unwrap();
+            cv_core::html::share_message(m, 0, &mut html, &cv_core::Resolver::new(None)).unwrap();
             assert!(
                 html.contains(&format!("<span class=\"role\">{label}</span>")) && html.contains(&text),
                 "{html}"
@@ -3004,8 +2716,8 @@ mod tests {
     /// `None` — overrides the discovery title).
     #[test]
     fn codex_windowed_render_is_byte_identical_to_the_full_parse() {
-        let _world = crate::test_world("codex_windowed_render_is_byte_identical_to_the_full_parse");
-        let home = temp_home("codex");
+        let world = crate::test_world("codex_windowed_render_is_byte_identical_to_the_full_parse");
+        let home = world.base.clone();
 
         let path = home.join("rollout-r.jsonl");
         let big = "giant output\n\t\"\\🌙".repeat(1200);
@@ -3041,7 +2753,7 @@ mod tests {
             title: Some("discovery title".into()),
             created_at: None,
             updated_at: None,
-            message_count: 3,
+            message_count: Some(3),
         };
         for range in [(2usize, Some(4usize)), (1, None), (3, Some(5))] {
             let header = assert_window_matches_full_parse(&r, range);
@@ -3051,7 +2763,5 @@ mod tests {
 
         let adapter = cv_core::harness::for_harness(r.harness).unwrap();
         assert_json_windows(adapter.as_ref(), &r);
-
-        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -3,6 +3,8 @@
 //! The serde derives visit message and block fields. This visitor replaces only their lazy
 //! leaves; ordinary fields still use serde_json. Output may be partial on any error, so callers
 //! publishing files must stage them first.
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::{
     ir::{Block, Message, Session},
     json::Json,
@@ -96,7 +98,7 @@ impl Message {
 
     fn write_json_format(&self, writer: &mut impl Write, resolver: &Resolver, pretty: bool) -> anyhow::Result<()> {
         let mut reads = crate::source::ReadSet::default();
-        crate::source::record_message_reads(self, std::path::Path::new(""), &mut reads);
+        crate::source::record_message_reads(self, None, &mut reads);
         let result = self.serialize(Fields {
             writer,
             resolver,
@@ -240,6 +242,8 @@ impl<W: Write> SerializeStruct for Fields<'_, W> {
         self.writer
             .write_all(if self.pretty { b": " } else { b":" })
             .map_err(OutputError::from)?;
+        // Serde supplies these keys from the IR derives. Intercept only source-backed fields
+        // to stream their contents; every other field keeps its ordinary serde representation.
         match (self.context, key) {
             (Context::Session(session), "messages") => self.messages(&session.messages),
             (Context::Message(message), "content") => self.content(&message.content),
@@ -394,9 +398,8 @@ impl<W: Write> Write for BaseIndent<'_, W> {
     }
 }
 
-// Whitespace-only transform of already canonical JSON. Delimiters inside escaped string
-// chunks are untouched; the stack holds only a nonempty bit for each nesting level.
 /// Whitespace transform for already validated compact JSON, preserving string bytes.
+/// The stack holds only a nonempty bit for each nesting level.
 /// This is not a JSON parser or acceptance boundary. One writer represents one complete value.
 pub struct PrettyJson<'a, W> {
     writer: &'a mut W,
@@ -555,7 +558,7 @@ mod tests {
             {"type":"file","mime":"text/plain","path":"/file","source":"reference"}
         ]);
         let mut message: Message = serde_json::from_value(json!({
-            "id":"msg","parent_id":"parent","role":"assistant","timestamp":"2026-10-12T00:00:00Z","model":"model",
+            "id":"msg","parent_id":"parent","role":"assistant","kind":"reply","origin":"model","timestamp":"2026-10-12T00:00:00Z","model":"model",
             "content":blocks,
             "usage":{"input_tokens":1,"output_tokens":2,"cache_read_tokens":3,"cache_creation_tokens":4,"reasoning_tokens":5},
             "extra":{"claude":{"field":[1,{"a":true}]},"_record":{"type":"record"}}
@@ -574,8 +577,10 @@ mod tests {
         let raw = r#"{"z":0,"a":[{},[],{"x":"\u0061\n\"\\☺","zero":-0,"float":1e2}],"z":2}"#.as_bytes();
         let source = Source::new(raw);
         let body = "☺a\\n\\t\\uD83D\\uDE00\\\"\\\\".repeat(17000);
-        let text_source = Source::new(body.as_bytes());
-        let literal = Source::new("☺\n\"\\plain".repeat(17000).as_bytes());
+        // A span covers a JSON string's body, the quotes around it in the file.
+        let text_source = Source::new(format!("\"{body}\"").as_bytes());
+        let literal = "☺plain".repeat(17000);
+        let literal = Source::new(format!("\"{literal}\"").as_bytes());
         let mut message = Message::new(Role::Assistant);
         message.content = vec![
             Block::ToolUse {
@@ -587,7 +592,7 @@ mod tests {
             Block::Text {
                 text: Text::Span(Span {
                     source: Some(text_source.0.clone()),
-                    offset: 0,
+                    offset: 1,
                     len: body.len() as u64,
                     escaped: true,
                 }),
@@ -596,8 +601,8 @@ mod tests {
                 tool_use_id: "id".into(),
                 content: Text::Span(Span {
                     source: Some(literal.0.clone()),
-                    offset: 0,
-                    len: std::fs::metadata(&literal.0).unwrap().len(),
+                    offset: 1,
+                    len: std::fs::metadata(&literal.0).unwrap().len() - 2,
                     escaped: false,
                 }),
                 is_error: false,
@@ -607,26 +612,6 @@ mod tests {
             },
         ];
         oracle(&message, &Resolver::new(None));
-    }
-    #[test]
-    fn ir_json_text_preserves_lossy_utf8_and_malformed_escape_fallback() {
-        for (raw, escaped) in [
-            (b"a\xffb".as_slice(), false),
-            (b"a\\uD800tail".as_slice(), true),
-            (b"a\\qtail".as_slice(), true),
-        ] {
-            let source = Source::new(raw);
-            let mut message = Message::new(Role::User);
-            message.content = vec![Block::Text {
-                text: Text::Span(Span {
-                    source: Some(source.0.clone()),
-                    offset: 0,
-                    len: raw.len() as u64,
-                    escaped,
-                }),
-            }];
-            oracle(&message, &Resolver::new(None));
-        }
     }
     #[test]
     fn ir_json_pretty_transform_is_independent_of_write_boundaries() {
@@ -686,7 +671,7 @@ mod tests {
                 Ok(())
             }
         }
-        let text = Source::new(&vec![b'x'; 10000]);
+        let text = Source::new(format!("\"{}\"", "x".repeat(10000)).as_bytes());
         let args = Source::new(format!("{{\"arg\":\"{}\"}}", "x".repeat(10000)).as_bytes());
         let resolver = Resolver::new(None);
         let mut message = Message::new(Role::Assistant);
@@ -694,7 +679,7 @@ mod tests {
             Block::Text {
                 text: Text::Span(Span {
                     source: Some(text.0.clone()),
-                    offset: 0,
+                    offset: 1,
                     len: 10000,
                     escaped: false,
                 }),
@@ -761,7 +746,9 @@ mod output_freshness_tests {
         let raw = serde_json::to_vec(&"source body ".repeat(10000))?;
         std::fs::write(&path, &raw)?;
         let text = crate::json::JsonSource::capture(&path)?
-            .read_range_value(0, raw.len() as u64, |view| view.source_text())?
+            .read(ReadInput::Range(0, raw.len() as u64), Validation::Value, |view| {
+                view.source_text()
+            })?
             .unwrap();
         let mut message = Message::new(crate::Role::User);
         message.content.push(Block::Text { text });
@@ -795,7 +782,9 @@ mod output_freshness_tests {
                 // Refresh capture after each deliberate source replacement.
                 message.content[0] = Block::Text {
                     text: crate::json::JsonSource::capture(&path)?
-                        .read_range_value(0, raw.len() as u64, |v| v.source_text())?
+                        .read(ReadInput::Range(0, raw.len() as u64), Validation::Value, |v| {
+                            v.source_text()
+                        })?
                         .unwrap(),
                 };
                 let mut writer = Mutate {

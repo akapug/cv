@@ -20,6 +20,17 @@ struct State {
     closed: bool,
 }
 
+/// Admission counters at a sweep boundary: bytes currently charged, the peak concurrent
+/// charge, the largest single document charged, and how often a worker waited for room.
+#[cfg(test)]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct AdmissionStats {
+    pub(super) charged_bytes: usize,
+    pub(super) peak_charged_bytes: usize,
+    pub(super) largest_document_bytes: usize,
+    pub(super) queue_waits: usize,
+}
+
 pub(super) struct Admission {
     limit: usize,
     state: Mutex<State>,
@@ -69,15 +80,21 @@ impl Admission {
     }
 
     #[cfg(test)]
-    pub(super) fn stats(&self) -> (usize, usize, usize, usize) {
+    pub(super) fn stats(&self) -> AdmissionStats {
         let state = self.state.lock().unwrap();
-        (state.bytes, state.peak, state.largest, state.waits)
+        AdmissionStats {
+            charged_bytes: state.bytes,
+            peak_charged_bytes: state.peak,
+            largest_document_bytes: state.largest,
+            queue_waits: state.waits,
+        }
     }
 }
 
 /// The compact document owns one public byte vector and a private field-address vector. Charge
 /// the exact byte capacity plus twice the field count at a conservative address size (the private
-/// packed address is smaller). Include both vector headers, wrapper and allocation overhead.
+/// packed address is smaller). A minimum four slots covers small-vector allocation slack; the
+/// extra 128 bytes conservatively covers vector headers and allocator overhead beyond the wrapper.
 fn document_bytes(document: &TantivyDocument) -> usize {
     document
         .node_data
@@ -123,65 +140,94 @@ impl Document for AdmittedDocument {
 
 /// Every write path, including single-session/test indexing, uses the same raw-document budget.
 pub(super) struct Writer {
-    inner: IndexWriter<AdmittedDocument>,
+    /// `None` only while [`Drop`] closes it.
+    inner: Option<IndexWriter<AdmittedDocument>>,
     pub(super) admission: Arc<Admission>,
-    #[cfg(test)]
-    fail_after: Mutex<Option<usize>>,
+    fault: Fault,
 }
 impl Writer {
     pub(super) fn new(index: &Index, heap: usize) -> Result<Self> {
         let inner = index.writer(heap).context("creating tantivy index writer")?;
-        #[cfg(all(test, feature = "probe-heap"))]
-        let limit = if std::env::var_os("CV_SWEEP_COMPARE_UNBOUNDED").is_some() {
-            usize::MAX
-        } else {
-            DOCUMENT_BYTES
-        };
-        #[cfg(not(all(test, feature = "probe-heap")))]
-        let limit = DOCUMENT_BYTES;
         Ok(Self {
-            inner,
-            admission: Admission::new(limit),
-            #[cfg(test)]
-            fail_after: Mutex::new(None),
+            inner: Some(inner),
+            admission: Admission::new(document_limit()),
+            fault: Fault::default(),
         })
     }
-    #[cfg(test)]
-    pub(super) fn add_document(&self, document: TantivyDocument) -> Result<Opstamp> {
-        self.add_admitted(self.admission.document(document)?)
-    }
     pub(super) fn add_admitted(&self, document: AdmittedDocument) -> Result<Opstamp> {
-        #[cfg(test)]
-        if let Some(remaining) = self.fail_after.lock().unwrap().as_mut() {
+        self.fault.check()?;
+        (**self).add_document(document).map_err(Into::into)
+    }
+}
+
+#[cfg(not(all(test, feature = "probe-heap")))]
+fn document_limit() -> usize {
+    DOCUMENT_BYTES
+}
+#[cfg(all(test, feature = "probe-heap"))]
+fn document_limit() -> usize {
+    if std::env::var_os("CV_SWEEP_COMPARE_UNBOUNDED").is_some() {
+        usize::MAX
+    } else {
+        DOCUMENT_BYTES
+    }
+}
+#[cfg(not(test))]
+#[derive(Default)]
+struct Fault {}
+#[cfg(not(test))]
+impl Fault {
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+#[cfg(test)]
+#[derive(Default)]
+struct Fault(Mutex<Option<usize>>);
+#[cfg(test)]
+impl Fault {
+    fn check(&self) -> Result<()> {
+        if let Some(remaining) = self.0.lock().unwrap().as_mut() {
             anyhow::ensure!(*remaining != 0, "injected index consumer failure");
             *remaining -= 1;
         }
-        self.inner.add_document(document).map_err(Into::into)
+        Ok(())
     }
-    #[cfg(test)]
+}
+#[cfg(test)]
+impl Writer {
+    pub(super) fn add_document(&self, document: TantivyDocument) -> Result<Opstamp> {
+        self.add_admitted(self.admission.document(document)?)
+    }
     pub(super) fn document_limit(&mut self, bytes: usize) {
         self.admission = Admission::new(bytes);
     }
-    #[cfg(test)]
     pub(super) fn fail_after(&self, documents: usize) {
-        *self.fail_after.lock().unwrap() = Some(documents);
+        *self.fault.0.lock().unwrap() = Some(documents);
     }
-    /// Close the writer and join the merge/GC work its commits started.
-    #[cfg(test)]
-    pub(super) fn wait_merging_threads(self) -> Result<()> {
-        self.inner.wait_merging_threads().map_err(Into::into)
+}
+
+/// tantivy's `IndexWriter` drop joins its indexing workers but not the segment updater, whose
+/// post-commit garbage collection (and any merge) can still be writing the directory after the
+/// writer is gone: a test removing the directory then failed with "Directory not empty", and a
+/// process could exit mid-GC. Every writer joins that work as it closes.
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let _ = inner.wait_merging_threads();
+        }
     }
 }
 
 impl Deref for Writer {
     type Target = IndexWriter<AdmittedDocument>;
     fn deref(&self) -> &Self::Target {
-        &self.inner
+        self.inner.as_ref().expect("an open writer")
     }
 }
 impl DerefMut for Writer {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+        self.inner.as_mut().expect("an open writer")
     }
 }
 
@@ -202,14 +248,14 @@ mod tests {
             assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
             drop(first);
             let next = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-            assert_eq!(next.admission.stats().0, 64);
+            assert_eq!(next.admission.stats().charged_bytes, 64);
             // Moving a reservation through a queue cannot return its bytes early.
             let (tx, rx) = mpsc::sync_channel(1);
             tx.send(next).unwrap();
-            assert_eq!(admission_stats_from_receiver(&rx).0, 0);
+            assert_eq!(admission_stats_from_receiver(&rx).charged_bytes, 0);
         });
-        assert_eq!(admission.stats().0, 0);
-        assert!(admission.stats().1 <= 128);
+        assert_eq!(admission.stats().charged_bytes, 0);
+        assert!(admission.stats().peak_charged_bytes <= 128);
 
         let oversized = admission.reserve(256).unwrap();
         let (tx, rx) = mpsc::channel();
@@ -221,14 +267,14 @@ mod tests {
             assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
             drop(oversized);
         });
-        assert_eq!(admission.stats().0, 0);
-        assert_eq!(admission.stats().1, 256);
+        assert_eq!(admission.stats().charged_bytes, 0);
+        assert_eq!(admission.stats().peak_charged_bytes, 256);
     }
 
-    fn admission_stats_from_receiver(rx: &mpsc::Receiver<Reservation>) -> (usize, usize, usize, usize) {
+    fn admission_stats_from_receiver(rx: &mpsc::Receiver<Reservation>) -> AdmissionStats {
         let reservation = rx.recv().unwrap();
         let admission = Arc::clone(&reservation.admission);
-        assert_eq!(admission.stats().0, reservation.bytes);
+        assert_eq!(admission.stats().charged_bytes, reservation.bytes);
         drop(reservation);
         admission.stats()
     }
@@ -247,15 +293,16 @@ mod tests {
             writer.add_document(document).unwrap();
         }
         writer.commit().unwrap();
-        assert_eq!(admission.stats().0, 0);
-        assert!(admission.stats().1 <= admission.limit.max(admission.stats().2));
+        assert_eq!(admission.stats().charged_bytes, 0);
+        let stats = admission.stats();
+        assert!(stats.peak_charged_bytes <= admission.limit.max(stats.largest_document_bytes));
         assert_eq!(index.reader().unwrap().searcher().num_docs(), 40);
         writer.fail_after(0);
         let mut document = TantivyDocument::default();
         document.add_text(body, "failed");
         assert!(writer.add_document(document).is_err());
-        assert_eq!(admission.stats().0, 0);
+        assert_eq!(admission.stats().charged_bytes, 0);
         drop(writer);
-        assert_eq!(admission.stats().0, 0);
+        assert_eq!(admission.stats().charged_bytes, 0);
     }
 }

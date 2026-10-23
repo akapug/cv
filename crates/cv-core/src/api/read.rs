@@ -1,18 +1,21 @@
-//! Small verified continuations for repeated API reads. No messages are cached.
+//! Verified continuations for repeated API reads, one per session read. No messages are cached.
 use super::{session_meta_json, WindowSink};
-use crate::source::{Probe, ReadSet, Snapshot};
-use crate::stream::{Checkpoint, Flow, ParseOptions};
+use crate::source::{Baseline, Probe, ReadSet};
+use crate::stream::{Checkpoint, Demand, Flow, Start};
 use crate::{Adapter, Session, SessionRef};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
-const MAX_ENTRIES: usize = 32;
-const MAX_ENTRY_BYTES: usize = 256 * 1024;
-const MAX_CACHE_BYTES: usize = 2 * 1024 * 1024;
+/// The continuations kept, one per (session, read, demand), least recently used out first. The
+/// count is the whole bound: an entry is as large as its checkpoint and metadata, the state the
+/// read held anyway. Past it an evicted session's next page or head reads from its start, and
+/// stderr says so once per process.
+const ENTRIES: usize = 1024;
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 struct Key {
     harness: String,
     id: String,
@@ -24,7 +27,7 @@ struct Key {
     title: Option<String>,
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    message_count: usize,
+    message_count: Option<usize>,
 }
 
 impl Key {
@@ -43,13 +46,6 @@ impl Key {
             message_count: r.message_count,
         }
     }
-
-    fn admitted(r: &SessionRef, primary: &std::path::Path, version: String, extra: bool) -> Option<Self> {
-        // Readers can use every catalog hint as fallback metadata. Check the borrowed ref before
-        // copying it so oversized demanded hints never become temporary cache keys.
-        bounded_size(&(r, primary))?;
-        Some(Self::of(r, primary, version, extra))
-    }
 }
 
 #[derive(Clone, Serialize)]
@@ -65,64 +61,75 @@ enum Payload {
 #[derive(Clone, Serialize)]
 struct Entry {
     key: Key,
-    source: Snapshot,
+    source: Baseline,
     payload: Payload,
-    #[serde(skip)]
-    bytes: usize,
+}
+
+#[derive(Default)]
+struct Entries {
+    by_key: HashMap<Key, (u64, Entry)>,
+    by_use: BTreeMap<u64, Key>,
+    tick: u64,
 }
 
 #[derive(Default)]
 pub(super) struct Cache {
-    entries: Mutex<Vec<Entry>>,
+    entries: Mutex<Entries>,
 }
 
 impl Cache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Entries> {
+        self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     fn get(&self, key: &Key) -> Option<Entry> {
-        self.entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .find(|entry| &entry.key == key)
-            .cloned()
+        let mut entries = self.lock();
+        let Entries { by_key, by_use, tick } = &mut *entries;
+        let (used, entry) = by_key.get_mut(key)?;
+        by_use.remove(used);
+        *tick += 1;
+        *used = *tick;
+        by_use.insert(*tick, key.clone());
+        Some(entry.clone())
     }
     fn remove(&self, key: &Key) {
-        self.entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|entry| &entry.key != key);
-    }
-    fn insert(&self, mut entry: Entry) {
-        let Some(bytes) = bounded_size(&entry) else { return };
-        entry.bytes = bytes;
-        let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries.retain(|old| old.key != entry.key);
-        while entries.len() >= MAX_ENTRIES
-            || entries.iter().map(|entry| entry.bytes).sum::<usize>() + bytes > MAX_CACHE_BYTES
-        {
-            entries.remove(0);
+        let mut entries = self.lock();
+        if let Some((used, _)) = entries.by_key.remove(key) {
+            entries.by_use.remove(&used);
         }
-        entries.push(entry);
+    }
+    fn insert(&self, entry: Entry) {
+        let mut entries = self.lock();
+        let Entries { by_key, by_use, tick } = &mut *entries;
+        if let Some((used, _)) = by_key.remove(&entry.key) {
+            by_use.remove(&used);
+        }
+        while by_key.len() >= ENTRIES {
+            let Some((_, oldest)) = by_use.pop_first() else { break };
+            by_key.remove(&oldest);
+            noted_eviction();
+        }
+        *tick += 1;
+        by_use.insert(*tick, entry.key.clone());
+        by_key.insert(entry.key.clone(), (*tick, entry));
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().by_key.len()
+    }
+    #[cfg(test)]
+    fn entries(&self) -> Vec<Entry> {
+        self.lock().by_key.values().map(|(_, entry)| entry.clone()).collect()
     }
 }
 
-/// Count serialization through a bounded writer; never allocate a checkpoint-sized JSON string.
-pub(super) fn bounded_size(value: &impl Serialize) -> Option<usize> {
-    struct Size(usize);
-    impl std::io::Write for Size {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            if self.0 > MAX_ENTRY_BYTES {
-                return Err(std::io::Error::other("API read state exceeds budget"));
-            }
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+/// The budget's one report: the first eviction in a process says the cache is full.
+fn noted_eviction() {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "cv: the API read cache holds its {ENTRIES} most recent sessions; a page or head of an older one reads from its start"
+        );
     }
-    let mut size = Size(0);
-    serde_json::to_writer(&mut size, value).ok()?;
-    Some(size.0)
 }
 
 pub(super) fn shared() -> &'static Cache {
@@ -130,11 +137,7 @@ pub(super) fn shared() -> &'static Cache {
     CACHE.get_or_init(Cache::default)
 }
 
-pub(super) fn note_message_sources(message: &crate::Message, primary: &std::path::Path, reads: &mut ReadSet) {
-    crate::source::record_message_reads(message, primary, reads);
-}
-
-fn captured(r: &SessionRef, primary: &std::path::Path) -> (Snapshot, ReadSet) {
+fn captured(r: &SessionRef, primary: &std::path::Path) -> (Baseline, ReadSet) {
     let before = Probe::default().snapshot_from(r, primary);
     let mut reads = ReadSet::default();
     // Include replacement identity and ctime, even when size and mtime were restored.
@@ -142,38 +145,12 @@ fn captured(r: &SessionRef, primary: &std::path::Path) -> (Snapshot, ReadSet) {
     (before, reads)
 }
 
-fn fresh(r: &SessionRef, before: &Snapshot, primary: &std::path::Path) -> bool {
+fn fresh(r: &SessionRef, before: &Baseline, primary: &std::path::Path) -> bool {
     let mut probe = Probe::default();
     let current = probe.snapshot_from(r, primary);
     before.fresh(&current, &mut probe)
 }
 
-fn window_sink(
-    primary: &std::path::Path,
-    start: usize,
-    end: Option<usize>,
-    capture: bool,
-    reads: ReadSet,
-) -> WindowSink {
-    WindowSink {
-        resolver: crate::Resolver::new(Some(primary.to_path_buf())),
-        primary: primary.to_path_buf(),
-        idx: 0,
-        start,
-        end,
-        msgs: Vec::new(),
-        staged: None,
-        selected: 0,
-        more: false,
-        meta: None,
-        fail: None,
-        capture,
-        checkpoint: None,
-        reads,
-    }
-}
-
-#[cfg(test)]
 pub(super) fn window(
     cache: &Cache,
     adapter: &dyn Adapter,
@@ -182,40 +159,16 @@ pub(super) fn window(
     end: Option<usize>,
     extra: bool,
 ) -> Result<(Session, WindowSink)> {
-    window_output(cache, adapter, r, start, end, extra, false)
-}
-
-pub(super) fn window_output(
-    cache: &Cache,
-    adapter: &dyn Adapter,
-    r: &SessionRef,
-    start: usize,
-    end: Option<usize>,
-    extra: bool,
-    staged: bool,
-) -> Result<(Session, WindowSink)> {
-    let opts = ParseOptions {
-        extra,
-        ..ParseOptions::lazy()
-    };
-    let version = crate::resume::version(adapter, "api-window1");
+    let opts = if extra { Demand::RICH } else { Demand::LEAN }.with_spans();
+    let version = crate::resume::version(adapter, "api-window");
     let primary = adapter.resume_source(r);
-    if version.is_none() {
-        let (before, reads) = captured(r, &primary);
-        let mut sink = window_sink(&primary, start, end, false, reads);
-        sink.staged = staged.then(|| std::io::BufWriter::with_capacity(64 * 1024, crate::bytes::ByteStage::default()));
-        let shell = adapter.try_stream(r, &opts, &mut sink)?;
-        verify(r, &primary, &before, &sink)?;
-        return Ok((shell, sink));
-    }
-    let key = version.and_then(|version| Key::admitted(r, &primary, version, extra));
+    let key = Key::of(r, &primary, version, extra);
     let (before, reads) = captured(r, &primary);
-    let mut sink = window_sink(&primary, start, end, key.is_some(), reads);
-    sink.staged = staged.then(|| std::io::BufWriter::with_capacity(64 * 1024, crate::bytes::ByteStage::default()));
+    let mut sink = WindowSink::page(&primary, start, end, true, reads.clone());
     let mut resumed = false;
     let mut shell = None;
-    if let Some(key) = &key {
-        if let Some(entry) = cache.get(key) {
+    {
+        if let Some(entry) = cache.get(&key) {
             if fresh(r, &entry.source, &primary) {
                 if let Payload::Window {
                     index,
@@ -229,114 +182,161 @@ pub(super) fn window_output(
                         if let Some(old_reads) = entry.source.reads() {
                             sink.reads.merge(&old_reads);
                         }
-                        shell = adapter.try_resume(r, &opts, &mut sink, &checkpoint)?;
+                        shell = adapter.transcript(r, &opts, Start::Checkpoint(&checkpoint), &mut sink)?;
                         resumed = shell.is_some();
                     }
                 }
             } else {
-                cache.remove(key);
+                cache.remove(&key);
             }
         }
     }
     if shell.is_none() {
-        // A declined resume promises no callbacks, but discard its initial state too.
-        let (_, reads) = captured(r, &primary);
-        sink = window_sink(&primary, start, end, key.is_some(), reads);
-        sink.staged = staged.then(|| std::io::BufWriter::with_capacity(64 * 1024, crate::bytes::ByteStage::default()));
+        // A declined resume promises no callbacks, but discard its initial state too: the
+        // stream starts from the capture taken before the cache was consulted.
+        sink = WindowSink::page(&primary, start, end, true, reads);
         shell = Some(adapter.try_stream(r, &opts, &mut sink)?);
     }
     let source = before.with_reads(&sink.reads);
     let stable = fresh(r, &source, &primary);
     if resumed && !stable {
         // Do not return a new suffix composed with an old prefix's metadata after a mutation.
-        if let Some(key) = &key {
-            cache.remove(key);
-        }
+        cache.remove(&key);
         let (retry_before, reads) = captured(r, &primary);
-        let mut whole = window_sink(&primary, start, end, false, reads);
-        whole.staged = staged.then(|| std::io::BufWriter::with_capacity(64 * 1024, crate::bytes::ByteStage::default()));
+        let mut whole = WindowSink::page(&primary, start, end, false, reads);
         let shell = adapter.try_stream(r, &opts, &mut whole)?;
         verify(r, &primary, &retry_before, &whole)?;
         return Ok((shell, whole));
     }
-    verify(r, &primary, &before, &sink)?;
-    if stable {
-        if let (Some(key), Some((index, checkpoint, meta))) = (key, sink.checkpoint.take()) {
-            cache.insert(Entry {
-                key,
-                source,
-                payload: Payload::Window {
-                    index,
-                    checkpoint,
-                    meta,
-                },
-                bytes: 0,
-            });
-        }
+    // `stable` is `verify`'s primary check on this same baseline and read set.
+    anyhow::ensure!(stable, "API window source changed before publication");
+    if let Some((index, checkpoint, meta)) = sink.checkpoint.take() {
+        cache.insert(Entry {
+            key,
+            source,
+            payload: Payload::Window {
+                index,
+                checkpoint,
+                meta,
+            },
+        });
     }
     Ok((shell.expect("a stream or accepted resume returned metadata"), sink))
 }
 
-fn verify(r: &SessionRef, primary: &std::path::Path, before: &Snapshot, sink: &WindowSink) -> Result<()> {
+fn verify(r: &SessionRef, primary: &std::path::Path, before: &Baseline, sink: &WindowSink) -> Result<()> {
     anyhow::ensure!(
-        fresh(r, &before.with_reads(&sink.reads), primary) && sink.reads.fresh(&mut Probe::default()),
+        fresh(r, &before.with_reads(&sink.reads), primary),
         "API window source changed before publication"
     );
     Ok(())
 }
 
-pub(super) fn head(cache: &Cache, adapter: &dyn Adapter, r: &SessionRef) -> Result<Value> {
-    let primary = adapter.resume_source(r);
-    let key = Key::admitted(r, &primary, format!("{}/api-head1", env!("CARGO_PKG_VERSION")), false);
-    if let Some(entry) = key.as_ref().and_then(|key| cache.get(key)) {
-        if fresh(r, &entry.source, &primary) {
+fn value(
+    cache: &Cache,
+    r: &SessionRef,
+    primary: &std::path::Path,
+    consumer: &str,
+    read: impl FnOnce(&mut ReadSet) -> Result<Value>,
+) -> Result<Value> {
+    let key = Key::of(r, primary, crate::source::consumer_version(consumer), false);
+    if let Some(entry) = cache.get(&key) {
+        if fresh(r, &entry.source, primary) {
             if let Payload::Head(value) = entry.payload {
                 return Ok(value);
             }
         } else {
-            cache.remove(key.as_ref().expect("cached head has a key"));
+            cache.remove(&key);
         }
     }
-    let (before, reads) = captured(r, &primary);
-    struct Counter {
-        primary: std::path::PathBuf,
-        total: usize,
-        reads: ReadSet,
-    }
-    impl crate::MessageSink for Counter {
-        fn message(&mut self, message: crate::Message) -> Flow {
-            note_message_sources(&message, &self.primary, &mut self.reads);
-            self.total += 1;
-            Flow::Continue
-        }
-        fn dependency(&mut self, path: &std::path::Path) {
-            self.reads.record(path);
-        }
-    }
-    let mut counter = Counter {
-        primary: primary.clone(),
-        total: 0,
-        reads,
-    };
-    let shell = adapter.try_stream(r, &ParseOptions::lazy(), &mut counter)?;
-    let mut value = session_meta_json(&shell);
-    let map = value.as_object_mut().expect("session metadata is an object");
-    map.insert("total".into(), json!(counter.total));
-    map.insert("extra".into(), Value::Object(shell.extra));
-    let source = before.with_reads(&counter.reads);
-    anyhow::ensure!(
-        fresh(r, &source, &primary) && counter.reads.fresh(&mut Probe::default()),
-        "API head source changed before publication"
-    );
-    if let Some(key) = key.filter(|_| bounded_size(&value).is_some()) {
-        cache.insert(Entry {
-            key,
-            source,
-            payload: Payload::Head(value.clone()),
-            bytes: 0,
-        });
-    }
+    let (before, mut reads) = captured(r, primary);
+    let value = read(&mut reads)?;
+    let source = before.with_reads(&reads);
+    anyhow::ensure!(fresh(r, &source, primary), "API source changed before publication");
+    cache.insert(Entry {
+        key,
+        source,
+        payload: Payload::Head(value.clone()),
+    });
     Ok(value)
+}
+
+pub(super) fn head(cache: &Cache, adapter: &dyn Adapter, r: &SessionRef) -> Result<Value> {
+    let primary = adapter.resume_source(r);
+    value(cache, r, &primary, "api-head1", |reads| {
+        struct Counter {
+            primary: std::path::PathBuf,
+            total: usize,
+            reads: ReadSet,
+        }
+        impl crate::MessageSink for Counter {
+            fn message(&mut self, message: crate::Message) -> Flow {
+                crate::source::record_message_reads(&message, Some(&self.primary), &mut self.reads);
+                self.total += 1;
+                Flow::Continue
+            }
+            fn dependency(&mut self, path: &std::path::Path) {
+                self.reads.record(path);
+            }
+        }
+        let mut counter = Counter {
+            primary: primary.clone(),
+            total: 0,
+            reads: std::mem::take(reads),
+        };
+        let shell = adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut counter)?;
+        let mut value = session_meta_json(&shell);
+        let map = value.as_object_mut().expect("session metadata is an object");
+        // `title`/`cwd` are carried only when the transcript knows them: a null would overwrite
+        // the catalog row's discovery hint when this map merges into it (`session_head`).
+        for key in ["title", "cwd"] {
+            if map.get(key).is_some_and(Value::is_null) {
+                map.remove(key);
+            }
+        }
+        map.insert("total".into(), json!(counter.total));
+        map.insert("extra".into(), Value::Object(shell.extra));
+        *reads = counter.reads;
+        Ok(value)
+    })
+}
+
+pub(super) fn compactions(cache: &Cache, adapter: &dyn Adapter, r: &SessionRef) -> Result<Value> {
+    let primary = adapter.resume_source(r);
+    value(cache, r, &primary, "api-compactions1", |reads| {
+        struct Sink<'a> {
+            inner: crate::compaction::CompactionSink,
+            primary: &'a std::path::Path,
+            reads: &'a mut ReadSet,
+        }
+        impl crate::MessageSink for Sink<'_> {
+            fn message(&mut self, m: crate::Message) -> Flow {
+                crate::source::record_message_reads(&m, Some(self.primary), self.reads);
+                self.inner.message(m)
+            }
+            fn dependency(&mut self, path: &std::path::Path) {
+                self.reads.record(path);
+            }
+        }
+        let mut sink = Sink {
+            inner: crate::compaction::CompactionSink::new(true).with_source(&r.path),
+            primary: &primary,
+            reads,
+        };
+        adapter.try_stream(r, &Demand::FACTS.with_spans(), &mut sink)?;
+        let boundaries = sink.inner.into_boundaries()?;
+        Ok(Value::Array(
+            (0..boundaries.len())
+                .map(|n| {
+                    let mut row = crate::compaction::row(&boundaries, n);
+                    row.as_object_mut()
+                        .expect("compaction row")
+                        .insert("headline".into(), json!(boundaries[n].headline(n + 1)));
+                    row
+                })
+                .collect(),
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -381,6 +381,9 @@ mod tests {
         fn wants_checkpoint(&mut self, offset: u64) -> bool {
             self.sink.wants_checkpoint(offset)
         }
+        fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+            self.sink.wants_final_checkpoint(offset)
+        }
         fn checkpoint(&mut self, checkpoint: &mut Checkpoint) {
             self.sink.checkpoint(checkpoint);
         }
@@ -395,10 +398,10 @@ mod tests {
         fn roots(&self) -> Vec<std::path::PathBuf> {
             self.inner.roots()
         }
-        fn discover(&self) -> Result<Vec<SessionRef>> {
+        fn discover(&self) -> Result<crate::Discovered> {
             self.inner.discover()
         }
-        fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+        fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
             if let Some(path) = &self.dependency {
                 sink.dependency(path);
             }
@@ -411,19 +414,19 @@ mod tests {
                 },
             )
         }
-        fn resume_format(&self) -> Option<u32> {
-            self.inner.resume_format()
-        }
         fn resume_source(&self, r: &SessionRef) -> std::path::PathBuf {
             self.inner.resume_source(r)
         }
-        fn resume(
+        fn transcript(
             &self,
             r: &SessionRef,
-            opts: &ParseOptions,
+            opts: &Demand,
+            from: Start<'_>,
             sink: &mut dyn MessageSink,
-            cp: &Checkpoint,
         ) -> Result<Option<Session>> {
+            if matches!(from, Start::Whole) {
+                return self.try_stream(r, opts, sink).map(Some);
+            }
             if self.decline {
                 return Ok(None);
             }
@@ -433,34 +436,31 @@ mod tests {
             if let Some(path) = &self.dependency {
                 sink.dependency(path);
             }
-            self.inner.try_resume(
+            self.inner.transcript(
                 r,
                 opts,
+                from,
                 &mut Observer {
                     sink,
                     messages: &self.messages,
                 },
-                cp,
             )
         }
     }
-    fn result(shell: &Session, sink: &WindowSink) -> Value {
-        json!({ "messages": sink.msgs, "idx": sink.idx, "more": sink.more,
+    fn result(shell: &Session, sink: &mut WindowSink) -> Value {
+        json!({ "messages": sink.values().unwrap(), "idx": sink.idx, "more": sink.more,
             "meta": sink.meta.clone().unwrap_or_else(|| session_meta_json(shell)) })
     }
     fn oracle(adapter: &dyn Adapter, r: &SessionRef, start: usize, end: Option<usize>, extra: bool) -> Value {
-        let mut sink = window_sink(&adapter.resume_source(r), start, end, false, ReadSet::default());
+        let mut sink = WindowSink::page(&adapter.resume_source(r), start, end, false, ReadSet::default());
         let shell = adapter
             .try_stream(
                 r,
-                &ParseOptions {
-                    extra,
-                    ..ParseOptions::lazy()
-                },
+                &if extra { Demand::RICH } else { Demand::LEAN }.with_spans(),
                 &mut sink,
             )
             .unwrap();
-        result(&shell, &sink)
+        result(&shell, &mut sink)
     }
     fn fixture(world: &cv_testkit::World, count: usize) -> SessionRef {
         use std::io::Write as _;
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn heads_and_windows_reject_mutation_before_publication() {
-        struct Mutating(bool);
+        struct Mutating;
         impl Adapter for Mutating {
             fn harness(&self) -> Harness {
                 Harness::Claude
@@ -487,13 +487,10 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
-            fn resume_format(&self) -> Option<u32> {
-                self.0.then_some(1)
-            }
-            fn stream(&self, r: &SessionRef, _: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+            fn stream(&self, r: &SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
                 let mut message = Message::new(crate::Role::Assistant);
                 message.content.push(crate::Block::Text {
                     text: "selected".into(),
@@ -507,18 +504,13 @@ mod tests {
         let path = world.home.join("source");
         std::fs::write(&path, b"original").unwrap();
         let r = SessionRef::new("mutating", Harness::Claude, path);
-        for resumable in [false, true] {
-            for staged in [false, true] {
-                std::fs::write(&r.path, b"original").unwrap();
-                let cache = Cache::default();
-                assert!(window_output(&cache, &Mutating(resumable), &r, 0, Some(1), false, staged).is_err());
-                assert!(cache.entries.lock().unwrap().is_empty());
-            }
-        }
+        let cache = Cache::default();
+        assert!(window(&cache, &Mutating, &r, 0, Some(1), false).is_err());
+        assert_eq!(cache.len(), 0);
         std::fs::write(&r.path, b"original").unwrap();
         let cache = Cache::default();
-        assert!(head(&cache, &Mutating(false), &r).is_err());
-        assert!(cache.entries.lock().unwrap().is_empty());
+        assert!(head(&cache, &Mutating, &r).is_err());
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
@@ -586,9 +578,9 @@ mod tests {
                         (1, None),
                     ] {
                         let expected = oracle(adapter.as_ref(), &r, start, end, extra);
-                        let (shell, sink) = window(&cache, adapter.as_ref(), &r, start, end, extra).unwrap();
+                        let (shell, mut sink) = window(&cache, adapter.as_ref(), &r, start, end, extra).unwrap();
                         assert_eq!(
-                            result(&shell, &sink),
+                            result(&shell, &mut sink),
                             expected,
                             "{} {start} {end:?} extra={extra}",
                             file.path().display()
@@ -605,6 +597,28 @@ mod tests {
     }
 
     #[test]
+    fn compactions_reuse_verified_rows_and_invalidate_on_append() {
+        let world = crate::test_world("api-compaction-cache");
+        let r = fixture(&world, 3);
+        let inner = crate::harness::claude::Claude::with_config_dir(&world.home.join(".claude"));
+        let adapter = Observed::new(&inner);
+        let cache = Cache::default();
+        assert_eq!(compactions(&cache, &adapter, &r).unwrap(), json!([]));
+        let count = adapter.messages.load(Ordering::Relaxed);
+        assert_eq!(compactions(&cache, &adapter, &r).unwrap(), json!([]));
+        assert_eq!(adapter.messages.load(Ordering::Relaxed), count);
+        use std::io::Write as _;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&r.path).unwrap(),
+            r#"{{"type":"system","subtype":"compact_boundary","uuid":"boundary","compactMetadata":{{"trigger":"auto","preTokens":1000}}}}"#).unwrap();
+        let rows = compactions(&cache, &adapter, &r).unwrap();
+        assert_eq!(rows[0]["boundary_msg_idx"], 3);
+        assert!(adapter.messages.load(Ordering::Relaxed) > count);
+        let count = adapter.messages.load(Ordering::Relaxed);
+        assert_eq!(compactions(&cache, &adapter, &r).unwrap(), rows);
+        assert_eq!(adapter.messages.load(Ordering::Relaxed), count);
+    }
+
+    #[test]
     fn pages_resume_and_heads_reuse_only_unchanged_sources() {
         let world = crate::test_world("api_cache_invalidation");
         let r = fixture(&world, 20);
@@ -613,8 +627,8 @@ mod tests {
         let cache = Cache::default();
         for start in [0, 5, 10] {
             let expected = oracle(&inner, &r, start, Some(start + 5), false);
-            let (shell, sink) = window(&cache, &adapter, &r, start, Some(start + 5), false).unwrap();
-            assert_eq!(result(&shell, &sink), expected);
+            let (shell, mut sink) = window(&cache, &adapter, &r, start, Some(start + 5), false).unwrap();
+            assert_eq!(result(&shell, &mut sink), expected);
         }
         assert_eq!(adapter.messages.load(Ordering::Relaxed), 18); // Five selected plus one probe per page.
         let first = head(&cache, &adapter, &r).unwrap();
@@ -630,8 +644,8 @@ mod tests {
         .unwrap();
         assert_eq!(head(&cache, &adapter, &r).unwrap()["total"], 21);
         let before = adapter.messages.load(Ordering::Relaxed);
-        let (shell, sink) = window(&cache, &adapter, &r, 15, Some(20), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 15, Some(20), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 15, Some(20), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 15, Some(20), false));
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 21);
         // Switching extra flavor must read whole rather than reuse a checkpoint built lean.
         let before = adapter.messages.load(Ordering::Relaxed);
@@ -649,10 +663,10 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
-            fn stream(&self, r: &SessionRef, _: &ParseOptions, _: &mut dyn MessageSink) -> Result<Session> {
+            fn stream(&self, r: &SessionRef, _: &Demand, _: &mut dyn MessageSink) -> Result<Session> {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 let mut shell = Session::new(&r.id, r.harness);
                 shell.title = r.title.clone();
@@ -675,7 +689,7 @@ mod tests {
                 2 => r.cwd = Some(world.home.join("new-cwd")),
                 3 => r.created_at = Some("2026-01-01T00:00:00Z".parse().unwrap()),
                 4 => r.updated_at = Some("2026-02-01T00:00:00Z".parse().unwrap()),
-                5 => r.message_count = 42,
+                5 => r.message_count = Some(42),
                 _ => {}
             }
             let value = head(&cache, &adapter, &r).unwrap();
@@ -683,18 +697,19 @@ mod tests {
             assert_eq!(value["cwd"], json!(r.cwd));
             assert_eq!(value["extra"]["created_hint"], json!(r.created_at));
             assert_eq!(value["extra"]["updated_hint"], json!(r.updated_at));
-            assert_eq!(value["extra"]["catalog_count"], r.message_count);
+            assert_eq!(value["extra"]["catalog_count"], json!(r.message_count));
             assert_eq!(head(&cache, &adapter, &r).unwrap(), value);
             assert_eq!(adapter.0.load(Ordering::Relaxed), i + 1);
         }
-        r.title = Some("x".repeat(MAX_ENTRY_BYTES + 1024));
-        assert!(Key::admitted(&r, &r.path, "head".into(), false).is_none());
-        let prior = cache.entries.lock().unwrap().len();
+        // A hint of any size is a key like any other: read once, then served (0.17 reread a
+        // title over 256 KiB on every call).
+        r.title = Some("x".repeat(512 * 1024));
+        let prior = cache.len();
         for _ in 0..2 {
             assert_eq!(head(&cache, &adapter, &r).unwrap()["title"], json!(r.title));
         }
-        assert_eq!(adapter.0.load(Ordering::Relaxed), 8);
-        assert_eq!(cache.entries.lock().unwrap().len(), prior);
+        assert_eq!(adapter.0.load(Ordering::Relaxed), 7);
+        assert_eq!(cache.len(), prior + 1);
     }
 
     #[test]
@@ -707,13 +722,13 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
             fn resume_source(&self, _: &SessionRef) -> std::path::PathBuf {
                 self.0.clone()
             }
-            fn stream(&self, r: &SessionRef, _: &ParseOptions, _: &mut dyn MessageSink) -> Result<Session> {
+            fn stream(&self, r: &SessionRef, _: &Demand, _: &mut dyn MessageSink) -> Result<Session> {
                 self.1.fetch_add(1, Ordering::Relaxed);
                 let mut s = Session::new(&r.id, r.harness);
                 s.title = Some(std::fs::read_to_string(&self.0)?);
@@ -741,25 +756,28 @@ mod tests {
     }
 
     #[test]
-    fn cache_retention_has_entry_and_byte_budgets() {
+    fn cache_keeps_entries_of_any_size_up_to_its_count_least_recently_used_out() {
         let world = crate::test_world("api_cache_budget");
         let r = fixture(&world, 1);
         let (source, reads) = captured(&r, &crate::source::primary_path(&r));
         let source = source.with_reads(&reads);
         let cache = Cache::default();
-        for i in 0..100 {
-            cache.insert(Entry {
-                key: Key::of(&r, &r.path, format!("head{i}"), false),
-                source: source.clone(),
-                payload: Payload::Head(json!("x".repeat(100_000))),
-                bytes: 0,
-            });
+        let key = |i: usize| Key::of(&r, &r.path, format!("head{i}"), false);
+        let entry = |i: usize| Entry {
+            key: key(i),
+            source: source.clone(),
+            // A few entries past the old 256 KiB budget, the rest small.
+            payload: Payload::Head(json!("x".repeat(if i < 4 { 300_000 } else { 16 }))),
+        };
+        for i in 0..ENTRIES {
+            cache.insert(entry(i));
         }
-        let entries = cache.entries.lock().unwrap();
-        assert!(entries.len() <= MAX_ENTRIES);
-        assert!(entries.iter().map(|entry| entry.bytes).sum::<usize>() <= MAX_CACHE_BYTES);
-        drop(entries);
-        assert!(bounded_size(&json!("x".repeat(MAX_ENTRY_BYTES))).is_none());
+        assert_eq!(cache.len(), ENTRIES, "no entry is too large to keep");
+        assert!(cache.get(&key(0)).is_some(), "touch the oldest");
+        cache.insert(entry(ENTRIES));
+        assert_eq!(cache.len(), ENTRIES);
+        assert!(cache.get(&key(0)).is_some(), "a used entry stays");
+        assert!(cache.get(&key(1)).is_none(), "the least recently used goes");
     }
     #[test]
     fn changed_dynamic_reads_and_declined_resume_fall_back_whole() {
@@ -777,8 +795,8 @@ mod tests {
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 11);
         adapter.decline = true;
         let before = adapter.messages.load(Ordering::Relaxed);
-        let (shell, sink) = window(&cache, &adapter, &r, 10, Some(15), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 10, Some(15), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 10, Some(15), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 10, Some(15), false));
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 16);
     }
 
@@ -796,10 +814,10 @@ mod tests {
         let cache = Cache::default();
         window(&cache, &adapter, &r, 0, Some(5), false).unwrap();
         *adapter.rewrite.lock().unwrap() = Some(old.replace("old-title", "new-title"));
-        let (shell, sink) = window(&cache, &adapter, &r, 5, Some(10), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 5, Some(10), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 5, Some(10), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 5, Some(10), false));
         assert_eq!(shell.title.as_deref(), Some("new-title"));
-        assert!(cache.entries.lock().unwrap().is_empty());
+        assert_eq!(cache.len(), 0);
     }
 
     #[cfg(unix)]
@@ -819,8 +837,8 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
         let before = adapter.messages.load(Ordering::Relaxed);
-        let (shell, sink) = window(&cache, &adapter, &r, 5, Some(10), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 5, Some(10), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 5, Some(10), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 5, Some(10), false));
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 11);
     }
 
@@ -834,8 +852,8 @@ mod tests {
         let cache = Cache::default();
         for start in (0..20_000).step_by(200) {
             let expected = oracle(&inner, &r, start, Some(start + 200), false);
-            let (shell, sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
-            assert_eq!(result(&shell, &sink), expected);
+            let (shell, mut sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
+            assert_eq!(result(&shell, &mut sink), expected);
         }
         let page_callbacks = adapter.messages.load(Ordering::Relaxed);
         assert_eq!(page_callbacks, 20_099);
@@ -857,12 +875,12 @@ mod tests {
         let adapter = Observed::new(&inner);
         let cache = Cache::default();
         for start in (0..20_000).step_by(200) {
-            let (shell, sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
-            assert_eq!(sink.msgs.len(), 200);
+            let (shell, mut sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
+            assert_eq!(sink.selected, 200);
             assert_eq!(sink.idx, (start + 201).min(20_000));
             if start % 2000 == 0 || start == 19800 {
                 assert_eq!(
-                    result(&shell, &sink),
+                    result(&shell, &mut sink),
                     oracle(&inner, &r, start, Some(start + 200), false)
                 );
             }
@@ -892,12 +910,12 @@ mod tests {
         let adapter = Observed::new(&inner);
         let cache = Cache::default();
         for start in (0..20_000).step_by(200) {
-            let (shell, sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
-            assert_eq!(sink.msgs.len(), 200);
+            let (shell, mut sink) = window(&cache, &adapter, &r, start, Some(start + 200), false).unwrap();
+            assert_eq!(sink.selected, 200);
             assert_eq!(sink.idx, (start + 201).min(20_000));
             if start % 2000 == 0 || start == 19800 {
                 assert_eq!(
-                    result(&shell, &sink),
+                    result(&shell, &mut sink),
                     oracle(&inner, &r, start, Some(start + 200), false)
                 );
             }
@@ -915,21 +933,19 @@ mod tests {
             .unwrap();
         assert_eq!(head(&cache, &adapter, &r).unwrap()["total"], 20_001);
         let before = adapter.messages.load(Ordering::Relaxed);
-        let (shell, sink) = window(&cache, &adapter, &r, 19900, Some(19905), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 19900, Some(19905), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 19900, Some(19905), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 19900, Some(19905), false));
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 19_906);
         std::fs::write(&state, r#"{"id":"session_pages","cwd":"/new"}"#).unwrap();
         let before = adapter.messages.load(Ordering::Relaxed);
-        let (shell, sink) = window(&cache, &adapter, &r, 19905, Some(19910), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&inner, &r, 19905, Some(19910), false));
+        let (shell, mut sink) = window(&cache, &adapter, &r, 19905, Some(19910), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&inner, &r, 19905, Some(19910), false));
         assert_eq!(shell.cwd.as_deref(), Some(std::path::Path::new("/new")));
         assert_eq!(adapter.messages.load(Ordering::Relaxed) - before, 19_911);
         assert!(cache
-            .entries
-            .lock()
-            .unwrap()
+            .entries()
             .iter()
-            .all(|entry| entry.bytes < 16 * 1024));
+            .all(|entry| serde_json::to_vec(entry).unwrap().len() < 16 * 1024));
         eprintln!("kimi-code actual API: pages=100 selected=20000 callbacks=20099; two heads callbacks=20000; wire/state changes force exact whole fallback");
     }
 
@@ -946,10 +962,10 @@ mod tests {
             fn roots(&self) -> Vec<std::path::PathBuf> {
                 Vec::new()
             }
-            fn discover(&self) -> Result<Vec<SessionRef>> {
-                Ok(Vec::new())
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
             }
-            fn stream(&self, r: &SessionRef, _: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+            fn stream(&self, r: &SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 let input = crate::json::Json::source(&self.path, 0, std::fs::metadata(&self.path)?.len())?;
                 let mut message = Message::new(crate::Role::Assistant);
@@ -976,8 +992,8 @@ mod tests {
         head(&cache, &adapter, &r).unwrap();
         assert_eq!(adapter.calls.load(Ordering::Relaxed), 1);
         let (before, reads) = captured(&r, &crate::source::primary_path(&r));
-        let mut sink = window_sink(&crate::source::primary_path(&r), 1, Some(2), false, reads);
-        adapter.try_stream(&r, &ParseOptions::lazy(), &mut sink).unwrap();
+        let mut sink = WindowSink::page(&crate::source::primary_path(&r), 1, Some(2), false, reads);
+        adapter.try_stream(&r, &Demand::LEAN.with_spans(), &mut sink).unwrap();
         let source = before.with_reads(&sink.reads);
         assert!(fresh(&r, &source, &crate::source::primary_path(&r)));
         std::fs::write(path, r#"{"command":"updated"}"#).unwrap();
@@ -987,10 +1003,10 @@ mod tests {
     }
 
     #[test]
-    fn oversized_demanded_metadata_is_returned_without_cache_retention() {
+    fn large_demanded_metadata_is_returned_and_retained() {
         let world = crate::test_world("api_large_metadata_budget");
         let r = fixture(&world, 20);
-        let title = "x".repeat(MAX_ENTRY_BYTES + 1024);
+        let title = "x".repeat(512 * 1024);
         let body = format!(
             "{}\n{}",
             json!({"type":"ai-title", "aiTitle":title}),
@@ -1004,9 +1020,11 @@ mod tests {
             let (shell, _) = window(&cache, &adapter, &r, start, Some(start + 5), false).unwrap();
             assert_eq!(shell.title.as_deref(), Some(title.as_str()));
         }
-        assert_eq!(adapter.messages.load(Ordering::Relaxed), 17);
+        // The second page resumes at the first one's end (0.17 reread the head of a session with
+        // a title over 256 KiB on every page).
+        assert_eq!(adapter.messages.load(Ordering::Relaxed), 12);
         assert_eq!(head(&cache, &adapter, &r).unwrap()["title"], title);
-        assert!(cache.entries.lock().unwrap().is_empty());
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]
@@ -1021,11 +1039,11 @@ mod tests {
         std::fs::write(&r.path, format!("{first}\n{giant}\n{rest}")).unwrap();
         let adapter = crate::harness::claude::Claude::with_config_dir(&world.home.join(".claude"));
         let cache = Cache::default();
-        let (shell, sink) = window(&cache, &adapter, &r, 2, Some(4), false).unwrap();
-        assert_eq!(result(&shell, &sink), oracle(&adapter, &r, 2, Some(4), false));
-        let entries = cache.entries.lock().unwrap();
+        let (shell, mut sink) = window(&cache, &adapter, &r, 2, Some(4), false).unwrap();
+        assert_eq!(result(&shell, &mut sink), oracle(&adapter, &r, 2, Some(4), false));
+        let entries = cache.entries();
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].bytes < 16 * 1024);
+        assert!(serde_json::to_vec(&entries[0]).unwrap().len() < 16 * 1024);
         assert!(!serde_json::to_string(&entries[0])
             .unwrap()
             .contains("discarded-tool-content"));

@@ -28,8 +28,7 @@ pub(crate) struct DecisionSpec {
     pub repo: Option<PathBuf>,
     pub issue: Option<String>,
     pub tags: Vec<String>,
-    /// The note event this decision was posed from (an old log's `cv task split` wrote these; the
-    /// page's `reopen` of such a decision carries it forward).
+    /// The note event this decision was posed from (an old log's `cv task split` wrote these).
     pub source: Option<String>,
     /// Tasks (full ids) this decision blocks.
     pub blocks: Vec<String>,
@@ -54,7 +53,7 @@ pub(crate) fn option_list(default_choice: &str, options: &[String]) -> Vec<Strin
 /// `posed` (the options, the default, the deadline) — one creating event per decision, plus a
 /// `tagged` only for the caller's own tags, one `blocked_by` per task it blocks, and the
 /// provisional `resolved` when `spec.provisional`. Built, not written: [`pose`] appends them as
-/// ONE unit, and the page's `reopen` adds its notes to the same unit.
+/// ONE unit.
 pub(crate) fn pose_events(from: &str, spec: DecisionSpec) -> Result<Vec<TaskEvent>> {
     if spec.default_choice.trim().is_empty() {
         bail!("a decision needs a --default (the option that stands if nobody speaks)");
@@ -274,10 +273,43 @@ pub(crate) struct EventFilter {
     pub task: Option<String>,
 }
 
+/// Every wire tag an event can carry: the kinds cv writes, then the retired ones a log may hold.
+const LIVE_KIND_TAGS: [&str; 12] = [
+    "opened",
+    "claimed",
+    "released",
+    "noted",
+    "done",
+    "abandoned",
+    "superseded",
+    "tagged",
+    "blocked_by",
+    "posed",
+    "resolved",
+    "status_set",
+];
+
+/// The wire tags of a comma-separated `--kind` list (`kind_tag` on each). An unknown spelling is a
+/// usage error naming the known tags, never an empty result.
+pub(crate) fn kind_tags(list: &str) -> Result<Vec<String>> {
+    list.split(',')
+        .map(|spelling| {
+            let tag = kind_tag(spelling);
+            if LIVE_KIND_TAGS.contains(&tag.as_str()) || cv_core::task::RETIRED_TAGS.contains(&tag.as_str()) {
+                Ok(tag)
+            } else {
+                crate::util::usage(format!(
+                    "unknown event kind {spelling:?} (known: {}; `note`, `resolve`, `open`, `claim`, … also spell)",
+                    LIVE_KIND_TAGS.join(", ")
+                ))
+            }
+        })
+        .collect()
+}
+
 /// The wire tag for a kind spelling a person would type: `note`→`noted`, `resolve`→`resolved`,
-/// `open`→`opened`, `claim`→`claimed`, … Unknown spellings pass through (and match nothing,
-/// loudly empty rather than wrong).
-pub(crate) fn kind_tag(s: &str) -> String {
+/// `open`→`opened`, `claim`→`claimed`, … Any other spelling is returned lowercased and trimmed.
+fn kind_tag(s: &str) -> String {
     let s = s.trim().to_lowercase();
     match s.as_str() {
         "note" | "notes" => "noted",
@@ -335,13 +367,15 @@ pub(crate) fn event_json(ev: &TaskEvent, model: &TaskReadModel) -> serde_json::V
                 obj.insert("assignee".into(), serde_json::Value::String(a.clone()));
             }
         }
-        // The same telling detail the text feed prints, so a page need not know every kind.
+        // The telling detail the text feed prints, shaped alike but at this feed's own widths,
+        // so a page need not know every kind.
         obj.insert("detail".into(), serde_json::Value::String(event_detail(ev)));
     }
     v
 }
 
-/// The telling detail of one event (what `event_text` prints after the kind), sanitized.
+/// The telling detail of one event, shaped like the one `event_text` prints after the kind but
+/// at this feed's own widths, sanitized.
 pub(crate) fn event_detail(ev: &TaskEvent) -> String {
     match &ev.kind {
         TaskEventKind::Noted { text, .. } => truncate(&sanitize_line(text), 160),
@@ -602,15 +636,16 @@ pub(crate) fn render_inbox_md(page: &task::InboxPage) -> String {
                 }
                 out.push('\n');
             }
-            if !i.body.trim().is_empty() {
-                for para in i.body.trim().split("\n\n") {
+            if let Some(body) = i.body.as_deref().filter(|body| !body.trim().is_empty()) {
+                for para in body.trim().split("\n\n") {
                     out.push_str(&md_block(para));
                     out.push_str("\n\n");
                 }
             }
-            if !i.notes.is_empty() {
-                out.push_str(&format!("notes ({}):\n\n", i.notes.len()));
-                for note in &i.notes {
+            if i.notes.as_ref().is_some_and(|notes| !notes.is_empty()) {
+                let notes = i.notes.as_ref().unwrap();
+                out.push_str(&format!("notes ({}):\n\n", notes.len()));
+                for note in notes {
                     let mut line = format!(
                         "- _{}, {}{}:_ {}",
                         md_inline(&note.by),
@@ -759,17 +794,16 @@ mod tests {
             assert!(brief
                 .items
                 .iter()
-                .all(|row| row.body.is_empty() && row.notes.is_empty() && row.status.is_none()));
+                .all(|row| row.body.is_none() && row.notes.is_none() && row.status.is_none()));
             assert!(brief
                 .items
                 .iter()
                 .filter_map(|row| row.decision.as_ref())
                 .filter_map(|d| d.resolution.as_ref())
                 .all(|r| r.note.is_none()));
-            assert!(full
-                .items
-                .iter()
-                .any(|row| row.body == body && row.status.as_deref() == Some(body.as_str())));
+            assert!(full.items.iter().any(|row| {
+                row.body.as_deref() == Some(body.as_str()) && row.status.as_deref() == Some(body.as_str())
+            }));
         }
         assert_eq!(outcome.model.tasks[&action_id].body, body);
         assert_eq!(outcome.model.tasks[&action_id].notes[0].text, body);
@@ -852,7 +886,16 @@ mod tests {
         assert_eq!(kind_tag("note"), "noted");
         assert_eq!(kind_tag("Resolve"), "resolved");
         assert_eq!(kind_tag("done"), "done");
-        assert_eq!(kind_tag("bogus"), "bogus");
+        assert_eq!(
+            kind_tags("note,Resolve,landed").unwrap(),
+            ["noted", "resolved", "landed"]
+        );
+        let err = kind_tags("note,bogus").unwrap_err();
+        assert!(err.downcast_ref::<crate::util::UsageError>().is_some());
+        assert!(
+            err.to_string().contains("\"bogus\"") && err.to_string().contains("status_set"),
+            "{err}"
+        );
     }
 
     #[test]

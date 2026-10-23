@@ -55,6 +55,7 @@
 //! (`Usage::cost_usd`, `Usage::reasoning_tokens`); `session.parent_id` is `Lineage::parent`; the
 //! remaining `session` columns land in `Session::extra["opencode"]`.
 
+use crate::json::{ReadInput, Validation};
 mod emit;
 mod record;
 #[cfg(any(feature = "sqlite", test))]
@@ -63,7 +64,8 @@ pub use emit::emit;
 
 use super::Adapter;
 use crate::ir::*;
-use crate::stream::{Flow, MessageSink, ParseOptions};
+use crate::source::{Dependencies, Probe};
+use crate::stream::{Demand, Flow, MessageSink};
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -76,14 +78,30 @@ pub struct OpenCode {
     root: Option<PathBuf>,
     /// The canonical SQLite store, if present (and the `sqlite` feature is on).
     db: Option<PathBuf>,
+    skipped: Vec<crate::Skipped>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: OpenCode = OpenCode {
+    root: None,
+    db: None,
+    skipped: Vec::new(),
+};
 
 impl OpenCode {
     pub fn detect() -> Self {
         let data = data_dir();
         let root = data.as_ref().map(|d| d.join("storage")).filter(|p| p.exists());
-        let db = data.as_deref().and_then(resolve_db);
-        OpenCode { root, db }
+        let mut skipped = Vec::new();
+        let db = data.as_deref().and_then(|data| match resolve_db(data) {
+            Ok(db) => db,
+            Err(error) => {
+                skipped.extend(crate::Skipped::of(data, &error));
+                None
+            }
+        });
+        OpenCode { root, db, skipped }
     }
 
     /// An adapter rooted at an explicit JSON storage dir (`…/opencode/storage`) instead of `$HOME` —
@@ -93,6 +111,7 @@ impl OpenCode {
         OpenCode {
             root: Some(root),
             db: None,
+            skipped: Vec::new(),
         }
     }
 
@@ -105,7 +124,11 @@ impl OpenCode {
         let db = Some(data.join("opencode.db")).filter(|p| p.is_file());
         #[cfg(not(feature = "sqlite"))]
         let db = None;
-        OpenCode { root, db }
+        OpenCode {
+            root,
+            db,
+            skipped: Vec::new(),
+        }
     }
 
     /// An adapter over one explicit `opencode.db` (tests, alternate data dirs). No JSON tree.
@@ -114,29 +137,34 @@ impl OpenCode {
         OpenCode {
             root: None,
             db: Some(db),
+            skipped: Vec::new(),
         }
     }
 
-    /// Sessions from the SQLite store, plus their ids so the JSON walk can skip duplicates.
+    /// Sessions from the SQLite store (a database that cannot open is a reported skip), plus
+    /// their ids so the JSON walk can skip duplicates.
     #[cfg(feature = "sqlite")]
-    fn discover_db(&self) -> (Vec<SessionRef>, HashSet<String>) {
-        let Some(db) = &self.db else {
-            return (Vec::new(), HashSet::new());
+    fn discover_db(&self) -> (crate::Discovered, HashSet<String>) {
+        let mut out = crate::Discovered {
+            refs: Vec::new(),
+            skipped: self.skipped.clone(),
         };
-        match db::discover(db) {
-            Ok(refs) => {
-                let ids = refs.iter().map(|r| r.id.clone()).collect();
-                (refs, ids)
-            }
-            Err(e) => {
-                eprintln!("cv: skipping {}: {e:#}", db.display());
-                (Vec::new(), HashSet::new())
-            }
-        }
+        let Some(db) = &self.db else {
+            return (out, HashSet::new());
+        };
+        out.refs = out.keep(db, db::discover(db)).unwrap_or_default();
+        let ids = out.refs.iter().map(|r| r.id.clone()).collect();
+        (out, ids)
     }
     #[cfg(not(feature = "sqlite"))]
-    fn discover_db(&self) -> (Vec<SessionRef>, HashSet<String>) {
-        (Vec::new(), HashSet::new())
+    fn discover_db(&self) -> (crate::Discovered, HashSet<String>) {
+        (
+            crate::Discovered {
+                refs: Vec::new(),
+                skipped: self.skipped.clone(),
+            },
+            HashSet::new(),
+        )
     }
 
     fn message_dir(&self, sid: &str) -> Option<PathBuf> {
@@ -158,42 +186,191 @@ fn data_dir() -> Option<PathBuf> {
 /// `$OPENCODE_DB` (absolute, or relative to the data dir; `:memory:` means none), else
 /// `opencode.db` (release channels), else the newest `opencode-<channel>.db`.
 #[cfg(feature = "sqlite")]
-fn resolve_db(data: &Path) -> Option<PathBuf> {
+fn resolve_db(data: &Path) -> Result<Option<PathBuf>> {
     if let Some(v) = crate::env::var_os("OPENCODE_DB") {
         if v == ":memory:" {
-            return None;
+            return Ok(None);
         }
         let v = PathBuf::from(v);
-        let p = if v.is_absolute() { v } else { data.join(v) };
-        return p.is_file().then_some(p);
+        let path = if v.is_absolute() { v } else { data.join(v) };
+        return Ok(path.try_exists()?.then_some(path));
     }
     let main = data.join("opencode.db");
-    if main.is_file() {
-        return Some(main);
+    if main.try_exists()? {
+        return Ok(Some(main));
     }
-    let mut channel: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(data)
-        .ok()?
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            let name = p.file_name()?.to_str()?;
-            if !(name.starts_with("opencode-") && name.ends_with(".db")) {
-                return None;
-            }
-            Some((e.metadata().ok()?.modified().ok()?, p))
-        })
-        .collect();
+    let mut channel = Vec::new();
+    for entry in super::side_entries(data)? {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with("opencode-") && name.ends_with(".db") {
+            channel.push((entry.metadata()?.modified()?, path));
+        }
+    }
     channel.sort();
-    channel.pop().map(|(_, p)| p)
+    Ok(channel.pop().map(|(_, path)| path))
 }
 #[cfg(not(feature = "sqlite"))]
-fn resolve_db(_data: &Path) -> Option<PathBuf> {
-    None
+fn resolve_db(_data: &Path) -> Result<Option<PathBuf>> {
+    Ok(None)
 }
 
 impl Adapter for OpenCode {
+    /// A synthetic turn whose metadata names the `shell` source: a shell command finished.
+    fn record_affordance(
+        &self,
+        m: &Message,
+        _first: &crate::affordance::FirstText<'_>,
+    ) -> Result<Option<crate::affordance::RecordHit>> {
+        let shell = m
+            .harness_extra(Harness::OpenCode)
+            .and_then(|bag| bag.get("metadata"))
+            .and_then(|v| v.get("source"))
+            .and_then(Value::as_str)
+            == Some("shell");
+        Ok(shell.then_some(crate::affordance::RecordHit {
+            kind: crate::affordance::Kind::BackgroundJob,
+            action: "complete",
+            tool: "synthetic",
+        }))
+    }
+
     fn harness(&self) -> Harness {
         Harness::OpenCode
+    }
+
+    fn capabilities(&self) -> super::Capabilities {
+        use crate::affordance::Denial;
+        super::Capabilities {
+            denials: &[
+                Denial {
+                    prefix: "The user has specified a rule which prevents you from using this specific tool call",
+                    also: None,
+                },
+                Denial {
+                    prefix: "The user rejected permission to use this specific tool call",
+                    also: None,
+                },
+            ],
+            edit_guard: None,
+            lane_stops: None,
+            deferred_wrapper: None,
+            rich_spans: false,
+        }
+    }
+
+    /// The session's permission ruleset (`[{permission, pattern, action}]`) and its staged revert.
+    fn session_affordances(&self, s: &Session) -> Vec<crate::affordance::Affordance> {
+        use crate::affordance::{items_summary, session_row, short, Item, Kind};
+        let mut out = Vec::new();
+        let Some(bag) = s.harness_extra(Harness::OpenCode) else {
+            return out;
+        };
+        let rules: Vec<Item> = bag
+            .get("permission")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|r| {
+                let what = r.get("permission").and_then(Value::as_str)?;
+                let pattern = r.get("pattern").and_then(Value::as_str).unwrap_or("*");
+                Some(Item {
+                    content: format!("{what} {pattern}"),
+                    status: r.get("action").and_then(Value::as_str).map(str::to_string),
+                })
+            })
+            .collect();
+        if !rules.is_empty() {
+            let summary = items_summary(&rules).replacen(" item", " rule", 1);
+            out.push(session_row(Kind::Approval, "state", "permission", summary, rules));
+        }
+        if let Some(rev) = bag.get("revert").and_then(Value::as_object) {
+            let to = rev.get("messageID").and_then(Value::as_str).unwrap_or("?");
+            let snap = rev.get("snapshot").and_then(Value::as_str).map(short).unwrap_or("");
+            let summary = format!("to {to} · snapshot {snap}");
+            out.push(session_row(Kind::Checkpoint, "restore", "revert", summary, Vec::new()));
+        }
+        out
+    }
+
+    /// A turn's `patch` parts and its step `snapshot`, each a restorable point.
+    fn message_affordances(&self, m: &Message) -> Vec<crate::affordance::BagHit> {
+        use crate::affordance::{joined, short, BagHit, Kind};
+        let mut out = Vec::new();
+        let Some(bag) = m.harness_extra(Harness::OpenCode) else {
+            return out;
+        };
+        for p in bag.get("patches").and_then(Value::as_array).into_iter().flatten() {
+            let hash = p.get("hash").and_then(Value::as_str).unwrap_or("");
+            out.push(BagHit {
+                kind: Kind::Checkpoint,
+                action: "create",
+                tool: "patch",
+                summary: crate::ir::truncate(&format!("{} · {}", short(hash), joined(p.get("files"))), 120),
+            });
+        }
+        if let Some(snap) = bag.get("snapshot").filter(|v| !joined(v.get("files")).is_empty()) {
+            let hash = snap.get("start").and_then(Value::as_str).unwrap_or("");
+            out.push(BagHit {
+                kind: Kind::Checkpoint,
+                action: "create",
+                tool: "snapshot",
+                summary: crate::ir::truncate(&format!("{} · {}", short(hash), joined(snap.get("files"))), 120),
+            });
+        }
+        out
+    }
+
+    /// OpenCode accepts a database under any filename (`OPENCODE_DB`), so a name that is not a
+    /// SQLite one is sniffed; an unreadable one is unknown.
+    fn sqlite_source(&self, r: &SessionRef) -> Option<bool> {
+        if crate::source::has_sqlite_extension(&r.path) {
+            return Some(true);
+        }
+        crate::source::has_sqlite_header(&r.path)
+    }
+
+    fn dependencies(&self, r: &SessionRef, probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        if self.sqlite_source(r)? {
+            return Some(());
+        }
+        let storage = r
+            .path
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "session"))
+            .and_then(Path::parent)?;
+        let messages = storage.join("message").join(&r.id);
+        // IDs are data, not filenames: old/imported stores can disagree. Cache that small
+        // projection under its captured identity for every probe in this operation; no body
+        // is materialized and unchanged messages are not decoded again on publication.
+        for message in probe.list(&messages)?.iter() {
+            let mut reads = crate::source::ReadSet::default();
+            reads.record(message);
+            let (id, _) = crate::source::inventory("opencode-message-id", message, &reads, || {
+                let id = document(message, |view, _| {
+                    super::store::document::Fields::parse(view, &["id"])?
+                        .map(|fields| fields.string("id").map(Option::unwrap_or_default))
+                        .transpose()
+                })?
+                .flatten();
+                let bytes = id.as_ref().map_or(0, String::capacity) + std::mem::size_of_val(&id);
+                Ok((id, reads.clone(), bytes))
+            })
+            .inspect_err(|error| {
+                crate::env::warn_once(
+                    "OpenCode dependencies",
+                    format_args!("{}: {error:#}", message.display()),
+                );
+            })
+            .ok()?;
+            if let Some(id) = id.as_ref() {
+                deps.directories.push(storage.join("part").join(id));
+            }
+        }
+        deps.directories.push(messages);
+        Some(())
     }
 
     fn roots(&self) -> Vec<PathBuf> {
@@ -204,24 +381,33 @@ impl Adapter for OpenCode {
             .collect()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         // The database first (it is the live store), then the frozen JSON tree for anything the
         // database doesn't have — a session present in both (the import left copies) appears once.
+        // An unreadable directory, and a session file that cannot be read or decoded, are
+        // skipped and reported.
         let (mut out, seen) = self.discover_db();
         let Some(root) = &self.root else {
             return Ok(out);
         };
         let session_dir = root.join("session");
-        for entry in WalkDir::new(&session_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&session_dir) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    out.skipped.extend(crate::Skipped::walk(&error));
+                    continue;
+                }
+            };
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !name.starts_with("ses_") || !name.ends_with(".json") {
                 continue;
             }
-            let Ok(text) = fs::read_to_string(path) else {
+            let Some(text) = out.keep(path, fs::read_to_string(path).map_err(Into::into)) else {
                 continue;
             };
-            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            let Some(v) = out.keep(path, serde_json::from_str::<Value>(&text).map_err(Into::into)) else {
                 continue;
             };
             let id = v
@@ -232,25 +418,27 @@ impl Adapter for OpenCode {
             if seen.contains(&id) {
                 continue;
             }
-            let message_count = self.message_dir(&id).map(|d| count_turns(&d)).unwrap_or(0);
-            out.push(SessionRef {
-                id,
-                harness: Harness::OpenCode,
-                path: path.to_path_buf(),
+            out.refs.push(SessionRef {
                 cwd: v.get("directory").and_then(Value::as_str).map(PathBuf::from),
                 title: v
                     .get("title")
                     .and_then(Value::as_str)
-                    .map(|t| crate::ir::truncate(t, 80)),
+                    .map(|t| crate::ir::truncate(t, crate::projection::Head::TITLE)),
                 created_at: v.pointer("/time/created").and_then(super::ts_from_value),
                 updated_at: v.pointer("/time/updated").and_then(super::ts_from_value),
-                message_count,
+                // Uncounted (`SessionRef::new`): counting means opening every message file (C1).
+                ..SessionRef::new(id, Harness::OpenCode, path.to_path_buf())
             });
         }
         Ok(out)
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    /// OpenCode's sessions are rows of its database (or files beside it), written in place.
+    fn watch_policy(&self, _r: &SessionRef) -> super::WatchPolicy {
+        super::WatchPolicy::Database
+    }
+
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             // Spawn turns, sub-agent returns and deferred tool calls, typed (`crate::affordance`).
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::OpenCode, sink);
@@ -263,27 +451,23 @@ impl Adapter for OpenCode {
             // OpenCode stores a session as a *directory* of per-message JSON files (plus per-message
             // part files), each one document viewed by the record codec:
             //   1. read the small session meta file,
-            //   2. order the message files by their `time/created` key alone,
-            //   3. view each message file in order, then its part files one at a time, emit its IR
+            //   2. view each message file once: its header record and its `time/created` key,
+            //   3. in that order, view each header's part files one at a time, emit its IR
             //      message(s) to `sink`, and drop it before touching the next.
             let text = fs::read_to_string(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
-            let meta: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            // A document that does not decode is a counted record, read as no facts.
+            let mut unparsed = super::Unparsed::default();
+            let meta: Value = serde_json::from_str(&text).unwrap_or_else(|_| {
+                unparsed.count();
+                Value::Null
+            });
 
             let mut s = Session {
-                source_stamp: None,
-                id: r.id.clone(),
-                harness: Harness::OpenCode,
                 cwd: meta.get("directory").and_then(Value::as_str).map(PathBuf::from),
                 title: meta.get("title").and_then(Value::as_str).map(str::to_string),
                 created_at: meta.pointer("/time/created").and_then(super::ts_from_value),
                 updated_at: meta.pointer("/time/updated").and_then(super::ts_from_value),
-                model: None,
-                git: None,
-                messages: Vec::new(),
                 source_path: Some(r.path.clone()),
-                extra: serde_json::Map::new(),
-                principal: None,
-                system_prompt: None,
                 lineage: Lineage {
                     parent: meta
                         .get("parentID")
@@ -292,88 +476,93 @@ impl Adapter for OpenCode {
                         .map(str::to_string),
                     ..Lineage::default()
                 },
+                ..Session::new(r.id.clone(), Harness::OpenCode)
             };
-
-            // Order message files by `time/created` (same ordering as before) while holding only the
-            // sort key + path per file — never all message bodies at once.
-            let mut order: Vec<(i64, PathBuf)> = Vec::new();
-            if let Some(mdir) = self.message_dir(&r.id) {
-                if let Ok(rd) = fs::read_dir(&mdir) {
-                    for e in rd.filter_map(|e| e.ok()) {
-                        let path = e.path();
-                        let when = document(&path, |view, _| {
-                            Ok(record::owned(record::get(view.get("time")?, "created")?)?
-                                .and_then(|created| created.as_i64())
-                                .unwrap_or(0))
-                        })?;
-                        if let Some(when) = when {
-                            order.push((when, path));
-                        }
-                    }
-                }
-            }
-            order.sort();
-
-            sink.meta(&s);
 
             // All regenerated payloads share one private file for this session pass.
             let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena()?);
 
-            // Re-read one message file at a time, emit, then drop before the next.
-            for (_, path) in &order {
-                let Some(mut record) = document(path, |view, source| {
-                    record::Record::header(view, None, record::Ctx::new(opts.spans, source, &arena))
-                })?
-                .flatten() else {
+            // Each message file is captured and viewed once: its header (small: the parts hold
+            // the bodies) is held with its `time/created` sort key until every header is read.
+            let mut order: Vec<(i64, PathBuf, Option<record::Record>)> = Vec::new();
+            if let Some(mdir) = self.message_dir(&r.id) {
+                for path in listing(&mdir)? {
+                    let header = document(&path, |view, source| {
+                        let when = record::owned(record::get(view.get("time")?, "created")?)?
+                            .and_then(|created| created.as_i64())
+                            .unwrap_or(0);
+                        let header = record::Record::header(view, None, record::Ctx::new(opts.spans, source, &arena))?;
+                        Ok((when, header))
+                    })?;
+                    match header {
+                        Some((when, header)) => order.push((when, path, header)),
+                        None => unparsed.count(),
+                    }
+                }
+            }
+            order.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+
+            sink.meta(&s);
+
+            // One message at a time: its parts, emit, then drop before the next.
+            for (_, _, record) in order {
+                let Some(mut record) = record else {
                     continue;
                 };
                 if let Some(dir) = self.part_dir(record.id().unwrap_or("")) {
+                    // `dependencies` already inventories this directory and all its parts
+                    // before the read. Re-reporting them retains a duplicate per-part read set
+                    // through counted publication, even when the consumer discards every turn.
                     // Parts in file-name order, one file at a time.
-                    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|e| e.ok().map(|e| e.path()))
-                        .collect();
+                    let mut paths = listing(&dir)?;
                     paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
                     for path in paths {
-                        document(&path, |view, source| {
+                        let part = document(&path, |view, source| {
                             record.part(view, None, record::Ctx::new(opts.spans, source, &arena))
                         })?;
+                        if part.is_none() {
+                            unparsed.count();
+                        }
                     }
                 }
                 for mut built in record.finish() {
                     fold_into_session(&mut s, &mut built)?;
                     if sink.message(built) == Flow::Stop {
+                        unparsed.note(&mut s);
                         return Ok(s);
                     }
                 }
             }
 
+            unparsed.note(&mut s);
             Ok(s)
         })
     }
 
+    /// Every database session's certificate ([`db::rows`]); a JSON-file session is its own files.
+    #[cfg(feature = "sqlite")]
+    fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        db::rows(store).ok()
+    }
+
     /// The todo list `todowrite` keeps in `opencode.db`'s `todo` table (1.x; 2.x has none).
-    fn store_affordances(&self, r: &SessionRef) -> Vec<crate::affordance::Affordance> {
+    fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
         #[cfg(feature = "sqlite")]
         if self.db.as_ref() == Some(&r.path) || db::is_db_ref(r) {
-            return db::todos(r).into_iter().collect();
+            return Ok(db::todos(r)?.into_iter().collect());
         }
         #[cfg(not(feature = "sqlite"))]
         let _ = r;
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 
 /// Session facts a message reveals as it streams past: the session model (the first one seen when
-/// the store gave none), the system prompt (a `system` record), and the IR diet — `Message::model`
-/// stays set only when it differs from the session's.
+/// the store gave none) and the system prompt (a `system` record). The message keeps the model its
+/// record states.
 fn fold_into_session(s: &mut Session, m: &mut Message) -> Result<()> {
     if s.model.is_none() {
         s.model = m.model.clone();
-    }
-    if m.model.is_some() && m.model == s.model {
-        m.model = None;
     }
     if m.kind == MessageKind::SystemPrompt && s.system_prompt.is_none() {
         // System prompts are required as owned session metadata even for bounded readers.
@@ -383,41 +572,26 @@ fn fold_into_session(s: &mut Session, m: &mut Message) -> Result<()> {
     Ok(())
 }
 
-/// Count a session's conversational turns: message records whose `role` is `user`/`assistant`.
-/// The [`SessionRef::message_count`] contract is user+assistant turns only — counting directory
-/// entries (the old behavior) also picked up system/summary records and any stray files, so the
-/// number disagreed with every other adapter. Only the role is selected; older headers can
-/// contain large inline summaries. This never touches part files.
-fn count_turns(dir: &std::path::Path) -> usize {
-    let Ok(rd) = fs::read_dir(dir) else { return 0 };
-    rd.filter_map(|e| e.ok())
-        .filter(|entry| {
-            document(&entry.path(), |view, _| is_turn(view))
-                .ok()
-                .flatten()
-                .unwrap_or(false)
-        })
-        .count()
+/// The entries of one tree directory: none when it is absent, an error when it cannot be read.
+fn listing(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
+    };
+    entries
+        .map(|e| Ok(e.with_context(|| format!("reading {}", dir.display()))?.path()))
+        .collect()
 }
 
-/// A message record whose `role` is `user` or `assistant`.
-fn is_turn(view: crate::json::JsonView<'_>) -> Result<bool> {
-    Ok(matches!(
-        record::string(view.get("role")?)?.as_deref(),
-        Some("user" | "assistant")
-    ))
-}
-
-/// One JSON document of the tree, validated and viewed once; None for a file that cannot be
-/// captured or is not exactly one JSON value.
+/// One JSON document of the tree, validated and viewed once; None for a file that is not exactly
+/// one JSON value. A file that cannot be read is an error.
 fn document<T>(
     path: &Path,
     f: impl for<'a> FnOnce(crate::json::JsonView<'a>, &crate::json::JsonSource) -> Result<T>,
 ) -> Result<Option<T>> {
-    let Ok(source) = crate::json::JsonSource::capture(path) else {
-        return Ok(None);
-    };
-    match source.read_syntax(|view| {
+    let source = crate::json::JsonSource::capture(path)?;
+    match source.read(ReadInput::Document, Validation::Syntax, |view| {
         if view.accepts_value()? {
             f(view, &source).map(Some)
         } else {
@@ -440,7 +614,6 @@ mod db {
     use super::super::ts_from_epoch;
     use super::*;
     use rusqlite::types::ValueRef;
-    use std::collections::HashMap;
 
     /// Session columns the IR first-classes (`parent_id` is `Lineage::parent`; everything else lands
     /// in `Session::extra["opencode"]` verbatim).
@@ -465,9 +638,9 @@ mod db {
 
     /// The session's `todo` rows in position order, as its plan. `None` when the table is absent
     /// (2.x) or holds nothing for the session.
-    pub(super) fn todos(r: &SessionRef) -> Option<crate::affordance::Affordance> {
-        let conn = open_ro(&r.path).ok()?;
-        conn.read(|conn| {
+    pub(super) fn todos(r: &SessionRef) -> Result<Option<crate::affordance::Affordance>> {
+        let conn = open_ro(&r.path)?;
+        conn.read(|conn, _| {
             if !has_table(conn, "todo") {
                 return Ok(None);
             }
@@ -479,23 +652,89 @@ mod db {
                         status: row.get(1)?,
                     })
                 })?
-                .filter_map(|x| x.ok())
-                .collect();
+                .collect::<rusqlite::Result<_>>()?;
             Ok(crate::affordance::plan_state(
                 crate::affordance::Kind::Plan,
                 "todo",
                 items,
             ))
         })
-        .ok()
-        .flatten()
+    }
+
+    /// Every session's [`Rows`](crate::source::Rows) certificate: what a read of it consults
+    /// besides message bodies. Its `session` and `session_v2` rows whole (which table the read
+    /// takes is the presence of the latter); per 1.x `message` row its rowid, id, `time_created`
+    /// (the read's order), `time_updated` and the byte length of `data`; per `part` row, through
+    /// its message, the same with `message_id`; per 2.x `session_message` row its rowid, id, type,
+    /// `seq` (the read's order), `time_updated` and `data`'s length; and its `todo` rows. OpenCode
+    /// UPDATEs a streaming part (and a 2.x message) in place, so count and max rowid alone are
+    /// not enough: every UPDATE stamps `time_updated` (drizzle `$onUpdate`) and nearly every one
+    /// changes the length; a same-length rewrite within the same millisecond escapes. Lengths come
+    /// from record headers, so no body's overflow pages are read.
+    pub(super) fn rows(db: &Path) -> Result<std::collections::HashMap<String, crate::source::Rows>> {
+        open_ro(db)?.read(|conn, _| {
+            let _snapshot = crate::harness::store::sqlite::snapshot(conn)?;
+            let mut certificates = crate::harness::store::sqlite::Certificates::default();
+            for table in ["session", "session_v2"] {
+                if has_table(conn, table) {
+                    certificates.digest(conn, &format!("SELECT id, '{table}', * FROM {table} ORDER BY id"))?;
+                }
+            }
+            let column = |table: &str, name: &str, expr: &str| {
+                if crate::harness::store::sqlite::columns(conn, table).contains(name) {
+                    expr.to_owned()
+                } else {
+                    "NULL".to_owned()
+                }
+            };
+            if has_table(conn, "message") {
+                let (created, updated) = (
+                    column("message", "time_created", "time_created"),
+                    column("message", "time_updated", "time_updated"),
+                );
+                certificates.rows(
+                    conn,
+                    &format!(
+                        "SELECT session_id, rowid, id, {created}, {updated}, octet_length(data) FROM message \
+                         ORDER BY session_id, rowid"
+                    ),
+                )?;
+            }
+            if has_table(conn, "message") && has_table(conn, "part") {
+                let updated = column("part", "time_updated", "p.time_updated");
+                certificates.rows(
+                    conn,
+                    &format!(
+                        "SELECT m.session_id, p.rowid, p.message_id, p.id, {updated}, octet_length(p.data) \
+                         FROM part p JOIN message m ON m.id = p.message_id ORDER BY m.session_id, p.rowid"
+                    ),
+                )?;
+            }
+            if has_table(conn, "session_message") {
+                let updated = column("session_message", "time_updated", "time_updated");
+                certificates.rows(
+                    conn,
+                    &format!(
+                        "SELECT session_id, rowid, id, type, seq, {updated}, octet_length(data) FROM session_message \
+                         ORDER BY session_id, rowid"
+                    ),
+                )?;
+            }
+            if has_table(conn, "todo") {
+                certificates.digest(
+                    conn,
+                    "SELECT session_id, position, content, status FROM todo ORDER BY session_id, position",
+                )?;
+            }
+            Ok(certificates.0)
+        })
     }
 
     pub(super) fn is_db_ref(r: &SessionRef) -> bool {
         r.path.extension().and_then(|e| e.to_str()) == Some("db")
     }
 
-    fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
+    pub(super) fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
         conn.query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
             rusqlite::params![name],
@@ -511,16 +750,14 @@ mod db {
     pub(super) fn discover(db: &Path) -> Result<Vec<SessionRef>> {
         crate::harness::store::sqlite::cached_discover(db, || {
             let conn = open_ro(db)?;
-            conn.read(|reader| discover_snapshot(db, reader.reads(), reader))
+            conn.read(|reader, _| discover_snapshot(db, reader))
         })
     }
 
-    fn discover_snapshot(
-        db: &Path,
-        reads: &crate::source::ReadSet,
-        conn: &rusqlite::Connection,
-    ) -> Result<Vec<SessionRef>> {
-        let _transaction = conn.unchecked_transaction()?;
+    /// Counts stay unknown: a turn's kind can rest on its parts (`compaction`, an `@agent`
+    /// mention) or its `error`, so complete reads and indexing count and certify them.
+    fn discover_snapshot(db: &Path, conn: &rusqlite::Connection) -> Result<Vec<SessionRef>> {
+        let _snapshot = crate::harness::store::sqlite::snapshot(conn)?;
         let mut refs = if has_table(conn, "session_v2") && has_table(conn, "session_message") {
             discover_v2(conn, db)?
         } else {
@@ -528,41 +765,23 @@ mod db {
         };
         if has_table(conn, "session") && has_table(conn, "message") {
             let seen: HashSet<String> = refs.iter().map(|r| r.id.clone()).collect();
-            refs.extend(discover_v1(conn, db, reads, &seen)?);
+            refs.extend(discover_v1(conn, db, &seen)?);
         }
         Ok(refs)
     }
 
     fn discover_v2(conn: &rusqlite::Connection, db: &Path) -> Result<Vec<SessionRef>> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        {
-            let mut stmt = conn.prepare(
-                "SELECT session_id, COUNT(*) FROM session_message WHERE type IN ('user', 'assistant') GROUP BY session_id",
-            )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-            for (sid, n) in rows.flatten() {
-                counts.insert(sid, n.max(0) as usize);
-            }
-        }
         let mut stmt = conn.prepare(
             "SELECT id, directory, title, time_created, time_updated FROM session_v2 ORDER BY time_updated DESC",
         )?;
         let refs = stmt
             .query_map([], |r| session_ref(db, r))?
-            .flatten()
-            .map(|mut r| {
-                r.message_count = counts.get(&r.id).copied().unwrap_or(0);
-                r
-            })
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(refs)
     }
 
     fn session_ref(db: &Path, r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRef> {
         Ok(SessionRef {
-            id: r.get(0)?,
-            harness: Harness::OpenCode,
-            path: db.to_path_buf(),
             cwd: r
                 .get::<_, Option<String>>(1)?
                 .filter(|d| !d.is_empty())
@@ -570,52 +789,24 @@ mod db {
             title: r
                 .get::<_, Option<String>>(2)?
                 .filter(|t| !t.is_empty())
-                .map(|t| crate::ir::truncate(&t, 80)),
+                .map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE)),
             created_at: r.get::<_, Option<i64>>(3)?.and_then(ts_from_epoch),
             updated_at: r.get::<_, Option<i64>>(4)?.and_then(ts_from_epoch),
-            message_count: 0,
+            message_count: None,
+            ..SessionRef::new(r.get::<_, String>(0)?, Harness::OpenCode, db.to_path_buf())
         })
     }
 
-    /// Count the turns the stream reads: `message` cells whose final `role` is user or assistant.
-    fn discover_v1(
-        conn: &rusqlite::Connection,
-        db: &Path,
-        reads: &crate::source::ReadSet,
-        seen: &HashSet<String>,
-    ) -> Result<Vec<SessionRef>> {
-        // Migrated stores retain old message bodies. Select only surviving legacy sessions
-        // before touching those bodies; a fully migrated store needs no legacy message scan.
-        let mut refs: Vec<SessionRef> = conn
+    /// The 1.x sessions 2.x does not already cover.
+    fn discover_v1(conn: &rusqlite::Connection, db: &Path, seen: &HashSet<String>) -> Result<Vec<SessionRef>> {
+        Ok(conn
             .prepare("SELECT id, directory, title, time_created, time_updated FROM session ORDER BY time_updated DESC")?
             .query_map([], |r| session_ref(db, r))?
-            .flatten()
-            .filter(|reference| !seen.contains(&reference.id))
-            .collect();
-        if refs.is_empty() {
-            return Ok(refs);
-        }
-        let wanted: HashSet<&str> = refs.iter().map(|reference| reference.id.as_str()).collect();
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        let cells = Cells::new(conn, db, reads, "message")?;
-        let mut stmt = conn.prepare(&format!("SELECT session_id, {} FROM message", cells.select("data")))?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let Ok(sid) = row.get::<_, String>(0) else { continue };
-            if !wanted.contains(sid.as_str()) {
-                continue;
-            }
-            let Some(cell) = cells.cell(conn, "message", "data", row, 1)? else {
-                continue;
-            };
-            if cells.read(cell, |view| Ok(view.is_object()? && is_turn(view)?))? == Some(true) {
-                *counts.entry(sid).or_default() += 1;
-            }
-        }
-        for reference in &mut refs {
-            reference.message_count = counts.get(&reference.id).copied().unwrap_or(0);
-        }
-        Ok(refs)
+            .filter_map(|row| match row {
+                Ok(reference) if seen.contains(&reference.id) => None,
+                other => Some(other),
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// One row as a JSON object keyed by column name (`NULL`s dropped, JSON columns decoded).
@@ -643,19 +834,19 @@ mod db {
 
     /// Stream one db-backed session: the `session` row → [`Session`] metadata + `extra`, then each
     /// `message` row with its `part` rows hydrated and mapped one message at a time.
-    pub(super) fn stream(r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    pub(super) fn stream(r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         let conn = open_ro(&r.path)?;
-        conn.read(|reader| stream_snapshot(r, opts, sink, reader.reads(), reader))
+        conn.read(|reader, reads| stream_snapshot(r, opts, sink, reads, reader))
     }
 
     fn stream_snapshot(
         r: &SessionRef,
-        opts: &ParseOptions,
+        opts: &Demand,
         sink: &mut dyn MessageSink,
         reads: &crate::source::ReadSet,
         conn: &rusqlite::Connection,
     ) -> Result<Session> {
-        let _transaction = conn.unchecked_transaction()?;
+        let _snapshot = crate::harness::store::sqlite::snapshot(conn)?;
         // The 2.x tables win for a session in both (a migrated database; module doc of `v2`).
         let v2 = has_table(conn, "session_v2")
             && conn
@@ -687,11 +878,6 @@ mod db {
             bag.insert(k.clone(), v.clone());
         }
         let mut s = Session {
-            source_stamp: None,
-            id: r.id.clone(),
-            harness: Harness::OpenCode,
-            principal: None,
-            system_prompt: None,
             // A sub-agent session (`@agent` mention, `subtask`) points at the session that spawned it.
             lineage: Lineage {
                 parent: row
@@ -726,10 +912,8 @@ mod db {
                 .and_then(|m| m.get("id"))
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            git: None,
-            messages: Vec::new(),
             source_path: Some(r.path.clone()),
-            extra: Map::new(),
+            ..Session::new(r.id.clone(), Harness::OpenCode)
         };
         if !bag.is_empty() {
             s.harness_extra_mut(Harness::OpenCode).extend(bag);
@@ -759,36 +943,50 @@ mod db {
             "SELECT id, {} FROM part WHERE message_id = ?1 ORDER BY id",
             parts.select("data")
         ))?;
+        // A cell that is not one JSON value, and a part id that is not text, are counted.
+        let mut unparsed = super::super::Unparsed::default();
         let mut rows = message_rows.query(rusqlite::params![r.id])?;
         while let Some(row) = rows.next()? {
             let mid: String = row.get(0)?;
-            let Some(cell) = messages.cell(conn, "message", "data", row, 1)? else {
-                continue;
+            let header = match messages.cell(conn, "message", "data", row, 1)? {
+                Some(cell) => messages.read(cell, |view| {
+                    record::Record::header(view, Some(&mid), ctx(opts.spans, &messages))
+                })?,
+                None => None,
             };
-            let Some(Some(mut record)) = messages.read(cell, |view| {
-                record::Record::header(view, Some(&mid), ctx(opts.spans, &messages))
-            })?
-            else {
-                continue;
+            let mut record = match header {
+                Some(Some(record)) => record,
+                Some(None) => continue,
+                None => {
+                    unparsed.count();
+                    continue;
+                }
             };
             let mut part_rows = part_rows.query(rusqlite::params![mid])?;
             while let Some(row) = part_rows.next()? {
                 let Ok(pid) = row.get::<_, String>(0) else {
+                    unparsed.count();
                     continue;
                 };
-                if let Some(cell) = parts.cell(conn, "part", "data", row, 1)? {
-                    parts.read(cell, |view| {
+                let read = match parts.cell(conn, "part", "data", row, 1)? {
+                    Some(cell) => parts.read(cell, |view| {
                         record.part(view, Some([&pid, &mid, &r.id]), ctx(opts.spans, &parts))
-                    })?;
+                    })?,
+                    None => None,
+                };
+                if read.is_none() {
+                    unparsed.count();
                 }
             }
             for mut built in record.finish() {
                 fold_into_session(&mut s, &mut built)?;
                 if sink.message(built) == Flow::Stop {
+                    unparsed.note(&mut s);
                     return Ok(s);
                 }
             }
         }
+        unparsed.note(&mut s);
         Ok(s)
     }
 
@@ -797,7 +995,7 @@ mod db {
     fn stream_v2(
         conn: &rusqlite::Connection,
         mut s: Session,
-        opts: &ParseOptions,
+        opts: &Demand,
         sink: &mut dyn MessageSink,
         cells: &Cells,
     ) -> Result<Session> {
@@ -813,7 +1011,7 @@ mod db {
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
             let ty: String = row.get(1)?;
-            if opts.complete && !v2::known_type(&ty) {
+            if opts.tier == crate::stream::Tier::Complete && !v2::known_type(&ty) {
                 *unknown.entry(ty.clone()).or_default() += 1;
             }
             let decoded = match cells.cell(conn, "session_message", "data", row, 2)? {
@@ -821,14 +1019,14 @@ mod db {
                     let Some(mut built) = v2::build(&id, &ty, view, opts, ctx)? else {
                         return Ok(None);
                     };
-                    if opts.complete {
+                    if opts.tier == crate::stream::Tier::Complete {
                         v2::attach_complete(&mut built, &id, &ty, view.argument(opts.spans)?);
                     }
                     Ok(Some(built))
                 })?,
                 None => None,
             };
-            let mut built = match decoded {
+            let built = match decoded {
                 Some(Some(built)) => built,
                 Some(None) => {
                     *unknown.entry(ty).or_default() += 1;
@@ -839,18 +1037,6 @@ mod db {
                     continue;
                 }
             };
-            if let Some(record) = built.first_mut().and_then(|message| message.complete_record.as_mut()) {
-                let mut model = s.model.clone();
-                let record = std::sync::Arc::make_mut(record);
-                for original in &mut record.projection {
-                    if model.is_none() {
-                        model = original.model.clone();
-                    }
-                    if original.model.is_some() && original.model == model {
-                        original.model = None;
-                    }
-                }
-            }
             for mut m in built {
                 fold_into_session(&mut s, &mut m)?;
                 if sink.message(m) == Flow::Stop {
@@ -862,7 +1048,7 @@ mod db {
             s.harness_extra_mut(Harness::OpenCode)
                 .insert("unknown_message_types".into(), json!(unknown));
         }
-        super::super::note_skipped_lines(&mut s, unreadable);
+        super::super::Unparsed(unreadable).note(&mut s);
         Ok(s)
     }
     #[cfg(test)]
@@ -912,27 +1098,27 @@ mod db {
                         std::ptr::null_mut(),
                     );
                 }
-                let refs = discover_snapshot(&path, &Default::default(), &conn)?;
+                let refs = discover_snapshot(&path, &conn)?;
                 assert_eq!(refs.len(), 1);
                 assert_eq!(refs[0].title.as_deref(), Some("current title"));
-                assert_eq!(refs[0].message_count, 0);
+                assert_eq!(refs[0].message_count, None, "discovery defers the count");
             }
             Ok(())
         }
 
         #[test]
-        fn mixed_store_keeps_unmigrated_counts_and_order() -> Result<()> {
+        fn mixed_store_keeps_unmigrated_sessions_in_order() -> Result<()> {
             let world = cv_testkit::World::new("opencode-mixed-discovery");
             let path = world.base.join("provenance");
             fs::write(&path, b"unchanged")?;
             let conn = rusqlite::Connection::open_in_memory()?;
             conn.execute_batch(r#"CREATE TABLE session(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,data TEXT); CREATE TABLE session_v2(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT); INSERT INTO session VALUES('covered','/old','old',1,3),('older','/old','older',1,1),('newer','/old','newer',1,2); INSERT INTO session_v2 VALUES('covered','/new','current',2,2); INSERT INTO message VALUES('hidden','covered','{broken'),('orphan','missing','{broken'),('old','older','{"role":"user"}'),('new','newer','{"role":"system","role":"assistant"}');"#)?;
-            let refs = discover_snapshot(&path, &Default::default(), &conn)?;
+            let refs = discover_snapshot(&path, &conn)?;
             assert_eq!(
                 refs.iter()
                     .map(|r| (r.id.as_str(), r.message_count))
                     .collect::<Vec<_>>(),
-                vec![("covered", 0), ("newer", 1), ("older", 1)]
+                vec![("covered", None), ("newer", None), ("older", None)]
             );
             Ok(())
         }
@@ -943,6 +1129,53 @@ mod db {
 mod tests {
     use super::*;
     use crate::harness::Parse;
+
+    #[test]
+    fn json_tree_guard_rejects_part_changes_after_streaming() -> Result<()> {
+        for change in ["rewrite", "create", "delete", "retarget"] {
+            let world = crate::test_world("opencode-tree-guard");
+            let root = world.base.join("storage");
+            for dir in ["session/project", "message/ses_guard", "part/actual-id"] {
+                fs::create_dir_all(root.join(dir))?;
+            }
+            let path = root.join("session/project/ses_guard.json");
+            fs::write(&path, "{}")?;
+            let header = root.join("message/ses_guard/noncanonical.json");
+            fs::write(&header, r#"{"id":"actual-id","role":"user"}"#)?;
+            let part = root.join("part/actual-id/part.json");
+            fs::write(&part, r#"{"type":"text","text":"before"}"#)?;
+            let adapter = OpenCode::with_root(root.clone());
+            let reference = SessionRef::new("ses_guard", Harness::OpenCode, path);
+            let mut messages = 0;
+            let mut sink = crate::stream::TryFnSink::new(|_: Message| {
+                messages += 1;
+                Ok(Flow::Continue)
+            });
+            let done = crate::stream::stream_counted(
+                &adapter,
+                &reference,
+                &Demand::LEAN.with_spans(),
+                &mut sink,
+                crate::stream::Pass {
+                    record: false,
+                    guard: true,
+                    ..crate::stream::Pass::RECORD
+                },
+            )?;
+            assert_eq!(messages, 1);
+            let guard = done.guard.unwrap();
+            guard.verify(&reference)?;
+            match change {
+                "rewrite" => fs::write(&part, r#"{"type":"text","text":"after!"}"#)?,
+                "create" => fs::write(root.join("part/actual-id/new.json"), "{}")?,
+                "delete" => fs::remove_file(&part)?,
+                "retarget" => fs::write(&header, r#"{"id":"different","role":"user"}"#)?,
+                _ => unreachable!(),
+            }
+            assert!(guard.verify(&reference).is_err(), "{change} escaped the read guard");
+        }
+        Ok(())
+    }
 
     fn parts(json_strs: &[&str]) -> Vec<Value> {
         json_strs.iter().map(|s| serde_json::from_str(s).unwrap()).collect()
@@ -968,14 +1201,33 @@ mod tests {
     ) -> (Vec<Message>, Vec<Message>) {
         let source = crate::json::JsonSource::capture(path).unwrap();
         let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
-        let owned = source.read_document(|view| decode(view, record::Ctx::Owned)).unwrap();
+        let owned = source
+            .read(ReadInput::Document, Validation::Value, |view| {
+                decode(view, record::Ctx::Owned)
+            })
+            .unwrap();
         let mut spans = source
-            .read_document(|view| decode(view, record::Ctx::new(true, &source, &arena)))
+            .read(ReadInput::Document, Validation::Value, |view| {
+                decode(view, record::Ctx::new(true, &source, &arena))
+            })
             .unwrap();
         for message in &mut spans {
             message.materialize(&crate::lazy::Resolver::new(None)).unwrap();
         }
         (owned, spans)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn database_discovery_reports_a_failed_directory_read() {
+        let world = crate::test_world("opencode-db-path-error");
+        let data = world.home.join(".local/share/opencode");
+        fs::create_dir_all(data.parent().unwrap()).unwrap();
+        fs::write(&data, "not a directory").unwrap();
+        assert!(resolve_db(&data).is_err());
+        let discovered = OpenCode::detect().discover().unwrap();
+        assert_eq!(discovered.skipped.len(), 1);
+        assert_eq!(discovered.skipped[0].path, data);
     }
 
     #[test]
@@ -1001,12 +1253,12 @@ mod tests {
         // thinking signature preserved
         match &asst.content[0] {
             Block::Thinking { text, signature, .. } => {
-                assert_eq!(text, "thinking...");
+                assert_eq!(text.inline_str(), Some("thinking..."));
                 assert_eq!(signature.as_deref(), Some("SIG"));
             }
             b => panic!("expected thinking, got {b:?}"),
         }
-        assert!(matches!(&asst.content[1], Block::Text { text } if text == "Hello"));
+        assert!(matches!(&asst.content[1], Block::Text { text } if text.matches_str("Hello") == Some(true)));
         assert!(matches!(&asst.content[2], Block::ToolUse { name, .. } if name == "bash"));
         assert_eq!((asst.kind, asst.origin), (MessageKind::Reply, Origin::Model));
         // message-level facts live in the harness bag only
@@ -1037,7 +1289,7 @@ mod tests {
                 status,
                 ..
             } => {
-                assert_eq!(content, "a\nb");
+                assert_eq!(content.inline_str(), Some("a\nb"));
                 assert!(!is_error);
                 assert_eq!(tool_use_id, "c1");
                 assert_eq!(tool_name.as_deref(), Some("bash"));
@@ -1121,7 +1373,7 @@ mod tests {
         assert!(m
             .content
             .iter()
-            .any(|b| matches!(b, Block::Text { text } if text == "@oracle")));
+            .any(|b| matches!(b, Block::Text { text } if text.matches_str("@oracle") == Some(true))));
         assert!(m
             .content
             .iter()
@@ -1139,7 +1391,9 @@ mod tests {
         .unwrap();
         let out = build_messages(&mv, &[]);
         assert_eq!(out.len(), 1);
-        assert!(matches!(&out[0].content[0], Block::Text { text } if text == "Removed debug comments."));
+        assert!(
+            matches!(&out[0].content[0], Block::Text { text } if text.matches_str("Removed debug comments.") == Some(true))
+        );
         assert_eq!((out[0].kind, out[0].origin), (MessageKind::Prompt, Origin::Human));
         // diffs preserved in the bag
         assert!(out[0].extra["opencode"].get("summary_diffs").is_some());
@@ -1177,7 +1431,7 @@ mod tests {
             "the kind says it"
         );
         // the boolean must NOT be rendered as a text body; the real text comes from parts
-        assert!(matches!(&m.content[0], Block::Text { text } if text == "compacted history…"));
+        assert!(matches!(&m.content[0], Block::Text { text } if text.matches_str("compacted history…") == Some(true)));
     }
 
     #[test]
@@ -1227,7 +1481,7 @@ mod tests {
         let source = crate::json::JsonSource::capture(&path).unwrap();
         let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
         let mut messages = source
-            .read_document(|view| {
+            .read(ReadInput::Document, Validation::Value, |view| {
                 Ok(
                     record::Record::header(view, None, record::Ctx::new(true, &source, &arena))?
                         .unwrap()
@@ -1270,7 +1524,7 @@ mod tests {
         let Block::ToolResult { content, .. } = &owned[1].content[1] else {
             panic!("structured error result")
         };
-        assert_eq!(content, r#"{"message":"structured"}"#);
+        assert_eq!(content.inline_str(), Some(r#"{"message":"structured"}"#));
         let Block::ToolResult { content, .. } = &owned[1].content[3] else {
             panic!("object output")
         };
@@ -1339,7 +1593,7 @@ mod tests {
             );
             fs::write(&path, &wire).unwrap();
             let (owned, spans) = both_demands(&path, |view, ctx| {
-                Ok(v2::build("message", "shell", view, &ParseOptions::complete(), ctx)?.unwrap())
+                Ok(v2::build("message", "shell", view, &Demand::COMPLETE, ctx)?.unwrap())
             });
             assert_eq!(serde_json::to_vec(&owned).unwrap(), serde_json::to_vec(&spans).unwrap());
             assert_eq!(owned[0].text(), expected, "{}", &wire[..wire.len().min(200)]);
@@ -1350,12 +1604,12 @@ mod tests {
         let source = crate::json::JsonSource::capture(&path).unwrap();
         let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
         let messages = source
-            .read_document(|view| {
+            .read(ReadInput::Document, Validation::Value, |view| {
                 Ok(v2::build(
                     "message",
                     "shell",
                     view,
-                    &ParseOptions::lazy(),
+                    &Demand::LEAN.with_spans(),
                     record::Ctx::new(true, &source, &arena),
                 )?
                 .unwrap())
@@ -1387,11 +1641,11 @@ mod tests {
         let adapter = OpenCode::with_db(db.clone());
         let reference = SessionRef::new("session", Harness::OpenCode, &db);
         for opts in [
-            ParseOptions::lazy(),
-            ParseOptions::facts(),
-            ParseOptions {
+            Demand::LEAN.with_spans(),
+            Demand::FACTS.with_spans(),
+            Demand {
                 spans: true,
-                ..ParseOptions::complete()
+                ..Demand::COMPLETE
             },
         ] {
             let mut actual = crate::stream::collect_with(&adapter, &reference, &opts).unwrap();
@@ -1404,7 +1658,7 @@ mod tests {
             actual.materialize().unwrap();
             // Complete demand now retains the actual native record. Compare against the
             // same owned demand, rather than the bulk projection that omits rich metadata.
-            let owned_opts = ParseOptions { spans: false, ..opts };
+            let owned_opts = Demand { spans: false, ..opts };
             let owned = crate::stream::collect_with(&adapter, &reference, &owned_opts).unwrap();
             let actual = serde_json::to_vec(&actual).unwrap();
             let expected = serde_json::to_vec(&owned).unwrap();
@@ -1426,7 +1680,7 @@ mod tests {
                 context(&expected)
             );
         }
-        let mut retained = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy()).unwrap();
+        let mut retained = crate::stream::collect_with(&adapter, &reference, &Demand::LEAN.with_spans()).unwrap();
         connection.execute("UPDATE session_message SET data='{}'", []).unwrap();
         assert!(retained.materialize().is_err());
         connection
@@ -1437,7 +1691,7 @@ mod tests {
             anyhow::bail!("consumer cap")
         });
         let error = adapter
-            .stream(&reference, &ParseOptions::lazy(), &mut sink)
+            .stream(&reference, &Demand::LEAN.with_spans(), &mut sink)
             .unwrap_err();
         assert!(format!("{error:#}").contains("changed"), "{error:#}");
         assert!(!format!("{error:#}").contains("consumer cap"));
@@ -1458,9 +1712,9 @@ mod tests {
             )
             .unwrap();
         let corpus_reference = SessionRef::new(id, Harness::OpenCode, &corpus);
-        let expected = crate::stream::collect_with(&corpus_adapter, &corpus_reference, &ParseOptions::bulk()).unwrap();
+        let expected = crate::stream::collect_with(&corpus_adapter, &corpus_reference, &Demand::LEAN).unwrap();
         let mut actual =
-            crate::stream::collect_with(&corpus_adapter, &corpus_reference, &ParseOptions::lazy()).unwrap();
+            crate::stream::collect_with(&corpus_adapter, &corpus_reference, &Demand::LEAN.with_spans()).unwrap();
         actual.materialize().unwrap();
         assert_eq!(
             serde_json::to_vec(&actual).unwrap(),
@@ -1490,7 +1744,7 @@ mod tests {
         let data = json!({"content":content,"model":{"id":"model"},"tokens":{"input":1},"metadata":{"preserve":true}});
         std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
         let (owned, spans) = both_demands(&path, |view, ctx| {
-            Ok(v2::build("message", "assistant", view, &ParseOptions::lazy(), ctx)?.unwrap())
+            Ok(v2::build("message", "assistant", view, &Demand::LEAN.with_spans(), ctx)?.unwrap())
         });
         assert_eq!(
             serde_json::to_value(&owned).unwrap(),
@@ -1522,12 +1776,12 @@ mod tests {
         let source = crate::json::JsonSource::capture(&path).unwrap();
         let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
         let messages = source
-            .read_document(|view| {
+            .read(ReadInput::Document, Validation::Value, |view| {
                 Ok(v2::build(
                     "message",
                     "assistant",
                     view,
-                    &ParseOptions::lazy(),
+                    &Demand::LEAN.with_spans(),
                     record::Ctx::new(true, &source, &arena),
                 )?
                 .unwrap())
@@ -1558,22 +1812,15 @@ mod tests {
         let adapter = OpenCode::with_db(path.clone());
         let reference = adapter.discover()?.remove(0);
         for spans in [false, true] {
-            let full = crate::stream::collect_with(
-                &adapter,
-                &reference,
-                &ParseOptions {
-                    spans,
-                    ..ParseOptions::full()
-                },
-            )?;
+            let full = crate::stream::collect_with(&adapter, &reference, &Demand { spans, ..Demand::RICH })?;
             assert!(full.messages.is_empty());
             assert_eq!(full.extra["opencode"]["unknown_message_types"]["future-event"], 1);
             let complete = crate::stream::collect_with(
                 &adapter,
                 &reference,
-                &ParseOptions {
+                &Demand {
                     spans,
-                    ..ParseOptions::complete()
+                    ..Demand::COMPLETE
                 },
             )?;
             assert_eq!(complete.messages.len(), 1);
@@ -1617,14 +1864,7 @@ mod tests {
         let adapter = OpenCode::with_root(root);
         let reference = adapter.discover()?.remove(0);
         for spans in [false, true] {
-            let session = crate::stream::collect_with(
-                &adapter,
-                &reference,
-                &ParseOptions {
-                    spans,
-                    ..ParseOptions::full()
-                },
-            )?;
+            let session = crate::stream::collect_with(&adapter, &reference, &Demand { spans, ..Demand::RICH })?;
             assert_eq!(
                 session
                     .messages
@@ -1649,13 +1889,13 @@ mod tests {
         let mut s = Session::new("x", Harness::OpenCode);
         fold_into_session(&mut s, &mut m).unwrap();
         assert_eq!(s.system_prompt.as_deref(), Some("You are opencode."));
-        // the IR diet: a message model equal to the session's is dropped, a different one kept
+        // the first model seen becomes the session's; every message keeps the one its record states
         let mut a: Value =
             serde_json::from_str(r#"{"id":"a","role":"assistant","time":{"created":2},"modelID":"m1"}"#).unwrap();
         let mut first = build_messages(&a, &parts(&[r#"{"type":"text","text":"hi"}"#])).remove(0);
         fold_into_session(&mut s, &mut first).unwrap();
         assert_eq!(s.model.as_deref(), Some("m1"));
-        assert_eq!(first.model, None);
+        assert_eq!(first.model.as_deref(), Some("m1"));
         a["modelID"] = json!("m2");
         let mut second = build_messages(&a, &parts(&[r#"{"type":"text","text":"hi"}"#])).remove(0);
         fold_into_session(&mut s, &mut second).unwrap();
@@ -1860,8 +2100,8 @@ mod tests {
     #[test]
     fn reading_a_live_wal_store_writes_nothing_in_it() {
         use crate::harness::store::sqlite::{live_store, store_state};
-        let dir = std::env::temp_dir().join(format!("cv-opencode-live-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&dir).unwrap();
+        let world = cv_testkit::World::new("opencode-live-wal");
+        let dir = world.base.clone();
         let db = dir.join("opencode.db");
         drop(make_db(&db, true));
         let writer = live_store(&db, "SELECT 1");
@@ -1876,7 +2116,7 @@ mod tests {
             let refs = adapter.discover().unwrap();
             assert_eq!(refs.len(), 1);
             for reference in &refs {
-                let mut session = crate::stream::collect_with(&adapter, reference, &ParseOptions::lazy()).unwrap();
+                let mut session = crate::stream::collect_with(&adapter, reference, &Demand::LEAN.with_spans()).unwrap();
                 session.materialize().unwrap();
                 assert!(session
                     .messages
@@ -1886,7 +2126,6 @@ mod tests {
             assert_eq!(store_state(&dir), before, "checkpointed: {checkpointed}");
         }
         drop(writer);
-        fs::remove_dir_all(dir).ok();
     }
 
     /// A `session_message` cell that is not TEXT, empty, not UTF-8 or not exactly one JSON value
@@ -1915,7 +2154,7 @@ mod tests {
                 connection
                     .execute_batch(&format!("UPDATE session_message SET data = {expression}"))
                     .unwrap();
-                for opts in [ParseOptions::bulk(), ParseOptions::lazy()] {
+                for opts in [Demand::LEAN, Demand::LEAN.with_spans()] {
                     let session = crate::stream::collect_with(&adapter, &reference, &opts).unwrap();
                     assert!(session.messages.is_empty(), "{expression}");
                     assert_eq!(session.extra["cv"]["skipped_lines"], 1, "{expression}");
@@ -1925,11 +2164,10 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
-    #[cfg(feature = "sqlite")]
     #[test]
-    fn sqlite_v1_discovery_counts_follow_readable_final_roles() {
-        let dir = std::env::temp_dir().join(format!("cv-opencode-role-count-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
+    fn sqlite_v1_turns_follow_readable_final_roles() {
+        let world = cv_testkit::World::new("opencode-role-count");
+        let dir = world.base.clone();
         let path = dir.join("opencode.db");
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,message_id TEXT,data TEXT);").unwrap();
@@ -1974,7 +2212,7 @@ mod tests {
                 .into_iter()
                 .find(|reference| reference.id == id)
                 .unwrap();
-            assert_eq!(reference.message_count, *new);
+            assert_eq!(reference.message_count, None, "discovery defers the count");
             let session = adapter.parse(&reference).unwrap();
             assert_eq!(
                 session
@@ -1984,16 +2222,16 @@ mod tests {
                     .count(),
                 *new
             );
+            assert_eq!(session.messages.iter().filter(|m| m.is_turn()).count(), *new);
         }
         drop(connection);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn cold_wal_selected_text_keeps_original_guard_without_creating_sidecars() {
-        let dir = std::env::temp_dir().join(format!("cv-opencode-cold-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&dir).unwrap();
+        let world = cv_testkit::World::new("opencode-cold-wal");
+        let dir = world.base.clone();
         let db = dir.join("opencode.db");
         let writer = make_db(&db, false);
         writer
@@ -2011,13 +2249,15 @@ mod tests {
         fs::remove_file(&shm).unwrap();
         let adapter = OpenCode::with_db(db);
         let reference = adapter.discover().unwrap().remove(0);
-        assert_eq!(reference.message_count, 2);
+        assert_eq!(reference.message_count, None);
         let mut messages = Vec::new();
         let mut sink = crate::stream::TryFnSink::new(|message| {
             messages.push(message);
             Ok(crate::stream::Flow::Continue)
         });
-        adapter.stream(&reference, &ParseOptions::lazy(), &mut sink).unwrap();
+        adapter
+            .stream(&reference, &Demand::LEAN.with_spans(), &mut sink)
+            .unwrap();
         let Block::Text { text } = &messages[0].content[0] else {
             panic!("selected text")
         };
@@ -2036,14 +2276,13 @@ mod tests {
             "copied payload must validate original WAL"
         );
         drop(writer);
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_snapshot_rejects_wal_mutation_even_after_sink_failure() {
-        let dir = std::env::temp_dir().join(format!("cv-opencode-wal-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&dir).unwrap();
+        let world = cv_testkit::World::new("opencode-wal-guard");
+        let dir = world.base.clone();
         let db = dir.join("opencode.db");
         let writer = make_db(&db, false);
         writer.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
@@ -2057,20 +2296,98 @@ mod tests {
             anyhow::bail!("consumer cap")
         });
         let error = adapter
-            .stream(&reference, &ParseOptions::lazy(), &mut sink)
+            .stream(&reference, &Demand::LEAN.with_spans(), &mut sink)
             .unwrap_err();
         assert!(format!("{error:#}").contains("changed"), "{error:#}");
         assert!(!format!("{error:#}").contains("consumer cap"));
         drop(writer);
-        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Every corpus version: a part written into one session's last message (1.x) or a message
+    /// appended to it (2.x) moves that session's certificate alone, and every other session
+    /// reads exactly as before.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn corpus_rows_certify_each_session_and_move_only_with_its_rows() {
+        let corpus = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/opencode");
+        let mut versions: Vec<_> = std::fs::read_dir(&corpus).unwrap().map(|e| e.unwrap().path()).collect();
+        versions.sort();
+        assert!(!versions.is_empty());
+        for version in versions {
+            let world = crate::test_world("opencode-corpus-rows");
+            let db = world.base.join("opencode.db");
+            std::fs::copy(version.join(".local/share/opencode/opencode.db"), &db).unwrap();
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let v2 = db::has_table(&conn, "session_v2");
+            let leaf: String = conn
+                .query_row(
+                    if v2 {
+                        "SELECT session_id FROM session_message ORDER BY session_id LIMIT 1"
+                    } else {
+                        "SELECT session_id FROM message ORDER BY session_id LIMIT 1"
+                    },
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(conn);
+            let adapter = OpenCode::with_db(db.clone());
+            crate::harness::store::sqlite::assert_rows_move_alone(&adapter, &db, &leaf, |c| {
+                let sql = if v2 {
+                    "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) \
+                     SELECT 'zq', ?1, 'user', max(seq) + 1, 4102444800000, 4102444800000, \
+                     '{\"text\":\"zqcertified\"}' FROM session_message WHERE session_id = ?1"
+                } else {
+                    "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+                     SELECT 'prt_zq', id, ?1, 4102444800000, 4102444800000, \
+                     '{\"type\":\"text\",\"text\":\"zqcertified\"}' FROM message WHERE session_id = ?1 \
+                     ORDER BY time_created DESC LIMIT 1"
+                };
+                assert_eq!(c.execute(sql, [&leaf]).unwrap(), 1);
+            });
+            // A streaming part (a 2.x message) is UPDATEd in place: same rowid, same count.
+            let before = adapter.rows(&db).unwrap();
+            let table = if v2 { "session_message" } else { "part" };
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET data = json_set(data, '$.text', 'zqcertified, streamed'), \
+                         time_updated = time_updated + 1 WHERE id = (SELECT id FROM {table} WHERE id LIKE '%zq')"
+                    ),
+                    [],
+                )
+                .unwrap();
+            let after = adapter.rows(&db).unwrap();
+            assert_ne!(
+                after[&leaf], before[&leaf],
+                "{version:?}: an in-place update moves its session"
+            );
+            assert_eq!(
+                (after[&leaf].count, after[&leaf].high),
+                (before[&leaf].count, before[&leaf].high)
+            );
+            assert!(after.iter().all(|(id, rows)| id == &leaf || before[id] == *rows));
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn windowed_reads_keep_the_model() {
+        let _world = crate::test_world("opencode-windowed");
+        let corpus = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/opencode");
+        for version in ["1.18.20", "2.0.25"] {
+            let data = corpus.join(version).join(".local/share/opencode");
+            crate::harness::assert_windowed_models(&OpenCode::with_data_dir(&data));
+        }
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn db_store_discover_and_parse() {
         for with_metadata in [false, true] {
-            let dir = std::env::temp_dir().join(format!("cv-opencode-db-{}", uuid::Uuid::new_v4()));
-            fs::create_dir_all(&dir).unwrap();
+            let world = cv_testkit::World::new("opencode-db-store");
+            let dir = world.base.clone();
             let db = dir.join("opencode.db");
             let conn = make_db(&db, with_metadata);
             seed_session(&conn, "ses_DB01", with_metadata);
@@ -2084,10 +2401,7 @@ mod tests {
             assert_eq!(r.path, db, "a db-backed ref points at the database");
             assert_eq!(r.cwd.as_deref(), Some(std::path::Path::new("/home/dev/proj")));
             assert_eq!(r.title.as_deref(), Some("Removing debug comments"));
-            assert_eq!(
-                r.message_count, 2,
-                "user + assistant turns, from the role inside `data`"
-            );
+            assert_eq!(r.message_count, None, "discovery defers the count to a full read");
             assert!(r.created_at.is_some() && r.updated_at >= r.created_at);
 
             let s = oc.parse(r).unwrap();
@@ -2119,8 +2433,14 @@ mod tests {
                 kinds,
                 vec![MessageKind::Prompt, MessageKind::Reply, MessageKind::ToolResult]
             );
-            // both records name the session's own model, so neither carries it (IR diet)
-            assert!(s.messages.iter().all(|m| m.model.is_none()), "{:?}", s.messages);
+            // both records name the model they ran under (the user record under `model.modelID`)
+            assert!(
+                s.messages[..2]
+                    .iter()
+                    .all(|m| m.model.as_deref() == Some("claude-sonnet-4-5")),
+                "{:?}",
+                s.messages
+            );
             assert_eq!(s.messages[1].usage.as_ref().unwrap().cost_usd, Some(0.03));
             for m in &s.messages {
                 assert!(m.extra.keys().all(|k| k == "opencode"), "{:?}", m.extra);
@@ -2134,10 +2454,13 @@ mod tests {
             assert!(
                 matches!(&s.messages[1].content[0], Block::Thinking { signature, .. } if signature.as_deref() == Some("SIG"))
             );
-            assert!(matches!(&s.messages[1].content[1], Block::Text { text } if text == "Reverted."));
-            assert!(matches!(&s.messages[2].content[0], Block::ToolResult { content, .. } if content == "a\nb"));
+            assert!(
+                matches!(&s.messages[1].content[1], Block::Text { text } if text.matches_str("Reverted.") == Some(true))
+            );
+            assert!(
+                matches!(&s.messages[2].content[0], Block::ToolResult { content, .. } if content.matches_str("a\nb") == Some(true))
+            );
             assert_eq!(s.messages[1].usage.as_ref().unwrap().cache_read_tokens, Some(20627));
-            fs::remove_dir_all(&dir).ok();
         }
     }
 
@@ -2147,8 +2470,8 @@ mod tests {
         // The JSON fixture holds ses_FIX01; a database holding the same id (the import left both)
         // must yield ONE ref, the db-backed one — while a JSON-only session is still discovered.
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opencode/parts_gen");
-        let dir = std::env::temp_dir().join(format!("cv-opencode-dedupe-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let world = cv_testkit::World::new("opencode-dedupe");
+        let dir = world.base.clone();
         let db = dir.join("opencode.db");
         let conn = make_db(&db, false);
         seed_session(&conn, "ses_FIX01", false);
@@ -2156,6 +2479,7 @@ mod tests {
         let oc = OpenCode {
             root: Some(base),
             db: Some(db.clone()),
+            skipped: Vec::new(),
         };
         let refs = oc.discover().unwrap();
         assert_eq!(refs.len(), 1, "duplicate collapsed: {refs:?}");
@@ -2164,9 +2488,9 @@ mod tests {
         let oc_json_only = OpenCode {
             root: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opencode/parts_gen")),
             db: None,
+            skipped: Vec::new(),
         };
         assert_eq!(oc_json_only.discover().unwrap().len(), 1);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A `reasoning` part whose text is empty but which carries a provider signature is the WHOLE

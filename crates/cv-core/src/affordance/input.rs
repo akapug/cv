@@ -1,36 +1,9 @@
 //! Fallible projections of tool arguments, shared by affordance and event reducers.
 use crate::json::JsonView;
-use crate::projection::{string_prefix, string_until};
+use crate::projection::string_until;
 use anyhow::Result;
 
 /// Enough decoded text to reproduce `truncate(text, cap)`, across arbitrary chunk boundaries.
-pub(crate) struct Prefix {
-    text: String,
-    chars: usize,
-    cap: usize,
-}
-impl Prefix {
-    pub(crate) fn new(cap: usize) -> Self {
-        Self {
-            text: String::new(),
-            chars: 0,
-            cap,
-        }
-    }
-    pub(crate) fn push(&mut self, text: &str) {
-        for ch in text.chars().take((self.cap + 1).saturating_sub(self.chars)) {
-            self.text.push(ch);
-            self.chars += 1;
-        }
-    }
-    fn complete(&self) -> bool {
-        self.chars > self.cap
-    }
-    pub(crate) fn finish(self) -> String {
-        crate::ir::truncate(&self.text, self.cap)
-    }
-}
-
 /// Materialize one demanded string, never its sibling argument fields or a Value tree.
 pub(crate) fn string(view: JsonView<'_>) -> Result<Option<String>> {
     let mut out = String::new();
@@ -47,7 +20,7 @@ pub(crate) fn field_string(view: JsonView<'_>, key: &str) -> Result<Option<Strin
 }
 
 pub(crate) fn prefix(view: JsonView<'_>, cap: usize) -> Result<Option<String>> {
-    Ok(string_prefix(view, cap + 1)?.map(|text| crate::ir::truncate(&text, cap)))
+    crate::projection::Head::of_string(view, cap)
 }
 
 pub(crate) fn scalar_prefix(view: JsonView<'_>, cap: usize) -> Result<Option<String>> {
@@ -60,9 +33,21 @@ pub(crate) fn scalar_prefix(view: JsonView<'_>, cap: usize) -> Result<Option<Str
         .map(|number| number.to_string()))
 }
 
-/// Scan before allocating so an all-whitespace string emits no owned item. Trimming uses decoded
-/// byte bounds; a huge ignored whitespace tail does not become a transient String allocation.
+/// Reject all-whitespace strings even when `trim` is false; otherwise preserve whitespace unless
+/// trimming was requested. The untrimmed case builds while it scans, so the source decodes once.
+/// Trimming scans before allocating and uses decoded byte bounds; a huge ignored whitespace tail
+/// does not become a transient String allocation.
 pub(crate) fn item_string(view: JsonView<'_>, trim: bool) -> Result<Option<String>> {
+    if !trim {
+        let mut out = String::new();
+        let mut nonblank = false;
+        let is_string = view.for_each_str_chunk(|chunk| {
+            nonblank |= chunk.chars().any(|ch| !ch.is_whitespace());
+            out.push_str(chunk);
+            Ok(())
+        })?;
+        return Ok((is_string && nonblank).then_some(out));
+    }
     let mut offset = 0;
     let mut start = None;
     let mut end = 0;
@@ -81,9 +66,6 @@ pub(crate) fn item_string(view: JsonView<'_>, trim: bool) -> Result<Option<Strin
     let Some(start) = start else {
         return Ok(None);
     };
-    if !trim {
-        return string(view);
-    }
     let mut out = String::new();
     offset = 0;
     view.for_each_str_chunk(|chunk| {
@@ -120,37 +102,21 @@ pub(crate) fn word(view: JsonView<'_>, words: &[&str]) -> Result<Option<usize>> 
     Ok(words.iter().position(|word| word.len() == bytes && *word == text))
 }
 
-/// Trim both ends before truncating, preserving a long whitespace tail's non-ellipsis behavior.
+/// The trimmed [`Head`](crate::projection::Head) of a string: `truncate(trim(text), cap)`.
 pub(crate) fn trimmed_prefix(view: JsonView<'_>, cap: usize) -> Result<Option<String>> {
-    let mut prefix = String::new();
-    let mut chars = 0;
-    let mut started = false;
-    let mut later_content = false;
-    let is_string = view.for_each_str_chunk(|mut chunk| {
-        if !started {
-            chunk = chunk.trim_start();
-            started = !chunk.is_empty();
-        }
-        let mut end = 0;
-        for (offset, ch) in chunk.char_indices().take((cap + 1usize).saturating_sub(chars)) {
-            prefix.push(ch);
-            chars += 1;
-            end = offset + ch.len_utf8();
-        }
-        later_content |= !chunk[end..].trim().is_empty();
-        Ok(())
-    })?;
-    Ok(is_string.then(|| crate::ir::truncate(if later_content { &prefix } else { prefix.trim_end() }, cap)))
+    let mut head = crate::projection::Head::trimmed(cap);
+    let is_string = string_until(view, |chunk| head.push(chunk))?;
+    Ok(is_string.then(|| head.finish()))
 }
 
 /// The untrimmed prefix of a nonblank string, for object item text whose whitespace is retained.
 pub(crate) fn nonblank_prefix(view: JsonView<'_>, cap: usize) -> Result<Option<String>> {
-    let mut out = Prefix::new(cap);
+    let mut out = crate::projection::Head::bounded(cap);
     let mut nonblank = false;
     let is_string = string_until(view, |chunk| {
         out.push(chunk);
         nonblank |= !chunk.trim().is_empty();
-        out.complete() && nonblank
+        out.full() && nonblank
     })?;
     Ok((is_string && nonblank).then(|| out.finish()))
 }

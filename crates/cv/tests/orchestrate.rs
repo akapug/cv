@@ -44,6 +44,26 @@ fn boundary(uuid: &str, ts: &str) -> serde_json::Value {
 
 const SID: &str = "orchsess";
 
+/// The rendered `cv lanes` row of lane `id`: the line that starts with its short id. Semantic
+/// checks read `--json`; this only keeps the table honest about what it shows for a lane.
+fn lane_row<'a>(out: &'a str, id: &str) -> &'a str {
+    out.lines()
+        .find(|l| l.trim_start().starts_with(id))
+        .unwrap_or_else(|| panic!("no row for {id}:\n{out}"))
+}
+
+/// Per deferral phrase (in order): its message index and the task `--open-tasks` matched it to
+/// (the `matched` object, absent when none shares enough words), with the gate's exit status.
+fn deferral_matches(w: &World) -> (i32, Vec<(u64, Option<serde_json::Value>)>) {
+    let (_, code, json, err) = w.cv(&["deferrals", SID, "--open-tasks", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}\n{err}"));
+    let rows = rows
+        .iter()
+        .map(|r| (r["index"].as_u64().expect("index"), r.get("matched").cloned()))
+        .collect();
+    (code, rows)
+}
+
 /// The parent: two human prompts, a `/compact` with its bookkeeping rows, an AskUserQuestion
 /// answer, two replies with deferral phrases (one matching a task, one not), three lane
 /// notifications, and a human prompt after the compaction.
@@ -52,20 +72,20 @@ fn build_world(tag: &str) -> World {
     w.write_session(
         SID,
         &[
-            user("u0", "2026-10-01T10:00:00Z", "start the swarm please"),
+            user(SID, "u0", "2026-10-01T10:00:00Z", "start the swarm please"),
             assistant_tool("a0", "2026-10-01T10:00:05Z", "AskUserQuestion", serde_json::json!({"questions": [{"question": "Where?"}]})),
             tool_result("r0", "2026-10-01T10:01:00Z", "toolu_a0", "The user answered: \"Where?\"=\"persvati\""),
             assistant("a1", "2026-10-01T10:02:00Z", "Noted. The ResourceTargetAdmission externalKind exhaustiveness check is queued for the standing integrator right after FINAL-1 lands."),
-            user("u1", "2026-10-01T10:03:00Z", "/compact"),
-            user("u2", "2026-10-01T10:03:00Z", "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>"),
-            user("u3", "2026-10-01T10:03:30Z", "<local-command-stdout>Compacted</local-command-stdout>"),
+            user(SID, "u1", "2026-10-01T10:03:00Z", "/compact"),
+            user(SID, "u2", "2026-10-01T10:03:00Z", "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>"),
+            user(SID, "u3", "2026-10-01T10:03:30Z", "<local-command-stdout>Compacted</local-command-stdout>"),
             boundary("b1", "2026-10-01T10:03:31Z"),
             compact_summary("s1", "2026-10-01T10:03:32Z", "SUMMARY: the early context"),
-            user("u4", "2026-10-01T10:04:00Z", "hi :) we /compacted. carry on"),
+            user(SID, "u4", "2026-10-01T10:04:00Z", "hi :) we /compacted. carry on"),
             notification("2026-10-01T10:05:00Z", "aaa1", "completed"),
             notification("2026-10-01T10:06:00Z", "bbb2", "completed"),
             assistant("a2", "2026-10-01T10:07:00Z", "The hermes tariff reconciliation is an inconsistency to settle in one later lane, not tonight."),
-            user("u5", "2026-10-01T10:08:00Z", "ok"),
+            user(SID, "u5", "2026-10-01T10:08:00Z", "ok"),
         ],
     );
     // aaa1: finished cleanly.
@@ -75,7 +95,7 @@ fn build_world(tag: &str) -> World {
         "aaa1",
         "LANE-A: the first lane",
         &[
-            user("x0", "2026-10-01T10:00:10Z", "You are lane A."),
+            user(SID, "x0", "2026-10-01T10:00:10Z", "You are lane A."),
             assistant_tool(
                 "x1",
                 "2026-10-01T10:00:20Z",
@@ -98,7 +118,7 @@ fn build_world(tag: &str) -> World {
         "bbb2",
         "LANE-B: waits on a build",
         &[
-            user("y0", "2026-10-01T10:00:30Z", "You are lane B."),
+            user(SID, "y0", "2026-10-01T10:00:30Z", "You are lane B."),
             assistant_tool(
                 "y1",
                 "2026-10-01T10:00:40Z",
@@ -121,7 +141,7 @@ fn build_world(tag: &str) -> World {
         "ccc3",
         "LANE-C: still at it",
         &[
-            user("z0", "2026-10-01T10:01:00Z", "You are lane C."),
+            user(SID, "z0", "2026-10-01T10:01:00Z", "You are lane C."),
             assistant("z1", "2026-10-01T10:01:10Z", "Reading first."),
             assistant_tool(
                 "z2",
@@ -139,7 +159,7 @@ fn build_world(tag: &str) -> World {
         "ddd4",
         "LANE-D: lost notification",
         &[
-            user("q0", "2026-10-01T10:01:30Z", "You are lane D."),
+            user(SID, "q0", "2026-10-01T10:01:30Z", "You are lane D."),
             assistant_tool(
                 "q1",
                 "2026-10-01T10:01:40Z",
@@ -242,7 +262,7 @@ fn lanes_table_status_tokens_and_the_strand_class() {
     );
     // The lost-notification lane: `returned`, its report on the ↩ line, counted as done, and
     // explained in the footer.
-    assert!(out.contains("ddd4      returned"), "{out}");
+    assert!(lane_row(&out, "ddd4").contains("returned"), "{out}");
     assert!(out.contains("↩ All 12 tests pass; nothing left to do."), "{out}");
     assert!(out.contains("the harness lost the notification"), "{out}");
     // Launch order, one row per lane, the telling columns present.
@@ -263,10 +283,6 @@ fn lanes_table_status_tokens_and_the_strand_class() {
         out.contains("STRANDED") && out.contains("→ resume: SendMessage to bbb2"),
         "{out}"
     );
-    assert!(
-        out.contains("4m45s") || out.contains("4m"),
-        "duration from first to last turn:\n{out}"
-    );
 
     let (out, _) = w.cv_ok(&["lanes", SID, "--stranded"]);
     assert!(
@@ -285,8 +301,8 @@ fn lanes_table_status_tokens_and_the_strand_class() {
     // one empties it).
     let (out, _) = w.cv_ok(&["lanes", SID, "--since", "9000h"]);
     assert!(out.contains("4 sub-agents") && out.contains("active since"), "{out}");
-    let (out, _) = w.cv_ok(&["lanes", SID, "--since", "1s"]);
-    assert!(out.contains("no sub-agents") || out.contains("0 sub-agents"), "{out}");
+    let (out, _) = w.cv_ok(&["lanes", SID, "--since", "1s", "--json"]);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap(), json!([]));
     let (ok, _, _, err) = w.cv(&["lanes", SID, "--since", "soon"]);
     assert!(!ok && err.contains("--since takes a duration"), "{err}");
 
@@ -299,11 +315,13 @@ fn lanes_table_status_tokens_and_the_strand_class() {
     assert_eq!(d["stranded"], false);
     let by_id = |id: &str| rows.iter().find(|r| r["agent_id"] == id).unwrap().clone();
     let a = by_id("aaa1");
+    // The last assistant turn is 10:04:50; the 10:04:55 stop hook is bookkeeping.
+    assert_eq!(a["duration_ms"], 280_000, "duration from first to last turn");
     assert_eq!(a["status"], "completed");
     assert_eq!(a["status_source"], "task_notification");
     assert_eq!(a["stranded"], false);
     // Two usage-bearing assistant rows with distinct message ids: 100+10 input, 50+5 output,
-    // 1000 cache read → total 1165; two tool calls counted? one (Bash) — the text turn has none.
+    // 1000 cache read → total 1165; only Bash is a tool call, while the text turn contributes usage.
     assert_eq!(a["tokens"]["total"], 1165, "{a}");
     assert_eq!(a["tool_calls"], 1);
     let b = by_id("bbb2");
@@ -339,14 +357,24 @@ fn deferrals_find_the_phrases_and_open_tasks_gates_on_unmatched() {
         "no cross-reference without --open-tasks:\n{out}"
     );
 
-    // --since skips the earlier reply entirely.
-    let (out, _) = w.cv_ok(&["deferrals", SID, "--since", "10"]);
+    // --at skips the earlier reply entirely.
+    let (out, _) = w.cv_ok(&["deferrals", SID, "--at", "10"]);
     assert!(!out.contains("after FINAL") && out.contains("later lane"), "{out}");
+
+    // The old spelling errors with a pointer: `--since` is a duration, on `lanes`.
+    let (ok, code, _, err) = w.cv(&["deferrals", SID, "--since", "10"]);
+    assert!(!ok && code == 2 && err.contains("--at"), "{code}\n{err}");
 
     // No tasks yet: everything is UNMATCHED and the exit status says so.
     let (ok, code, out, _) = w.cv(&["deferrals", SID, "--open-tasks"]);
     assert!(!ok && code == 1, "unmatched deferrals exit 1: code={code}\n{out}");
-    assert!(out.contains("UNMATCHED") && !out.contains("MATCHED   "), "{out}");
+    assert!(out.contains("UNMATCHED"), "{out}");
+    let (code, matches) = deferral_matches(&w);
+    assert_eq!(code, 1);
+    assert!(
+        !matches.is_empty() && matches.iter().all(|(_, m)| m.is_none()),
+        "{matches:?}"
+    );
 
     // A task sharing three significant words with the first deferral matches it; the second
     // stays unmatched, so the gate still fails.
@@ -359,9 +387,21 @@ fn deferrals_find_the_phrases_and_open_tasks_gates_on_unmatched() {
     ]);
     let (ok, code, out, _) = w.cv(&["deferrals", SID, "--open-tasks"]);
     assert!(!ok && code == 1, "{out}");
-    assert!(out.contains("MATCHED   ") && out.contains("exhaustive"), "{out}");
-    assert!(out.contains("(shared: "), "{out}");
-    assert!(out.contains("UNMATCHED"), "the hermes one has no task:\n{out}");
+    assert!(out.contains("(shared: ") && out.contains("UNMATCHED"), "{out}");
+    let (code, matches) = deferral_matches(&w);
+    assert_eq!(code, 1);
+    // Every phrase of the integrator reply (message 3) matches the task; the hermes one (10) not.
+    for (index, matched) in &matches {
+        match index {
+            3 => {
+                let m = matched.as_ref().unwrap_or_else(|| panic!("{matches:?}"));
+                assert!(m["title"].as_str().unwrap().contains("exhaustive"), "{m}");
+                assert!(m["shared"].as_array().unwrap().len() >= 3, "{m}");
+            }
+            10 => assert!(matched.is_none(), "{matches:?}"),
+            _ => panic!("a deferral outside messages 3 and 10: {matches:?}"),
+        }
+    }
 
     // Cover the second with a task: the gate passes.
     w.cv_ok(&[
@@ -391,8 +431,13 @@ fn deferrals_find_the_phrases_and_open_tasks_gates_on_unmatched() {
 fn lanes_tasks_join_by_exported_endpoint_then_description() {
     let w = build_world("lanes-tasks");
     let open = |title: &str, who: &str| -> String {
-        let (out, _) = w.cv_ok(&["task", "open", title, "--assignee", who]);
-        out.lines().last().unwrap().trim().to_string()
+        w.cv_ok(&["task", "open", title, "--assignee", who]);
+        let (out, _) = w.cv_ok(&["task", "list", "--json"]);
+        let tasks: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
+        let matches: Vec<_> = tasks.iter().filter(|task| task["title"] == title).collect();
+        assert_eq!(matches.len(), 1, "one newly opened task with title {title:?}");
+        // Task projections use `task_id`; the lane's joined task row uses `id`.
+        matches[0]["task_id"].as_str().expect("task id").to_owned()
     };
     let a = open("A: the first lane's task", "lane:lane-a");
     w.cv_ok(&[
@@ -477,7 +522,7 @@ fn lanes_failure_cause_from_the_transcript() {
     w.write_session(
         SID,
         &[
-            user("u0", "2026-10-01T19:00:00Z", "go"),
+            user(SID, "u0", "2026-10-01T19:00:00Z", "go"),
             notification("2026-10-01T20:10:30Z", "eee5", "failed"),
             notification("2026-10-01T19:30:30Z", "fff6", "failed"),
             notification("2026-10-01T20:10:31Z", "ggg7", "failed"),
@@ -488,7 +533,7 @@ fn lanes_failure_cause_from_the_transcript() {
     );
     let run = |id: &str, desc: &str, tail: Vec<serde_json::Value>| {
         let mut lines = vec![
-            user(&format!("{id}0"), "2026-10-01T19:00:10Z", "You are a lane."),
+            user(SID, &format!("{id}0"), "2026-10-01T19:00:10Z", "You are a lane."),
             assistant_tool(
                 &format!("{id}1"),
                 "2026-10-01T19:00:20Z",
@@ -536,14 +581,19 @@ fn lanes_failure_cause_from_the_transcript() {
                 Some(429),
                 Some(1_790_902_800),
             ),
-            user("g4", "2026-10-01T21:10:00Z", "The coordinator sent a message: resume."),
+            user(
+                SID,
+                "g4",
+                "2026-10-01T21:10:00Z",
+                "The coordinator sent a message: resume.",
+            ),
             assistant("g5", "2026-10-01T21:29:00Z", "Resumed and finished; report written."),
         ],
     );
     run("hhh8", "LANE-H: died quietly", vec![]);
 
     let (out, _) = w.cv_ok(&["lanes", SID]);
-    assert!(out.contains("eee5      failed:rate-limited"), "{out}");
+    assert!(lane_row(&out, "eee5").contains("failed:rate-limited"), "{out}");
     assert!(
         out.contains("✗ You've hit your session limit · resets 9pm (America/New_York) (resets "),
         "{out}"
@@ -552,13 +602,17 @@ fn lanes_failure_cause_from_the_transcript() {
         out.contains("resume with one message after the reset: SendMessage to eee5"),
         "{out}"
     );
-    assert!(out.contains("fff6      failed:context"), "{out}");
+    assert!(lane_row(&out, "fff6").contains("failed:context"), "{out}");
     assert!(out.contains("✗ Prompt is too long → it cannot be resumed"), "{out}");
     assert!(
-        out.contains("ggg7      completed"),
+        lane_row(&out, "ggg7").contains("completed"),
         "a resumed lane is not dead:\n{out}"
     );
-    assert!(out.contains("hhh8      failed "), "no notice: plain failed:\n{out}");
+    let h = lane_row(&out, "hhh8");
+    assert!(
+        h.contains("failed") && !h.contains("failed:"),
+        "no notice: plain failed:\n{out}"
+    );
     assert!(
         out.contains("4 sub-agents: 0 running · 1 completed · 3 other (1 context · 1 rate-limited)"),
         "{out}"
@@ -571,8 +625,11 @@ fn lanes_failure_cause_from_the_transcript() {
     assert_eq!(e["status"], "failed");
     assert_eq!(e["failure_cause"], "rate-limited");
     assert_eq!(e["resets_at"], "2026-10-02T01:00:00Z");
+    assert_eq!(by_id("fff6")["status"], "failed");
     assert_eq!(by_id("fff6")["failure_cause"], "context");
+    assert_eq!(by_id("ggg7")["status"], "completed");
     assert!(by_id("ggg7").get("failure_cause").is_none());
+    assert_eq!(by_id("hhh8")["status"], "failed");
     assert!(by_id("hhh8").get("failure_cause").is_none());
 }
 
@@ -586,7 +643,7 @@ fn lanes_endpoint_comes_from_the_lanes_own_shell_exports_only() {
     w.write_session(
         SID,
         &[
-            user("u0", "2026-10-01T10:00:00Z", "go"),
+            user(SID, "u0", "2026-10-01T10:00:00Z", "go"),
             notification("2026-10-01T10:30:00Z", "ppp1", "completed"),
             notification("2026-10-01T10:30:01Z", "qqq2", "completed"),
             assistant("a0", "2026-10-01T10:31:00Z", "ok"),
@@ -599,7 +656,7 @@ fn lanes_endpoint_comes_from_the_lanes_own_shell_exports_only() {
         "ppp1",
         "PARENT: briefs a child, then works",
         &[
-            user("p0", "2026-10-01T10:00:10Z", "You are the parent lane."),
+            user(SID, "p0", "2026-10-01T10:00:10Z", "You are the parent lane."),
             assistant_tool(
                 "p1",
                 "2026-10-01T10:00:20Z",
@@ -630,7 +687,7 @@ fn lanes_endpoint_comes_from_the_lanes_own_shell_exports_only() {
         "qqq2",
         "ONLYBRIEF: spawns and stops",
         &[
-            user("q0", "2026-10-01T10:00:10Z", "You spawn one child."),
+            user(SID, "q0", "2026-10-01T10:00:10Z", "You spawn one child."),
             assistant_tool(
                 "q1",
                 "2026-10-01T10:00:20Z",

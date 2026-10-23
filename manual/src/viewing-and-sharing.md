@@ -1,6 +1,6 @@
 # Viewing & sharing: the app and `cv share`
 
-Everything `cv` does on the command line, clustervision also does with pixels. 🔮 The app is one static web UI — a header, a drop zone, a row of view tabs, and the active view — that runs two ways, with no code differences between them:
+The app reads, searches, compares and composes sessions. 🔮 The app is one static web UI — a header, a drop zone, a row of view tabs, and the active view — that runs two ways, with no code differences between them:
 
 - **The Tauri desktop app.** A thin native shell around that same UI. It reads **all** of your real local sessions natively (no zip, no upload, zero setup), bundles a `cv serve` for the live Fleet dashboard, and adds native redaction and zip ingest. This is the one to install if it's your machine.
 - **The browser build.** Zero-install, hosted at the GitHub Pages site (<https://emberian.github.io/clustervision/>). You **drop a harness `.zip`** (or an OpenSession `.json`) onto the page and explore. Nothing is uploaded — parsing happens in your browser via WASM. Great for a session a teammate sent you, or for poking around without installing anything.
@@ -15,9 +15,11 @@ The tab bar across the top switches between the views. They all read from one sh
 
 The classic two-pane view: a searchable, filterable list on the left, the full transcript on the right. This is where you actually *read* a session.
 
-The **list** carries free-text search (matching titles, working directories, models, and **all message content**), per-harness filter chips, and sort by recency / oldest / title / message count. The count line ("142 of 1,203 sessions") tells you how hard your filters are biting.
+The **list** uses indexed exchange search when a usable server index is available. Otherwise it
+filters downloaded metadata and loaded message content, and labels that narrower scope. It also
+has per-harness filter chips and sorting by relevance / recency / oldest / title / message count. The count line ("142 of 1,203 sessions") tells you how hard your filters are biting.
 
-The **transcript** renders a session as role-labeled turns: prose as safe Markdown, collapsible thinking blocks (including honest "[encrypted reasoning blob]" placeholders for harnesses like Codex and Grok), `tool_use` as labeled JSON with a copy button, `tool_result` with error styling, and images/files as labeled cards. The header shows model, cwd, branch/commit, token totals, and id, with one-click export to **OpenSession `.json`** or **Markdown**. Huge sessions (20k+ messages exist) open instantly: the first screenful renders synchronously and the rest streams in.
+The **transcript** renders a session as role-labeled turns: prose as safe Markdown, collapsible thinking blocks (including honest "[encrypted reasoning blob]" placeholders for harnesses like Codex and Grok), `tool_use` as labeled JSON with a copy button, `tool_result` with error styling, and images/files as labeled cards. The header shows model, cwd, branch/commit, token totals, and id, with one-click export to **OpenSession `.json`** or **Markdown**. Large sessions render in chunks; server-backed transcripts load message pages on demand.
 
 ### ◈ Projects — the repo lens
 
@@ -29,7 +31,7 @@ A bird's-eye view of every session across all harnesses and all of time. Up top 
 
 ### 🔍 Compare — side-by-side, aligned
 
-Pick **two** sessions and view them side by side with message-level alignment. The app walks both message lists in parallel: while they match (same role + same flattened content) the rows are marked **shared** (a calm amethyst tint, ✓ in the gutter); from the first divergence onward everything is flagged **diverged** (warm tint, ≠ or •). The summary tells you the shape at a glance — *"37 shared messages, then diverges"*. This is exactly what you want for [Loom](#-loom--the-splice-composer) branches that share a common prefix and then split. Use the **⇄** button to swap A and B. (Picks aren't auto-aligned — aligning two huge arbitrary sessions on every visit was useless and slow, so *you* choose the pair.)
+Pick **two** sessions and view them side by side with message-level alignment. The app walks both message lists in parallel: while they match (same role + same flattened content) the rows are marked **shared** (a calm amethyst tint, ✓ in the gutter); from the first divergence onward everything is flagged **diverged** (warm tint, ≠ or •). The summary tells you the shape at a glance — *"37 shared messages, then diverges"*. This is exactly what you want for [Splice](#-splice--the-composer) branches that share a common prefix and then split. Use the **⇄** button to swap A and B. (Picks aren't auto-aligned — aligning two huge arbitrary sessions on every visit was useless and slow, so *you* choose the pair.)
 
 ### 📊 Stats — the dashboard
 
@@ -66,7 +68,9 @@ On startup the app loads the machine's real on-disk sessions — **everything**,
 
 ### 2. Lazy hydration (metadata stubs → full transcripts on demand)
 
-Loading thousands of sessions stays fast because the pool is filled with lightweight **stubs**: id, harness, cwd, title, dates, message count — but **no messages**. The list, search, Projects, Timeline, and Stats all work on stubs alone. The full transcript is fetched **only when you actually open a session** (or pick it in Compare or Loom), then cached so it never re-fetches. That's why opening the app over thousands of sessions is instant, and why Stats is careful to say which numbers only count opened sessions.
+Loading thousands of sessions stays fast because the pool is filled with lightweight **stubs**: id, harness, cwd, title, dates, message count — but **no messages**. The list, search, Projects, Timeline, and Stats all work on stubs alone. Opening a server-backed transcript fetches its head and first message page; **load more** fetches
+the next page. Compare and Splice can request the complete transcript. Stats labels breakdowns
+that reflect only loaded messages.
 
 ### 3. Drop a zip, or File → Open
 
@@ -107,7 +111,7 @@ The browser build is fully capable, but the Tauri desktop shell adds the things 
 - **Native zip ingest** — File → Open zip… reads the zip in Rust, without the WASM module. (Generation in the splice composer is the OpenRouter path in both the app and the browser.)
 - A **native menu** (File / Edit / View / Help — Edit so `Cmd+C`/`Cmd+V` work in the transcript, which is the whole point of a viewer), DevTools, and **window state persistence** across launches.
 
-Whichever way you run it, the promise on the footer holds: **all parsing happens locally; nothing is uploaded.**
+**Parsing stays local.** Generating a continuation sends the selected composition to OpenRouter.
 
 ## Sharing a transcript: `cv share`
 

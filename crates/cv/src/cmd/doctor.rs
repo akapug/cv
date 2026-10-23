@@ -24,10 +24,11 @@ fn bar(frac: f64) -> String {
 pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: usize, json: bool) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
 
-    // Resolve the target session(s).
-    let targets: Vec<SessionRef> = if let Some(id) = &id {
-        let (r, _ad) = crate::util::resolve(id, want)?;
-        vec![r]
+    // Resolve the target session(s). An explicit id arrives with its adapter (resolve found it);
+    // the recent listing carries refs the loop below still has to load.
+    let targets: Vec<(SessionRef, Option<Box<dyn cv_core::Adapter>>)> = if let Some(id) = &id {
+        let (r, adapter) = crate::util::resolve(id, want)?;
+        vec![(r, Some(adapter))]
     } else {
         let cwd = std::env::current_dir().ok();
         let mut refs: Vec<SessionRef> = cv_core::sessions()
@@ -38,31 +39,39 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
         refs.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
         refs.truncate(recent.max(1));
         if refs.is_empty() {
+            // An empty listing may be a store cv could not open: name it with the refusal.
+            let unreadable = skipped_lines(&cv_core::catalog::skipped_sources());
             anyhow::bail!(
-                "no sessions found for {} — pass an explicit <id>, or run from a project dir",
-                cwd.map(|c| c.display().to_string()).unwrap_or_default()
+                "no sessions found for {} — pass an explicit <id>, or run from a project dir{}",
+                cwd.map(|c| c.display().to_string()).unwrap_or_default(),
+                unreadable.iter().map(|l| format!("\n{l}")).collect::<String>()
             );
         }
-        refs
+        refs.into_iter().map(|r| (r, None)).collect()
     };
+    let n_targets = targets.len();
 
     let mut rep = Report::default();
     let mut label = String::new();
-    for r in &targets {
-        let (rr, adapter) =
-            cv_core::find(&r.id, Some(r.harness))?.with_context(|| format!("could not load session {}", r.id))?;
+    for (r, found) in targets {
+        let (rr, adapter) = match found {
+            Some(adapter) => (r, adapter),
+            None => {
+                cv_core::find(&r.id, Some(r.harness))?.with_context(|| format!("could not load session {}", r.id))?
+            }
+        };
         // Count decoded text in bounded chunks and request only attribution metadata facts.
         let mut pass = rep.session(Some(rr.path.clone()));
         cv_core::stream::stream_counted(
             adapter.as_ref(),
             &rr,
-            &cv_core::ParseOptions::facts(),
+            &cv_core::Demand::FACTS.with_spans(),
             &mut pass,
             cv_core::stream::Pass::RECORD,
         )?;
         pass.finish()?;
         if label.is_empty() {
-            label = crate::short_id(&rr.id);
+            label = crate::util::short_id(&rr.id);
         }
     }
 
@@ -70,11 +79,15 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
         let mut v = rep.to_json();
         if let Some(obj) = v.as_object_mut() {
             obj.insert("hooks".into(), crate::cmd::hooks::doctor_json());
+            let skipped = cv_core::catalog::skipped_sources();
+            if !skipped.is_empty() {
+                obj.insert("skipped_sources".into(), skipped_json(&skipped));
+            }
         }
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    print_report(&rep, &label, targets.len());
+    print_report(&rep, &label, n_targets);
     Ok(())
 }
 
@@ -89,6 +102,11 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
     // The cybernetic layer: are the hooks that make compaction visible from inside the session
     // installed, and which compaction knobs are in force (settings + environment).
     for line in crate::cmd::hooks::doctor_lines() {
+        println!("{line}");
+    }
+
+    println!("{}", writer_versions_line(cv_core::catalog::writer_versions()));
+    for line in skipped_lines(&cv_core::catalog::skipped_sources()) {
         println!("{line}");
     }
 
@@ -200,6 +218,86 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
     println!("\nVerdict: {}", verdict(rep));
     if n_targets == 1 && rep.sessions == 1 {
         println!("  (analyze your whole project: `cv doctor --recent 20`)");
+    }
+}
+
+/// The sources the last discovery found but could not open: the store has bytes, the listing has
+/// zero. Catalog knowledge only, as [`writer_versions_line`]; nothing when there are none.
+fn skipped_lines(skipped: &[(cv_core::Harness, cv_core::Skipped)]) -> Vec<String> {
+    if skipped.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Unreadable sources: {} (the store has bytes, the listing has zero)",
+        skipped.len()
+    )];
+    lines.extend(
+        skipped
+            .iter()
+            .map(|(h, s)| format!("  {h} {} — {}", s.path.display(), s.why)),
+    );
+    lines
+}
+
+fn skipped_json(skipped: &[(cv_core::Harness, cv_core::Skipped)]) -> serde_json::Value {
+    skipped
+        .iter()
+        .map(|(h, s)| serde_json::json!({"harness": h.as_str(), "path": s.path, "why": s.why}))
+        .collect()
+}
+
+/// Render only catalog knowledge. This helper never resolves or probes source paths.
+fn writer_versions_line(observations: Vec<cv_core::writer_version::Observed>) -> String {
+    let rows: Vec<_> = observations
+        .into_iter()
+        .map(|o| {
+            let verified = o.verified;
+            let status = match o
+                .newest
+                .as_deref()
+                .and_then(|v| cv_core::writer_version::compare(v, verified))
+            {
+                Some(std::cmp::Ordering::Greater) => " · newer than verified",
+                _ => "",
+            };
+            format!(
+                "{} observed {} / verified {}{} ({} unknown of {})",
+                o.harness,
+                o.newest.as_deref().unwrap_or("unknown"),
+                verified,
+                status,
+                o.unknown,
+                o.sessions
+            )
+        })
+        .collect();
+    format!("Writer versions: {}", rows.join("; "))
+}
+
+#[cfg(test)]
+mod writer_version_tests {
+    use super::*;
+    #[test]
+    fn catalog_knowledge_and_unknown_coverage() {
+        let line = writer_versions_line(vec![
+            cv_core::writer_version::Observed {
+                harness: "claude",
+                verified: "2.1.304",
+                newest: Some("2.10.0".into()),
+                sessions: 5,
+                unknown: 2,
+            },
+            cv_core::writer_version::Observed {
+                harness: "codex",
+                verified: "0.163.0",
+                newest: None,
+                sessions: 0,
+                unknown: 0,
+            },
+        ]);
+        assert!(line.contains("newer than verified"));
+        assert!(line.contains("2 unknown of 5"));
+        assert!(line.contains("codex observed unknown"));
     }
 }
 

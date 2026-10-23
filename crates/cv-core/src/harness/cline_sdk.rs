@@ -54,11 +54,12 @@
 
 use super::store::document::text_summary;
 use super::store::document::Fields;
-use super::wire::{anthropic, coerce_text};
+use super::wire::{self, anthropic};
 use super::{parse_ts, ts_from_epoch};
 use crate::ir::*;
 use crate::json::{JsonSource, JsonView};
-use crate::stream::{Flow, MessageSink, ParseOptions};
+use crate::json::{ReadInput, Validation};
+use crate::stream::{Demand, Flow, MessageSink};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -99,41 +100,34 @@ pub fn is_sdk_path(path: &Path) -> bool {
 }
 
 /// One `SessionRef` per messages file under each root: the lead session first, then its children.
-pub fn discover(roots: &[PathBuf]) -> Vec<SessionRef> {
-    let mut out = Vec::new();
-    for root in roots {
-        let Ok(entries) = fs::read_dir(root) else {
-            continue;
+/// Every SDK messages file under `roots`, into `out`; an unreadable dir or file is skipped and
+/// reported.
+pub fn discover(roots: &[PathBuf], out: &mut crate::Discovered) {
+    let entries_of = |dir: &Path, out: &mut crate::Discovered| -> Vec<PathBuf> {
+        let Some(entries) = out.keep(dir, fs::read_dir(dir).map_err(Into::into)) else {
+            return Vec::new();
         };
-        let mut dirs: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_dir())
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|e| out.keep(dir, e.map_err(Into::into)).map(|e| e.path()))
             .collect();
-        dirs.sort();
+        paths.sort();
+        paths
+    };
+    for root in roots {
+        let dirs: Vec<PathBuf> = entries_of(root, out).into_iter().filter(|p| p.is_dir()).collect();
         for dir in dirs {
             let Some(sid) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
                 continue;
             };
-            let Ok(files) = fs::read_dir(&dir) else {
-                continue;
-            };
-            let mut files: Vec<PathBuf> = files
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| is_sdk_path(p))
-                .collect();
-            files.sort();
+            let files: Vec<PathBuf> = entries_of(&dir, out).into_iter().filter(|p| is_sdk_path(p)).collect();
             let lead = dir.join(format!("{sid}.messages.json"));
-            if let Some(r) = scan(&lead, &sid) {
-                out.push(r);
-            }
-            for f in files.iter().filter(|f| **f != lead) {
-                if let Some(r) = scan(f, &sid) {
-                    out.push(r);
+            for f in std::iter::once(&lead).chain(files.iter().filter(|f| **f != lead)) {
+                if let Some(found) = crate::Skipped::listed(f, scan(f, &sid).map(Some)) {
+                    out.push(found);
                 }
             }
         }
     }
-    out
 }
 
 /// A child file's session id: `<sid>/<stem>`; the lead's is `<sid>`.
@@ -156,77 +150,99 @@ fn mtime(path: &Path) -> Option<DateTime<Utc>> {
     fs::metadata(path).ok()?.modified().ok().map(DateTime::<Utc>::from)
 }
 
-fn scan(path: &Path, sid: &str) -> Option<SessionRef> {
-    JsonSource::capture(path)
-        .ok()?
-        .read_document(|view| {
-            let record = Fields::parse(view, &["messages", "updated_at"])?.context("SDK document object")?;
-            let messages = record.get("messages").context("SDK messages")?;
-            let id = ref_id(path, sid).context("SDK id")?;
-            let lead = id == sid;
-            let row = if lead {
-                path.parent().and_then(|dir| manifest(dir, sid))
-            } else {
-                None
-            };
-            let mut r = SessionRef::new(&id, Harness::Cline, path.to_path_buf());
-            r.cwd = row
+/// Whether a `messages[]` entry is a turn ([`Message::is_turn`]) as [`message_with_blocks`] kinds
+/// it: an assistant reply that is not a display-only error, or a user entry that does not hold
+/// only tool results. Reads `role`, `metadata` and block types, never bodies.
+fn is_turn(entry: &Fields<'_>) -> Result<bool> {
+    Ok(match entry.string("role")?.as_deref() {
+        Some("assistant") => {
+            let meta = entry
+                .get("metadata")
+                .map(|m| Fields::parse(m, &["displayOnly", "displayRole"]))
+                .transpose()?
+                .flatten();
+            let display_only = meta
                 .as_ref()
-                .and_then(|m| m.get("cwd"))
-                .and_then(Value::as_str)
-                .map(PathBuf::from);
-            r.title = row
-                .as_ref()
-                .and_then(|m| m.pointer("/metadata/title"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            r.created_at = row
-                .as_ref()
-                .and_then(|m| m.get("started_at"))
-                .and_then(Value::as_str)
-                .and_then(parse_ts);
-            let mut first = true;
-            let mut first_user = false;
-            for message in messages.array()?.context("SDK messages array")? {
-                r.message_count += 1;
-                let message = message?;
-                if let Some(record) = Fields::parse(message, &["ts", "role", "content"])? {
-                    if first && r.created_at.is_none() {
-                        r.created_at = record.value("ts")?.and_then(|v| v.as_i64()).and_then(ts_from_epoch);
-                    }
-                    if !first_user && record.string("role")?.as_deref() == Some("user") {
-                        first_user = true;
-                        if r.title.is_none() {
-                            r.title = super::wire::text_title(record.get("content"))?;
-                        }
+                .and_then(|m| m.get("displayOnly"))
+                .map(|v| v.as_bool())
+                .transpose()?
+                .flatten();
+            let display_role = meta.as_ref().map(|m| m.string("displayRole")).transpose()?.flatten();
+            !(display_only == Some(true) && display_role.as_deref() == Some("error"))
+        }
+        Some("user") => !anthropic::only_tool_results(entry.get("content"), |part| {
+            anthropic::block_kind(part, &anthropic::ANTHROPIC)
+        })?,
+        _ => false,
+    })
+}
+
+fn scan(path: &Path, sid: &str) -> Result<SessionRef> {
+    JsonSource::capture(path)?.read(ReadInput::Document, Validation::Value, |view| {
+        let record = Fields::parse(view, &["messages", "updated_at"])?.context("SDK document object")?;
+        let messages = record.get("messages").context("SDK messages")?;
+        let id = ref_id(path, sid).context("SDK id")?;
+        let lead = id == sid;
+        let row = if lead {
+            path.parent().and_then(|dir| manifest(dir, sid))
+        } else {
+            None
+        };
+        let mut r = SessionRef::new(&id, Harness::Cline, path.to_path_buf());
+        r.cwd = row
+            .as_ref()
+            .and_then(|m| m.get("cwd"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        r.title = row
+            .as_ref()
+            .and_then(|m| m.pointer("/metadata/title"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        r.created_at = row
+            .as_ref()
+            .and_then(|m| m.get("started_at"))
+            .and_then(Value::as_str)
+            .and_then(parse_ts);
+        let mut first = true;
+        let mut first_user = false;
+        let mut count = 0;
+        for message in messages.array()?.context("SDK messages array")? {
+            let message = message?;
+            // A message entry, not the document-level `record` above.
+            if let Some(entry) = Fields::parse(message, &["ts", "role", "content", "metadata"])? {
+                count += usize::from(is_turn(&entry)?);
+                if first && r.created_at.is_none() {
+                    r.created_at = entry.value("ts")?.and_then(|v| v.as_i64()).and_then(ts_from_epoch);
+                }
+                if !first_user && entry.string("role")?.as_deref() == Some("user") {
+                    first_user = true;
+                    if r.title.is_none() {
+                        r.title = super::wire::text_title(entry.get("content"))?;
                     }
                 }
-                first = false;
             }
-            r.title = r.title.map(|t| truncate(&t, 80));
-            r.updated_at = record
-                .string("updated_at")?
-                .as_deref()
-                .and_then(parse_ts)
-                .or_else(|| mtime(path))
-                .or(r.created_at);
-            Ok(r)
-        })
-        .ok()
+            first = false;
+        }
+        r.message_count = Some(count);
+        r.title = r.title.map(|t| truncate(&t, crate::projection::Head::TITLE));
+        r.updated_at = record
+            .string("updated_at")?
+            .as_deref()
+            .and_then(parse_ts)
+            .or_else(|| mtime(path))
+            .or(r.created_at);
+        Ok(r)
+    })
 }
 /// Read one messages file into `sink`, returning the session with empty `messages`.
 pub fn stream(path: &Path, id: &str, sink: &mut dyn MessageSink) -> Result<Session> {
-    stream_with_options(path, id, &ParseOptions::full(), sink)
+    stream_with_options(path, id, &Demand::RICH, sink)
 }
 
-pub(crate) fn stream_with_options(
-    path: &Path,
-    id: &str,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-) -> Result<Session> {
+pub(crate) fn stream_with_options(path: &Path, id: &str, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
     let source = JsonSource::capture(path)?;
-    source.read_document(|view| {
+    source.read(ReadInput::Document, Validation::Value, |view| {
         let keys = [
             "agent",
             "taskType",
@@ -237,14 +253,16 @@ pub(crate) fn stream_with_options(
             "messages",
         ];
         let record = Fields::parse(view, &keys)?;
+        // `messages` streams below; every other parsed key projects into the document value.
+        let [doc_keys @ .., messages_key] = keys;
         let doc = Value::Object(
             record
                 .as_ref()
-                .map(|r| r.project(&keys[..keys.len() - 1]))
+                .map(|r| r.project(&doc_keys))
                 .transpose()?
                 .unwrap_or_default(),
         );
-        let messages = record.as_ref().and_then(|r| r.get("messages"));
+        let messages = record.as_ref().and_then(|r| r.get(messages_key));
         let mut s = Session::new(id.to_string(), Harness::Cline);
         s.source_path = Some(path.to_path_buf());
         let sid = id.split('/').next().unwrap_or(id);
@@ -278,7 +296,7 @@ pub(crate) fn stream_with_options(
             if let Some(o) = origin {
                 bag.insert("origin".into(), o.clone());
             }
-            if let Some(row) = row.as_ref().filter(|_| lead) {
+            if let Some(row) = row.as_ref() {
                 for k in [
                     "source",
                     "status",
@@ -295,17 +313,18 @@ pub(crate) fn stream_with_options(
             }
         }
         if !lead {
-            s.lineage.parent = origin
-                .and_then(|o| o.get("parentThreadId"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| Some(sid.to_string()));
+            s.lineage.parent = Some(
+                origin
+                    .and_then(|o| o.get("parentThreadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(sid)
+                    .to_string(),
+            );
             s.lineage.agent_path = origin
                 .and_then(|o| o.get("subagent"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
-        let row = row.filter(|_| lead);
         s.cwd = row
             .as_ref()
             .and_then(|m| m.get("cwd"))
@@ -332,7 +351,6 @@ pub(crate) fn stream_with_options(
 
         let mut prompted = false;
         let resolver = crate::lazy::Resolver::new(Some(path.to_path_buf()));
-        let mut has_sources = false;
         for view in messages
             .map(JsonView::array)
             .transpose()?
@@ -358,23 +376,11 @@ pub(crate) fn stream_with_options(
                     false,
                 );
             }
-            let sourced = m.content.iter().any(|block| {
-                matches!(
-                    block,
-                    Block::ToolUse {
-                        input: crate::Json::Source(_),
-                        ..
-                    }
-                )
-            });
-            has_sources |= sourced;
-            if sourced {
-                source.check()?;
-            }
+            // A span demand checks its own source; the stream rechecks after a slow callback and
+            // at the end (`stream` module: who owns the source guarantee).
+            let started = std::time::Instant::now();
             let flow = sink.try_message(m)?;
-            if sourced {
-                source.check()?;
-            }
+            source.check_after(started)?;
             if flow == Flow::Stop {
                 break;
             }
@@ -382,16 +388,16 @@ pub(crate) fn stream_with_options(
         if s.updated_at.is_none() {
             s.updated_at = mtime(path).or(s.created_at);
         }
-        if has_sources {
-            source.check()?;
-        }
+        source.check()?;
         Ok(s)
     })
 }
 
 fn result_text(c: Option<&Value>) -> String {
     match c {
-        Some(Value::Array(items)) if items.iter().all(|i| i.get("type").is_some()) => coerce_text(c),
+        Some(Value::Array(items)) if items.iter().all(|i| i.get("type").is_some()) => {
+            wire::joined_owned(c, wire::RESULT)
+        }
         Some(Value::String(s)) => s.clone(),
         None | Some(Value::Null) => String::new(),
         Some(other) => serde_json::to_string(other).unwrap_or_default(),
@@ -406,9 +412,11 @@ fn view_message(view: JsonView<'_>, spans: bool, lead: bool, prompted: &mut bool
     let Some(record) = Fields::parse(view, &keys)? else {
         return Ok(None);
     };
-    let meta = Value::Object(record.project(&keys[..keys.len() - 1])?);
+    // `content` decodes into blocks below; the other parsed keys project into the meta value.
+    let [meta_keys @ .., content_key] = keys;
+    let meta = Value::Object(record.project(&meta_keys)?);
     let mut blocks = Vec::new();
-    if let Some(content) = record.get("content") {
+    if let Some(content) = record.get(content_key) {
         if let Some(text) = content.lazy_text(spans)? {
             blocks.push(Block::Text { text });
         } else if let Some(items) = content.array()? {
@@ -443,7 +451,7 @@ fn view_message(view: JsonView<'_>, spans: bool, lead: bool, prompted: &mut bool
                     &anthropic::ANTHROPIC,
                     spans,
                     &mut |v| v.lazy_text(spans),
-                    if spans { 0 } else { u64::MAX },
+                    crate::harness::wire::joined_over(spans),
                 )? {
                     blocks.push(block);
                 }
@@ -498,35 +506,130 @@ fn message_with_blocks(v: &Value, blocks: Vec<Block>, lead: bool, prompted: &mut
     Some(m)
 }
 
-/// The side-database rows of a lead session (see the module docs): schedule fires from
-/// `sessions.db` / `cron.db`, team runs from `teams.db`. A child file (`<sid>/<stem>`) has none.
-#[cfg(feature = "sqlite")]
-pub fn store_affordances(r: &SessionRef) -> Vec<crate::affordance::Affordance> {
-    if r.id.contains('/') {
-        return Vec::new();
+/// The side databases under `<data>/db/` a lead session reads its rows of.
+pub(crate) const SIDE_DATABASES: [&str; 3] = ["sessions.db", "cron.db", "teams.db"];
+
+/// The `<data>/db/` directory of a lead session's side databases; a child file (`<sid>/<stem>`)
+/// reads none.
+pub(crate) fn side_store(r: &SessionRef) -> Option<PathBuf> {
+    if r.id.contains('/') || !is_sdk_path(&r.path) {
+        return None;
     }
-    let Some(db) = r
-        .path
+    r.path
         .parent()
         .and_then(Path::parent)
         .and_then(Path::parent)
         .map(|d| d.join("db"))
-    else {
-        return Vec::new();
+}
+
+/// The side-database rows of a lead session (see the module docs): schedule fires from
+/// `sessions.db` / `cron.db`, team runs from `teams.db`. A child file (`<sid>/<stem>`) has none.
+#[cfg(feature = "sqlite")]
+pub fn store_affordances(r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
+    let Some(db) = side_store(r) else {
+        return Ok(Vec::new());
     };
-    let mut out = schedule_fires(&db, &r.id);
-    out.extend(team_runs(&db.join("teams.db"), &r.id));
-    out
+    let mut out = schedule_fires(&db, &r.id)?;
+    out.extend(team_runs(&db.join("teams.db"), &r.id)?);
+    Ok(out)
+}
+
+/// Every lead session's certificate in the side databases at `db` (`<data>/db/`): the rows its
+/// read takes ([`schedule_fires`], [`team_runs`]), each query's result digested per session, from
+/// one grouped query per database. Every session directory beside `db` is certified, rows or not.
+#[cfg(feature = "sqlite")]
+pub(crate) fn side_rows(db: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+    use super::store::sqlite::{open_ro, table_exists};
+    use crate::source::Rows;
+    use rusqlite::types::ValueRef;
+    let sessions = db.parent()?.join("sessions");
+    let mut certificates: std::collections::HashMap<String, Rows> = fs::read_dir(&sessions)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .map(|sid| {
+            (
+                sid,
+                Rows {
+                    count: 0,
+                    high: 0,
+                    digest: Rows::SEED,
+                },
+            )
+        })
+        .collect();
+    // (database, tables the read requires, the read's query grouped by its session column first)
+    const QUERIES: [(&str, [&str; 2], &str); 3] = [
+        (
+            "sessions.db",
+            ["schedule_executions", "schedules"],
+            "SELECT e.session_id, s.name, s.cron_pattern, s.prompt, e.status, e.triggered_at FROM schedule_executions e \
+             JOIN schedules s ON s.schedule_id = e.schedule_id ORDER BY e.session_id, e.triggered_at",
+        ),
+        (
+            "cron.db",
+            ["cron_runs", "cron_specs"],
+            "SELECT r.session_id, p.title, p.schedule_expr, p.prompt, r.status, COALESCE(r.started_at, r.created_at) \
+             FROM cron_runs r JOIN cron_specs p ON p.spec_id = r.spec_id ORDER BY r.session_id, r.created_at",
+        ),
+        (
+            "teams.db",
+            ["team_events", "team_events"],
+            "SELECT team_name, ts, event_type, payload_json FROM team_events ORDER BY team_name, id",
+        ),
+    ];
+    for (index, (file, tables, sql)) in QUERIES.into_iter().enumerate() {
+        let path = db.join(file);
+        if !path.try_exists().ok()? {
+            continue;
+        }
+        open_ro(&path)
+            .ok()?
+            .read(|conn, _| {
+                if !tables.iter().all(|t| table_exists(conn, t)) {
+                    return Ok(());
+                }
+                let mut statement = conn.prepare(sql)?;
+                let columns = statement.column_count();
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    let Ok(sid) = row.get::<_, String>(0) else { continue };
+                    let Some(cert) = certificates.get_mut(&sid) else {
+                        continue;
+                    };
+                    cert.count += 1;
+                    cert.digest = Rows::fold(cert.digest, &[index as u8]);
+                    for column in 1..columns {
+                        let bytes: Vec<u8> = match row.get_ref(column)? {
+                            ValueRef::Null => b"n".to_vec(),
+                            ValueRef::Integer(i) => format!("i{i}").into_bytes(),
+                            ValueRef::Real(f) => format!("r{f}").into_bytes(),
+                            ValueRef::Text(t) => [b"t".as_slice(), &(t.len() as u64).to_le_bytes(), t].concat(),
+                            ValueRef::Blob(b) => [b"b".as_slice(), &(b.len() as u64).to_le_bytes(), b].concat(),
+                        };
+                        cert.digest = Rows::fold(cert.digest, &bytes);
+                    }
+                }
+                Ok(())
+            })
+            .ok()?;
+    }
+    Some(certificates)
 }
 
 #[cfg(not(feature = "sqlite"))]
-pub fn store_affordances(_r: &SessionRef) -> Vec<crate::affordance::Affordance> {
-    Vec::new()
+pub(crate) fn side_rows(_db: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+    None
+}
+
+#[cfg(not(feature = "sqlite"))]
+pub fn store_affordances(_r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
+    Ok(Vec::new())
 }
 
 /// One `schedule`/`fire` row per execution that ran as `sid`.
 #[cfg(feature = "sqlite")]
-fn schedule_fires(db: &Path, sid: &str) -> Vec<crate::affordance::Affordance> {
+fn schedule_fires(db: &Path, sid: &str) -> Result<Vec<crate::affordance::Affordance>> {
     use super::store::sqlite::{open_ro, table_exists};
     use crate::affordance::{Affordance, Kind};
     const QUERIES: [(&str, &str, &str, &str); 2] = [
@@ -547,9 +650,10 @@ fn schedule_fires(db: &Path, sid: &str) -> Vec<crate::affordance::Affordance> {
     ];
     let mut out = Vec::new();
     for (file, runs, specs, sql) in QUERIES {
-        let Ok(conn) = open_ro(&db.join(file)) else {
+        if !db.join(file).try_exists()? {
             continue;
-        };
+        }
+        let conn = open_ro(&db.join(file))?;
         type Row = (
             Option<String>,
             Option<String>,
@@ -557,19 +661,17 @@ fn schedule_fires(db: &Path, sid: &str) -> Vec<crate::affordance::Affordance> {
             Option<String>,
             Option<String>,
         );
-        let rows: Vec<Row> = conn
-            .read(|conn| {
-                if !table_exists(conn, runs) || !table_exists(conn, specs) {
-                    return Ok(Vec::new());
-                }
-                Ok(conn.prepare(sql).and_then(|mut st| {
-                    st.query_map([sid], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-                    })?
-                    .collect()
-                })?)
-            })
-            .unwrap_or_default();
+        let rows: Vec<Row> = conn.read(|conn, _| {
+            if !table_exists(conn, runs) || !table_exists(conn, specs) {
+                return Ok(Vec::new());
+            }
+            Ok(conn.prepare(sql).and_then(|mut st| {
+                st.query_map([sid], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                })?
+                .collect()
+            })?)
+        })?;
         for (name, cron, prompt, status, at) in rows {
             let summary = [name, cron, prompt, status]
                 .into_iter()
@@ -589,32 +691,31 @@ fn schedule_fires(db: &Path, sid: &str) -> Vec<crate::affordance::Affordance> {
             });
         }
     }
-    out
+    Ok(out)
 }
 
 /// The lead's team, from `team_events` (keyed `team_name = <lead session id>`): one
 /// `subagent_spawn`/`state` row per run, in the order the runs were queued, then one per teammate
 /// spawned that never ran.
 #[cfg(feature = "sqlite")]
-fn team_runs(teams_db: &Path, sid: &str) -> Vec<crate::affordance::Affordance> {
+fn team_runs(teams_db: &Path, sid: &str) -> Result<Vec<crate::affordance::Affordance>> {
     use super::store::sqlite::{open_ro, table_exists};
     use crate::affordance::{Affordance, Kind};
-    let Ok(conn) = open_ro(teams_db) else {
-        return Vec::new();
-    };
-    let events: Vec<(String, String, String)> = conn
-        .read(|conn| {
-            if !table_exists(conn, "team_events") {
-                return Ok(Vec::new());
-            }
-            Ok(conn
-                .prepare("SELECT ts, event_type, payload_json FROM team_events WHERE team_name = ?1 ORDER BY id")
-                .and_then(|mut st| {
-                    st.query_map([sid], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                        .collect()
-                })?)
-        })
-        .unwrap_or_default();
+    if !teams_db.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let conn = open_ro(teams_db)?;
+    let events: Vec<(String, String, String)> = conn.read(|conn, _| {
+        if !table_exists(conn, "team_events") {
+            return Ok(Vec::new());
+        }
+        Ok(conn
+            .prepare("SELECT ts, event_type, payload_json FROM team_events WHERE team_name = ?1 ORDER BY id")
+            .and_then(|mut st| {
+                st.query_map([sid], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect()
+            })?)
+    })?;
     /// One team run as its events tell it: the last status and result win.
     struct Run {
         queued: Option<DateTime<Utc>>,
@@ -629,9 +730,7 @@ fn team_runs(teams_db: &Path, sid: &str) -> Vec<crate::affordance::Affordance> {
     let mut run_positions = std::collections::HashMap::new();
     let mut teammates: Vec<(Option<DateTime<Utc>>, String)> = Vec::new();
     for (ts, ty, payload) in events {
-        let Ok(p) = serde_json::from_str::<Value>(&payload) else {
-            continue;
-        };
+        let p = serde_json::from_str::<Value>(&payload)?;
         let at = parse_ts(&ts);
         if ty == "teammate_spawned" {
             if let Some(a) = p.get("agentId").and_then(Value::as_str) {
@@ -693,7 +792,7 @@ fn team_runs(teams_db: &Path, sid: &str) -> Vec<crate::affordance::Affordance> {
             out.push(row(at, format!("{agent}: spawned, never ran")));
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -749,8 +848,7 @@ mod tests {
                 }),
             );
             let mut sink = ChildSink::default();
-            let session =
-                stream_with_options(&path, &format!("lead/{stem}"), &ParseOptions::full(), &mut sink).unwrap();
+            let session = stream_with_options(&path, &format!("lead/{stem}"), &Demand::RICH, &mut sink).unwrap();
             assert!(sink.dependencies.contains(&manifest));
             assert_eq!(session.cwd, None);
             assert_eq!(session.model.as_deref(), Some("child-model"));
@@ -762,8 +860,7 @@ mod tests {
 
     #[test]
     fn lead_and_child_sessions_with_tool_results_and_a_display_error() {
-        let root = std::env::temp_dir().join(format!("cv-cline-sdk-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = cv_testkit::temp_dir("cline-sdk");
         let dir = root.join("100_abcde");
         fs::create_dir_all(&dir).unwrap();
         write(
@@ -795,7 +892,8 @@ mod tests {
                          {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}]}),
         );
 
-        let refs = discover(std::slice::from_ref(&root));
+        let mut refs = crate::Discovered::default();
+        discover(std::slice::from_ref(&root), &mut refs);
         let ids: Vec<&str> = refs.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["100_abcde", "100_abcde/agent_x"]);
         assert_eq!(refs[0].title.as_deref(), Some("t"));
@@ -832,8 +930,7 @@ mod tests {
 
     #[test]
     fn native_raw_messages_preserve_full_codec_and_wrapper_validation() {
-        let dir = std::env::temp_dir().join(format!("cv-sdk-raw-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("sdk-raw");
         let path = dir.join("sdk.messages.json");
         let body = "a\n\"é😀".repeat(8192);
         let doc = json!({"messages":[
@@ -845,7 +942,7 @@ mod tests {
         ]});
         fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
         let mut expected = None;
-        for opts in [ParseOptions::full(), ParseOptions::lazy(), ParseOptions::complete()] {
+        for opts in [Demand::RICH, Demand::LEAN.with_spans(), Demand::COMPLETE] {
             let mut sink = CollectSink::default();
             let mut actual = stream_with_options(&path, "sdk", &opts, &mut sink).unwrap();
             actual.messages = sink.messages;
@@ -895,7 +992,7 @@ mod tests {
             }
         };
         assert!(
-            stream_with_options(&path, "sdk", &ParseOptions::lazy(), &mut mutate).is_err(),
+            stream_with_options(&path, "sdk", &Demand::LEAN.with_spans(), &mut mutate).is_err(),
             "source mutation after publication must reject completion"
         );
         assert!(
@@ -909,7 +1006,7 @@ mod tests {
             )
             .unwrap();
             let mut sink = CollectSink::default();
-            assert!(stream_with_options(&path, "sdk", &ParseOptions::lazy(), &mut sink).is_err());
+            assert!(stream_with_options(&path, "sdk", &Demand::LEAN.with_spans(), &mut sink).is_err());
             assert!(sink.messages.is_empty());
         }
         fs::remove_dir_all(dir).unwrap();
@@ -960,7 +1057,12 @@ mod tests {
             }
             transaction.commit().unwrap();
         }
-        let rows = team_runs(&path, "lead");
+        assert!(team_runs(&path, "lead").is_err(), "corrupt side rows are reported");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM team_events WHERE payload_json = '{malformed'", [])
+            .unwrap();
+        let rows = team_runs(&path, "lead").unwrap();
         assert_eq!(rows.len(), count * 2 + 1);
         for (index, row) in rows[..count].iter().enumerate() {
             assert_eq!(
@@ -973,15 +1075,14 @@ mod tests {
             assert_eq!(row.summary, format!("idle-{index}: spawned, never ran"));
         }
         assert_eq!(rows.last().unwrap().summary, "idle-0: spawned, never ran");
-        assert!(team_runs(&path, "other lead").is_empty());
+        assert!(team_runs(&path, "other lead").unwrap().is_empty());
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn schedule_fires_and_team_runs_from_the_side_databases() {
         use crate::affordance::Kind;
-        let root = std::env::temp_dir().join(format!("cv-cline-sdk-dbs-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = cv_testkit::temp_dir("cline-sdk-dbs");
         let sid = "200_fghij";
         let dir = root.join("sessions").join(sid);
         fs::create_dir_all(&dir).unwrap();
@@ -1023,7 +1124,7 @@ mod tests {
         );
         let mut r = SessionRef::new(sid, Harness::Cline, path);
         r.created_at = parse_ts("2026-10-11T00:00:00Z");
-        let rows = store_affordances(&r);
+        let rows = store_affordances(&r).unwrap();
         let got: Vec<(Kind, &str, &str)> = rows.iter().map(|a| (a.kind, a.action, a.summary.as_str())).collect();
         assert_eq!(
             got,
@@ -1039,7 +1140,10 @@ mod tests {
             Harness::Cline,
             dir.join("agent_x.messages.json"),
         );
-        assert!(store_affordances(&child).is_empty(), "a child file has no side rows");
+        assert!(
+            store_affordances(&child).unwrap().is_empty(),
+            "a child file has no side rows"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

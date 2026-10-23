@@ -1,4 +1,4 @@
-//! Hermes (Nous Research) adapter — `~/.hermes/state.db` (SQLite, schema v30; back-compatible to the
+//! Hermes (Nous Research) adapter — `~/.hermes/state.db` (SQLite, including schema v31; back-compatible to the
 //! pre-v11 tables).
 //!
 //! See `docs/FORMATS.md`. One DB holds all sessions: a `sessions` table (metadata) and a `messages`
@@ -61,15 +61,16 @@
 //! compaction flags, the raw reasoning columns, and the session row under
 //! `extra["hermes"]["session"]`.
 
+use crate::json::{ReadInput, Validation};
 mod emit;
 pub use emit::emit;
 
-use super::store::sqlite::{columns, open_ro, table_exists, Cells};
+use super::store::sqlite::{open_ro, table_exists, Cells, Select};
 use super::wire::openai;
 use super::{ts_from_epoch, Adapter};
 use crate::ir::*;
-use crate::stream::{Flow, MessageSink, ParseOptions};
-use anyhow::Result;
+use crate::stream::{self, Flow, MessageSink, Tier};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -177,6 +178,16 @@ pub struct Hermes {
     dbs: Vec<PathBuf>,
 }
 
+/// Hermes's deferred-tool wrapper: `tool_call{name, arguments}`.
+pub(crate) const DEFERRED_WRAPPER: crate::affordance::DeferredWrapper = crate::affordance::DeferredWrapper {
+    name_key: "name",
+    args_key: "arguments",
+};
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Hermes = Hermes { dbs: Vec::new() };
+
 impl Hermes {
     pub fn detect() -> Self {
         // HERMES_HOME overrides ~/.hermes.
@@ -216,8 +227,45 @@ impl Hermes {
 }
 
 impl Adapter for Hermes {
+    /// The `display_kind` the reader keeps: a finished process, a skill invocation.
+    fn record_affordance(
+        &self,
+        m: &Message,
+        _first: &crate::affordance::FirstText<'_>,
+    ) -> Result<Option<crate::affordance::RecordHit>> {
+        use crate::affordance::{Kind, RecordHit};
+        let display = m
+            .harness_extra(Harness::Hermes)
+            .and_then(|bag| bag.get("display_kind"))
+            .and_then(Value::as_str);
+        Ok(match display.unwrap_or("") {
+            "process_complete" => Some(RecordHit {
+                kind: Kind::BackgroundJob,
+                action: "complete",
+                tool: "process_complete",
+            }),
+            "skill_invocation" => Some(RecordHit {
+                kind: Kind::Skill,
+                action: "load",
+                tool: "skill_invocation",
+            }),
+            _ => None,
+        })
+    }
+
     fn harness(&self) -> Harness {
         Harness::Hermes
+    }
+
+    /// The delegate runs of the conversation's compression chain ([`subagent_refs`]).
+    fn forest(
+        &self,
+        r: &SessionRef,
+        _demand: crate::SubagentDemand,
+        workflow: Option<&str>,
+        select: &(dyn Fn(&str, Option<&str>) -> bool + Sync),
+    ) -> Result<Vec<crate::AgentRef>> {
+        Ok(super::ref_forest(subagent_refs(r)?, workflow, select))
     }
 
     /// Every dir holding a `state.db` (home + each profile), the first `state.db`'s first:
@@ -234,78 +282,94 @@ impl Adapter for Hermes {
         roots
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         // Iterate every DB (top-level + each profile), opening each read-only, and concatenate the
         // per-DB discovery. Each `SessionRef` carries its own `path`, so refs from different
         // profiles stay disambiguated even when their internal session ids collide. A single
-        // unreadable DB (e.g. permission-denied) is skipped rather than failing the whole scan.
-        let mut out = Vec::new();
+        // unreadable DB (permission-denied, locked, not a database) is skipped and reported rather
+        // than failing the whole scan.
+        let mut out = crate::Discovered::default();
         for db in &self.dbs {
-            let refs = super::store::sqlite::cached_discover(db, || {
-                let Ok(conn) = open_ro(db) else {
-                    return Ok(Vec::new());
-                };
-                conn.read(|conn| discover_conn(conn, db))
-            });
-            if let Ok(refs) = refs {
-                out.extend(refs);
+            let refs =
+                super::store::sqlite::cached_discover(db, || open_ro(db)?.read(|conn, _| discover_conn(conn, db)));
+            if let Some(refs) = out.keep(db, refs) {
+                out.refs.extend(refs);
             }
         }
         Ok(out)
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn capabilities(&self) -> super::Capabilities {
+        super::Capabilities {
+            denials: &[],
+            edit_guard: None,
+            lane_stops: None,
+            // Hermes routes lazily loaded tools through `tool_call{name, arguments}` and its reader
+            // leaves the wrapper in place.
+            deferred_wrapper: Some(DEFERRED_WRAPPER),
+            rich_spans: false,
+        }
+    }
+
+    /// Hermes writes each profile's `state.db` in place.
+    fn watch_policy(&self, _r: &SessionRef) -> super::WatchPolicy {
+        super::WatchPolicy::Database
+    }
+
+    fn stream(&self, r: &SessionRef, opts: &stream::Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             // Spawn turns, sub-agent returns and deferred tool calls, typed (`crate::affordance`).
-            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Hermes, sink);
+            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Hermes, sink)
+                .unwrapping(self.capabilities().deferred_wrapper);
             let sink: &mut dyn MessageSink = &mut spawns;
             // Route by the ref's own DB path (set at discovery time), NOT a single self.db — this is
             // what lets one Hermes adapter span many profile DBs without id collisions.
-            let conn = open_ro(&r.path)?;
-            conn.read(|conn| stream_conn_with_reads(conn, r, opts, sink, conn.reads()))
+            super::store::sqlite::read(&r.path, |conn, reads| {
+                stream_conn_with_reads(conn, r, opts, sink, reads)
+            })
         })
+    }
+
+    /// Every session's certificate, from one read of the store's small tables and the
+    /// `messages(session_id, …)` indexes ([`rows_conn`]).
+    fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        open_ro(store)
+            .ok()?
+            .read(|conn, _| rows_from(conn, &*walked(conn, store)?))
+            .ok()
     }
 
     /// What `/goal`, `/loop` and `/heartbeat` keep in `state_meta` under `<kind>:<session id>`.
-    fn store_affordances(&self, r: &SessionRef) -> Vec<crate::affordance::Affordance> {
-        let Ok(conn) = open_ro(&r.path) else {
-            return Vec::new();
-        };
-        conn.read(|conn| {
+    fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
+        let conn = open_ro(&r.path)?;
+        conn.read(|conn, _| {
             if !table_exists(conn, "state_meta") {
                 return Ok(Vec::new());
             }
-            Ok(state_meta_affordances(conn, &r.id))
+            state_meta_affordances(conn, &r.id)
         })
-        .unwrap_or_default()
     }
 }
 
-/// Row shape of the per-session metadata SELECT in [`stream_conn`] (columns guarded by
-/// `session_has_col`, absent ones selected as NULL): model, started_at, ended_at, title, source,
-/// parent_session_id, end_reason, cwd, git_branch, last_activity_at, model_config.
-type SessionMetaRow = (
-    Option<String>,
-    Option<f64>,
-    Option<f64>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<f64>,
-    Option<String>,
-);
+/// Per-session metadata. Historical absent columns are selected as NULL; unreadable cells fail.
+struct SessionMetaRow {
+    model: Option<String>,
+    started: Option<f64>,
+    ended: Option<f64>,
+    title: Option<String>,
+    source: Option<String>,
+    parent: Option<String>,
+    end_reason: Option<String>,
+    cwd: Option<String>,
+    git_branch: Option<String>,
+    last_activity: Option<f64>,
+    model_config: Option<String>,
+}
 
 /// The most recent of a session's activity stamps: Hermes bumps `last_activity_at` on every turn
 /// while `ended_at` stays NULL for a live session, so it is the honest `updated_at`.
 fn latest_of(stamps: [Option<f64>; 3]) -> Option<DateTime<Utc>> {
-    stamps
-        .into_iter()
-        .flatten()
-        .fold(None, |acc: Option<f64>, t| Some(acc.map_or(t, |a| a.max(t))))
-        .and_then(ts_from_epoch)
+    stamps.into_iter().flatten().reduce(f64::max).and_then(ts_from_epoch)
 }
 
 /// One `SessionRef` per CONVERSATION. Excluded: delegate sub-agent runs
@@ -321,135 +385,362 @@ fn latest_of(stamps: [Option<f64>; 3]) -> Option<DateTime<Utc>> {
 /// user-visible conversations and stay listed. An untitled compression tip takes its root's title,
 /// as Hermes's listing does (`COALESCE(tip.title, s.title)`, `hermes_state_sessions.py:1137`).
 fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
-    refs_conn(conn, path, None)
+    Ok(refs_of(&*walked(conn, path)?, path, false)?
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect())
 }
 
 /// The delegate sub-agent runs of one conversation (`model_config._delegate_from` naming it, or any
 /// segment of its compression chain, since a delegate records the session id live when it was
 /// spawned), as [`SessionRef`]s of the same shape discovery gives a session in that db, sorted by
 /// id. Discovery leaves them out (Hermes's picker hides them too); this is how a caller reaches
-/// them from their parent. Empty when the db cannot be opened.
-pub fn subagent_refs(parent: &SessionRef) -> Vec<SessionRef> {
-    let Ok(conn) = open_ro(&parent.path) else {
-        return Vec::new();
-    };
-    conn.read(|conn| {
-        let chain: HashSet<String> = if columns(conn, "sessions").contains("parent_session_id") {
-            session_lineage_root_to_tip(conn, &parent.id).into_iter().collect()
-        } else {
-            HashSet::from([parent.id.clone()])
-        };
-        let mut out = refs_conn(conn, &parent.path, Some(&chain)).unwrap_or_default();
-        out.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(out)
+/// them from their parent. Every listed conversation's answer is derived once per db state and
+/// kept in cv's catalog, so an unchanged db is neither copied nor opened to answer.
+pub fn subagent_refs(parent: &SessionRef) -> Result<Vec<SessionRef>> {
+    let record = super::store::sqlite::derived(&parent.path, Harness::Hermes, forests_conn)?;
+    let forests = &record.payload;
+    if forests.listed.contains(&parent.id) {
+        return Ok(forests.of.get(&parent.id).cloned().unwrap_or_default());
+    }
+    // A session discovery does not list (a delegate run, a compression ancestor) walks its chain.
+    open_ro(&parent.path)?.read(|conn, _| {
+        anyhow::ensure!(
+            crate::source::unchanged(parent, &record.baseline),
+            "SQLite source dependencies changed or unavailable"
+        );
+        Ok(chain_delegates(
+            &*walked(conn, &parent.path)?,
+            &parent.id,
+            &forests.by_parent,
+        ))
     })
-    .unwrap_or_default()
 }
 
-/// Session refs in one db: with `delegates_of` unset, every listed conversation (see
-/// [`discover_conn`]); with it set, only the delegate runs whose `_delegate_from` is in the set.
-fn refs_conn(conn: &Connection, path: &Path, delegates_of: Option<&HashSet<String>>) -> Result<Vec<SessionRef>> {
-    // Older schemas may lack `title`, `parent_session_id`, …: select what exists, NULL for the rest.
-    let scols = columns(conn, "sessions");
-    let expr = |col: &str| {
-        if scols.contains(col) {
-            col.to_string()
-        } else {
-            "NULL".to_string()
-        }
+/// What [`subagent_refs`] keeps per db state.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Forests {
+    /// Every delegate run, by the session its `_delegate_from` names.
+    by_parent: std::collections::HashMap<String, Vec<SessionRef>>,
+    /// The conversations discovery lists, each answered by `of` (absent there: none).
+    listed: HashSet<String>,
+    of: std::collections::HashMap<String, Vec<SessionRef>>,
+}
+
+impl crate::source::Payload for Forests {
+    const TAG: &'static str = "hermes-delegates";
+}
+
+/// One walk over `sessions` for the delegate runs, then each listed conversation's chain. The
+/// walk reads the overflow pages too; a forest fold asks for every conversation's delegates, so
+/// one walk per parent made a `--subagents` pass over a 4 GB store read ~4 GB per conversation.
+fn forests_conn(conn: &Connection, path: &Path) -> Result<Forests> {
+    let walk = walked(conn, path)?;
+    let mut by_parent = std::collections::HashMap::<String, Vec<SessionRef>>::new();
+    for (from, r) in refs_of(&walk, path, true)? {
+        by_parent.entry(from.unwrap_or_default()).or_default().push(r);
+    }
+    let listed: HashSet<String> = super::store::sqlite::cached_discover(path, || discover_conn(conn, path))?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let of = if by_parent.is_empty() {
+        Default::default()
+    } else {
+        listed
+            .iter()
+            .map(|id| (id.clone(), chain_delegates(&walk, id, &by_parent)))
+            .filter(|(_, kids)| !kids.is_empty())
+            .collect()
     };
-    let has_parent = scols.contains("parent_session_id");
-    let sql = format!(
-        "SELECT id, {title}, started_at, ended_at, {cwd}, {last}, {model_config} \
-         FROM sessions ORDER BY started_at DESC",
-        title = expr("title"),
-        cwd = expr("cwd"),
-        last = expr("last_activity_at"),
-        model_config = expr("model_config"),
+    Ok(Forests { by_parent, listed, of })
+}
+
+/// The delegates of every segment of `id`'s compression chain, sorted by id.
+fn chain_delegates(
+    walk: &Walk,
+    id: &str,
+    by_parent: &std::collections::HashMap<String, Vec<SessionRef>>,
+) -> Vec<SessionRef> {
+    let chain = if walk.has("parent_session_id") {
+        walk.lineage(id)
+    } else {
+        vec![id.to_string()]
+    };
+    let mut out: Vec<SessionRef> = chain
+        .iter()
+        .filter_map(|id| by_parent.get(id))
+        .flatten()
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// One walk over `sessions` per store state, serving discovery, the delegate forests and every
+/// session's certificate ([`walked`]). Each read the table whole (its overflow pages too: the
+/// system prompts of older schemas), three times per state, and a forest derivation probed the
+/// schema and walked each listed conversation's chain by query once more.
+pub(crate) struct Walk {
+    columns: HashSet<String>,
+    /// The rows in the listing order (`ORDER BY started_at DESC`), scanned in table order.
+    rows: Vec<WalkRow>,
+    /// Row positions by text id (`WHERE id = ?1`).
+    by_id: std::collections::HashMap<String, usize>,
+}
+
+/// One `sessions` row as its readers take it.
+struct WalkRow {
+    /// The listing's typed reads (`id` as text, then its columns), or the first one's error.
+    listed: std::result::Result<Listed, String>,
+    /// Text of a column, as a lone-column query reads it (`None` for NULL, absent or not text).
+    id: Option<String>,
+    title: Option<String>,
+    parent: Option<String>,
+    end_reason: Option<String>,
+    model_config: Option<String>,
+    /// [`rows_from`]: the digest of every column, and of `(id, model_config, started_at)`.
+    digest: u64,
+    child: u64,
+}
+
+struct Listed {
+    id: String,
+    title: Option<String>,
+    started: Option<f64>,
+    ended: Option<f64>,
+    cwd: Option<String>,
+    last: Option<f64>,
+    model_config: Option<String>,
+}
+
+/// A value as SQLite orders it: NULL, then numbers, then text, then blobs.
+#[derive(PartialEq, PartialOrd)]
+enum SqlOrder {
+    Null,
+    Number(f64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+impl Walk {
+    fn has(&self, column: &str) -> bool {
+        self.columns.contains(column)
+    }
+
+    fn row(&self, id: &str) -> Option<&WalkRow> {
+        self.by_id.get(id).map(|&i| &self.rows[i])
+    }
+
+    /// [`session_lineage_root_to_tip`] over the walked rows.
+    fn lineage(&self, session_id: &str) -> Vec<String> {
+        if session_id.is_empty() {
+            return vec![session_id.to_string()];
+        }
+        let (has_end_reason, has_model_config) = (self.has("end_reason"), self.has("model_config"));
+        let mut chain: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut current = session_id.to_string();
+        loop {
+            if current.is_empty() || seen.contains(&current) {
+                break;
+            }
+            seen.insert(current.clone());
+            chain.push(current.clone());
+            let row = self.row(&current);
+            if has_model_config && !lineage_markers(row.and_then(|r| r.model_config.as_deref())).is_empty() {
+                break;
+            }
+            let Some(parent) = row.and_then(|r| r.parent.clone()).filter(|p| !p.is_empty()) else {
+                break;
+            };
+            if has_end_reason
+                && !matches!(
+                    self.row(&parent).and_then(|r| r.end_reason.as_deref()),
+                    Some("compression") | Some("orphaned_compression")
+                )
+            {
+                break;
+            }
+            current = parent;
+        }
+        chain.reverse();
+        if chain.is_empty() {
+            vec![session_id.to_string()]
+        } else {
+            chain
+        }
+    }
+}
+
+/// The [`Walk`] of `conn`'s `sessions` table.
+fn walk_conn(conn: &Connection) -> Result<Walk> {
+    use super::store::sqlite::fold_value;
+    use crate::source::Rows;
+    let mut stmt = conn.prepare("SELECT * FROM sessions")?;
+    let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
+    let at = |name: &str| names.iter().position(|n| n == name);
+    let id_at = at("id").context("hermes sessions without id")?;
+    let (title_at, parent_at, end_at, config_at) = (
+        at("title"),
+        at("parent_session_id"),
+        at("end_reason"),
+        at("model_config"),
     );
+    let (started_at, ended_at, cwd_at, last_at) = (at("started_at"), at("ended_at"), at("cwd"), at("last_activity_at"));
+    let lone = |row: &rusqlite::Row<'_>, i: Option<usize>| -> Option<String> {
+        row.get::<_, Option<String>>(i?).ok().flatten()
+    };
+    let mut rows = Vec::new();
+    let mut keys = Vec::new();
+    let mut query = stmt.query([])?;
+    while let Some(row) = query.next()? {
+        let mut digest = Rows::SEED;
+        for i in 0..names.len() {
+            digest = fold_value(digest, row.get_ref(i)?);
+        }
+        let mut child = Rows::SEED;
+        for i in [Some(id_at), config_at, started_at].into_iter().flatten() {
+            child = fold_value(child, row.get_ref(i)?);
+        }
+        let typed = |i: Option<usize>| -> std::result::Result<Option<String>, String> {
+            i.map_or(Ok(None), |i| row.get::<_, Option<String>>(i).map_err(|e| e.to_string()))
+        };
+        let number = |i: Option<usize>| -> std::result::Result<Option<f64>, String> {
+            i.map_or(Ok(None), |i| row.get::<_, Option<f64>>(i).map_err(|e| e.to_string()))
+        };
+        let listed = (|| {
+            Ok(Listed {
+                id: row.get::<_, String>(id_at).map_err(|e| e.to_string())?,
+                title: typed(title_at)?,
+                started: number(started_at)?,
+                ended: number(ended_at)?,
+                cwd: typed(cwd_at)?,
+                last: number(last_at)?,
+                model_config: typed(config_at)?,
+            })
+        })();
+        let key = match started_at.map(|i| row.get_ref(i)).transpose()? {
+            None | Some(rusqlite::types::ValueRef::Null) => SqlOrder::Null,
+            Some(rusqlite::types::ValueRef::Integer(i)) => SqlOrder::Number(i as f64),
+            Some(rusqlite::types::ValueRef::Real(f)) => SqlOrder::Number(f),
+            Some(rusqlite::types::ValueRef::Text(t)) => SqlOrder::Text(t.to_vec()),
+            Some(rusqlite::types::ValueRef::Blob(b)) => SqlOrder::Blob(b.to_vec()),
+        };
+        keys.push(key);
+        rows.push(WalkRow {
+            listed,
+            id: lone(row, Some(id_at)),
+            title: lone(row, title_at),
+            parent: lone(row, parent_at),
+            end_reason: lone(row, end_at),
+            model_config: lone(row, config_at),
+            digest,
+            child,
+        });
+    }
+    // `ORDER BY started_at DESC`, ties in table order.
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&a, &b| keys[b].partial_cmp(&keys[a]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut slots: Vec<Option<WalkRow>> = rows.into_iter().map(Some).collect();
+    let rows: Vec<WalkRow> = order.into_iter().filter_map(|i| slots[i].take()).collect();
+    let mut by_id = std::collections::HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        if let Ok(listed) = &row.listed {
+            by_id.entry(listed.id.clone()).or_insert(i);
+        }
+    }
+    Ok(Walk {
+        columns: names.into_iter().collect(),
+        rows,
+        by_id,
+    })
+}
+
+/// The [`Walk`] of the store at `db`, once per store state (its database, WAL and journal
+/// identities) in this process. Memory: the walked rows' small columns, for the stores read.
+fn walked(conn: &Connection, db: &Path) -> Result<std::sync::Arc<Walk>> {
+    type State = Vec<Option<crate::source::FileId>>;
+    type Walks = std::sync::Mutex<std::collections::HashMap<PathBuf, (State, std::sync::Arc<Walk>)>>;
+    static WALKS: std::sync::LazyLock<Walks> = std::sync::LazyLock::new(Default::default);
+    let state = || -> State {
+        let mut files: Vec<PathBuf> = crate::source::sqlite_sidecars(db).into();
+        files.push(db.to_path_buf());
+        files.iter().map(|f| crate::source::FileId::at(f)).collect()
+    };
+    let key = std::path::absolute(db)?;
+    let before = state();
+    let lock = || WALKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, walk)) = lock().get(&key).filter(|(at, _)| *at == before) {
+        return Ok(walk.clone());
+    }
+    #[cfg(test)]
+    WALKED.with(|n| n.set(n.get() + 1));
+    let walk = std::sync::Arc::new(walk_conn(conn)?);
+    // Kept only when no write landed while it walked.
+    if state() == before {
+        lock().insert(key, (before, walk.clone()));
+    }
+    Ok(walk)
+}
+
+#[cfg(test)]
+thread_local! { static WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+/// Session refs in one db, each with the session its `_delegate_from` names: with `delegates`
+/// unset, every listed conversation (see [`discover_conn`]); with it set, only the delegate runs.
+fn refs_of(walk: &Walk, path: &Path, delegates: bool) -> Result<Vec<(Option<String>, SessionRef)>> {
+    // The listing selects these whatever the schema.
+    for column in ["started_at", "ended_at"] {
+        anyhow::ensure!(walk.has(column), "no such column: {column}");
+    }
+    let has_parent = walk.has("parent_session_id");
     // Compression ancestors: parents (ended in compression) that some session continues from.
-    let mut compression_parents: HashSet<String> = HashSet::new();
-    if has_parent && scols.contains("end_reason") {
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT DISTINCT p.id FROM sessions p JOIN sessions c ON c.parent_session_id = p.id \
-             WHERE p.end_reason IN ('compression', 'orphaned_compression')",
-        ) {
-            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-                compression_parents.extend(rows.flatten());
+    let mut compression_parents: HashSet<&str> = HashSet::new();
+    if has_parent && walk.has("end_reason") {
+        let continued: HashSet<&str> = walk.rows.iter().filter_map(|r| r.parent.as_deref()).collect();
+        for row in &walk.rows {
+            let Ok(listed) = &row.listed else { continue };
+            if matches!(
+                row.end_reason.as_deref(),
+                Some("compression") | Some("orphaned_compression")
+            ) && continued.contains(listed.id.as_str())
+            {
+                compression_parents.insert(listed.id.as_str());
             }
         }
     }
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| {
-        let id: String = row.get(0)?;
-        let title: Option<String> = row.get(1).ok().flatten();
-        let started: Option<f64> = row.get(2).ok().flatten();
-        let ended: Option<f64> = row.get(3).ok().flatten();
-        let cwd: Option<String> = row.get(4).ok().flatten();
-        let last: Option<f64> = row.get(5).ok().flatten();
-        let model_config: Option<String> = row.get(6).ok().flatten();
-        Ok((id, title, started, ended, cwd, last, model_config))
-    })?;
     let mut out = Vec::new();
-    for (id, title, started, ended, cwd, last, model_config) in rows.flatten() {
-        if compression_parents.contains(&id) {
+    for row in &walk.rows {
+        let listed = row.listed.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if compression_parents.contains(listed.id.as_str()) {
             continue;
         }
-        let delegate_from = lineage_markers(model_config.as_deref())
+        let delegate_from = lineage_markers(listed.model_config.as_deref())
             .get("_delegate_from")
             .map(|v| v.as_str().unwrap_or_default().to_string());
-        match (delegates_of, &delegate_from) {
-            (None, Some(_)) => continue,
-            (Some(set), Some(from)) if set.contains(from) => {}
-            (Some(_), _) => continue,
-            (None, None) => {}
+        if delegates != delegate_from.is_some() {
+            continue;
         }
-        let title = title.filter(|t| !t.is_empty()).or_else(|| {
+        let title = listed.title.clone().filter(|t| !t.is_empty()).or_else(|| {
             has_parent
-                .then(|| inherited_title(conn, &session_lineage_root_to_tip(conn, &id)))
+                .then(|| inherited_title(walk, &walk.lineage(&listed.id)))
                 .flatten()
         });
-        out.push(SessionRef {
-            id,
-            harness: Harness::Hermes,
-            path: path.to_path_buf(),
-            cwd: cwd.filter(|c| !c.is_empty()).map(PathBuf::from),
-            title: title.map(|t| crate::ir::truncate(&t, 80)),
-            created_at: started.and_then(ts_from_epoch),
-            updated_at: latest_of([ended, last, started]),
-            message_count: 0,
-        });
+        out.push((
+            delegate_from,
+            SessionRef {
+                cwd: listed.cwd.clone().filter(|c| !c.is_empty()).map(PathBuf::from),
+                title: title.map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE)),
+                created_at: listed.started.and_then(ts_from_epoch),
+                updated_at: latest_of([listed.ended, listed.last, listed.started]),
+                message_count: None,
+                ..SessionRef::new(listed.id.clone(), Harness::Hermes, path.to_path_buf())
+            },
+        ));
     }
-    // Native message_count counts active rows (including tools/notices, omitting compacted
-    // history). SessionRef counts canonical prompts/replies, including rotation ancestors.
-    // Reuse the display parser so generation/replay dedup and type classification cannot drift.
-    let options = if path.is_file() {
-        ParseOptions::lazy()
-    } else {
-        ParseOptions::bulk()
-    };
-    for reference in &mut out {
-        let mut count = TurnCount::default();
-        stream_conn_with_demand(
-            conn,
-            reference,
-            &options,
-            &mut count,
-            &crate::source::ReadSet::default(),
-            true,
-        )?;
-        reference.message_count = count.0;
-    }
+    // Counts stay unknown here; complete reads/indexing count canonical turns and certify them.
     Ok(out)
-}
-
-#[derive(Default)]
-struct TurnCount(usize);
-impl MessageSink for TurnCount {
-    fn message(&mut self, message: Message) -> Flow {
-        self.0 += usize::from(message.is_turn());
-        Flow::Continue
-    }
 }
 
 /// Hermes titles a compression chain `COALESCE(tip.title, root.title)` (`hermes_state_sessions.py:1137`):
@@ -457,7 +748,7 @@ impl MessageSink for TurnCount {
 /// state right after a rotation (a real 0.21.3 store: `publish_compression_child` leaves the child's
 /// `title` NULL). Given a root→tip `chain` (see [`session_lineage_root_to_tip`]), the nearest titled
 /// ancestor, root first; `None` for a chain of one.
-fn inherited_title(conn: &Connection, chain: &[String]) -> Option<String> {
+fn inherited_title_conn(conn: &Connection, chain: &[String]) -> Option<String> {
     let (_, ancestors) = chain.split_last()?;
     ancestors.iter().find_map(|id| {
         conn.query_row("SELECT title FROM sessions WHERE id = ?1", [id], |row| {
@@ -467,6 +758,14 @@ fn inherited_title(conn: &Connection, chain: &[String]) -> Option<String> {
         .flatten()
         .filter(|t| !t.is_empty())
     })
+}
+
+/// [`inherited_title_conn`] over the walked rows.
+fn inherited_title(walk: &Walk, chain: &[String]) -> Option<String> {
+    let (_, ancestors) = chain.split_last()?;
+    ancestors
+        .iter()
+        .find_map(|id| walk.row(id)?.title.clone().filter(|t| !t.is_empty()))
 }
 
 /// Per-session columns with no first-class IR home. Captured into
@@ -522,46 +821,54 @@ fn read_session_facts(
     id: &str,
     source: Option<&str>,
     end_reason: Option<&str>,
-    opts: &ParseOptions,
+    opts: &stream::Demand,
 ) -> Result<SessionFacts> {
     let mut meta = serde_json::Map::new();
-    let scols = columns(conn, "sessions");
-    if opts.wants_full_extra() {
+    let select = Select::of(conn, "sessions")
+        .present(SESSION_META_TEXT_COLS)
+        .present(SESSION_META_INT_COLS);
+    if opts.tier >= Tier::Rich {
         if let Some(s) = source.filter(|s| !s.is_empty()) {
             meta.insert("source".into(), Value::String(s.to_string()));
         }
         if let Some(e) = end_reason.filter(|s| !s.is_empty()) {
             meta.insert("end_reason".into(), Value::String(e.to_string()));
         }
-        for col in SESSION_META_TEXT_COLS {
-            if !scols.contains(*col) {
-                continue;
-            }
-            let v: Option<String> = conn
-                .query_row(&format!("SELECT {col} FROM sessions WHERE id = ?1"), [id], |row| {
-                    row.get::<_, Option<String>>(0)
-                })
-                .ok()
-                .flatten();
-            if let Some(v) = v.filter(|s| !s.is_empty()) {
-                meta.insert((*col).into(), Value::String(v));
+        // One row read for every column the bag carries; a value of another type reads as absent.
+        let mut text: Vec<(&str, Option<String>)> = Vec::new();
+        let mut ints: Vec<(&str, Option<i64>)> = Vec::new();
+        if !select.list().is_empty() {
+            let row = conn.query_row(
+                &format!("SELECT {} FROM sessions WHERE id = ?1", select.list()),
+                [id],
+                |row| {
+                    let at = |c: &str| select.at(c);
+                    text = SESSION_META_TEXT_COLS
+                        .iter()
+                        .filter_map(|c| at(c).map(|i| (*c, row.get::<_, Option<String>>(i).ok().flatten())))
+                        .collect();
+                    ints = SESSION_META_INT_COLS
+                        .iter()
+                        .filter_map(|c| at(c).map(|i| (*c, row.get::<_, Option<i64>>(i).ok().flatten())))
+                        .collect();
+                    Ok(())
+                },
+            );
+            if row.is_err() {
+                (text, ints) = (Vec::new(), Vec::new());
             }
         }
-        for col in SESSION_META_INT_COLS {
-            if !scols.contains(*col) {
-                continue;
+        for (col, v) in text {
+            if let Some(v) = v.filter(|s| !s.is_empty()) {
+                meta.insert(col.into(), Value::String(v));
             }
-            let v: Option<i64> = conn
-                .query_row(&format!("SELECT {col} FROM sessions WHERE id = ?1"), [id], |row| {
-                    row.get::<_, Option<i64>>(0)
-                })
-                .ok()
-                .flatten();
+        }
+        for (col, v) in ints {
             // Only carry non-zero aggregates: a freshly-emitted DB leaves these at their DEFAULT 0, so
             // storing 0 would make the round-trip "lose" a value that was never meaningfully set. emit
             // writes back exactly the keys present here, so omitting 0 keeps emit→parse symmetric.
             if let Some(v) = v.filter(|n| *n != 0) {
-                meta.insert((*col).into(), Value::Number(v.into()));
+                meta.insert(col.into(), Value::Number(v.into()));
             }
         }
     }
@@ -576,13 +883,13 @@ fn read_session_facts(
             .filter(|s| !s.is_empty())
     };
     let mut system_prompt = None;
-    if scols.contains("system_prompt_hash") && table_exists(conn, "system_prompts") {
+    if select.has("system_prompt_hash") && table_exists(conn, "system_prompts") {
         system_prompt = str_col(
             "SELECT sp.prompt FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash \
              WHERE s.id = ?1",
         );
     }
-    if system_prompt.is_none() && scols.contains("system_prompt") {
+    if system_prompt.is_none() && select.has("system_prompt") {
         system_prompt = str_col("SELECT system_prompt FROM sessions WHERE id = ?1");
     }
     let mut bag = serde_json::Map::new();
@@ -591,20 +898,22 @@ fn read_session_facts(
     // very transcript cv also parses natively. Surface it in the bag (full demand) so consumers can
     // dedupe; the messages themselves carry `Origin::Import` on every demand.
     let mut imported_from = None;
-    if scols.contains("origin_json") {
+    if select.has("origin_json") {
         let cells = Cells::new(conn, path, reads, "sessions")?;
-        let sql = format!("SELECT {} FROM sessions WHERE id = ?1", cells.select("origin_json"));
+        let origin = Select::of(conn, "sessions").cell(&cells, "origin_json");
+        let at = origin.index("origin_json")?;
+        let sql = format!("SELECT {} FROM sessions WHERE id = ?1", origin.list());
         let mut statement = conn.prepare(&sql)?;
         let mut rows = statement.query([id])?;
         if let Some(cell) = rows
             .next()?
-            .map(|row| cells.cell(conn, "sessions", "origin_json", row, 0))
+            .map(|row| cells.cell(conn, "sessions", "origin_json", row, at))
             .transpose()?
             .flatten()
         {
             imported_from = cells
                 .read(cell, |view| match view.get("imported_from")? {
-                    Some(from) if from.is_object()? => Ok(Some(if opts.wants_full_extra() {
+                    Some(from) if from.is_object()? => Ok(Some(if opts.tier >= Tier::Rich {
                         from.resolve()?.into_owned()
                     } else {
                         Value::Null
@@ -615,7 +924,7 @@ fn read_session_facts(
         }
     }
     let imported = imported_from.is_some();
-    let imported_from = imported_from.filter(|_| opts.wants_full_extra());
+    let imported_from = imported_from.filter(|_| opts.tier >= Tier::Rich);
     if let Some(imported_from) = imported_from {
         bag.insert("imported_from".into(), imported_from);
     }
@@ -631,99 +940,225 @@ fn read_session_facts(
 
 /// The compression continuation of `id`, if any: the child whose `parent_session_id` is `id` and
 /// that carries no branch / reset / delegate marker (`_COMPRESSION_CHILD_SQL`). Only meaningful for
-/// a session that ended in compression; `None` when the store does not say.
-fn compression_child(conn: &Connection, id: &str) -> Option<String> {
-    let scols = columns(conn, "sessions");
-    if !scols.contains("parent_session_id") {
-        return None;
+/// a session that ended in compression; `None` when the store does not say, an error when it
+/// cannot be asked. A child whose id is not text is no session cv can name.
+/// Every session's [`Rows`](crate::source::Rows) certificate: what a read of it consults besides
+/// message bodies. The message rows of its compression chain (count, highest id and, from schema
+/// v11 on, the `active` flags: a rewind or an in-place compaction flips them), each chain
+/// session's whole `sessions` row (title, prompt hash, lineage, counters), the end reason of the
+/// parent that stopped the walk, the `(id, model_config, started_at)` of its children (the
+/// compression continuation), and its `state_meta` rows. The aggregates come from the
+/// `messages(session_id, …)` indexes; no `content` is read.
+#[cfg(test)]
+fn rows_conn(conn: &Connection) -> Result<std::collections::HashMap<String, crate::source::Rows>> {
+    rows_from(conn, &walk_conn(conn)?)
+}
+
+/// [`rows_conn`] with the `sessions` table already walked.
+fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap<String, crate::source::Rows>> {
+    use super::store::sqlite::fold_value;
+    use crate::source::Rows;
+    use std::collections::HashMap;
+    struct Meta {
+        row: u64,
+        parent: Option<String>,
+        end_reason: Option<String>,
+        marked: bool,
+        child: u64,
     }
-    let model_config = if scols.contains("model_config") {
-        "model_config"
-    } else {
-        "NULL"
-    };
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT id, {model_config} FROM sessions WHERE parent_session_id = ?1 ORDER BY started_at ASC"
-        ))
-        .ok()?;
-    let rows = stmt
-        .query_map([id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1).ok().flatten()))
+    let columns = &walk.columns;
+    let mut sessions: HashMap<String, Meta> = HashMap::new();
+    let mut children: HashMap<String, u64> = HashMap::new();
+    let text = |value: &Option<String>| value.clone().filter(|s| !s.is_empty());
+    for row in &walk.rows {
+        let Some(id) = text(&row.id) else { continue };
+        sessions.insert(
+            id,
+            Meta {
+                row: row.digest,
+                parent: text(&row.parent),
+                end_reason: text(&row.end_reason),
+                marked: !lineage_markers(text(&row.model_config).as_deref()).is_empty(),
+                child: row.child,
+            },
+        );
+    }
+    let mut by_parent: Vec<(&str, &str, u64)> = sessions
+        .iter()
+        .filter_map(|(id, meta)| Some((meta.parent.as_deref()?, id.as_str(), meta.child)))
+        .collect();
+    by_parent.sort_unstable();
+    for (parent, _, child) in by_parent {
+        let digest = children.entry(parent.to_owned()).or_insert(Rows::SEED);
+        *digest = Rows::fold(*digest, &child.to_le_bytes());
+    }
+    let flags = super::store::sqlite::columns(conn, "messages").contains("active");
+    let mut messages: HashMap<String, (u64, i64, i64)> = HashMap::new();
+    {
+        let sql = if flags {
+            "SELECT session_id, count(*), max(id), total(active) FROM messages GROUP BY session_id"
+        } else {
+            "SELECT session_id, count(*), max(id), 0 FROM messages GROUP BY session_id"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let Some(id) = row.get::<_, Option<String>>(0)? else {
+                continue;
+            };
+            let active: f64 = row.get(3)?;
+            messages.insert(
+                id,
+                (
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    active as i64,
+                ),
+            );
+        }
+    }
+    let mut meta_rows: HashMap<String, u64> = HashMap::new();
+    if table_exists(conn, "state_meta") {
+        let mut stmt = conn.prepare("SELECT key, value FROM state_meta ORDER BY key")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let Some(key) = row.get::<_, Option<String>>(0).ok().flatten() else {
+                continue;
+            };
+            let Some((_, id)) = key.split_once(':') else { continue };
+            let digest = meta_rows.entry(id.to_owned()).or_insert(Rows::SEED);
+            *digest = fold_value(fold_value(*digest, row.get_ref(0)?), row.get_ref(1)?);
+        }
+    }
+    let compressed = |id: &str| {
+        sessions.get(id).is_some_and(|m| {
+            matches!(
+                m.end_reason.as_deref(),
+                Some("compression") | Some("orphaned_compression")
+            )
         })
-        .ok()?;
-    // Not a tail expression: `rows` borrows `stmt`, which must drop before the return.
-    #[allow(clippy::let_and_return)]
-    let found = rows
-        .flatten()
-        .find(|(_, mc)| lineage_markers(mc.as_deref()).is_empty())
-        .map(|(child, _)| child);
-    found
+    };
+    let has_end = columns.contains("end_reason");
+    let mut out = HashMap::with_capacity(sessions.len());
+    for id in sessions.keys() {
+        let (mut count, mut high, mut digest) = (0u64, 0i64, Rows::SEED);
+        let mut seen = HashSet::new();
+        let mut current = id.as_str();
+        // The walk [`session_lineage_root_to_tip`] makes, over the rows just read.
+        loop {
+            if !seen.insert(current) {
+                break;
+            }
+            let Some(meta) = sessions.get(current) else { break };
+            let (n, max, active) = messages.get(current).copied().unwrap_or_default();
+            count += n;
+            high = high.max(max);
+            for part in [meta.row, n, max as u64, active as u64] {
+                digest = Rows::fold(digest, &part.to_le_bytes());
+            }
+            if meta.marked {
+                break;
+            }
+            let Some(parent) = meta.parent.as_deref() else { break };
+            digest = Rows::fold(digest, parent.as_bytes());
+            if let Some(end) = sessions.get(parent).and_then(|p| p.end_reason.as_deref()) {
+                digest = Rows::fold(digest, end.as_bytes());
+            }
+            if has_end && !compressed(parent) {
+                break;
+            }
+            current = parent;
+        }
+        for part in [children.get(id), meta_rows.get(id)] {
+            digest = Rows::fold(digest, &part.copied().unwrap_or(0).to_le_bytes());
+        }
+        out.insert(id.clone(), Rows { count, high, digest });
+    }
+    Ok(out)
+}
+
+fn compression_child(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let select = Select::of(conn, "sessions").always(&["id"]).probed(&["model_config"]);
+    if !select.has("parent_session_id") {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM sessions WHERE parent_session_id = ?1 ORDER BY started_at ASC",
+        select.list()
+    ))?;
+    let mut rows = stmt.query([id])?;
+    while let Some(row) = rows.next()? {
+        let Ok(child) = row.get::<_, String>(0) else { continue };
+        let model_config = row.get::<_, Option<String>>(1).ok().flatten();
+        if lineage_markers(model_config.as_deref()).is_empty() {
+            return Ok(Some(child));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
-fn stream_conn(conn: &Connection, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+fn stream_conn(
+    conn: &Connection,
+    r: &SessionRef,
+    opts: &stream::Demand,
+    sink: &mut dyn MessageSink,
+) -> Result<Session> {
     stream_conn_with_reads(conn, r, opts, sink, &crate::source::ReadSet::default())
 }
 
 fn stream_conn_with_reads(
     conn: &Connection,
     r: &SessionRef,
-    opts: &ParseOptions,
+    opts: &stream::Demand,
     sink: &mut dyn MessageSink,
     reads: &crate::source::ReadSet,
-) -> Result<Session> {
-    stream_conn_with_demand(conn, r, opts, sink, reads, false)
-}
-
-fn stream_conn_with_demand(
-    conn: &Connection,
-    r: &SessionRef,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    reads: &crate::source::ReadSet,
-    count_only: bool,
 ) -> Result<Session> {
     // session-level metadata (guard optional columns for historical schemas).
-    let scols = columns(conn, "sessions");
-    let expr = |col: &str| {
-        if scols.contains(col) && (!count_only || matches!(col, "parent_session_id" | "end_reason" | "model_config")) {
-            col.to_string()
-        } else {
-            "NULL".to_string()
-        }
-    };
-    let has_parent = scols.contains("parent_session_id");
-    let meta_sql = format!(
-        "SELECT {model}, started_at, ended_at, {title}, {source}, {parent}, {end_reason}, {cwd}, \
-         {git_branch}, {last}, {model_config} FROM sessions WHERE id = ?1",
-        model = expr("model"),
-        title = expr("title"),
-        source = expr("source"),
-        parent = expr("parent_session_id"),
-        end_reason = expr("end_reason"),
-        cwd = expr("cwd"),
-        git_branch = expr("git_branch"),
-        last = expr("last_activity_at"),
-        model_config = expr("model_config"),
-    );
-    let (model, started, ended, title, source, parent, end_reason, cwd, git_branch, last_activity, model_config): SessionMetaRow =
-        conn.query_row(&meta_sql, [&r.id], |row| {
-            Ok((
-                row.get(0).ok().flatten(),
-                row.get(1).ok().flatten(),
-                row.get(2).ok().flatten(),
-                row.get(3).ok().flatten(),
-                row.get(4).ok().flatten(),
-                row.get(5).ok().flatten(),
-                row.get(6).ok().flatten(),
-                row.get(7).ok().flatten(),
-                row.get(8).ok().flatten(),
-                row.get(9).ok().flatten(),
-                row.get(10).ok().flatten(),
-            ))
+    let select = Select::of(conn, "sessions")
+        .probed(&["model"])
+        .always(&["started_at", "ended_at"])
+        .probed(&[
+            "title",
+            "source",
+            "parent_session_id",
+            "end_reason",
+            "cwd",
+            "git_branch",
+            "last_activity_at",
+            "model_config",
+        ]);
+    let has_parent = select.has("parent_session_id");
+    let meta_sql = format!("SELECT {} FROM sessions WHERE id = ?1", select.list());
+    let SessionMetaRow {
+        model,
+        started,
+        ended,
+        title,
+        source,
+        parent,
+        end_reason,
+        cwd,
+        git_branch,
+        last_activity,
+        model_config,
+    } = conn
+        .query_row(&meta_sql, [&r.id], |row| {
+            Ok(SessionMetaRow {
+                model: row.get(0)?,
+                started: row.get(1)?,
+                ended: row.get(2)?,
+                title: row.get(3)?,
+                source: row.get(4)?,
+                parent: row.get(5)?,
+                end_reason: row.get(6)?,
+                cwd: row.get(7)?,
+                git_branch: row.get(8)?,
+                last_activity: row.get(9)?,
+                model_config: row.get(10)?,
+            })
         })
-        .unwrap_or((None, None, None, r.title.clone(), None, None, None, None, None, None, None));
+        .with_context(|| format!("hermes session {:?}", r.id))?;
 
     // Format-complete: capture the session columns that have no first-class IR home, so emit can
     // write them back (small metadata only — text/aggregate counters, never message bodies). The tip
@@ -732,31 +1167,21 @@ fn stream_conn_with_demand(
         bag: mut hermes_bag,
         system_prompt,
         imported,
-    } = if count_only {
-        // Turn classification/replay do not inspect imported origin or system-prompt/header
-        // payloads. Listing already owns its title/cwd; avoid reading these fields again here.
-        SessionFacts {
-            bag: Default::default(),
-            system_prompt: None,
-            imported: false,
-        }
-    } else {
-        read_session_facts(
-            conn,
-            (&r.path, reads),
-            &r.id,
-            source.as_deref(),
-            end_reason.as_deref(),
-            opts,
-        )?
-    };
+    } = read_session_facts(
+        conn,
+        (&r.path, reads),
+        &r.id,
+        source.as_deref(),
+        end_reason.as_deref(),
+        opts,
+    )?;
     // A foreign import: every message of the session came through the importer.
     let session_origin = imported.then_some(Origin::Import);
 
     // Walk the compression lineage root→tip so a compressed-and-continued conversation reads as a
     // single transcript (mirrors `_resume_lineage_ids`); branches/resets/delegates stand alone.
     let chain = if has_parent {
-        session_lineage_root_to_tip(conn, &r.id)
+        session_lineage_root_to_tip(conn, &r.id, &select)
     } else {
         vec![r.id.clone()]
     };
@@ -779,12 +1204,12 @@ fn stream_conn_with_demand(
         end_reason.as_deref(),
         Some("compression") | Some("orphaned_compression")
     ) {
-        lineage.continued_in = compression_child(conn, &r.id);
+        lineage.continued_in = compression_child(conn, &r.id)?;
     }
-    if let Some(reset) = marker("_reset_from").filter(|_| opts.wants_full_extra()) {
+    if let Some(reset) = marker("_reset_from").filter(|_| opts.tier >= Tier::Rich) {
         hermes_bag.insert("_reset_from".into(), Value::String(reset));
     }
-    if opts.wants_full_extra() && chain.len() == 1 && markers.is_empty() {
+    if opts.tier >= Tier::Rich && chain.len() == 1 && markers.is_empty() {
         if let Some(p) = parent.filter(|p| !p.is_empty()) {
             hermes_bag.insert("parent_session_id".into(), Value::String(p));
         }
@@ -795,9 +1220,6 @@ fn stream_conn_with_demand(
     }
 
     let s = Session {
-        source_stamp: None,
-        id: r.id.clone(),
-        harness: Harness::Hermes,
         cwd: cwd
             .filter(|c| !c.is_empty())
             .map(PathBuf::from)
@@ -805,7 +1227,7 @@ fn stream_conn_with_demand(
         title: title
             .filter(|t| !t.is_empty())
             .or_else(|| r.title.clone())
-            .or_else(|| inherited_title(conn, &chain)),
+            .or_else(|| inherited_title_conn(conn, &chain)),
         created_at: started.and_then(ts_from_epoch).or(r.created_at),
         updated_at: latest_of([ended, last_activity, started]).or(r.updated_at),
         model,
@@ -813,16 +1235,12 @@ fn stream_conn_with_demand(
             branch: Some(branch),
             ..Default::default()
         }),
-        messages: Vec::new(),
         source_path: Some(r.path.clone()),
-        principal: None,
         extra,
         system_prompt,
         lineage,
+        ..Session::new(r.id.clone(), Harness::Hermes)
     };
-
-    let cols = columns(conn, "messages");
-    let has = |c: &str| cols.contains(c);
 
     // Build the SELECT defensively: required cols always present; optional cols gated by probe.
     // Plain columns are selected by name; every JSON column (and `content`) as a cell, which the
@@ -831,34 +1249,34 @@ fn stream_conn_with_demand(
     // incremental, the cell itself otherwise).
     let cells = Cells::new(conn, &r.path, reads, "messages")?;
     let incremental = super::store::sqlite::incremental_utf8_table(conn, "messages");
-    let mut names: Vec<String> = ["id", "role", "tool_call_id", "tool_calls", "tool_name", "timestamp"]
-        .map(String::from)
-        .to_vec();
-    names.extend(
-        OPTIONAL_MSG_COLS
-            .iter()
-            .filter(|c| has(c) && !CELL_COLS.contains(c))
-            .map(|c| c.to_string()),
-    );
-    let mut select_list = names.clone();
-    select_list.push(cells.select("content"));
-    names.extend(if incremental {
-        ["_content_rowid".to_string(), "content".to_string()]
-    } else {
-        ["content".to_string(), "content#type".to_string()]
-    });
+    let plain: Vec<&str> = OPTIONAL_MSG_COLS
+        .iter()
+        .copied()
+        .filter(|c| !CELL_COLS.contains(c))
+        .collect();
+    let mut select = Select::of(conn, "messages")
+        .always(&["id", "role", "tool_call_id", "tool_calls", "tool_name", "timestamp"])
+        .present(&plain)
+        .cell_named(
+            &cells,
+            "content",
+            if incremental {
+                ["_content_rowid".to_string(), "content".to_string()]
+            } else {
+                ["content".to_string(), "content#type".to_string()]
+            },
+        );
     for column in CELL_COLS {
-        select_list.push(cells.select(if has(column) { column } else { "NULL" }));
-        names.extend([format!("{column}#"), format!("{column}#type")]);
+        select = select.cell_named(&cells, column, [format!("{column}#"), format!("{column}#type")]);
     }
-    let select_list = select_list.join(", ");
-    let idx = |name: &str| names.iter().position(|c| c == name);
+    let select_list = select.list();
+    let idx = |name: &str| select.at(name);
 
     // Row visibility (schema v12+): Hermes's display projection is `(active = 1 OR compacted = 1)`
     // — live rows plus the history a compaction summarized away — which drops rewound rows and the
     // superseded originals of carried tails. `complete` reads every row instead and tags the flags.
-    let has_flags = has("active") && has("compacted");
-    let visibility = if has_flags && !opts.complete {
+    let has_flags = select.has("active") && select.has("compacted");
+    let visibility = if has_flags && opts.tier != Tier::Complete {
         " AND (active = 1 OR compacted = 1)"
     } else {
         ""
@@ -866,7 +1284,7 @@ fn stream_conn_with_demand(
     // Display-generation dedup (`_dedupe_display_generations`): a compaction copies the protected
     // tail into each generation — same role/content/timestamp/tool fields, different id/flags — so
     // each logical message is emitted once (its first row; the copies are byte-identical).
-    let dedup_generations = has("compacted") && !opts.complete;
+    let dedup_generations = select.has("compacted") && opts.tier != Tier::Complete;
     let mut generations = GenerationDedup::default();
 
     // Hand the session-level metadata to the sink before the body (header-rendering sinks use it).
@@ -876,11 +1294,7 @@ fn stream_conn_with_demand(
     // look-back (the trailing run of user single-texts since the last substantive assistant turn),
     // not the whole transcript, so peak stays O(one message).
     let mut dedup = ReplayDedup::default();
-    let demand = Demand {
-        opts,
-        count_only,
-        incremental,
-    };
+    let demand = Demand::of(opts, incremental);
     'lineage: for sid in &chain {
         // `ORDER BY id`, as Hermes itself reads (`_ACTIVE_IDS_SQL`, `_fetch_conversation_rows`):
         // timestamps are not monotonic and would split a tool call from its result.
@@ -894,32 +1308,25 @@ fn stream_conn_with_demand(
                 continue;
             }
             let row = read_row(conn, &cells, row, &idx, &demand)?;
-            let row_id = row.id;
-            let Some(mut m) = row.into_message(session_origin, opts) else {
+            let Some(m) = row.into_message(session_origin, demand.tier) else {
                 continue;
             };
-            // A compaction summary row: emit the boundary marker first, then the summary linked to
-            // it by `parent_id` — the `CompactionBoundary` + `CompactionSummary` pair
-            // `crate::compaction` detects for every harness.
+            // A compaction summary row: Hermes keeps no row for the compaction itself, so cv
+            // synthesizes the boundary before it (no content, no id); `crate::compaction` pairs the
+            // two by adjacency.
             if m.kind == MessageKind::CompactionSummary {
-                let boundary_id = format!("compact-{row_id}");
-                let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, m.origin);
-                boundary.id = Some(boundary_id.clone());
+                let mut boundary = Message::synthesized(MessageKind::CompactionBoundary, m.origin);
                 boundary.timestamp = m.timestamp;
-                boundary.content.push(Block::Text {
-                    text: "[conversation compacted]".to_string().into(),
-                });
                 if sink.message(boundary) == Flow::Stop {
                     break 'lineage;
                 }
-                m.parent_id = Some(boundary_id);
                 if sink.message(m) == Flow::Stop {
                     break 'lineage;
                 }
                 continue;
             }
             // Dedup the replayed first user message at compression boundaries (`complete` keeps it).
-            if !opts.complete && !dedup.admit(&m)? {
+            if opts.tier != Tier::Complete && !dedup.admit(&m)? {
                 continue;
             }
             if sink.message(m) == Flow::Stop {
@@ -930,14 +1337,15 @@ fn stream_conn_with_demand(
     #[cfg(test)]
     ARENA_WRITE_OBSERVER.with(|observer| -> Result<()> {
         if let Some(bytes) = observer.borrow_mut().as_mut() {
-            bytes.push(cells.out().1.len()?);
+            bytes.push(cells.out().1.byte_len()?);
         }
         Ok(())
     })?;
     Ok(s)
 }
 
-/// Streaming equivalent of [`is_duplicate_replayed_user_message`]: tracks only the trailing run of
+/// Streams the replayed-user-message dedup Hermes's reader does whole-Vec
+/// (`SessionDB._is_duplicate_replayed_user_message`): tracks only the trailing run of
 /// user single-texts since the last substantive assistant turn (the exact look-back window the
 /// whole-Vec scan uses), so the streaming path stays byte-identical without retaining the session.
 #[derive(Default)]
@@ -962,28 +1370,15 @@ impl ReplayDedup {
         Ok(true)
     }
 
-    /// Fold an *emitted* message into the look-back state.
+    /// Fold an *emitted* message that `admit` did not take as a new trailing prompt into the
+    /// look-back state: a substantive assistant turn (text or tool call) ends the window.
     fn observe(&mut self, m: &Message) -> Result<()> {
-        match m.role {
-            Role::User => {
-                if let Some(text) = single_text(m) {
-                    if !text.is_empty() {
-                        self.recent_user_texts
-                            .insert_source(text, &crate::lazy::Resolver::new(None))?;
-                    }
-                }
-            }
-            Role::Assistant => {
-                // A substantive assistant turn (text or tool call) ends the look-back window.
-                let has_content = m
-                    .content
-                    .iter()
-                    .any(|b| matches!(b, Block::Text { .. } | Block::ToolUse { .. }));
-                if has_content {
-                    self.recent_user_texts.clear();
-                }
-            }
-            _ => {}
+        if m.role == Role::Assistant
+            && m.content
+                .iter()
+                .any(|b| matches!(b, Block::Text { .. } | Block::ToolUse { .. }))
+        {
+            self.recent_user_texts.clear();
         }
         Ok(())
     }
@@ -994,14 +1389,14 @@ impl ReplayDedup {
 /// `_session_lineage_root_to_tip`, `_COMPRESSION_CHILD_SQL`). A `/branch` copy (`_branched_from`)
 /// owns a copied transcript and stands alone; reset (`_reset_from`) and delegate (`_delegate_from`)
 /// children are separate conversations that only record their lineage; a parent that ended for any
-/// reason other than compression is not a continuation either. Bounded + cycle-guarded.
-fn session_lineage_root_to_tip(conn: &Connection, session_id: &str) -> Vec<String> {
+/// reason other than compression is not a continuation either. Bounded + cycle-guarded. `probe` is
+/// the caller's `sessions` schema probe (column presence only; the caller reuses its own).
+fn session_lineage_root_to_tip(conn: &Connection, session_id: &str, probe: &Select) -> Vec<String> {
     if session_id.is_empty() {
         return vec![session_id.to_string()];
     }
-    let scols = columns(conn, "sessions");
-    let has_end_reason = scols.contains("end_reason");
-    let has_model_config = scols.contains("model_config");
+    let has_end_reason = probe.has("end_reason");
+    let has_model_config = probe.has("model_config");
     let str_col = |col: &str, id: &str| -> Option<String> {
         conn.query_row(&format!("SELECT {col} FROM sessions WHERE id = ?1"), [id], |row| {
             row.get::<_, Option<String>>(0)
@@ -1044,10 +1439,6 @@ fn session_lineage_root_to_tip(conn: &Connection, session_id: &str) -> Vec<Strin
     }
 }
 
-/// Mirrors `SessionDB._is_duplicate_replayed_user_message`: a compression continuation re-injects
-/// the boundary's last user message as its first message; suppress that duplicate when merging.
-/// The streaming equivalent is [`ReplayDedup`] (a bounded look-back over the trailing user run).
-///
 /// Plain text of a message iff it is exactly one Text block (the shape Hermes replays as a string).
 fn single_text(m: &Message) -> Option<&crate::Text> {
     match m.content.as_slice() {
@@ -1061,6 +1452,37 @@ fn borrowed_text<'a>(row: &'a rusqlite::Row<'_>, index: Option<usize>) -> Option
     match row.get_ref(index?).ok()? {
         rusqlite::types::ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
         _ => None,
+    }
+}
+
+/// Explicit FNV-1a framing: optional fields have a presence byte, strings end in 0xff
+/// (not a UTF-8 byte), and numbers use little endian. No std::Hash layout is persisted.
+#[derive(Clone)]
+struct GenerationHash(u64);
+impl GenerationHash {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    fn text(&mut self, text: Option<&str>) {
+        self.write(&[u8::from(text.is_some())]);
+        if let Some(text) = text {
+            self.write(text.as_bytes());
+            self.write(&[0xff]);
+        }
+    }
+    fn number(&mut self, value: Option<u64>) {
+        self.write(&[u8::from(value.is_some())]);
+        if let Some(value) = value {
+            self.write(&value.to_le_bytes());
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0
     }
 }
 
@@ -1087,20 +1509,13 @@ fn generation_identity(
     conn: &Connection,
     incremental_content: bool,
 ) -> Result<GenerationIdentity> {
-    use std::hash::{Hash, Hasher};
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    borrowed_text(row, index("role")).unwrap_or_default().hash(&mut hash);
+    let mut hash = GenerationHash::new();
+    hash.text(Some(borrowed_text(row, index("role")).unwrap_or_default()));
     let content_present;
     if incremental_content {
         let mut content_hash = hash.clone();
         let present = if borrowed_text(row, index("content")).is_some_and(|kind| kind == "text") {
-            // Use Option's own prefix, followed by str's bytes and terminator. This preserves
-            // the pinned DefaultHasher's borrowed-String identity without owning the body.
-            struct StringPrefix;
-            impl Hash for StringPrefix {
-                fn hash<H: Hasher>(&self, _: &mut H) {}
-            }
-            Some(StringPrefix).hash(&mut content_hash);
+            content_hash.write(&[1]);
             super::store::sqlite::with_cell_reader(
                 conn,
                 "messages",
@@ -1118,22 +1533,23 @@ fn generation_identity(
         };
         content_present = present;
         if present {
-            content_hash.write_u8(0xff);
+            content_hash.write(&[0xff]);
             hash = content_hash;
         } else {
-            None::<&str>.hash(&mut hash);
+            hash.text(None);
         }
     } else {
         let content = borrowed_text(row, index("content"));
         content_present = content.is_some();
-        content.hash(&mut hash);
+        hash.text(content);
     }
-    index("timestamp")
-        .and_then(|i| row.get::<_, Option<f64>>(i).ok().flatten())
-        .map(f64::to_bits)
-        .hash(&mut hash);
+    hash.number(
+        index("timestamp")
+            .and_then(|i| row.get::<_, Option<f64>>(i).ok().flatten())
+            .map(f64::to_bits),
+    );
     for key in ["tool_call_id", "tool_calls", "tool_name"] {
-        borrowed_text(row, index(key)).hash(&mut hash);
+        hash.text(borrowed_text(row, index(key)));
     }
     Ok(GenerationIdentity {
         hash: hash.finish(),
@@ -1143,14 +1559,9 @@ fn generation_identity(
 
 #[derive(Default)]
 struct GenerationDedup {
-    headers: std::collections::HashMap<u64, GenerationGroup>,
+    index: Option<super::store::sqlite::Selection>,
     #[cfg(test)]
     forced_hash: Option<u64>,
-}
-#[derive(Default)]
-struct GenerationGroup {
-    pending: Option<i64>,
-    bodies: std::collections::HashMap<u64, Vec<(i64, GenerationIdentity)>>,
 }
 impl GenerationDedup {
     fn fingerprint(&self, hash: u64) -> u64 {
@@ -1167,23 +1578,41 @@ impl GenerationDedup {
         conn: &Connection,
         incremental: bool,
     ) -> Result<bool> {
-        use std::hash::{Hash, Hasher};
-        let mut header = std::collections::hash_map::DefaultHasher::new();
-        borrowed_text(row, index("role")).unwrap_or_default().hash(&mut header);
+        let mut header = GenerationHash::new();
+        header.text(Some(borrowed_text(row, index("role")).unwrap_or_default()));
         for column in ["tool_call_id", "tool_calls", "tool_name"] {
-            borrowed_text(row, index(column)).hash(&mut header);
+            header.text(borrowed_text(row, index(column)));
         }
-        index("timestamp")
-            .and_then(|i| row.get::<_, Option<f64>>(i).ok().flatten())
-            .map(f64::to_bits)
-            .hash(&mut header);
+        header.number(
+            index("timestamp")
+                .and_then(|i| row.get::<_, Option<f64>>(i).ok().flatten())
+                .map(f64::to_bits),
+        );
         let id: i64 = row.get(index(if incremental { "_content_rowid" } else { "id" }).unwrap())?;
         let fingerprint = self.fingerprint(header.finish());
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.headers.entry(fingerprint) {
-            entry.insert(GenerationGroup {
-                pending: Some(id),
-                ..Default::default()
-            });
+        if self.index.is_none() {
+            self.index = Some(super::store::sqlite::Selection::build(
+                "CREATE TABLE generations(ordinal INTEGER PRIMARY KEY,header BLOB,body BLOB,native_id INTEGER,content INTEGER); CREATE INDEX generation_membership ON generations(header,body);",
+                |_| Ok(()),
+            )?);
+        }
+        let selection = self.index.as_ref().unwrap();
+        let header = fingerprint.to_le_bytes();
+        use rusqlite::OptionalExtension as _;
+        let first = selection.with(|private| {
+            let exists: bool = private
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM generations WHERE header=?1)")?
+                .query_row([&header], |row| row.get(0))?;
+            if !exists {
+                // Unique headers do not demand their bodies. Resolve the pending member only
+                // when another row shares its header, under the same native snapshot.
+                private
+                    .prepare_cached("INSERT INTO generations(header,native_id) VALUES (?1,?2)")?
+                    .execute(rusqlite::params![header, id])?;
+            }
+            Ok(!exists)
+        })?;
+        if first {
             return Ok(true);
         }
         let mut current = generation_identity(row, index, conn, incremental)?;
@@ -1207,43 +1636,63 @@ impl GenerationDedup {
         };
         #[cfg(test)]
         let forced = self.forced_hash;
-        let group = self.headers.get_mut(&fingerprint).unwrap();
         let mut statement = conn.prepare_cached(sql)?;
-        if let Some(prior) = group.pending {
-            let key = statement.query_row([prior], |prior_row| {
-                generation_identity(prior_row, &prior_index, conn, incremental)
-                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))
-            })?;
-            #[cfg(test)]
-            let key = GenerationIdentity {
-                hash: forced.unwrap_or(key.hash),
-                ..key
-            };
-            group.bodies.entry(key.hash).or_default().push((prior, key));
-            group.pending = None;
-        }
-        // Distinct body digests under a repeated header remain an indexed lookup, rather than
-        // scanning every earlier row sharing a timestamp. Only real digest collisions compare.
-        let candidates = group.bodies.entry(current.hash).or_default();
-        for (prior, key) in candidates.iter() {
-            let equal = statement.query_row([*prior], |prior_row| {
-                generation_rows_equal(
-                    row,
-                    index,
-                    prior_row,
-                    &prior_index,
-                    conn,
-                    incremental,
-                    (current.content, key.content),
-                )
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))
-            })?;
-            if equal {
-                return Ok(false);
+        selection.with(|private| {
+            let pending: Option<i64> = private
+                .prepare_cached("SELECT native_id FROM generations WHERE header=?1 AND body IS NULL")?
+                .query_row([&header], |row| row.get(0))
+                .optional()?;
+            if let Some(prior) = pending {
+                let key = statement.query_row([prior], |prior_row| {
+                    generation_identity(prior_row, &prior_index, conn, incremental)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))
+                })?;
+                #[cfg(test)]
+                let key = GenerationIdentity {
+                    hash: forced.unwrap_or(key.hash),
+                    ..key
+                };
+                private
+                    .prepare_cached("UPDATE generations SET body=?1,content=?2 WHERE header=?3 AND body IS NULL")?
+                    .execute(rusqlite::params![key.hash.to_le_bytes(), key.content, header])?;
             }
-        }
-        candidates.push((id, current));
-        Ok(true)
+            // Digests select candidates, never establish equality. Keep all native decoder
+            // normalizations (including f64 bits), then compare demanded bodies exactly.
+            let mut candidates = private.prepare_cached(
+                "SELECT native_id,content FROM generations WHERE header=?1 AND body=?2 ORDER BY ordinal",
+            )?;
+            let mut rows = candidates.query(rusqlite::params![header, current.hash.to_le_bytes()])?;
+            while let Some(candidate) = rows.next()? {
+                let prior: i64 = candidate.get(0)?;
+                let content: bool = candidate.get(1)?;
+                let equal = statement.query_row([prior], |prior_row| {
+                    generation_rows_equal(
+                        row,
+                        index,
+                        prior_row,
+                        &prior_index,
+                        conn,
+                        incremental,
+                        (current.content, content),
+                    )
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))
+                })?;
+                if equal {
+                    return Ok(false);
+                }
+            }
+            drop(rows);
+            drop(candidates);
+            private
+                .prepare_cached("INSERT INTO generations(header,body,native_id,content) VALUES (?1,?2,?3,?4)")?
+                .execute(rusqlite::params![
+                    header,
+                    current.hash.to_le_bytes(),
+                    id,
+                    current.content
+                ])?;
+            Ok(true)
+        })
     }
 }
 
@@ -1325,12 +1774,21 @@ const CELL_COLS: &[&str] = &[
     "codex_message_items",
 ];
 
-/// What a read of the rows resolves: the parse demand, plus `count_only` (discovery's turn
-/// count: only whether a non-turn or an assistant reply has a body, never the body itself).
-struct Demand<'a> {
-    opts: &'a ParseOptions,
-    count_only: bool,
+/// Row materialization: the read's tier and spans, and the SQLite cell access mode.
+struct Demand {
+    tier: Tier,
+    spans: bool,
     incremental: bool,
+}
+
+impl Demand {
+    fn of(demand: &stream::Demand, incremental: bool) -> Self {
+        Demand {
+            tier: demand.tier,
+            spans: demand.spans,
+            incremental,
+        }
+    }
 }
 
 /// A row's `content`: text by the codec's rule, or the parts of a `\x00json:` multimodal document.
@@ -1346,10 +1804,9 @@ fn read_row(
     cells: &Cells,
     row: &rusqlite::Row<'_>,
     idx: &impl Fn(&str) -> Option<usize>,
-    demand: &Demand<'_>,
+    demand: &Demand,
 ) -> Result<MsgRow> {
-    let opts = demand.opts;
-    let (spans, full) = (opts.spans, opts.wants_full_extra());
+    let (spans, full) = (demand.spans, demand.tier >= Tier::Rich);
     let get_str =
         |name: &str| -> Option<String> { idx(name).and_then(|i| row.get::<_, Option<String>>(i).ok().flatten()) };
     let get_i64 = |name: &str| -> Option<i64> { idx(name).and_then(|i| row.get::<_, Option<i64>>(i).ok().flatten()) };
@@ -1358,11 +1815,6 @@ fn read_row(
     let role = borrowed_text(row, idx("role"));
     let display_kind = get_str("display_kind");
     let compressed_summary = get_i64("_compressed_summary").is_some_and(|n| n != 0);
-    // Non-turn rows cannot affect a turn count or replay suppression.
-    let nonturn = matches!(role, Some("tool" | "system"))
-        || compressed_summary
-        || display_kind.as_deref().and_then(harness_display_kind).is_some();
-    let skip = demand.count_only && nonturn;
     let check_failed = role == Some("assistant") && display_kind.is_none();
 
     let content_at = idx(if demand.incremental {
@@ -1373,36 +1825,7 @@ fn read_row(
     .unwrap();
     let mut body = None;
     let mut untyped_failed_turn = false;
-    let mut projected = false;
-    if !skip && demand.count_only && role == Some("assistant") {
-        // A reply counts by presence and the failed-turn notice; its body is not copied.
-        let mut prefix = [0; MULTIMODAL_SENTINEL.len()];
-        let mut prefix_len = 0;
-        let mut present = false;
-        let mut notice = FailedNotice::new();
-        match cells.chunks(conn, "messages", "content", row, content_at, |chunk| {
-            present |= !chunk.is_empty();
-            let take = chunk.len().min(prefix.len() - prefix_len);
-            prefix[prefix_len..prefix_len + take].copy_from_slice(&chunk.as_bytes()[..take]);
-            prefix_len += take;
-            if prefix_len == prefix.len() && prefix.as_slice() == MULTIMODAL_SENTINEL.as_bytes() {
-                return Err(CountNeedsBody.into());
-            }
-            notice.push(chunk);
-            Ok(())
-        }) {
-            Ok(valid) => {
-                projected = true;
-                untyped_failed_turn = check_failed && valid && notice.finished();
-                if valid && present {
-                    body = Some(Body::Text("[content present]".into()));
-                }
-            }
-            Err(error) if error.is::<CountNeedsBody>() => {}
-            Err(error) => return Err(error),
-        }
-    }
-    if !skip && !projected {
+    {
         if let Some(text) = cells.text(conn, "messages", "content", row, content_at)? {
             let multimodal = role != Some("tool");
             (body, untyped_failed_turn) = cells
@@ -1411,7 +1834,7 @@ fn read_row(
         }
     }
 
-    let calls = match cell("tool_calls")?.filter(|_| !skip) {
+    let calls = match cell("tool_calls")? {
         Some(calls) => cells
             .read(calls, |view| {
                 let mut calls = Vec::new();
@@ -1430,7 +1853,7 @@ fn read_row(
     // dedup) and the text entries of `reasoning_details`; the first encrypted handle of
     // `reasoning_details` or else `codex_reasoning_items`. Full demand keeps the JSON sidecars.
     let mut reasoning = Reasoning::default();
-    if !(demand.count_only && (nonturn || role == Some("assistant"))) {
+    {
         let summary = borrowed_text(row, idx("reasoning"));
         if let Some(summary) = summary {
             reasoning.push(summary);
@@ -1491,7 +1914,6 @@ fn read_row(
                 .flatten()
                 .is_some());
     Ok(MsgRow {
-        id: get_i64("id").unwrap_or(0),
         role: get_str("role").unwrap_or_default(),
         body,
         untyped_failed_turn,
@@ -1612,7 +2034,9 @@ fn content(
             })?;
             Ok(())
         })?;
-        match source.read_backing_value(arena.clone(), offset, len, |v| multimodal_blocks(v, spans)) {
+        match source.read(ReadInput::Backing(arena.clone(), offset, len), Validation::Value, |v| {
+            multimodal_blocks(v, spans)
+        }) {
             Ok(Some(blocks)) => return Ok((Some(Body::Blocks(blocks)), false)),
             Ok(None) => {}
             Err(error) if error.is::<crate::json::InvalidJson>() => {}
@@ -1677,7 +2101,6 @@ fn row_has_extra(row: &rusqlite::Row<'_>, index: &impl Fn(&str) -> Option<usize>
 }
 
 struct MsgRow {
-    id: i64,
     role: String,
     body: Option<Body>,
     untyped_failed_turn: bool,
@@ -1713,7 +2136,7 @@ struct MsgRow {
 impl MsgRow {
     /// The IR message for this row. `session_origin` overrides every message's origin when the
     /// session as a whole came from somewhere else (a foreign import).
-    fn into_message(self, session_origin: Option<Origin>, opts: &ParseOptions) -> Option<Message> {
+    fn into_message(self, session_origin: Option<Origin>, tier: Tier) -> Option<Message> {
         let (mut role, mut kind, mut origin) = match self.role.as_str() {
             "assistant" => (Role::Assistant, MessageKind::Reply, Origin::Model),
             "tool" => (Role::Tool, MessageKind::ToolResult, Origin::Harness),
@@ -1751,16 +2174,13 @@ impl MsgRow {
         // In-place compaction / rewind flags (non-default values only, so old-schema rows carry
         // nothing): `compacted` = summarized away but still displayed history; `active = false`
         // alone = a rewound or superseded row (only reachable under `complete`).
-        if opts.wants_full_extra() && matches!(self.compacted, Some(c) if c != 0) {
+        if tier >= Tier::Rich && matches!(self.compacted, Some(c) if c != 0) {
             bag.insert("compacted".into(), Value::Bool(true));
         }
-        if opts.wants_full_extra() && matches!(self.active, Some(0)) {
+        if tier >= Tier::Rich && matches!(self.active, Some(0)) {
             bag.insert("active".into(), Value::Bool(false));
         }
-        if let Some(k) = self
-            .display_kind
-            .filter(|s| !s.is_empty() && (opts.wants_full_extra() || opts.facts_only()))
-        {
+        if let Some(k) = self.display_kind.filter(|s| !s.is_empty() && (tier >= Tier::Facts)) {
             bag.insert("display_kind".into(), Value::String(k));
         }
         if let Some(ed) = self.effect_disposition.filter(|s| !s.is_empty()) {
@@ -1813,7 +2233,7 @@ impl MsgRow {
         if let Some(pmid) = self.platform_message_id.filter(|s| !s.is_empty()) {
             bag.insert("platform_message_id".into(), Value::String(pmid));
         }
-        if opts.wants_full_extra() && matches!(self.observed, Some(o) if o != 0) {
+        if tier >= Tier::Rich && matches!(self.observed, Some(o) if o != 0) {
             bag.insert("observed".into(), Value::Bool(true));
         }
         // Format-complete capture: the reasoning sidecars and the raw reasoning columns verbatim,
@@ -1868,6 +2288,7 @@ impl MsgRow {
 }
 
 #[derive(Default)]
+// FAILED_TURN_NOTICES must be ASCII: positions are byte offsets compared to decoded chars.
 struct FailedNotice {
     leading: bool,
     positions: [Option<usize>; FAILED_TURN_NOTICES.len()],
@@ -1911,19 +2332,15 @@ impl FailedNotice {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("count needs multimodal body projection")]
-struct CountNeedsBody;
-
 /// Whole-`Session` convenience over [`stream_conn`] for tests: stream into a [`CollectSink`] and
 /// reattach the messages. The production path goes through `Adapter::parse` → `stream::collect`.
 #[cfg(test)]
 fn parse_conn(conn: &Connection, r: &SessionRef) -> Result<Session> {
-    parse_conn_with(conn, r, &ParseOptions::full())
+    parse_conn_with(conn, r, &stream::Demand::RICH)
 }
 
 #[cfg(test)]
-fn parse_conn_with(conn: &Connection, r: &SessionRef, opts: &ParseOptions) -> Result<Session> {
+fn parse_conn_with(conn: &Connection, r: &SessionRef, opts: &stream::Demand) -> Result<Session> {
     let mut sink = crate::stream::CollectSink::default();
     let mut s = stream_conn(conn, r, opts, &mut sink)?;
     s.messages = sink.messages;
@@ -1933,8 +2350,9 @@ fn parse_conn_with(conn: &Connection, r: &SessionRef, opts: &ParseOptions) -> Re
 /// `state_meta` rows `goal:<sid>` (`{goal, status, turns_used, max_turns, …}`), `loop:<sid>`
 /// (`{prompt, status, mode, interval_seconds, ticks_fired, …}`) and `heartbeat:<sid>` (`{prompt,
 /// interval_seconds, status, fire_count}`) as the session's goal and schedules.
-fn state_meta_affordances(conn: &Connection, id: &str) -> Vec<crate::affordance::Affordance> {
+fn state_meta_affordances(conn: &Connection, id: &str) -> Result<Vec<crate::affordance::Affordance>> {
     use crate::affordance::{Affordance, Item, Kind};
+    use rusqlite::OptionalExtension as _;
     let mut out = Vec::new();
     for key in ["goal", "loop", "heartbeat"] {
         let value: Option<String> = conn
@@ -1943,8 +2361,8 @@ fn state_meta_affordances(conn: &Connection, id: &str) -> Vec<crate::affordance:
                 [format!("{key}:{id}")],
                 |row| row.get(0),
             )
-            .ok();
-        let Some(v) = value.and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
+            .optional()?;
+        let Some(v) = value.map(|t| serde_json::from_str::<Value>(&t)).transpose()? else {
             continue;
         };
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
@@ -1973,7 +2391,7 @@ fn state_meta_affordances(conn: &Connection, id: &str) -> Vec<crate::affordance:
             ),
         });
     }
-    out
+    Ok(out)
 }
 
 // Thread-local observation of existing arena length keeps the consumer connection control
@@ -2028,7 +2446,7 @@ mod tests {
             }
         }
         let failure = adapter
-            .stream(&reference, &ParseOptions::default(), &mut MutatingSink(&writer))
+            .stream(&reference, &stream::Demand::LEAN, &mut MutatingSink(&writer))
             .unwrap_err();
         assert!(failure.to_string().contains("dependencies changed"), "{failure:#}");
     }
@@ -2111,11 +2529,11 @@ mod tests {
         let typed = Hermes::with_db(legacy_path.clone());
         let typed_ref = SessionRef::new("s", Harness::Hermes, &legacy_path);
         for options in [
-            ParseOptions::bulk(),
-            ParseOptions::full(),
-            ParseOptions::lazy(),
-            ParseOptions::facts(),
-            ParseOptions::complete(),
+            stream::Demand::LEAN,
+            stream::Demand::RICH,
+            stream::Demand::LEAN.with_spans(),
+            stream::Demand::FACTS.with_spans(),
+            stream::Demand::COMPLETE,
         ] {
             let mut actual = crate::stream::collect_with(&adapter, &reference, &options)?;
             let mut expected = crate::stream::collect_with(&typed, &typed_ref, &options)?;
@@ -2166,7 +2584,7 @@ mod tests {
         drop(writer);
         let adapter = Hermes::with_db(path.clone());
         let reference = adapter.discover()?.remove(0);
-        let owned = crate::stream::collect_with(&adapter, &reference, &ParseOptions::complete())?;
+        let owned = crate::stream::collect_with(&adapter, &reference, &stream::Demand::COMPLETE)?;
         let checked = crate::emit::parse_for_emit(&adapter, &reference, Harness::Hermes)?;
         assert_eq!(
             checked.messages.len(),
@@ -2258,7 +2676,7 @@ mod tests {
         drop(writer);
         let adapter = Hermes::with_db(path.clone());
         let reference = adapter.discover()?.remove(0);
-        let owned = crate::stream::collect_with(&adapter, &reference, &ParseOptions::complete())?;
+        let owned = crate::stream::collect_with(&adapter, &reference, &stream::Demand::COMPLETE)?;
         let checked = crate::emit::parse_for_emit(&adapter, &reference, Harness::Hermes)?;
         assert_eq!(checked.messages.len(), 8);
         for message in checked.messages.iter().take(3) {
@@ -2329,16 +2747,16 @@ mod tests {
         drop(writer);
         let adapter = Hermes::with_db(path.clone());
         let reference = adapter.discover()?.into_iter().find(|r| r.id == "s").unwrap();
-        let full = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
+        let full = crate::stream::collect_with(&adapter, &reference, &stream::Demand::RICH)?;
         assert_eq!(full.messages.len(), 12);
         assert_eq!(full.lineage.continues.as_deref(), Some("root"));
         assert!(full.messages.iter().all(|message| message.origin == Origin::Import));
         for options in [
-            ParseOptions::bulk(),
-            ParseOptions::lazy(),
-            ParseOptions::usage(),
-            ParseOptions::facts(),
-            ParseOptions::lazy_extra(),
+            stream::Demand::LEAN,
+            stream::Demand::LEAN.with_spans(),
+            stream::Demand::USAGE.with_spans(),
+            stream::Demand::FACTS.with_spans(),
+            stream::Demand::RICH.with_spans(),
         ] {
             let mut actual = crate::stream::collect_with(&adapter, &reference, &options)?;
             if options.spans {
@@ -2355,7 +2773,7 @@ mod tests {
                         ..
                     }
                 )));
-                if !options.wants_full_extra() {
+                if options.tier < Tier::Rich {
                     assert!(actual.messages.iter().flat_map(|m| &m.content).any(|block| matches!(
                         block,
                         Block::Thinking {
@@ -2367,15 +2785,15 @@ mod tests {
             }
             actual.materialize()?;
             let mut expected = full.clone();
-            if !options.wants_full_extra() {
+            if options.tier < Tier::Rich {
                 expected.extra.clear();
                 for message in &mut expected.messages {
                     let kind = message
                         .harness_extra(Harness::Hermes)
                         .and_then(|bag| bag.get("display_kind"))
                         .cloned();
-                    message.extra.clear();
-                    if options.facts_only() {
+                    message.extra.retain(|k, _| k == crate::ir::CV_NAMESPACE);
+                    if options.tier == Tier::Facts {
                         if let Some(kind) = kind {
                             message
                                 .harness_extra_mut(Harness::Hermes)
@@ -2390,15 +2808,9 @@ mod tests {
                 "{options:?}"
             );
         }
-        let complete = crate::stream::collect_with(&adapter, &reference, &ParseOptions::complete())?;
-        let mut override_facts = crate::stream::collect_with(
-            &adapter,
-            &reference,
-            &ParseOptions {
-                complete: true,
-                ..ParseOptions::facts()
-            },
-        )?;
+        let complete = crate::stream::collect_with(&adapter, &reference, &stream::Demand::COMPLETE)?;
+        let mut override_facts =
+            crate::stream::collect_with(&adapter, &reference, &stream::Demand::COMPLETE.with_spans())?;
         override_facts.materialize()?;
         assert_eq!(serde_json::to_value(override_facts)?, serde_json::to_value(complete)?);
         assert_eq!(
@@ -2412,7 +2824,7 @@ mod tests {
         // Every retained lean body/argument uses the producer read set, including WAL-only writes.
         let writer = Connection::open(&path)?;
         writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)")?;
-        let lean = crate::stream::collect_with(&adapter, &reference, &ParseOptions::facts())?;
+        let lean = crate::stream::collect_with(&adapter, &reference, &stream::Demand::FACTS.with_spans())?;
         let before_main = std::fs::read(&path)?;
         writer.execute("UPDATE messages SET content='changed' WHERE id=2", [])?;
         assert_eq!(std::fs::read(&path)?, before_main);
@@ -2437,40 +2849,17 @@ mod tests {
     }
 
     #[test]
-    fn replay_text_memory_budget_includes_tiny_entry_slots() {
-        let mut texts = crate::spill::ExactStrings::default();
-        for i in 0..40000 {
-            texts.insert(i.to_string()).unwrap();
-        }
-        assert!(texts.is_spilled(), "small strings still consume entry storage");
-        assert!(texts.contains("0").unwrap());
-        assert!(texts.contains("39999").unwrap());
+    fn replay_dedup_tiny_prompts_stay_off_disk() {
+        // The dedup's look-back budget must absorb a long run of empty prompts without spilling:
+        // the generic spill budgets this tests against live in `crate::spill`'s own suite.
         let mut dedup = ReplayDedup::default();
         let mut message = Message::new(Role::User);
         message.content.push(Block::Text { text: "".into() });
         for _ in 0..40000 {
-            dedup.observe(&message).unwrap();
+            dedup.admit(&message).unwrap();
         }
         assert!(!dedup.recent_user_texts.contains("").unwrap());
         assert!(!dedup.recent_user_texts.is_spilled());
-    }
-
-    #[test]
-    fn replay_text_spill_keeps_exact_equality_and_releases_on_clear() {
-        let mut texts = crate::spill::ExactStrings::default();
-        texts.insert("first".into()).unwrap();
-        let large = "x".repeat(1024 * 1024 + 1);
-        texts.insert(large.clone()).unwrap();
-        assert!(texts.contains("first").unwrap());
-        assert!(texts.contains(&large).unwrap());
-        assert!(!texts.contains("FIRST").unwrap());
-        assert!(!texts.contains(&(large.clone() + "x")).unwrap());
-        texts.insert("nul\0suffix".into()).unwrap();
-        assert!(texts.contains("nul\0suffix").unwrap());
-        assert!(!texts.contains("nul").unwrap());
-        texts.clear();
-        assert!(!texts.is_spilled());
-        assert!(!texts.contains("first").unwrap());
     }
 
     fn bag(m: &Message) -> &serde_json::Map<String, Value> {
@@ -2489,9 +2878,8 @@ mod tests {
     /// and the `_record` carrier), so a fact leaking into some other harness's bag also fails.
     fn assert_nested_extra(s: &Session) {
         crate::harness::assert_no_flat_keys(s);
-        let allowed = |k: &str| {
-            k == Harness::Hermes.as_str() || k == crate::ir::CV_NAMESPACE || k == crate::harness::claude::CARRIER_KEY
-        };
+        let allowed =
+            |k: &str| k == Harness::Hermes.as_str() || k == crate::ir::CV_NAMESPACE || k == crate::ir::CARRIER_KEY;
         for k in s.extra.keys() {
             assert!(allowed(k), "flat session extra key {k:?}");
         }
@@ -2525,6 +2913,141 @@ mod tests {
             rusqlite::params![id, parent, started, ended, end_reason],
         )
         .unwrap();
+    }
+
+    /// Every corpus version: each session has a certificate, a certificate is deterministic, and
+    /// a row written to one session moves its certificate alone, while every session whose
+    /// certificate held reads exactly as it did before the write.
+    /// Over both corpus stores: discovery, the delegate forests and every session's certificate
+    /// walk `sessions` once per store state, and give what the walks of their own gave.
+    #[test]
+    fn corpus_sessions_are_walked_once_per_store_state() {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/hermes");
+        for version in std::fs::read_dir(&corpus).unwrap().map(|e| e.unwrap().path()) {
+            let world = cv_testkit::World::new("hermes-walk-once");
+            let db = world.base.join("state.db");
+            std::fs::copy(version.join(".hermes/state.db"), &db).unwrap();
+            let adapter = Hermes::with_db(db.clone());
+            WALKED.with(|n| n.set(0));
+            let refs = adapter.discover().unwrap().refs;
+            for r in &refs {
+                subagent_refs(r).unwrap();
+            }
+            let certified = adapter.rows(&db).unwrap();
+            assert_eq!(WALKED.with(|n| n.replace(0)), 1, "{version:?}");
+            let conn = open_ro(&db).unwrap();
+            conn.read(|conn, _| {
+                let walk = walk_conn(conn)?;
+                assert_eq!(rows_from(conn, &walk)?, certified, "{version:?}");
+                let listed: Vec<SessionRef> = refs_of(&walk, &db, false)?.into_iter().map(|(_, r)| r).collect();
+                assert_eq!(
+                    serde_json::to_string(&listed)?,
+                    serde_json::to_string(&refs)?,
+                    "{version:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn corpus_rows_certify_each_session_and_move_only_with_its_rows() {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/hermes");
+        let mut versions: Vec<_> = std::fs::read_dir(&corpus).unwrap().map(|e| e.unwrap().path()).collect();
+        versions.sort();
+        assert!(!versions.is_empty());
+        for version in versions {
+            let world = cv_testkit::World::new("hermes-corpus-rows");
+            let db = world.base.join("state.db");
+            std::fs::copy(version.join(".hermes/state.db"), &db).unwrap();
+            let conn = Connection::open(&db).unwrap();
+            let before = rows_conn(&conn).unwrap();
+            assert_eq!(rows_conn(&conn).unwrap(), before, "{version:?}");
+            let refs = discover_conn(&conn, &db).unwrap();
+            assert!(!refs.is_empty());
+            for r in &refs {
+                assert!(before.contains_key(&r.id), "{version:?} {}", r.id);
+            }
+            let read = |conn: &Connection, r: &SessionRef| {
+                serde_json::to_string(&parse_conn_with(conn, r, &stream::Demand::RICH).unwrap().messages).unwrap()
+            };
+            let reads: Vec<String> = refs.iter().map(|r| read(&conn, r)).collect();
+            // A session no other session's read consults: no parent, no children.
+            let parents: HashSet<String> = conn
+                .prepare("SELECT parent_session_id FROM sessions WHERE parent_session_id IS NOT NULL")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let leaf = refs.iter().find(|r| !parents.contains(&r.id)).expect("a leaf session");
+            conn.execute(
+                "INSERT INTO messages(session_id, role, content, timestamp) VALUES(?1, 'user', 'zqcertified', 9e9)",
+                [&leaf.id],
+            )
+            .unwrap();
+            let after = rows_conn(&conn).unwrap();
+            assert_eq!(after[&leaf.id].count, before[&leaf.id].count + 1, "{version:?}");
+            assert!(after[&leaf.id].high > before[&leaf.id].high, "{version:?}");
+            for (r, old) in refs.iter().zip(&reads) {
+                if r.id == leaf.id {
+                    assert_ne!(read(&conn, r), *old);
+                    continue;
+                }
+                assert_eq!(after[&r.id], before[&r.id], "{version:?} {}", r.id);
+                assert_eq!(
+                    read(&conn, r),
+                    *old,
+                    "{version:?} {}: certified unchanged, read changed",
+                    r.id
+                );
+            }
+        }
+    }
+
+    /// Every corpus version, listed as `cv ls` lists it: cold (nothing counted yet), then after
+    /// full reads recorded each session's count (the certified counts list), then with the store
+    /// replaced by a fresh copy of the same bytes, as the dump-hash stage rebuilds it: that is
+    /// another store, so the listing is the cold one again, not the counts certified for the old
+    /// file's rows. The copy is created after the old file is unlinked and renamed over its path,
+    /// so a filesystem that reuses freed inodes (ext4) gives it the old inode number.
+    #[test]
+    fn corpus_listing_of_a_replaced_store_is_the_cold_listing() {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/hermes");
+        let mut versions: Vec<_> = std::fs::read_dir(&corpus).unwrap().map(|e| e.unwrap().path()).collect();
+        versions.sort();
+        for version in versions {
+            let world = crate::test_world("hermes-cold-warm");
+            let home = world.home.join(".hermes");
+            std::fs::create_dir_all(&home).unwrap();
+            let db = home.join("state.db");
+            let stage = || {
+                let _ = std::fs::remove_file(&db);
+                let next = home.join("state.db.next");
+                std::fs::copy(version.join(".hermes/state.db"), &next).unwrap();
+                std::fs::rename(&next, &db).unwrap();
+            };
+            let listing = || {
+                let mut rows: Vec<(String, Option<usize>)> = crate::sessions()
+                    .into_iter()
+                    .filter(|r| r.harness == Harness::Hermes)
+                    .map(|r| (r.id, r.message_count))
+                    .collect();
+                rows.sort();
+                rows
+            };
+            stage();
+            let cold = listing();
+            assert!(!cold.is_empty(), "{version:?}");
+            let adapter = Hermes::with_home(&home);
+            for r in adapter.discover().unwrap().refs {
+                crate::stream::collect_with(&adapter, &r, &stream::Demand::RICH).unwrap();
+            }
+            assert_ne!(listing(), cold, "{version:?}: full reads certify counts on this store");
+            stage();
+            assert_eq!(listing(), cold, "{version:?}: a replaced store lists as a cold one");
+        }
     }
 
     #[test]
@@ -2586,7 +3109,7 @@ mod tests {
         let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         assert_eq!(s.messages.len(), 1);
         let blocks = &s.messages[0].content;
-        assert!(matches!(&blocks[0], Block::Text { text } if text == "see this"));
+        assert!(matches!(&blocks[0], Block::Text { text } if text.matches_str("see this") == Some(true)));
         assert!(matches!(&blocks[1], Block::Image { data_ref: Some(u), .. } if u.starts_with("data:image/png")));
     }
 
@@ -2603,7 +3126,7 @@ mod tests {
         .unwrap();
         let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         let blocks = &s.messages[0].content;
-        assert!(matches!(&blocks[0], Block::Text { text } if text == "hi"));
+        assert!(matches!(&blocks[0], Block::Text { text } if text.matches_str("hi") == Some(true)));
         assert!(matches!(&blocks[1], Block::Image { data_ref: Some(u), .. } if u.starts_with("data:image/jpeg")));
     }
 
@@ -2687,7 +3210,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(text, "same");
+        assert_eq!(text.inline_str(), Some("same"));
     }
 
     #[test]
@@ -2856,14 +3379,7 @@ mod tests {
         let s = parse_conn(&conn, &sref(&conn, "s")).unwrap();
         assert_eq!(
             texts(&s),
-            vec![
-                "q1",
-                "a1",
-                "q2",
-                "[conversation compacted]",
-                "[CONTEXT COMPACTION] earlier turns…",
-                "a2"
-            ]
+            vec!["q1", "a1", "q2", "[CONTEXT COMPACTION] earlier turns…", "a2"]
         );
         assert!(
             !texts(&s).contains(&"typo".to_string()),
@@ -2878,14 +3394,25 @@ mod tests {
             (boundary.kind, boundary.origin),
             (MessageKind::CompactionBoundary, Origin::Harness)
         );
-        assert!(boundary.extra.is_empty(), "the boundary is its kind; no flat subtype");
+        assert!(
+            boundary.content.is_empty() && boundary.id.is_none(),
+            "cv invents no text, no id"
+        );
+        assert!(boundary.is_synthesized(), "the boundary is cv's, and says so");
+        assert!(
+            boundary.harness_extra(Harness::Hermes).is_none(),
+            "no harness facts on it"
+        );
         let summary = &s.messages[4];
         assert_eq!(summary.role, Role::System);
         assert_eq!(
             (summary.kind, summary.origin),
             (MessageKind::CompactionSummary, Origin::Harness)
         );
-        assert_eq!(summary.parent_id, boundary.id, "summary links to its boundary");
+        assert_eq!(
+            summary.parent_id, None,
+            "no invented link: the detector pairs by adjacency"
+        );
         assert_eq!(bag(summary)["display_kind"], "hidden");
         assert!(!bag(summary).contains_key("isCompactSummary"), "the kind carries it");
         // the shared detector sees one compaction with its summary
@@ -2895,7 +3422,7 @@ mod tests {
         assert_nested_extra(&s);
 
         // Complete: every row, flags tagged, no dedup.
-        let c = parse_conn_with(&conn, &sref(&conn, "s"), &ParseOptions::complete()).unwrap();
+        let c = parse_conn_with(&conn, &sref(&conn, "s"), &stream::Demand::COMPLETE).unwrap();
         assert_eq!(c.messages.len(), 8, "7 rows + 1 boundary marker");
         let typo = c.messages.iter().find(|m| m.text().as_deref() == Some("typo")).unwrap();
         assert_eq!(bag(typo)["active"], Value::Bool(false));
@@ -2958,17 +3485,51 @@ mod tests {
             "discovery lists conversations, not delegates or ancestors"
         );
         let tip = refs.iter().find(|r| r.id == "t").unwrap();
-        let kids = subagent_refs(tip);
+        let kids = subagent_refs(tip).unwrap();
         assert_eq!(kids.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["d1", "d2"]);
         assert!(kids.iter().all(|k| k.path == db && k.harness == Harness::Hermes));
+        // The forest is the same delegates, newest first.
+        let mut forest: Vec<String> = crate::subagent_tree_of(tip)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.session.id)
+            .collect();
+        forest.sort();
+        assert_eq!(forest, ["d1", "d2"]);
         let x = refs.iter().find(|r| r.id == "x").unwrap();
+        let opens = || super::super::store::sqlite::DERIVE_OPENS.with(std::cell::Cell::get);
+        let before = opens();
         assert_eq!(
-            subagent_refs(x).iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            subagent_refs(x)
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["dx"]
+        );
+        assert_eq!(
+            opens(),
+            before,
+            "an unchanged db answers every conversation from one scan"
         );
         // a child parses as its own conversation that names its parent
         let d1 = Hermes::with_db(db.clone()).parse(&kids[0]).unwrap();
         assert_eq!(d1.lineage.parent.as_deref(), Some("r"));
+        // The delegate scan is kept per db state: a delegate written after it is still seen.
+        let live = Connection::open(&db).unwrap();
+        insert_session(&live, "d3", Some("t"), Some("agent_close"), 1160.0, Some(1161.0));
+        live.execute(
+            "UPDATE sessions SET model_config = json_object('_delegate_from', 't'), source = 'subagent' WHERE id = 'd3'",
+            [],
+        )
+        .unwrap();
+        drop(live);
+        let kids = subagent_refs(tip).unwrap();
+        assert_eq!(
+            kids.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["d1", "d2", "d3"]
+        );
+        assert_eq!(opens(), before + 1, "a written db is scanned again");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3227,9 +3788,13 @@ mod tests {
         );
         assert_eq!(bag(&s.messages[8])["display_kind"], "personality_switch");
         assert_eq!(
-            s.first_user_text().as_deref(),
+            s.messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .find_map(|m| m.text().filter(|t| !t.trim().is_empty()))
+                .as_deref(),
             Some("keep going but faster"),
-            "notices never become the title"
+            "notices never become the first user text"
         );
         assert_nested_extra(&s);
     }
@@ -3262,7 +3827,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_orders_and_counts() {
+    fn discover_orders_without_reducing_messages() {
         let conn = mk_conn("schema-v14.sql");
         conn.execute_batch(&fixture("discover_orders_and_counts.sql")).unwrap();
         conn.execute_batch(
@@ -3276,9 +3841,27 @@ mod tests {
         assert_eq!(refs.len(), 2);
         // ordered by started_at DESC
         assert_eq!(refs[0].id, "b");
-        assert_eq!(refs[0].message_count, 3);
+        assert_eq!(refs[0].message_count, None);
+        assert_eq!(
+            parse_conn(&conn, &refs[0])
+                .unwrap()
+                .messages
+                .iter()
+                .filter(|m| m.is_turn())
+                .count(),
+            3
+        );
         assert_eq!(refs[1].id, "a");
-        assert_eq!(refs[1].message_count, 1);
+        assert_eq!(refs[1].message_count, None);
+        assert_eq!(
+            parse_conn(&conn, &refs[1])
+                .unwrap()
+                .messages
+                .iter()
+                .filter(|m| m.is_turn())
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3336,6 +3919,56 @@ mod tests {
     }
 
     #[test]
+    fn generation_selection_preserves_loose_native_types_and_null_normalization() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY,role,content,timestamp,tool_call_id,tool_calls,tool_name);
+            INSERT INTO messages(role,content,timestamp,tool_name) VALUES
+            (NULL,NULL,NULL,NULL),(x'01',x'02','bad',1),('', '',NULL,NULL),(NULL,'',NULL,NULL),
+            ('assistant','same',1,NULL),('assistant','same',1.0,NULL),('assistant','same','1',NULL),
+            ('assistant','same','1',x'01'),('assistant','same','1','');",
+        )?;
+        let columns = [
+            "role",
+            "content",
+            "_content_rowid",
+            "timestamp",
+            "tool_call_id",
+            "tool_calls",
+            "tool_name",
+        ];
+        let index = |name: &str| {
+            columns
+                .iter()
+                .position(|column| *column == name)
+                .or_else(|| (name == "id").then_some(2))
+        };
+        for incremental in [false, true] {
+            let sql = if incremental {
+                "SELECT role,typeof(content),rowid,timestamp,tool_call_id,tool_calls,tool_name FROM messages ORDER BY id"
+            } else {
+                "SELECT role,content,id,timestamp,tool_call_id,tool_calls,tool_name FROM messages ORDER BY id"
+            };
+            let mut dedup = GenerationDedup {
+                forced_hash: Some(0),
+                ..Default::default()
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let mut rows = stmt.query([])?;
+            let mut admitted = Vec::new();
+            while let Some(row) = rows.next()? {
+                admitted.push(dedup.admit(row, &index, &conn, incremental)?);
+            }
+            assert_eq!(
+                admitted,
+                [true, false, true, false, true, false, true, false, true],
+                "{incremental}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn production_discovery_writes_no_ordinary_assistant_body_arena() -> Result<()> {
         fn observe<T>(run: impl FnOnce() -> Result<T>) -> Result<(T, Vec<u64>)> {
             struct Clear;
@@ -3362,14 +3995,14 @@ mod tests {
         )?;
         let adapter = Hermes::with_db(path);
         let (references, discovery_bytes) = observe(|| adapter.discover())?;
-        assert_eq!(references[0].message_count, 1);
+        assert_eq!(references[0].message_count, None);
         assert_eq!(
-            discovery_bytes,
-            [0],
+            discovery_bytes.iter().sum::<u64>(),
+            0,
             "actual listing must not stage the undemanded reply body"
         );
         let (session, collection_bytes) =
-            observe(|| crate::stream::collect_with(&adapter, &references[0], &ParseOptions::lazy()))?;
+            observe(|| crate::stream::collect_with(&adapter, &references[0], &stream::Demand::LEAN.with_spans()))?;
         assert_eq!(session.messages.len(), 1);
         assert!(
             collection_bytes.iter().sum::<u64>() >= body.len() as u64,
@@ -3379,7 +4012,7 @@ mod tests {
     }
 
     #[test]
-    fn count_demand_preserves_parser_acceptance_without_copying_plain_assistant_bodies() -> Result<()> {
+    fn streamed_turn_classification_preserves_owned_parser_acceptance() -> Result<()> {
         let world = crate::test_world("hermes-count-demand");
         let path = world.base.join("state.db");
         let writer = Connection::open(&path)?;
@@ -3413,42 +4046,16 @@ mod tests {
         )?;
         let reference = SessionRef::new("s", Harness::Hermes, &path);
         let parsed = parse_conn(&writer, &reference)?;
-        struct CountSink {
-            turns: usize,
-            placeholders: usize,
-        }
+        struct CountSink(usize);
         impl MessageSink for CountSink {
             fn message(&mut self, message: Message) -> Flow {
-                self.turns += usize::from(message.is_turn());
-                for block in &message.content {
-                    if let Block::Text { text } = block {
-                        assert!(
-                            !matches!(text, crate::Text::Source(_)),
-                            "ordinary count body must not own arena bytes"
-                        );
-                        self.placeholders += usize::from(text == "[content present]");
-                    }
-                }
+                self.0 += usize::from(message.is_turn());
                 Flow::Continue
             }
         }
-        let mut count = CountSink {
-            turns: 0,
-            placeholders: 0,
-        };
-        stream_conn_with_demand(
-            &writer,
-            &reference,
-            &ParseOptions::lazy(),
-            &mut count,
-            &crate::source::ReadSet::default(),
-            true,
-        )?;
-        assert_eq!(count.turns, parsed.messages.iter().filter(|m| m.is_turn()).count());
-        assert_eq!(
-            count.placeholders, 2,
-            "ordinary reply and failed-turn body are represented without copies"
-        );
+        let mut count = CountSink(0);
+        stream_conn(&writer, &reference, &stream::Demand::LEAN.with_spans(), &mut count)?;
+        assert_eq!(count.0, parsed.messages.iter().filter(|m| m.is_turn()).count());
         Ok(())
     }
 
@@ -3473,9 +4080,9 @@ mod tests {
         }
         let adapter = Hermes::with_db(path);
         let reference = adapter.discover()?.remove(0);
-        assert_eq!(reference.message_count, 3);
+        assert_eq!(reference.message_count, None);
         let owned = parse_conn(&writer, &reference)?;
-        let mut checked = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy_extra())?;
+        let mut checked = crate::stream::collect_with(&adapter, &reference, &stream::Demand::RICH.with_spans())?;
         assert_eq!(checked.messages.len(), 3);
         assert!(matches!(
             &checked.messages[0].content[0],
@@ -3501,16 +4108,22 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(session_lineage_root_to_tip(&conn, "s149").len(), 150);
+        assert_eq!(
+            session_lineage_root_to_tip(&conn, "s149", &Select::of(&conn, "sessions")).len(),
+            150
+        );
         let reference = SessionRef::new("s149", Harness::Hermes, at(&conn));
         assert_eq!(parse_conn(&conn, &reference).unwrap().messages.len(), 150);
         conn.execute("UPDATE sessions SET parent_session_id='s149' WHERE id='s0'", [])
             .unwrap();
-        assert_eq!(session_lineage_root_to_tip(&conn, "s149").len(), 150);
+        assert_eq!(
+            session_lineage_root_to_tip(&conn, "s149", &Select::of(&conn, "sessions")).len(),
+            150
+        );
     }
 
     #[test]
-    fn discovery_turn_counts_match_native_display_and_compression_replay() -> Result<()> {
+    fn discovery_defers_turns_and_complete_reads_publish_native_display_counts() -> Result<()> {
         let world = crate::test_world("hermes-discovery-turn-counts");
         let path = world.base.join("state.db");
         std::fs::copy(
@@ -3521,22 +4134,38 @@ mod tests {
         writer.execute("UPDATE sessions SET message_count=999", [])?;
         let adapter = Hermes::with_db(path.clone());
         let mut imported = false;
-        for reference in adapter.discover()? {
-            let parsed = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
+        let references = adapter.discover()?;
+        assert!(references.iter().all(|r| r.message_count.is_none()));
+        crate::catalog::sync(&references);
+        for reference in references {
+            let parsed = crate::stream::collect_with(&adapter, &reference, &stream::Demand::RICH)?;
             imported |= parsed.messages.iter().any(|message| message.origin == Origin::Import);
-            assert_eq!(
-                reference.message_count,
-                parsed.messages.iter().filter(|m| m.is_turn()).count(),
-                "{}",
-                reference.id
-            );
-            for child in subagent_refs(&reference) {
-                let parsed = crate::stream::collect_with(&adapter, &child, &ParseOptions::full())?;
+            let done = crate::stream::stream_counted(
+                &adapter,
+                &reference,
+                &stream::Demand::FACTS.with_spans(),
+                &mut crate::stream::Discard,
+                crate::stream::Pass::RECORD,
+            )?;
+            let turns = parsed.messages.iter().filter(|m| m.is_turn()).count();
+            assert_eq!(done.counted.unwrap().turns, turns, "{}", reference.id);
+            let reader = crate::catalog::Reader::open().unwrap();
+            let mut refreshed = reference.clone();
+            reader.refill_turns(std::iter::once(&mut refreshed));
+            assert_eq!(refreshed.message_count, Some(turns), "{}", reference.id);
+            for child in subagent_refs(&reference).unwrap() {
+                assert_eq!(child.message_count, None);
+                let parsed = crate::stream::collect_with(&adapter, &child, &stream::Demand::RICH)?;
+                let done = crate::stream::stream_counted(
+                    &adapter,
+                    &child,
+                    &stream::Demand::FACTS.with_spans(),
+                    &mut crate::stream::Discard,
+                    crate::stream::Pass::RECORD,
+                )?;
                 assert_eq!(
-                    child.message_count,
-                    parsed.messages.iter().filter(|m| m.is_turn()).count(),
-                    "{}",
-                    child.id
+                    done.counted.unwrap().turns,
+                    parsed.messages.iter().filter(|m| m.is_turn()).count()
                 );
             }
         }
@@ -3609,14 +4238,15 @@ mod tests {
         assert_eq!(by_id(A).cwd, Some(PathBuf::from("/tmp/proj")));
         assert_eq!(
             by_id(A).message_count,
-            8,
-            "SessionRef counts canonical conversational turns"
+            None,
+            "cold discovery defers canonical turn counting"
         );
 
         // A: the display view — each carried message once, in id order, the summary as a system turn.
         let a = parse_conn(&conn, &sref(&conn, A)).unwrap();
         let t = texts(&a);
         assert_eq!(a.messages.len(), 13, "{t:?}");
+        assert_eq!(a.messages.iter().filter(|m| m.is_turn()).count(), 8);
         // Index by message (the tool-result turn has no text, so `t` is one shorter).
         let txt = |i: usize| a.messages[i].text().unwrap_or_default();
         assert_eq!(txt(0), "fix the flaky test in tests/sched.py");
@@ -3680,7 +4310,7 @@ mod tests {
         assert!(a.lineage.is_empty(), "{:?}", a.lineage);
         assert_nested_extra(&a);
         // complete: the superseded originals of the carried tail are present, tagged as rewind rows.
-        let ac = parse_conn_with(&conn, &sref(&conn, A), &ParseOptions::complete()).unwrap();
+        let ac = parse_conn_with(&conn, &sref(&conn, A), &stream::Demand::COMPLETE).unwrap();
         assert!(ac.messages.len() > a.messages.len());
         // (Flags are recorded as non-default values only: a superseded original carries
         // `active: false` and no `compacted` key — the same shape as a rewound row.)

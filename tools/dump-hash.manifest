@@ -1,0 +1,40 @@
+# The dump-hash sample (tools/dump-hash.sh): one root per line, staged as a fake HOME.
+#
+#   corpus <harness>/<version>   a committed corpus version (crates/cv-core/tests/corpus/…)
+#   synthetic <edge>             a generated Claude edge: giant | escaped | malformed | live
+#   home <abs dir>               an external fake HOME of real sessions — NEVER committed. Build it
+#                                with `cp -c` of ~30 sessions into <dir>/.claude/projects/<proj>/ and
+#                                <dir>/.codex/sessions/YYYY/MM/DD/, or pass it as `--home <dir>`.
+corpus claude/2.1.296
+corpus claude/2.1.304
+corpus cline/3.0.70
+corpus codex/0.161.0
+corpus codex/0.162.1
+corpus codex/0.163.0
+corpus continue/1.5.47
+corpus cursor/2026.10.01-e373342
+corpus cursor/3.24.12-ide
+corpus devin/3000.11.3
+corpus gemini/0.46.0
+corpus gemini/0.63.0
+corpus goose/1.51.0
+corpus goose/1.54.0
+corpus grok/1.0.50
+corpus hermes/0.21.6
+corpus hermes/2026.8.31
+corpus kimi/1.48.0
+corpus kimi/1.51.0
+corpus kimi-code/0.39.1
+corpus kimi-code/0.39.1-then-2.1.1
+corpus kimi-code/2.1.1
+corpus openclaw/2026.1.29
+corpus openclaw/2026.10.1
+corpus opencode/1.18.20
+corpus opencode/1.18.20-migrated-2.0.25
+corpus opencode/2.0.25
+corpus qwen/0.25.1
+corpus roo/0.1.17
+synthetic giant
+synthetic escaped
+synthetic malformed
+synthetic live

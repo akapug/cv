@@ -78,20 +78,6 @@ pub(super) fn composer(view: JsonView<'_>) -> Result<Composer<'_>> {
     })
 }
 
-/// An inline string, or None for a nonstring or a string kept in the source.
-pub(super) fn string(view: JsonView<'_>) -> Result<Option<String>> {
-    Ok(view.text(false)?.and_then(|text| match text {
-        Text::Inline(text) => Some(text),
-        _ => None,
-    }))
-}
-fn nonempty(text: &Text) -> bool {
-    match text {
-        Text::Inline(text) => !text.is_empty(),
-        Text::Source(text) => text.raw_len() != 0,
-        Text::Span(span) => span.len != 0,
-    }
-}
 fn scalar(view: JsonView<'_>) -> Result<Value> {
     if view.is_object()? || view.is_array()? {
         return Ok(Value::Null);
@@ -153,24 +139,13 @@ fn lexical(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<Option<Text
         }
         Ok(children.is_some())
     }
-    #[derive(Debug, thiserror::Error)]
-    #[error("nonblank text found")]
-    struct Nonblank;
     let build = |view: JsonView<'_>| -> Result<Option<Text>> {
         let Some(root) = view.get("root")? else { return Ok(None) };
         let text = built(cells, spans, |out| walk(root, out).map(|_| ()))?;
-        // Stop at the first nonblank chunk; a source mutation still takes precedence.
-        let check = text.try_for_each_chunk(&crate::lazy::Resolver::new(None), 1024, |part| {
-            if part.chars().any(|c| !c.is_whitespace()) {
-                return Err(Nonblank.into());
-            }
-            Ok(())
-        });
-        match check {
-            Ok(()) => Ok(None),
-            Err(error) if error.downcast_ref::<Nonblank>().is_some() => Ok(Some(text)),
-            Err(error) => Err(error),
-        }
+        Ok(
+            (!crate::harness::store::document::text_is_blank(&text, &crate::lazy::Resolver::new(None))?)
+                .then_some(text),
+        )
     };
     if !view.is_string()? {
         return build(view);
@@ -193,7 +168,9 @@ fn result_text(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<Option<
 }
 
 /// One bubble: `type` 1 is the user, anything else the assistant. None for an empty bubble.
-pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<Option<Message>> {
+/// `ordinal` is the bubble's place in its composer's conversation: a tool record naming no call id
+/// gets one derived from it (`cv:cursor:<ordinal>`; a bubble holds at most one call).
+pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool, ordinal: usize) -> Result<Option<Message>> {
     let Some(fields) = Fields::parse(
         view,
         &[
@@ -231,7 +208,7 @@ pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<O
             .flatten()
             .unwrap_or_default();
         let signature = thinking.string("signature")?.filter(|s| !s.is_empty());
-        if nonempty(&text) || signature.is_some() {
+        if !text.is_empty() || signature.is_some() {
             message.content.push(Block::Thinking {
                 text,
                 signature,
@@ -245,7 +222,7 @@ pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<O
         .map(|v| v.lazy_text(spans))
         .transpose()?
         .flatten()
-        .filter(nonempty)
+        .filter(|text| !text.is_empty())
     {
         message.content.push(Block::Text { text });
     } else if let Some(rich) = fields.get("richText") {
@@ -270,11 +247,14 @@ pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<O
             ],
         )?;
         let get = |key| tf.as_ref().and_then(|f| f.get(key));
-        let text = |key| get(key).map(string).transpose().map(Option::flatten);
+        let text = |key| get(key).map(|view| view.string()).transpose().map(Option::flatten);
         let name = text("name")?.unwrap_or_else(|| "tool".into());
         let id = match text("toolCallId")? {
             Some(id) => id,
-            None => text("modelCallId")?.unwrap_or_default(),
+            None => match text("modelCallId")? {
+                Some(id) => id,
+                None => crate::ir::derived_call_id("cursor", ordinal),
+            },
         };
         // The model-issued `rawArgs`, else the normalized `params` (decoded, or as stored).
         let mut input = None;
@@ -303,7 +283,7 @@ pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<O
             .map(|v| v.get("status"))
             .transpose()?
             .flatten()
-            .map(string)
+            .map(|view| view.string())
             .transpose()?
             .flatten()
             .is_some_and(|s| s.eq_ignore_ascii_case("error"));
@@ -336,7 +316,11 @@ pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool) -> Result<O
         .flatten()
         .or(fields.get("modelType"))
         .or(fields.get("model"));
-    message.model = model.map(string).transpose()?.flatten().filter(|s| !s.is_empty());
+    message.model = model
+        .map(|view| view.string())
+        .transpose()?
+        .flatten()
+        .filter(|s| !s.is_empty());
     if let Some(tokens) = fields
         .get("tokenCount")
         .map(|v| Fields::parse(v, &["inputTokens", "outputTokens"]))

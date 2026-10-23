@@ -1,6 +1,8 @@
 //! Operation-private source descriptors. A staged descriptor keeps the original accepted source
 //! identity; restoration never captures or validates a newer file in place of that source.
 use super::{Json, JsonSource};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -80,7 +82,9 @@ impl SourceRegistry {
             None => source.range(descriptor.offset, descriptor.len)?,
             Some(id) => {
                 let bytes = self.decoded.get(id).context("unknown staged decoded JSON")?.clone();
-                let len = bytes.len()?;
+                let len = bytes.byte_len()?;
+                // A descriptor must name a complete JSON value; even an empty JSON string
+                // occupies two quote bytes, so a zero-length range cannot be valid.
                 anyhow::ensure!(
                     descriptor.len != 0
                         && descriptor
@@ -113,19 +117,25 @@ mod tests {
         let mut reads = crate::source::ReadSet::default();
         reads.record(&wal);
         let before = JsonSource::capture_with_reads(&path, &reads).unwrap();
-        let mut value = before.read_document(|view| view.to_json()).unwrap();
+        let mut value = before
+            .read(ReadInput::Document, Validation::Value, |view| view.to_json())
+            .unwrap();
         let mut registry = SourceRegistry::default();
         let descriptor = registry.detach(&mut value).unwrap();
         std::fs::write(&wal, b"new WAL").unwrap();
         let mut reads = crate::source::ReadSet::default();
         reads.record(&wal);
         let after = JsonSource::capture_with_reads(&path, &reads).unwrap();
-        let mut value = after.read_document(|view| view.to_json()).unwrap();
+        let mut value = after
+            .read(ReadInput::Document, Validation::Value, |view| view.to_json())
+            .unwrap();
         registry.detach(&mut value).unwrap();
         assert_eq!(registry.sources.len(), 2);
         assert_ne!(before, after);
         assert!(registry.restore(descriptor).unwrap().canonical_len().is_err());
-        let value = after.read_document(|view| view.to_json()).unwrap();
+        let value = after
+            .read(ReadInput::Document, Validation::Value, |view| view.to_json())
+            .unwrap();
         let error = value
             .with_view::<()>(|_| {
                 std::fs::remove_file(&wal)?;
@@ -144,7 +154,7 @@ mod tests {
         let source = JsonSource::capture(&path).unwrap();
         let mut registry = SourceRegistry::default();
         let descriptors = source
-            .read_document(|view| {
+            .read(ReadInput::Document, Validation::Value, |view| {
                 view.array()?
                     .unwrap()
                     .map(|view| {

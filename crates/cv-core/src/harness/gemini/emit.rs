@@ -29,12 +29,12 @@ mod stream;
 /// projects.json is not enough. We therefore: pick the cwd basename (suffixing `-2`, `-3`… if a
 /// DIFFERENT path already owns that dir's marker), write the `.project_root` marker, and record the
 /// projects.json mapping (the fast path; gemini heals from the marker regardless). After this,
-/// `gemini --resume`/`--list-sessions` discover the session. Returns the slug, `None` if `cwd` empty.
-fn gemini_register_project(global_tmp: &Path, cwd: &str) -> Result<Option<String>> {
+/// `gemini --resume`/`--list-sessions` discover the session. This picks the slug (`None` if `cwd` is
+/// empty); [`stage_project`] stages the marker and the mapping.
+fn project_slug(global_tmp: &Path, cwd: &str) -> Option<String> {
     if cwd.is_empty() {
-        return Ok(None);
+        return None;
     }
-    const MARKER: &str = ".project_root";
     // Reuse the slug whose marker already owns this cwd, if any (gemini's findExistingSlugForPath).
     let owned_by = |slug_dir: &Path| -> Option<String> {
         fs::read_to_string(slug_dir.join(MARKER))
@@ -44,7 +44,7 @@ fn gemini_register_project(global_tmp: &Path, cwd: &str) -> Result<Option<String
     if let Ok(entries) = fs::read_dir(global_tmp) {
         for e in entries.flatten() {
             if owned_by(&e.path()).as_deref() == Some(cwd) {
-                return Ok(e.file_name().to_str().map(str::to_string));
+                return e.file_name().to_str().map(str::to_string);
             }
         }
     }
@@ -66,12 +66,18 @@ fn gemini_register_project(global_tmp: &Path, cwd: &str) -> Result<Option<String
             _ => break, // free, or already ours
         }
     }
-    let slug_dir = global_tmp.join(&slug);
-    fs::create_dir_all(&slug_dir).with_context(|| format!("creating Gemini project {}", slug_dir.display()))?;
-    let marker = slug_dir.join(MARKER);
-    crate::publish::publish_reader(&marker, "stage", cwd.as_bytes(), crate::publish::Claim::Replace)
+    Some(slug)
+}
+
+const MARKER: &str = ".project_root";
+
+/// Stage `slug`'s `.project_root` marker (required) and its `projects.json` mapping (only where
+/// the registry reads as one) into `set`. The slug directory must exist.
+fn stage_project(global_tmp: &Path, slug: &str, cwd: &str, set: &mut crate::publish::Set) -> Result<()> {
+    use crate::publish::Claim;
+    let marker = global_tmp.join(slug).join(MARKER);
+    set.stage(&marker, "stage", cwd.as_bytes(), Claim::Replace)
         .with_context(|| format!("writing Gemini project marker {}", marker.display()))?;
-    // Record the projects.json fast-path mapping too (best-effort).
     if let Some(parent) = global_tmp.parent() {
         let projects_json = parent.join("projects.json");
         let mut doc: Value = match fs::read_to_string(&projects_json) {
@@ -79,10 +85,10 @@ fn gemini_register_project(global_tmp: &Path, cwd: &str) -> Result<Option<String
                 Ok(doc) if doc.is_object() => doc,
                 // The required marker is enough for native recovery. Never replace an unreadable
                 // or unrecognized existing registry with an invented empty mapping.
-                _ => return Ok(Some(slug)),
+                _ => return Ok(()),
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
-            Err(_) => return Ok(Some(slug)),
+            Err(_) => return Ok(()),
         };
         let projects = doc
             .as_object_mut()
@@ -92,12 +98,11 @@ fn gemini_register_project(global_tmp: &Path, cwd: &str) -> Result<Option<String
         if let Some(m) = projects.as_object_mut() {
             m.insert(cwd.to_string(), json!(slug));
         }
-        if let Ok(s) = serde_json::to_string_pretty(&doc) {
-            let _ =
-                crate::publish::publish_reader(&projects_json, "stage", s.as_bytes(), crate::publish::Claim::Replace);
-        }
+        let text = serde_json::to_string_pretty(&doc)?;
+        set.stage(&projects_json, "stage", text.as_bytes(), Claim::Replace)
+            .with_context(|| format!("writing the Gemini registry {}", projects_json.display()))?;
     }
-    Ok(Some(slug))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -108,51 +113,74 @@ mod checked_tests {
         Harness, Json, SessionRef,
     };
 
-    #[test]
-    fn project_registration_preserves_unrecognized_existing_registry() {
-        let root = std::env::temp_dir().join(format!("cv-gemini-registry-{}", Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        let registry = root.join("projects.json");
-        for original in ["{broken registry", "[\"unexpected schema\"]"] {
-            fs::write(&registry, original).unwrap();
-            assert_eq!(
-                gemini_register_project(&root.join("tmp"), "/synthetic/project").unwrap(),
-                Some("project".into())
-            );
-            assert_eq!(fs::read_to_string(&registry).unwrap(), original);
-            assert_eq!(
-                fs::read_to_string(root.join("tmp/project/.project_root")).unwrap(),
-                "/synthetic/project"
-            );
-            fs::remove_dir_all(root.join("tmp")).unwrap();
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn required_project_marker_failure_prevents_transcript_publication() {
-        let dir = std::env::temp_dir().join(format!("cv-gemini-marker-{}", Uuid::new_v4()));
-        fs::create_dir_all(dir.join("project/.project_root")).unwrap();
+    fn project_session() -> Session {
         let mut session = Session::new("source", Harness::Gemini);
         session.cwd = Some("/synthetic/project".into());
-        let result = emit(
-            &session,
-            &dir,
-            &EmitOptions {
-                new_id: Some("destination".into()),
-                ..Default::default()
-            },
-        );
-        assert!(format!("{:#}", result.unwrap_err()).contains("project marker"));
-        assert!(!dir.join("project/chats").exists());
-        fs::remove_dir_all(dir).unwrap();
+        session
+    }
+    fn pinned(force: bool) -> EmitOptions {
+        EmitOptions {
+            new_id: Some("destination".into()),
+            force,
+            ..Default::default()
+        }
     }
 
+    #[test]
+    fn project_registration_preserves_unrecognized_existing_registry() {
+        let world = cv_testkit::World::new("gemini-registry");
+        let registry = world.base.join("projects.json");
+        for original in ["{broken registry", "[\"unexpected schema\"]"] {
+            fs::write(&registry, original).unwrap();
+            emit(&project_session(), &world.base.join("tmp"), &pinned(false)).unwrap();
+            assert_eq!(fs::read_to_string(&registry).unwrap(), original);
+            assert_eq!(
+                fs::read_to_string(world.base.join("tmp/project/.project_root")).unwrap(),
+                "/synthetic/project"
+            );
+            fs::remove_dir_all(world.base.join("tmp")).unwrap();
+        }
+    }
+
+    /// The transcript is claimed first; the marker's claim then fails (a directory holds its
+    /// name), and the transcript is undone: a new one retracted, a replaced one restored.
+    #[test]
+    fn required_project_marker_failure_prevents_transcript_publication() {
+        let world = cv_testkit::World::new("gemini-marker");
+        let dir = &world.base;
+        fs::create_dir_all(dir.join("project/.project_root")).unwrap();
+        let result = emit(&project_session(), dir, &pinned(false));
+        assert!(format!("{:#}", result.unwrap_err()).contains(".project_root"));
+        assert_eq!(fs::read_dir(dir.join("project/chats")).unwrap().count(), 0);
+        let transcript = dir.join("project/chats/session-destination.json");
+        fs::write(&transcript, "the session it replaces").unwrap();
+        assert!(emit(&project_session(), dir, &pinned(true)).is_err());
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), "the session it replaces");
+        assert_eq!(fs::read_dir(dir.join("project/chats")).unwrap().count(), 1);
+    }
+
+    /// A registry that cannot be written fails the emit, and nothing is published.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_registry_publishes_nothing() {
+        let world = cv_testkit::World::new("gemini-registry-read-only");
+        let tmp = world.base.join("tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        if !crate::publish::tests::read_only(&world.base, true) {
+            return;
+        }
+        let result = emit(&project_session(), &tmp, &pinned(false));
+        crate::publish::tests::read_only(&world.base, false);
+        assert!(format!("{:#}", result.unwrap_err()).contains("projects.json"));
+        assert!(!tmp.join("project/.project_root").exists());
+        assert_eq!(fs::read_dir(tmp.join("project/chats")).unwrap().count(), 0);
+    }
+
+    /// The emitted chat, ids included: they are name-based on the session id, so reproducible.
     fn normalized(path: &Path) -> Result<Vec<u8>> {
-        let mut value: Value = serde_json::from_slice(&fs::read(path)?)?;
-        for (i, message) in value["messages"].as_array_mut().unwrap().iter_mut().enumerate() {
-            assert!(Uuid::parse_str(message["id"].as_str().unwrap()).is_ok());
-            message["id"] = json!(format!("generated-{i}"));
+        let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+        for message in value["messages"].as_array().unwrap() {
+            assert_eq!(Uuid::parse_str(message["id"].as_str().unwrap())?.get_version_num(), 5);
         }
         Ok(serde_json::to_vec_pretty(&value)?)
     }
@@ -169,7 +197,7 @@ mod checked_tests {
     #[test]
     fn checked_gemini_matches_frozen_pretty_all_modes_and_fields() -> Result<()> {
         let world = crate::test_world("gemini-wire-oracle");
-        let mut frozen = crate::emit::grok_qwen_tests::Frozen::new("gemini-fixture");
+        let mut frozen = crate::emit::frozen::Frozen::new("gemini-fixture");
         let mut session = Session::new("source", Harness::Claude);
         let ts = "2026-10-12T12:00:00Z".parse()?;
         session.created_at = Some(ts);
@@ -349,15 +377,15 @@ mod checked_tests {
         assert!(prepared.messages[0]
             .content
             .iter()
-            .any(|block| matches!(block,Block::Text {text} if text.is_span())));
+            .any(|block| matches!(block,Block::Text {text} if text.is_lazy())));
         prepared.materialize()?;
-        let full = crate::stream::collect_with(&adapter, &reference, &crate::ParseOptions::full())?;
+        let full = crate::stream::collect_with(&adapter, &reference, &crate::Demand::RICH)?;
         assert_eq!(serde_json::to_value(&prepared)?, serde_json::to_value(&full)?);
-        let complete = crate::stream::collect_with(&adapter, &reference, &crate::ParseOptions::complete())?;
+        let complete = crate::stream::collect_with(&adapter, &reference, &crate::Demand::COMPLETE)?;
         assert!(complete.messages[0]
             .content
             .iter()
-            .all(|block| !matches!(block,Block::Text {text} if text.is_span())));
+            .all(|block| !matches!(block,Block::Text {text} if text.is_lazy())));
         // Same-harness Gemini uses the existing complete/owned compatibility path.
         Ok(())
     }

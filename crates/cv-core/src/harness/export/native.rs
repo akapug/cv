@@ -2,6 +2,7 @@
 use super::*;
 use crate::harness::store::document::{text_summary, Fields};
 use crate::json::{InvalidJson, JsonSource, JsonView};
+use crate::json::{ReadInput, Validation};
 use crate::lazy::{Resolver, Text};
 use crate::stream::Flow;
 use std::collections::{HashMap, VecDeque};
@@ -20,23 +21,23 @@ struct Archive {
     source: JsonSource,
     entries: Vec<Entry>,
     // Positions sorted by id then original position; discovery keeps archive order.
-    by_id: Vec<usize>,
+    by_id: crate::harness::store::selection::Positions,
     charge: usize,
+    /// The file is not a JSON archive: read as none, reported by discovery.
+    undecodable: bool,
 }
 impl Archive {
     fn entry(&self, id: &str) -> Option<&Entry> {
-        let position = self.by_id.partition_point(|&i| self.entries[i].id.as_str() < id);
         self.by_id
-            .get(position)
+            .equal(|i| self.entries[i].id.as_str().cmp(id))
+            .first()
             .map(|&i| &self.entries[i])
-            .filter(|entry| entry.id == id)
     }
 }
-fn entry_index(entries: &[Entry]) -> Vec<usize> {
-    let mut index: Vec<_> = (0..entries.len()).collect();
-    index.sort_unstable_by(|&a, &b| entries[a].id.cmp(&entries[b].id).then(a.cmp(&b)));
-    index
+fn entry_index(entries: &[Entry]) -> crate::harness::store::selection::Positions {
+    crate::harness::store::selection::Positions::new(entries.len(), |a, b| entries[a].id.cmp(&entries[b].id))
 }
+
 struct Cached {
     path: PathBuf,
     archive: Arc<Archive>,
@@ -76,12 +77,14 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
         std::env::current_dir()?.join(path)
     };
     for _ in 0..2 {
+        // Taken before the capture: an offset index published below describes this state.
+        let state = offsets_state(&key);
         let source = JsonSource::capture(path)?;
         {
             let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(position) = guard.entries.iter().position(|e| e.path == key) {
                 let hit = guard.entries.remove(position).unwrap();
-                if hit.archive.source.same_identity(&source) {
+                if hit.archive.source == source {
                     let archive = hit.archive.clone();
                     guard.entries.push_back(hit);
                     return Ok(archive);
@@ -89,18 +92,50 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
                 guard.bytes -= hit.archive.charge;
             }
         }
+        // An archive past the roster cache: its offset index, when one describes this state.
+        if let Some(id) = selected {
+            if let Some(offsets) = offsets_record(&key, &state) {
+                let entries: Vec<Entry> = offsets
+                    .payload
+                    .0
+                    .get(id)
+                    .map(|&(offset, len)| Entry {
+                        id: id.to_owned(),
+                        offset,
+                        len,
+                        refs: [None, None],
+                    })
+                    .into_iter()
+                    .collect();
+                let by_id = entry_index(&entries);
+                return Ok(Arc::new(Archive {
+                    source,
+                    entries,
+                    by_id,
+                    charge: 0,
+                    undecodable: false,
+                }));
+            }
+        }
+        // Every conversation's first accepted range, for a selected read's index.
+        let mut offsets: HashMap<String, (u64, u64)> = HashMap::new();
         let mut shapes = [false; 2];
         let mut entries = Vec::new();
         let mut selected_entry = None;
         let mut payload_charge = key.capacity().saturating_add(source.metadata_bytes());
         let mut charge = payload_charge;
         let mut cacheable = true;
-        let scanned = source.read_archive(|values| {
+        #[cfg(test)]
+        SCANS.lock().unwrap().push(key.clone());
+        let scanned = source.read(ReadInput::Document, Validation::Syntax, |values| {
+            let values = values.accepted_array()?;
             for (position, view) in values.into_iter().flatten().enumerate() {
                 let Some(view) = view? else { continue };
                 let Some(record) = Fields::parse(view, CONVERSATION_FIELDS)? else {
                     continue;
                 };
+                // Account archives are assumed uniform: only record zero selects the export
+                // shape. A missing discriminator there leaves the archive unrecognized.
                 if position == 0 {
                     shapes = [record.get("mapping").is_some(), record.get("chat_messages").is_some()];
                 }
@@ -121,6 +156,9 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
                     continue;
                 };
                 let (offset, len) = view.source_range()?.context("export source range")?;
+                if selected.is_some() {
+                    offsets.entry(id.clone()).or_insert((offset, len));
+                }
                 if selected == Some(id.as_str()) && selected_entry.is_none() {
                     // Retain the first accepted duplicate, independent of cache admission. Reads
                     // receive their metadata in SessionRef and do not need unrelated discovery refs.
@@ -161,6 +199,7 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
             }
             Ok(())
         });
+        let mut undecodable = false;
         if let Err(error) = scanned {
             if source.check().is_err() {
                 continue;
@@ -169,10 +208,14 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
                 return Err(error);
             }
             entries.clear();
+            undecodable = true;
         }
         source.check()?;
         if !cacheable && selected.is_some() {
             entries = selected_entry.into_iter().collect();
+            if !undecodable {
+                publish_offsets(&key, state, Offsets(offsets));
+            }
         }
         let by_id = entry_index(&entries);
         let archive = Arc::new(Archive {
@@ -180,6 +223,7 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
             entries,
             by_id,
             charge,
+            undecodable,
         });
         if cacheable && charge <= CACHE_BYTES {
             let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -206,16 +250,113 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
     anyhow::bail!("export changed while reading {}", path.display())
 }
 
-pub(super) fn discover(kind: Kind, paths: Vec<PathBuf>) -> Vec<SessionRef> {
-    let mut out = Vec::new();
+/// Where each conversation of an archive past the roster cache starts and ends (its first
+/// accepted duplicate), from one scan of the archive at one state. Without it every selected read
+/// of such an archive scanned the whole archive again to find its conversation: reading every
+/// conversation of it was quadratic. Kept in this process and as a catalog source record (the
+/// archive-wide consumer `export-offsets`, empty session id), admitted by the archive's identity
+/// like every source record, so a later process reads it without a scan.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Offsets(HashMap<String, (u64, u64)>);
+
+impl crate::source::Payload for Offsets {
+    const TAG: &'static str = "export-offsets";
+}
+
+/// The archive-wide ref an [`Offsets`] record is kept under (whichever export shape reads it).
+fn offsets_ref(key: &Path) -> SessionRef {
+    SessionRef::new(String::new(), Harness::ChatGptExport, key.to_path_buf())
+}
+
+/// The archive's state an [`Offsets`] record is admitted against.
+fn offsets_state(key: &Path) -> crate::source::Baseline {
+    crate::source::Probe::default()
+        .snapshot(&offsets_ref(key))
+        .with_reads(&Default::default())
+}
+
+#[cfg(test)]
+static SCANS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+type OffsetsMemo = Mutex<HashMap<PathBuf, Arc<crate::source::Record<Offsets>>>>;
+static OFFSETS: std::sync::LazyLock<OffsetsMemo> = std::sync::LazyLock::new(Default::default);
+
+/// The [`Offsets`] of the archive at `key` as of `now`: this process's, else the catalog's.
+fn offsets_record(key: &Path, now: &crate::source::Baseline) -> Option<Arc<crate::source::Record<Offsets>>> {
+    let mut probe = crate::source::Probe::default();
+    let memo = OFFSETS.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned();
+    if let Some(record) = memo.filter(|record| record.admit(now, &mut probe).is_some()) {
+        return Some(record);
+    }
+    #[cfg(feature = "sqlite")]
+    {
+        let stored = crate::discover_cache::read::Context::current()
+            .with_connection(|conn| {
+                crate::source::record_in::<Offsets>(conn, <Offsets as crate::source::Payload>::TAG, &offsets_ref(key))
+            })
+            .flatten()
+            .filter(|record| record.admit(now, &mut probe).is_some())?;
+        let record = Arc::new(stored);
+        OFFSETS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_path_buf(), record.clone());
+        Some(record)
+    }
+    #[cfg(not(feature = "sqlite"))]
+    None
+}
+
+/// Keep `offsets`, scanned from the archive at `state`, in this process and the catalog; the
+/// publisher rechecks the archive's identity, and a frozen or unavailable catalog keeps none.
+fn publish_offsets(key: &Path, state: crate::source::Baseline, offsets: Offsets) {
+    #[cfg(feature = "sqlite")]
+    crate::discover_cache::read::Context::current().with_connection_mut(|conn| {
+        let mut publish = || -> Result<()> {
+            let tx = conn.transaction()?;
+            let mut probe = crate::source::Probe::default();
+            crate::source::publish_in(
+                &tx,
+                <Offsets as crate::source::Payload>::TAG,
+                &offsets_ref(key),
+                &state,
+                &offsets,
+                &mut probe,
+            )?;
+            tx.commit()?;
+            Ok(())
+        };
+        if let Err(error) = publish() {
+            crate::env::warn_once("the export offset catalog", error);
+        }
+    });
+    OFFSETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_path_buf(), Arc::new(crate::source::Record::new(state, offsets)));
+}
+
+/// Every conversation of `kind` in the archives at `paths`; an archive that cannot be read or
+/// decoded is a reported skip.
+pub(super) fn discover(kind: Kind, paths: Vec<PathBuf>) -> crate::Discovered {
+    let mut out = crate::Discovered::default();
     let mut seen = std::collections::HashSet::new();
     for path in paths {
-        let Ok(archive) = load(&path, None) else { continue };
+        let Some(archive) = out.keep(&path, load(&path, None)) else {
+            continue;
+        };
+        if archive.undecodable {
+            out.skipped.push(crate::Skipped {
+                path: path.clone(),
+                why: "not a JSON export archive".into(),
+            });
+            continue;
+        }
         for r in archive.entries.iter().filter_map(|e| e.refs[slot(kind)].as_ref()) {
             if seen.insert(r.id.clone()) {
                 let mut r = r.clone();
                 r.path = path.clone();
-                out.push(r);
+                out.refs.push(r);
             }
         }
     }
@@ -236,6 +377,15 @@ const CONVERSATION_FIELDS: &[&str] = &[
     "current_node",
     "default_model_slug",
 ];
+fn role_from_str(s: &str) -> Role {
+    match s {
+        "user" | "human" => Role::User,
+        "assistant" => Role::Assistant,
+        "tool" => Role::Tool,
+        _ => Role::System,
+    }
+}
+
 fn view_ref(kind: Kind, path: &Path, r: &Fields<'_>, id: &str) -> Result<SessionRef> {
     let title = r
         .string(if kind == Kind::ChatGpt { "title" } else { "name" })?
@@ -263,7 +413,7 @@ fn view_ref(kind: Kind, path: &Path, r: &Fields<'_>, id: &str) -> Result<Session
         title,
         created_at: timestamp("create_time", "created_at")?,
         updated_at: timestamp("update_time", "updated_at")?,
-        message_count,
+        message_count: Some(message_count),
         ..SessionRef::new(id, kind.harness(), path.to_path_buf())
     })
 }
@@ -355,7 +505,7 @@ fn node_role(kind: Kind, view: JsonView<'_>) -> Result<Option<String>> {
     };
     author.string("role")
 }
-pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
     let archive = load(&r.path, Some(&r.id))?;
     let entry = archive
         .entry(&r.id)
@@ -363,10 +513,8 @@ pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &ParseOptions, sink: &mut
     // Cached archives own metadata only. Generated multipart backing belongs to this read,
     // not to the cache's JsonSource/arena and its uncharged lifetime.
     let source = JsonSource::capture(&r.path)?;
-    anyhow::ensure!(
-        source.same_identity(&archive.source),
-        "export source changed before selected read"
-    );
+    // `JsonSource` equality is identity: the same path carrying the same captured bytes.
+    anyhow::ensure!(source == archive.source, "export source changed before selected read");
     let value = source.validated_range(entry.offset, entry.len)?;
     value.with_view(|view| {
         let conv = Fields::parse(view, CONVERSATION_FIELDS)?.context("export conversation is not an object")?;
@@ -409,34 +557,17 @@ pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &ParseOptions, sink: &mut
         }
         sink.meta(&session);
         let mut calls = HashMap::new();
-        let mut has_sources = false;
         for view in nodes.iter()? {
             if let Some(message) = build_message(kind, view?, opts.spans, &source, &resolver, &mut calls)? {
-                let sourced = message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        Block::ToolUse {
-                            input: crate::Json::Source(_),
-                            ..
-                        }
-                    )
-                });
-                has_sources |= sourced;
-                if sourced {
-                    archive.source.check()?;
-                }
+                let started = std::time::Instant::now();
                 let flow = sink.try_message(message)?;
-                if sourced {
-                    archive.source.check()?;
-                }
+                archive.source.check_after(started)?;
                 if flow == Flow::Stop {
                     break;
                 }
             }
         }
-        if has_sources {
-            archive.source.check()?;
-        }
+
         Ok(session)
     })
 }
@@ -474,7 +605,7 @@ fn claude_message(view: JsonView<'_>, spans: bool) -> Result<Option<Message>> {
                 &anthropic::CLAUDE_AI,
                 spans,
                 &mut |v| v.lazy_text(spans),
-                if spans { 0 } else { u64::MAX },
+                crate::harness::wire::joined_over(spans),
             )?
             else {
                 continue;
@@ -746,14 +877,69 @@ mod tests {
         assert!(archive.entry("conversation-2048-extra").is_none());
         assert!(archive.entry("before-all").is_none());
         assert!(archive.entry("zzz-after-all").is_none());
-        // Cache hits reuse the charged index, and freshness still rejects changed archives.
-        assert!(Arc::ptr_eq(&archive, &load(&path, Some("conversation-2048"))?));
+        // Selection keeps the first duplicate even if another reader evicts the shared cache.
+        let selected = load(&path, Some("conversation-2048"))?;
+        let expected = archive.entry("conversation-2048").unwrap();
+        let actual = selected.entry("conversation-2048").unwrap();
+        assert_eq!((actual.offset, actual.len), (expected.offset, expected.len));
+        // Freshness still rejects changed archives.
         std::fs::write(&path, b"[]")?;
         assert!(archive.source.check().is_err());
         assert!(load(&path, Some("conversation-2048"))?
             .entry("conversation-2048")
             .is_none());
         Ok(())
+    }
+
+    /// Reading every conversation of an archive past the roster cache scans it once: the first
+    /// selected read leaves the offset index, in this process and the catalog, that every later
+    /// read (another process's too) finds its conversation by. A changed archive scans again.
+    #[test]
+    fn selected_reads_past_the_roster_cache_scan_the_archive_once() {
+        let world = crate::test_world("export-offsets");
+        let context = crate::discover_cache::read::Context::current();
+        let _scope = context.enter();
+        let path = world.base.join("conversations.json");
+        let write = |n: usize| {
+            let values: Vec<_> = (0..n)
+                .map(|i| serde_json::json!({"uuid":format!("c{i}"),"chat_messages":[{"sender":"human","text":format!("body {i}")}]}))
+                .collect();
+            std::fs::write(&path, serde_json::to_vec(&values).unwrap()).unwrap();
+        };
+        let scans = || {
+            let mut all = SCANS.lock().unwrap();
+            let mine = all.iter().filter(|p| **p == path).count();
+            all.retain(|p| *p != path);
+            mine
+        };
+        let range = |id: &str| {
+            let archive = load_bounded(&path, Some(id), 1024).unwrap();
+            archive.entry(id).map(|e| (e.offset, e.len))
+        };
+        write(64);
+        let expected: Vec<_> = (0..64)
+            .map(|i| {
+                load(&path, None)
+                    .unwrap()
+                    .entry(&format!("c{i}"))
+                    .map(|e| (e.offset, e.len))
+            })
+            .collect();
+        // Only the oversized path is under test: no roster in this process's cache.
+        *CACHE.get_or_init(Mutex::default).lock().unwrap() = Cache::default();
+        scans();
+        for (i, expected) in expected.iter().enumerate() {
+            assert_eq!(range(&format!("c{i}")), *expected);
+        }
+        assert_eq!(range("absent"), None);
+        assert_eq!(scans(), 1);
+        // Another process: the catalog's record, no scan.
+        OFFSETS.lock().unwrap().clear();
+        assert_eq!(range("c7"), expected[7]);
+        assert_eq!(scans(), 0);
+        write(65);
+        assert!(range("c64").is_some());
+        assert_eq!(scans(), 1);
     }
 
     #[test]
@@ -791,7 +977,7 @@ mod tests {
         let mut sink = crate::stream::CollectSink::default();
         std::fs::write(&path, format!("[{first},]")).unwrap();
         let r = SessionRef::new("target", Harness::ClaudeExport, path.clone());
-        assert!(stream(Kind::Claude, &r, &ParseOptions::lazy(), &mut sink).is_err());
+        assert!(stream(Kind::Claude, &r, &Demand::LEAN.with_spans(), &mut sink).is_err());
         assert!(
             sink.messages.is_empty(),
             "whole archive syntax must pass before callbacks"

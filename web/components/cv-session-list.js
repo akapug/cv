@@ -13,10 +13,9 @@
 //     <ul> is stretched to the height the whole result set would occupy and each live row is
 //     placed at its own offset, so the scrollbar still measures the corpus, not the window.
 //
-//  2. It searches two different ways and says which. With a daemon, `/api/search` reads every
-//     message in the archive. Without one (the static demo, an older server), all this page has is
-//     the metadata stubs it downloaded, so it filters those — which cannot match a message it
-//     never had. The placeholder names whichever is true.
+//  2. It searches two different ways and says which. With a usable index, `/api/search` matches
+//     the live corpus's exchange. Otherwise it filters downloaded metadata and loaded messages,
+//     which cannot match content it never received. The placeholder names whichever is true.
 import {
   esc, fmtTime, sortTime, searchableText, sessionLabel, shortPath, msgCount, harnessBadge,
   truncate, normalizeSession, HARNESS_LABELS, sessionKey, sessionByKey,

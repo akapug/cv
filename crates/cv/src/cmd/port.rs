@@ -1,32 +1,27 @@
+//! `cv port` / `cv resume` — producing a copy of a session that runs elsewhere (another harness,
+//! another working directory, or both), and launching one in its native harness.
+//!
+//! `--harness` picks the target harness (default: the source's) and `--cwd` the new home.
+//! The source is never touched.
+//!
 //! Claude replay `--thinking` defaults to native when every recorded model is `claude-*` and to
 //! portable otherwise. Portable turns thinking plaintext into ordinary text, removes reasoning that
 //! has no plaintext (signature-only, redacted), and gives illegal tool IDs one collision-free
 //! mapping at both endpoints. The source remains unchanged. Native preserves archival format
 //! fidelity, including provider signatures and identifiers. Other targets use the text policy in
 //! portable mode.
-//! `cv port` / `cv resume` — producing a copy of a session that runs elsewhere (another harness,
-//! another working directory, or both), and launching one in its native harness.
-//!
-//! `port` is the one verb for "make this session runnable somewhere else": 0.10's `convert` (same
-//! place, different harness) and `port` (different place) were the same act, so `--harness` picks
-//! the target harness (default: the source's) and `--cwd` the new home. The source is never touched.
 
-use crate::util::{home_rel, parse_harness, resolve, usage};
+use crate::util::{home_rel, parse_harness, resolve, shell_quote, usage};
 use anyhow::{bail, Context, Result};
-use cv_core::ir::{Harness, Session, SessionRef};
-use cv_core::{Adapter, EmitOptions};
+use cv_core::harness::claude::skills::SkillsPolicy;
+use cv_core::ir::{Harness, Session};
+use cv_core::EmitOptions;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Parse a session at the fidelity the port needs. Same-harness (a pure rehome) parses
-/// **format-complete** so the carrier/replay machinery preserves every record (meta lines, compact
-/// boundaries, exhaustive `extra`) — the emitter replays them verbatim. Cross-harness sticks to the
-/// plain full-fidelity parse: carriers hold *source*-native records that no other emitter can
-/// replay (they'd just surface as empty turns).
-fn parse_for_emit(adapter: &dyn Adapter, r: &SessionRef, to_h: Harness) -> Result<Session> {
-    cv_core::emit::parse_for_emit(adapter, r, to_h)
-}
+use cv_core::emit::parse_for_emit;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_port(
     id: &str,
     harness: Option<String>,
@@ -35,6 +30,7 @@ pub(crate) fn cmd_port(
     no_context: bool,
     strict: bool,
     thinking: Option<cv_core::emit::ThinkingMode>,
+    skills_policy: SkillsPolicy,
 ) -> Result<()> {
     // The source harness rides on the id (`codex:019e…`); `--harness` is the TARGET.
     let (r, adapter) = resolve(id, None)?;
@@ -42,6 +38,12 @@ pub(crate) fn cmd_port(
         Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
         None => r.harness, // a pure rehome
     };
+    if skills_policy != SkillsPolicy::Keep && !cv_core::harness::has_derived_copies(to_h) {
+        return usage(format!(
+            "--skills {} requires a Claude target (target: {to_h})",
+            skills_policy.as_str()
+        ));
+    }
     let session = parse_for_emit(adapter.as_ref(), &r, to_h)?;
     let thinking = thinking.unwrap_or_else(|| {
         cv_core::emit::ThinkingMode::replay_default(
@@ -53,7 +55,7 @@ pub(crate) fn cmd_port(
         )
     });
     let new_cwd = cwd.clone();
-    emit_session(
+    let written = emit_session(
         &session,
         to_h,
         out,
@@ -61,9 +63,19 @@ pub(crate) fn cmd_port(
             new_cwd: cwd,
             strict,
             thinking,
+            parsed_at: cv_core::emit::ParsedAt::for_port(r.harness, to_h),
             ..Default::default()
         },
     )?;
+
+    if skills_policy != SkillsPolicy::Keep {
+        use cv_core::harness::claude::skills::{config_dir_of, rewrite_file};
+        let config = config_dir_of(&written).or_else(|| config_dir_of(&r.path));
+        let report = rewrite_file(&written, skills_policy, config.as_deref())?;
+        let mut h = String::new();
+        crate::cmd::reshape::skills_line(&mut h, &report);
+        print!("{h}");
+    }
 
     // Carry the project's context files to the new home, so the ported session keeps its memory.
     if !no_context {
@@ -97,13 +109,14 @@ fn carry_context(src: &Path, dst: &Path) {
             continue;
         }
         let to = dst.join(name);
+        let already_exists = || eprintln!("  ↳ context: {name} already exists at target — left as-is");
         if to.exists() {
-            eprintln!("  ↳ context: {name} already exists at target — left as-is");
+            already_exists();
             continue;
         }
         match fs::create_dir_all(dst).and_then(|_| copy_context_if_absent(&from, &to)) {
             Ok(Some(_)) => copied.push(*name),
-            Ok(None) => eprintln!("  ↳ context: {name} already exists at target — left as-is"),
+            Ok(None) => already_exists(),
             Err(e) => eprintln!("  ↳ context: couldn't copy {name}: {e}"),
         }
     }
@@ -131,7 +144,22 @@ fn copy_context_if_absent(from: &Path, to: &Path) -> std::io::Result<Option<u64>
     }
 }
 
-pub(crate) fn emit_session(session: &Session, to_h: Harness, out: Option<PathBuf>, opts: EmitOptions) -> Result<()> {
+pub(crate) fn emit_session(
+    session: &Session,
+    to_h: Harness,
+    out: Option<PathBuf>,
+    opts: EmitOptions,
+) -> Result<PathBuf> {
+    emit_session_output(session, to_h, out, opts, false)
+}
+
+pub(crate) fn emit_session_output(
+    session: &Session,
+    to_h: Harness,
+    out: Option<PathBuf>,
+    opts: EmitOptions,
+    json: bool,
+) -> Result<PathBuf> {
     if !cv_core::emit::supported_targets().contains(&to_h) {
         // A caller mistake, not a failure (exit 2): the source parsed, the target cannot be written.
         return usage(format!(
@@ -153,14 +181,22 @@ pub(crate) fn emit_session(session: &Session, to_h: Harness, out: Option<PathBuf
     // Verified emit: after writing, re-parse the output with the target's own adapter and diff it
     // against the source IR, so a lossy conversion is *visible* instead of silent.
     let (res, warnings) = cv_core::emit::emit_verified(session, to_h, &out_dir, &opts)?;
-    println!("✦ wrote {} ({})", res.path.display(), res.new_id);
-    if let Some(hint) = res.resume_hint {
-        println!("  ↳ {hint}");
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"path": res.path, "id": res.new_id, "harness": to_h,
+            "resume_hint": res.resume_hint, "warnings": warnings})
+        );
+    } else {
+        println!("✦ wrote {} ({})", res.path.display(), res.new_id);
+        if let Some(hint) = res.resume_hint {
+            println!("  ↳ {hint}");
+        }
     }
     for w in &warnings {
         eprintln!("  ⚠ lossy: {w}");
     }
-    Ok(())
+    Ok(res.path)
 }
 
 // ---------- resume ----------
@@ -211,7 +247,8 @@ pub(crate) fn resume_lines(h: Harness, id: &str, cwd: Option<&Path>) -> Vec<Stri
 }
 
 /// Best-known resume incantation per harness: the program + its args (the cwd is handled
-/// separately, since most harnesses resume relative to the directory they're launched in).
+/// separately, since most harnesses resume relative to the directory they're launched in). A
+/// per-harness table, so a new harness states its own.
 fn resume_command(h: Harness, id: &str) -> (String, Vec<String>) {
     match h {
         Harness::Claude => ("claude".into(), vec!["--resume".into(), id.into()]),
@@ -227,24 +264,21 @@ fn resume_command(h: Harness, id: &str) -> (String, Vec<String>) {
         Harness::KimiCode => ("kimi".into(), vec!["--session".into(), format!("session_{id}")]),
         Harness::Qwen => ("qwen".into(), vec!["--resume".into(), id.into()]),
         Harness::Devin => ("devin".into(), vec!["--resume".into(), id.into()]),
-        // Desktop/IDE apps (and any future harness) have no documented CLI resume.
-        _ => (
+        // Desktop/IDE apps, Goose, the account exports and OpenSession documents have no
+        // documented CLI resume.
+        Harness::Cursor
+        | Harness::LmStudio
+        | Harness::Cline
+        | Harness::Roo
+        | Harness::Continue
+        | Harness::Goose
+        | Harness::Zed
+        | Harness::ChatGptExport
+        | Harness::ClaudeExport
+        | Harness::OpenSession => (
             format!("# no CLI resume for {h}; open the app and find the session"),
             vec![id.into()],
         ),
-    }
-}
-
-pub(crate) fn shell_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".into();
-    }
-    if s.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+' | b':' | b'@'))
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
     }
 }
 

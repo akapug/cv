@@ -1,12 +1,16 @@
 //! The Claude record codec: one validated record view and the reader's demand in, session facts
 //! and at most one IR message out. Every byte source feeds this one function: mapped lines,
 //! positioned records and parsed strings differ only in the [`JsonView`] they hand it. A demand
-//! (`ParseOptions` plus the sink's projection) chooses which fields are resolved, never which code
+//! (`crate::stream::Demand` plus the sink's projection) chooses which fields are resolved, never which code
 //! runs; a field nobody asked for is skipped by the view, not decoded and dropped.
 
+use super::notification::NotificationSummary;
 use super::*;
 use crate::harness::store::document::Fields;
 use crate::json::JsonView;
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
+use crate::stream::Tier;
 
 /// Every top-level key any record kind reads. One selection pass per record; a field is
 /// resolved only by the branch that needs it.
@@ -41,6 +45,9 @@ const TOP: &[&str] = &[
     "tag",
     "relocatedCwd",
     "continuedInSessionId",
+    "parentSessionId",
+    "parentLastUuid",
+    "contextLength",
     "prUrl",
     "attachment",
     "rendered",
@@ -57,6 +64,10 @@ const TOP: &[&str] = &[
     "hookAdditionalContext",
     "level",
     "cause",
+    "retryAttempt",
+    "maxRetries",
+    "retryInMs",
+    "source",
     "slug",
     "logicalParentUuid",
     "stopReason",
@@ -72,6 +83,7 @@ const TOP: &[&str] = &[
     "version",
     "parentToolUseID",
     "sourceToolAssistantUUID",
+    "sourceToolUseID",
     "attributionAgent",
     "attributionMcpServer",
     "attributionMcpTool",
@@ -85,6 +97,12 @@ const SYSTEM_EXTRA: &[&str] = &[
     "compactMetadata",
     "cause",
     "error",
+    // A retried request (2.1.302+ `api_error` with `source: request_retry`): which attempt, of how
+    // many, and the back-off before it.
+    "retryAttempt",
+    "maxRetries",
+    "retryInMs",
+    "source",
     "isMeta",
     "isSidechain",
     "agentId",
@@ -108,23 +126,473 @@ const SYSTEM_EXTRA: &[&str] = &[
     "direction",
 ];
 
+#[derive(Clone, Copy)]
+pub(crate) enum Demand {
+    Message,
+    Metadata,
+    /// The decision facts of [`Facts`].
+    Facts,
+    /// A compaction boundary's `subtype` and `compactMetadata`.
+    Compact,
+    /// The `message` whose role, text and tool calls the workflow readers mine.
+    Tools,
+}
+
+/// A read's tier picks the head: [`Tier::Discovery`] selects the listing keys, every other tier
+/// the message keys. Facts, Compact and Tools are the reshape readers' own selections.
+impl From<&crate::stream::Demand> for Demand {
+    fn from(demand: &crate::stream::Demand) -> Self {
+        if demand.tier == Tier::Discovery {
+            Demand::Metadata
+        } else {
+            Demand::Message
+        }
+    }
+}
+
+/// One shared selection/type parse for metadata and message demands. Fields are lazy views;
+/// discovery never constructs a message or resolves bodies, rich extras or tool arguments.
+pub(crate) struct Head<'a> {
+    pub(crate) top: Fields<'a>,
+    pub(crate) ty: String,
+}
+
+impl<'a> Head<'a> {
+    pub(crate) fn parse(view: JsonView<'a>, demand: Demand) -> Result<Option<Self>> {
+        let keys = match demand {
+            Demand::Message => TOP,
+            Demand::Facts => FACT_KEYS,
+            Demand::Compact => &["type", "subtype", "compactMetadata"],
+            Demand::Tools => &["type", "timestamp", "message"],
+            // The listing keys, then the rest of what [`counts_as_turn`] decides on.
+            Demand::Metadata => &[
+                "type",
+                "version",
+                "cwd",
+                "timestamp",
+                "customTitle",
+                "aiTitle",
+                "message",
+                "isApiErrorMessage",
+                "isCompactSummary",
+                "isMeta",
+                "scheduledTaskId",
+                "scheduledFireId",
+                "turnOrigin",
+                "origin",
+            ],
+        };
+        let Some(top) = Fields::parse(view, keys)? else {
+            return Ok(None);
+        };
+        let ty = top.string("type")?.unwrap_or_default();
+        Ok(Some(Self { top, ty }))
+    }
+}
+
+/// Every record type the codec knows is no conversational turn: the titles (`summary`,
+/// `ai-title`, `custom-title`), the session facts (`continued-in`, `fork-context-ref`,
+/// `agent-name`, `tag`, `relocated`, `pr-link`), model-visible `attachment`s, and pure
+/// bookkeeping / live-process records with no conversational payload: the input queue,
+/// UI/permission state, the leaf pointer, sub-agent hook/streaming telemetry, running cost, the
+/// ATIS and isolation latches, artifact watches, request-side content replacements, and the
+/// request ledger (2.1.300+: `api-request` per API call, with its `api-request-shape` system
+/// prompt + tool schemas and `api-request-blob` messages, content-addressed; a blob's `message`
+/// is a request body, not a turn). Only `user`, `assistant` and `system` records are turns.
+pub(crate) const META_TYPES: &[&str] = &[
+    "summary",
+    "ai-title",
+    "custom-title",
+    "continued-in",
+    "fork-context-ref",
+    "agent-name",
+    "tag",
+    "relocated",
+    "pr-link",
+    "attachment",
+    "mode",
+    "permission-mode",
+    "last-prompt",
+    "progress",
+    "started",
+    "result",
+    "queue-operation",
+    "x-quota",
+    "file-history-snapshot",
+    "cost-state",
+    "atis-latch",
+    "isolation-latch",
+    "frame-link",
+    "content-replacement",
+    "artifact-comment-monitor",
+    "artifact-autoreact-ledger",
+    "api-request",
+    "api-request-shape",
+    "api-request-blob",
+];
+
+/// The keys [`Demand::Facts`] selects: what prune, rewind, fork recognition and the resumability
+/// check decide on, never a body.
+const FACT_KEYS: &[&str] = &[
+    "type",
+    "subtype",
+    "isSidechain",
+    "agentId",
+    "isApiErrorMessage",
+    "sessionId",
+    "cwd",
+    "timestamp",
+    "uuid",
+    "parentUuid",
+    "logicalParentUuid",
+    "_cv_orig_ctx",
+    "message",
+    "compactMetadata",
+    "toolUseResult",
+    "rendered",
+];
+
+/// One content block's identity, at its position in `message.content` (a non-object element
+/// keeps its slot with every field `None`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FactBlock {
+    pub ty: Option<String>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub tool_use_id: Option<String>,
+}
+
+/// A record's decision facts, typed: what `cv prune` and `cv rewind` select on, and what a fork's
+/// head is recognized by ([`super::fork`]). Strings are
+/// `Some` only when the record holds a string there; flags are `true` only for a JSON `true`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Facts {
+    /// `type`, or empty when absent or not a string.
+    pub ty: String,
+    pub subtype: Option<String>,
+    pub sidechain: bool,
+    /// `agentId`: the sub-agent a sidechain record belongs to.
+    pub agent_id: Option<String>,
+    pub api_error: bool,
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    /// `timestamp`, as recorded.
+    pub timestamp: Option<String>,
+    pub uuid: Option<String>,
+    /// `parentUuid`: `None` when the key is absent, `Some(None)` when it is null or not a string.
+    pub parent: Option<Option<String>>,
+    pub logical_parent: Option<String>,
+    /// `message` is an object (a turn with a body).
+    pub message: bool,
+    /// `message.id`: one API response split over several records shares it.
+    pub message_id: Option<String>,
+    pub model: Option<String>,
+    /// The context size `message.usage` records, read the way Claude Code reads it
+    /// ([`usage_context`]); `None` without a usage object.
+    pub usage_in: Option<u64>,
+    pub blocks: Vec<FactBlock>,
+    /// `compactMetadata.preservedSegment.headUuid`.
+    pub compact_head: Option<String>,
+    /// `_cv_orig_ctx`: the recorded context size a `cv prune --revive` replaced in `usage`.
+    pub orig_ctx: Option<u64>,
+    /// Byte spans of the `sessionId`/`session_id` strings a restamp rewrites.
+    pub ids: Vec<(u64, u64)>,
+}
+
+/// The body views a [`Facts`] read leaves in the source, for a consumer that prices them.
+#[derive(Default)]
+pub(crate) struct Body<'a> {
+    pub content: Option<JsonView<'a>>,
+    pub tool_use_result: Option<JsonView<'a>>,
+    pub rendered: Option<JsonView<'a>>,
+    /// The `content` of each `tool_result` block, in order.
+    pub results: Vec<JsonView<'a>>,
+}
+
+impl Facts {
+    /// A main-thread conversational turn: `Some(is_user)`, `None` for bookkeeping, sub-agent
+    /// lines and synthetic notices ([`is_turn`]).
+    pub(crate) fn turn_kind(&self) -> Option<bool> {
+        if self.sidechain || !is_turn(&self.ty, self.api_error, self.model.as_deref()) {
+            return None;
+        }
+        Some(self.ty == "user")
+    }
+
+    /// The record's place in the conversation tree: `None` when it records no `parentUuid`,
+    /// else the parent (`parentUuid`, or `logicalParentUuid` across a compaction) if it has one.
+    pub(crate) fn link(&self) -> Option<Option<&str>> {
+        let parent = self.parent.as_ref()?;
+        Some(parent.as_deref().or(self.logical_parent.as_deref()))
+    }
+
+    pub(crate) fn is_compact_boundary(&self) -> bool {
+        self.ty == "system" && self.subtype.as_deref() == Some("compact_boundary")
+    }
+
+    /// Facts and body views of one record. A record that is not an object has no facts but its
+    /// id spans (a positional `["<id>"]` row is restamped like a keyed one).
+    pub(crate) fn parse(view: JsonView<'_>) -> Result<(Self, Body<'_>)> {
+        let ids = crate::restamp::source_id_spans(view, super::IDENTITY.session_keys)?;
+        let Some(Head { top, ty }) = Head::parse(view, Demand::Facts)? else {
+            return Ok((Self { ids, ..Self::default() }, Body::default()));
+        };
+        let flag =
+            |key: &str| -> Result<bool> { Ok(top.get(key).map(|v| v.as_bool()).transpose()?.flatten() == Some(true)) };
+        let number = |key: &str| -> Result<Option<u64>> {
+            Ok(top
+                .get(key)
+                .map(|v| v.as_number())
+                .transpose()?
+                .flatten()
+                .and_then(|n| n.as_u64()))
+        };
+        let mut facts = Self {
+            ty,
+            subtype: top.string("subtype")?,
+            sidechain: flag("isSidechain")?,
+            agent_id: top.string("agentId")?,
+            api_error: flag("isApiErrorMessage")?,
+            session_id: top.string("sessionId")?,
+            cwd: top.string("cwd")?,
+            timestamp: top.string("timestamp")?,
+            uuid: top.string("uuid")?,
+            parent: match top.get("parentUuid") {
+                Some(_) => Some(top.string("parentUuid")?),
+                None => None,
+            },
+            logical_parent: top.string("logicalParentUuid")?,
+            orig_ctx: number("_cv_orig_ctx")?,
+            ids,
+            ..Self::default()
+        };
+        let mut body = Body {
+            tool_use_result: top.get("toolUseResult"),
+            rendered: top.get("rendered"),
+            ..Body::default()
+        };
+        if let Some(message) = top
+            .get("message")
+            .map(|m| Fields::parse(m, &["id", "model", "usage", "content"]))
+            .transpose()?
+            .flatten()
+        {
+            facts.message = true;
+            facts.message_id = message.string("id")?;
+            facts.model = message.string("model")?;
+            facts.usage_in = message.get("usage").map(usage_context).transpose()?.flatten();
+            body.content = message.get("content");
+            if let Some(blocks) = body.content.map(|c| c.array()).transpose()?.flatten() {
+                for block in blocks {
+                    let block = Fields::parse(block?, &["type", "id", "name", "tool_use_id", "content"])?;
+                    facts.blocks.push(match block {
+                        Some(b) => {
+                            let ty = b.string("type")?;
+                            if ty.as_deref() == Some("tool_result") {
+                                body.results.extend(b.get("content"));
+                            }
+                            FactBlock {
+                                ty,
+                                id: b.string("id")?,
+                                name: b.string("name")?,
+                                tool_use_id: b.string("tool_use_id")?,
+                            }
+                        }
+                        None => FactBlock::default(),
+                    });
+                }
+            }
+        }
+        if let Some(head) = top
+            .get("compactMetadata")
+            .map(|v| v.get("preservedSegment"))
+            .transpose()?
+            .flatten()
+            .map(|v| Fields::parse(v, &["headUuid"]))
+            .transpose()?
+            .flatten()
+        {
+            facts.compact_head = head.string("headUuid")?;
+        }
+        Ok((facts, body))
+    }
+}
+
+/// Who wrote a `user` record: the scheduler, the harness (`isMeta`, or an `origin.kind` other
+/// than `human`), or the person.
+fn user_origin(top: &Fields<'_>) -> Result<Origin> {
+    let scheduled = top.get("scheduledTaskId").is_some()
+        || top.get("scheduledFireId").is_some()
+        || top.string("turnOrigin")?.as_deref() == Some("scheduled");
+    let origin_kind = match top.get("origin") {
+        Some(origin) => origin
+            .get("kind")?
+            .filter(|v| v.may_be_string())
+            .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
+            .transpose()?,
+        None => None,
+    };
+    let is_meta = top.get("isMeta").map(|v| v.as_bool()).transpose()?.flatten() == Some(true);
+    Ok(user_origin_from(scheduled, is_meta, origin_kind.as_deref()))
+}
+
+/// Whether a record is a conversational turn ([`Message::is_turn`]), decided from its head
+/// without building the message: what [`Record::conversation`] classifies a typed prompt or a
+/// model reply. A `user` record carrying only tool results is a Tool turn, an injected one
+/// (`isMeta`, a harness origin, an interrupt marker), a compaction summary or a slash command
+/// is not; neither is a record without a `message` or an assistant client-side notice. `top`
+/// selects `message`, `isApiErrorMessage`, `isCompactSummary`, `isMeta`, `scheduledTaskId`,
+/// `scheduledFireId`, `turnOrigin` and `origin`. Reads only the first 64 characters of a user record's leading text, and the `type` of each block.
+pub(crate) fn counts_as_turn(top: &Fields<'_>, ty: &str) -> Result<bool> {
+    let role = match ty {
+        "user" => Role::User,
+        "assistant" => Role::Assistant,
+        _ => return Ok(false),
+    };
+    let Some(message) = top.get("message") else {
+        return Ok(false);
+    };
+    let body = Fields::parse(message, &["model", "content"])?;
+    if role == Role::Assistant {
+        let api_error = top.get("isApiErrorMessage").map(|v| v.as_bool()).transpose()?.flatten() == Some(true);
+        let model = body.as_ref().map_or(Ok(None), |b| b.string("model"))?;
+        return Ok(is_turn(ty, api_error, model.as_deref()));
+    }
+    if top.get("isCompactSummary").map(|v| v.as_bool()).transpose()?.flatten() == Some(true) {
+        return Ok(false);
+    }
+    // Every other harness-written user record is injected context or a sub-agent's return.
+    let origin = user_origin(top)?;
+    if origin == Origin::Harness {
+        return Ok(false);
+    }
+    let mut head = String::new();
+    match body.as_ref().and_then(|b| b.get("content")) {
+        Some(content) if content.is_string()? => {
+            head = string_head(content, 64)?;
+            if head.starts_with("<command-name>") || head.starts_with("<local-command-stdout>") {
+                return Ok(false);
+            }
+        }
+        Some(content) => {
+            if anthropic::only_tool_results(Some(content), |item| anthropic::block_kind(item, &anthropic::ANTHROPIC))? {
+                return Ok(false);
+            }
+            if let Some(first) = content.array()?.and_then(|mut items| items.next()).transpose()? {
+                if let Some(text) = first.get("text")?.filter(|v| v.may_be_string()) {
+                    head = string_head(text, 64)?;
+                }
+            }
+        }
+        None => {}
+    }
+    Ok(user_kind_from_head(origin, &head).0 == MessageKind::Prompt)
+}
+
+/// A conversational turn by type: a user record, or an assistant record that is not one of
+/// Claude Code's client-side notices (`isApiErrorMessage`, or the `<synthetic>` model).
+pub(crate) fn is_turn(ty: &str, api_error: bool, model: Option<&str>) -> bool {
+    match ty {
+        "user" => true,
+        "assistant" => !api_error && model != Some(SYNTHETIC_MODEL),
+        _ => false,
+    }
+}
+
+/// The three context-bearing counters of a `usage` object (input plus both cache buckets).
+pub(crate) const USAGE_CTX_KEYS: [&str; 3] = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
+
+/// The context-token count of a `usage` object, read the way Claude Code reads it. Since 2.1.277
+/// Claude Code sizes the loaded context from `usage.iterations` when present: the LAST iteration
+/// that is not an auxiliary request (`advisor_message`/`compaction`), when it is a well-formed
+/// request iteration (`message`/`fallback_message`, all four counts present, non-zero context);
+/// the top-level counters otherwise, and zero when they are zero. `None` for a non-object.
+pub(crate) fn usage_context(usage: JsonView<'_>) -> Result<Option<u64>> {
+    const ITERATION: &[&str] = &[
+        "type",
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+    ];
+    let Some(fields) = Fields::parse(
+        usage,
+        &[
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "iterations",
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    let count = |fields: &Fields<'_>, key: &str| -> Result<Option<u64>> {
+        Ok(fields
+            .get(key)
+            .map(|v| v.as_number())
+            .transpose()?
+            .flatten()
+            .and_then(|n| n.as_u64()))
+    };
+    let context = |fields: &Fields<'_>| -> Result<u64> {
+        let mut sum = 0u64;
+        for key in USAGE_CTX_KEYS {
+            sum += count(fields, key)?.unwrap_or(0);
+        }
+        Ok(sum)
+    };
+    let top = context(&fields)?;
+    if top == 0 {
+        return Ok(Some(0));
+    }
+    // The last non-auxiliary iteration; a non-object one is last too, and never a request.
+    let mut last: Option<Option<Fields<'_>>> = None;
+    if let Some(iterations) = fields.get("iterations").map(|v| v.array()).transpose()?.flatten() {
+        for iteration in iterations {
+            let Some(it) = Fields::parse(iteration?, ITERATION)? else {
+                last = Some(None);
+                continue;
+            };
+            if matches!(it.string("type")?.as_deref(), Some("advisor_message" | "compaction")) {
+                continue;
+            }
+            last = Some(Some(it));
+        }
+    }
+    if let Some(Some(it)) = last {
+        let request = matches!(it.string("type")?.as_deref(), Some("message" | "fallback_message"));
+        let mut counted = true;
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ] {
+            counted &= count(&it, key)?.is_some();
+        }
+        let sum = context(&it)?;
+        if request && counted && sum > 0 {
+            return Ok(Some(sum));
+        }
+    }
+    Ok(Some(top))
+}
+
 /// One record: update `session` and hand its message (if any) to `sink`. `at` is the record's
-/// byte offset when the source has one. `sourced` is set when the delivered message holds a
-/// source descriptor, which obliges the reader to recheck the source before going on. Errors
+/// byte offset when the source has one. The shared driver owns source checks; errors here
 /// are source failures, never malformed records.
-pub(super) fn ingest(
+pub(super) fn record(
     session: &mut Session,
     view: JsonView<'_>,
     at: Option<u64>,
-    opts: &ParseOptions,
+    opts: &crate::stream::Demand,
     sink: &mut dyn MessageSink,
-    sourced: &mut bool,
 ) -> Result<Flow> {
     // A record that is not an object carries nothing (Value's lookups all miss).
-    let Some(top) = Fields::parse(view, TOP)? else {
+    let Some(Head { top, ty }) = Head::parse(view, opts.into())? else {
         return Ok(Flow::Continue);
     };
-    let ty = top.string("type")?.unwrap_or_default();
     let ty = ty.as_str();
     let r = Record { view, top, at, opts };
 
@@ -196,6 +664,27 @@ pub(super) fn ingest(
             }
             return r.carry_or_skip(sink);
         }
+        // A fork sub-agent's first record (2.1.302+, `subagent_type: fork`): the child's context is
+        // the parent transcript up to `parentLastUuid` (`contextLength` records), so the parent is
+        // where it was forked from; the cut point rides in the bag as `fork_context`.
+        "fork-context-ref" => {
+            if let Some(id) = r.top.string("parentSessionId")? {
+                session.lineage.forked_from = Some(id);
+            }
+            let mut cut = Map::new();
+            if let Some(uuid) = r.top.string("parentLastUuid")? {
+                cut.insert("parent_last_uuid".into(), Value::String(uuid));
+            }
+            if let Some(n) = r.value("contextLength")?.filter(Value::is_number) {
+                cut.insert("context_length".into(), n);
+            }
+            if !cut.is_empty() {
+                session
+                    .harness_extra_mut(Harness::Claude)
+                    .insert("fork_context".into(), Value::Object(cut));
+            }
+            return r.carry_or_skip(sink);
+        }
         "agent-name" | "tag" | "relocated" | "pr-link" => {
             let (from, to) = match ty {
                 "agent-name" => ("agentName", "agent_name"),
@@ -248,36 +737,19 @@ pub(super) fn ingest(
             return match r.attachment()? {
                 Some(mut m) => {
                     r.stamp(&mut m);
-                    Ok(deliver(m, sink, sourced))
+                    Ok(sink.message(m))
                 }
                 None => r.carry_or_skip(sink),
             };
         }
-        // Pure bookkeeping / live-process records with no conversational payload: the input queue,
-        // UI/permission state, the leaf pointer, sub-agent hook/streaming telemetry, running cost,
-        // the ATIS latch, artifact watches, request-side content replacements. The lean passes drop
-        // them; `complete` carries them verbatim as round-trippable carrier messages.
-        "mode"
-        | "permission-mode"
-        | "last-prompt"
-        | "progress"
-        | "started"
-        | "result"
-        | "queue-operation"
-        | "x-quota"
-        | "file-history-snapshot"
-        | "cost-state"
-        | "atis-latch"
-        | "frame-link"
-        | "content-replacement"
-        | "artifact-comment-monitor"
-        | "artifact-autoreact-ledger" => return r.carry_or_skip(sink),
+        // The rest of [`META_TYPES`]: bookkeeping. The lean passes drop it; `complete` carries it
+        // verbatim as round-trippable carrier messages.
+        t if META_TYPES.contains(&t) => return r.carry_or_skip(sink),
         "user" | "assistant" | "system" | "" => {}
-        // Any other record without a `message` body is a bookkeeping record we haven't met yet
-        // (Claude Code adds a few per release). Never conversational — carry it in `complete` mode
-        // so round-trips stay lossless, skip it otherwise.
-        _ if r.top.get("message").is_none() => return r.carry_or_skip(sink),
-        _ => {}
+        // Any other record is a bookkeeping record we haven't met yet (Claude Code adds a few per
+        // release), whether or not it has a `message` field: only the three types above are turns.
+        // Carry it in `complete` mode so round-trips stay lossless, skip it otherwise.
+        _ => return r.carry_or_skip(sink),
     }
 
     note_conversation_metadata(
@@ -296,29 +768,22 @@ pub(super) fn ingest(
         return Ok(Flow::Continue);
     };
     r.stamp(&mut msg);
-    // Record-local models must not depend on how much of a transcript preceded the window.
+    // Keep the message model record-local; the session default is the first non-synthetic
+    // model encountered in this read, so a window can have a different session default.
     if session.model.is_none() && msg.model.as_deref() != Some(SYNTHETIC_MODEL) {
         session.model = msg.model.clone();
     }
-    Ok(deliver(msg, sink, sourced))
+    Ok(sink.message(msg))
 }
 
-fn deliver(msg: Message, sink: &mut dyn MessageSink, sourced: &mut bool) -> Flow {
-    *sourced |= msg.content.iter().any(|block| match block {
-        Block::Text { text } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
-            matches!(text, Text::Source(_))
-        }
-        Block::ToolUse { input, .. } => matches!(input, Json::Source(_)),
-        _ => false,
-    });
-    sink.message(msg)
-}
-
+/// One record under the read's [`stream::Demand`]. At [`Tier::Facts`] Claude builds only the
+/// reducer facts: a notice's `compactMetadata` `trigger`/`preTokens`/`durationMs`, `message.id`,
+/// `sourceToolUseID`, the attachment type and a tool result's `details.restorable`.
 struct Record<'a, 'o> {
     view: JsonView<'a>,
     top: Fields<'a>,
     at: Option<u64>,
-    opts: &'o ParseOptions,
+    opts: &'o crate::stream::Demand,
 }
 
 impl<'a> Record<'a, '_> {
@@ -343,17 +808,18 @@ impl<'a> Record<'a, '_> {
     /// Carry the record verbatim under `complete`, skip it otherwise — the shared tail of every
     /// non-conversational record arm.
     fn carry_or_skip(&self, sink: &mut dyn MessageSink) -> Result<Flow> {
-        Ok(if self.opts.complete {
+        Ok(if self.opts.tier == Tier::Complete {
             sink.message(self.carrier()?)
         } else {
             Flow::Continue
         })
     }
 
-    /// A non-conversational meta record carried verbatim under [`ParseOptions::complete`] so a
+    /// A non-conversational meta record carried verbatim under [`crate::stream::Demand::COMPLETE`] so a
     /// `parse → emit` round-trip reproduces it. Modeled as an empty-content `System` message —
     /// render/dataset/count all skip empty turns — with the full original record stashed under
-    /// `extra["_record"]` for the emitter to replay byte-for-byte.
+    /// `extra["_record"]` for replay with JSON values and key order preserved; serialization
+    /// may normalize whitespace and numeric spelling.
     fn carrier(&self) -> Result<Message> {
         let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
         m.id = self.top.string("uuid")?;
@@ -374,7 +840,7 @@ impl<'a> Record<'a, '_> {
     /// A model-visible `attachment` record (one with a non-empty `rendered[]`) as a
     /// [`Role::System`] message: one text block per rendered item, exactly the text appended to
     /// the prompt. `None` when nothing was rendered. Under `complete` the message is also a carrier
-    /// of the verbatim record, so the emitter replays it byte-for-byte while lean consumers still
+    /// of the record, so the emitter preserves its JSON values and key order while lean consumers still
     /// see its text. `origin` is [`Origin::Hook`] for `hook_*` attachments (a user-configured
     /// hook's stdout) and [`Origin::Harness`] otherwise. The attachment kind always rides in
     /// `extra["claude"]["attachment_type"]`; the full `attachment` object only under rich demand.
@@ -401,11 +867,11 @@ impl<'a> Record<'a, '_> {
         }
         let att_type = attachment
             .get("type")?
-            .filter(|v| v.is_string().unwrap_or(false))
+            .filter(|v| v.may_be_string())
             .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
             .transpose()?
             .unwrap_or_else(|| "attachment".into());
-        let mut m = if self.opts.complete {
+        let mut m = if self.opts.tier == Tier::Complete {
             self.carrier()?
         } else {
             Message::new(Role::System)
@@ -421,7 +887,7 @@ impl<'a> Record<'a, '_> {
         m.timestamp = self.timestamp()?;
         m.content = blocks;
         let mut rich = Vec::new();
-        if self.opts.wants_full_extra() {
+        if self.opts.tier >= Tier::Rich {
             rich.push(("attachment", attachment.resolve()?.into_owned()));
             for key in ["renderedInHumanTurn", "agentId"] {
                 if let Some(val) = self.value(key)? {
@@ -445,14 +911,14 @@ impl<'a> Record<'a, '_> {
     /// notices) have no body and are dropped. `subtype`/`level`/metadata go to `extra` either way.
     fn system(&self) -> Result<Option<Message>> {
         // Format-complete: `system` records are carried verbatim. The lean passes *render* them
-        // (slash-command distillation, the synthesized `[conversation compacted]` marker, the ⛓
+        // (slash-command distillation, the compaction boundary, the ⛓
         // hook one-liner), which is lossy; carrying the raw record (system bodies are small
         // notices) is the only way `parse → emit` reproduces it.
-        if self.opts.complete {
+        if self.opts.tier == Tier::Complete {
             return Ok(Some(self.carrier()?));
         }
         let subtype = self.top.string("subtype")?.unwrap_or_default();
-        let content = self.top.get("content").filter(|v| v.is_string().unwrap_or(false));
+        let content = self.top.get("content").filter(|v| v.may_be_string());
         // `stop_hook_summary` carries no `content`, but it IS the record of a Stop-hook firing:
         // surface it as a readable line when there's something to show (output or an error).
         if subtype == "stop_hook_summary" {
@@ -469,33 +935,67 @@ impl<'a> Record<'a, '_> {
                 }
             }
             return match render_hook_summary(&Value::Object(hooks)) {
-                Some(body) => self.system_msg(Text::Inline(body), &subtype),
+                Some(body) => self.system_msg(Some(Text::Inline(body)), &subtype),
                 None => Ok(None),
             };
         }
+        // Since 2.1.302 a retried request is an `api_error` with no `content`: `error` is an object
+        // (`formatted`, `message`, `status`) and `retryAttempt`/`maxRetries` say where the retry
+        // loop stood. That is the record of a provider failure the model never saw; render it.
+        let retry = if content.is_none() && subtype == "api_error" {
+            self.api_error_text()?
+        } else {
+            None
+        };
         // Subtypes with no human-readable body — keep them out of the message stream.
         let bodyless = matches!(subtype.as_str(), "turn_duration" | "agents_killed");
-        if bodyless || (content.is_none() && subtype != "compact_boundary") {
+        if bodyless || (content.is_none() && retry.is_none() && subtype != "compact_boundary") {
             return Ok(None);
+        }
+        if let Some(text) = retry {
+            return self.system_msg(Some(Text::Inline(text)), &subtype);
         }
         // Slash-command records wrap their payload in pseudo-XML tags; distill the tag soup to a
         // readable one/two-liner (these are always small, so they stay inline).
         if subtype == "local_command" {
             if let Some(c) = content.map(|v| v.resolve()).transpose()? {
                 if let Some(rendered) = render_slash_command(c.as_str().unwrap_or_default()) {
-                    return self.system_msg(Text::Inline(rendered), &subtype);
+                    return self.system_msg(Some(Text::Inline(rendered)), &subtype);
                 }
             }
         }
-        let text = match content {
-            Some(c) => c.lazy_text(self.opts.spans)?.unwrap_or_default(),
-            // compact_boundary often has only structured metadata; synthesize a marker.
-            None => Text::Inline("[conversation compacted]".to_string()),
-        };
+        let text = content.map(|c| c.lazy_text(self.opts.spans)).transpose()?.flatten();
         self.system_msg(text, &subtype)
     }
 
-    fn system_msg(&self, text: Text, subtype: &str) -> Result<Option<Message>> {
+    /// The one-line text of a content-less `api_error`: the error's `formatted` line (else its
+    /// `message`, else a bare string `error`), with the retry position when the record has one.
+    fn api_error_text(&self) -> Result<Option<String>> {
+        let error = self.top.get("error");
+        let mut text = match error
+            .as_ref()
+            .map(|e| Fields::parse(*e, &["formatted", "message"]))
+            .transpose()?
+            .flatten()
+        {
+            Some(fields) => fields.string("formatted")?.or(fields.string("message")?),
+            None => error
+                .map(|e| e.resolve())
+                .transpose()?
+                .and_then(|e| e.as_str().map(str::to_owned)),
+        };
+        let number = |key: &str| -> Result<Option<u64>> { Ok(self.value(key)?.and_then(|v| v.as_u64())) };
+        if let (Some(line), Some(attempt)) = (text.as_mut(), number("retryAttempt")?) {
+            line.push_str(&format!(" (retry {attempt}"));
+            if let Some(max) = number("maxRetries")? {
+                line.push_str(&format!(" of {max}"));
+            }
+            line.push(')');
+        }
+        Ok(text.filter(|t| !t.trim().is_empty()))
+    }
+
+    fn system_msg(&self, text: Option<Text>, subtype: &str) -> Result<Option<Message>> {
         // The subtype says what the notice IS: a compaction marker, an error the model never
         // answered, a Stop hook's output, a scheduled wakeup, or a plain harness notice.
         let (kind, origin) = match subtype {
@@ -506,7 +1006,7 @@ impl<'a> Record<'a, '_> {
             _ => (MessageKind::Notice, Origin::Harness),
         };
         let mut bag = Map::new();
-        if self.opts.facts_only() {
+        if self.opts.tier == Tier::Facts {
             // Reducers read only the compaction facts: trigger and the two counters.
             if let Some(meta) = self
                 .top
@@ -514,7 +1014,7 @@ impl<'a> Record<'a, '_> {
                 .filter(|v| v.is_object().unwrap_or(false))
             {
                 let mut fields = Map::new();
-                if let Some(value) = meta.get("trigger")?.filter(|v| v.is_string().unwrap_or(false)) {
+                if let Some(value) = meta.get("trigger")?.filter(|v| v.may_be_string()) {
                     fields.insert("trigger".into(), value.resolve()?.into_owned());
                 }
                 for key in ["preTokens", "durationMs"] {
@@ -526,7 +1026,7 @@ impl<'a> Record<'a, '_> {
                 }
                 bag.insert("compactMetadata".into(), Value::Object(fields));
             }
-        } else if self.opts.extra {
+        } else if self.opts.tier >= Tier::Rich {
             if !subtype.is_empty() {
                 bag.insert("subtype".into(), Value::String(subtype.to_string()));
             }
@@ -536,23 +1036,21 @@ impl<'a> Record<'a, '_> {
                 }
             }
         }
-        let mut extra = Map::new();
+        let mut m = match text {
+            Some(text) => {
+                let mut m = Message::of_kind(Role::System, kind, origin);
+                m.content.push(Block::Text { text });
+                m
+            }
+            None => Message::synthesized(kind, origin),
+        };
+        m.id = self.top.string("uuid")?;
+        m.parent_id = self.top.string("parentUuid")?;
+        m.timestamp = self.timestamp()?;
         if !bag.is_empty() {
-            extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));
+            m.extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));
         }
-        Ok(Some(Message {
-            complete_record: None,
-            id: self.top.string("uuid")?,
-            parent_id: self.top.string("parentUuid")?,
-            role: Role::System,
-            kind,
-            origin,
-            timestamp: self.timestamp()?,
-            model: None,
-            content: vec![Block::Text { text }],
-            usage: None,
-            extra,
-        }))
+        Ok(Some(m))
     }
 
     /// A `user` or `assistant` record. `None` when it has no `message` at all.
@@ -561,11 +1059,8 @@ impl<'a> Record<'a, '_> {
             return Ok(None);
         };
         let opts = self.opts;
-        // The sink may ask for reducer facts instead of rich extras for this message.
-        let facts = opts.facts_only()
-            || (!opts.complete
-                && opts.wants_full_extra()
-                && sink.extra_projection() == crate::stream::ExtraProjection::Facts);
+        // The sink may narrow a rich read to reducer facts for this message.
+        let tier = opts.for_sink(sink);
         let body = Fields::parse(
             msg,
             &[
@@ -584,18 +1079,7 @@ impl<'a> Record<'a, '_> {
             Some(usage) => Some(parse_usage(usage)?),
             None => None,
         };
-        let scheduled = self.top.get("scheduledTaskId").is_some()
-            || self.top.get("scheduledFireId").is_some()
-            || self.top.string("turnOrigin")?.as_deref() == Some("scheduled");
-        let origin_kind = match self.top.get("origin") {
-            Some(origin) => origin
-                .get("kind")?
-                .filter(|v| v.is_string().unwrap_or(false))
-                .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
-                .transpose()?,
-            None => None,
-        };
-        let user_origin = user_origin_from(scheduled, self.bool("isMeta")? == Some(true), origin_kind.as_deref());
+        let user_origin = user_origin(&self.top)?;
 
         let mut blocks = Vec::new();
         let mut head = None;
@@ -613,7 +1097,7 @@ impl<'a> Record<'a, '_> {
                 for (index, item) in items.enumerate() {
                     let item = item?;
                     if index == 0 && role == Role::User {
-                        if let Some(text) = item.get("text")?.filter(|v| v.is_string().unwrap_or(false)) {
+                        if let Some(text) = item.get("text")?.filter(|v| v.may_be_string()) {
                             head = Some(classify_head(text, user_origin)?);
                         }
                     }
@@ -629,11 +1113,11 @@ impl<'a> Record<'a, '_> {
         // `Block::ToolResult::details`, not in the harness bag. Only rich demand resolves it: the
         // sidecar routinely dwarfs the visible transcript. Reducers read only `restorable`.
         let sidecar = self.top.get("toolUseResult");
-        if facts {
+        if tier == Tier::Facts {
             if let Some(restorable) = sidecar.map(|v| v.get("restorable")).transpose()?.flatten() {
                 attach_tool_use_result(&mut blocks, serde_json::json!({"restorable": restorable.resolve()?}));
             }
-        } else if opts.wants_full_extra() && blocks.iter().any(|b| matches!(b, Block::ToolResult { .. })) {
+        } else if tier >= Tier::Rich && blocks.iter().any(|b| matches!(b, Block::ToolResult { .. })) {
             if let Some(sidecar) = sidecar.filter(|v| !v.is_null().unwrap_or(false)) {
                 attach_tool_use_result(&mut blocks, sidecar.resolve()?.into_owned());
             }
@@ -654,7 +1138,7 @@ impl<'a> Record<'a, '_> {
                 sidecar.get("agentId")?.is_some()
                     && sidecar
                         .get("status")?
-                        .filter(|v| v.is_string().unwrap_or(false))
+                        .filter(|v| v.may_be_string())
                         .map(|v| v.resolve().map(|v| v.as_str() == Some("async_launched")))
                         .transpose()?
                         != Some(true)
@@ -678,12 +1162,16 @@ impl<'a> Record<'a, '_> {
                 && (head_text.starts_with("<command-name>") || head_text.starts_with("<local-command-stdout>")),
             user,
         };
-        let (role, kind, origin) = classify_conversation(role, class, opts.complete);
-        let model = if synthetic && !opts.complete { None } else { model };
+        let (role, kind, origin) = classify_conversation(role, class, opts.tier == Tier::Complete);
+        let model = if synthetic && opts.tier != Tier::Complete {
+            None
+        } else {
+            model
+        };
 
         // Everything Claude-specific lands in `extra["claude"]`; the top level stays clean.
         let mut bag = Map::new();
-        if synthetic && !opts.complete && !facts {
+        if synthetic && !matches!(tier, Tier::Facts | Tier::Complete) {
             for key in [
                 "isApiErrorMessage",
                 "error",
@@ -696,11 +1184,16 @@ impl<'a> Record<'a, '_> {
                 }
             }
         }
-        if facts || (!opts.extra && opts.usage_identity) {
+        // Skill bodies loaded by a tool have an ID; slash-loaded bodies do not. This small
+        // correlation fact prevents counting the tool invocation and its injected body twice.
+        if let Some(id) = self.top.string("sourceToolUseID")? {
+            bag.insert("sourceToolUseID".into(), Value::String(id));
+        }
+        if matches!(tier, Tier::Usage | Tier::Facts) {
             if let Some(id) = body_string("id")? {
                 bag.insert(format!("{MESSAGE_EXTRA_PREFIX}id"), Value::String(id));
             }
-        } else if opts.extra {
+        } else if tier >= Tier::Rich {
             for &key in CLAUDE_EXTRA_TOP {
                 if let Some(value) = self.value(key)?.filter(|v| keep_extra_top(key, v)) {
                     bag.insert(key.to_owned(), value);
@@ -722,7 +1215,7 @@ impl<'a> Record<'a, '_> {
         // first-classed ones) so `parse → emit` reproduces the record with no dropped keys. The
         // already-captured fields are re-confirmed, not duplicated. This is also the only producer
         // of the bag's verbatim `toolUseResult`, the complete-mode replay fallback.
-        if opts.complete {
+        if opts.tier == Tier::Complete {
             self.view.for_each_entry(|key, value| {
                 if !CLAUDE_FIRSTCLASS_TOP.contains(&key) && !bag.contains_key(key) {
                     bag.insert(key.to_owned(), value.resolve()?.into_owned());
@@ -774,8 +1267,8 @@ fn block(item: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
         joined_over,
     )?;
     if let Some(Block::ToolResult { content, details, .. }) = &mut block {
-        let stub = match item.get("content")?.filter(|v| v.is_string().unwrap_or(false)) {
-            Some(raw) if head(raw, PERSISTED.len())? == PERSISTED => {
+        let stub = match item.get("content")?.filter(|v| v.may_be_string()) {
+            Some(raw) if string_head(raw, PERSISTED.len())? == PERSISTED => {
                 persisted_output(raw.resolve()?.as_str().unwrap_or_default())
             }
             Some(_) => None,
@@ -819,7 +1312,7 @@ fn parse_usage(v: JsonView<'_>) -> Result<Usage> {
 
 /// The first `chars` characters of a string after its leading whitespace, decoded in place:
 /// classification never owns or windows a giant body.
-fn head(view: JsonView<'_>, chars: usize) -> Result<String> {
+fn string_head(view: JsonView<'_>, chars: usize) -> Result<String> {
     let mut head = String::new();
     let mut n = 0;
     view.for_each_char(|c| {
@@ -836,14 +1329,14 @@ fn head(view: JsonView<'_>, chars: usize) -> Result<String> {
 /// harness `<task-notification>` is a sub-agent's return when its first `<summary>` names an agent
 /// or a workflow; that summary can follow a giant output, so it is found by streaming.
 fn classify_head(text: JsonView<'_>, origin: Origin) -> Result<(String, (MessageKind, Origin))> {
-    let prefix = head(text, 64)?;
+    let prefix = string_head(text, 64)?;
     let kind = if origin == Origin::Harness && prefix.starts_with("<task-notification>") {
         let mut summary = NotificationSummary::default();
         text.for_each_str_chunk(|chunk| {
             summary.push(chunk);
             Ok(())
         })?;
-        if summary.complete && ((summary.agent_possible && summary.agent == 6) || summary.workflow_found) {
+        if summary.is_agent_return() {
             (MessageKind::SubagentReturn, Origin::Subagent)
         } else {
             (MessageKind::InjectedContext, Origin::Harness)
@@ -852,110 +1345,6 @@ fn classify_head(text: JsonView<'_>, origin: Origin) -> Result<(String, (Message
         user_kind_from_head(origin, &prefix)
     };
     Ok((prefix, kind))
-}
-
-/// tag_inner's first `<summary>` and its first following `</summary>`, across decoder windows,
-/// with bounded state: tag and word suffixes are carried, the summary itself never copied.
-struct NotificationSummary {
-    opened: bool,
-    complete: bool,
-    pending: String,
-    scratch: String,
-    leading: bool,
-    agent_possible: bool,
-    agent: usize,
-    workflow_found: bool,
-    workflow: usize,
-}
-impl Default for NotificationSummary {
-    fn default() -> Self {
-        Self {
-            opened: false,
-            complete: false,
-            pending: String::new(),
-            scratch: String::new(),
-            leading: true,
-            agent_possible: true,
-            agent: 0,
-            workflow_found: false,
-            workflow: 0,
-        }
-    }
-}
-impl NotificationSummary {
-    fn push(&mut self, chunk: &str) {
-        if self.complete {
-            return;
-        }
-        self.scratch.clear();
-        self.scratch.push_str(&self.pending);
-        self.scratch.push_str(chunk);
-        self.pending.clear();
-        let mut body = self.scratch.as_str();
-        if !self.opened {
-            if let Some(at) = body.find("<summary>") {
-                self.opened = true;
-                body = &body[at + 9..];
-            } else {
-                let n = suffix(body.as_bytes(), b"<summary>", false);
-                self.pending.push_str(&body[body.len() - n..]);
-                return;
-            }
-        }
-        if let Some(at) = body.find("</summary>") {
-            body = &body[..at];
-            self.complete = true;
-        } else {
-            let n = suffix(body.as_bytes(), b"</summary>", false);
-            self.pending.push_str(&body[body.len() - n..]);
-            body = &body[..body.len() - n];
-        }
-        if self.leading {
-            body = body.trim_start();
-            self.leading = body.is_empty();
-        }
-        if self.agent_possible && self.agent < 6 {
-            let n = body.len().min(6 - self.agent);
-            if body.as_bytes()[..n] == b"Agent "[self.agent..self.agent + n] {
-                self.agent += n;
-            } else {
-                self.agent_possible = false;
-            }
-        }
-        if !self.workflow_found {
-            const WORD: &[u8] = b"workflow";
-            // Only a proper suffix can bridge windows. Never copy the complete summary.
-            let mut bridge = [0; 14];
-            bridge[..self.workflow].copy_from_slice(&WORD[..self.workflow]);
-            let n = body.len().min(7);
-            bridge[self.workflow..self.workflow + n].copy_from_slice(&body.as_bytes()[..n]);
-            let bridge = &bridge[..self.workflow + n];
-            let contains = |bytes: &[u8]| {
-                memchr::memchr2_iter(b'w', b'W', bytes).any(|at| {
-                    bytes
-                        .get(at..at + 8)
-                        .is_some_and(|word| word.eq_ignore_ascii_case(WORD))
-                })
-            };
-            self.workflow_found = contains(bridge) || contains(body.as_bytes());
-            self.workflow = suffix(if body.len() < 7 { bridge } else { body.as_bytes() }, WORD, true);
-        }
-    }
-}
-
-/// Longest proper suffix matching an ASCII tag/word prefix (therefore a UTF-8 boundary).
-fn suffix(body: &[u8], wanted: &[u8], insensitive: bool) -> usize {
-    (1..wanted.len().min(body.len() + 1))
-        .rev()
-        .find(|&n| {
-            let end = &body[body.len() - n..];
-            if insensitive {
-                end.eq_ignore_ascii_case(&wanted[..n])
-            } else {
-                end == &wanted[..n]
-            }
-        })
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1027,7 +1416,9 @@ mod tests {
                     fs::write(&path, &encoded).unwrap();
                     let source = JsonSource::capture(&path).unwrap();
                     let actual = source
-                        .read_record(0, &encoded, |view| classify_head(view, origin))
+                        .read(ReadInput::Record(0, &encoded, None), Validation::Value, |view| {
+                            classify_head(view, origin)
+                        })
                         .unwrap();
                     assert_eq!(actual.1, expected, "{origin:?}");
                 }
@@ -1060,12 +1451,32 @@ mod tests {
                     summary.push(&body[start..end]);
                     start = end;
                 }
-                assert_eq!(
-                    summary.complete && ((summary.agent_possible && summary.agent == 6) || summary.workflow_found),
-                    expected,
-                    "width {width}"
-                );
+                assert_eq!(summary.is_agent_return(), expected, "width {width}");
             }
         }
+    }
+
+    /// The selection lists skip silently: a non-object line is `Ok(None)` under every demand (the
+    /// non-turn filter), and an object missing every selected key still parses — fields are
+    /// presence-selected, completeness is objecthood.
+    #[test]
+    fn selections_skip_non_objects_and_select_by_presence() -> Result<()> {
+        for demand in [
+            Demand::Message,
+            Demand::Metadata,
+            Demand::Facts,
+            Demand::Compact,
+            Demand::Tools,
+        ] {
+            for line in ["[1,2]", "\"scalar\"", "42", "null"] {
+                let value: serde_json::Value = serde_json::from_str(line)?;
+                let parsed = Head::parse(JsonView::from(&value), demand)?;
+                assert!(parsed.is_none(), "{line} parsed");
+            }
+            let value: serde_json::Value = serde_json::from_str(r#"{"unrelated":true}"#)?;
+            let head = Head::parse(JsonView::from(&value), demand)?;
+            assert!(head.is_some(), "object with none of the keys");
+        }
+        Ok(())
     }
 }

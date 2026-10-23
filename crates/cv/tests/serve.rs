@@ -1,48 +1,23 @@
-//! Integration tests for `cv archive` (`sync` idempotency against a fixture corpus) and the
-//! `cv serve` HTTP endpoints (status codes, JSON shapes, query parsing) — all hermetic via a
-//! temp `$HOME` + `$CLUSTERVISION_HOME` passed only to child processes.
+//! Integration tests for the `cv serve` HTTP endpoints (status codes, JSON shapes, query
+//! parsing) — all hermetic via a temp `$HOME` + `$CLUSTERVISION_HOME` passed only to child
+//! processes. (The `cv archive` tests live in `archive.rs`; the two-session fixture corpus they
+//! share with these tests is in `common/mod.rs`.)
 
+mod common;
+
+use common::world;
+use cv_core::rows::SEARCH_ROW_KEYS;
+use cv_testkit::http::status as raw_status;
 use cv_testkit::World;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
-/// A world with the two-session fixture corpus every test starts from.
-fn world(tag: &str) -> World {
-    let w = World::new(tag);
-    write_fixtures(&w);
-    w
-}
-
-fn write_fixtures(w: &World) {
-    let alpha = [
-        json!({"type": "ai-title", "aiTitle": "alpha adventures"}),
-        json!({"type": "user", "uuid": "u1", "timestamp": "2026-01-01T10:00:00Z",
-               "cwd": "/work/proj",
-               "message": {"role": "user", "content": "please fix the zebrafish migration"}}),
-        json!({"type": "assistant", "uuid": "a1", "timestamp": "2026-01-02T10:00:00Z",
-               "message": {"role": "assistant", "content": [
-                   {"type": "text", "text": "done"}]}}),
-    ];
-    let beta = [
-        json!({"type": "user", "uuid": "b1", "timestamp": "2026-03-01T09:00:00Z",
-               "cwd": "/work/proj",
-               "message": {"role": "user", "content": "quokka census"}}),
-        json!({"type": "assistant", "uuid": "b2", "timestamp": "2026-03-01T09:05:00Z",
-               "message": {"role": "assistant", "content": [
-                   {"type": "text", "text": "seventeen"}]}}),
-    ];
-    for (name, lines) in [("alphasess", &alpha[..]), ("betasess", &beta[..])] {
-        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
-        fs::write(w.transcript(name), body).unwrap();
-    }
-}
-
-/// A third, tool-heavy session (separate from `write_fixtures` so the sync tests' "2
+/// A third, tool-heavy session (separate from `common::write_fixtures` so the archive tests' "2
 /// discovered" counts hold): 6 messages with an Edit, a failing Bash, a clean Bash, and a
 /// closing text — the raw material for the messages/events/touched endpoint tests.
 fn write_gamma(w: &World) {
@@ -119,138 +94,24 @@ fn write_web_root(w: &World) -> PathBuf {
     web
 }
 
-fn count_lines(p: &Path) -> usize {
-    fs::read_to_string(p)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .count()
-}
-
-// ───────────────────────────── sync ─────────────────────────────
-
-#[test]
-fn sync_is_idempotent() {
-    let w = world("sync");
-
-    // First sync archives both sessions.
-    let (out, _) = w.cv_ok(&["archive", "sync"]);
-    assert!(
-        out.contains("2 archived, 0 skipped (unchanged) of 2 discovered"),
-        "{out}"
-    );
-    assert!(w.cv_home.join("archive/claude/alphasess.json").is_file());
-    assert!(w.cv_home.join("archive/claude/betasess.json").is_file());
-    assert_eq!(count_lines(&w.cv_home.join("catalog.jsonl")), 2);
-
-    // Second sync: nothing changed → nothing rewritten, no duplicate catalog rows.
-    let (out, _) = w.cv_ok(&["archive", "sync"]);
-    assert!(
-        out.contains("0 archived, 2 skipped (unchanged) of 2 discovered"),
-        "{out}"
-    );
-    assert_eq!(count_lines(&w.cv_home.join("catalog.jsonl")), 2, "no dupes on resync");
-
-    // ls shows each session exactly once.
-    let (out, _) = w.cv_ok(&["archive", "ls"]);
-    assert!(out.contains("2 session(s)"), "{out}");
-    assert_eq!(out.matches("alphases").count(), 1, "{out}");
-    assert!(out.contains("alpha adventures"), "{out}");
-
-    // Append a turn to one session: only that one re-archives; the catalog dedupes by key.
-    let mut body = fs::read_to_string(w.transcript("alphasess")).unwrap();
-    body.push_str(
-        &json!({"type": "user", "uuid": "u9", "timestamp": "2026-06-02T10:00:00Z",
-                "message": {"role": "user", "content": "one more thing"}})
-        .to_string(),
-    );
-    body.push('\n');
-    fs::write(w.transcript("alphasess"), body).unwrap();
-
-    let (out, _) = w.cv_ok(&["archive", "sync"]);
-    assert!(
-        out.contains("1 archived, 1 skipped (unchanged) of 2 discovered"),
-        "{out}"
-    );
-    let (out, _) = w.cv_ok(&["archive", "ls"]);
-    assert!(
-        out.contains("2 session(s)"),
-        "changed session must not duplicate:\n{out}"
-    );
-    assert!(out.contains("3 msgs"), "updated message count visible:\n{out}");
-
-    // The archived JSON is the parsed IR, scrubbed of nothing — spot-check its shape.
-    let archived: Value =
-        serde_json::from_str(&fs::read_to_string(w.cv_home.join("archive/claude/alphasess.json")).unwrap())
-            .expect("archived session is valid JSON");
-    assert_eq!(archived["id"], "alphasess");
-    assert_eq!(archived["messages"].as_array().unwrap().len(), 3);
-}
-
-#[test]
-fn ls_and_path_on_empty_archive() {
-    let w = world("empty");
-    let (out, _) = w.cv_ok(&["archive", "ls"]);
-    assert!(out.contains("archive empty"), "{out}");
-    let (out, _) = w.cv_ok(&["archive", "path"]);
-    assert_eq!(out.trim(), w.cv_home.display().to_string(), "{out}");
-}
-
 // ───────────────────────────── serve ─────────────────────────────
 
-/// A minimal HTTP/1.0-style GET over a raw socket (no client dep): returns (status, body).
 fn http(port: u16, method: &str, path: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to cv serve");
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read response");
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("bad status line in: {text}"));
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
-        .unwrap_or_default();
-    (status, body)
+    let raw = raw_request(port, method, path, &[]);
+    (raw_status(&raw), cv_testkit::http::parts(&raw).1.to_owned())
 }
 
-/// Like [`http`] but also hands back the `Content-Type`, for the static-asset rules where the
-/// header IS the behaviour under test.
-fn get_raw(port: u16, path: &str) -> (u16, String, String) {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to cv serve");
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read response");
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("bad status line in: {text}"));
-    let ct = text
+/// Include Content-Type when the response headers are part of the contract.
+fn get_with_content_type(port: u16, path: &str) -> (u16, String, String) {
+    let raw = raw_get(port, path);
+    let (head, body) = cv_testkit::http::parts(&raw);
+    let content_type = head
         .lines()
-        .take_while(|l| !l.trim().is_empty())
-        .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-        .map(|l| l[l.find(':').unwrap() + 1..].trim().to_string())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.trim())
         .unwrap_or_default();
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
-        .unwrap_or_default();
-    (status, ct, body)
+    (raw_status(&raw), content_type.to_owned(), body.to_owned())
 }
 
 fn get_json(port: u16, path: &str) -> (u16, Value) {
@@ -278,11 +139,7 @@ fn full_session_downloads_match_native_exports_beyond_loaded_page() {
         ("opensession", "json", "application/json", "opensession.json"),
     ] {
         let (expected, _) = w.cv_ok(&["export", "download", "--harness", "claude", "--format", native]);
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        write!(stream, "GET /api/session/claude/download/export?format={format} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").unwrap();
-        let mut raw = String::new();
-        stream.read_to_string(&mut raw).unwrap();
+        let raw = raw_get(port, &format!("/api/session/claude/download/export?format={format}"));
         let (headers, body) = raw.split_once("\r\n\r\n").unwrap();
         assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
         let headers = headers.to_ascii_lowercase();
@@ -316,15 +173,11 @@ impl Drop for Reaper {
 /// Spawn `cv serve` on a free port and wait for the listener. Returns the port and the reaper
 /// keeping the child alive (drop it to kill the server).
 fn spawn_serve(w: &World) -> (u16, Reaper) {
-    spawn_serve_with(w, &[])
+    spawn_serve_cfg(w, &[], &[])
 }
 
-/// Like [`spawn_serve`] but with extra `serve` args (e.g. `["--web", dir]`).
-fn spawn_serve_with(w: &World, extra: &[&str]) -> (u16, Reaper) {
-    spawn_serve_cfg(w, extra, &[])
-}
-
-/// Like [`spawn_serve_with`] but also with extra child env vars (e.g. `CVD_TOKEN`).
+/// Like [`spawn_serve`] but with extra `serve` args (e.g. `["--web", dir]`) and extra child env
+/// vars (e.g. `CVD_TOKEN`).
 ///
 /// Binds `--port 0` (the OS assigns a genuinely free ephemeral port — no bind/release/rebind race
 /// under parallel tests) and parses the REAL port out of the startup banner on stderr. The child
@@ -745,7 +598,6 @@ fn serve_workflow_script() {
 #[test]
 fn serve_session_head() {
     let w = world("head");
-    write_fixtures(&w);
     let (port, _reaper) = spawn_serve(&w);
 
     let (status, v) = get_json(port, "/api/session/claude/alphasess/head");
@@ -784,20 +636,19 @@ fn serve_session_head() {
 #[test]
 fn serve_static_missing_asset_is_404_not_the_index() {
     let w = world("static");
-    write_fixtures(&w);
     let webroot = write_web_root(&w);
-    let (port, _reaper) = spawn_serve_with(&w, &["--web", webroot.to_str().unwrap()]);
+    let (port, _reaper) = spawn_serve_cfg(&w, &["--web", webroot.to_str().unwrap()], &[]);
 
-    let (status, ct, _) = get_raw(port, "/pkg/cv_web.js");
+    let (status, ct, _) = get_with_content_type(port, "/pkg/cv_web.js");
     assert_eq!(status, 404, "a missing module is a 404, not the index");
     assert!(!ct.contains("html"), "and not served as html: {ct}");
 
-    let (status, ct, _) = get_raw(port, "/components/cv-forest.js");
+    let (status, ct, _) = get_with_content_type(port, "/components/cv-forest.js");
     assert_eq!(status, 200);
     assert!(ct.contains("javascript"), "{ct}");
 
     // A route (no file extension) still resolves to the SPA index so deep links work.
-    let (status, ct, body) = get_raw(port, "/session/claude/alphasess");
+    let (status, ct, body) = get_with_content_type(port, "/session/claude/alphasess");
     assert_eq!(status, 200);
     assert!(ct.contains("html"), "{ct}");
     assert!(body.contains("<!doctype html>"), "{body}");
@@ -859,10 +710,9 @@ fn serve_compactions() {
     let (status, v) = get_json(port, "/api/session/claude/compactsess/messages");
     assert_eq!(status, 200);
     let m = &v["messages"].as_array().unwrap()[2];
-    // Lean read: no `extra` populated (the map is absent or empty for the boundary) — but `kind`
-    // is first-class, so the boundary is still identifiable without opting into the harness bag.
-    let extra_empty = m["extra"].is_null() || m["extra"].as_object().map(|o| o.is_empty()).unwrap_or(true);
-    assert!(extra_empty, "lean read should omit extra: {m}");
+    // Lean read: no `extra` on the wire at all (an empty bag is skipped) — but `kind` is
+    // first-class, so the boundary is still identifiable without opting into the harness bag.
+    assert_eq!(m.get("extra"), None, "lean read should omit extra: {m}");
     assert_eq!(m["kind"], "compaction_boundary", "{m}");
 }
 
@@ -872,7 +722,7 @@ fn serve_compactions() {
 fn serve_static_web_hub() {
     let w = world("webhub");
     let web = write_web_root(&w);
-    let (port, _reaper) = spawn_serve_with(&w, &["--web", web.to_str().unwrap()]);
+    let (port, _reaper) = spawn_serve_cfg(&w, &["--web", web.to_str().unwrap()], &[]);
 
     // `/` serves index.html with an HTML content type.
     let (status, body) = http(port, "GET", "/");
@@ -907,7 +757,7 @@ fn serve_static_web_hub() {
 
     // Path traversal cannot escape the web root: the sibling secret is unreachable.
     let (status, body) = http(port, "GET", "/../secret.txt");
-    assert!(status == 403 || status == 200, "status {status}");
+    assert_eq!(status, 403, "path traversal must be refused: {body}");
     assert!(!body.contains("TOP SECRET"), "traversal leaked the secret:\n{body}");
     // Encoded traversal too.
     for path in [
@@ -1057,6 +907,27 @@ fn serve_tasks_routes() {
         "HTTP rows carry timestamps: {v}"
     );
     assert!(v["warnings"].as_array().is_some_and(|w| w.is_empty()), "{v}");
+    // `detail=1` adds the inbox page's backlog columns; the plain row keeps its shape.
+    assert!(row.get("notes").is_none() && row.get("body").is_none(), "{v}");
+    let (status, v) = get_json(port, "/api/tasks?detail=1");
+    assert_eq!(status, 200, "{v}");
+    let row = v["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(id))
+        .unwrap();
+    assert_eq!(row["opened_by"], "human", "{v}");
+    assert_eq!(
+        (
+            row["notes"].as_u64(),
+            row["decision"].as_bool(),
+            row["blocked"].as_bool()
+        ),
+        (Some(0), Some(false), Some(false)),
+        "{v}"
+    );
+    assert_eq!(row["body"], "", "{v}");
 
     // State filter hits and misses.
     let (_, v) = get_json(port, "/api/tasks?state=claimed");
@@ -1133,7 +1004,7 @@ fn serve_host_validation() {
 #[test]
 fn serve_token_auth() {
     let w = world("token");
-    let (port, _reaper) = spawn_serve_with(&w, &["--token", "opensesame"]);
+    let (port, _reaper) = spawn_serve_cfg(&w, &["--token", "opensesame"], &[]);
 
     let raw = raw_request(port, "GET", "/api/sessions", &[]);
     assert_eq!(raw_status(&raw), 401, "{raw}");
@@ -1191,45 +1062,42 @@ fn raw_json(raw: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("non-JSON body {body:?}: {e}"))
 }
 
-/// The §3 search row: a session row plus what the search contributed. `cv search --json` emits
-/// exactly these keys in exactly this order, so `/api/search` must too — a consumer that cannot
-/// tell the CLI's rows from the daemon's is the whole point of the contract.
-const SEARCH_ROW_KEYS: [&str; 14] = [
-    "id",
-    "harness",
-    "path",
-    "cwd",
-    "title",
-    "created_at",
-    "updated_at",
-    "message_count",
-    "size_bytes",
-    "score",
-    "snippet",
-    "agent_id",
-    "parent_id",
-    "workflow",
-];
-
-/// `/api/search` over a world with NO full-text index — i.e. the degraded path, which is the one
-/// a hermetic test can drive (building a tantivy index needs a real corpus under the *test
-/// process*'s `$HOME`, which these tests deliberately don't have; the indexed path is verified
-/// against the real 6,873-session archive by hand). It must still answer, in the same row shape,
-/// and SAY it degraded.
+/// `/api/search` over a world with NO full-text index: every session is unindexed, so the live
+/// read answers (all of it unless `live_bytes` bounds it) and the note says so; `scan=1` asks for the live scan
+/// instead, which answers in the same row shape and SAYS it is a scan.
 #[test]
 fn serve_search() {
     let w = world("search");
     let (port, _reaper) = spawn_serve(&w);
 
-    // A word only `alphasess` says. One row, and the row is the §3 search row.
+    // No index: the live read finds it, ranked, and the note names what was read and the cure.
     let raw = raw_get(port, "/api/search?q=zebrafish");
+    assert_eq!(raw_status(&raw), 200, "{raw}");
+    let v = raw_json(&raw);
+    assert_eq!(v.as_array().map(Vec::len), Some(1), "{v}");
+    assert!(v[0]["score"].as_f64().is_some(), "{v}");
+    assert_eq!(header_of(&raw, "X-Cv-Search-Source").as_deref(), Some("index"), "{raw}");
+    let note = header_of(&raw, "X-Cv-Search-Note").unwrap_or_default();
+    assert!(note.contains("no index yet"), "{raw}");
+    // A zero budget reads nothing live, and says what it left out.
+    let raw = raw_get(port, "/api/search?q=zebrafish&live_bytes=0");
+    assert_eq!(raw_json(&raw), serde_json::json!([]), "{raw}");
+    let note = header_of(&raw, "X-Cv-Search-Note").unwrap_or_default();
+    assert!(note.contains("not indexed") && note.contains("cv index"), "{raw}");
+
+    // A word only `alphasess` says. One row, and the row is the §3 search row.
+    let raw = raw_get(port, "/api/search?scan=1&q=zebrafish");
     assert_eq!(raw_status(&raw), 200, "{raw}");
     let v = raw_json(&raw);
     let arr = v.as_array().expect("array");
     assert_eq!(arr.len(), 1, "{v}");
     assert_eq!(arr[0]["id"], "alphasess", "{v}");
-    let keys: Vec<&str> = arr[0].as_object().unwrap().keys().map(String::as_str).collect();
-    assert_eq!(keys, SEARCH_ROW_KEYS, "search row must match §3 exactly: {v}");
+    // The §3 contract is the key SET (a JSON object has no order), not the wire order.
+    let mut keys: Vec<&str> = arr[0].as_object().unwrap().keys().map(String::as_str).collect();
+    let mut expected: Vec<&str> = SEARCH_ROW_KEYS.to_vec();
+    keys.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(keys, expected, "search row must match §3 exactly: {v}");
     // The session-row half is real (it came from a ref, not the index) and the search half is
     // filled the way a scoreless scan fills it.
     assert!(arr[0]["path"].as_str().is_some_and(|p| p.ends_with(".jsonl")), "{v}");
@@ -1244,7 +1112,10 @@ fn serve_search() {
     // …and it says which door answered, so the UI can tell the user the result is partial.
     assert_eq!(header_of(&raw, "X-Cv-Search-Source").as_deref(), Some("live"), "{raw}");
     let note = header_of(&raw, "X-Cv-Search-Note").unwrap_or_default();
-    assert!(note.contains("no index"), "the degrade must be stated: {raw}");
+    assert!(
+        note.contains("scanned every transcript live"),
+        "the scan must be stated: {raw}"
+    );
 
     // An empty or missing query is a caller mistake, not "every session".
     for path in ["/api/search", "/api/search?q=", "/api/search?limit=5"] {
@@ -1253,38 +1124,52 @@ fn serve_search() {
         assert!(v["error"].as_str().unwrap().contains("q parameter"), "{v}");
     }
 
+    // Semantic vectors embed the exchange alone: asking them for the context is a 400, as the
+    // CLI's --semantic conflicts with --kind.
+    let (status, v) = get_json(port, "/api/search?semantic=1&kind=context&q=zebrafish");
+    assert_eq!(status, 400, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("exchange only"), "{v}");
+
+    // Live scan has no context projection; never silently search the exchange instead.
+    for kind in ["context", "all"] {
+        let (status, v) = get_json(port, &format!("/api/search?scan=1&kind={kind}&q=zebrafish"));
+        assert_eq!(status, 400, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("exchange only"), "{v}");
+    }
+
     // harness: a filter, and a typo is a clear 400 (same as /api/sessions).
-    let (status, v) = get_json(port, "/api/search?q=zebrafish&harness=claude");
+    let (status, v) = get_json(port, "/api/search?scan=1&q=zebrafish&harness=claude");
     assert_eq!(status, 200);
     assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
-    let (status, v) = get_json(port, "/api/search?q=zebrafish&harness=codex");
+    let (status, v) = get_json(port, "/api/search?scan=1&q=zebrafish&harness=codex");
     assert_eq!(status, 200);
     assert!(v.as_array().unwrap().is_empty(), "{v}");
-    let (status, v) = get_json(port, "/api/search?q=zebrafish&harness=warpdrive");
+    let (status, v) = get_json(port, "/api/search?scan=1&q=zebrafish&harness=warpdrive");
     assert_eq!(status, 400);
     assert!(v["error"].as_str().unwrap().contains("unknown harness"), "{v}");
 
     // cwd: a substring of the row's cwd, matching /api/sessions?cwd=.
-    let (_, v) = get_json(port, "/api/search?q=zebrafish&cwd=%2Fwork%2Fproj");
+    let (_, v) = get_json(port, "/api/search?scan=1&q=zebrafish&cwd=%2Fwork%2Fproj");
     assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
-    let (_, v) = get_json(port, "/api/search?q=zebrafish&cwd=nowhere");
+    let (_, v) = get_json(port, "/api/search?scan=1&q=zebrafish&cwd=nowhere");
     assert!(v.as_array().unwrap().is_empty(), "{v}");
 
     // A needle both fixtures contain ("plea(se)" / "(se)venteen"), so `limit` bites — and the
     // truncation is stated rather than silently looking like the whole answer.
-    let (_, v) = get_json(port, "/api/search?q=se");
+    let (_, v) = get_json(port, "/api/search?scan=1&q=se");
     assert_eq!(v.as_array().unwrap().len(), 2, "{v}");
-    let raw = raw_get(port, "/api/search?q=se&limit=1");
+    let raw = raw_get(port, "/api/search?scan=1&q=se&limit=1");
     assert_eq!(raw_json(&raw).as_array().unwrap().len(), 1);
     assert!(
         header_of(&raw, "X-Cv-Search-Note")
             .unwrap_or_default()
-            .contains("stopped at 1 hits"),
+            .contains("1 of 2 matches"),
         "{raw}"
     );
+    assert_eq!(header_of(&raw, "X-Cv-Search-Total").as_deref(), Some("2"), "{raw}");
 
     // A miss is an empty array, never an error.
-    let (status, v) = get_json(port, "/api/search?q=pangolin");
+    let (status, v) = get_json(port, "/api/search?scan=1&q=pangolin");
     assert_eq!(status, 200);
     assert!(v.as_array().unwrap().is_empty(), "{v}");
 
@@ -1293,7 +1178,7 @@ fn serve_search() {
     let raw = raw_request(
         port,
         "GET",
-        "/api/search?q=zebrafish",
+        "/api/search?scan=1&q=zebrafish",
         &[("Origin", "http://localhost:5173")],
     );
     let exposed = header_of(&raw, "Access-Control-Expose-Headers").unwrap_or_default();
@@ -1313,16 +1198,19 @@ fn serve_stats() {
 
     let (status, v) = get_json(port, "/api/stats");
     assert_eq!(status, 200, "{v}");
-    let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    // The §3 contract is the key SET (a JSON object has no order), not the wire order.
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
     assert_eq!(
         keys,
         [
-            "sessions",
-            "messages",
             "by_harness",
-            "top_cwds",
             "earliest_created",
-            "latest_updated"
+            "latest_updated",
+            "messages",
+            "sessions",
+            "top_cwds",
+            "uncounted"
         ],
         "stats payload must match `cv stats --json` exactly: {v}"
     );
@@ -1382,13 +1270,16 @@ fn live_search_filters_cwd_before_spending_the_result_budget() {
         w.write_session(id, &[json!({"type":"user", "uuid":id, "cwd":format!("/work/{id}"), "message":{"role":"user", "content":"sharedneedle"}})]);
     }
     let (port, _server) = spawn_serve(&w);
-    let (_, first) = get_json(port, "/api/search?q=sharedneedle&limit=1");
+    let (_, first) = get_json(port, "/api/search?scan=1&q=sharedneedle&limit=1");
     let target = if first[0]["id"] == "alphasess" {
         "betasess"
     } else {
         "alphasess"
     };
-    let (status, filtered) = get_json(port, &format!("/api/search?q=sharedneedle&limit=1&cwd=/work/{target}"));
+    let (status, filtered) = get_json(
+        port,
+        &format!("/api/search?scan=1&q=sharedneedle&limit=1&cwd=/work/{target}"),
+    );
     assert_eq!(status, 200, "{filtered}");
     assert_eq!(
         filtered.as_array().unwrap().len(),
@@ -1396,7 +1287,7 @@ fn live_search_filters_cwd_before_spending_the_result_budget() {
         "nonmatching hit exhausted live limit: {filtered}"
     );
     assert_eq!(filtered[0]["id"], target);
-    assert_eq!(get_json(port, "/api/search?q=sharedneedle&limit=0").1, json!([]));
+    assert_eq!(get_json(port, "/api/search?scan=1&q=sharedneedle&limit=0").1, json!([]));
 }
 
 #[test]
@@ -1452,8 +1343,10 @@ fn request_headers_are_bounded_and_buffering_preserves_body_and_pipeline() {
     write!(stream, "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 4\r\n\r\nbodyGET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").unwrap();
     let mut raw = String::new();
     stream.read_to_string(&mut raw).unwrap();
+    // Count full status LINES (`HTTP/1.1 200 OK\r\n`), so a body that happens to quote a bare
+    // "HTTP/1.1 200" is never counted as a response.
     assert_eq!(
-        raw.matches("HTTP/1.1 200").count(),
+        raw.matches("HTTP/1.1 200 OK\r\n").count(),
         2,
         "buffered body/pipeline lost: {raw}"
     );
@@ -1508,6 +1401,10 @@ fn pipelined_requests_each_pass_the_host_check() {
     assert_eq!(statuses, ["200", "403", "403"], "{raw}");
 }
 
+/// The server's connection cap (`http::Limits::connections`' default): filling it with idle
+/// connections must shed the next newcomer, not queue it.
+const CONNECTION_CAP: usize = 64;
+
 /// Idle connections cannot lock the server out: past the connection cap a newcomer is answered
 /// 503 at once, never queued behind them, and each idle one is closed at the first-byte deadline.
 #[test]
@@ -1515,7 +1412,7 @@ fn idle_connections_are_shed_then_expire() {
     let w = world("idle-shed");
     let (port, _server) = spawn_serve(&w);
     std::thread::sleep(Duration::from_millis(200)); // let the readiness probe's connection end
-    let idle: Vec<TcpStream> = (0..64)
+    let idle: Vec<TcpStream> = (0..CONNECTION_CAP)
         .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
         .collect();
     std::thread::sleep(Duration::from_millis(300));
@@ -1615,49 +1512,14 @@ fn raw_get(port: u16, path: &str) -> String {
 /// A raw request with custom headers, returning the full response text (headers + body).
 /// A default local `Host` is supplied unless the caller passes their own.
 fn raw_request(port: u16, method: &str, path: &str, headers: &[(&str, &str)]) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut req = format!("{method} {path} HTTP/1.1\r\n");
-    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
-        req.push_str(&format!("Host: 127.0.0.1:{port}\r\n"));
-    }
-    for (k, v) in headers {
-        req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    req.push_str("Connection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).unwrap();
-    let mut s = String::new();
-    stream.read_to_string(&mut s).unwrap();
-    s
-}
-
-/// The status code from a raw response's status line.
-fn raw_status(raw: &str) -> u16 {
-    raw.split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("bad status line in: {raw}"))
+    cv_testkit::http::raw_request(&format!("127.0.0.1:{port}"), method, path, headers, None)
 }
 
 // ───────────────────────────── the inbox on cv serve ─────────────────────────────
 
 /// A POST with a body and headers, returning the raw response.
 fn raw_post(port: u16, path: &str, body: &str, headers: &[(&str, &str)]) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut req = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\n",
-        body.len()
-    );
-    for (k, v) in headers {
-        req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    req.push_str("Connection: close\r\n\r\n");
-    req.push_str(body);
-    stream.write_all(req.as_bytes()).unwrap();
-    let mut s = String::new();
-    stream.read_to_string(&mut s).unwrap();
-    s
+    cv_testkit::http::raw_request(&format!("127.0.0.1:{port}"), "POST", path, headers, Some(body))
 }
 
 /// What `cv task serve` served moved onto `cv serve`: the page (at `/inbox`, and at `/` with no
@@ -1684,10 +1546,10 @@ fn serve_carries_the_inbox_and_guards_its_writes() {
         ))
         .expect("seed open");
     let id = opened.task_id.clone();
-    let (port, _reaper) = spawn_serve_with(&w, &["--who", "ember"]);
+    let (port, _reaper) = spawn_serve_cfg(&w, &["--who", "ember"], &[]);
 
     for path in ["/", "/inbox"] {
-        let (status, ct, body) = get_raw(port, path);
+        let (status, ct, body) = get_with_content_type(port, path);
         assert_eq!(status, 200, "{path}");
         assert!(
             ct.contains("html") && body.contains("<title>cv inbox</title>"),
@@ -1698,8 +1560,18 @@ fn serve_carries_the_inbox_and_guards_its_writes() {
     assert_eq!(status, 200, "{v}");
     assert_eq!(v["who"], "ember", "the server's --who is the default inbox: {v}");
     let (status, v) = get_json(port, "/api/backlog");
-    assert_eq!(status, 200, "{v}");
-    assert_eq!(v["count"], 1, "{v}");
+    assert_eq!(status, 410, "{v}");
+    assert!(
+        v["error"].as_str().unwrap_or_default().contains("/api/tasks?detail=1"),
+        "{v}"
+    );
+    let raw = raw_post(
+        port,
+        &format!("/api/task/{id}/reopen"),
+        "{}",
+        &[("Content-Type", "application/json")],
+    );
+    assert_eq!(raw_status(&raw), 410, "{raw}");
 
     let path = format!("/api/task/{id}/note");
     let body = r#"{"who":"ember","text":"a little flat"}"#;
@@ -1729,7 +1601,7 @@ fn serve_carries_the_inbox_and_guards_its_writes() {
     oversized.push_str(&" ".repeat((1 << 20) + 1 - oversized.len()));
     let raw = raw_post(port, &path, &oversized, &[("Content-Type", "application/json")]);
     assert_eq!(raw_status(&raw), 413, "truncated JSON prefix was accepted: {raw}");
-    let (_, _, events) = get_raw(port, "/api/events");
+    let (_, _, events) = get_with_content_type(port, "/api/events");
     assert_eq!(
         events.lines().count(),
         1,
@@ -1760,7 +1632,7 @@ fn serve_carries_the_inbox_and_guards_its_writes() {
     assert_eq!(v["by"], "web:ember", "{v}");
 
     // The events feed is the same query as `cv task events`: JSON lines, the note last.
-    let (status, ct, lines) = get_raw(port, "/api/events?since=1h");
+    let (status, ct, lines) = get_with_content_type(port, "/api/events?since=1h");
     assert_eq!(status, 200);
     assert!(ct.contains("ndjson"), "{ct}");
     let last: Value = serde_json::from_str(lines.lines().last().unwrap()).unwrap();
@@ -1769,6 +1641,189 @@ fn serve_carries_the_inbox_and_guards_its_writes() {
     // POST anywhere else is still a 405.
     let raw = raw_post(port, "/api/sessions", "{}", &[("Content-Type", "application/json")]);
     assert_eq!(raw_status(&raw), 405, "{raw}");
+}
+
+/// A GET or POST with a JSON content type; returns (status, body).
+fn json_http(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    let raw = cv_testkit::http::raw_request(
+        &format!("127.0.0.1:{port}"),
+        method,
+        path,
+        &[("Content-Type", "application/json")],
+        Some(body.unwrap_or("")),
+    );
+    (raw_status(&raw), cv_testkit::http::parts(&raw).1.to_owned())
+}
+
+/// The page and the CLI are one store: GET the inbox for a fixture assignee (one decision, one
+/// action), POST resolve / done / note / discuss, and `cv task show --brief` reflects every event
+/// with the author `web:<assignee>`. The event feed route is the same query as `cv task events`.
+#[test]
+fn the_inbox_records_the_same_events_as_the_cli() {
+    let w = World::new("serve-cli-agreement");
+    w.cv_ok(&[
+        "task",
+        "decide",
+        "PAY §7: tariff",
+        "--for",
+        "ember",
+        "--default",
+        "1 credit/unit",
+        "--option",
+        "free tier",
+        "--from",
+        "orchestrator:x",
+    ]);
+    let titled = |title: &str| -> String {
+        let (json, _) = w.cv_ok(&["task", "list", "--all", "--json"]);
+        let tasks: Vec<Value> = serde_json::from_str(&json).unwrap();
+        let ids: Vec<&str> = tasks
+            .iter()
+            .filter(|t| t["title"] == title)
+            .map(|t| t["task_id"].as_str().expect("task_id"))
+            .collect();
+        assert_eq!(ids.len(), 1, "one task titled {title:?}:\n{json}");
+        ids[0].to_string()
+    };
+    let d = titled("PAY §7: tariff");
+    w.cv_ok(&[
+        "task",
+        "open",
+        "push dregg-infra",
+        "--assignee",
+        "ember",
+        "--from",
+        "orchestrator:x",
+    ]);
+    let a = titled("push dregg-infra");
+    let (port, _reaper) = spawn_serve_cfg(&w, &["--who", "ember"], &[]);
+    // The page itself is served inline; it names its own origin story.
+    let (status, html) = json_http(port, "GET", "/", None);
+    assert_eq!(status, 200);
+    assert!(
+        html.contains("<title>cv inbox</title>") && html.contains("/api/inbox"),
+        "{}",
+        &html[..200.min(html.len())]
+    );
+    assert!(
+        !html.contains("<script src=") && !html.contains("<link rel=\"stylesheet\""),
+        "no external resources"
+    );
+    // A DNS-named Host is refused (rebinding).
+    let raw = cv_testkit::http::raw_request(
+        &format!("127.0.0.1:{port}"),
+        "GET",
+        "/api/inbox",
+        &[("Host", "evil.example")],
+        None,
+    );
+    assert_eq!(raw_status(&raw), 403);
+
+    let (status, body) = json_http(port, "GET", "/api/inbox?who=ember", None);
+    assert_eq!(status, 200, "{body}");
+    let page: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page["who"], "ember");
+    assert_eq!(page["counts"]["decisions"], 1);
+    assert_eq!(page["counts"]["assigned"], 1);
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items[0]["reason"], "decision_owed");
+    assert_eq!(items[0]["decision"]["default"], "1 credit/unit");
+    assert_eq!(items[0]["decision"]["alternatives"], json!(["free tier"]));
+    assert_eq!(items[1]["reason"], "assigned_open");
+    // Without ?who the server's --who applies.
+    let (status, body) = json_http(port, "GET", "/api/inbox", None);
+    assert_eq!(status, 200);
+    assert!(body.contains("\"who\":\"ember\""), "{body}");
+
+    // Act: a note, then "needs discussion", then resolve with an option, then done.
+    let (status, body) = json_http(
+        port,
+        "POST",
+        &format!("/api/task/{d}/note"),
+        Some(r#"{"text":"reading PAY first"}"#),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"by\":\"web:ember\""), "{body}");
+    let (status, body) = json_http(
+        port,
+        "POST",
+        &format!("/api/task/{d}/discuss"),
+        Some(r#"{"text":"what is a unit?"}"#),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = json_http(
+        port,
+        "POST",
+        &format!("/api/task/{d}/resolve"),
+        Some(r#"{"choice":"free tier","note":"for October"}"#),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"task_state\":\"resolved\""), "{body}");
+    let (status, body) = json_http(
+        port,
+        "POST",
+        &format!("/api/task/{d}/resolve"),
+        Some(r#"{"accept_default":true}"#),
+    );
+    assert_eq!(status, 400, "a second resolution is refused: {body}");
+    let (status, body) = json_http(
+        port,
+        "POST",
+        &format!("/api/task/{a}/done"),
+        Some(r#"{"observed":"pushed"}"#),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = json_http(port, "POST", &format!("/api/task/{a}/done"), Some("{}"));
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = json_http(port, "POST", &format!("/api/task/{a}/frobnicate"), Some("{}"));
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = json_http(port, "POST", &format!("/api/task/{a}/note"), Some("not json"));
+    assert_eq!(status, 400, "{body}");
+
+    // The closed items show under the page's Resolved filter; the web-only reopen is a pointer.
+    let (status, body) = json_http(port, "GET", "/api/inbox?who=ember", None);
+    assert_eq!(status, 200);
+    let page: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 0);
+    assert_eq!(page["closed"].as_array().unwrap().len(), 2);
+    let (status, body) = json_http(port, "POST", &format!("/api/task/{a}/reopen"), Some("{}"));
+    assert_eq!(status, 410, "{body}");
+    assert!(body.contains("removed in 0.17"), "{body}");
+
+    // One task, with its history; the event feed is the same query as `cv task events`.
+    let (status, body) = json_http(port, "GET", &format!("/api/task/{d}?events=1"), None);
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["effective_state"], "resolved");
+    assert!(v["events"].as_array().unwrap().len() >= 6, "{body}");
+    let (status, body) = json_http(port, "GET", "/api/events?since=1h&kind=resolved,done", None);
+    assert_eq!(status, 200);
+    let rows: Vec<Value> = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(rows.len(), 2, "{body}");
+    assert!(rows.iter().all(|r| r["by"] == "web:ember"), "{body}");
+
+    // The CLI sees exactly what the page recorded, with the web author.
+    let (out, _) = w.cv_ok(&["task", "show", &d, "--brief"]);
+    assert!(out.contains("[resolved]"), "{out}");
+    assert!(
+        out.contains("resolved: free tier — by web:ember,") && out.contains("· for October"),
+        "{out}"
+    );
+    assert!(out.contains("web:ember") && out.contains("reading PAY first"), "{out}");
+    assert!(out.contains("NEEDS DISCUSSION: what is a unit?"), "{out}");
+    assert!(
+        out.contains("tags:     discuss"),
+        "a decision is posed, never tagged:\n{out}"
+    );
+    let (out, _) = w.cv_ok(&["task", "show", &a, "--brief"]);
+    assert!(
+        out.contains("[done]") && out.contains("self-reported") && out.contains("(pushed)"),
+        "{out}"
+    );
+    let (json, _) = w.cv_ok(&["task", "show", &a, "--events"]);
+    assert!(json.contains("\"by\": \"web:ember\""), "{json}");
+    let (out, _) = w.cv_ok(&["task", "events", "--since", "1h", "--kind", "resolved,done"]);
+    assert_eq!(out.lines().count(), 2, "the CLI feed and /api/events agree:\n{out}");
 }
 
 /// The removed names answer with a pointer and exit 2, never silently.
@@ -1796,6 +1851,188 @@ fn removed_server_spellings_point_at_cv_serve() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// The provisional decision lifecycle on the CLI: a provisional resolution reads as "made for
+/// you (veto?)", the poser cannot pick a non-default, a veto supersedes (keeping the provisional
+/// one), and confirming through the page records `web:<who>` with the provisional kept.
+#[test]
+fn task_provisional_resolution_veto_and_confirm() {
+    let w = World::new("provisional");
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "decide",
+        "build base: /tank or NVMe",
+        "--for",
+        "ember",
+        "--default",
+        "keep /tank",
+        "--option",
+        "move to NVMe",
+        "--provisional",
+        "--from",
+        "orchestrator:o",
+    ]);
+    let titled = |title: &str| -> String {
+        let (json, _) = w.cv_ok(&["task", "list", "--all", "--json"]);
+        let tasks: Vec<Value> = serde_json::from_str(&json).unwrap();
+        let ids: Vec<&str> = tasks
+            .iter()
+            .filter(|t| t["title"] == title)
+            .map(|t| t["task_id"].as_str().expect("task_id"))
+            .collect();
+        assert_eq!(ids.len(), 1, "one task titled {title:?}:\n{json}");
+        ids[0].to_string()
+    };
+    let d = titled("build base: /tank or NVMe");
+    assert!(
+        out.contains("resolved") && out.contains("provisionally on the default"),
+        "{out}"
+    );
+    let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
+    assert!(
+        out.starts_with("made for you (veto?) (1):"),
+        "not owed, its own group:\n{out}"
+    );
+    assert!(
+        out.contains("⇒ made: keep /tank — by orchestrator:o · veto to: move to NVMe"),
+        "{out}"
+    );
+    assert!(out.contains("cv task resolve <id> --confirm --from ember"), "{out}");
+    let (json, _) = w.cv_ok(&["task", "inbox", "ember", "--json"]);
+    let inbox: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(inbox["counts"]["provisional"], 1, "{json}");
+    let item = inbox["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == d.as_str());
+    assert_eq!(item.map(|i| &i["reason"]), Some(&json!("provisional")), "{json}");
+    let (out, _) = w.cv_ok(&["task", "show", &d]);
+    assert!(out.contains("[resolved]") && out.contains("PROVISIONAL"), "{out}");
+    assert!(out.contains("veto?:    cv task resolve"), "{out}");
+
+    // The poser cannot pick a non-default provisionally; a third party cannot override.
+    w.cv_ok(&[
+        "task",
+        "decide",
+        "Q2",
+        "--for",
+        "ember",
+        "--default",
+        "a",
+        "--option",
+        "b",
+        "--from",
+        "orchestrator:o",
+    ]);
+    let d2 = titled("Q2");
+    let (_, err) = w.cv_fails(&[
+        "task",
+        "resolve",
+        &d2,
+        "--choice",
+        "b",
+        "--provisional",
+        "--from",
+        "orchestrator:o",
+    ]);
+    assert!(err.contains("stands on the default"), "{err}");
+    let (_, err) = w.cv_fails(&[
+        "task",
+        "resolve",
+        &d,
+        "--choice",
+        "move to NVMe",
+        "--from",
+        "lane:someone",
+    ]);
+    assert!(err.contains("only the decision's assignee (ember)"), "{err}");
+    let (_, err) = w.cv_fails(&["task", "resolve", &d2, "--confirm", "--from", "ember"]);
+    assert!(err.contains("no provisional resolution to confirm"), "{err}");
+    // No identity: the cure names the decision's owner, never a guess.
+    let (_, err) = w.cv_fails(&["task", "resolve", &d2, "--accept-default"]);
+    assert!(
+        err.contains("records WHO decided") && err.contains("--accept-default --from ember"),
+        "{err}"
+    );
+
+    // The decider vetoes: a new resolution replaces the provisional one, which is kept.
+    let (out, _) = w.cv_ok(&["task", "resolve", &d, "--choice", "move to NVMe", "--from", "ember"]);
+    assert!(out.contains("→ move to NVMe (by ember)"), "{out}");
+    let (out, _) = w.cv_ok(&["task", "show", &d]);
+    assert!(out.contains("provisionally: keep /tank — by orchestrator:o"), "{out}");
+    assert!(
+        out.contains("resolved: move to NVMe — by ember") && !out.contains("PROVISIONAL"),
+        "{out}"
+    );
+    let (json, _) = w.cv_ok(&["task", "show", &d, "--json"]);
+    let t: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(t["decision"]["resolution"]["choice"], "move to NVMe");
+    assert!(t["decision"]["resolution"].get("provisional").is_none(), "{json}");
+    assert_eq!(t["decision"]["superseded_provisional"]["provisional"], true, "{json}");
+    // Vetoed, it is no longer made for ember: not an open item, counted as closed.
+    let (json, _) = w.cv_ok(&["task", "inbox", "ember", "--json"]);
+    let inbox: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(inbox["counts"]["provisional"], 0, "{json}");
+    assert!(
+        inbox["items"].as_array().unwrap().iter().all(|i| i["id"] != d.as_str()),
+        "{json}"
+    );
+    assert!(
+        inbox["closed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["id"] == d.as_str()),
+        "{json}"
+    );
+    // A second answer is refused as it always was.
+    let (_, err) = w.cv_fails(&["task", "resolve", &d, "--accept-default", "--from", "ember"]);
+    assert!(err.contains("cannot apply resolved"), "{err}");
+
+    // Confirm through the page.
+    w.cv_ok(&[
+        "task",
+        "decide",
+        "Q3",
+        "--for",
+        "ember",
+        "--default",
+        "x",
+        "--option",
+        "y",
+        "--provisional",
+        "--from",
+        "orchestrator:o",
+    ]);
+    let d3 = titled("Q3");
+    let (port, _reaper) = spawn_serve_cfg(&w, &["--who", "ember"], &[]);
+    let (status, body) = json_http(port, "GET", "/api/inbox?who=ember", None);
+    assert_eq!(status, 200, "{body}");
+    let page: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page["counts"]["provisional"], 1, "{body}");
+    assert_eq!(page["counts"]["decisions"], 1, "Q2 is still owed; Q3 is not: {body}");
+    let made: Vec<&Value> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["reason"] == "provisional")
+        .collect();
+    assert_eq!(made.len(), 1, "{body}");
+    assert_eq!(made[0]["title"], "Q3");
+    let (status, body) = json_http(
+        port,
+        "POST",
+        &format!("/api/task/{d3}/resolve"),
+        Some(r#"{"confirm":true}"#),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (json, _) = w.cv_ok(&["task", "show", &d3, "--json"]);
+    let t: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(t["decision"]["resolution"]["by"], "web:ember");
+    assert_eq!(t["decision"]["resolution"]["choice"], "x");
+    assert_eq!(t["decision"]["superseded_provisional"]["by"], "orchestrator:o");
 }
 
 #[test]
@@ -1869,6 +2106,19 @@ fn malformed_header_fields_fail_before_routing() {
     }
     let response = raw_request(port, "GET", "/api/health", &[("X-Valid_Token", "\tvalid\tvalue\t")]);
     assert_eq!(raw_status(&response), 200, "{response}");
+}
+
+#[test]
+fn duplicate_host_fields_are_rejected_before_routing() {
+    let w = world("duplicate-host");
+    let (port, _server) = spawn_serve(&w);
+    for hosts in [
+        [("Host", "localhost"), ("host", "evil.example")],
+        [("Host", "localhost"), ("Host", "localhost")],
+    ] {
+        let response = raw_request(port, "GET", "/api/health", &hosts);
+        assert_eq!(raw_status(&response), 400, "{response}");
+    }
 }
 
 #[test]

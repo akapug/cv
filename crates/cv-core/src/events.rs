@@ -4,7 +4,7 @@
 //! file X / ran command Y / hit error Z". Every [`Block::ToolUse`]/[`Block::ToolResult`] streaming
 //! past is distilled into a tiny normalized [`Event`] row (kind + tool + target), persisted into the
 //! same SQLite catalog as [`crate::catalog`]'s `sessions` table. That makes `cv touched <path>`
-//! an indexed lookup instead of a corpus re-parse, and is the substrate for a future `cv blame`
+//! an indexed lookup instead of a corpus re-parse, and is the substrate for `cv blame`
 //! (line of code → the session whose reasoning wrote it).
 //!
 //! Tool names differ wildly across harnesses (claude `Edit`/`Read`/`Bash`, codex
@@ -16,12 +16,12 @@
 //! Memory discipline (the project's core value): the sink owns only the small classified rows.
 //! Tool arguments are projected from owned or validated source-backed JSON; only selected paths,
 //! command prefixes and actual patch target lines are retained. Tool result content is never
-//! materialized — under [`ParseOptions::lazy()`](crate::stream::ParseOptions::lazy) a large result
+//! materialized — under [`Demand::LEAN.with_spans()`](crate::stream::Demand::with_spans) a large result
 //! is an unresolved [`Span`](crate::lazy::Span) and the error `detail` is simply skipped for it.
 //! Like [`crate::catalog`], the persistence side is best-effort: SQLite errors degrade to empty
-//! results / no-ops, never failing the caller.
+//! results / no-ops with a named diagnostic, never silently failing the caller.
 
-use crate::ir::{truncate, Block, Message, Session, SessionRef};
+use crate::ir::{Block, Message, Session, SessionRef};
 use crate::json::{Json, JsonView};
 use crate::stream::{Checkpoint, Flow, MessageSink};
 use anyhow::Result;
@@ -33,10 +33,12 @@ mod arguments;
 mod spool;
 pub use spool::{EventSpool, SpoolingSink};
 
-/// Cap (chars) on a command-string target. File-path targets are never truncated.
-const TARGET_MAX: usize = 300;
-/// Cap (chars) on the `detail` context (e.g. the head of an error result).
-const DETAIL_MAX: usize = 200;
+/// Controls catalog ingestion over the discovered corpus.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IngestOptions {
+    pub force: bool,
+    pub subagents: bool,
+}
 
 /// Name fragments that mark a file-keyed tool as *writing* its target.
 const WRITE_HINTS: &[&str] = &["edit", "write", "patch", "notebook", "replace", "create", "save"];
@@ -68,7 +70,7 @@ pub struct Event {
     /// The raw tool name as the harness recorded it (`None` for an error result whose tool is unknown).
     pub tool: Option<String>,
     pub target: Option<String>,
-    /// Small context, capped at [`DETAIL_MAX`] chars (e.g. the head of an error result).
+    /// An error result's whole text (trimmed), resolved from the source when it is lazy.
     pub detail: Option<String>,
     /// The first row of its `tool_use` block. One call can yield several rows (a patch sent through
     /// the shell is a `command` row plus a `file_edit` per file); counting calls counts these.
@@ -83,8 +85,11 @@ pub struct EventSink {
     events: Vec<Event>,
     dependencies: crate::source::ReadSet,
     capture_events: bool,
-    error: Option<anyhow::Error>,
-    failed: bool,
+    extractor: EventExtractor,
+    /// Resolves a lazy error result for its `detail`: the session's source, from
+    /// [`with_source`](Self::with_source) or the streamed meta session.
+    resolver: crate::lazy::Resolver,
+    latch: crate::stream::Latch,
 }
 
 impl EventSink {
@@ -97,28 +102,43 @@ impl EventSink {
             events: Vec::new(),
             dependencies: Default::default(),
             capture_events: true,
-            error: None,
-            failed: false,
+            extractor: EventExtractor::default(),
+            resolver: crate::lazy::Resolver::new(None),
+            latch: Default::default(),
         }
+    }
+
+    /// Resolve lazy error results against `source` (the session's file) until a streamed meta
+    /// session names its own, parse-time stamped, source.
+    pub fn with_source(mut self, source: PathBuf) -> Self {
+        self.resolver = crate::lazy::Resolver::new(Some(source));
+        self
     }
 
     /// Observe a borrowed message when another consumer owns its delivery.
     pub fn observe_message(&mut self, m: &Message) -> Flow {
-        if self.failed {
+        if self.latch.failed() {
             return Flow::Stop;
         }
-        if self.capture_events {
-            if let Err(error) = extract_into(m, self.msg_idx, self.cwd.as_deref(), &mut self.events) {
-                self.error = Some(error);
-                self.failed = true;
-                return Flow::Stop;
-            }
+        if let Err(error) = self.extractor.extract(
+            m,
+            self.msg_idx,
+            self.cwd.as_deref(),
+            None,
+            Some(&self.resolver),
+            &mut self.events,
+        ) {
+            self.latch.fail(error);
+            return Flow::Stop;
+        }
+        if !self.capture_events {
+            release_scratch(&mut self.events);
         }
         self.msg_idx += 1;
         Flow::Continue
     }
 
-    /// Keep checkpoint state and dependencies without extracting or retaining event rows.
+    /// Keep checkpoint/call identity state and dependencies without retaining event rows.
     /// Useful when events are fresh but another consumer needs a new shared resume mark.
     pub fn without_events(mut self) -> Self {
         self.capture_events = false;
@@ -152,8 +172,9 @@ impl EventSink {
             events: Vec::new(),
             dependencies: st.dependencies,
             capture_events: true,
-            error: None,
-            failed: false,
+            extractor: EventExtractor::resume(st.extractor).ok()?,
+            resolver: crate::lazy::Resolver::new(None),
+            latch: Default::default(),
         })
     }
 }
@@ -164,21 +185,32 @@ const EVENTS_LAYER: &str = "events";
 /// What an [`EventSink`] holds at a checkpoint: the rows so far are in the catalog already.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EventState {
+    extractor: ExtractorState,
     msg_idx: usize,
     cwd: Option<PathBuf>,
-    #[serde(default = "crate::source::ReadSet::unrecorded")]
     dependencies: crate::source::ReadSet,
 }
 
 impl MessageSink for EventSink {
     fn dependency(&mut self, path: &std::path::Path) {
-        if !self.failed {
+        if !self.latch.failed() {
             self.dependencies.record(path);
         }
     }
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if !self.latch.failed() {
+            self.dependencies.record_append_only(path);
+        }
+    }
     fn meta(&mut self, s: &Session) {
-        if !self.failed && self.cwd.is_none() {
+        if self.latch.failed() {
+            return;
+        }
+        if self.cwd.is_none() {
             self.cwd = s.cwd.clone();
+        }
+        if s.source_path.is_some() {
+            self.resolver = s.resolver();
         }
     }
 
@@ -187,23 +219,24 @@ impl MessageSink for EventSink {
     }
 
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.error.take().or_else(|| {
-            self.failed
-                .then(|| anyhow::anyhow!("event consumer has already failed"))
-        })
+        self.latch.take("event consumer")
     }
 
     fn wants_checkpoint(&mut self, _offset: u64) -> bool {
-        !self.failed
+        !self.latch.failed() && self.extractor.can_checkpoint()
     }
 
     fn checkpoint(&mut self, cp: &mut Checkpoint) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
+        let Some(extractor) = self.extractor.checkpoint() else {
+            return;
+        };
         cp.put(
             EVENTS_LAYER,
             &EventState {
+                extractor,
                 msg_idx: self.msg_idx,
                 cwd: self.cwd.clone(),
                 dependencies: self.dependencies.clone(),
@@ -214,10 +247,15 @@ impl MessageSink for EventSink {
 
 /// Classify one message's tool blocks into events. `msg_idx` is its index in the transcript;
 /// relative file targets resolve against `cwd`. The standalone form of what [`EventSink`] does
-/// per streamed message.
-pub fn extract(m: &Message, msg_idx: usize, cwd: Option<&Path>) -> Result<Vec<Event>> {
+/// per streamed message. `resolver` reads a lazy error result whole for its `detail`.
+pub fn extract(
+    m: &Message,
+    msg_idx: usize,
+    cwd: Option<&Path>,
+    resolver: &crate::lazy::Resolver,
+) -> Result<Vec<Event>> {
     let mut out = Vec::new();
-    extract_into(m, msg_idx, cwd, &mut out)?;
+    EventExtractor::default().extract(m, msg_idx, cwd, None, Some(resolver), &mut out)?;
     Ok(out)
 }
 
@@ -229,26 +267,164 @@ pub(crate) fn release_scratch(events: &mut Vec<Event>) {
     }
 }
 
-pub(crate) fn extract_into(m: &Message, msg_idx: usize, cwd: Option<&Path>, out: &mut Vec<Event>) -> Result<()> {
-    extract_into_for_tool(m, msg_idx, cwd, None, out)
+/// Correlate native completed file changes by exact call ID and resolved target.
+/// Call markers and target pairs share one bounded set; completions use the other.
+/// Code-mode nested calls have their own native IDs and no visible ToolUse counterpart.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ExtractorState {
+    inferred_keys: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    completed: std::collections::BTreeSet<String>,
 }
 
-pub(crate) fn extract_into_for_tool(
+pub(crate) struct EventExtractor {
+    inferred_edits: crate::spill::ExactStrings,
+    completed: crate::spill::ExactStrings,
+    pending: usize,
+}
+
+impl Default for EventExtractor {
+    fn default() -> Self {
+        Self {
+            inferred_edits: crate::spill::ExactStrings::with_memory_limit(64 * 1024),
+            completed: crate::spill::ExactStrings::with_memory_limit(64 * 1024),
+            pending: 0,
+        }
+    }
+}
+
+impl EventExtractor {
+    fn resume(state: ExtractorState) -> Result<Self> {
+        anyhow::ensure!(
+            state.completed.is_subset(&state.inferred_keys) && state.completed.iter().all(|key| key.starts_with('c')),
+            "invalid inferred call checkpoint"
+        );
+        let mut extractor = Self {
+            pending: state.inferred_keys.iter().filter(|key| key.starts_with('c')).count() - state.completed.len(),
+            ..Self::default()
+        };
+        for id in state.inferred_keys {
+            extractor.inferred_edits.insert(id)?;
+        }
+        for id in state.completed {
+            extractor.completed.insert(id)?;
+        }
+        Ok(extractor)
+    }
+
+    // Spill files belong to this read operation. Decline the shared checkpoint until
+    // identities fit in its owned state again; append recovery replays the prior prefix.
+    fn can_checkpoint(&self) -> bool {
+        self.inferred_edits.memory_values().is_some() && self.completed.memory_values().is_some()
+    }
+
+    fn checkpoint(&self) -> Option<ExtractorState> {
+        Some(ExtractorState {
+            inferred_keys: self.inferred_edits.memory_values()?.iter().cloned().collect(),
+            completed: self.completed.memory_values()?.iter().cloned().collect(),
+        })
+    }
+
+    fn note_inferred(&mut self, id: &str) -> Result<()> {
+        if self.inferred_edits.insert(format!("c{id}"))? {
+            self.pending += 1;
+        }
+        Ok(())
+    }
+
+    // Length-prefix the ID so arbitrary ID/path bytes cannot alias another pair or a call key.
+    fn target_key(id: &str, target: &str) -> String {
+        format!("p{}:{id}{target}", id.len())
+    }
+
+    fn note_target(&mut self, id: &str, target: &str) -> Result<()> {
+        self.note_inferred(id)?;
+        self.inferred_edits.insert(Self::target_key(id, target))?;
+        Ok(())
+    }
+
+    fn complete(&mut self, id: &str) -> Result<()> {
+        if self.inferred_edits.contains(&format!("c{id}"))? && self.completed.insert(format!("c{id}"))? {
+            self.pending = self.pending.saturating_sub(1);
+            if self.pending == 0 {
+                self.inferred_edits.clear();
+                self.completed.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Classify `m` into `out`. With `details`, rows carry their text whole: a command's string
+    /// and an error's (resolved) text. Without, a caller that only counts or matches tools and
+    /// files reads and assembles neither.
+    pub(crate) fn extract(
+        &mut self,
+        m: &Message,
+        msg_idx: usize,
+        cwd: Option<&Path>,
+        tool: Option<&str>,
+        details: Option<&crate::lazy::Resolver>,
+        out: &mut Vec<Event>,
+    ) -> Result<()> {
+        extract_message(m, msg_idx, cwd, tool, details, out, self)
+    }
+}
+
+/// A file edit a harness record states outside its tool blocks
+/// ([`crate::harness::Adapter::native_edit`]): one `file_edit` event per path, under `tool`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEdit<'m> {
+    /// The edit's own id, which a tool call that already produced its events carries too.
+    pub id: Option<&'m str>,
+    /// The tool the edit is attributed to.
+    pub tool: &'static str,
+    /// Every path the edit touches (sources and move destinations), as the record spells them.
+    pub paths: Vec<&'m str>,
+}
+
+fn extract_message(
     m: &Message,
     msg_idx: usize,
     cwd: Option<&Path>,
     tool: Option<&str>,
+    details: Option<&crate::lazy::Resolver>,
     out: &mut Vec<Event>,
+    extractor: &mut EventExtractor,
 ) -> Result<()> {
     let mut staged = Vec::new();
     let ts = m.timestamp.map(|t| t.timestamp());
+    // A file edit the harness record states outside its tool blocks, unless a call already did.
+    if let Some(edit) = crate::harness::native_edit(m) {
+        if let Some(id) = edit.id {
+            let paths: std::collections::BTreeSet<_> = edit.paths.iter().map(|path| absolutize(path, cwd)).collect();
+            for path in paths {
+                if !extractor
+                    .inferred_edits
+                    .contains(&EventExtractor::target_key(id, &path))?
+                {
+                    staged.push(Event {
+                        msg_idx,
+                        ts,
+                        kind: "file_edit",
+                        tool: Some(edit.tool.into()),
+                        target: Some(path),
+                        detail: None,
+                        call: false,
+                    });
+                }
+            }
+        }
+    }
     for b in &m.content {
         match b {
-            Block::ToolUse { name, input, .. } => {
-                if tool.is_some_and(|selected| selected != name) {
-                    continue;
+            Block::ToolUse { id, name, input, .. } => {
+                let before = staged.len();
+                extract_call_into(name, input, msg_idx, ts, cwd, details.is_some(), &mut staged)?;
+                for event in staged[before..].iter().filter(|event| event.kind == "file_edit") {
+                    if let Some(target) = &event.target {
+                        extractor.note_target(id, target)?;
+                    }
                 }
-                extract_call_into(name, input, msg_idx, ts, cwd, &mut staged)?;
             }
             Block::ToolResult {
                 content,
@@ -256,16 +432,14 @@ pub(crate) fn extract_into_for_tool(
                 tool_name,
                 ..
             } => {
-                if tool.is_some_and(|selected| tool_name.as_deref() != Some(selected)) {
-                    continue;
-                }
-                // Never materialize a lazy span just for a 200-char detail — an unresolved span
-                // (a giant failed-command dump) simply contributes no detail.
-                let detail = content
-                    .inline_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| truncate(s, DETAIL_MAX));
+                // The whole error text: a lazy one is read from the source. A caller that keeps
+                // no text (`cv tools` counts rows) passes no resolver and reads nothing.
+                let detail = match details {
+                    Some(resolver) => Some(content.try_resolve(resolver)?)
+                        .map(|text| text.trim().to_owned())
+                        .filter(|s| !s.is_empty()),
+                    None => None,
+                };
                 staged.push(Event {
                     msg_idx,
                     ts,
@@ -279,22 +453,35 @@ pub(crate) fn extract_into_for_tool(
             _ => {}
         }
     }
-    out.extend(staged);
+    for block in &m.content {
+        if let Block::ToolResult { tool_use_id, .. } = block {
+            extractor.complete(tool_use_id)?;
+        }
+    }
+    // Correlation always sees every call. Select only the canonical attributed rows.
+    out.extend(
+        staged
+            .into_iter()
+            .filter(|event| tool.is_none_or(|name| event.tool.as_deref() == Some(name))),
+    );
     Ok(())
 }
 
-/// Classify a borrowed call without cloning its possibly owned, oversized arguments.
+/// Classify a borrowed call without cloning its possibly owned, oversized arguments. A `command`
+/// row's target is the whole command only when `commands`; otherwise it is `None` and the command
+/// is never assembled.
 pub(crate) fn extract_call_into(
     name: &str,
     input: &crate::Json,
     msg_idx: usize,
     ts: Option<i64>,
     cwd: Option<&Path>,
+    commands: bool,
     out: &mut Vec<Event>,
 ) -> Result<()> {
     out.extend(
         input
-            .with_view(|view| classify_tool_view(name, view, cwd))?
+            .with_view(|view| classify_tool_view(name, view, cwd, commands))?
             .into_iter()
             .enumerate()
             .map(|(i, (kind, target))| Event {
@@ -316,7 +503,10 @@ fn classify_tool_view(
     name: &str,
     input: JsonView<'_>,
     cwd: Option<&Path>,
+    commands: bool,
 ) -> Result<Vec<(&'static str, Option<String>)>> {
+    let workdir = arguments::file_key(input, &["workdir", "cwd"])?.map(|path| PathBuf::from(absolutize(&path, cwd)));
+    let cwd = workdir.as_deref().or(cwd);
     let lname = name.to_ascii_lowercase();
     if lname.contains("patch") {
         let files = arguments::patch_rows(input)?;
@@ -337,8 +527,8 @@ fn classify_tool_view(
         };
         return Ok(vec![(kind, Some(absolutize(&path, cwd)))]);
     }
-    if let Some((prefix, files)) = arguments::command_rows(input, TARGET_MAX)? {
-        let mut rows = vec![("command", Some(prefix))];
+    if let Some((command, files)) = arguments::command_rows(input, commands)? {
+        let mut rows = vec![("command", command)];
         rows.extend(
             files
                 .into_iter()
@@ -349,41 +539,9 @@ fn classify_tool_view(
     Ok(vec![("tool", None)])
 }
 
-/// Full command projection for consumers whose required output is the complete command.
-/// Event classification uses a bounded prefix and streaming patch reducer instead.
+/// Full command projection: the string a `command` event's target holds.
 pub(crate) fn command_of_json(input: &Json) -> Result<Option<String>> {
     input.with_view(arguments::command_string)
-}
-
-/// File paths named by a patch body. Primary: codex apply_patch headers
-/// (`*** Update File: <path>` / `*** Add File:` / `*** Delete File:` / `*** Move to:`).
-/// Fallback: unified-diff `+++ <path>` headers — but only when `--- ` headers are present too,
-/// so an *added line* whose content begins with `++ ` can't fake a target.
-#[cfg(test)]
-fn patch_targets(patch: &str) -> Vec<String> {
-    fn push(out: &mut Vec<String>, f: &str) {
-        let f = f.trim();
-        if !f.is_empty() && f != "/dev/null" && !out.iter().any(|x| x == f) {
-            out.push(f.to_string());
-        }
-    }
-    let mut out: Vec<String> = Vec::new();
-    for line in patch.lines() {
-        let t = line.trim();
-        for pre in ["*** Update File:", "*** Add File:", "*** Delete File:", "*** Move to:"] {
-            if let Some(rest) = t.strip_prefix(pre) {
-                push(&mut out, rest);
-            }
-        }
-    }
-    if out.is_empty() && patch.lines().any(|l| l.starts_with("--- ")) {
-        for line in patch.lines() {
-            if let Some(rest) = line.strip_prefix("+++ ") {
-                push(&mut out, rest.trim().trim_start_matches("b/"));
-            }
-        }
-    }
-    out
 }
 
 /// Lexically absolutize `p` against the session cwd. Already-absolute paths pass through; with no
@@ -420,6 +578,41 @@ impl Provenance {
     pub fn is_empty(&self) -> bool {
         self.parent_id.is_none() && self.agent_id.is_none() && self.workflow.is_none()
     }
+}
+
+/// Read current events, refreshing stale rows on use. Frozen commands stream stale sources
+/// directly so the answer stays current without publishing either events or certified counts.
+pub fn read_ref(r: &crate::SessionRef, kind: Option<&str>) -> Result<Vec<EventRow>> {
+    if needs_ingest(r) {
+        if crate::env::frozen() {
+            let adapter = crate::harness::for_harness(r.harness)
+                .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+            let mut sink = EventSink::new(r.cwd.clone()).with_source(r.path.clone());
+            adapter.try_stream(r, &crate::Demand::LEAN.with_spans(), &mut sink)?;
+            let mut events = sink.into_events()?;
+            // Match catalog order.
+            events.sort_by_key(|e| (e.msg_idx, e.kind));
+            return Ok(events
+                .into_iter()
+                .filter(|e| kind.is_none_or(|k| e.kind == k))
+                .map(|e| EventRow {
+                    harness: r.harness.as_str().into(),
+                    session_id: r.id.clone(),
+                    msg_idx: e.msg_idx as i64,
+                    ts: e.ts,
+                    kind: e.kind.into(),
+                    tool: e.tool,
+                    target: e.target,
+                    detail: e.detail,
+                    parent_id: None,
+                    agent_id: None,
+                    workflow: None,
+                })
+                .collect());
+        }
+        ingest_ref(r)?;
+    }
+    events_for(r.harness.as_str(), &r.id, kind)
 }
 
 /// One persisted event row, as read back from the catalog.
@@ -483,62 +676,10 @@ pub struct EditEvent {
 #[cfg(feature = "sqlite")]
 mod db {
     use super::*;
-    use anyhow::Result;
+    use anyhow::{Context as _, Result};
     use rusqlite::{params, Connection};
 
-    /// Event-tables schema generation, stamped into the catalog's `PRAGMA user_version`.
-    ///
-    /// v1 (0.9.10) stored `(harness TEXT, session_id TEXT, …, target TEXT)` per event row plus a
-    /// dedup expression index — measured at ~3× the data size in indexes alone. v2 interns session
-    /// identity and targets into side tables and carries integers per row. The catalog is a pure
-    /// cache, so "migration" is version-stamp + drop + lazy reingest (dropping `event_sync` makes
-    /// every session look stale; the next `cv index` — or any on-the-spot `cv events <id>` —
-    /// rebuilds), exactly like the tantivy schema self-heal.
-    /// v3 (0.9.13) adds sub-agent provenance columns (`parent_id`, `agent_id`, `workflow`) to
-    /// `event_sessions`, so a folded-in sub-agent transcript's events can be attributed to the
-    /// orchestrator that spawned it. Same self-heal as before: bumping the version drops the event
-    /// tables + `event_sync`, so everything reads stale and the next `cv index` reingests on the
-    /// new schema.
-    const EVENTS_SCHEMA_VERSION: i64 = 3;
-
-    /// Drop pre-v2 event tables (their indexes go with them) and stamp the version.
-    ///
-    /// Two triggers, both checked on every open so the schema self-heals:
-    /// * `user_version < 2` — a v1/unversioned catalog (the `sessions` table never changed shape
-    ///   and is versionless `CREATE IF NOT EXISTS`; the event tables own the version stamp);
-    /// * a v1-*shaped* `events` table (it has a `harness` column) even under a v2 stamp — an old
-    ///   0.9.10 binary re-created v1 tables in a v2 catalog. (The common old-binary case is
-    ///   harmless without this: v2 drops `idx_events_dedup`, so the old binary's
-    ///   `CREATE UNIQUE INDEX … ON events(harness,…)` DDL fails against the v2 table and it
-    ///   degrades to events-disabled — its designed no-catalog path, no corruption possible. The
-    ///   shape check covers the race where an old binary lands v1 tables *first*.)
-    fn migrate(conn: &Connection) -> Option<()> {
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).ok()?;
-        let v1_shaped: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('events') WHERE name='harness')",
-                [],
-                |r| r.get(0),
-            )
-            .ok()?;
-        if version >= EVENTS_SCHEMA_VERSION && !v1_shaped {
-            return Some(());
-        }
-        conn.execute_batch(&format!(
-            "DROP TABLE IF EXISTS events;
-             DROP TABLE IF EXISTS event_sync;
-             DROP TABLE IF EXISTS event_sessions;
-             DROP TABLE IF EXISTS event_targets;
-             PRAGMA user_version = {EVENTS_SCHEMA_VERSION};"
-        ))
-        .ok()?;
-        // The drop frees most of the file's pages but SQLite never returns them to the OS on its
-        // own — reclaim once, opportunistically (a busy db just keeps its free pages for reuse).
-        let _ = conn.execute_batch("VACUUM;");
-        Some(())
-    }
-
-    /// Open the shared catalog db and ensure the (v2) event tables exist. `None` on any error.
+    /// Open the shared catalog db and ensure the event tables exist. `None` on any error.
     ///
     /// Schema notes:
     /// * `event_sessions` is a dedicated intern table rather than a reuse of the `sessions`
@@ -548,17 +689,17 @@ mod db {
     ///   `UNIQUE(harness, session_id)` here is stable across syncs and tiny (~2.4k rows).
     /// * `event_targets` interns the distinct target strings (~54k of ~145k events); event rows
     ///   carry a nullable integer. Re-ingest deletes a session's event rows but leaves its
-    ///   interned targets — orphans are unreferenced cache rows, reclaimed only by the next
-    ///   schema migration. Suffix matching scans `event_targets` instead of every event row.
-    /// * No dedup index: [`record`] is DELETE-by-session + batch INSERT in one transaction, so
-    ///   cross-session duplicates are impossible by construction, and intra-batch duplicates are
-    ///   deduped in memory there.
+    ///   interned targets — orphans are unreferenced cache rows, reclaimed only when a
+    ///   catalog of another schema is rebuilt. Suffix matching scans `event_targets` instead of every event row.
+    /// * No dedup: [`record`] is DELETE-by-session + batch INSERT in one transaction, and every
+    ///   extracted event is a row.
     /// * `idx_events_session` serves [`events_for`] and `record`'s delete; `idx_events_target`
-    ///   joins event rows back from a matched target. v1's `idx_events_kind_ts` indexed
-    ///   `(kind, ts)` which no query ever drove with a kind-prefix lookup — dropped.
+    ///   joins event rows back from a matched target.
     pub(crate) fn open() -> Option<Connection> {
         let conn = crate::catalog::open_db()?;
-        migrate(&conn)?;
+        if crate::env::frozen() {
+            return Some(conn);
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS event_sessions(
                  id         INTEGER PRIMARY KEY,
@@ -567,8 +708,6 @@ mod db {
                  parent_id  TEXT,
                  agent_id   TEXT,
                  workflow   TEXT,
-                 source_path TEXT,
-                 source_cwd TEXT,
                  UNIQUE(harness, session_id)
              );
              CREATE TABLE IF NOT EXISTS event_targets(
@@ -585,272 +724,122 @@ mod db {
                  detail    TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_events_session ON events(session);
-             CREATE INDEX IF NOT EXISTS idx_events_target ON events(target_id);
-             CREATE TABLE IF NOT EXISTS event_sync(
-                 harness  TEXT NOT NULL,
-                 id       TEXT NOT NULL,
-                 path     TEXT NOT NULL,
-                 mtime_ns INTEGER NOT NULL,
-                 size     INTEGER,
-                 PRIMARY KEY(harness, id, path)
-             );",
+             CREATE INDEX IF NOT EXISTS idx_events_target ON events(target_id);",
         )
         .ok()?;
-        // Lazy migration: a pre-`size` `event_sync` (the CREATE above is a no-op on it) gets the
-        // column added in place. Old rows read back a NULL size, which [`sync_fresh`] treats as
-        // stale — each session re-ingests once and is stamped with its size; no wholesale drop.
-        let has_size: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('event_sync') WHERE name='size')",
-                [],
-                |r| r.get(0),
-            )
-            .ok()?;
-        if !has_size {
-            conn.execute_batch("ALTER TABLE event_sync ADD COLUMN size INTEGER;")
-                .ok()?;
-        }
-        let has_source_path: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('event_sessions') WHERE name='source_path')",
-                [],
-                |row| row.get(0),
-            )
-            .ok()?;
-        if !has_source_path {
-            conn.execute_batch("ALTER TABLE event_sessions ADD COLUMN source_path TEXT;")
-                .ok()?;
-        }
-        let has_source_cwd: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('event_sessions') WHERE name='source_cwd')",
-                [],
-                |row| row.get(0),
-            )
-            .ok()?;
-        if !has_source_cwd {
-            conn.execute_batch("ALTER TABLE event_sessions ADD COLUMN source_cwd TEXT;")
-                .ok()?;
-        }
         Some(conn)
     }
 
-    fn authority_matches(conn: &Connection, r: &SessionRef, prov: &Provenance) -> rusqlite::Result<bool> {
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM event_sessions es JOIN event_sync s
-               ON s.harness=es.harness AND s.id=es.session_id AND s.path=es.source_path
-             WHERE es.harness=?1 AND es.session_id=?2 AND es.source_path=?3
-               AND es.parent_id IS ?4 AND es.agent_id IS ?5 AND es.workflow IS ?6
-               AND es.source_cwd IS ?7 AND s.mtime_ns != 0 AND s.size >= 0)",
-            params![
-                r.harness.as_str(),
-                r.id,
-                r.path.to_string_lossy(),
-                prov.parent_id,
-                prov.agent_id,
-                prov.workflow,
-                r.cwd.as_ref().map(|p| p.to_string_lossy())
-            ],
-            |row| row.get(0),
-        )
+    /// The `events` consumer's record payload: the provenance and cwd its rows were attributed
+    /// under. Another provenance's rows are another output.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub(crate) struct Attributed {
+        parent_id: Option<String>,
+        agent_id: Option<String>,
+        workflow: Option<String>,
+        cwd: Option<String>,
+        // Required: old catalogs/checkpoints lack target-level correlation and must replay.
+        target_correlation: bool,
     }
 
-    /// The event-catalog freshness predicate over a stored `(mtime_ns, size)` stamp, shared with
-    /// FTS. Both must match, including for append logs: a same-size edit is still a change.
-    /// A missing stored size (a pre-`size` catalog row) never matches. A real empty file
-    /// requires the captured source guard, just like a nonempty file; missing/old guards miss.
-    fn sync_fresh(
-        stored: Option<(i64, Option<i64>)>,
-        mtime_ns: i64,
-        size: i64,
-        source_fresh: impl FnOnce() -> bool,
-    ) -> bool {
-        stored.is_some_and(|(stored_mtime, stored_size)| {
-            stored_size.is_some_and(|stored_size| {
-                crate::offsets::sig_is_fresh_with_source((stored_mtime, stored_size), (mtime_ns, size), source_fresh)
-            })
-        })
+    impl crate::source::Payload for Attributed {
+        const TAG: &'static str = "events";
+        const BY_ROWS: bool = true;
     }
 
-    /// Whether `r` needs an event (re)ingest: its source as captured now is not the one the
-    /// `event_sync` row's baseline recorded (or there is none). `false` when the catalog can't be opened — events
-    /// degrade silently rather than re-streaming the corpus into a broken db forever.
+    fn authority(r: &SessionRef, prov: &Provenance) -> Attributed {
+        Attributed {
+            parent_id: prov.parent_id.clone(),
+            agent_id: prov.agent_id.clone(),
+            workflow: prov.workflow.clone(),
+            cwd: r.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            target_correlation: true,
+        }
+    }
+
+    /// `r`'s events record, whatever its source now.
+    fn attributed_in(conn: &Connection, r: &SessionRef) -> Option<Attributed> {
+        Some(crate::source::record_in::<Attributed>(conn, "events", r)?.payload)
+    }
+
+    /// Whether `r` needs an event (re)ingest: its source as captured now is not the one its
+    /// published baseline recorded, or that baseline belongs to another provenance, or there is
+    /// none. `false` when the catalog can't be opened — events degrade silently rather than
+    /// re-streaming the corpus into a broken db forever.
     ///
     /// Opens a fresh connection per call — fine for a one-off check (`cv events <id>`), wrong for
-    /// a corpus sweep: bulk callers use [`SyncTable`] (one query for the whole skip-table).
+    /// a corpus sweep: bulk callers use [`SyncTable`] (one query for the whole table).
     pub fn needs_ingest(r: &SessionRef) -> bool {
-        let Some(conn) = open() else { return false };
-        let stored: Option<(i64, Option<i64>)> = conn
-            .query_row(
-                "SELECT s.mtime_ns, s.size FROM event_sync s JOIN event_sessions es
-                   ON es.harness=s.harness AND es.session_id=s.id AND es.source_path=s.path
-                 WHERE s.harness=?1 AND s.id=?2 AND s.path=?3
-                   AND es.parent_id IS NULL AND es.agent_id IS NULL AND es.workflow IS NULL
-                   AND es.source_cwd IS ?4",
-                params![
-                    r.harness.as_str(),
-                    r.id,
-                    r.path.to_string_lossy(),
-                    r.cwd.as_ref().map(|p| p.to_string_lossy())
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
+        let Some(conn) = open() else {
+            return crate::env::frozen();
+        };
         let source = crate::source::Probe::default().snapshot(r);
-        !sync_fresh(stored, source.primary.0, source.primary.1, || {
-            crate::source::Table::load("events").fresh(r, source.primary, &source.dependencies)
-        })
+        !crate::source::fresh_in(&conn, "events", r, &source, &authority(r, &Provenance::default()))
     }
 
-    /// The whole `event_sync` skip-table, loaded with **one** connection + query, for bulk passes
+    /// Every published event baseline, loaded with **one** connection + query, for bulk passes
     /// that check every discovered session ([`ingest_all`], the FTS indexer's event ride-along).
     /// The per-session [`needs_ingest`] opens a connection — and re-runs the catalog DDL — per
     /// call, which a ~2,400-session sweep pays ~2,400 times.
     ///
     /// Answers exactly like [`needs_ingest`], including the degrade: when the catalog can't be
     /// opened, every check returns `false` (don't re-stream the corpus into a broken db).
-    /// `(harness, id, path) → (mtime_ns, size)` — one loaded `event_sync` stamp per session
-    /// (size is `None` on rows written before the size column existed).
-    struct SyncEntry {
-        signature: (i64, Option<i64>),
-        cwd: Option<String>,
-        provenance: Provenance,
-    }
-    type SyncRows = std::collections::HashMap<(String, String, String), SyncEntry>;
-
     pub struct SyncTable {
-        /// The loaded skip-table; `None` when the catalog is unavailable.
-        rows: Option<SyncRows>,
-        dependencies: crate::source::Table,
+        /// `None` when the catalog is unavailable.
+        baselines: Option<crate::source::Table<Attributed>>,
     }
 
     impl SyncTable {
         pub fn load() -> SyncTable {
-            let load = || -> Option<(SyncRows, crate::source::Table)> {
-                let mut conn = open()?;
-                let tx = conn.transaction().ok()?;
-                let mut stmt = tx
-                    .prepare("SELECT s.harness, s.id, s.path, s.mtime_ns, s.size, es.parent_id, es.agent_id, es.workflow, es.source_cwd
-                              FROM event_sync s JOIN event_sessions es
-                                ON es.harness=s.harness AND es.session_id=s.id AND es.source_path=s.path")
-                    .ok()?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((
-                            (
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ),
-                            SyncEntry {
-                                signature: (row.get(3)?, row.get(4)?),
-                                cwd: row.get(8)?,
-                                provenance: Provenance {
-                                    parent_id: row.get(5)?,
-                                    agent_id: row.get(6)?,
-                                    workflow: row.get(7)?,
-                                },
-                            },
-                        ))
-                    })
-                    .ok()?;
-                Some((rows.flatten().collect(), crate::source::Table::load_in(&tx, "events")))
-            };
-            match load() {
-                Some((rows, dependencies)) => SyncTable {
-                    rows: Some(rows),
-                    dependencies,
-                },
-                None => SyncTable {
-                    rows: None,
-                    dependencies: Default::default(),
-                },
+            SyncTable {
+                baselines: open().map(|conn| crate::source::Table::load_in(&conn, "events")),
             }
         }
 
-        /// Whether `r`'s one published event output is stale: source copy, provenance, tuple and
-        /// dependencies, checked against the preloaded table with the operation's shared probe.
+        /// Whether `r`'s one published event output is stale: provenance, source identity and
+        /// dependencies, checked against the loaded table with the operation's shared probe.
         pub fn needs_ingest(
             &self,
             r: &SessionRef,
-            source: &crate::source::Snapshot,
+            source: &crate::source::Baseline,
             provenance: &Provenance,
             probe: &mut crate::source::Probe,
         ) -> bool {
-            let Some(rows) = &self.rows else { return false };
-            let key = (
-                r.harness.as_str().to_string(),
-                r.id.clone(),
-                r.path.to_string_lossy().into_owned(),
-            );
-            !sync_fresh(
-                rows.get(&key)
-                    .filter(|entry| {
-                        entry.provenance == *provenance
-                            && entry.cwd.as_deref() == r.cwd.as_ref().map(|p| p.to_string_lossy()).as_deref()
-                    })
-                    .map(|entry| entry.signature),
-                source.primary.0,
-                source.primary.1,
-                || {
-                    self.dependencies
-                        .fresh_with_probe(r, source.primary, &source.dependencies, probe)
-                },
-            )
+            self.baselines
+                .as_ref()
+                .is_some_and(|table| table.admit(r, source, probe) != Some(&authority(r, provenance)))
         }
+
         /// Whether retained prefix events belong to this source copy and expected provenance.
-        /// This is separate from unchanged freshness: an ordinary append changes the tuple.
+        /// This is separate from unchanged freshness: an ordinary append changes the identity.
         pub fn can_resume(&self, r: &SessionRef, provenance: &Provenance) -> bool {
-            self.rows.as_ref().is_some_and(|rows| {
-                rows.get(&(
-                    r.harness.as_str().to_owned(),
-                    r.id.clone(),
-                    r.path.to_string_lossy().into_owned(),
-                ))
-                .is_some_and(|entry| {
-                    entry.signature.0 != 0
-                        && entry.signature.1.is_some_and(|size| size >= 0)
-                        && entry.provenance == *provenance
-                        && entry.cwd.as_deref() == r.cwd.as_ref().map(|p| p.to_string_lossy()).as_deref()
-                })
+            self.baselines.as_ref().is_some_and(|table| {
+                table
+                    .get(r)
+                    .is_some_and(|record| record.payload == authority(r, provenance))
             })
         }
     }
 
-    /// Persist `events` as the complete event set for session `r` (one transaction: delete prior
-    /// rows, insert, stamp `event_sync` and the source baseline from `source`, captured by the
-    /// caller **before** streaming, so content appended mid-parse reads as stale next time).
-    /// Idempotent — a re-ingest of an unchanged session rewrites identical rows. Best-effort: any
-    /// sqlite error leaves the previous state and returns quietly.
+    /// Publish a completed ordered batch with bounded row/target retention in one transaction:
+    /// delete the prior rows of messages `from` and later, insert, and publish the source
+    /// baseline from `source`, captured by the caller **before** streaming, so content appended
+    /// mid-parse reads as stale next time. Any spill read, ordering or SQL failure rolls back rows
+    /// and freshness together.
     ///
-    /// Dedup invariant (what replaced v1's unique expression index): the DELETE-by-session +
-    /// batch-INSERT shape makes cross-session duplicates impossible by construction, and
-    /// duplicates *within* this batch — same `(msg_idx, kind, target)`, matching the old index's
-    /// `COALESCE(target,'')` semantics — are dropped by the in-memory set below.
-    ///
-    /// From `from`, only the rows of messages `from` and later are replaced; the earlier ones
-    /// stay as the pass that read them stored them.
-    pub fn record_from_with_source(
-        r: &SessionRef,
-        from: usize,
-        events: &[Event],
-        source: &crate::source::Snapshot,
-        prov: &Provenance,
-    ) {
-        if let Some(mut conn) = open() {
-            let _ = record_from_in(&mut conn, r, from, events.iter().map(Ok), false, prov, source);
-        }
-    }
-
-    /// Publish a completed ordered batch with bounded row/target retention in one transaction.
-    /// Any spill read, ordering or SQL failure rolls back rows and freshness together.
+    /// Dedup invariant: the DELETE-by-session + batch-INSERT shape makes cross-session duplicates
+    /// impossible by construction, and duplicates within one message — same `(msg_idx, kind,
+    /// target)`, `COALESCE(target,'')` semantics — are dropped as they arrive.
     pub fn record_spooled_with_source(
         r: &SessionRef,
         from: usize,
         events: EventSpool,
-        source: &crate::source::Snapshot,
+        source: &crate::source::Baseline,
         prov: &Provenance,
     ) -> Result<()> {
+        if crate::env::frozen() {
+            return Ok(());
+        }
         let mut conn = open().ok_or_else(|| anyhow::anyhow!("event catalog unavailable"))?;
         record_spooled_in(&mut conn, r, from, events, source, prov)
     }
@@ -860,11 +849,14 @@ mod db {
         r: &SessionRef,
         from: usize,
         events: EventSpool,
-        source: &crate::source::Snapshot,
+        source: &crate::source::Baseline,
         prov: &Provenance,
     ) -> Result<()> {
+        if crate::env::frozen() {
+            return Ok(());
+        }
         let rows = events.rows()?;
-        record_from_in(conn, r, from, rows, true, prov, source)
+        record_from_in(conn, r, from, rows, prov, source)
     }
 
     // Acquire write ownership before reading authority. A deferred WAL transaction can read
@@ -876,22 +868,20 @@ mod db {
         prov: &Provenance,
     ) -> Result<rusqlite::Transaction<'a>> {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if from > 0 && !authority_matches(&tx, r, prov)? {
+        if from > 0 && attributed_in(&tx, r) != Some(authority(r, prov)) {
             anyhow::bail!("event prefix belongs to another or unknown output authority");
         }
         Ok(tx)
     }
 
-    fn record_from_in<E: std::borrow::Borrow<Event>>(
+    fn record_from_in(
         conn: &mut Connection,
         r: &SessionRef,
         from: usize,
-        events: impl IntoIterator<Item = Result<E>>,
-        ordered: bool,
+        events: impl IntoIterator<Item = Result<Event>>,
         prov: &Provenance,
-        source: &crate::source::Snapshot,
+        source: &crate::source::Baseline,
     ) -> Result<()> {
-        let (mtime_ns, size) = source.primary;
         let tx = publication_transaction(conn, r, from, prov)?;
         let harness = r.harness.as_str();
         tx.execute(
@@ -901,17 +891,8 @@ mod db {
         // Stamp provenance on every record (idempotent re-ingest keeps it current); top-level
         // sessions write NULLs, which leaves the existing top-level rows exactly as before.
         tx.execute(
-            "UPDATE event_sessions SET parent_id=?3, agent_id=?4, workflow=?5, source_path=?6, source_cwd=?7
-             WHERE harness=?1 AND session_id=?2",
-            params![
-                harness,
-                r.id,
-                prov.parent_id,
-                prov.agent_id,
-                prov.workflow,
-                r.path.to_string_lossy(),
-                r.cwd.as_ref().map(|p| p.to_string_lossy())
-            ],
+            "UPDATE event_sessions SET parent_id=?3, agent_id=?4, workflow=?5 WHERE harness=?1 AND session_id=?2",
+            params![harness, r.id, prov.parent_id, prov.agent_id, prov.workflow],
         )?;
         let session = tx.query_row(
             "SELECT id FROM event_sessions WHERE harness=?1 AND session_id=?2",
@@ -929,26 +910,14 @@ mod db {
                 "INSERT INTO events(session,msg_idx,ts,kind,tool,target_id,detail)
                  VALUES(?1,?2,?3,?4,?5,?6,?7)",
             )?;
-            let mut seen: std::collections::HashSet<(usize, &'static str, String)> = std::collections::HashSet::new();
             let mut targets: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
             let mut previous = None;
             for e in events {
-                let item = e?;
-                let e = item.borrow();
-                if ordered {
-                    if e.msg_idx < from || previous.is_some_and(|idx| e.msg_idx < idx) {
-                        anyhow::bail!("event batch is not ordered from the resume index");
-                    }
-                    if previous != Some(e.msg_idx) {
-                        // Stream extraction emits consecutive rows for each message. Dedup keys
-                        // cannot recur in later messages, so retain only this message's keys.
-                        seen.clear();
-                    }
-                    previous = Some(e.msg_idx);
+                let e = e?;
+                if e.msg_idx < from || previous.is_some_and(|idx| e.msg_idx < idx) {
+                    anyhow::bail!("event batch is not ordered from the resume index");
                 }
-                if !seen.insert((e.msg_idx, e.kind, e.target.clone().unwrap_or_default())) {
-                    continue;
-                }
+                previous = Some(e.msg_idx);
                 let target_id: Option<i64> = match e.target.as_deref() {
                     None => None,
                     Some(t) => match targets.get(t) {
@@ -977,35 +946,30 @@ mod db {
                 ])?;
             }
         }
+        // One session's rows have one source copy: another path's baseline no longer describes them.
         tx.execute(
-            "DELETE FROM event_sync WHERE harness=?1 AND id=?2",
+            "DELETE FROM source_dependencies WHERE consumer='events' AND harness=?1 AND id=?2",
             params![harness, r.id],
         )?;
-        tx.execute(
-            "INSERT OR REPLACE INTO event_sync(harness,id,path,mtime_ns,size) VALUES(?1,?2,?3,?4,?5)",
-            params![harness, r.id, r.path.to_string_lossy(), mtime_ns, size],
-        )?;
-        crate::source::publish_in(&tx, "events", r, source)
-            .ok_or_else(|| anyhow::anyhow!("event source baseline publication failed"))?;
+        crate::source::publish_in(
+            &tx,
+            "events",
+            r,
+            source,
+            &authority(r, prov),
+            &mut crate::source::Probe::default(),
+        )
+        .context("event source baseline publication failed")?;
         tx.commit()?;
         Ok(())
     }
 
     /// (Re)ingest events for one session: stream it (lazily — large content stays on disk) through
     /// a [`SpoolingSink`] and persist the rows. Returns the number of events extracted. The
-    /// `(mtime, size)` stamp is captured **before** the streamed pass, so anything appended while
-    /// we were reading still shows as stale next time.
+    /// baseline is captured **before** the streamed pass, so anything appended while we were
+    /// reading still shows as stale next time.
     pub fn ingest_ref(r: &SessionRef) -> Result<usize> {
-        let adapter =
-            crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
-        let source = crate::source::Probe::default().snapshot(r);
-        let mut sink = SpoolingSink::new(r.cwd.clone());
-        adapter.try_stream(r, &crate::stream::ParseOptions::lazy(), &mut sink)?;
-        let source = source.with_reads(sink.inner().dependencies());
-        let events = sink.into_spool()?;
-        let len = events.len();
-        record_spooled_with_source(r, 0, events, &source, &Provenance::default())?;
-        Ok(len)
+        ingest_subagent(r, &Provenance::default())
     }
 
     /// (Re)ingest events for one sub-agent transcript, stamping `prov`enance on its catalog row so
@@ -1015,8 +979,8 @@ mod db {
         let adapter =
             crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
         let source = crate::source::Probe::default().snapshot(r);
-        let mut sink = SpoolingSink::new(r.cwd.clone());
-        adapter.try_stream(r, &crate::stream::ParseOptions::lazy(), &mut sink)?;
+        let mut sink = SpoolingSink::new(r.cwd.clone()).with_source(r.path.clone());
+        adapter.try_stream(r, &crate::stream::Demand::LEAN.with_spans(), &mut sink)?;
         let source = source.with_reads(sink.inner().dependencies());
         let events = sink.into_spool()?;
         let len = events.len();
@@ -1024,8 +988,8 @@ mod db {
         Ok(len)
     }
 
-    /// (Re)ingest events for every discovered session, skipping unchanged ones (by the
-    /// `event_sync` `(mtime, size)` signature) unless `force`. The standalone entry point for users who don't run the tantivy
+    /// (Re)ingest events for every discovered session, skipping unchanged ones (by their
+    /// published baseline) unless `force`. The standalone entry point for users who don't run the tantivy
     /// indexer (which otherwise ingests events as a ride-along). Returns sessions (re)ingested.
     ///
     /// With `subagents`, also fold each top-level Claude session's whole sub-agent **forest**
@@ -1033,8 +997,9 @@ mod db {
     /// streamed through the same `EventSink` and stored with provenance (parent / workflow / agent),
     /// so `cv touched`/`cv events` see what the agents did — not just the orchestrator. Off by
     /// default (the forest can be hundreds of transcripts / ~900 MB).
-    pub fn ingest_all(force: bool, subagents: bool) -> Result<usize> {
-        let sources = collect_sources(crate::discover_all(), subagents);
+    pub fn ingest_all(options: IngestOptions) -> Result<usize> {
+        let IngestOptions { force, subagents } = options;
+        let sources = collect_sources(crate::discover_all(), subagents)?;
         let sync = SyncTable::load();
         let mut probe = crate::source::Probe::default();
         let mut n = 0;
@@ -1051,25 +1016,31 @@ mod db {
         Ok(n)
     }
 
-    pub(super) fn collect_sources(refs: Vec<SessionRef>, subagents: bool) -> Vec<(SessionRef, Provenance)> {
+    pub(super) fn collect_sources(refs: Vec<SessionRef>, subagents: bool) -> Result<Vec<(SessionRef, Provenance)>> {
         let mut sources: Vec<_> = refs.into_iter().map(|r| (r, Provenance::default())).collect();
         if subagents {
             let folded: Vec<_> = sources
                 .iter()
-                .flat_map(|(parent, _)| {
-                    crate::subagent_tree_of(parent).into_iter().map(|sub| {
-                        let provenance = Provenance {
-                            parent_id: Some(parent.id.clone()),
-                            agent_id: Some(sub.agent_id().to_owned()),
-                            workflow: sub.workflow.clone(),
-                        };
-                        (sub.session, provenance)
-                    })
+                .map(|(parent, _)| {
+                    Ok(crate::subagent_tree_of(parent)?
+                        .into_iter()
+                        .map(|sub| {
+                            let provenance = Provenance {
+                                parent_id: Some(parent.id.clone()),
+                                agent_id: Some(sub.agent_id().to_owned()),
+                                workflow: sub.workflow.clone(),
+                            };
+                            (sub.session, provenance)
+                        })
+                        .collect::<Vec<_>>())
                 })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
                 .collect();
             sources.extend(folded);
         }
-        preferred_sources(sources)
+        Ok(preferred_sources(sources))
     }
 
     /// Events have one output per harness/id, independent of how many source copies discovery
@@ -1115,10 +1086,10 @@ mod db {
     }
 
     /// All persisted events of one session in transcript order, optionally filtered by kind.
-    /// Empty on any error or an un-ingested session.
-    pub fn events_for(harness: &str, session_id: &str, kind: Option<&str>) -> Vec<EventRow> {
-        let Some(conn) = open() else { return Vec::new() };
-        let Ok(mut stmt) = conn.prepare(
+    /// Empty for an un-ingested session; an event catalog that cannot open or answer is an error.
+    pub fn events_for(harness: &str, session_id: &str, kind: Option<&str>) -> Result<Vec<EventRow>> {
+        let conn = open().context("the event catalog cannot be opened")?;
+        let mut stmt = conn.prepare(
             "SELECT es.harness, es.session_id, e.msg_idx, e.ts, e.kind, e.tool, t.target, e.detail,
                     es.parent_id, es.agent_id, es.workflow
              FROM events e
@@ -1126,9 +1097,7 @@ mod db {
              LEFT JOIN event_targets t ON t.id = e.target_id
              WHERE es.harness=?1 AND es.session_id=?2 AND (?3 IS NULL OR e.kind=?3)
              ORDER BY e.msg_idx, e.kind",
-        ) else {
-            return Vec::new();
-        };
+        )?;
         let rows = stmt.query_map(params![harness, session_id, kind], |row| {
             Ok(EventRow {
                 harness: row.get(0)?,
@@ -1143,11 +1112,8 @@ mod db {
                 agent_id: row.get(9)?,
                 workflow: row.get(10)?,
             })
-        });
-        match rows {
-            Ok(rows) => rows.flatten().collect(),
-            Err(_) => Vec::new(),
-        }
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// THE query: sessions whose file events touched `path`, newest activity first.
@@ -1155,13 +1121,13 @@ mod db {
     /// `path` is lexically absolutized against the current directory, and *also* matched by
     /// suffix (`…/<path>`), so `cv touched src/ir.rs` finds `/repo/src/ir.rs` from anywhere.
     /// `edits_only` keeps only sessions with at least one `file_edit`. Titles come from a join
-    /// against the `sessions` catalog. Empty on any error or a cold catalog.
+    /// against the `sessions` catalog. Empty on a cold catalog; a catalog error is an error.
     ///
-    /// The leading-`%` LIKE can never use an index; since v2 it scans `event_targets` (the
+    /// The leading-`%` LIKE can never use an index; it scans `event_targets` (the
     /// distinct targets, ~⅓ of the event rows) and joins matches back through `idx_events_target`
     /// instead of scanning every event row.
-    pub fn sessions_touching(path: &str, edits_only: bool) -> Vec<TouchedSession> {
-        let abs = absolutize(path, std::env::current_dir().ok().as_deref());
+    pub fn sessions_touching(path: &str, edits_only: bool) -> Result<Vec<TouchedSession>> {
+        let abs = absolutize(path, crate::env::current_dir().as_deref());
         // Escape LIKE metacharacters in the user's path, then match any target ending in /<path>.
         let escaped = path
             .trim_start_matches("./")
@@ -1180,12 +1146,12 @@ mod db {
     /// indexed point lookup behind the `cv hook edit` guard, which must answer in milliseconds on
     /// a store of millions of events. No suffix match, so no scan of `event_targets` — the
     /// `target` UNIQUE index resolves the path and `idx_events_target` the rows. Newest first.
-    pub fn sessions_editing(abs: &str) -> Vec<TouchedSession> {
+    pub fn sessions_editing(abs: &str) -> Result<Vec<TouchedSession>> {
         touching(abs, None, true)
     }
 
-    fn touching(abs: &str, suffix: Option<&str>, edits_only: bool) -> Vec<TouchedSession> {
-        let Some(conn) = open() else { return Vec::new() };
+    fn touching(abs: &str, suffix: Option<&str>, edits_only: bool) -> Result<Vec<TouchedSession>> {
+        let conn = open().context("the event catalog cannot be opened")?;
         let having = if edits_only { "HAVING edits > 0" } else { "" };
         // With a suffix: `target = ?1 OR target LIKE ?2` — the IN-subquery (not a join) pins the
         // plan to one scan over the distinct targets, then matching event rows through
@@ -1210,9 +1176,7 @@ mod db {
              {having}
              ORDER BY last_ts DESC, es.session_id"
         );
-        let Ok(mut stmt) = conn.prepare(&sql) else {
-            return Vec::new();
-        };
+        let mut stmt = conn.prepare(&sql)?;
         // rusqlite refuses a parameter the SQL never references, so bind exactly what it names.
         let map = |row: &rusqlite::Row| {
             Ok(TouchedSession {
@@ -1228,13 +1192,10 @@ mod db {
             })
         };
         let rows = match suffix {
-            Some(sfx) => stmt.query_map(params![abs, sfx], map),
-            None => stmt.query_map(params![abs], map),
+            Some(sfx) => stmt.query_map(params![abs, sfx], map)?,
+            None => stmt.query_map(params![abs], map)?,
         };
-        match rows {
-            Ok(rows) => rows.flatten().collect(),
-            Err(_) => Vec::new(),
-        }
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Every `file_edit` event on one file, with session metadata riding along, oldest first.
@@ -1243,14 +1204,14 @@ mod db {
     /// path in the *current* checkout) and by repo-relative suffix `rel` (target equals `rel` or
     /// ends with `/<rel>`), so edits recorded by a session whose checkout lived at a different
     /// path still surface. The LEFT JOIN is grouped per event row because a session may be
-    /// cataloged at more than one path. Empty on any error or a cold catalog.
-    pub fn edits_touching_file(abs: &str, rel: &str) -> Vec<EditEvent> {
-        let Some(conn) = open() else { return Vec::new() };
+    /// cataloged at more than one path. Empty on a cold catalog; a catalog error is an error.
+    pub fn edits_touching_file(abs: &str, rel: &str) -> Result<Vec<EditEvent>> {
+        let conn = open().context("the event catalog cannot be opened")?;
         let escaped = rel.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let suffix = format!("%/{escaped}");
         // IN-subquery for the same plan-pinning reason as [`sessions_touching`]; the extra join
         // back to event_targets only resolves the matched rows' target strings by rowid.
-        let Ok(mut stmt) = conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT es.harness, es.session_id, e.msg_idx, e.ts, t.target,
                     MAX(s.title), MAX(s.cwd), MAX(s.created_at), MAX(s.updated_at), MAX(es.parent_id)
              FROM events e
@@ -1262,9 +1223,7 @@ mod db {
                                    WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\')
              GROUP BY es.harness, es.session_id, e.msg_idx, e.ts, t.target
              ORDER BY e.ts, e.msg_idx",
-        ) else {
-            return Vec::new();
-        };
+        )?;
         let rows = stmt.query_map(params![abs, rel, suffix], |row| {
             Ok(EditEvent {
                 harness: row.get(0)?,
@@ -1278,11 +1237,8 @@ mod db {
                 updated_at: row.get(8)?,
                 parent_id: row.get(9)?,
             })
-        });
-        match rows {
-            Ok(rows) => rows.flatten().collect(),
-            Err(_) => Vec::new(),
-        }
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Whether *any* events have ever been ingested — lets callers distinguish "no sessions
@@ -1303,7 +1259,7 @@ mod db {
             let source = crate::source::Probe::default()
                 .snapshot(&r)
                 .with_reads(&Default::default());
-            record_from_with_source(&r, 0, &[], &source, &Provenance::default());
+            record_spooled_with_source(&r, 0, Default::default(), &source, &Provenance::default()).unwrap();
             let mut first = open().unwrap();
             let second = open().unwrap();
             assert_eq!(
@@ -1316,13 +1272,21 @@ mod db {
             // This is the former production sequence: the read admits a WAL snapshot, then
             // another connection commits before the initial INSERT. Waiting cannot fix it.
             let deferred = first.transaction().unwrap();
-            assert!(authority_matches(&deferred, &r, &Provenance::default()).unwrap());
-            second
-                .execute(
-                    "UPDATE event_sessions SET workflow='intervening' WHERE session_id='lock'",
-                    [],
-                )
-                .unwrap();
+            assert!(attributed_in(&deferred, &r) == Some(authority(&r, &Provenance::default())));
+            // Another publication re-attributes the output: its baseline now names that workflow.
+            let provenance = Provenance {
+                workflow: Some("intervening".into()),
+                ..Default::default()
+            };
+            crate::source::publish_in(
+                &second,
+                "events",
+                &r,
+                &source,
+                &authority(&r, &provenance),
+                &mut Default::default(),
+            )
+            .unwrap();
             let error = deferred
                 .execute(
                     "INSERT OR IGNORE INTO event_sessions(harness,session_id) VALUES('claude','lock')",
@@ -1351,10 +1315,6 @@ mod db {
                     .unwrap(),
                 before
             );
-            let provenance = Provenance {
-                workflow: Some("intervening".into()),
-                ..Default::default()
-            };
             // Exercise the production transaction owner before its first output mutation.
             let immediate = publication_transaction(&mut first, &r, 1, &provenance).unwrap();
             let error = second
@@ -1384,9 +1344,13 @@ mod db {
                 before
             );
             let count: i64 = second
-                .query_row("SELECT COUNT(*) FROM event_sync WHERE id='lock'", [], |row| row.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM source_dependencies WHERE consumer='events' AND id='lock'",
+                    [],
+                    |row| row.get(0),
+                )
                 .unwrap();
-            assert_eq!(count, 1, "authority rejection preserves the published stamp");
+            assert_eq!(count, 1, "authority rejection preserves the published baseline");
         }
     }
 }
@@ -1394,7 +1358,7 @@ mod db {
 #[cfg(feature = "sqlite")]
 pub use db::{
     catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent, needs_ingest,
-    record_from_with_source, record_spooled_with_source, sessions_editing, sessions_touching, SyncTable,
+    record_spooled_with_source, sessions_editing, sessions_touching, SyncTable,
 };
 
 /// No-op fallbacks without sqlite: extraction still works (the sink is pure), persistence and
@@ -1408,7 +1372,7 @@ mod db_stub {
     use anyhow::Result;
 
     pub fn needs_ingest(_r: &SessionRef) -> bool {
-        false
+        crate::env::frozen()
     }
     /// No-op twin of the sqlite [`SyncTable`]: nothing is ever stale.
     pub struct SyncTable;
@@ -1419,7 +1383,7 @@ mod db_stub {
         pub fn needs_ingest(
             &self,
             _r: &SessionRef,
-            _source: &crate::source::Snapshot,
+            _source: &crate::source::Baseline,
             _provenance: &Provenance,
             _probe: &mut crate::source::Probe,
         ) -> bool {
@@ -1429,19 +1393,11 @@ mod db_stub {
             false
         }
     }
-    pub fn record_from_with_source(
-        _r: &SessionRef,
-        _from: usize,
-        _events: &[Event],
-        _source: &crate::source::Snapshot,
-        _prov: &Provenance,
-    ) {
-    }
     pub fn record_spooled_with_source(
         _r: &SessionRef,
         _from: usize,
         _events: EventSpool,
-        _source: &crate::source::Snapshot,
+        _source: &crate::source::Baseline,
         _prov: &Provenance,
     ) -> Result<()> {
         Ok(())
@@ -1452,20 +1408,20 @@ mod db_stub {
     pub fn ingest_subagent(_r: &SessionRef, _prov: &Provenance) -> Result<usize> {
         Ok(0)
     }
-    pub fn ingest_all(_force: bool, _subagents: bool) -> Result<usize> {
+    pub fn ingest_all(_options: IngestOptions) -> Result<usize> {
         Ok(0)
     }
-    pub fn events_for(_harness: &str, _session_id: &str, _kind: Option<&str>) -> Vec<EventRow> {
-        Vec::new()
+    pub fn events_for(_harness: &str, _session_id: &str, _kind: Option<&str>) -> Result<Vec<EventRow>> {
+        Ok(Vec::new())
     }
-    pub fn sessions_touching(_path: &str, _edits_only: bool) -> Vec<TouchedSession> {
-        Vec::new()
+    pub fn sessions_touching(_path: &str, _edits_only: bool) -> Result<Vec<TouchedSession>> {
+        Ok(Vec::new())
     }
-    pub fn sessions_editing(_abs: &str) -> Vec<TouchedSession> {
-        Vec::new()
+    pub fn sessions_editing(_abs: &str) -> Result<Vec<TouchedSession>> {
+        Ok(Vec::new())
     }
-    pub fn edits_touching_file(_abs: &str, _rel: &str) -> Vec<EditEvent> {
-        Vec::new()
+    pub fn edits_touching_file(_abs: &str, _rel: &str) -> Result<Vec<EditEvent>> {
+        Ok(Vec::new())
     }
     pub fn catalog_has_events() -> bool {
         false
@@ -1474,7 +1430,7 @@ mod db_stub {
 #[cfg(not(feature = "sqlite"))]
 pub use db_stub::{
     catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent, needs_ingest,
-    record_from_with_source, record_spooled_with_source, sessions_editing, sessions_touching, SyncTable,
+    record_spooled_with_source, sessions_editing, sessions_touching, SyncTable,
 };
 
 #[cfg(test)]
@@ -1482,6 +1438,132 @@ mod tests {
     use super::*;
     use crate::ir::{Message, Role};
     use serde_json::json;
+
+    #[test]
+    fn native_codex_patch_facts_deduplicate_by_exact_call_identity_across_checkpoints() {
+        // Real Codex 0.163.0 records from the isolated hooks scenario; scrubbed, not authored.
+        let nested = crate::harness::codex::parse_str(
+            "nested",
+            include_str!("../tests/fixtures/codex/code_mode_patch.jsonl"),
+            true,
+            None,
+        )
+        .unwrap();
+        let direct = crate::harness::codex::parse_str(
+            "direct",
+            include_str!("../tests/fixtures/codex/direct_patch.jsonl"),
+            true,
+            None,
+        )
+        .unwrap();
+        for session in [&nested, &direct] {
+            assert_eq!(session.messages.len(), 3);
+            let mut before = EventSink::new(None);
+            before.observe_message(&session.messages[0]);
+            let initial = before.events().iter().filter(|e| e.kind == "file_edit").count();
+            let mut checkpoint = Checkpoint::new(42);
+            before.checkpoint(&mut checkpoint);
+            // Cross the actual serialized checkpoint boundary, not a clone of the extractor.
+            let bytes = serde_json::to_vec(&checkpoint).unwrap();
+            let checkpoint = serde_json::from_slice(&bytes).unwrap();
+            let mut after = EventSink::resume(&checkpoint).unwrap();
+            for message in &session.messages[1..] {
+                after.observe_message(message);
+            }
+            let edits: Vec<_> = after.events().iter().filter(|e| e.kind == "file_edit").collect();
+            assert_eq!(initial + edits.len(), 1);
+            let histogram = crate::tools::ToolHistogram::from_messages(&session.messages, None).unwrap();
+            assert_eq!(histogram.tools.values().map(|t| t.edits).sum::<usize>(), 1);
+        }
+        // Parallel completions must not mistake an unrelated outer call for the native child.
+        let mut sink = EventSink::new(None);
+        sink.observe_message(&direct.messages[0]);
+        sink.observe_message(&nested.messages[0]);
+        sink.observe_message(&nested.messages[1]);
+        sink.observe_message(&direct.messages[1]);
+        assert_eq!(sink.events().iter().filter(|e| e.kind == "file_edit").count(), 2);
+        assert_eq!(sink.events().iter().filter(|e| e.call).count(), 2);
+    }
+
+    #[test]
+    fn native_edits_reconcile_resolved_targets_and_command_workdir() {
+        let fixture = include_str!("../tests/fixtures/codex/direct_patch.jsonl");
+        for shell_cd in [false, true] {
+            let mut session = crate::harness::codex::parse_str("direct", fixture, true, None).unwrap();
+            if shell_cd {
+                let Block::ToolUse { input, .. } = &mut session.messages[0].content[0] else {
+                    panic!("fixture must start with the shell call");
+                };
+                *input = json!({"cmd": "cd /home/corpus/project && apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: notes.txt\n*** End Patch\nPATCH"}).into();
+            }
+            // The native completion knows an additional path not understood by inference.
+            session.messages[1].extra["codex"]["item"]["changes"]["/home/corpus/project/extra.txt"] =
+                json!({"type":"update", "unified_diff":"", "move_path":null});
+            let mut before = EventSink::new(Some("/different/session".into()));
+            before.observe_message(&session.messages[0]);
+            let mut cp = Checkpoint::new(42);
+            before.checkpoint(&mut cp);
+            let cp = serde_json::from_slice(&serde_json::to_vec(&cp).unwrap()).unwrap();
+            let mut after = EventSink::resume(&cp).unwrap();
+            for message in &session.messages[1..] {
+                after.observe_message(message);
+            }
+            let mut paths: Vec<_> = before
+                .events()
+                .iter()
+                .chain(after.events())
+                .filter(|e| e.kind == "file_edit")
+                .map(|e| e.target.as_deref().unwrap())
+                .collect();
+            paths.sort();
+            assert_eq!(
+                paths,
+                ["/home/corpus/project/extra.txt", "/home/corpus/project/notes.txt"]
+            );
+        }
+    }
+
+    #[test]
+    fn inferred_call_identity_spills_exactly_and_defers_checkpoints_until_closed() {
+        let _world = crate::test_world("events-spilled-calls");
+        let mut sink = EventSink::new(None);
+        for i in 0..3000 {
+            sink.extractor
+                .note_target(&format!("pending-{i}"), &format!("/repo/file-{i}.rs"))
+                .unwrap();
+        }
+        assert!(!sink.wants_checkpoint(1));
+        let mut checkpoint = Checkpoint::new(1);
+        sink.checkpoint(&mut checkpoint);
+        assert!(EventSink::resume(&checkpoint).is_none());
+        assert!(sink.extractor.inferred_edits.contains("cpending-0").unwrap());
+        assert!(sink.extractor.inferred_edits.contains("cpending-2999").unwrap());
+        assert!(!sink.extractor.inferred_edits.contains("absent").unwrap());
+        let mut session = crate::harness::codex::parse_str(
+            "direct",
+            include_str!("../tests/fixtures/codex/direct_patch.jsonl"),
+            true,
+            None,
+        )
+        .unwrap();
+        let native = &mut session.messages[1];
+        native.extra["codex"]["item"]["id"] = json!("pending-0");
+        native.extra["codex"]["item"]["changes"] = json!({
+            "/repo/file-0.rs": {"type":"update"}, "/repo/missed.rs": {"type":"update"}
+        });
+        sink.observe_message(native);
+        assert_eq!(sink.events().len(), 1);
+        assert_eq!(sink.events()[0].target.as_deref(), Some("/repo/missed.rs"));
+        sink.extractor.complete("pending-0").unwrap();
+        sink.extractor.complete("pending-0").unwrap();
+        assert_eq!(sink.extractor.pending, 2999);
+        for i in (1..3000).rev() {
+            sink.extractor.complete(&format!("pending-{i}")).unwrap();
+        }
+        assert!(sink.wants_checkpoint(2));
+        sink.checkpoint(&mut checkpoint);
+        assert_eq!(EventSink::resume(&checkpoint).unwrap().extractor.pending, 0);
+    }
 
     #[test]
     fn checkpoint_only_sink_tracks_positions_without_extracting_rows() {
@@ -1541,7 +1623,7 @@ mod tests {
                 vec![
                     (
                         "command",
-                        Some("apply_patch *** Begin Patch *** Add File: late *** End Patch".to_string()),
+                        Some("apply_patch *** Begin Patch\n*** Add File: late\n*** End Patch".to_string()),
                     ),
                     ("file_edit", Some("/w/late".to_string())),
                 ],
@@ -1553,12 +1635,12 @@ mod tests {
             let owned: Value = serde_json::from_str(raw).unwrap();
             assert_eq!(
                 source
-                    .with_view(|view| classify_tool_view(name, view, Some(Path::new("/w"))))
+                    .with_view(|view| classify_tool_view(name, view, Some(Path::new("/w")), true))
                     .unwrap(),
                 expected
             );
             assert_eq!(
-                classify_tool_view(name, JsonView::from(&owned), Some(Path::new("/w"))).unwrap(),
+                classify_tool_view(name, JsonView::from(&owned), Some(Path::new("/w")), true).unwrap(),
                 expected
             );
             let mut message = msg(vec![
@@ -1572,7 +1654,9 @@ mod tests {
             ]);
             std::fs::remove_file(&path).unwrap();
             let mut rows = vec![];
-            assert!(extract_into(&message, 0, None, &mut rows).is_err());
+            assert!(EventExtractor::default()
+                .extract(&message, 0, None, None, None, &mut rows)
+                .is_err());
             assert!(rows.is_empty(), "the first valid call must not partially publish");
             let mut sink = EventSink::new(None);
             assert_eq!(sink.message(message.clone()), Flow::Stop);
@@ -1603,9 +1687,11 @@ mod tests {
             let raw = serde_json::to_vec(&value).unwrap();
             std::fs::write(&path, &raw).unwrap();
             let source = Json::source(&path, 0, raw.len() as u64).unwrap();
-            let expected = classify_tool_view(name, JsonView::from(&value), None).unwrap();
+            let expected = classify_tool_view(name, JsonView::from(&value), None, true).unwrap();
             assert_eq!(
-                source.with_view(|view| classify_tool_view(name, view, None)).unwrap(),
+                source
+                    .with_view(|view| classify_tool_view(name, view, None, true))
+                    .unwrap(),
                 expected
             );
             assert!(expected
@@ -1627,7 +1713,7 @@ mod tests {
             tool_use("Bash", json!({"command": "cargo test -p cv-core"})),
             tool_use("Glob", json!({"pattern": "**/*.rs", "path": "crates"})),
         ]);
-        let ev = extract(&m, 7, Some(cwd)).unwrap();
+        let ev = extract(&m, 7, Some(cwd), &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(ev.len(), 4);
         assert_eq!(
             (ev[0].kind, ev[0].target.as_deref()),
@@ -1650,7 +1736,7 @@ mod tests {
     fn codex_style_shell_and_local_shell_become_commands() {
         // codex `shell`: argv array.
         let m = msg(vec![tool_use("shell", json!({"command": ["bash", "-lc", "ls -la"]}))]);
-        let ev = extract(&m, 0, None).unwrap();
+        let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(
             (ev[0].kind, ev[0].target.as_deref()),
             ("command", Some("bash -lc ls -la"))
@@ -1661,7 +1747,7 @@ mod tests {
             "local_shell",
             json!({"action": {"type": "exec", "command": ["echo", "hi"]}, "status": "completed"}),
         )]);
-        let ev = extract(&m, 0, None).unwrap();
+        let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("command", Some("echo hi")));
     }
 
@@ -1675,7 +1761,7 @@ mod tests {
                      *** End Patch";
         // Plain-string input (codex custom_tool_call).
         let m = msg(vec![tool_use("apply_patch", json!(patch))]);
-        let ev = extract(&m, 0, Some(Path::new("/repo"))).unwrap();
+        let ev = extract(&m, 0, Some(Path::new("/repo")), &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(ev.len(), 2);
         assert_eq!(
             (ev[0].kind, ev[0].target.as_deref()),
@@ -1688,11 +1774,15 @@ mod tests {
 
         // The same patch routed through the shell tool: command row + per-file edits.
         let m = msg(vec![tool_use("shell", json!({"command": ["apply_patch", patch]}))]);
-        let ev = extract(&m, 0, Some(Path::new("/repo"))).unwrap();
+        let ev = extract(&m, 0, Some(Path::new("/repo")), &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(ev[0].kind, "command");
         let edits: Vec<_> = ev.iter().filter(|e| e.kind == "file_edit").collect();
         assert_eq!(edits.len(), 2);
         assert_eq!(edits[0].target.as_deref(), Some("/repo/crates/cv-core/src/ir.rs"));
+    }
+
+    fn patch_targets(patch: &str) -> Vec<String> {
+        arguments::patch_rows(crate::json::JsonView::from(&json!(patch))).unwrap()
     }
 
     #[test]
@@ -1710,11 +1800,11 @@ mod tests {
     fn ambiguous_file_tool_and_unknown_tool_degrade_gracefully() {
         // File key but a name that hints neither read nor write → 'tool' with the path target.
         let m = msg(vec![tool_use("Mystery", json!({"path": "x.txt"}))]);
-        let ev = extract(&m, 0, Some(Path::new("/w"))).unwrap();
+        let ev = extract(&m, 0, Some(Path::new("/w")), &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("tool", Some("/w/x.txt")));
         // No file key, no command → bare 'tool' row.
         let m = msg(vec![tool_use("web_search", json!({"query": "rust"}))]);
-        let ev = extract(&m, 0, None).unwrap();
+        let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("tool", None));
     }
 
@@ -1729,7 +1819,7 @@ mod tests {
                 json!({"file_path": "/g/edit.txt", "old_string": "a", "new_string": "b"}),
             ),
         ]);
-        let ev = extract(&m, 0, Some(Path::new("/g"))).unwrap();
+        let ev = extract(&m, 0, Some(Path::new("/g")), &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("file_edit", Some("/g/out.txt")));
         assert_eq!((ev[1].kind, ev[1].target.as_deref()), ("file_read", Some("/g/in.txt")));
         assert_eq!((ev[2].kind, ev[2].target.as_deref()), ("command", Some("make build")));
@@ -1740,7 +1830,12 @@ mod tests {
     }
 
     #[test]
-    fn error_results_emit_error_events_without_materializing_spans() {
+    fn error_results_carry_their_whole_text_lazy_or_inline() {
+        // A failed dump past the inline limit, lazy on disk: its detail is read whole.
+        let dump = format!("  {}tail of the failure\n", "boom\n".repeat(20_000));
+        let path = std::env::temp_dir().join(format!("cv-event-detail-{}", uuid::Uuid::new_v4()));
+        let encoded = serde_json::to_string(&dump).unwrap();
+        std::fs::write(&path, &encoded).unwrap();
         let mut m = Message::new(Role::Tool);
         m.content = vec![
             Block::ToolResult {
@@ -1751,14 +1846,13 @@ mod tests {
                 status: None,
                 details: None,
             },
-            // A giant failed dump left lazy on disk: the event still lands, detail is skipped.
             Block::ToolResult {
                 tool_use_id: "t2".into(),
                 content: crate::lazy::Text::Span(crate::lazy::Span {
-                    source: None,
-                    offset: 0,
-                    len: 50_000_000,
-                    escaped: false,
+                    source: Some(path.clone()),
+                    offset: 1,
+                    len: encoded.len() as u64 - 2,
+                    escaped: true,
                 }),
                 is_error: true,
                 tool_name: None,
@@ -1775,21 +1869,24 @@ mod tests {
                 details: None,
             },
         ];
-        let ev = extract(&m, 3, None).unwrap();
+        let ev = extract(&m, 3, None, &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(ev.len(), 2);
         assert_eq!(ev[0].kind, "error");
         assert_eq!(ev[0].detail.as_deref(), Some("command failed: no such file"));
         assert_eq!(ev[0].tool.as_deref(), Some("Bash"));
         assert_eq!(ev[1].kind, "error");
-        assert_eq!(ev[1].detail, None);
+        assert_eq!(ev[1].detail.as_deref(), Some(dump.trim()));
+        // A source that is gone fails the extraction instead of dropping the detail.
+        std::fs::remove_file(&path).unwrap();
+        assert!(extract(&m, 3, None, &crate::lazy::Resolver::new(None)).is_err());
     }
 
     #[test]
-    fn long_commands_and_details_are_capped() {
-        let long_cmd = "x".repeat(1000);
+    fn long_commands_and_details_are_whole() {
+        let long_cmd = format!("cat <<'EOF'\n{}\nEOF", "x".repeat(100_000));
         let m = msg(vec![tool_use("Bash", json!({"command": long_cmd}))]);
-        let ev = extract(&m, 0, None).unwrap();
-        assert!(ev[0].target.as_ref().unwrap().chars().count() <= TARGET_MAX);
+        let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
+        assert_eq!(ev[0].target.as_deref(), Some(long_cmd.as_str()));
 
         let mut m = Message::new(Role::Tool);
         m.content = vec![Block::ToolResult {
@@ -1800,8 +1897,25 @@ mod tests {
             status: None,
             details: None,
         }];
-        let ev = extract(&m, 0, None).unwrap();
-        assert!(ev[0].detail.as_ref().unwrap().chars().count() <= DETAIL_MAX);
+        let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
+        assert_eq!(ev[0].detail, Some("e".repeat(1000)));
+    }
+
+    #[test]
+    fn a_caller_keeping_no_text_assembles_no_command() {
+        // Query facts and `cv tools` pass no resolver: the command row and its patched files
+        // still land, its text does not.
+        let command = format!(
+            "apply_patch *** Begin Patch\n*** Add File: a.rs\n{}*** End Patch",
+            "+x\n".repeat(10_000)
+        );
+        let m = msg(vec![tool_use("Bash", json!({ "command": command }))]);
+        let mut rows = vec![];
+        EventExtractor::default()
+            .extract(&m, 0, Some(Path::new("/w")), None, None, &mut rows)
+            .unwrap();
+        let rows: Vec<_> = rows.iter().map(|e| (e.kind, e.target.as_deref())).collect();
+        assert_eq!(rows, [("command", None), ("file_edit", Some("/w/a.rs"))]);
     }
 
     #[cfg(feature = "sqlite")]
@@ -1830,7 +1944,7 @@ mod tests {
             let source = probe.snapshot(r);
             SyncTable::load().needs_ingest(r, &source, prov, &mut probe)
         };
-        let rows = || format!("{:?}", events_for("claude", "shared", None));
+        let rows = || format!("{:?}", events_for("claude", "shared", None).unwrap());
         ingest_ref(&a).unwrap();
         assert!(!stale(&a, &direct));
         let planned = SyncTable::load();
@@ -1841,21 +1955,9 @@ mod tests {
         assert!(!needs_ingest(&b));
         assert!(!SyncTable::load().can_resume(&a, &direct));
         assert_eq!(
-            events_for("claude", "shared", None)[0].target.as_deref(),
+            events_for("claude", "shared", None).unwrap()[0].target.as_deref(),
             Some("/first/b.rs")
         );
-        let conn = crate::catalog::open_db().unwrap();
-        let a_sig = crate::offsets::file_sig(&a.path);
-        conn.execute(
-            "INSERT INTO event_sync(harness,id,path,mtime_ns,size) VALUES('claude','shared',?1,?2,?3)",
-            rusqlite::params![a.path.to_string_lossy(), a_sig.0, a_sig.1],
-        )
-        .unwrap();
-        assert!(
-            stale(&a, &direct),
-            "a competing historical path stamp cannot claim published output"
-        );
-        assert!(!stale(&b, &direct));
         let before = rows();
         let source = crate::source::Probe::default().snapshot(&a);
         let empty = || SpoolingSink::new(None).into_spool().unwrap();
@@ -1873,7 +1975,7 @@ mod tests {
         assert!(needs_ingest(&b));
         assert!(!stale(&b, &folded));
         assert_eq!(
-            events_for("claude", "shared", None)[0].parent_id.as_deref(),
+            events_for("claude", "shared", None).unwrap()[0].parent_id.as_deref(),
             Some("parent")
         );
         let source = crate::source::Probe::default().snapshot(&b);
@@ -1881,45 +1983,32 @@ mod tests {
         ingest_ref(&b).unwrap();
         assert!(!stale(&b, &direct));
         assert!(stale(&b, &folded));
-        assert!(events_for("claude", "shared", None)[0].parent_id.is_none());
+        assert!(events_for("claude", "shared", None).unwrap()[0].parent_id.is_none());
         let mut changed = b.clone();
         changed.cwd = Some("/second".into());
         assert!(stale(&changed, &direct));
         assert!(!SyncTable::load().can_resume(&changed, &direct));
         ingest_ref(&changed).unwrap();
         assert_eq!(
-            events_for("claude", "shared", None)[0].target.as_deref(),
+            events_for("claude", "shared", None).unwrap()[0].target.as_deref(),
             Some("/second/b.rs")
         );
         assert!(!stale(&changed, &direct));
         let conn = crate::catalog::open_db().unwrap();
         assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM event_sync WHERE id='shared'", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            1
+            conn.query_row(
+                "SELECT COUNT(*) FROM source_dependencies WHERE consumer='events' AND id='shared'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "one session has one published source copy"
         );
-        conn.execute("UPDATE event_sessions SET source_path=NULL", []).unwrap();
-        assert!(stale(&changed, &direct), "legacy output has no authoritative path");
-        assert!(!SyncTable::load().can_resume(&changed, &direct));
-        assert!(record_spooled_with_source(&changed, 1, empty(), &source, &direct).is_err());
-        ingest_ref(&changed).unwrap();
-        assert!(!stale(&changed, &direct));
         let before = rows();
         let source = crate::source::Probe::default().snapshot(&changed);
         record_spooled_with_source(&changed, 1, empty(), &source, &direct).unwrap();
         assert_eq!(rows(), before, "same-authority prefix retention remains supported");
-        conn.execute_batch(
-            "ALTER TABLE event_sessions DROP COLUMN source_path; ALTER TABLE event_sessions DROP COLUMN source_cwd;",
-        )
-        .unwrap();
-        assert!(
-            stale(&changed, &direct),
-            "existing catalog gains nullable authority and misses lazily"
-        );
-        assert_eq!(rows(), before, "authority migration keeps old event output available");
-        ingest_ref(&changed).unwrap();
-        assert!(!stale(&changed, &direct));
     }
 
     #[cfg(feature = "sqlite")]
@@ -2001,7 +2090,7 @@ mod tests {
             std::fs::write(agents.join(format!("agent-{name}.jsonl")), format!("{line}\n")).unwrap();
             parents.push(parent);
         }
-        let selected = db::collect_sources(parents.clone(), true);
+        let selected = db::collect_sources(parents.clone(), true).unwrap();
         assert_eq!(selected.len(), 3, "one preferred parent plus both disjoint children");
         assert_eq!(
             selected.iter().find(|(r, _)| r.id == "parent").unwrap().0.path,
@@ -2009,13 +2098,16 @@ mod tests {
         );
         for (r, provenance) in selected.iter().filter(|(_, provenance)| !provenance.is_empty()) {
             ingest_subagent(r, provenance).unwrap();
-            let rows = events_for(r.harness.as_str(), &r.id, None);
+            let rows = events_for(r.harness.as_str(), &r.id, None).unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].parent_id.as_deref(), Some("parent"));
         }
         assert_eq!(
             format!("{selected:?}"),
-            format!("{:?}", db::collect_sources(parents.into_iter().rev().collect(), true))
+            format!(
+                "{:?}",
+                db::collect_sources(parents.into_iter().rev().collect(), true).unwrap()
+            )
         );
     }
 
@@ -2032,27 +2124,15 @@ mod tests {
         let mut probe = crate::source::Probe::default();
         assert!(!SyncTable::load().needs_ingest(&r, &source, &Provenance::default(), &mut probe));
         let conn = crate::catalog::open_db().unwrap();
-        conn.execute("UPDATE event_sync SET size=NULL WHERE id='empty'", [])
-            .unwrap();
-        assert!(needs_ingest(&r), "historical unknown size still misses");
-        ingest_ref(&r).unwrap();
         conn.execute("DELETE FROM source_dependencies WHERE consumer='events'", [])
             .unwrap();
         assert!(needs_ingest(&r), "missing captured authority still misses");
         ingest_ref(&r).unwrap();
-        let text: String = conn
-            .query_row(
-                "SELECT stamp FROM source_dependencies WHERE consumer='events'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let mut legacy: serde_json::Value = serde_json::from_str(&text).unwrap();
-        legacy["version"] = 2.into();
-        legacy.as_object_mut().unwrap().remove("primary");
+        // A real record of the previous writer version — the whole envelope cv wrote, with only
+        // the version rewound — not a hand-cut byte offset.
         conn.execute(
-            "UPDATE source_dependencies SET stamp=?1 WHERE consumer='events'",
-            [legacy.to_string()],
+            "UPDATE source_dependencies SET record=CAST(json_set(CAST(record AS TEXT),'$.version',?1) AS BLOB) WHERE consumer='events'",
+            [crate::source::VERSION - 1],
         )
         .unwrap();
         assert!(needs_ingest(&r), "old source stamps cannot authorize empty reuse");
@@ -2109,7 +2189,7 @@ mod tests {
             title: Some("fix the parser".into()),
             created_at: None,
             updated_at: None,
-            message_count: 2,
+            message_count: Some(2),
         };
 
         let n = ingest_ref(&r).unwrap();
@@ -2119,7 +2199,7 @@ mod tests {
         assert!(!needs_ingest(&r));
         ingest_ref(&r).unwrap();
 
-        let rows = events_for("claude", "evt-e2e", None);
+        let rows = events_for("claude", "evt-e2e", None).unwrap();
         assert_eq!(rows.len(), n, "re-ingest must not duplicate rows");
         let edit = rows.iter().find(|e| e.kind == "file_edit").unwrap();
         assert_eq!(edit.target.as_deref(), Some("/repo/src/parser.rs"));
@@ -2131,7 +2211,7 @@ mod tests {
         assert!(err.detail.as_deref().unwrap().contains("E0308"));
 
         // Kind filter narrows.
-        assert_eq!(events_for("claude", "evt-e2e", Some("command")).len(), 1);
+        assert_eq!(events_for("claude", "evt-e2e", Some("command")).unwrap().len(), 1);
 
         // A same-size rewrite must invalidate events, even for this normally append-only log.
         let content = std::fs::read(&path).unwrap();
@@ -2147,7 +2227,7 @@ mod tests {
             .unwrap();
         assert!(needs_ingest(&r), "same-size rewrites must force an event re-ingest");
         ingest_ref(&r).unwrap();
-        let edited_rows = events_for("claude", "evt-e2e", Some("file_edit"));
+        let edited_rows = events_for("claude", "evt-e2e", Some("file_edit")).unwrap();
         assert_eq!(edited_rows.len(), 1);
         assert_eq!(edited_rows[0].target.as_deref(), Some("/repo/src/reader.rs"));
         assert!(!needs_ingest(&r));
@@ -2170,25 +2250,25 @@ mod tests {
         assert!(!needs_ingest(&r));
 
         // The touched query finds the session by absolute path and by suffix.
-        let touched = sessions_touching("/repo/src/parser.rs", false);
+        let touched = sessions_touching("/repo/src/parser.rs", false).unwrap();
         assert_eq!(touched.len(), 1);
         assert_eq!(touched[0].session_id, "evt-e2e");
         assert_eq!(touched[0].edits, 1);
         assert_eq!(touched[0].reads, 0);
-        let by_suffix = sessions_touching("src/parser.rs", true);
+        let by_suffix = sessions_touching("src/parser.rs", true).unwrap();
         assert_eq!(by_suffix.len(), 1, "suffix match + edits_only should still hit");
         // A file nobody touched stays quiet.
-        assert!(sessions_touching("src/nonexistent.rs", false).is_empty());
+        assert!(sessions_touching("src/nonexistent.rs", false).unwrap().is_empty());
         // The edit guard's exact lookup: the absolute path hits, a suffix never does.
-        let exact = sessions_editing("/repo/src/parser.rs");
+        let exact = sessions_editing("/repo/src/parser.rs").unwrap();
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].session_id, "evt-e2e");
-        assert!(sessions_editing("src/parser.rs").is_empty());
+        assert!(sessions_editing("src/parser.rs").unwrap().is_empty());
 
         // blame's edit query: abs + repo-relative-suffix matching, session metadata joined in.
         crate::catalog::sync(std::slice::from_ref(&r));
         assert!(catalog_has_events());
-        let edits = edits_touching_file("/repo/src/parser.rs", "src/parser.rs");
+        let edits = edits_touching_file("/repo/src/parser.rs", "src/parser.rs").unwrap();
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].session_id, "evt-e2e");
         assert_eq!(edits[0].msg_idx, 1);
@@ -2196,107 +2276,15 @@ mod tests {
         assert_eq!(edits[0].cwd.as_deref(), Some("/repo"));
         assert_eq!(edits[0].title.as_deref(), Some("fix the parser"));
         // Suffix-only match from a *different* checkout path still hits.
-        let edits = edits_touching_file("/elsewhere/src/parser.rs", "src/parser.rs");
+        let edits = edits_touching_file("/elsewhere/src/parser.rs", "src/parser.rs").unwrap();
         assert_eq!(edits.len(), 1);
-        assert!(edits_touching_file("/repo/src/other.rs", "src/other.rs").is_empty());
-    }
-
-    /// Migration e2e: a v1-shaped (0.9.10) catalog opened by v2 code is dropped wholesale —
-    /// old rows AND `event_sync` (so everything reads as stale) — then lazily reingested; the
-    /// version stamp prevents re-drops; and a v1 table snuck back in by an old binary under a
-    /// v2 stamp self-heals on the next open.
-    #[cfg(feature = "sqlite")]
-    #[test]
-    fn v1_catalog_migrates_by_drop_and_lazy_reingest() {
-        let world = crate::test_world("events-migration");
-        let home = &world.cv_home;
-
-        const V1_DDL: &str = "CREATE TABLE events(
-                 harness    TEXT NOT NULL,
-                 session_id TEXT NOT NULL,
-                 msg_idx    INTEGER NOT NULL,
-                 ts         INTEGER,
-                 kind       TEXT NOT NULL,
-                 tool       TEXT,
-                 target     TEXT,
-                 detail     TEXT
-             );
-             CREATE UNIQUE INDEX idx_events_dedup
-                 ON events(harness, session_id, msg_idx, kind, COALESCE(target,''));
-             INSERT INTO events VALUES('claude','mig-e2e',1,NULL,'file_edit','Edit','/old/v1.rs',NULL);";
-
-        // A v1-shaped catalog as 0.9.10 left it: v1 events + a fresh event_sync stamp.
-        let sdir = home.join("sessions");
-        std::fs::create_dir_all(&sdir).unwrap();
-        let path = sdir.join("mig-e2e.jsonl");
-        std::fs::write(
-            &path,
-            format!(
-                "{}\n",
-                serde_json::json!({
-                    "type": "assistant", "uuid": "a0", "sessionId": "mig-e2e",
-                    "message": {"role": "assistant", "content": [
-                        {"type": "tool_use", "id": "t1", "name": "Edit",
-                         "input": {"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}}
-                    ]}
-                })
-            ),
-        )
-        .unwrap();
-        let mtime = crate::offsets::file_sig(&path).0;
-        {
-            let conn = rusqlite::Connection::open(home.join("catalog.db")).unwrap();
-            conn.execute_batch(&format!(
-                "{V1_DDL}
-                 CREATE TABLE event_sync(
-                     harness TEXT NOT NULL, id TEXT NOT NULL, path TEXT NOT NULL,
-                     mtime_ns INTEGER NOT NULL, PRIMARY KEY(harness, id, path));
-                 INSERT INTO event_sync VALUES('claude','mig-e2e','{}',{mtime});",
-                path.display()
-            ))
-            .unwrap();
-        }
-
-        let r = SessionRef {
-            id: "mig-e2e".into(),
-            harness: crate::ir::Harness::Claude,
-            path: path.clone(),
-            cwd: Some("/repo".into()),
-            title: None,
-            created_at: None,
-            updated_at: None,
-            message_count: 1,
-        };
-
-        // First v2 open (inside needs_ingest) migrates: v1 rows gone, sync stamp gone → stale.
-        assert!(needs_ingest(&r), "v1 event_sync stamps must not survive migration");
-        assert!(!catalog_has_events(), "v1 event rows must not survive migration");
-
-        // The normal lazy path then rebuilds cleanly on the v2 schema.
-        let n = ingest_ref(&r).unwrap();
-        assert_eq!(n, 1);
-        assert!(!needs_ingest(&r));
-        let rows = events_for("claude", "mig-e2e", None);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].target.as_deref(), Some("/repo/src/lib.rs"));
-        assert_eq!(sessions_touching("src/lib.rs", true).len(), 1);
-
-        // The stamp stuck, so the next open did NOT re-drop (the ingested rows are still there).
-        {
-            let conn = rusqlite::Connection::open(home.join("catalog.db")).unwrap();
-            let v: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
-            assert_eq!(v, 3);
-
-            // Now simulate an old 0.9.10 binary recreating v1 tables under the v2 stamp.
-            conn.execute_batch(&format!("DROP TABLE events; {V1_DDL}")).unwrap();
-        }
-        // Shape detection self-heals on open: full reset, stale again, reingest works.
-        assert!(
-            !catalog_has_events(),
-            "a v1-shaped table under a v2 stamp must be dropped"
-        );
-        assert!(needs_ingest(&r));
-        ingest_ref(&r).unwrap();
-        assert_eq!(events_for("claude", "mig-e2e", None).len(), 1);
+        assert!(edits_touching_file("/repo/src/other.rs", "src/other.rs")
+            .unwrap()
+            .is_empty());
+        // A suffix must start at a path-component boundary, and a relative path equals only itself.
+        assert!(edits_touching_file("/x/rser.rs", "rser.rs").unwrap().is_empty());
+        assert!(edits_touching_file("/x/src/parser.rs.bak", "src/parser.rs.bak")
+            .unwrap()
+            .is_empty());
     }
 }

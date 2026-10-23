@@ -20,43 +20,47 @@ fn real_session() -> String {
         .expect("set CV_REAL_SESSION=<session id> to run the real-data tests")
 }
 
-fn cv(args: &[&str]) -> (i32, String) {
+fn cv(args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_cv"))
         .args(args)
         .output()
         .expect("cv runs");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-    )
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "cv {args:?}: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status
+    );
+    stdout
 }
 
 #[test]
 #[ignore = "needs CV_REAL_SESSION; run with --ignored"]
 fn real_prompts_are_human_lines_and_answers_only() {
     let session = real_session();
-    let (code, out) = cv(&["show", &session, "--kind", "prompt,answer", "--json"]);
-    assert_eq!(code, 0, "{out}");
+    let out = cv(&["show", &session, "--kind", "prompt,answer", "--json"]);
     let rows: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
     assert!(!rows.is_empty(), "a real session has at least one prompt");
     assert!(
-        rows.iter().all(|r| r["kind"] == "prompt" || r["kind"] == "answer"),
+        rows.iter()
+            .all(|r| matches!(r["kind"].as_str().expect("message kind"), "prompt" | "answer")),
         "every row is a prompt or an AskUserQuestion answer"
     );
     assert!(rows.iter().any(|r| r["kind"] == "prompt"));
     // Slash-command bookkeeping is a `notice`, never a prompt (Claude Code >= 2.1 writes
     // `<command-name>…` records on the user side).
-    assert!(!rows
-        .iter()
-        .any(|r| r["text"].as_str().unwrap_or("").starts_with("<command-name>")));
+    assert!(!rows.iter().any(|r| r["text"]
+        .as_str()
+        .expect("prompt/answer text")
+        .starts_with("<command-name>")));
 }
 
 #[test]
 #[ignore = "needs CV_REAL_SESSION; run with --ignored"]
 fn real_lanes_census_is_consistent() {
     let session = real_session();
-    let (code, out) = cv(&["lanes", &session, "--json"]);
-    assert_eq!(code, 0, "{out}");
+    let out = cv(&["lanes", &session, "--json"]);
     let rows: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
     assert!(!rows.is_empty(), "the session has sub-agents (pick an orchestrator)");
     let running = rows.iter().filter(|r| r["status"] == "running").count();

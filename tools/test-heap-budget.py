@@ -19,6 +19,31 @@ spec.loader.exec_module(budget)
 
 
 class DriverTests(unittest.TestCase):
+    def test_event_fixtures_keep_close_reopen_and_native_shapes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for shape in ("unfinished", "open-close", "native"):
+                source = Path(directory) / f"{shape}.jsonl"
+                harness, messages, expected = budget.event_fixture(source, shape, 4)
+                rows = [json.loads(line) for line in source.read_text().splitlines()]
+                self.assertEqual(len(rows), messages)
+                self.assertEqual(len(expected), 8 if shape == "native" else 5 if shape == "open-close" else 4)
+                if shape == "open-close":
+                    ids = [row["message"]["content"][0]["tool_use_id"] for row in rows[4:8]]
+                    self.assertEqual(ids, [f"call-{i}" for i in reversed(range(4))])
+                    self.assertEqual(rows[-1]["message"]["content"][0]["type"], "tool_use")
+                elif shape == "native":
+                    self.assertEqual(harness, "codex")
+                    self.assertEqual(rows[1]["payload"]["item"]["type"], "FileChange")
+                    self.assertEqual(len(rows[1]["payload"]["item"]["changes"]), 2)
+
+    def test_events_gate_runs_every_shape_for_either_build(self):
+        for mmap in (False, True):
+            with tempfile.TemporaryDirectory() as directory, patch.object(budget, "events_case") as cases:
+                budget.events("probe", Path(directory), {}, mmap=mmap)
+                self.assertEqual([call.args[3] for call in cases.call_args_list],
+                                 ["unfinished", "open-close", "native"])
+                self.assertTrue(all(call.kwargs == {"mmap": mmap} for call in cases.call_args_list))
+
     def result(self, features, heap):
         return SimpleNamespace(returncode=0, stdout=json.dumps({"build_features": features, "requested_rust_heap": heap}), stderr="")
 

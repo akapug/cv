@@ -30,14 +30,14 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         .unwrap_or_else(|| PathBuf::from("/"));
     let cwd_str = cwd.to_string_lossy().into_owned();
 
-    let now = session.created_at.unwrap_or_else(Utc::now);
+    let created = session.created_at.unwrap_or_else(Utc::now);
     // Path: out_dir/YYYY/MM/DD/rollout-<YYYY-MM-DDTHH-MM-SS>-<uuid>.jsonl — in LOCAL time and with no
     // zone suffix, exactly as `RolloutFileName::render` writes it (`OffsetDateTime::now_local()`):
     // Codex's `RolloutFileName::parse` requires a 19-char timestamp with byte 19 == `-` before the
     // uuid, so a `…T11-04-49Z-<uuid>` name (what we used to write) is invisible to every
     // filename-based lookup (thread-id resolution, migration, `builder_from_items`) and the thread
     // only resumed while its sqlite row happened to exist.
-    let local = now.with_timezone(&chrono::Local);
+    let local = created.with_timezone(&chrono::Local);
     let date_dir = out_dir
         .join(local.format("%Y").to_string())
         .join(local.format("%m").to_string())
@@ -46,7 +46,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     let stamp = local.format("%Y-%m-%dT%H-%M-%S").to_string();
     let file_path = date_dir.join(format!("rollout-{stamp}-{new_id}.jsonl"));
 
-    let ts_str = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let ts_str = created.to_rfc3339_opts(SecondsFormat::Millis, true);
 
     let mut lines = JsonlStage::new();
 
@@ -63,8 +63,17 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     // say so — Codex ≥ 0.147 keys its persistence policy and ordinal handling off `history_mode`,
     // defaulting to `legacy` when absent, and the legacy→paginated migration canonicalizes it.
     meta.insert("history_mode".into(), json!("legacy"));
-    meta.insert("originator".into(), json!("clustervision"));
-    meta.insert("cli_version".into(), json!(env!("CARGO_PKG_VERSION")));
+    meta.insert("originator".into(), json!(super::CV_ORIGINATOR));
+    // `SessionMeta.cli_version: String` has no serde default: without the key Codex's reader
+    // rejects the rollout ("does not start with session metadata"). It names the Codex CLI that
+    // wrote the file, which cv is not: carry a Codex source's recorded version, else Codex's own
+    // spelling of unknown, `""` (its `SessionMeta` default, which `state::extract` skips).
+    let cli_version = session
+        .harness_extra(Harness::Codex)
+        .and_then(|bag| bag.get("cli_version"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    meta.insert("cli_version".into(), json!(cli_version));
     // Codex persists this field into `state_5.sqlite.threads.model_provider` when it first
     // discovers the rollout. Omitting it creates an empty provider entry which the TUI then
     // cannot resume (`Model provider `` not found`), even though `turn_context.model` is valid.
@@ -79,11 +88,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     if let Some(g) = &session.git {
         meta.insert("git".into(), codex_git(g));
     }
-    lines.push(json!({
-        "type": "session_meta",
-        "timestamp": ts_str,
-        "payload": Value::Object(meta),
-    }))?;
+    writer::value(&mut lines, &ts_str, "session_meta", &Value::Object(meta))?;
 
     // The model rides in a `turn_context` record (per-turn config: model/cwd/approval/sandbox) —
     // that's the ONLY place Codex's own parser (and ours, `apply_turn_context`) reads a model id
@@ -94,18 +99,19 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     // skipped on resume, so the model never actually came back. `on-request` + `workspace-write`
     // are Codex's own defaults (both decode with no further fields).
     if let Some(model) = &session.model {
-        lines.push(json!({
-            "type": "turn_context",
-            "timestamp": ts_str,
-            "payload": {
+        writer::value(
+            &mut lines,
+            &ts_str,
+            "turn_context",
+            &json!({
                 "turn_id": Uuid::now_v7().to_string(),
                 "cwd": cwd_str,
                 "approval_policy": "on-request",
                 "sandbox_policy": { "type": "workspace-write" },
                 "model": model,
                 "summary": "auto",
-            },
-        }))?;
+            }),
+        )?;
     }
 
     for msg in &session.messages {
@@ -161,7 +167,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                 )?;
             }
             Role::Assistant => {
-                let first_record = lines.len();
+                let first_record = lines.record_count();
                 // Split assistant content into NL text (event_msg) and structured items.
                 for b in &msg.content {
                     match crate::emit::thinking::fate(b, Harness::Codex, opts.thinking, &resolver)? {
@@ -229,13 +235,15 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                         }
                         Block::File { path, source, .. } => {
                             let label = path.as_deref().or(source.as_deref()).unwrap_or("?");
-                            lines.push(codex_event_msg(
+                            writer::value(
+                                &mut lines,
                                 &ts,
-                                json!({
+                                "event_msg",
+                                &json!({
                                     "type": "agent_message",
                                     "message": format!("[file: {label}]"),
                                 }),
-                            ))?;
+                            )?;
                         }
                         Block::ToolResult { .. } | Block::Image { .. } => {}
                     }
@@ -246,14 +254,16 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                 // ported session read back `usage: 393 → 0`. Only when the turn actually wrote
                 // records Codex reads back: trailing nothing (or only an empty `reasoning` item,
                 // which its reader drops) the event would synthesize a bare usage-only turn.
-                if lines.len() > first_record
+                if lines.record_count() > first_record
                     && !unrepresentable_checked(Harness::Codex, opts.thinking, msg, &resolver)?
                 {
-                    if let Some(info) = codex_token_usage(msg.usage.as_ref()) {
-                        lines.push(codex_event_msg(
+                    if let Some(info) = codex_token_usage(msg.usage.as_ref())? {
+                        writer::value(
+                            &mut lines,
                             &ts,
-                            json!({ "type": "token_count", "info": { "last_token_usage": info } }),
-                        ))?;
+                            "event_msg",
+                            &json!({ "type": "token_count", "info": { "last_token_usage": info } }),
+                        )?;
                     }
                 }
             }
@@ -279,15 +289,17 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                         // Emit a call shell first so the pair is well-formed and the output's text
                         // still reaches the model, rather than dropping the turn.
                         if is_orphan_result(b, &called) {
-                            lines.push(codex_response_item(
+                            writer::value(
+                                &mut lines,
                                 &ts,
-                                json!({
+                                "response_item",
+                                &json!({
                                     "type": "function_call",
                                     "call_id": tool_use_id,
                                     "name": tool_name.clone().unwrap_or_else(|| "unknown".into()),
                                     "arguments": "{}",
                                 }),
-                            ))?;
+                            )?;
                         }
                         writer::record(&mut lines, &ts, "response_item", |out| {
                             out.write_all(b"{\"type\":\"function_call_output\",\"call_id\":")?;
@@ -330,14 +342,18 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
 /// `reasoning_output_tokens`). Only the fields actually present are written, so a Codex source
 /// round-trips with the same key set. `None` when there is nothing Codex's parser would read back
 /// (it requires at least one of input / output / cached-input).
-fn codex_token_usage(usage: Option<&crate::ir::Usage>) -> Option<Value> {
-    let u = usage?;
+fn codex_token_usage(usage: Option<&crate::ir::Usage>) -> Result<Option<Value>> {
+    let Some(u) = usage else { return Ok(None) };
     let mut m = Map::new();
     // The IR's `input_tokens` excludes the cache counts; Codex's includes them.
-    let input = u.input_tokens.map(|i| {
-        i.saturating_add(u.cache_read_tokens.unwrap_or(0))
-            .saturating_add(u.cache_creation_tokens.unwrap_or(0))
-    });
+    let input = u
+        .input_tokens
+        .map(|i| {
+            i.checked_add(u.cache_read_tokens.unwrap_or(0))
+                .and_then(|n| n.checked_add(u.cache_creation_tokens.unwrap_or(0)))
+                .context("Codex input token count overflows u64")
+        })
+        .transpose()?;
     for (key, val) in [
         ("input_tokens", input),
         ("cached_input_tokens", u.cache_read_tokens),
@@ -350,21 +366,17 @@ fn codex_token_usage(usage: Option<&crate::ir::Usage>) -> Option<Value> {
         }
     }
     if u.input_tokens.is_none() && u.output_tokens.is_none() && u.cache_read_tokens.is_none() {
-        return None;
+        return Ok(None);
     }
     // Codex's own totals are input + output (cached input is a *subset* of its `input_tokens`, not
     // an addend — 35507 + 55 = 35562 in a real 0.155 record whose cached count was 34432).
-    let total: u64 = u.total_tokens();
-    m.insert("total_tokens".into(), json!(total));
-    Some(Value::Object(m))
-}
-
-fn codex_event_msg(ts: &str, payload: Value) -> Value {
-    json!({ "type": "event_msg", "timestamp": ts, "payload": payload })
-}
-
-fn codex_response_item(ts: &str, payload: Value) -> Value {
-    json!({ "type": "response_item", "timestamp": ts, "payload": payload })
+    if let (Some(input), Some(output)) = (input, u.output_tokens) {
+        let total = input
+            .checked_add(output)
+            .context("Codex total token count overflows u64")?;
+        m.insert("total_tokens".into(), json!(total));
+    }
+    Ok(Some(Value::Object(m)))
 }
 
 fn codex_git(g: &GitInfo) -> Value {
@@ -381,58 +393,6 @@ fn codex_git(g: &GitInfo) -> Value {
     Value::Object(m)
 }
 
-// Borrow payload strings rather than constructing a second Value tree for each text twin.
-#[derive(serde::Serialize)]
-struct Record<'a, T> {
-    r#type: &'a str,
-    timestamp: &'a str,
-    payload: T,
-}
-#[derive(serde::Serialize)]
-struct TextItem<'a> {
-    r#type: &'a str,
-    text: &'a str,
-}
-#[derive(serde::Serialize)]
-struct TextMessage<'a> {
-    r#type: &'a str,
-    role: &'a str,
-    content: [TextItem<'a>; 1],
-}
-#[derive(serde::Serialize)]
-struct TextEvent<'a> {
-    r#type: &'a str,
-    message: &'a str,
-}
-fn push_text(
-    lines: &mut JsonlStage,
-    ts: &str,
-    role: &str,
-    content_type: &str,
-    event_type: &str,
-    text: &str,
-) -> Result<()> {
-    lines.push(Record {
-        r#type: "response_item",
-        timestamp: ts,
-        payload: TextMessage {
-            r#type: "message",
-            role,
-            content: [TextItem {
-                r#type: content_type,
-                text,
-            }],
-        },
-    })?;
-    lines.push(Record {
-        r#type: "event_msg",
-        timestamp: ts,
-        payload: TextEvent {
-            r#type: event_type,
-            message: text,
-        },
-    })
-}
 #[cfg(test)]
 mod staged_tests {
     use super::*;
@@ -458,7 +418,8 @@ mod staged_tests {
             content: "delivered".into(),
             is_error: false,
             tool_name: Some("send_message".into()),
-            status: Some("completed".into()),
+            // A Codex output record has no status of its own, so none survives the round trip.
+            status: None,
             details: None,
         });
         session.messages = vec![call, result];
@@ -491,42 +452,31 @@ mod staged_tests {
     }
 
     #[test]
-    fn usage_wire_aggregates_saturate_large_component_counts() {
+    fn usage_wire_rejects_overflow_and_keeps_partial_counts_partial() {
+        for usage in [
+            crate::ir::Usage {
+                input_tokens: Some(u64::MAX),
+                cache_read_tokens: Some(1),
+                ..Default::default()
+            },
+            crate::ir::Usage {
+                input_tokens: Some(u64::MAX),
+                output_tokens: Some(1),
+                ..Default::default()
+            },
+        ] {
+            assert!(codex_token_usage(Some(&usage))
+                .unwrap_err()
+                .to_string()
+                .contains("overflows u64"));
+        }
         let value = codex_token_usage(Some(&crate::ir::Usage {
-            input_tokens: Some(u64::MAX),
-            cache_read_tokens: Some(1),
-            cache_creation_tokens: Some(2),
             output_tokens: Some(3),
             ..Default::default()
         }))
+        .unwrap()
         .unwrap();
-        assert_eq!(value["input_tokens"], u64::MAX);
-        assert_eq!(value["total_tokens"], u64::MAX);
-        assert_eq!(value["cached_input_tokens"], 1);
-    }
-
-    #[test]
-    fn borrowed_text_twins_preserve_wire_bytes() -> Result<()> {
-        let world = cv_testkit::World::new("codex-text-stage");
-        for (role, content_type, event_type) in [
-            ("user", "input_text", "user_message"),
-            ("assistant", "output_text", "agent_message"),
-        ] {
-            let text = "a\"\\\nλ";
-            let mut stage = JsonlStage::new();
-            push_text(&mut stage, "fixed", role, content_type, event_type, text)?;
-            let path = world.base.join(role);
-            stage.publish(&path, crate::publish::Claim::New)?;
-            let expected = format!(
-                "{}\n{}\n",
-                serde_json::to_string(&codex_response_item(
-                    "fixed",
-                    json!({"type":"message", "role":role, "content":[{"type":content_type,"text":text}]})
-                ))?,
-                serde_json::to_string(&codex_event_msg("fixed", json!({"type":event_type,"message":text})))?
-            );
-            assert_eq!(std::fs::read(&path)?, expected.as_bytes());
-        }
-        Ok(())
+        assert_eq!(value["output_tokens"], 3);
+        assert!(value.get("input_tokens").is_none() && value.get("total_tokens").is_none());
     }
 }

@@ -1,0 +1,56 @@
+name: macOS filesystem gates
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  push:
+    tags: ['v*-rc*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  filesystem:
+    name: APFS identity · publish · SQLite · mmap heap
+    runs-on: macos-14
+    steps:
+      - name: Isolate cv state and temporary files
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/cv-macos-home" "$RUNNER_TEMP/cv-macos-tmp"
+          echo "CLUSTERVISION_HOME=$RUNNER_TEMP/cv-macos-home" >> "$GITHUB_ENV"
+          echo "TMPDIR=$RUNNER_TEMP/cv-macos-tmp" >> "$GITHUB_ENV"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install pinned nextest
+        # cargo selects the runner's native architecture; the Linux archive is not portable.
+        run: cargo install --locked cargo-nextest --version 0.9.136
+      - name: Default-feature filesystem and SQLite lifecycle tests
+        # Includes restored-tuple rewrites, mmap source changes, exclusive publication,
+        # cold/live WAL snapshots, and cross-process lease/reclamation tests.
+        run: cargo nextest run --profile ci -p clustervision-core --lib -E 'test(/^(source|lazy|publish|resume|harness::store::(sqlite|jsonl))::/) | test(/^harness::.*::tests::.*(callback|held_final|final_pending)/)'
+      - name: Positioned source and callback lifecycle tests
+        # Keep the same callback controls active when source reads use positioned I/O.
+        run: cargo nextest run --profile ci -p clustervision-core --no-default-features --features sqlite --lib -E 'test(/^(source|harness::store::jsonl)::/) | test(/^harness::.*::tests::.*(callback|held_final|final_pending)/)'
+      - name: Install fixture compression tool
+        run: brew list zstd >/dev/null 2>&1 || brew install zstd
+      - name: Mmap and positioned heap probes
+        shell: bash
+        run: |
+          cargo build --release -p clustervision-core --example store_probe --features probe-heap
+          cp target/release/examples/store_probe "$RUNNER_TEMP/cv-store-probe-mmap"
+          cargo build --release -p clustervision-core --example store_probe --no-default-features --features probe-heap
+          python3 -I tools/check-heap-budget.py "$RUNNER_TEMP/cv-store-probe-mmap" --no-mmap-probe target/release/examples/store_probe
+          python3 -I tools/check-heap-budget.py "$RUNNER_TEMP/cv-store-probe-mmap" --no-mmap-probe target/release/examples/store_probe --only selected-payloads

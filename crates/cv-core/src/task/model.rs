@@ -80,7 +80,7 @@ pub enum TaskEventKind {
     Superseded {
         by_task: String,
     },
-    /// Add tags (deduplicated, lowercase labels such as `decision`, `deploy`, `lean`). Tags are
+    /// Add tags (deduplicated, case-sensitive labels such as `decision`, `deploy`, `lean`). Tags are
     /// additive: a task's tag set is the union of every `tagged` event on it.
     Tagged {
         tags: Vec<String>,
@@ -139,6 +139,24 @@ pub enum TaskEventKind {
     #[serde(untagged)]
     Retired(RetiredEvent),
 }
+
+/// The wire tags of every live [`TaskEventKind`], the image of [`TaskEventKind::tag`] over the
+/// whole grammar. Fixture tests hold golden logs to this roster, so a new variant adds its tag
+/// here (the round-trip test fails loud until it does).
+pub const LIVE_TAGS: &[&str] = &[
+    "opened",
+    "claimed",
+    "released",
+    "noted",
+    "done",
+    "abandoned",
+    "superseded",
+    "tagged",
+    "blocked_by",
+    "posed",
+    "resolved",
+    "status_set",
+];
 
 /// The wire tags of the land facet retired in 0.15.0: reviewed code revisions, review
 /// verdicts, and the git verifier's observations. Kept so a log that holds them still replays
@@ -219,6 +237,16 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    /// Every state, in lifecycle order: the vocabulary `--state` accepts and `as_str` spells.
+    pub const ALL: [TaskState; 6] = [
+        TaskState::Open,
+        TaskState::Claimed,
+        TaskState::Done,
+        TaskState::Abandoned,
+        TaskState::Superseded,
+        TaskState::Resolved,
+    ];
+
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -226,7 +254,8 @@ impl TaskState {
         )
     }
 
-    pub fn as_str(self) -> &'static str {
+    /// The state's one spelling, the same as its serde name.
+    pub const fn as_str(self) -> &'static str {
         match self {
             TaskState::Open => "open",
             TaskState::Claimed => "claimed",
@@ -238,9 +267,35 @@ impl TaskState {
     }
 }
 
+impl std::str::FromStr for TaskState {
+    type Err = String;
+
+    /// One of [`TaskState::ALL`] by its spelling; an unknown word names the whole vocabulary.
+    fn from_str(s: &str) -> Result<Self, String> {
+        TaskState::ALL
+            .into_iter()
+            .find(|state| state.as_str() == s)
+            .ok_or_else(|| {
+                format!(
+                    "unknown state {s:?} (expected one of {})",
+                    TaskState::ALL.map(TaskState::as_str).join("|")
+                )
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_state_is_spelled_once() {
+        for state in TaskState::ALL {
+            assert_eq!(serde_json::to_value(state).unwrap(), state.as_str());
+            assert_eq!(state.as_str().parse::<TaskState>(), Ok(state));
+        }
+        assert!("redy".parse::<TaskState>().unwrap_err().contains("open|claimed|done"));
+    }
 
     fn event(kind: TaskEventKind) -> TaskEvent {
         TaskEvent {
@@ -309,13 +364,20 @@ mod tests {
                 text: "tip abc123; next: merge B".into(),
             },
         ];
+        let mut tags = std::collections::BTreeSet::new();
         for kind in kinds {
             let ev = event(kind);
             let json = serde_json::to_string(&ev).unwrap();
             let back: TaskEvent = serde_json::from_str(&json).unwrap();
             assert_eq!(ev, back, "round-trip mismatch for {json}");
             assert!(!back.kind.is_retired(), "a live kind must not read as retired: {json}");
+            tags.insert(back.kind.tag());
         }
+        assert_eq!(
+            tags,
+            LIVE_TAGS.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            "every live kind's tag is in LIVE_TAGS, and LIVE_TAGS names no kind this list leaves out"
+        );
     }
 
     /// The wire contract: tags and core field names, pinned. If this test fails you are
@@ -344,10 +406,49 @@ mod tests {
         assert_eq!(v["options"], serde_json::json!(["a", "b"]));
         assert!(v.get("deadline").is_none() && v.get("source").is_none(), "{v}");
 
-        // Tag helper stays in sync with serde.
+        // Tag helper stays in sync with serde, for every kind (the hand map must spell what
+        // `rename_all` writes).
         for (kind, tag) in [
+            (
+                TaskEventKind::Opened {
+                    title: "t".into(),
+                    body: String::new(),
+                    repo: None,
+                    issue: None,
+                    channel: None,
+                    assignee: None,
+                },
+                "opened",
+            ),
+            (TaskEventKind::Claimed { assignee: "a".into() }, "claimed"),
             (TaskEventKind::Released {}, "released"),
-            (TaskEventKind::StatusSet { text: "s".into() }, "status_set"),
+            (
+                TaskEventKind::Noted {
+                    text: "n".into(),
+                    session_ref: None,
+                },
+                "noted",
+            ),
+            (
+                TaskEventKind::Done {
+                    observed: None,
+                    check: None,
+                },
+                "done",
+            ),
+            (TaskEventKind::Abandoned { reason: "r".into() }, "abandoned"),
+            (TaskEventKind::Superseded { by_task: "b".into() }, "superseded"),
+            (TaskEventKind::Tagged { tags: vec![] }, "tagged"),
+            (TaskEventKind::BlockedBy { task: "b".into() }, "blocked_by"),
+            (
+                TaskEventKind::Posed {
+                    options: vec!["a".into()],
+                    default_choice: "a".into(),
+                    deadline: None,
+                    source: None,
+                },
+                "posed",
+            ),
             (
                 TaskEventKind::Resolved {
                     choice: "a".into(),
@@ -356,6 +457,7 @@ mod tests {
                 },
                 "resolved",
             ),
+            (TaskEventKind::StatusSet { text: "s".into() }, "status_set"),
         ] {
             let v: serde_json::Value =
                 serde_json::from_str(&serde_json::to_string(&event(kind.clone())).unwrap()).unwrap();

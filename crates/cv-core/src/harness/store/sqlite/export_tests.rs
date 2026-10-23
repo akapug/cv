@@ -1,4 +1,5 @@
 //! Connection-scoped export oracles; callbacks own no production instrumentation.
+use crate::json::{ReadInput, Validation};
 use crate::{Block, Harness, Message, Role, Session};
 use anyhow::Result;
 use rusqlite::{ffi, Connection};
@@ -113,7 +114,11 @@ pub(crate) fn fixture(world: &cv_testkit::World) -> Result<(Session, PathBuf)> {
     let path = world.base.join("body.json");
     std::fs::write(&path, serde_json::to_vec(&"λ\nquoted \"body\"".repeat(2000))?)?;
     let source = crate::json::JsonSource::capture(&path)?;
-    let text = source.read_range_value(0, source.len(), |v| v.source_text())?.unwrap();
+    let text = source
+        .read(ReadInput::Range(0, source.len()), Validation::Value, |v| {
+            v.source_text()
+        })?
+        .unwrap();
     let arguments = world.base.join("arguments.json");
     std::fs::write(&arguments, br#"{"z":1,"a":"escaped\n","dup":1,"dup":2,"n":1.25}"#)?;
     let input = crate::Json::source(&arguments, 0, std::fs::metadata(&arguments)?.len())?;
@@ -268,7 +273,7 @@ pub(crate) fn exercise_frozen(
     direct: fn(&Session, &Path, &crate::emit::EmitOptions) -> Result<crate::harness::EmitResult>,
     writer: impl Fn(&Session, &crate::emit::EmitOptions, &mut Connection) -> Result<()>,
 ) -> Result<()> {
-    let mut frozen = crate::emit::grok_qwen_tests::Frozen::new(name);
+    let mut frozen = crate::emit::frozen::Frozen::new(name);
     exercise_with(
         target,
         |mode, rows| {
@@ -284,6 +289,49 @@ pub(crate) fn exercise_frozen(
     frozen.check()
 }
 
+/// What the shared oracle needs to know about one target's store: the per-target facts the
+/// exercise branches on, in one table instead of inline conditionals.
+struct TargetFacts {
+    /// One prepared INSERT shape per row type.
+    insert_shapes: usize,
+    /// The fixture's row count, where the last-read guard's mutation lands.
+    row_count_sql: &'static str,
+    /// SQL rejecting a synthetic row mid-write, to exercise SQL-failure rollback.
+    reject_trigger: &'static str,
+    /// SQL run once before the failure sweeps (Hermes drops its FTS triggers so the
+    /// failure comes from the source, not full-text maintenance).
+    pre_failure_sql: &'static str,
+    /// The `new_id` a second export must use to reach the failure sweeps at all
+    /// (OpenCode rejects identity reuse; the rest reuse "fixed").
+    failure_new_id: &'static str,
+}
+
+fn facts(target: Harness) -> TargetFacts {
+    match target {
+        Harness::OpenCode => TargetFacts {
+            insert_shapes: 3,
+            row_count_sql: "SELECT (SELECT count(*) FROM message)+(SELECT count(*) FROM part)",
+            reject_trigger: "CREATE TRIGGER reject_system BEFORE INSERT ON message WHEN json_extract(new.data,'$.role')='system' BEGIN SELECT RAISE(ABORT,'synthetic row rejection'); END;",
+            pre_failure_sql: "",
+            failure_new_id: "fresh",
+        },
+        Harness::Hermes => TargetFacts {
+            insert_shapes: 2,
+            row_count_sql: "SELECT count(*) FROM messages",
+            reject_trigger: "CREATE TRIGGER reject_system BEFORE INSERT ON messages WHEN new.role='system' BEGIN SELECT RAISE(ABORT,'synthetic row rejection'); END;",
+            pre_failure_sql: "DROP TRIGGER messages_fts_insert; DROP TRIGGER messages_fts_trigram_insert;",
+            failure_new_id: "fixed",
+        },
+        _ => TargetFacts {
+            insert_shapes: 3,
+            row_count_sql: "SELECT count(*) FROM messages",
+            reject_trigger: "CREATE TRIGGER reject_system BEFORE INSERT ON messages WHEN new.role='system' BEGIN SELECT RAISE(ABORT,'synthetic row rejection'); END;",
+            pre_failure_sql: "",
+            failure_new_id: "fixed",
+        },
+    }
+}
+
 /// Emit the shared fixture in every thinking mode through the connection `writer`, `direct` and
 /// the dispatcher, which must agree, hand each mode's rows to `observe`, then check that every
 /// source and SQL failure rolls the transaction back.
@@ -295,6 +343,7 @@ fn exercise_with(
 ) -> Result<()> {
     let world = crate::test_world("sqlite-export-oracle");
     let (session, path) = fixture(&world)?;
+    let facts = facts(target);
     for mode in crate::emit::ThinkingMode::ALL {
         let options = crate::emit::EmitOptions {
             new_id: Some("fixed".into()),
@@ -307,7 +356,7 @@ fn exercise_with(
         assert_eq!(hooks.counts.commits, 1);
         assert_eq!(
             hooks.counts.inserts.len(),
-            if target == Harness::Hermes { 2 } else { 3 },
+            facts.insert_shapes,
             "one prepared INSERT shape per row type"
         );
         assert!(hooks.counts.inserts.values().all(|pointers| pointers.len() == 1));
@@ -352,21 +401,17 @@ fn exercise_with(
         new_id: Some("fixed".into()),
         ..Default::default()
     };
-    // OpenCode now rejects identity reuse. Seed one preserved session, then exercise
-    // transactional failures while inserting a distinct session, so collision rejection
-    // cannot masquerade as successful source/SQL rollback coverage.
+    // Targets that reject identity reuse (OpenCode) seed one preserved session, then the
+    // failure sweeps insert a distinct one, so collision rejection cannot masquerade as
+    // successful source/SQL rollback coverage.
     let failure_options = crate::emit::EmitOptions {
-        new_id: if target == Harness::OpenCode {
-            Some("fresh".into())
-        } else {
-            options.new_id.clone()
-        },
+        new_id: Some(facts.failure_new_id.into()),
         ..options.clone()
     };
     let mut database = Connection::open_in_memory()?;
     writer(&session, &options, &mut database)?;
-    if target == Harness::Hermes {
-        database.execute_batch("DROP TRIGGER messages_fts_insert; DROP TRIGGER messages_fts_trigram_insert;")?;
+    if !facts.pre_failure_sql.is_empty() {
+        database.execute_batch(facts.pre_failure_sql)?;
     }
     let before_schema = logical(&database, target)?;
     let hooks = Hooks::new(&mut database, Some(path.clone()));
@@ -404,12 +449,7 @@ fn exercise_with(
     let mut database = Connection::open_in_memory()?;
     writer(&last, &options, &mut database)?;
     let before = logical(&database, target)?;
-    let row_count = if target == Harness::OpenCode {
-        "SELECT (SELECT count(*) FROM message)+(SELECT count(*) FROM part)"
-    } else {
-        "SELECT count(*) FROM messages"
-    };
-    let row_count = database.query_row(row_count, [], |r| r.get::<_, usize>(0))?;
+    let row_count = database.query_row(facts.row_count_sql, [], |r| r.get::<_, usize>(0))?;
     let mut hooks = Hooks::new(&mut database, Some(path));
     hooks.counts.mutate_at = row_count;
     assert!(
@@ -423,12 +463,7 @@ fn exercise_with(
     let (sql_error, _) = fixture(&world)?;
     let mut database = Connection::open_in_memory()?;
     writer(&sql_error, &options, &mut database)?;
-    let reject = if target == Harness::OpenCode {
-        "CREATE TRIGGER reject_system BEFORE INSERT ON message WHEN json_extract(new.data,'$.role')='system' BEGIN SELECT RAISE(ABORT,'synthetic row rejection'); END;"
-    } else {
-        "CREATE TRIGGER reject_system BEFORE INSERT ON messages WHEN new.role='system' BEGIN SELECT RAISE(ABORT,'synthetic row rejection'); END;"
-    };
-    database.execute_batch(reject)?;
+    database.execute_batch(facts.reject_trigger)?;
     let before = logical(&database, target)?;
     let hooks = Hooks::new(&mut database, None);
     let error = writer(&sql_error, &failure_options, hooks.connection).unwrap_err();

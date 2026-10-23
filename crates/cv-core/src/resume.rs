@@ -5,37 +5,31 @@
 //! lets the next pass over the same file (grown by an append) read only what came after it. A
 //! mark passes its guards when the file's device/inode identity matches, it is at least `offset`
 //! bytes long, the sampled head and bytes immediately before `offset` hash as they did, and it was
-//! written by this very parser ([`version`]: the cv release, the affordance view, the adapter's
-//! state format and the consumer's). Anything else means a whole pass, which writes a new mark.
+//! written under this stored-format version, adapter state format and consumer ([`version`]). Anything else means a whole pass, which writes a new mark.
 //!
-//! These samples do not establish that the entire prefix is unchanged. Resuming assumes the
-//! adapter's immutable-prefix append contract; an in-place edit outside the samples (past the
-//! first 4 KiB and before the last 4 KiB under the mark) followed by growth escapes detection, and
-//! the docs and counts of the edited bytes stay as they were read. Proving arbitrary prefix edits
-//! absent requires reading that prefix again: hashing the whole prefix on every resume was
-//! measured and rejected (docs/design/PERF.md, "Resume marks"). Consumers must separately reject
-//! non-growth rewrites; the FTS sweep compares the current size with the size of its previously
-//! indexed source.
+//! These samples ([`Prefix`]) do not establish that the entire prefix is unchanged, here or in
+//! the append admission of a captured source ([`crate::source::FileId::admits`]), which uses the
+//! same sample. Both assume the adapter's immutable-prefix append contract: an in-place edit
+//! outside the samples (past the first 4 KiB and before the last 4 KiB under the mark or captured
+//! length), at the same length or followed by growth, escapes detection, and the docs and counts
+//! of the edited bytes stay as they were read. Proving arbitrary prefix edits absent requires
+//! reading that prefix again: hashing the whole prefix on every resume was measured and rejected
+//! (docs/design/PERF.md, "Resume marks").
 //!
 //! The marks live in the catalog db beside the counts and events they continue (`resume_marks`);
 //! like the rest of the catalog it is a cache, best-effort throughout.
 
 use crate::harness::Adapter;
 use crate::ir::SessionRef;
+use crate::source::Prefix;
 use crate::stream::Checkpoint;
 use std::path::Path;
 
-/// How many bytes the prefix hash reads at the head of the file and again just before the mark.
-const HASH_SPAN: u64 = 4096;
-
-/// A stored mark minus its state: version, position and sampled-byte guard for append reuse.
+/// A stored mark minus its state: version, and the sampled prefix it continues.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MarkHead {
-    pub offset: u64,
-    pub hash: u64,
+    pub prefix: Prefix,
     pub version: String,
-    /// Device/inode on Unix. Legacy marks without identity are rejected once.
-    pub identity: Option<(u64, u64)>,
 }
 
 impl MarkHead {
@@ -51,77 +45,46 @@ impl MarkHead {
     /// this way, so a file renamed over the path mid-pass is never paired with this pass's
     /// checkpoint (its next pass sees another inode and reads whole).
     pub fn of_file(file: &std::fs::File, cp: &Checkpoint, version: &str) -> Option<MarkHead> {
-        let (identity, hash) = prefix_guard_file(file, cp.offset)?;
-        identity?; // Without a stable file identity, prefer a whole read.
-        Some(MarkHead {
-            offset: cp.offset,
-            hash,
+        // Without a stable file identity (off Unix), prefer a whole read.
+        #[cfg(not(unix))]
+        let mark = {
+            let _ = (file, cp, version);
+            None
+        };
+        #[cfg(unix)]
+        let mark = Some(MarkHead {
+            prefix: Prefix::of(file, cp.offset)?,
             version: version.to_string(),
-            identity,
-        })
+        });
+        mark
     }
 
-    /// Whether the file identity, version, minimum length and sampled bytes match. This does
-    /// not establish that the whole old prefix is unchanged or that the file grew since its read.
-    pub fn holds(&self, path: &Path, size: u64, version: &str) -> bool {
-        self.version == version
-            && size >= self.offset
-            && self.identity.is_some()
-            && prefix_guard(path, self.offset) == Some((self.identity, self.hash))
+    pub fn offset(&self) -> u64 {
+        self.prefix.len
+    }
+
+    /// The one admission of a stored checkpoint: written at `version`, describing `cp` (its
+    /// offset is the mark's), and the file `path` names now still holds the sampled prefix
+    /// ([`Prefix::holds`]). This does not establish that the whole old prefix is unchanged.
+    pub fn admit<'c>(&self, path: &Path, version: &str, cp: &'c Checkpoint) -> Option<&'c Checkpoint> {
+        (self.version == version && cp.offset == self.prefix.len && self.prefix.holds(path)).then_some(cp)
     }
 }
 
-/// The version a mark records and must match: the cv release, the affordance view, the adapter's
-/// checkpoint format and `consumer` (the caller's own state format). `None`: the adapter takes no
-/// checkpoints.
-pub fn version(adapter: &dyn Adapter, consumer: &str) -> Option<String> {
-    Some(format!(
-        "{}/view{}/{}{}/{consumer}",
-        env!("CARGO_PKG_VERSION"),
-        crate::affordance::VIEW_VERSION,
-        adapter.harness().as_str(),
-        adapter.resume_format()?
-    ))
+/// The version a mark records and must match: the one stored-format version
+/// ([`crate::source::VERSION`], which the affordance view shares), the harness and `consumer`
+/// (the caller's own state format). Not the cv release: a release that changes what a mark means
+/// bumps one of those. A checkpoint's codec state carries no version of its own: what a codec
+/// keeps, and what a record parses to, are versioned by that same `source::VERSION`.
+pub fn version(adapter: &dyn Adapter, consumer: &str) -> String {
+    crate::source::consumer_version(format_args!("{}/{consumer}", adapter.harness().as_str()))
 }
 
-/// FNV-1a (64-bit) over the first [`HASH_SPAN`] bytes of `path` and the [`HASH_SPAN`] bytes
-/// before `offset` (overlapping on a short file). `None` when the file is shorter than `offset`.
-pub fn prefix_hash(path: &Path, offset: u64) -> Option<u64> {
-    prefix_guard(path, offset).map(|(_, hash)| hash)
+/// A session and its new mark (`mark: None`: it has none any more), for [`update`].
+pub struct MarkUpdate {
+    pub session: SessionRef,
+    pub mark: Option<(MarkHead, Checkpoint)>,
 }
-
-fn prefix_guard(path: &Path, offset: u64) -> Option<(Option<(u64, u64)>, u64)> {
-    prefix_guard_file(&std::fs::File::open(path).ok()?, offset)
-}
-
-fn prefix_guard_file(file: &std::fs::File, offset: u64) -> Option<(Option<(u64, u64)>, u64)> {
-    use crate::harness::store::jsonl::ranges::read_exact_at;
-    let metadata = file.metadata().ok()?;
-    #[cfg(unix)]
-    let identity = {
-        use std::os::unix::fs::MetadataExt;
-        Some((metadata.dev(), metadata.ino()))
-    };
-    #[cfg(not(unix))]
-    let identity = None;
-    if metadata.len() < offset {
-        return None;
-    }
-    let mut head = vec![0u8; offset.min(HASH_SPAN) as usize];
-    read_exact_at(file, &mut head, 0).ok()?;
-    let from = offset.saturating_sub(HASH_SPAN);
-    let mut tail = vec![0u8; (offset - from) as usize];
-    read_exact_at(file, &mut tail, from).ok()?;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in head.iter().chain(&tail).chain(&offset.to_le_bytes()) {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    Some((identity, h))
-}
-
-/// A session and its new mark (`None`: it has none any more), for [`update`].
-pub type MarkUpdate = (SessionRef, Option<(MarkHead, Checkpoint)>);
 
 #[cfg(feature = "sqlite")]
 mod imp {
@@ -129,32 +92,9 @@ mod imp {
     use rusqlite::{params, Connection};
     use std::collections::HashMap;
 
+    /// The catalog connection: `resume_marks` is part of its migration.
     fn open() -> Option<Connection> {
-        let conn = crate::catalog::open_db()?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS resume_marks(
-                 harness TEXT NOT NULL,
-                 id      TEXT NOT NULL,
-                 path    TEXT NOT NULL,
-                 offset  INTEGER NOT NULL,
-                 hash    INTEGER NOT NULL,
-                 version TEXT NOT NULL,
-                 state   TEXT NOT NULL,
-                 PRIMARY KEY(harness, id, path)
-             );",
-        )
-        .ok()?;
-        let has_identity: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('resume_marks') WHERE name='identity')",
-                [],
-                |row| row.get(0),
-            )
-            .ok()?;
-        if !has_identity {
-            let _ = conn.execute_batch("ALTER TABLE resume_marks ADD COLUMN identity TEXT;");
-        }
-        Some(conn)
+        crate::catalog::open_db()
     }
 
     fn key(r: &SessionRef) -> (String, String, String) {
@@ -182,18 +122,11 @@ mod imp {
                     .query_map([], |row| {
                         Ok((
                             (row.get(0)?, row.get(1)?, row.get(2)?),
-                            MarkHead {
-                                offset: row.get::<_, i64>(3)? as u64,
-                                hash: row.get::<_, i64>(4)? as u64,
-                                version: row.get(5)?,
-                                identity: row
-                                    .get::<_, Option<String>>(6)?
-                                    .and_then(|text| serde_json::from_str(&text).ok()),
-                            },
+                            row_head(row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?),
                         ))
                     })
                     .ok()?;
-                Some(rows.flatten().collect())
+                Some(rows.flatten().filter_map(|(key, head)| Some((key, head?))).collect())
             };
             MarkTable {
                 rows: load().unwrap_or_default(),
@@ -207,7 +140,23 @@ mod imp {
 
     /// The checkpoint `r`'s mark holds, when it is still the one `head` describes.
     pub fn state(r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
-        let conn = open()?;
+        Reader::default().state(r, head)
+    }
+
+    /// One operation's lazy catalog reader, reused by every job in an index worker.
+    pub struct Reader(crate::discover_cache::read::Context);
+    impl Default for Reader {
+        fn default() -> Self {
+            Self(crate::discover_cache::read::Context::current())
+        }
+    }
+    impl Reader {
+        pub fn state(&self, r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
+            self.0.with_connection(|conn| state_in(conn, r, head)).flatten()
+        }
+    }
+
+    fn state_in(conn: &Connection, r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
         let (h, i, p) = key(r);
         let (offset, hash, version, text, identity): (i64, i64, String, String, Option<String>) = conn
             .query_row(
@@ -216,20 +165,28 @@ mod imp {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .ok()?;
-        let same = MarkHead {
-            offset: offset as u64,
-            hash: hash as u64,
-            version,
-            identity: identity.and_then(|text| serde_json::from_str(&text).ok()),
-        } == *head;
         let cp: Checkpoint = serde_json::from_str(&text).ok()?;
-        (same && cp.offset == head.offset).then_some(cp)
+        (row_head(offset, hash, version, identity).as_ref() == Some(head) && cp.offset == head.offset()).then_some(cp)
+    }
+
+    /// A row's head; a row without a device/inode identity has none and is read whole.
+    fn row_head(offset: i64, hash: i64, version: String, identity: Option<String>) -> Option<MarkHead> {
+        let (dev, ino) = serde_json::from_str(&identity?).ok()?;
+        Some(MarkHead {
+            prefix: Prefix {
+                len: offset as u64,
+                hash: hash as u64,
+                dev,
+                ino,
+            },
+            version,
+        })
     }
 
     /// Bring each session's mark up to date in one transaction: the new mark replaces the old,
     /// `None` drops it (the next pass over that file reads it whole).
     pub fn update(marks: &[MarkUpdate]) {
-        if marks.is_empty() {
+        if crate::env::frozen() || marks.is_empty() {
             return;
         }
         let Some(mut conn) = open() else { return };
@@ -244,8 +201,8 @@ mod imp {
             let Ok(mut drop) = tx.prepare("DELETE FROM resume_marks WHERE harness=?1 AND id=?2 AND path=?3") else {
                 return;
             };
-            for (r, mark) in marks {
-                let (h, i, p) = key(r);
+            for MarkUpdate { session, mark } in marks {
+                let (h, i, p) = key(session);
                 let _ = match mark {
                     Some((head, cp)) => {
                         let Ok(text) = serde_json::to_string(cp) else { continue };
@@ -253,11 +210,11 @@ mod imp {
                             h,
                             i,
                             p,
-                            head.offset as i64,
-                            head.hash as i64,
+                            head.prefix.len as i64,
+                            head.prefix.hash as i64,
                             head.version,
                             text,
-                            head.identity.and_then(|id| serde_json::to_string(&id).ok())
+                            serde_json::to_string(&(head.prefix.dev, head.prefix.ino)).ok()
                         ])
                     }
                     None => drop.execute(params![h, i, p]),
@@ -269,7 +226,7 @@ mod imp {
 }
 
 #[cfg(feature = "sqlite")]
-pub use imp::{state, update, MarkTable};
+pub use imp::{state, update, MarkTable, Reader};
 
 /// Without the catalog there are no marks: every pass reads the whole file.
 #[cfg(not(feature = "sqlite"))]
@@ -309,14 +266,14 @@ mod tests {
             file.seek(SeekFrom::Start(123)).unwrap();
             let mark = MarkHead::of_file(&file, &Checkpoint::new(offset), "v1").unwrap();
             let end = offset as usize;
-            let expected = body[..end.min(HASH_SPAN as usize)]
+            let expected = body[..end.min(crate::source::SAMPLE_SPAN as usize)]
                 .iter()
-                .chain(&body[end.saturating_sub(HASH_SPAN as usize)..end])
+                .chain(&body[end.saturating_sub(crate::source::SAMPLE_SPAN as usize)..end])
                 .chain(&offset.to_le_bytes())
                 .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
                     (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
                 });
-            assert_eq!(mark.hash, expected);
+            assert_eq!(mark.prefix.hash, expected);
             assert_eq!(file.stream_position().unwrap(), 123);
             let mut next = [0; 8];
             reader.read_exact(&mut next).unwrap();
@@ -339,33 +296,32 @@ mod tests {
         std::fs::write(&path, &body).unwrap();
         let offset = body[..body.len() / 2].rfind('\n').unwrap() as u64 + 1;
         let head = MarkHead::of(&path, &Checkpoint::new(offset), "v1").unwrap();
-        let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+        let cp = Checkpoint::new(offset);
 
-        assert!(head.holds(&path, size(&path), "v1"));
-        assert!(!head.holds(&path, size(&path), "v2"), "another version");
+        assert!(head.admit(&path, "v1", &cp).is_some());
+        assert!(head.admit(&path, "v2", &cp).is_none(), "another version");
 
-        let legacy = MarkHead {
-            identity: None,
-            ..head.clone()
-        };
         assert!(
-            !legacy.holds(&path, size(&path), "v1"),
-            "legacy identity must refresh once"
+            head.admit(&path, "v1", &Checkpoint::new(offset - 1)).is_none(),
+            "another checkpoint"
         );
         let grown = format!("{body}{}", line(401));
         std::fs::write(&path, &grown).unwrap();
-        assert!(head.holds(&path, size(&path), "v1"), "an append keeps it");
+        assert!(head.admit(&path, "v1", &cp).is_some(), "an append keeps it");
         let replacement = dir.join("replacement.jsonl");
         std::fs::write(&replacement, &grown).unwrap();
         std::fs::rename(&replacement, &path).unwrap();
-        assert_eq!(prefix_hash(&path, offset), Some(head.hash));
+        assert_eq!(
+            Prefix::of(&std::fs::File::open(&path).unwrap(), offset).unwrap().hash,
+            head.prefix.hash
+        );
         assert!(
-            !head.holds(&path, size(&path), "v1"),
+            head.admit(&path, "v1", &cp).is_none(),
             "replacement identity differs even with identical samples"
         );
 
         let head = MarkHead::of(&path, &Checkpoint::new(offset), "v1").unwrap();
-        assert!(head.holds(&path, size(&path), "v1"));
+        assert!(head.admit(&path, "v1", &cp).is_some());
 
         // A mark taken on a handle opened before a rename-over describes the file read, so it
         // does not hold for what the path names now; reopening the path would have paired them.
@@ -373,8 +329,8 @@ mod tests {
         std::fs::write(&replacement, &grown).unwrap();
         std::fs::rename(&replacement, &path).unwrap();
         let of_read = MarkHead::of_file(&read, &Checkpoint::new(offset), "v1").unwrap();
-        assert_eq!(of_read.hash, head.hash);
-        assert!(!of_read.holds(&path, size(&path), "v1"));
+        assert_eq!(of_read.prefix.hash, head.prefix.hash);
+        assert!(of_read.admit(&path, "v1", &cp).is_none());
         let head = MarkHead::of(&path, &Checkpoint::new(offset), "v1").unwrap();
 
         // One byte changed just before the mark, then one in the head: both break it.
@@ -382,10 +338,20 @@ mod tests {
             let mut b = grown.clone().into_bytes();
             b[at] = b'y';
             std::fs::write(&path, &b).unwrap();
-            assert!(!head.holds(&path, size(&path), "v1"), "byte {at} changed");
+            assert!(head.admit(&path, "v1", &cp).is_none(), "byte {at} changed");
         }
         std::fs::write(&path, &grown.as_bytes()[..offset as usize - 1]).unwrap();
-        assert!(!head.holds(&path, size(&path), "v1"), "truncated before the mark");
+        assert!(head.admit(&path, "v1", &cp).is_none(), "truncated before the mark");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(not(feature = "sqlite"))]
+#[derive(Default)]
+pub struct Reader;
+#[cfg(not(feature = "sqlite"))]
+impl Reader {
+    pub fn state(&self, _: &SessionRef, _: &MarkHead) -> Option<Checkpoint> {
+        None
     }
 }

@@ -4,7 +4,7 @@ use crate::{
     harness::wire::write::{self as wire, ObjectWriter},
     json::JsonView,
     lazy::Resolver,
-    stream::ParseOptions,
+    stream::Demand,
     Json, Message,
 };
 use std::collections::HashMap;
@@ -14,10 +14,12 @@ pub(super) struct Native {
     enabled: bool,
     linked: bool,
     ids: HashMap<String, String>,
+    namespace: Uuid,
     model: Option<String>,
 }
 impl Native {
-    pub(super) fn new(session: &Session) -> Self {
+    pub(super) fn new(session: &Session, new_id: &str) -> Self {
+        let namespace = Uuid::new_v5(&Uuid::NAMESPACE_OID, new_id.as_bytes());
         let enabled = session.harness == Harness::OpenClaw;
         let header_version = session
             .extra
@@ -36,23 +38,28 @@ impl Native {
         let mut ids = HashMap::new();
         if enabled {
             for id in session.messages.iter().filter_map(|m| m.id.as_ref()) {
-                ids.entry(id.clone()).or_insert_with(openclaw_short_id);
+                ids.entry(id.clone())
+                    .or_insert_with(|| openclaw_short_id(&namespace, &format!("native:{id}")));
             }
         }
         Self {
             enabled,
             linked: enabled && header_version.is_some_and(|v| v >= 3),
             ids,
+            namespace,
             model: session.model.clone(),
         }
     }
-    pub(super) fn entry_id(&self, message: &Message) -> String {
+    pub(super) fn generated_id(&self, key: &str) -> String {
+        openclaw_short_id(&self.namespace, key)
+    }
+    pub(super) fn entry_id(&self, message: &Message, index: usize) -> String {
         message
             .id
             .as_ref()
             .and_then(|id| self.ids.get(id))
             .cloned()
-            .unwrap_or_else(openclaw_short_id)
+            .unwrap_or_else(|| self.generated_id(&format!("message:{index}")))
     }
     pub(super) fn parent(&self, message: &Message, linear: &Option<String>) -> Option<String> {
         if self.linked && message.id.is_some() {
@@ -124,13 +131,13 @@ impl Native {
         if !self.enabled {
             return Ok(None);
         }
-        let message = &messages[0];
-        if !message.extra.contains_key(crate::harness::claude::CARRIER_KEY) {
+        let message = messages.first().context("OpenClaw replay requires a current message")?;
+        if !message.extra.contains_key(crate::ir::CARRIER_KEY) {
             if let Some(record) = &message.complete_record {
                 let group = if record.unchanged(Harness::OpenClaw, messages) {
                     Some(record.projection.len())
                 } else if let Json::Owned(value) = &record.value {
-                    self.owned_group(value, &record.projection, messages)
+                    self.owned_group(value, &record.projection, messages)?
                 } else {
                     None
                 };
@@ -156,7 +163,7 @@ impl Native {
         }
         // The public IR representation also accepts explicitly owned bookkeeping carriers.
         if matches!(message.kind, MessageKind::Carrier | MessageKind::Notice) {
-            if let Some(raw) = message.extra.get(crate::harness::claude::CARRIER_KEY) {
+            if let Some(raw) = message.extra.get(crate::ir::CARRIER_KEY) {
                 self.write(raw.into(), writer, mode, resolver)?;
                 return Ok(Some(1));
             }
@@ -165,26 +172,24 @@ impl Native {
     }
     // A full owned read has no retained payload witness: rebuild just this record using
     // the native codec, then apply the session-level normalization used by the reader.
-    fn owned_group(&self, value: &Value, envelopes: &[Message], messages: &[Message]) -> Option<usize> {
-        let mut original = super::super::record::record(JsonView::from(value), &ParseOptions::complete())
-            .ok()?
-            .messages;
+    fn owned_group(&self, value: &Value, envelopes: &[Message], messages: &[Message]) -> Result<Option<usize>> {
+        let mut original = super::super::record::record(JsonView::from(value), &Demand::COMPLETE)?.messages;
         if original.len() != envelopes.len() || messages.len() < original.len() {
-            return None;
+            return Ok(None);
         }
         for ((original, envelope), current) in original.iter_mut().zip(envelopes).zip(messages) {
             if !crate::ir::record::same_envelope(envelope, current) {
-                return None;
+                return Ok(None);
             }
             let original = Message {
                 content: std::mem::take(&mut original.content),
                 ..envelope.clone()
             };
             if !crate::ir::record::same_message(&original, current) {
-                return None;
+                return Ok(None);
             }
         }
-        Some(original.len())
+        Ok(Some(original.len()))
     }
     fn write(
         &self,
@@ -232,14 +237,12 @@ fn message_with_thinking(
             let mut first = true;
             for part in value.array()?.unwrap() {
                 let part = part?;
-                let fields = crate::harness::store::document::Fields::parse(part, &["type"])?;
-                let thinking = fields
-                    .as_ref()
-                    .map(|v| v.string("type"))
+                let thinking = part
+                    .get("type")?
+                    .map(|value| crate::affordance::input::word(value, &["thinking"]))
                     .transpose()?
                     .flatten()
-                    .as_deref()
-                    == Some("thinking");
+                    == Some(0);
                 let block = if thinking {
                     super::super::record::block_with(part, true, &mut |v| v.source_text())?
                 } else {

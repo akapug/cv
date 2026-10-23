@@ -1,15 +1,9 @@
 //! Prompt metadata without retaining the prompt. Marker positions use decoded UTF-8 bytes;
 //! a second bounded traversal selects the same first prose/task line as the owned codec.
 
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use anyhow::Result;
-#[derive(Debug)]
-struct Selected;
-impl std::fmt::Display for Selected {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("prompt metadata selected")
-    }
-}
-impl std::error::Error for Selected {}
 use std::path::PathBuf;
 
 #[derive(Default, Debug)]
@@ -61,102 +55,102 @@ impl Marker {
     }
 }
 
-#[derive(Default)]
+/// The first non-blank line, as a trimmed title [`Head`](crate::projection::Head).
 struct FirstLine {
-    prefix: String,
-    chars: u64,
-    last_nonwhite: u64,
+    line: crate::projection::Head,
     title: Option<String>,
+}
+impl Default for FirstLine {
+    fn default() -> Self {
+        Self {
+            line: crate::projection::Head::trimmed(crate::projection::Head::TITLE),
+            title: None,
+        }
+    }
 }
 impl FirstLine {
     fn feed(&mut self, c: char) {
         if self.title.is_some() {
             return;
         }
-        if c == '\n' {
+        if c == '\n' || self.line.push_char(c) {
             self.finish_line();
-        } else if self.chars != 0 || !c.is_whitespace() {
-            if self.chars < 81 {
-                self.prefix.push(c);
-            }
-            self.chars = self.chars.saturating_add(1);
-            if !c.is_whitespace() {
-                self.last_nonwhite = self.chars;
-                if self.last_nonwhite >= 81 {
-                    self.finish_line();
-                }
-            }
         }
     }
     fn finish_line(&mut self) {
         if self.title.is_some() {
             return;
         }
-        if self.last_nonwhite != 0 {
-            let text = if self.last_nonwhite <= 81 {
-                self.prefix.trim_end()
-            } else {
-                &self.prefix
-            };
-            self.title = Some(crate::ir::truncate(text, 80));
-        } else {
-            self.prefix.clear();
-            self.chars = 0;
+        let line = std::mem::replace(
+            &mut self.line,
+            crate::projection::Head::trimmed(crate::projection::Head::TITLE),
+        );
+        if !line.is_blank() {
+            self.title = Some(line.finish());
         }
     }
 }
 
 const CWD_PREFIX: &str = "# Current Working Directory";
+#[derive(Default, PartialEq, Eq)]
+enum CwdState {
+    #[default]
+    Prefix,
+    BeforePath,
+    Path,
+    IgnoreLine,
+    Done,
+}
+
 #[derive(Default)]
 struct Cwd {
     matched: usize,
-    // 0: prefix; 1: whitespace before '('; 2: path; 3: ignore line; 4: terminal.
-    state: u8,
+    state: CwdState,
     first: Option<u64>,
     last: u64,
     result: Option<(u64, u64)>,
 }
 impl Cwd {
     fn feed(&mut self, c: char, at: u64) {
-        if self.state == 4 {
+        if self.state == CwdState::Done {
             return;
         }
         if c == '\n' {
-            if self.state == 1 || self.state == 2 {
+            if self.state == CwdState::BeforePath || self.state == CwdState::Path {
                 // The owned extractor returns at the first prefix with malformed parentheses.
-                self.state = 4;
+                self.state = CwdState::Done;
             } else {
-                self.state = 0;
+                self.state = CwdState::Prefix;
                 self.matched = 0;
             }
             return;
         }
         match self.state {
-            0 => {
+            CwdState::Prefix => {
                 if self.matched == 0 && c.is_whitespace() {
                     return;
                 }
                 if CWD_PREFIX.as_bytes().get(self.matched).copied() == Some(c as u8) && c.is_ascii() {
                     self.matched += 1;
                     if self.matched == CWD_PREFIX.len() {
-                        self.state = 1;
+                        self.state = CwdState::BeforePath;
                     }
                 } else {
-                    self.state = 3;
+                    self.state = CwdState::IgnoreLine;
                 }
             }
-            1 if c.is_whitespace() => {}
-            1 if c == '(' => self.state = 2,
-            1 => self.state = 4,
-            2 if c == ')' => {
+            CwdState::BeforePath if c.is_whitespace() => {}
+            CwdState::BeforePath if c == '(' => self.state = CwdState::Path,
+            CwdState::BeforePath => self.state = CwdState::Done,
+            CwdState::Path if c == ')' => {
                 if let Some(first) = self.first {
                     self.result = Some((first, self.last));
-                    self.state = 4;
+                    self.state = CwdState::Done;
                 } else {
-                    self.state = 3;
+                    self.state = CwdState::IgnoreLine;
                 }
             }
-            2 if !c.is_whitespace() => {
+            CwdState::Path if !c.is_whitespace() => {
                 self.first.get_or_insert(at);
                 self.last = at + c.len_utf8() as u64;
             }
@@ -218,14 +212,14 @@ pub(super) fn summarize(mut visit: impl FnMut(&mut dyn FnMut(&str) -> Result<()>
             let title_complete = explicit.title.is_some() || (task_complete && prose.title.is_some());
             let path_complete = cwd.result.is_none_or(|(_, end)| next >= end);
             if title_complete && path_complete {
-                return Err(Selected.into());
+                return Err(crate::stream::Stop.into());
             }
         }
         position += chunk.len() as u64;
         Ok(())
     });
     if let Err(error) = selected {
-        if !error.is::<Selected>() {
+        if !error.is::<crate::stream::Stop>() {
             return Err(error);
         }
     }
@@ -244,13 +238,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_prompt_cutoffs_match_owned_and_early_stop_keeps_identity_checks() -> Result<()> {
+    fn source_prompt_cutoffs_and_early_stop_keep_identity_checks() -> Result<()> {
         let world = crate::test_world("cline-prompt-cutoffs");
         let path = world.base.join("prompt.json");
         for chars in [79, 80, 81, 82] {
             for padding in [0, 65_530, 65_536] {
                 // Leading whitespace places the title across decoder windows without
-                // changing the owned codec's trimmed first line.
+                // changing the trimmed first line.
                 let text = format!("{}{}  \nignored", " ".repeat(padding), "é".repeat(chars));
                 for wire in [
                     serde_json::to_string(&text)?,
@@ -258,12 +252,14 @@ mod tests {
                 ] {
                     std::fs::write(&path, wire)?;
                     let source = crate::json::JsonSource::capture(&path)?;
-                    let summary =
-                        source.read_document(|view| summarize(|feed| view.for_each_str_chunk(feed).map(|_| ())))?;
-                    assert_eq!(
-                        summary.title,
-                        crate::harness::cline::clean_user_title(&text).map(|s| crate::ir::truncate(&s, 80))
-                    );
+                    let summary = source.read(ReadInput::Document, Validation::Value, |view| {
+                        summarize(|feed| view.for_each_str_chunk(feed).map(|_| ()))
+                    })?;
+                    let title = match chars {
+                        ..=80 => "é".repeat(chars),
+                        _ => "é".repeat(79) + "…",
+                    };
+                    assert_eq!(summary.title, Some(title));
                 }
             }
         }
@@ -272,12 +268,12 @@ mod tests {
         std::fs::write(&path, wire)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let mut passes = 0;
-        let result = source.read_document(|view| {
+        let result = source.read(ReadInput::Document, Validation::Value, |view| {
             summarize(|feed| {
                 passes += 1;
                 let result = view.for_each_str_chunk(feed).map(|_| ());
                 if passes == 2 {
-                    assert!(result.as_ref().is_err_and(|error| error.is::<Selected>()));
+                    assert!(result.as_ref().is_err_and(|error| error.is::<crate::stream::Stop>()));
                     std::fs::write(&path, b"\"changed\"")?;
                 }
                 result
@@ -292,21 +288,43 @@ mod tests {
     }
 
     #[test]
-    fn bounded_prompt_scan_matches_the_owned_metadata_codec_at_every_split() {
+    fn bounded_prompt_scan_is_the_same_at_every_split() {
+        // (text, title, cwd), frozen from the retired owned metadata codec.
+        let late = "x".repeat(100) + "  \n<task>late title</task>";
+        let wide = "x".to_string() + &" ".repeat(200) + "end";
+        let wide_title = "x".to_string() + &" ".repeat(78) + "…";
         let cases = [
-            "plain\nsecond".to_string(),
-            "雪  \r\n# Current Working Directory (/a b) Files".to_string(),
-            "before\n<task>  \nexplicit é  \nsecond</task>after".to_string(),
-            "pre<environment_details>hidden\nmore</environment_details>suffix".to_string(),
-            "</environment_details>before<environment_details>hidden".to_string(),
-            "<task>  </task>\nplain".to_string(),
-            "# Current Working Directory missing\n# Current Working Directory (/late)".to_string(),
-            "# Current Working Directory (  )\n# Current Working Directory (/later)".to_string(),
-            "<task>".to_string(),
-            "x".repeat(100) + "  \n<task>late title</task>",
-            "x".to_string() + &" ".repeat(200) + "end",
+            ("plain\nsecond", "plain", None),
+            (
+                "<task>do x</task>\n<environment_details>\n# Current Working Directory (/Users/me/proj) Files\na.rs\n</environment_details>",
+                "do x",
+                Some("/Users/me/proj"),
+            ),
+            ("Just do the thing\n<environment_details>noise</environment_details>", "Just do the thing", None),
+            ("雪  \r\n# Current Working Directory (/a b) Files", "雪", Some("/a b")),
+            ("before\n<task>  \nexplicit é  \nsecond</task>after", "explicit é", None),
+            ("pre<environment_details>hidden\nmore</environment_details>suffix", "presuffix", None),
+            (
+                "</environment_details>before<environment_details>hidden",
+                "</environment_details>before<environment_details>hidden",
+                None,
+            ),
+            ("<task>  </task>\nplain", "<task>  </task>", None),
+            (
+                "# Current Working Directory missing\n# Current Working Directory (/late)",
+                "# Current Working Directory missing",
+                None,
+            ),
+            (
+                "# Current Working Directory (  )\n# Current Working Directory (/later)",
+                "# Current Working Directory (  )",
+                Some("/later"),
+            ),
+            ("<task>", "<task>", None),
+            (late.as_str(), "late title", None),
+            (wide.as_str(), wide_title.as_str(), None),
         ];
-        for text in cases {
+        for (text, title, cwd) in cases {
             for at in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
                 let result = summarize(|feed| {
                     feed(&text[..at])?;
@@ -314,14 +332,10 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+                assert_eq!(result.title.as_deref(), Some(title), "at {at}: {text:?}");
                 assert_eq!(
-                    result.title,
-                    crate::harness::cline::clean_user_title(&text).map(|s| crate::ir::truncate(&s, 80)),
-                    "at {at}: {text:?}"
-                );
-                assert_eq!(
-                    result.cwd,
-                    crate::harness::cline::extract_cwd(&text),
+                    result.cwd.as_deref(),
+                    cwd.map(std::path::Path::new),
                     "at {at}: {text:?}"
                 );
                 assert_eq!(result.task, text.contains("<task>"));
@@ -332,12 +346,20 @@ mod tests {
     #[test]
     fn second_pass_stops_only_after_late_title_and_path_are_settled() -> Result<()> {
         let padding = "x".repeat(8192);
-        for text in [
-            format!("plain\n{padding}"),
-            format!("plain\n{padding}\n# Current Working Directory (/late-path) Files"),
-            format!("plain\n{padding}<task>late title</task>"),
-            format!("<environment_details>{padding}</environment_details>after"),
-            format!("<task> \n </task>\nplain\n{padding}"),
+        for (text, title, cwd) in [
+            (format!("plain\n{padding}"), "plain", None),
+            (
+                format!("plain\n{padding}\n# Current Working Directory (/late-path) Files"),
+                "plain",
+                Some("/late-path"),
+            ),
+            (format!("plain\n{padding}<task>late title</task>"), "late title", None),
+            (
+                format!("<environment_details>{padding}</environment_details>after"),
+                "after",
+                None,
+            ),
+            (format!("<task> \n </task>\nplain\n{padding}"), "<task>", None),
         ] {
             let mut visits = 0;
             let mut bytes = [0usize; 2];
@@ -353,11 +375,8 @@ mod tests {
                 Ok(())
             })?;
             assert_eq!(bytes[0], text.len());
-            assert_eq!(
-                result.title,
-                crate::harness::cline::clean_user_title(&text).map(|s| crate::ir::truncate(&s, 80))
-            );
-            assert_eq!(result.cwd, crate::harness::cline::extract_cwd(&text));
+            assert_eq!(result.title.as_deref(), Some(title));
+            assert_eq!(result.cwd.as_deref(), cwd.map(std::path::Path::new));
             if text == format!("plain\n{padding}") {
                 assert_eq!(bytes[1], 64);
             }

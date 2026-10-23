@@ -25,75 +25,202 @@
 
 use crate::affordance::{Affordance, Kind};
 use crate::ir::{truncate, SessionRef};
+use anyhow::Result;
 use serde_json::Value;
-use std::fs;
 use std::path::Path;
 
+/// The state dir's position above either store layout: self, `sessions|agent`, `<agent>`, `agents`,
+/// then `<state>` — so both `<state>/agents/<agent>/sessions/<sid>.jsonl` and
+/// `<state>/agents/<agent>/agent/<db>.sqlite` keep it at the same ancestor index.
+const STATE_ANCESTOR: usize = 4;
+
 /// Every registry row that belongs to `r`.
-pub(super) fn affordances(r: &SessionRef) -> Vec<Affordance> {
-    // `<state>/agents/<agent>/sessions/<sid>.jsonl` and `<state>/agents/<agent>/agent/<db>.sqlite`
-    // sit at the same depth.
-    let Some(state) = r.path.ancestors().nth(4) else {
-        return Vec::new();
+pub(super) fn affordances(r: &SessionRef) -> Result<Vec<Affordance>> {
+    let Some(state) = r.path.ancestors().nth(STATE_ANCESTOR) else {
+        return Ok(Vec::new());
     };
-    let Some(key) = session_key(r) else {
-        return Vec::new();
+    let Some(key) = session_key(r)? else {
+        return Ok(Vec::new());
     };
     let (jobs, runs) = if super::is_sqlite_store_path(&r.path) {
-        sqlite_registries(state, &key)
+        sqlite_registries(state, &key)?
     } else {
-        (jsonl_jobs(state), jsonl_runs(state, &key))
+        (jsonl_jobs(state, &key)?, jsonl_runs(state, &key)?)
     };
     let mut out: Vec<Affordance> = jobs.iter().filter(|j| job_belongs(j, &key)).map(job_row).collect();
     out.extend(runs.iter().filter(|(by, _)| by.contains(&key)).map(|(_, p)| run_row(p)));
-    out
+    Ok(out)
+}
+
+/// Every session's certificate in the JSONL registries a transcript in `dir` reads: exactly what
+/// its read takes from them. From `dir/sessions.json`: the key [`session_key`] finds (the first
+/// entry naming it, in the parsed map's order) and, as [`super::JsonKeys`] reads the document,
+/// its own entry's key and `spawnedBy` and the session that spawner key names now; from the state
+/// dir's `cron/jobs.json` and `subagents/runs.json`, the jobs and runs that belong to its key
+/// ([`jsonl_jobs`], [`jsonl_runs`]); a registry that fails to read, as the failure. Keyed by the
+/// session ids `sessions.json` names and the transcripts' file names.
+pub(super) fn jsonl_rows(dir: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+    use crate::source::Rows;
+    let state = dir.ancestors().nth(STATE_ANCESTOR - 1)?;
+    let index_path = dir.join("sessions.json");
+    let index = shared_json(&index_path);
+    let keys = super::JsonKeys::read(&index_path);
+    let entries = match &index {
+        Ok(Some(index)) => index.as_object(),
+        _ => None,
+    };
+    // The sessions `sessions.json` names, and every transcript's by its file name (a session it
+    // does not name reads no entry: that absence is its certificate).
+    let on_disk: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(super::is_primary_transcript_name))
+        .map(|e| super::session_id_from_filename(&e.path()))
+        .collect();
+    let mut ids: std::collections::BTreeSet<&str> = keys.sessions.keys().map(String::as_str).collect();
+    ids.extend(
+        entries
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, e)| e.get("sessionId").and_then(Value::as_str)),
+    );
+    ids.extend(on_disk.iter().map(String::as_str));
+    let fold = |digest: u64, part: &[u8]| Rows::fold(Rows::fold(digest, &(part.len() as u64).to_le_bytes()), part);
+    let json = |value: &Value| serde_json::to_vec(value).unwrap_or_default();
+    let mut out = std::collections::HashMap::new();
+    for id in ids {
+        let mut digest = Rows::SEED;
+        let key = match &index {
+            Err(error) => {
+                digest = fold(digest, format!("error {error:#}").as_bytes());
+                None
+            }
+            Ok(None) => None,
+            Ok(Some(_)) => match entries {
+                None => {
+                    digest = fold(digest, b"not an object");
+                    None
+                }
+                Some(entries) => entries
+                    .iter()
+                    .find(|(_, e)| e.get("sessionId").and_then(Value::as_str) == Some(id))
+                    .map(|(k, _)| k.clone()),
+            },
+        };
+        digest = fold(digest, key.as_deref().unwrap_or("\0").as_bytes());
+        if let Some((own, spawned_by)) = keys.sessions.get(id) {
+            digest = fold(digest, own.as_bytes());
+            if let Some(by) = spawned_by {
+                digest = fold(digest, by.as_bytes());
+                digest = fold(digest, keys.preferred.get(by).map_or(&b"\0"[..], |s| s.as_bytes()));
+            }
+        }
+        if let Some(key) = &key {
+            match jsonl_jobs(state, key) {
+                Ok(jobs) => jobs.iter().for_each(|job| digest = fold(digest, &json(job))),
+                Err(error) => digest = fold(digest, format!("error {error:#}").as_bytes()),
+            }
+            match jsonl_runs(state, key) {
+                Ok(runs) => runs.iter().for_each(|(_, run)| digest = fold(digest, &json(run))),
+                Err(error) => digest = fold(digest, format!("error {error:#}").as_bytes()),
+            }
+        }
+        out.insert(
+            id.to_owned(),
+            Rows {
+                count: 1,
+                high: 0,
+                digest,
+            },
+        );
+    }
+    Some(out)
 }
 
 /// The session's key: the `sessions.json` entry naming it, or its `session_windows` row.
-fn session_key(r: &SessionRef) -> Option<String> {
+fn session_key(r: &SessionRef) -> Result<Option<String>> {
     if super::is_sqlite_store_path(&r.path) {
         return sqlite_session_key(r);
     }
-    let text = fs::read_to_string(r.path.parent()?.join("sessions.json")).ok()?;
-    let Ok(Value::Object(index)) = serde_json::from_str::<Value>(&text) else {
-        return None;
+    let Some(parent) = r.path.parent() else { return Ok(None) };
+    let Some(index) = shared_json(&parent.join("sessions.json"))? else {
+        return Ok(None);
     };
-    index
+    let index = index
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("sessions.json is not an object"))?;
+    Ok(index
         .iter()
         .find(|(_, e)| e.get("sessionId").and_then(Value::as_str) == Some(r.id.as_str()))
-        .map(|(k, _)| k.clone())
+        .map(|(k, _)| k.clone()))
 }
 
 #[cfg(feature = "sqlite")]
-fn sqlite_session_key(r: &SessionRef) -> Option<String> {
-    let conn = super::open_ro(&r.path).ok()?;
-    conn.read(|conn| {
-        Ok(conn.query_row(
-            "SELECT session_key FROM session_windows WHERE session_id = ?1",
-            [&r.id],
-            |row| row.get(0),
-        )?)
+fn sqlite_session_key(r: &SessionRef) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension as _;
+    let conn = super::open_ro(&r.path)?;
+    conn.read(|conn, _| {
+        Ok(conn
+            .query_row(
+                "SELECT session_key FROM session_windows WHERE session_id = ?1",
+                [&r.id],
+                |row| row.get(0),
+            )
+            .optional()?)
     })
-    .ok()
 }
 
 #[cfg(not(feature = "sqlite"))]
-fn sqlite_session_key(_r: &SessionRef) -> Option<String> {
-    None
+fn sqlite_session_key(_r: &SessionRef) -> Result<Option<String>> {
+    anyhow::bail!("SQLite support is required for the session registry")
 }
 
-fn read_json(path: &Path) -> Option<Value> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
-}
-
-fn jsonl_jobs(state: &Path) -> Vec<Value> {
-    let Some(mut registry) = read_json(&state.join("cron").join("jobs.json")) else {
-        return Vec::new();
-    };
-    match registry.get_mut("jobs").map(Value::take) {
-        Some(Value::Array(jobs)) => jobs,
-        _ => Vec::new(),
+/// A registry file's parse, shared while the file stats as it did when it was parsed. Every
+/// session's affordances consult the same `sessions.json`, `cron/jobs.json` and
+/// `subagents/runs.json`; parsing them per session made a pass over n sessions cost
+/// n × the registries. Errors are not kept: the next ask reads and reports again.
+fn shared_json(path: &Path) -> Result<Option<std::sync::Arc<Value>>> {
+    use crate::source::FileId;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    type Memo = HashMap<PathBuf, (FileId, Arc<Value>)>;
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    let before = FileId::at(path);
+    if let Some(before) = before {
+        if let Some((_, hit)) = memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(path)
+            .filter(|(seen, _)| *seen == before)
+        {
+            return Ok(Some(Arc::clone(hit)));
+        }
     }
+    let Some(value) = crate::affordance::side_json(path)? else {
+        return Ok(None);
+    };
+    let value = Arc::new(value);
+    // A write during the read stores nothing: the next ask parses the file as it then stands.
+    if let Some(before) = before.filter(|before| FileId::at(path) == Some(*before)) {
+        memo.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf(), (before, Arc::clone(&value)));
+    }
+    Ok(Some(value))
+}
+
+/// The cron jobs that belong to `key`, in registry order.
+fn jsonl_jobs(state: &Path, key: &str) -> Result<Vec<Value>> {
+    let Some(registry) = shared_json(&state.join("cron").join("jobs.json"))? else {
+        return Ok(Vec::new());
+    };
+    Ok(match registry.get("jobs") {
+        Some(Value::Array(jobs)) => jobs.iter().filter(|j| job_belongs(j, key)).cloned().collect(),
+        _ => Vec::new(),
+    })
 }
 
 /// A sub-agent run: the keys it belongs to (requester, controller) and its record.
@@ -106,88 +233,118 @@ fn run_keys(p: &Value) -> Vec<String> {
         .collect()
 }
 
-fn jsonl_runs(state: &Path, key: &str) -> Vec<Run> {
-    let Some(mut registry) = read_json(&state.join("subagents").join("runs.json")) else {
-        return Vec::new();
+fn jsonl_runs(state: &Path, key: &str) -> Result<Vec<Run>> {
+    let Some(registry) = shared_json(&state.join("subagents").join("runs.json"))? else {
+        return Ok(Vec::new());
     };
-    let Some(Value::Object(runs)) = registry.get_mut("runs").map(Value::take) else {
-        return Vec::new();
+    let Some(Value::Object(runs)) = registry.get("runs") else {
+        return Ok(Vec::new());
     };
     // Only this session's runs need ordering. Filtering before sorting avoids ordering
     // the full global registry again for every requested session.
     let mut out: Vec<Run> = runs
-        .into_iter()
-        .filter_map(|(_, p)| {
-            ["requesterSessionKey", "controllerSessionKey"]
-                .into_iter()
-                .any(|field| p.get(field).and_then(Value::as_str) == Some(key))
-                .then(|| (run_keys(&p), p))
+        .values()
+        .filter_map(|p| {
+            let keys = run_keys(p);
+            keys.iter().any(|by| by == key).then(|| (keys, p.clone()))
         })
         .collect();
     out.sort_by_key(|(_, p)| p.get("createdAt").and_then(Value::as_i64).unwrap_or(0));
-    out
+    Ok(out)
 }
 
 #[cfg(feature = "sqlite")]
-fn sqlite_registries(state: &Path, key: &str) -> (Vec<Value>, Vec<Run>) {
+fn sqlite_registries(state: &Path, key: &str) -> Result<(Vec<Value>, Vec<Run>)> {
+    let path = state.join("state").join("openclaw.sqlite");
+    if !path.try_exists()? {
+        return Ok(Default::default());
+    }
+    let all = sqlite_rows(&path)?;
+    let mut jobs = Vec::new();
+    for (job, state) in &all.jobs {
+        if !job_belongs(job, key) {
+            continue;
+        }
+        // Read as text and parsed for a belonging job only, as before: another job's state
+        // cannot fail this one.
+        let state: Value = serde_json::from_str(rusqlite::types::ValueRef::from(state).as_str()?)?;
+        let mut job = job.clone();
+        if let Some(object) = job.as_object_mut() {
+            object.insert("state".into(), state);
+        }
+        jobs.push(job);
+    }
+    let runs = all
+        .runs
+        .iter()
+        .filter(|(keys, _)| keys.iter().any(|by| by == key))
+        .cloned()
+        .collect();
+    Ok((jobs, runs))
+}
+
+/// Every `cron_jobs` row (its parsed job and raw state cell) and `subagent_runs` row of one store, in
+/// query order.
+#[cfg(feature = "sqlite")]
+#[derive(Default)]
+struct Rows {
+    jobs: Vec<(Value, rusqlite::types::Value)>,
+    runs: Vec<Run>,
+}
+
+/// [`Rows`] of the store at `path`, kept while the store and its WAL and journal stat as they did
+/// when they were read (the pattern of Hermes's delegate scan). Each session's affordances ask; a
+/// scan per session parsed every job and run once per session of the store.
+#[cfg(feature = "sqlite")]
+fn sqlite_rows(path: &Path) -> Result<std::sync::Arc<Rows>> {
     use super::super::store::sqlite::table_exists;
-    let Ok(conn) = super::open_ro(&state.join("state").join("openclaw.sqlite")) else {
-        return Default::default();
-    };
-    conn.read(|conn| {
-        let parse = |t: String| serde_json::from_str::<Value>(&t).ok();
-        let jobs = if table_exists(conn, "cron_jobs") {
-            // Decode and filter each row before retaining it. Payload ownership remains authoritative:
-            // migrated projections can disagree, and SQLite's JSON duplicate-key rules differ from
-            // serde_json's. Unrelated bodies live only until the next cursor row.
-            conn.prepare("SELECT job_json, state_json FROM cron_jobs ORDER BY sort_order, updated_at, job_id")
-                .and_then(|mut st| {
-                    st.query_map([], |row| {
-                        let job: String = row.get(0)?;
-                        let state: String = row.get(1)?;
-                        let Some(mut job) = parse(job).filter(|job| job_belongs(job, key)) else {
-                            return Ok(None);
-                        };
-                        // The runtime state rides in its own column; fold it back where the 1.29
-                        // entry kept it, but only decode state for matching jobs.
-                        if let (Some(o), Some(state)) = (job.as_object_mut(), parse(state)) {
-                            o.insert("state".into(), state);
-                        }
-                        Ok(Some(job))
-                    })?
-                    .filter_map(|row| row.transpose())
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let runs = if table_exists(conn, "subagent_runs") {
-            conn.prepare("SELECT payload_json FROM subagent_runs ORDER BY created_at, run_id")
-                .and_then(|mut st| {
-                    st.query_map([], |row| {
-                        let payload: String = row.get(0)?;
-                        let Some(payload) = parse(payload) else {
-                            return Ok(None);
-                        };
-                        let keys = run_keys(&payload);
-                        Ok(keys.iter().any(|by| by == key).then_some((keys, payload)))
-                    })?
-                    .filter_map(|row| row.transpose())
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        Ok((jobs, runs))
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    type Memo = HashMap<PathBuf, (crate::source::ReadSet, Arc<Rows>)>;
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    let conn = super::open_ro(path)?;
+    conn.read(|conn, reads| {
+        let hit = memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(path)
+            .filter(|(seen, _)| seen.fresh(&mut crate::source::Probe::default()))
+            .map(|(_, rows)| Arc::clone(rows));
+        if let Some(rows) = hit {
+            return Ok(rows);
+        }
+        let mut all = Rows::default();
+        if table_exists(conn, "cron_jobs") {
+            let mut stmt =
+                conn.prepare("SELECT job_json, state_json FROM cron_jobs ORDER BY sort_order, updated_at, job_id")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let job: Value = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
+                let state = rusqlite::types::Value::from(row.get_ref(1)?);
+                all.jobs.push((job, state));
+            }
+        }
+        if table_exists(conn, "subagent_runs") {
+            let mut stmt = conn.prepare("SELECT payload_json FROM subagent_runs ORDER BY created_at, run_id")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let payload: Value = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
+                all.runs.push((run_keys(&payload), payload));
+            }
+        }
+        let all = Arc::new(all);
+        memo.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf(), (reads.clone(), Arc::clone(&all)));
+        Ok(all)
     })
-    .unwrap_or_default()
 }
 
 #[cfg(not(feature = "sqlite"))]
-fn sqlite_registries(_state: &Path, _key: &str) -> (Vec<Value>, Vec<Run>) {
-    Default::default()
+fn sqlite_registries(_state: &Path, _key: &str) -> Result<(Vec<Value>, Vec<Run>)> {
+    anyhow::bail!("SQLite support is required for the side registries")
 }
 
 fn str_at<'a>(v: &'a Value, ptr: &str) -> Option<&'a str> {
@@ -199,8 +356,9 @@ fn job_belongs(job: &Value, key: &str) -> bool {
         .iter()
         .any(|p| str_at(job, p) == Some(key));
     let id = str_at(job, "/id").unwrap_or("");
-    let mut parts = key.split(':');
-    let (agent, kind, rest) = (parts.nth(1), parts.next(), parts.next());
+    // `agent:<agentId>:<kind>:<…>`: the agent, the kind, and the first field after it.
+    let fields: Vec<&str> = key.split(':').collect();
+    let (agent, kind, rest) = (fields.get(1).copied(), fields.get(2).copied(), fields.get(3).copied());
     let run = kind == Some("cron") && !id.is_empty() && rest == Some(id);
     let main = str_at(job, "/sessionTarget") == Some("main")
         && kind == Some("main")
@@ -209,9 +367,15 @@ fn job_belongs(job: &Value, key: &str) -> bool {
     owner || run || main
 }
 
-/// The public summary is 120 characters; retain one lookahead for truncate's ellipsis.
+/// The public summary's bound.
+const SUMMARY: usize = 120;
+/// What a [`Head`](crate::projection::Head) of the summary keeps: its bound and one lookahead.
 fn summary_prefix<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
-    parts.into_iter().flat_map(str::chars).take(121).collect()
+    parts
+        .into_iter()
+        .flat_map(str::chars)
+        .take(crate::projection::Head::kept(SUMMARY))
+        .collect()
 }
 
 /// `corpus-ping · at 2026-10-11T20:48:42Z · Reply with the word pong. · last ok`.
@@ -247,7 +411,7 @@ fn job_row(job: &Value) -> Affordance {
             .enumerate()
             .flat_map(|(i, part)| [if i == 0 { "" } else { " · " }, *part]),
     );
-    Affordance::store(Kind::Schedule, "cron", truncate(&prefix, 120), Vec::new())
+    Affordance::store(Kind::Schedule, "cron", truncate(&prefix, SUMMARY), Vec::new())
 }
 
 /// `ok-reply-check · Reply with the single word ok. · ok → ok`.
@@ -271,7 +435,12 @@ fn run_row(p: &Value) -> Affordance {
         .and_then(chrono::DateTime::from_timestamp_millis);
     Affordance {
         timestamp,
-        ..Affordance::store(Kind::SubagentSpawn, "subagents", truncate(&summary, 120), Vec::new())
+        ..Affordance::store(
+            Kind::SubagentSpawn,
+            "subagents",
+            truncate(&summary, SUMMARY),
+            Vec::new(),
+        )
     }
 }
 
@@ -279,6 +448,7 @@ fn run_row(p: &Value) -> Affordance {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
 
     /// The three ways a job belongs to a session: it made the job, it is one of the job's runs, or
     /// the job fires into it.
@@ -330,7 +500,7 @@ mod tests {
         expected.sort_by_key(|(_, p)| p.get("createdAt").and_then(Value::as_i64).unwrap_or(0));
         expected.retain(|(keys, _)| keys.iter().any(|by| by == key));
         fs::write(world.base.join("subagents/runs.json"), json!({"runs":runs}).to_string())?;
-        let actual = jsonl_runs(&world.base, key);
+        let actual = jsonl_runs(&world.base, key).unwrap();
         assert_eq!(actual, expected);
         assert_eq!(actual.len(), 5);
         Ok(())
@@ -438,6 +608,11 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO subagent_runs VALUES ('malformed', 99, 'bad', '', '')", [])
             .unwrap();
+        assert!(sqlite_registries(&state, "agent:main:explicit:s1").is_err());
+        conn.execute("DELETE FROM cron_jobs WHERE job_id = 'bad'", []).unwrap();
+        assert!(sqlite_registries(&state, "agent:main:explicit:s1").is_err());
+        conn.execute("DELETE FROM subagent_runs WHERE run_id = 'bad'", [])
+            .unwrap();
         for key in [
             "agent:main:explicit:s1",
             "agent:main:main",
@@ -446,7 +621,7 @@ mod tests {
             "1",
             "",
         ] {
-            let (actual_jobs, actual_runs) = sqlite_registries(&state, key);
+            let (actual_jobs, actual_runs) = sqlite_registries(&state, key).unwrap();
             let expected_jobs: Vec<Value> = jobs
                 .iter()
                 .filter(|j| job_belongs(j, key))
@@ -468,5 +643,102 @@ mod tests {
             assert_eq!(actual_runs, expected_runs, "{key}");
         }
         fs::remove_dir_all(state).unwrap();
+    }
+
+    /// Every session of an agent asks for the same registries: each is parsed once per file
+    /// state, and a rewrite is read.
+    #[test]
+    fn registries_are_parsed_once_per_file_state() -> Result<()> {
+        let world = crate::test_world("openclaw-registry-shared");
+        let state = world.base.join("state");
+        let sessions = state.join("agents/main/sessions");
+        fs::create_dir_all(&sessions)?;
+        fs::create_dir_all(state.join("cron"))?;
+        fs::create_dir_all(state.join("subagents"))?;
+        let mut index = serde_json::Map::new();
+        for i in 0..3 {
+            index.insert(
+                format!("agent:main:main:{i}"),
+                serde_json::json!({"sessionId": format!("s{i}")}),
+            );
+            fs::write(sessions.join(format!("s{i}.jsonl")), "")?;
+        }
+        fs::write(sessions.join("sessions.json"), Value::Object(index).to_string())?;
+        fs::write(
+            state.join("cron/jobs.json"),
+            r#"{"jobs":[{"id":"j","name":"ping","owner":{"sessionKey":"agent:main:main:1"}}]}"#,
+        )?;
+        let runs = |label: &str| {
+            fs::write(
+                state.join("subagents/runs.json"),
+                format!(
+                    r#"{{"runs":{{"r":{{"requesterSessionKey":"agent:main:main:2","task":"t","label":"{label}"}}}}}}"#
+                ),
+            )
+        };
+        runs("first")?;
+        let rows = |i: usize| {
+            let r = SessionRef::new(
+                format!("s{i}"),
+                crate::Harness::OpenClaw,
+                sessions.join(format!("s{i}.jsonl")),
+            );
+            affordances(&r).map(|rows| rows.iter().map(|a| a.summary.clone()).collect::<Vec<_>>())
+        };
+        let parsed = |name: &str| shared_json(&state.join(name)).map(|v| v.unwrap());
+        assert_eq!(rows(0)?, Vec::<String>::new());
+        assert_eq!(rows(1)?, vec!["ping".to_string()]);
+        assert_eq!(rows(2)?, vec!["first · t".to_string()]);
+        let (jobs, before) = (parsed("cron/jobs.json")?, parsed("subagents/runs.json")?);
+        rows(0)?;
+        assert!(
+            std::sync::Arc::ptr_eq(&jobs, &parsed("cron/jobs.json")?),
+            "unchanged: not reparsed"
+        );
+        assert!(std::sync::Arc::ptr_eq(&before, &parsed("subagents/runs.json")?));
+        runs("second")?;
+        assert!(
+            !std::sync::Arc::ptr_eq(&before, &parsed("subagents/runs.json")?),
+            "a rewrite is read"
+        );
+        assert_eq!(rows(2)?, vec!["second · t".to_string()]);
+        Ok(())
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_registry_rows_are_read_once_per_store_state() -> Result<()> {
+        let world = crate::test_world("openclaw-registry-sqlite");
+        let state = world.base.join("state");
+        let path = state.join("state/openclaw.sqlite");
+        fs::create_dir_all(path.parent().unwrap())?;
+        let conn = rusqlite::Connection::open(&path)?;
+        conn.execute_batch(
+            r#"CREATE TABLE cron_jobs(job_id TEXT, job_json TEXT, state_json, sort_order INT, updated_at INT);
+               CREATE TABLE subagent_runs(run_id TEXT, payload_json TEXT, created_at INT);
+               INSERT INTO cron_jobs VALUES('a', '{"id":"a","name":"mine","owner":{"sessionKey":"k1"}}', '{"lastStatus":"ok"}', 0, 0);
+               INSERT INTO cron_jobs VALUES('b', '{"id":"b","name":"theirs","owner":{"sessionKey":"k2"}}', NULL, 1, 0);
+               INSERT INTO subagent_runs VALUES('r', '{"requesterSessionKey":"k2","task":"t"}', 0);"#,
+        )?;
+        let (jobs, runs) = sqlite_registries(&state, "k1")?;
+        assert_eq!(jobs.len(), 1, "another job's NULL state does not fail this one");
+        assert_eq!(jobs[0]["state"]["lastStatus"], "ok");
+        assert!(runs.is_empty());
+        assert!(
+            sqlite_registries(&state, "k2").is_err(),
+            "its own NULL state still fails, as before"
+        );
+        let first = sqlite_rows(&path)?;
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &sqlite_rows(&path)?),
+            "unchanged: not reread"
+        );
+        conn.execute(
+            "INSERT INTO subagent_runs VALUES('s', '{\"requesterSessionKey\":\"k1\",\"task\":\"u\"}', 1)",
+            [],
+        )?;
+        assert!(!std::sync::Arc::ptr_eq(&first, &sqlite_rows(&path)?), "a write is read");
+        assert_eq!(sqlite_registries(&state, "k1")?.1.len(), 1);
+        Ok(())
     }
 }

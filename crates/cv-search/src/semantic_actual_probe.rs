@@ -6,10 +6,18 @@
 use super::*;
 use std::cell::Cell;
 thread_local! { static CALLS: Cell<[usize; 3]> = const { Cell::new([0; 3]) }; }
-pub(super) fn record(index: usize) {
+
+/// The observed operation boundaries, in `CALLS` slot order.
+#[derive(Clone, Copy)]
+enum Observed {
+    ReadCorpusDoc,
+    LoadModel,
+    SaveStore,
+}
+fn record(observed: Observed) {
     CALLS.with(|calls| {
         let mut value = calls.get();
-        value[index] += 1;
+        value[observed as usize] += 1;
         calls.set(value);
     });
 }
@@ -18,6 +26,41 @@ fn reset() {
 }
 fn calls() -> [usize; 3] {
     CALLS.with(Cell::get)
+}
+
+// Inject observations at the same operation boundaries used by production.
+fn embed_sessions(path: &Path, refs: &[cv_core::SessionRef]) -> Result<usize> {
+    embed_with(
+        path,
+        refs,
+        |r, head| {
+            record(Observed::ReadCorpusDoc);
+            crate::read_corpus_doc(r, head)
+        },
+        |spec| {
+            record(Observed::LoadModel);
+            load_model(spec)
+        },
+        |path, store| {
+            record(Observed::SaveStore);
+            save_store(path, store)
+        },
+    )
+}
+fn semantic_search(path: &Path, query: &str, k: usize) -> Result<Vec<Hit>> {
+    ResidentSearch::new(path.to_path_buf())
+        .search(
+            query,
+            k,
+            crate::SearchFilter::default(),
+            || resolve_model(false),
+            |spec| {
+                record(Observed::LoadModel);
+                load_model(spec)
+            },
+            |model, query| model.encode_single(query),
+        )
+        .map(|(hits, _)| hits)
 }
 
 fn copy_tree(source: &Path, destination: &Path) {
@@ -53,7 +96,7 @@ fn reference(path: PathBuf, id: &str, harness: cv_core::Harness) -> cv_core::Ses
         title: None,
         created_at: None,
         updated_at: None,
-        message_count: 2,
+        message_count: Some(2),
     }
 }
 fn claude(path: &Path, content: &str, note: &str) {
@@ -66,7 +109,7 @@ fn vectors(store: &Store) -> std::collections::BTreeMap<(String, String), Vec<u3
         .enumerate()
         .map(|(i, m)| {
             (
-                (m.harness.clone(), m.id.clone()),
+                (m.session.harness.as_str().to_string(), m.session.id.clone()),
                 store.vector(i).iter().map(|f| f.to_bits()).collect(),
             )
         })
@@ -161,14 +204,14 @@ fn actual_model_refresh_probe() {
     assert!(initial
         .meta
         .iter()
-        .find(|m| m.id == "large-arguments")
+        .find(|m| m.session.id == "large-arguments")
         .unwrap()
         .preview
         .starts_with("Inspect large semantic arguments Edit"));
     assert!(initial
         .meta
         .iter()
-        .find(|m| m.id == "escaped-text")
+        .find(|m| m.session.id == "escaped-text")
         .unwrap()
         .preview
         .starts_with("Escaped semantic bridge"));
@@ -243,13 +286,14 @@ fn actual_model_refresh_probe() {
     assert_eq!(calls(), [0, 0, 0]);
     refresh_stage("model-artifact-changed", &store, &refs, [refs.len(), 1, 1]);
     assert_eq!(vectors(&load_store(&store).unwrap()), changed_vectors);
-    let mut obsolete = load_store(&store).unwrap();
-    obsolete.projection = PROJECTION_VERSION.saturating_sub(1);
-    save_store(&store, &obsolete).unwrap();
+    // A store of the previous stored-format version (its magic byte) re-embeds whole.
+    let mut obsolete = std::fs::read(&store).unwrap();
+    obsolete[7] = obsolete[7].wrapping_sub(1);
+    std::fs::write(&store, obsolete).unwrap();
     reset();
     assert!(semantic_search(&store, "astronomy", 1).is_err());
     assert_eq!(calls(), [0, 0, 0]);
-    refresh_stage("projection-changed", &store, &refs, [refs.len(), 1, 1]);
+    refresh_stage("format-version-changed", &store, &refs, [refs.len(), 1, 1]);
     refresh_stage("final-unchanged", &store, &refs, [0, 0, 0]);
     reset();
     let mut elapsed = Vec::new();

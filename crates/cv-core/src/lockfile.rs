@@ -6,9 +6,13 @@
 //! re-create dance could crown two winners and cascade-steal a *live* holder's lock). The lockfile
 //! itself is never removed: unlinking it would let the next locker open a fresh inode and lock
 //! *that*, silently breaking mutual exclusion.
+//!
+//! Use this lock for read-modify-write transactions. The [`crate::lanes`] event ledger instead
+//! appends independent rows without a lock and skips torn lines when reading; it remains stored
+//! state, not a transactional task log.
 
 use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 #[cfg(not(target_family = "wasm"))]
@@ -20,12 +24,12 @@ pub(crate) struct FileLock {
 
 impl FileLock {
     /// Acquire the lock, blocking until the current holder (if any) releases it.
-    pub(crate) fn acquire(path: PathBuf) -> Result<FileLock> {
+    pub(crate) fn acquire(path: &Path) -> Result<FileLock> {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)
+            .open(path)
             .with_context(|| format!("creating lockfile {}", path.display()))?;
         // wasm32 has no file locking (and no cross-process concurrency): the open alone suffices.
         #[cfg(not(target_family = "wasm"))]

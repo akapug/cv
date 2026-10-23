@@ -296,7 +296,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clustervision"
-version = "0.16.1"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -309,6 +309,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "toml",
  "ureq",
  "urlencoding",
  "uuid",
@@ -316,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "clustervision-core"
-version = "0.16.1"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -433,7 +434,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "cv-search"
-version = "0.16.1"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -452,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "cv-testkit"
-version = "0.16.1"
+version = "0.18.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -460,11 +461,10 @@ dependencies = [
 
 [[package]]
 name = "cv-web"
-version = "0.16.1"
+version = "0.18.0"
 dependencies = [
  "clustervision-core",
  "serde_json",
- "uuid",
  "wasm-bindgen",
 ]
 
@@ -1884,6 +1884,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2447,6 +2453,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

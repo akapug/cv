@@ -4,8 +4,12 @@
 
 use super::*;
 use crate::harness::store::document::{text_head, text_summary, Fields};
+use crate::harness::wire::genai::{self, Dialect, Part};
 use crate::json::{JsonSource, JsonView};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::lazy::{Resolver, Text};
+use crate::stream::Tier;
 
 /// How a record's bodies are resolved.
 #[derive(Clone, Copy)]
@@ -17,6 +21,20 @@ pub(super) enum Demand<'s> {
     /// Discovery: message presence, tool identities and the first prompt's title only. No
     /// argument tree, result body or system display body is decoded.
     Discovery,
+}
+
+impl<'s> Demand<'s> {
+    /// The read's demand over its captured `source`: [`Tier::Discovery`] reads only what the
+    /// listing needs, spans keep strings in the source, anything else is owned.
+    pub(super) fn of(demand: &stream::Demand, source: &'s JsonSource) -> Self {
+        if demand.tier == Tier::Discovery {
+            Demand::Discovery
+        } else if demand.spans {
+            Demand::Spans(source)
+        } else {
+            Demand::Owned
+        }
+    }
 }
 
 /// Every top-level key any record kind reads.
@@ -43,7 +61,7 @@ const TOP: &[&str] = &[
 
 /// One record: fold its session facts, then (unless the sink already stopped) hand its messages
 /// to `sink`. Returns false once the sink has stopped.
-pub(super) fn ingest(
+pub(super) fn record(
     view: JsonView<'_>,
     s: &mut Session,
     st: &mut ReplayState,
@@ -72,19 +90,18 @@ fn string(view: Option<JsonView<'_>>, key: &str) -> Result<Option<String>> {
         .and_then(|v| v.as_str().map(str::to_owned)))
 }
 
+type DateTime = chrono::DateTime<chrono::Utc>;
+
 fn timestamp(r: &Fields<'_>) -> Result<Option<DateTime>> {
     Ok(r.string("timestamp")?.as_deref().and_then(parse_ts))
 }
-type DateTime = chrono::DateTime<chrono::Utc>;
 
 /// Session-level facts every record carries: id, cwd, branch, version, time span, fork origin,
 /// approval mode.
 fn session_facts(s: &mut Session, r: &Fields<'_>) -> Result<()> {
     if s.lineage.parent.is_none() {
         if let Some(id) = r.string("sessionId")? {
-            if s.id != id {
-                s.id = id;
-            }
+            s.id = id;
         }
     }
     if s.cwd.is_none() {
@@ -134,6 +151,15 @@ fn emit(
     let subtype = r.string("subtype")?;
     let provenance = r.string("provenance")?;
     let payload = r.get("systemPayload");
+    if matches!(demand, Demand::Discovery)
+        && st.listed
+        && !matches!(
+            (ty.as_str(), subtype.as_deref()),
+            ("system", Some("custom_title" | "parent_session"))
+        )
+    {
+        return Ok(Flow::Continue);
+    }
     let blocks = || -> Result<Vec<Block>> {
         if ty == "system" {
             system_blocks(payload, subtype.as_deref(), demand)
@@ -200,11 +226,10 @@ fn emit(
             let mut m = Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model);
             m.content = blocks()?;
             if let Some(model) = r.string("model")? {
-                match st.session_model.as_deref() {
-                    None => st.session_model = Some(model),
-                    Some(m0) if m0 != model => m.model = Some(model),
-                    _ => {}
+                if st.session_model.is_none() {
+                    st.session_model = Some(model.clone());
                 }
+                m.model = Some(model);
             }
             if !matches!(demand, Demand::Discovery) {
                 m.usage = r.get("usageMetadata").map(usage_of).transpose()?.flatten();
@@ -257,9 +282,6 @@ fn emit(
             // `{info: {originalTokenCount, newTokenCount, triggerReason, ...}, compressedHistory:
             // Content[]}`: the boundary, then the summary turn that seeds the new window.
             let mut m = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
-            m.content.push(Block::Text {
-                text: "[conversation compressed]".to_string().into(),
-            });
             let info = payload.map(|p| p.get("info")).transpose()?.flatten();
             if let Some(info) = info.filter(|v| v.is_object().unwrap_or(false)) {
                 let mut kept = Vec::new();
@@ -293,13 +315,7 @@ fn emit(
             m.content = blocks()?;
             m
         }
-        ("system", Some("rewind")) => {
-            let mut m = Message::of_kind(Role::System, MessageKind::Branch, Origin::Harness);
-            m.content.push(Block::Text {
-                text: "[rewound]".to_string().into(),
-            });
-            m
-        }
+        ("system", Some("rewind")) => Message::of_kind(Role::System, MessageKind::Branch, Origin::Harness),
         ("system", Some("session_model")) => {
             let mut m = Message::of_kind(Role::System, MessageKind::ModelChange, Origin::Harness);
             m.model = payload_str(payload, &["model", "modelId"])?;
@@ -329,9 +345,14 @@ fn emit(
     finish(m, r, subtype.as_deref(), sink)
 }
 
-/// Stamp a message with its record's identity and hand it to the sink (an empty one is dropped).
+/// Stamp a message with its record's identity and hand it to the sink. An empty turn is dropped
+/// unless its kind is the fact: a model change, a compression boundary, a rewind.
 fn finish(mut m: Message, r: &Fields<'_>, subtype: Option<&str>, sink: &mut dyn MessageSink) -> Result<Flow> {
-    if m.content.is_empty() && m.kind != MessageKind::ModelChange {
+    let marker = matches!(
+        m.kind,
+        MessageKind::ModelChange | MessageKind::CompactionBoundary | MessageKind::Branch
+    );
+    if m.content.is_empty() && !marker {
         return Ok(Flow::Continue);
     }
     m.id = r.string("uuid")?;
@@ -407,90 +428,91 @@ fn content_blocks(message: Option<JsonView<'_>>, demand: Demand<'_>) -> Result<V
     let discovery = matches!(demand, Demand::Discovery);
     for part in parts.into_iter().flatten() {
         let part = part?;
-        if let Some(call) = part.get("functionCall")? {
-            let name = string(Some(call), "name")?.unwrap_or_else(|| "tool".into());
-            let id = string(Some(call), "id")?.unwrap_or_else(|| name.clone());
-            let args = call.get("args")?;
-            // `tool_call` invokes a deferred tool (one `tool_search` loaded) by name:
-            // `{name, arguments}`. The call is that tool's, namespaced `tool_call`.
-            let inner = if name == TOOL_CALL { string(args, "name")? } else { None };
-            let (name, namespace, input) = match inner {
-                Some(inner) => (
-                    inner,
-                    Some(TOOL_CALL.to_string()),
-                    args.map(|v| v.get("arguments")).transpose()?.flatten(),
-                ),
-                None => (name, None, args),
-            };
-            let input = match (input, demand) {
-                (Some(_), Demand::Discovery) | (None, _) => Value::Null.into(),
-                (Some(v), Demand::Spans(_)) => v.to_json()?,
-                (Some(v), Demand::Owned) => v.resolve()?.into_owned().into(),
-            };
-            out.push(Block::ToolUse {
-                id,
-                name,
-                input,
-                namespace,
-            });
-        } else if let Some(result) = part.get("functionResponse")? {
-            let name = string(Some(result), "name")?.unwrap_or_else(|| "tool".into());
-            let resp = result.get("response")?;
-            out.push(Block::ToolResult {
-                tool_use_id: string(Some(result), "id")?.unwrap_or_else(|| name.clone()),
-                content: response(resp, demand)?,
-                is_error: resp.map(|v| v.get("error")).transpose()?.flatten().is_some(),
-                tool_name: Some(name),
-                status: None,
-                details: None,
-            });
-        } else if let Some(inline) = part.get("inlineData")? {
-            out.push(Block::Image {
-                media_type: string(Some(inline), "mimeType")?,
-                data_ref: None,
-            });
-        } else if let Some(file) = part.get("fileData")? {
-            out.push(Block::File {
-                mime: string(Some(file), "mimeType")?,
-                path: None,
-                source: string(Some(file), "fileUri")?,
-            });
-        } else if let Some(mut text) = part.get("text")?.map(|v| text_of(v, demand)).transpose()?.flatten() {
-            if text.is_empty() {
-                continue;
-            }
-            let thought = part.get("thought")?.map(|v| v.as_bool()).transpose()?.flatten() == Some(true);
-            if discovery {
-                // Counting needs block presence, tool identity and the first prompt's title;
-                // it never needs a decoded result body or argument tree. Keep the classifier's
-                // trimmed hook prefix separately from the title's untrimmed 81 characters.
-                let head = if !thought
-                    && text_head(&text, &Resolver::new(None), 80, true)?
-                        .0
-                        .starts_with(HOOK_CONTEXT_TAG)
-                {
-                    HOOK_CONTEXT_TAG.to_string()
-                } else {
-                    text_head(&text, &Resolver::new(None), 81, false)?.0
+        match genai::select(part, Dialect::Qwen)?.part {
+            Some(Part::Call(call)) => {
+                let name = string(Some(call), "name")?.unwrap_or_else(|| "tool".into());
+                let id = string(Some(call), "id")?.unwrap_or_else(|| name.clone());
+                let args = call.get("args")?;
+                // `tool_call` invokes a deferred tool (one `tool_search` loaded) by name:
+                // `{name, arguments}`. The call is that tool's, namespaced `tool_call`.
+                let inner = if name == TOOL_CALL { string(args, "name")? } else { None };
+                let (name, namespace, input) = match inner {
+                    Some(inner) => (
+                        inner,
+                        Some(TOOL_CALL.to_string()),
+                        args.map(|v| v.get("arguments")).transpose()?.flatten(),
+                    ),
+                    None => (name, None, args),
                 };
-                text = head.into();
-            }
-            if thought {
-                out.push(Block::Thinking {
-                    text,
-                    signature: if discovery {
-                        None
-                    } else {
-                        string(Some(part), "thoughtSignature")?
-                    },
-                    encrypted: None,
-                    redacted: false,
+                let input = match (input, demand) {
+                    (Some(_), Demand::Discovery) | (None, _) => Value::Null.into(),
+                    (Some(v), Demand::Spans(_)) => v.to_json()?,
+                    (Some(v), Demand::Owned) => v.resolve()?.into_owned().into(),
+                };
+                out.push(Block::ToolUse {
+                    id,
+                    name,
+                    input,
+                    namespace,
                 });
-            } else {
-                out.push(Block::Text { text });
             }
+            Some(Part::Response(result)) => {
+                let name = string(Some(result), "name")?.unwrap_or_else(|| "tool".into());
+                let resp = result.get("response")?;
+                out.push(Block::ToolResult {
+                    tool_use_id: string(Some(result), "id")?.unwrap_or_else(|| name.clone()),
+                    content: response(resp, demand)?,
+                    is_error: resp.map(|v| v.get("error")).transpose()?.flatten().is_some(),
+                    tool_name: Some(name),
+                    status: None,
+                    details: None,
+                });
+            }
+            Some(Part::Media(block)) => out.push(block),
+            Some(Part::Text {
+                value,
+                thought,
+                signature,
+            }) => {
+                let Some(mut text) = text_of(value, demand)? else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                if discovery {
+                    // Counting needs block presence, tool identity and the first prompt's title;
+                    // it never needs a decoded result body or argument tree. Keep the classifier's
+                    // trimmed hook prefix separately from the title head's untrimmed characters.
+                    let head = if !thought
+                        && text_head(&text, &Resolver::new(None), 80, true)?
+                            .0
+                            .starts_with(HOOK_CONTEXT_TAG)
+                    {
+                        HOOK_CONTEXT_TAG.to_string()
+                    } else {
+                        text_head(
+                            &text,
+                            &Resolver::new(None),
+                            crate::projection::Head::kept(crate::projection::Head::TITLE),
+                            false,
+                        )?
+                        .0
+                    };
+                    text = head.into();
+                }
+                let signature = match signature {
+                    Some(value) if thought && !discovery && value.is_string()? => {
+                        value.resolve()?.as_str().map(str::to_owned)
+                    }
+                    _ => None,
+                };
+                out.push(genai::text_block(text, thought, signature));
+            }
+            None => {}
         }
     }
+
     Ok(out)
 }
 
@@ -695,7 +717,9 @@ mod tests {
         ]}});
         std::fs::write(&path, serde_json::to_vec(&record)?)?;
         let source = JsonSource::capture(&path)?;
-        let blocks = source.read_document(|view| content_blocks(view.get("message")?, Demand::Discovery))?;
+        let blocks = source.read(ReadInput::Document, Validation::Value, |view| {
+            content_blocks(view.get("message")?, Demand::Discovery)
+        })?;
         assert!(serde_json::to_vec(&blocks)?.len() < 2000);
         assert!(
             matches!(&blocks[3], Block::ToolUse { id, name, namespace: Some(namespace), input }
@@ -710,5 +734,37 @@ mod tests {
         };
         assert_eq!(text.try_resolve(&Resolver::new(None))?.as_ref(), HOOK_CONTEXT_TAG);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod genai_contracts {
+    use super::*;
+    use crate::harness::wire::genai_frozen as frozen;
+    #[test]
+    fn decoder_matches_independent_frozen_parts() -> Result<()> {
+        let world = crate::test_world("qwen-genai-frozen");
+        let path = world.base.join("parts.json");
+        let resolver = Resolver::new(Some(path.clone()));
+        let mut rows = Vec::new();
+        for (case, parts) in frozen::cases().into_iter().enumerate() {
+            let value = serde_json::json!({"parts":parts});
+            let bytes = serde_json::to_vec(&value)?;
+            std::fs::write(&path, &bytes)?;
+            let source = JsonSource::capture(&path)?;
+            for demand in 0..3 {
+                let (blocks, flag) = source.read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
+                    let d = match demand {
+                        0 => Demand::Owned,
+                        1 => Demand::Spans(&source),
+                        _ => Demand::Discovery,
+                    };
+                    Ok((content_blocks(Some(view), d)?, false))
+                })?;
+                rows.push(serde_json::json!({"case":case,"demand":demand,"source_sha256":crate::digest::sha256_hex(&bytes),"result":frozen::row(blocks,flag,&resolver)?}));
+            }
+            assert_eq!(std::fs::read(&path)?, bytes, "decoder changed source");
+        }
+        frozen::assert_frozen(rows, include_str!("../../../tests/fixtures/wire/qwen-parts.jsonl"))
     }
 }

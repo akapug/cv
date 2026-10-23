@@ -15,10 +15,12 @@
 use crate::events::{EventRow, TouchedSession};
 use crate::ir::{Harness, SessionRef};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 /// THE session row (§3): the same nine keys `cv ls --json`, `cv search --json`, `cv serve`'s
 /// `/api/sessions` and the desktop app's `api` command emit. `size_bytes` is passed in because
-/// only the caller knows whether it already has the `stat` in hand.
+/// only the caller knows whether it already has the `stat` in hand. `message_count` is `null`
+/// for a session no full read or index has counted yet; `0` is a session with no turns.
 pub fn session_row(r: &SessionRef, size_bytes: Option<u64>) -> Value {
     json!({
         "id": r.id,
@@ -65,12 +67,15 @@ pub struct SearchRow<'a> {
 /// statement, without a daemon cache or a retained second collection of hit metadata.
 pub struct SearchRowContext {
     catalog: std::cell::OnceCell<Option<crate::catalog::Reader>>,
+    /// One stat per transcript path: chunked hits repeat a session's path within a response.
+    sizes: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<u64>>>,
 }
 
 impl SearchRowContext {
     pub fn new() -> Self {
         Self {
             catalog: std::cell::OnceCell::new(),
+            sizes: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -86,12 +91,7 @@ impl SearchRow<'_> {
     /// `size_bytes` are the same values `ls --json` gives — all null for a sub-agent lane, which
     /// the catalog does not list) with the hit's own title/cwd/dates laid over it, plus `score`,
     /// `snippet`, and the sub-agent provenance trio — always present, null for a top-level hit.
-    pub fn to_json(&self) -> Value {
-        self.to_json_with(&SearchRowContext::new())
-    }
-
-    /// Shape a response's hits through one operation-owned exact catalog reader. Index overlays,
-    /// key order and the legacy first-exact-copy policy match the standalone row contract.
+    /// A response's hits share one operation-owned exact catalog reader (`context`).
     pub fn to_json_with(&self, context: &SearchRowContext) -> Value {
         let cataloged = context
             .catalog
@@ -105,8 +105,8 @@ impl SearchRow<'_> {
                 )
             });
         let reference = cataloged.as_ref();
-        // Choose each final value before serialization. Valid index dates overlay the catalog;
-        // out-of-range seconds retain the catalog fallback, as in the old overlay policy.
+        // Index cwd/title and valid dates win when present; the catalog supplies their fallbacks
+        // plus canonical identity, path and count. Out-of-range index dates use the catalog too.
         let created = rfc3339(self.created_at).or_else(|| reference.and_then(|r| r.created_at).map(|t| t.to_rfc3339()));
         let updated = rfc3339(self.updated_at).or_else(|| reference.and_then(|r| r.updated_at).map(|t| t.to_rfc3339()));
         json!({
@@ -118,7 +118,13 @@ impl SearchRow<'_> {
             "created_at": created,
             "updated_at": updated,
             "message_count": reference.map(|r| r.message_count),
-            "size_bytes": reference.and_then(|r| std::fs::metadata(&r.path).ok().map(|m| m.len())),
+            "size_bytes": reference.and_then(|r| {
+                *context
+                    .sizes
+                    .borrow_mut()
+                    .entry(r.path.clone())
+                    .or_insert_with(|| std::fs::metadata(&r.path).ok().map(|m| m.len()))
+            }),
             "score": self.score,
             "snippet": self.snippet,
             "agent_id": self.agent_id,
@@ -175,36 +181,75 @@ pub fn touched_row(t: &TouchedSession) -> Value {
     })
 }
 
-/// The keys a §3 session row carries, in order — for tests and `cv schema`.
-pub const SESSION_ROW_KEYS: [&str; 9] = [
-    "id",
-    "harness",
-    "path",
-    "cwd",
-    "title",
-    "created_at",
-    "updated_at",
-    "message_count",
-    "size_bytes",
-];
+/// `head` then `tail`, as one array: the §3 rows are `SessionRef::FIELDS` plus what each row adds.
+const fn joined<const N: usize>(head: &[&'static str], tail: &[&'static str]) -> [&'static str; N] {
+    let mut out = [""; N];
+    let mut i = 0;
+    while i < head.len() {
+        out[i] = head[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < tail.len() {
+        out[i + j] = tail[j];
+        j += 1;
+    }
+    assert!(i + j == N, "the row's key count is its parts' sum");
+    out
+}
+
+/// The keys a §3 session row carries, in order: [`SessionRef::FIELDS`] plus `size_bytes`.
+pub const SESSION_ROW_KEYS: [&str; SessionRef::FIELDS.len() + 1] = joined(SessionRef::FIELDS, &["size_bytes"]);
+
+/// The keys a sub-agent forest row carries (`/api/session/{harness}/{id}/subagents`), in order:
+/// the session row plus the sidecar enrichment the forest view groups by.
+pub const SUBAGENT_ROW_KEYS: [&str; SESSION_ROW_KEYS.len() + 7] = joined(
+    &SESSION_ROW_KEYS,
+    &[
+        "agent_id",
+        "agent_type",
+        "description",
+        "tool_use_id",
+        "workflow",
+        "result_status",
+        "result_summary",
+    ],
+);
+
+/// One sub-agent of a forest as its row: [`session_row`] of its transcript, then the
+/// [`SUBAGENT_ROW_KEYS`] it adds, each an explicit `null` when the sidecar did not say.
+pub fn subagent_row(s: &crate::AgentRef, size_bytes: Option<u64>) -> Value {
+    let crate::AgentRef {
+        session,
+        agent_type,
+        description,
+        tool_use_id,
+        workflow,
+        result_status,
+        result_summary,
+    } = s;
+    let mut row = session_row(session, size_bytes);
+    let map = row.as_object_mut().expect("session_row is an object");
+    let added = [
+        json!(s.agent_id()),
+        json!(agent_type),
+        json!(description),
+        json!(tool_use_id),
+        json!(workflow),
+        json!(result_status),
+        json!(result_summary),
+    ];
+    for (key, value) in SUBAGENT_ROW_KEYS[SESSION_ROW_KEYS.len()..].iter().zip(added) {
+        map.insert((*key).into(), value);
+    }
+    row
+}
 
 /// The keys a §3 search row carries, in order: the session row plus what the search contributed.
-pub const SEARCH_ROW_KEYS: [&str; 14] = [
-    "id",
-    "harness",
-    "path",
-    "cwd",
-    "title",
-    "created_at",
-    "updated_at",
-    "message_count",
-    "size_bytes",
-    "score",
-    "snippet",
-    "agent_id",
-    "parent_id",
-    "workflow",
-];
+pub const SEARCH_ROW_KEYS: [&str; SESSION_ROW_KEYS.len() + 5] = joined(
+    &SESSION_ROW_KEYS,
+    &["score", "snippet", "agent_id", "parent_id", "workflow"],
+);
 
 #[cfg(test)]
 mod tests {
@@ -219,7 +264,7 @@ mod tests {
             title: None,
             created_at: None,
             updated_at: None,
-            message_count: 3,
+            message_count: Some(3),
         }
     }
 
@@ -229,7 +274,37 @@ mod tests {
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys, SESSION_ROW_KEYS, "§3 row keys, in order");
         assert!(v["title"].is_null(), "missing title is an explicit null");
+        assert_eq!(v["message_count"], 3);
         assert_eq!(v["size_bytes"], 10);
+        let uncounted = SessionRef {
+            message_count: None,
+            ..a_ref()
+        };
+        assert!(
+            session_row(&uncounted, None)["message_count"].is_null(),
+            "not counted yet is null, never 0"
+        );
+    }
+
+    #[test]
+    fn subagent_rows_carry_the_session_row_plus_the_sidecar_fields() {
+        let agent = crate::AgentRef {
+            session: SessionRef {
+                id: "agent-a1".into(),
+                ..a_ref()
+            },
+            agent_type: Some("Explore".into()),
+            description: None,
+            tool_use_id: Some("toolu_1".into()),
+            workflow: None,
+            result_status: None,
+            result_summary: None,
+        };
+        let row = subagent_row(&agent, None);
+        let keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, SUBAGENT_ROW_KEYS);
+        assert_eq!(row["agent_id"], "a1");
+        assert!(row["description"].is_null());
     }
 
     #[test]
@@ -250,7 +325,7 @@ mod tests {
             parent_id: Some("parent"),
             workflow: Some("wf_1"),
         }
-        .to_json();
+        .to_json_with(&SearchRowContext::new());
         let keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys, SEARCH_ROW_KEYS, "§3 search row keys, in order");
         assert_eq!(row["created_at"], "2023-11-14T22:13:20+00:00");

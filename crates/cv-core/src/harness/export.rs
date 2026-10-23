@@ -1,3 +1,5 @@
+//! Readers for account exports into cv; the CLI export group writes sessions out.
+//!
 //! **Account data-export** adapters — the archives you download from ChatGPT ("Export data") and
 //! Claude.ai. Both pack *many* conversations into one big JSON file (`conversations.json`, often split
 //! `conversations-000.json … -NNN.json`), so unlike the per-session harnesses one file yields many
@@ -19,14 +21,14 @@
 use super::wire::anthropic;
 use super::{ts_from_value, Adapter};
 use crate::ir::*;
-use crate::stream::{MessageSink, ParseOptions};
+use crate::stream::{Demand, MessageSink};
 use anyhow::{Context, Result};
 
 mod native;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     ChatGpt,
     Claude,
 }
@@ -40,76 +42,47 @@ impl Kind {
     }
 }
 
-// ── Adapters (thin wrappers over the shared engine, one per export shape) ──────
+// ── Adapters (one per export shape over the shared engine) ────────────────────
 
-pub struct ChatGptExport;
-pub struct ClaudeExport;
-impl Adapter for ChatGptExport {
-    fn harness(&self) -> Harness {
-        Harness::ChatGptExport
-    }
-    fn roots(&self) -> Vec<PathBuf> {
-        export_dirs()
-    }
-    fn discover(&self) -> Result<Vec<SessionRef>> {
-        Ok(discover_kind(Kind::ChatGpt))
-    }
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
-        crate::stream::checked(sink, |sink| native::stream(Kind::ChatGpt, r, opts, sink))
-    }
-}
-
-impl Adapter for ClaudeExport {
-    fn harness(&self) -> Harness {
-        Harness::ClaudeExport
-    }
-    fn roots(&self) -> Vec<PathBuf> {
-        export_dirs()
-    }
-    fn discover(&self) -> Result<Vec<SessionRef>> {
-        Ok(discover_kind(Kind::Claude))
-    }
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
-        crate::stream::checked(sink, |sink| native::stream(Kind::Claude, r, opts, sink))
-    }
-}
-
-impl ChatGptExport {
-    /// Discover only supplied export files/directories, without consulting configuration.
-    pub fn with_roots(roots: Vec<PathBuf>) -> impl Adapter {
-        RootedExport {
-            kind: Kind::ChatGpt,
-            roots,
-        }
-    }
-}
-impl ClaudeExport {
-    /// Discover only supplied export files/directories, without consulting configuration.
-    pub fn with_roots(roots: Vec<PathBuf>) -> impl Adapter {
-        RootedExport {
-            kind: Kind::Claude,
-            roots,
-        }
-    }
-}
-struct RootedExport {
+/// One export adapter: the archive's shape ([`Kind`]) and where its files come from — the
+/// registered sources (`roots: None`, read at discovery time) or an explicit list.
+#[derive(Clone)]
+pub struct ExportAdapter {
     kind: Kind,
-    roots: Vec<PathBuf>,
+    roots: Option<Vec<PathBuf>>,
 }
-impl Adapter for RootedExport {
+
+/// The registered-sources adapter of each shape ([`super::rootless`]).
+pub(crate) static CHATGPT_EXPORT: ExportAdapter = ExportAdapter {
+    kind: Kind::ChatGpt,
+    roots: None,
+};
+pub(crate) static CLAUDE_EXPORT: ExportAdapter = ExportAdapter {
+    kind: Kind::Claude,
+    roots: None,
+};
+
+impl ExportAdapter {
+    /// Discover only supplied export files/directories, without consulting configuration.
+    pub(crate) fn with_roots(kind: Kind, roots: Vec<PathBuf>) -> Self {
+        ExportAdapter {
+            kind,
+            roots: Some(roots),
+        }
+    }
+}
+
+impl Adapter for ExportAdapter {
     fn harness(&self) -> Harness {
         self.kind.harness()
     }
     fn roots(&self) -> Vec<PathBuf> {
-        self.roots.clone()
+        self.roots.clone().unwrap_or_else(export_dirs)
     }
-    fn discover(&self) -> Result<Vec<SessionRef>> {
-        Ok(discover_kind_in(
-            self.kind,
-            files_under(self.roots.clone(), is_conversations_file),
-        ))
+    fn discover(&self) -> Result<crate::Discovered> {
+        Ok(discover_kind_under(self.kind, self.roots()))
     }
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| native::stream(self.kind, r, opts, sink))
     }
 }
@@ -132,16 +105,26 @@ pub(crate) fn export_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Every `conversations*.json` under the export dirs.
-fn export_files() -> Vec<PathBuf> {
-    files_under(export_dirs(), is_conversations_file)
-}
-
 /// Every file under `roots` matching `pred` (depth ≤ 2; a dir entry is scanned, a file entry is
-/// taken directly), sorted and deduped. Shared with [`opensession`](super::opensession), which
-/// discovers `.opensession.json` documents through the same registered sources — they have no
-/// fixed home either.
-pub(crate) fn files_under(roots: Vec<PathBuf>, pred: fn(&Path) -> bool) -> Vec<PathBuf> {
+/// taken directly), sorted and deduped; a directory that cannot be read is added to `skipped`.
+/// Shared with [`opensession`](super::opensession), which discovers `.opensession.json`
+/// documents through the same registered sources — they have no fixed home either.
+pub(crate) fn files_under(
+    roots: Vec<PathBuf>,
+    pred: fn(&Path) -> bool,
+    skipped: &mut Vec<crate::Skipped>,
+) -> Vec<PathBuf> {
+    let mut entries = |dir: &Path| -> Vec<PathBuf> {
+        let mut found = crate::Discovered::default();
+        let listed = found
+            .keep(dir, std::fs::read_dir(dir).map_err(Into::into))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| found.keep(dir, entry.map_err(Into::into)).map(|e| e.path()))
+            .collect();
+        skipped.append(&mut found.skipped);
+        listed
+    };
     let mut out = Vec::new();
     for root in roots {
         if root.is_file() {
@@ -151,13 +134,11 @@ pub(crate) fn files_under(roots: Vec<PathBuf>, pred: fn(&Path) -> bool) -> Vec<P
             continue;
         }
         // root dir + one level of subdirs (an extracted export is usually a subfolder)
-        for depth1 in std::fs::read_dir(&root).into_iter().flatten().flatten() {
-            let p = depth1.path();
+        for p in entries(&root) {
             if p.is_file() && pred(&p) {
                 out.push(p);
             } else if p.is_dir() {
-                for depth2 in std::fs::read_dir(&p).into_iter().flatten().flatten() {
-                    let q = depth2.path();
+                for q in entries(&p) {
                     if q.is_file() && pred(&q) {
                         out.push(q);
                     }
@@ -176,27 +157,19 @@ fn is_conversations_file(p: &Path) -> bool {
         .is_some_and(|n| n == "conversations.json" || (n.starts_with("conversations") && n.ends_with(".json")))
 }
 
-/// Enumerate every conversation of `kind` across all export files as lightweight [`SessionRef`]s.
-/// Reads each file once: parse the array, sniff the kind from its first element, then enumerate.
-/// Dedups by conversation id (keeping the first) — overlapping exports (e.g. a loose
-/// `conversations-000.json` plus an extracted full archive) commonly repeat the same conversation.
-fn discover_kind(kind: Kind) -> Vec<SessionRef> {
-    discover_kind_in(kind, export_files())
+/// [`discover_kind_in`] over every `conversations*.json` under `roots`; an unreadable dir is
+/// reported beside the archives' own skips.
+fn discover_kind_under(kind: Kind, roots: Vec<PathBuf>) -> crate::Discovered {
+    let mut skipped = Vec::new();
+    let files = files_under(roots, is_conversations_file, &mut skipped);
+    let mut out = discover_kind_in(kind, files);
+    skipped.append(&mut out.skipped);
+    out.skipped = skipped;
+    out
 }
 
-fn discover_kind_in(kind: Kind, paths: Vec<PathBuf>) -> Vec<SessionRef> {
+fn discover_kind_in(kind: Kind, paths: Vec<PathBuf>) -> crate::Discovered {
     native::discover(kind, paths)
-}
-
-// ── Parse one conversation ──────────────────────────────────────────────────
-
-fn role_from_str(s: &str) -> Role {
-    match s {
-        "user" | "human" => Role::User,
-        "assistant" => Role::Assistant,
-        "tool" => Role::Tool,
-        _ => Role::System,
-    }
 }
 
 #[cfg(test)]

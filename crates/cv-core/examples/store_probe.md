@@ -1,9 +1,8 @@
 # Store probe
 
 This diagnostic example performs one operation per process without modifying harness stores.
-It supports Claude, Codex, Gemini, OpenClaw, Continue, LM Studio, Cline, Kimi, Kimi Code, Grok, Qwen,
-OpenSession, ChatGPT/Claude account exports and (with SQLite enabled) Cursor, OpenCode, Devin,
-Hermes, Goose and Zed through explicit-root constructors. Direct stream operations never update
+It supports every harness (the SQLite ones with SQLite enabled) through the registry's
+explicit-root constructor, `harness::for_harness_with_root`. Direct stream operations never update
 the catalog or detect installed homes to resolve IDs. The `sessions` operation follows production
 fleet detection from `HOME`/XDG and may perform a scoped or full discovery.
 
@@ -29,11 +28,10 @@ Run `OP HARNESS ID PATH`, optionally `--root DIR`, `--mode lazy|lazy-extra|facts
 `--mode facts` requests the shared reducer metadata projection; adapters without a projection
 implementation retain full extras. Compare reducer outputs rather than Message JSON across these
 two modes. The default mode is lazy. The root defaults to the input's parent; for discovery
-pass the config/runtime root explicitly (`projects/`, `sessions/`, or `tmp/` lives beneath it).
-Continue expects its global directory containing `sessions/`; LM Studio expects the conversations
-directory containing `*.conversation.json` itself. OpenClaw expects its state directory.
-Cline expects a home containing `.cline/`; Kimi, Kimi Code and Grok expect their native homes
-containing `sessions/`. Devin/Zed expect the directory containing `sessions.db`/`threads.db`. Directory session
+pass the root explicitly: what `for_harness_with_root` documents for the harness (Claude's config
+dir, Codex's home, Continue's global dir, LM Studio's conversations dir, OpenClaw's state dir, a
+user home for Cline and Roo, the dir holding `sessions.db`/`threads.db` for Devin/Zed, a Cursor
+`User` dir or CLI home, …). Directory session
 paths (Kimi, Kimi Code and Grok) report directory metadata size, not total transcript/sidecar bytes;
 use the generator manifest for total generated physical source sizes.
 OpenSession and account exports scan only the explicit root, excluding configured exports and
@@ -128,8 +126,8 @@ Use `/usr/bin/time -l` (macOS) or `/usr/bin/time -v` (Linux) around each clean p
 wall/user/system CPU, RSS and faults. JSON `wall_seconds` measures the stage only; process RSS
 includes startup and setup. For macOS file-backed versus private residency also inspect
 `vmmap --summary`/`footprint` on a long enough run. A directory/whole DB size is not selected
-session bytes; this tool labels metadata size `physical_input_bytes` and reports traversed bytes
-as unknown. It never primes input with a whole-file read. Record explicitly warmed versus
+session bytes; this tool labels metadata size `physical_input_bytes` and does not report traversed
+bytes (it cannot measure them). It never primes input with a whole-file read. Record explicitly warmed versus
 unprimed input and catalog state, and do not claim a cold OS cache without controlling it.
 
 Generate fresh representative fixtures outside the measured process:
@@ -208,7 +206,7 @@ uses the independent lazy collector followed by `matches_full`. Both require a s
 report the same boolean result, and force lazy parsing. The collected session stays alive through
 the heap snapshot. Use rich tool arguments and repeated events to measure retained history;
 large text spans alone do not exercise that distinction. Callback counts are not observed by
-these composed APIs. Compaction predicates have a separate validation pass and should be
+these composed APIs (`messages` is null). Compaction predicates have a separate validation pass and should be
 measured separately from ordinary tool/model/path queries.
 
 `perf-fixture.py claude|codex NEW_DIR --shape tool-arguments --records N --payload-bytes B`
@@ -227,7 +225,7 @@ this gate promises bounded history retention, not lazy argument materialization.
 `tools-collect` uses the previous EventSink collection followed by `from_events`. Both force
 lazy parsing and report the complete small histogram as `detail`, so exact output parity needs
 no additional digest or transcript materialization. Neither updates the catalog. Callback counts
-are not observed by the composed histogram API. Use fixed-size tool calls with distinct targets
+are not observed by the composed histogram API (`messages` is null). Use fixed-size tool calls with distinct targets
 and one tool name to distinguish retained event history from demanded histogram output. The old
 path includes EventSink's per-record checkpoint requests; the histogram consumer never resumes
 from or stores them.
@@ -243,11 +241,12 @@ heap and clean timing runs, and state whether the scratch catalog is new or alre
 
 `tools/check-heap-budget.py MMAP_HEAP_PROBE --no-mmap-probe RANGED_HEAP_PROBE --only events`
 is the event retention gate run in CI. It generates 20,000 and 200,000
-small Claude Edit records with distinct targets, verifies every persisted row and the source stamp,
-checks temporary-file cleanup and I/O accounting, and bounds Rust heap at 1 MiB with 256 KiB growth.
-The retained `events-collected` oracle must produce identical rows and demonstrate growing heap.
-The focused event case uses only the mmap binary. Native SQLite memory, giant tool arguments and
-crash cleanup remain outside this heap guarantee.
+calls per case: unfinished Claude Edits, open-many/close-in-reverse/reopen, and Codex visible patches
+with native completions adding another path. Both mmap and positioned probes (with `sqlite`) verify
+every persisted row and source stamp, temporary-file cleanup and I/O accounting, with unchanged
+1 MiB Rust heap and 256 KiB growth limits. The retained `events-collected` control must produce
+identical rows and demonstrate growing heap. Native SQLite memory, giant native diffs/tool
+arguments and crash cleanup remain outside this heap guarantee.
 
 `hash --raw-order` resolves content but preserves IR map insertion order in message and metadata
 digests. It detects serialization-order drift that the default canonical digest deliberately
@@ -324,7 +323,7 @@ counters work with a successful 4,096-byte allocation before setup. A failed/dis
 error, rather than a reported zero. After optional discovery setup, stage counters reset and report
 baseline/end/peak live bytes, peak above baseline, live/peak allocation counts, and largest single
 allocation request. Counts are simultaneous outstanding allocations; cumulative allocation requests
-and requested bytes are unavailable from SQLite's built-in status API and reported as null.
+and requested bytes are unavailable from SQLite's built-in status API and not reported.
 
 These counters include SQLite-managed page caches and SQLite's allocator bookkeeping, exclude
 underlying system allocator overhead, and do not measure mapped pages or filesystem residency.

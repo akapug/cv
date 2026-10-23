@@ -144,12 +144,12 @@
 
 mod record;
 
-use super::store::sqlite::{columns, open_ro, table_exists, Cell, Cells};
+use super::store::sqlite::{open_ro, table_exists, Cell, Cells, Select};
 use super::store::xdg_data_dir;
-use super::{note_skipped_lines, ts_from_epoch, Adapter};
+use super::{ts_from_epoch, Adapter, Unparsed};
 use crate::ir::*;
-use crate::stream::{Flow, MessageSink, ParseOptions};
-use anyhow::Result;
+use crate::stream::{Demand, Flow, MessageSink};
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -159,6 +159,10 @@ pub struct Devin {
     /// The `~/.local/share/devin/cli` dir (candidate — may not exist).
     root: PathBuf,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Devin = Devin { root: PathBuf::new() };
 
 impl Devin {
     pub fn detect() -> Self {
@@ -187,36 +191,70 @@ impl Devin {
 }
 
 impl Adapter for Devin {
+    /// `agent_mode` is Devin's permission mode (`bypass`, `normal`, `accept-edits`, `plan`).
+    fn session_affordances(&self, s: &Session) -> Vec<crate::affordance::Affordance> {
+        match s.harness_extra(Harness::Devin).and_then(|bag| bag.get("agent_mode")) {
+            Some(Value::String(mode)) => vec![crate::affordance::mode_row("agent_mode", &[mode.as_str()])],
+            _ => Vec::new(),
+        }
+    }
+
     fn harness(&self) -> Harness {
         Harness::Devin
+    }
+
+    /// The chains the session's `subagent_heads` table names.
+    fn forest(
+        &self,
+        r: &SessionRef,
+        _demand: crate::SubagentDemand,
+        workflow: Option<&str>,
+        select: &(dyn Fn(&str, Option<&str>) -> bool + Sync),
+    ) -> Result<Vec<crate::AgentRef>> {
+        Ok(super::select_forest(subagent_tree(&r.path, &r.id)?, workflow, select))
     }
 
     fn roots(&self) -> Vec<PathBuf> {
         self.db_path().map(|_| self.root.clone()).into_iter().collect()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         let Some(db) = self.db_path() else {
-            return Ok(vec![]);
+            return Ok(Default::default());
         };
-        super::store::sqlite::cached_discover(&db, || {
-            let Ok(conn) = open_ro(&db) else {
-                return Ok(vec![]);
-            };
-            conn.read(|conn| discover_conn(conn, &db))
-        })
+        // One database: one that cannot open (locked, unreadable, not a database) is skipped.
+        let mut found = crate::Discovered::default();
+        let refs =
+            super::store::sqlite::cached_discover(&db, || open_ro(&db)?.read(|conn, _| discover_conn(conn, &db)));
+        if let Some(refs) = found.keep(&db, refs) {
+            found.refs = refs;
+        }
+        Ok(found)
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    /// Every session's certificate ([`rows_conn`]).
+    fn rows(&self, store: &Path) -> Option<HashMap<String, crate::source::Rows>> {
+        open_ro(store).ok()?.read(|conn, _| rows_conn(conn)).ok()
+    }
+
+    /// A sub-agent `<session_id>/<agent_id>` reads its parent session's forest and row: the
+    /// parent's certificate covers it.
+    fn rows_key<'a>(&self, r: &'a SessionRef) -> &'a str {
+        r.id.split_once('/').map_or(&r.id, |(session, _)| session)
+    }
+
+    /// Devin writes its session database in place.
+    fn watch_policy(&self, _r: &SessionRef) -> super::WatchPolicy {
+        super::WatchPolicy::Database
+    }
+
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             // Spawn turns, sub-agent returns and deferred tool calls, typed (`crate::affordance`).
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Devin, sink);
             let sink: &mut dyn MessageSink = &mut spawns;
             let conn = open_ro(&r.path)?;
-            conn.read(|conn| {
-                let cells = Cells::new(conn, &r.path, conn.reads(), "message_nodes")?;
-                stream_conn(conn, r, sink, &cells, opts.spans)
-            })
+            conn.read(|conn, reads| stream_conn(conn, r, sink, reads, opts.spans))
         })
     }
 }
@@ -236,6 +274,8 @@ struct Forest {
     navigation: HashMap<i64, record::Navigation>,
     node_meta: HashMap<i64, NodeFacts>,
     receipts: Vec<(String, i64, Option<i64>)>,
+    /// Per sub-agent, the lowest node naming it and that node's tool call ([`spawning_call`]).
+    spawns: HashMap<String, (i64, Option<String>)>,
 }
 
 /// One node row: its creation time and its `chat_message` and `metadata` cells.
@@ -245,32 +285,37 @@ struct Node {
     meta: Option<Cell>,
 }
 
+#[cfg(test)]
+thread_local! { static FOREST_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 fn load_forest(conn: &Connection, session_id: &str, cells: &Cells) -> Result<Forest> {
+    #[cfg(test)]
+    FOREST_LOADS.with(|n| n.set(n.get() + 1));
     let mut f = Forest::default();
-    if let Ok(mut stmt) = conn.prepare("SELECT node_id, parent_node_id FROM message_nodes WHERE session_id = ?1") {
-        if let Ok(rows) = stmt.query_map([session_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
-        }) {
-            for r in rows.flatten() {
-                f.parents.insert(r.0, r.1);
-            }
-        }
+    let mut stmt = conn.prepare("SELECT node_id, parent_node_id FROM message_nodes WHERE session_id = ?1")?;
+    let rows = stmt.query_map([session_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+    })?;
+    for r in rows {
+        let (node, parent) = r?;
+        f.parents.insert(node, parent);
     }
-    let metadata = if columns(conn, "message_nodes").contains("metadata") {
-        cells.select("metadata")
-    } else {
-        "NULL, NULL".into()
-    };
+    let select = Select::of(conn, "message_nodes")
+        .always(&["node_id", "created_at"])
+        .cell(cells, "chat_message")
+        .cell(cells, "metadata");
+    let (node_at, created_at) = (select.index("node_id")?, select.index("created_at")?);
+    let (chat_at, meta_at) = (select.index("chat_message")?, select.index("metadata")?);
     let mut statement = conn.prepare(&format!(
-        "SELECT node_id, created_at, {}, {metadata} FROM message_nodes WHERE session_id=?1 ORDER BY node_id",
-        cells.select("chat_message")
+        "SELECT {} FROM message_nodes WHERE session_id=?1 ORDER BY node_id",
+        select.list()
     ))?;
     let mut rows = statement.query([session_id])?;
     while let Some(row) = rows.next()? {
-        let node: i64 = row.get(0)?;
-        let created = row.get::<_, Option<i64>>(1).ok().flatten();
-        let chat = cells.cell(conn, "message_nodes", "chat_message", row, 2)?;
-        let meta = cells.cell(conn, "message_nodes", "metadata", row, 4)?;
+        let node: i64 = row.get(node_at)?;
+        let created = row.get::<_, Option<i64>>(created_at).ok().flatten();
+        let chat = cells.cell(conn, "message_nodes", "chat_message", row, chat_at)?;
+        let meta = cells.cell(conn, "message_nodes", "metadata", row, meta_at)?;
         if let Some(facts) = meta
             .map(|meta| cells.read(meta, record::facts))
             .transpose()?
@@ -294,7 +339,102 @@ fn load_forest(conn: &Connection, session_id: &str, cells: &Cells) -> Result<For
         }
         f.nodes.insert(node, Node { created, chat, meta });
     }
+    for (&node, n) in &f.navigation {
+        if let Some(agent) = &n.agent_id {
+            let spawn = f.spawns.entry(agent.clone()).or_insert((node, n.tool_call_id.clone()));
+            if node < spawn.0 {
+                *spawn = (node, n.tool_call_id.clone());
+            }
+        }
+    }
     Ok(f)
+}
+
+type ForestKey = (PathBuf, String, Vec<Option<crate::source::FileId>>);
+type SharedForests = std::sync::Mutex<HashMap<ForestKey, std::sync::Weak<(Cells, Forest)>>>;
+static SHARED: std::sync::LazyLock<SharedForests> = std::sync::LazyLock::new(Default::default);
+thread_local! {
+    static LAST: std::cell::RefCell<Option<std::sync::Arc<(Cells, Forest)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Forget every kept forest, as a new process starts (tests).
+#[cfg(test)]
+fn forget_forests() {
+    SHARED.lock().unwrap().clear();
+    LAST.with(|last| last.borrow_mut().take());
+}
+
+/// A session's forest with the cells it was read into, for a read at the store's current state:
+/// the one a parent's or a sibling sub-agent's read of the same session loaded at this state, or
+/// a fresh load. Every sub-agent reads its parent's whole forest, so a parent and its k
+/// sub-agents loaded it k+1 times. Each thread keeps the last forest it read (memory: one
+/// session's forest per thread), and every thread finds one another thread still keeps.
+fn loaded_forest(
+    conn: &Connection,
+    db: &Path,
+    session_id: &str,
+    reads: &crate::source::ReadSet,
+) -> Result<std::sync::Arc<(Cells, Forest)>> {
+    use std::sync::{Arc, Weak};
+    let state = || -> Vec<Option<crate::source::FileId>> {
+        let mut files: Vec<PathBuf> = crate::source::sqlite_sidecars(db).into();
+        files.push(db.to_path_buf());
+        files.iter().map(|f| crate::source::FileId::at(f)).collect()
+    };
+    let key: ForestKey = (std::path::absolute(db)?, session_id.to_owned(), state());
+    let shared = || SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let found = shared().get(&key).and_then(Weak::upgrade);
+    let loaded = match found {
+        Some(loaded) => loaded,
+        None => {
+            let cells = Cells::new(conn, db, reads, "message_nodes")?;
+            let forest = load_forest(conn, session_id, &cells)?;
+            let loaded = Arc::new((cells, forest));
+            // Shared only when no write landed while it loaded.
+            if state() == key.2 {
+                let mut shared = shared();
+                shared.retain(|_, kept| kept.strong_count() > 0);
+                shared.insert(key, Arc::downgrade(&loaded));
+            }
+            loaded
+        }
+    };
+    LAST.with(|last| *last.borrow_mut() = Some(loaded.clone()));
+    Ok(loaded)
+}
+
+/// Every session's [`Rows`](crate::source::Rows) certificate: what a read of it, or of any of its
+/// sub-agent chains, consults besides message bodies. Its whole `sessions` row (the main chain id
+/// among it); per `message_nodes` row, in `row_id` order, its `row_id`, node id, parent node id,
+/// `created_at` and the byte lengths of `chat_message` and `metadata` (headers, never bodies); its
+/// `subagent_heads` rows; and the store's schema version, which the read reports.
+fn rows_conn(conn: &Connection) -> Result<HashMap<String, crate::source::Rows>> {
+    let mut certificates = super::store::sqlite::Certificates::default();
+    let version = if table_exists(conn, "refinery_schema_history") {
+        "(SELECT MAX(version) FROM refinery_schema_history)"
+    } else {
+        "NULL"
+    };
+    certificates.digest(conn, &format!("SELECT id, {version}, * FROM sessions ORDER BY id"))?;
+    let metadata = if super::store::sqlite::columns(conn, "message_nodes").contains("metadata") {
+        "octet_length(metadata)"
+    } else {
+        "NULL"
+    };
+    certificates.rows(
+        conn,
+        &format!(
+            "SELECT session_id, row_id, node_id, parent_node_id, created_at, octet_length(chat_message), {metadata} \
+             FROM message_nodes ORDER BY session_id, row_id"
+        ),
+    )?;
+    if table_exists(conn, "subagent_heads") {
+        certificates.digest(
+            conn,
+            "SELECT session_id, agent_id, chain_node_id, updated_at FROM subagent_heads ORDER BY session_id, agent_id",
+        )?;
+    }
+    Ok(certificates.0)
 }
 
 /// Walk from `head` up `parent_node_id` to a root and reverse it into transcript order. Cycles
@@ -331,37 +471,41 @@ fn chain_head(f: &Forest, main_chain_id: Option<i64>) -> (Option<i64>, bool) {
 /// sub-agent that only a tool row names. 3000.11.3's `run_subagent` writes no `subagent_heads`
 /// row: its result row's `metadata.extensions` carry `subagent/agent_id` and
 /// `subagent/chain_node_id` (the child chain's tail), and that is the only pointer to the chain.
-fn subagent_head_rows(conn: &Connection, session_id: &str, forest: &Forest) -> Vec<(String, i64, Option<i64>)> {
+fn subagent_head_rows(conn: &Connection, session_id: &str, forest: &Forest) -> Result<Vec<(String, i64, Option<i64>)>> {
     let mut out: Vec<(String, i64, Option<i64>)> = Vec::new();
     if table_exists(conn, "subagent_heads") {
-        if let Ok(mut stmt) =
-            conn.prepare("SELECT agent_id, chain_node_id, updated_at FROM subagent_heads WHERE session_id = ?1")
-        {
-            if let Ok(rows) = stmt.query_map([session_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<i64>>(2).ok().flatten(),
-                ))
-            }) {
-                out.extend(rows.flatten());
+        let mut stmt =
+            conn.prepare("SELECT agent_id, chain_node_id, updated_at FROM subagent_heads WHERE session_id = ?1")?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2).ok().flatten(),
+            ))
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    // Indexed by agent: a session with many sub-agents and receipts scanned both lists per receipt.
+    let listed: HashSet<&str> = out.iter().map(|(a, ..)| a.as_str()).collect();
+    let mut from_tools: Vec<(String, i64, Option<i64>)> = Vec::new();
+    let mut at_index: HashMap<&str, usize> = HashMap::new();
+    for (agent, head, at) in &forest.receipts {
+        if listed.contains(agent.as_str()) {
+            continue;
+        }
+        match at_index.get(agent.as_str()) {
+            Some(&i) if *head > from_tools[i].1 => from_tools[i] = (agent.clone(), *head, *at),
+            Some(_) => {}
+            None => {
+                at_index.insert(agent, from_tools.len());
+                from_tools.push((agent.clone(), *head, *at));
             }
         }
     }
-    let receipts = &forest.receipts;
-    let mut from_tools: Vec<(String, i64, Option<i64>)> = Vec::new();
-    for (agent, head, at) in receipts.iter().cloned() {
-        if out.iter().any(|(a, ..)| *a == agent) {
-            continue;
-        }
-        match from_tools.iter_mut().find(|(a, ..)| *a == agent) {
-            Some(e) if head > e.1 => *e = (agent, head, at),
-            Some(_) => {}
-            None => from_tools.push((agent, head, at)),
-        }
-    }
     out.extend(from_tools);
-    out
+    Ok(out)
 }
 
 /// user + assistant turns on `head`'s chain — the [`SessionRef::message_count`] contract
@@ -400,27 +544,22 @@ fn child_ref(
         None => format!("[{agent}]"),
     };
     Some(SessionRef {
-        id: format!("{session_id}/{agent}"),
-        harness: Harness::Devin,
-        path: db.to_path_buf(),
         cwd: parent.cwd.clone(),
-        title: Some(crate::ir::truncate(&title, 80)),
+        title: Some(crate::ir::truncate(&title, crate::projection::Head::TITLE)),
         created_at: parent.created_at,
         updated_at: updated.and_then(ts_from_epoch).or(parent.updated_at),
-        message_count: chain_message_count(forest, Some(head)),
+        message_count: Some(chain_message_count(forest, Some(head))),
+        ..SessionRef::new(format!("{session_id}/{agent}"), Harness::Devin, db.to_path_buf())
     })
 }
 
 fn discover_conn(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
-    let cols = columns(conn, "sessions");
-    let has = |c: &str| cols.contains(c);
-    let sel = |c: &str| if has(c) { c.to_string() } else { "NULL".to_string() };
-    let sql = format!(
-        "SELECT id, working_directory, {}, created_at, last_activity_at, {} \
-         FROM sessions ORDER BY last_activity_at DESC",
-        sel("title"),
-        sel("main_chain_id"),
-    );
+    let select = Select::of(conn, "sessions")
+        .always(&["id", "working_directory"])
+        .probed(&["title"])
+        .always(&["created_at", "last_activity_at"])
+        .probed(&["main_chain_id"]);
+    let sql = format!("SELECT {} FROM sessions ORDER BY last_activity_at DESC", select.list());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -432,26 +571,25 @@ fn discover_conn(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
             row.get::<_, Option<i64>>(5).ok().flatten(),
         ))
     })?;
-    let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "message_nodes")?;
     let mut out = Vec::new();
-    for (id, wd, title, created, last, main_chain_id) in rows.flatten() {
+    for row in rows {
+        let (id, wd, title, created, last, main_chain_id) = row?;
+        let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "message_nodes")?;
         // One forest load serves the parent's count AND its sub-agent children's.
         let forest = load_forest(conn, &id, &cells)?;
         let (head, _) = chain_head(&forest, main_chain_id);
         let parent = SessionRef {
-            id: id.clone(),
-            harness: Harness::Devin,
-            path: db.to_path_buf(),
             cwd: wd.filter(|s| !s.is_empty()).map(PathBuf::from),
             title: title
                 .filter(|s| !s.trim().is_empty())
-                .map(|t| crate::ir::truncate(&t, 80)),
+                .map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE)),
             created_at: created.and_then(ts_from_epoch),
             updated_at: last.and_then(ts_from_epoch).or_else(|| created.and_then(ts_from_epoch)),
-            message_count: chain_message_count(&forest, head),
+            message_count: Some(chain_message_count(&forest, head)),
+            ..SessionRef::new(id.clone(), Harness::Devin, db.to_path_buf())
         };
         out.push(parent.clone());
-        for (agent, head, updated) in subagent_head_rows(conn, &id, &forest) {
+        for (agent, head, updated) in subagent_head_rows(conn, &id, &forest)? {
             if let Some(r) = child_ref(db, &id, &agent, head, updated, &forest, &parent) {
                 out.push(r);
             }
@@ -463,74 +601,79 @@ fn discover_conn(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
 /// A parent's completion receipt records the tool call that launched this child. The same
 /// projection serves parsed lineage and the forest, including older tool-only subagents.
 fn spawning_call(agent: &str, forest: &Forest) -> Option<String> {
-    forest
-        .navigation
-        .iter()
-        .filter(|(_, n)| n.agent_id.as_deref() == Some(agent))
-        .min_by_key(|(node, _)| *node)
-        .and_then(|(_, n)| n.tool_call_id.clone())
+    forest.spawns.get(agent).and_then(|(_, call)| call.clone())
 }
 
 /// The sub-agent chains a session's `subagent_heads` table names — the same rows [`discover_conn`]
 /// turns into `<session_id>/<agent_id>` child refs — as the forest [`crate::subagent_tree_of`]
 /// surfaces. `agent_id` is the child's `agent_type`; a completion receipt provides its spawning
 /// tool call. Devin records no per-agent description.
-pub fn subagent_tree(db: &Path, session_id: &str) -> Vec<crate::harness::claude::SubagentInfo> {
-    let Ok(conn) = open_ro(db) else {
-        return Vec::new();
+pub fn subagent_tree(db: &Path, session_id: &str) -> Result<Vec<crate::AgentRef>> {
+    // Child refs address a chain within the root session, not another sessions row. The native
+    // store attaches every subagent head to the root; a child has no separately nested forest.
+    if session_id.contains('/') {
+        return Ok(Vec::new());
+    }
+    // Every listed session's forest, derived once per db state and kept in cv's catalog: a
+    // forest fold over an unchanged store neither copies nor opens it.
+    let forests = super::store::sqlite::derived(db, Harness::Devin, |conn, db| {
+        let listed = super::store::sqlite::cached_discover(db, || discover_conn(conn, db))?;
+        Ok(Forests(
+            listed
+                .into_iter()
+                .filter(|r| !r.id.contains('/'))
+                .filter_map(|r| Some((r.id.clone(), forest_conn(conn, db, &r.id).ok()?)))
+                .collect::<HashMap<String, Vec<crate::AgentRef>>>(),
+        ))
+    })?;
+    if let Some(forest) = forests.payload.0.get(session_id) {
+        return Ok(forest.clone());
+    }
+    open_ro(db)?.read(|conn, _| forest_conn(conn, db, session_id))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Forests(HashMap<String, Vec<crate::AgentRef>>);
+
+impl crate::source::Payload for Forests {
+    const TAG: &'static str = "devin-forests";
+}
+
+/// The subagent heads of `session_id`, each with the chain it names.
+fn forest_conn(conn: &Connection, db: &Path, session_id: &str) -> Result<Vec<crate::AgentRef>> {
+    let select = Select::of(conn, "sessions")
+        .always(&["working_directory"])
+        .probed(&["title"])
+        .always(&["created_at", "last_activity_at"]);
+    let (wd, title, created, last): (Option<String>, Option<String>, Option<i64>, Option<i64>) = conn.query_row(
+        &format!("SELECT {} FROM sessions WHERE id = ?1", select.list()),
+        [session_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let parent = SessionRef {
+        cwd: wd.filter(|s| !s.is_empty()).map(PathBuf::from),
+        title,
+        created_at: created.and_then(ts_from_epoch),
+        updated_at: last.and_then(ts_from_epoch),
+        ..SessionRef::new(session_id.to_string(), Harness::Devin, db.to_path_buf())
     };
-    conn.read(|conn| {
-        let cols = columns(conn, "sessions");
-        let sel = |c: &str| {
-            if cols.contains(c) {
-                c.to_string()
-            } else {
-                "NULL".to_string()
-            }
-        };
-        let (wd, title, created, last): (Option<String>, Option<String>, Option<i64>, Option<i64>) = conn
-            .query_row(
-                &format!(
-                    "SELECT working_directory, {}, created_at, last_activity_at FROM sessions WHERE id = ?1",
-                    sel("title")
-                ),
-                [session_id],
-                |row| {
-                    Ok((
-                        row.get(0).ok().flatten(),
-                        row.get(1).ok().flatten(),
-                        row.get(2).ok().flatten(),
-                        row.get(3).ok().flatten(),
-                    ))
-                },
-            )
-            .unwrap_or_default();
-        let parent = SessionRef {
-            cwd: wd.filter(|s| !s.is_empty()).map(PathBuf::from),
-            title,
-            created_at: created.and_then(ts_from_epoch),
-            updated_at: last.and_then(ts_from_epoch),
-            ..SessionRef::new(session_id.to_string(), Harness::Devin, db.to_path_buf())
-        };
-        let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "message_nodes")?;
-        let forest = load_forest(conn, session_id, &cells)?;
-        let mut out = Vec::new();
-        for (agent, head, updated) in subagent_head_rows(conn, session_id, &forest) {
-            if let Some(session) = child_ref(db, session_id, &agent, head, updated, &forest, &parent) {
-                out.push(crate::harness::claude::SubagentInfo {
-                    session,
-                    tool_use_id: spawning_call(&agent, &forest),
-                    agent_type: Some(agent),
-                    description: None,
-                    workflow: None,
-                    result_status: None,
-                    result_summary: None,
-                });
-            }
+    let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "message_nodes")?;
+    let forest = load_forest(conn, session_id, &cells)?;
+    let mut out = Vec::new();
+    for (agent, head, updated) in subagent_head_rows(conn, session_id, &forest)? {
+        if let Some(session) = child_ref(db, session_id, &agent, head, updated, &forest, &parent) {
+            out.push(crate::AgentRef {
+                session,
+                tool_use_id: spawning_call(&agent, &forest),
+                agent_type: Some(agent),
+                description: None,
+                workflow: None,
+                result_status: None,
+                result_summary: None,
+            });
         }
-        Ok(out)
-    })
-    .unwrap_or_default()
+    }
+    Ok(out)
 }
 
 /// Row shape of the session metadata SELECT (columns probed — absent ones come back NULL):
@@ -564,7 +707,7 @@ fn stream_conn(
     conn: &Connection,
     r: &SessionRef,
     sink: &mut dyn MessageSink,
-    cells: &Cells,
+    reads: &crate::source::ReadSet,
     spans: bool,
 ) -> Result<Session> {
     // Child ids split on the FIRST '/': `<session_id>/<agent_id>` — slugs never contain one.
@@ -572,7 +715,7 @@ fn stream_conn(
         Some((s, a)) => (s, Some(a)),
         None => (r.id.as_str(), None),
     };
-    stream_session(conn, session_id, agent_id, r, sink, cells, spans)
+    stream_session(conn, session_id, agent_id, r, sink, reads, spans)
 }
 
 /// The one chain walk / node map / meta path behind [`Adapter::stream`] for both a session and
@@ -585,50 +728,56 @@ fn stream_session(
     agent: Option<&str>,
     r: &SessionRef,
     sink: &mut dyn MessageSink,
-    cells: &Cells,
+    reads: &crate::source::ReadSet,
     spans: bool,
 ) -> Result<Session> {
-    let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
-    let cols = columns(conn, "sessions");
-    let has = |c: &str| cols.contains(c);
-    let sel = |c: &str| if has(c) { c.to_string() } else { "NULL".to_string() };
-    let sql = format!(
-        "SELECT working_directory, backend_type, model, agent_mode, created_at, last_activity_at, \
-         {}, {}, {}, {}, {}, {} FROM sessions WHERE id = ?1",
-        sel("title"),
-        sel("main_chain_id"),
-        sel("cogs_json"),
-        sel("workspace_dirs"),
-        sel("hidden"),
-        sel("metadata"),
-    );
+    let _snapshot = super::store::sqlite::snapshot(conn)?;
+    let select = Select::of(conn, "sessions")
+        .always(&[
+            "working_directory",
+            "backend_type",
+            "model",
+            "agent_mode",
+            "created_at",
+            "last_activity_at",
+        ])
+        .probed(&[
+            "title",
+            "main_chain_id",
+            "cogs_json",
+            "workspace_dirs",
+            "hidden",
+            "metadata",
+        ]);
+    let sql = format!("SELECT {} FROM sessions WHERE id = ?1", select.list());
     let (wd, backend, model, agent_mode, created, last, title, main_chain_id, cogs, wdirs, hidden, smeta): SessionRow =
         conn.query_row(&sql, [session_id], |row| {
             Ok((
-                row.get(0).ok().flatten(),
-                row.get(1).ok().flatten(),
-                row.get(2).ok().flatten(),
-                row.get(3).ok().flatten(),
-                row.get(4).ok().flatten(),
-                row.get(5).ok().flatten(),
-                row.get(6).ok().flatten(),
-                row.get(7).ok().flatten(),
-                row.get(8).ok().flatten(),
-                row.get(9).ok().flatten(),
-                row.get(10).ok().flatten(),
-                row.get(11).ok().flatten(),
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
             ))
         })
-        .unwrap_or_default();
+        .with_context(|| format!("devin session {session_id:?}"))?;
 
     // The chosen chain (see the module doc): head → root, reversed. For a child the head comes
     // from `subagent_heads.chain_node_id` — a head naming no live node leaves the chain empty
     // (counted as dangling rather than falling back, which would pick some other chain's tail).
-    let forest = load_forest(conn, session_id, cells)?;
-    let heads = subagent_head_rows(conn, session_id, &forest);
+    let loaded = loaded_forest(conn, &r.path, session_id, reads)?;
+    let (cells, forest) = (&loaded.0, &loaded.1);
+    let heads = subagent_head_rows(conn, session_id, forest)?;
     let (head, fell_back, dangling_head) = match agent {
         None => {
-            let (head, fb) = chain_head(&forest, main_chain_id);
+            let (head, fb) = chain_head(forest, main_chain_id);
             (head, fb, None)
         }
         Some(a) => match heads.iter().find(|(id, _, _)| id == a) {
@@ -641,7 +790,7 @@ fn stream_session(
     // For a child, the tool call that spawned it: the parent's `tool` row carrying
     // `subagent/agent_id` — its `tool_call_id` names the spawning call. The forest already
     // projected these receipts; absent on sessions without a completion row.
-    let spawned_by = agent.and_then(|a| spawning_call(a, &forest));
+    let spawned_by = agent.and_then(|a| spawning_call(a, forest));
 
     // The forest's bounded metadata projection serves compaction, prefix and turn counts.
     let node_meta = &forest.node_meta;
@@ -800,9 +949,6 @@ fn stream_session(
         (None, t) => t.or_else(|| r.title.clone()),
     };
     let mut s = Session {
-        source_stamp: None,
-        id: r.id.clone(),
-        harness: Harness::Devin,
         cwd: wd
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
@@ -811,11 +957,8 @@ fn stream_session(
         created_at: created.and_then(ts_from_epoch).or(r.created_at),
         updated_at: head_updated.or_else(|| last.and_then(ts_from_epoch)).or(r.updated_at),
         model,
-        git: None,
-        messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra,
-        principal: None,
         system_prompt: (!prefix.is_empty()).then(|| prefix.join("\n\n")),
         lineage: match agent {
             Some(a) => crate::ir::Lineage {
@@ -826,6 +969,7 @@ fn stream_session(
             },
             None => crate::ir::Lineage::default(),
         },
+        ..Session::new(r.id.clone(), Harness::Devin)
     };
     sink.meta(&s);
 
@@ -834,7 +978,7 @@ fn stream_session(
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut last_msg_id: Option<String> = None;
     let mut last_sf: Option<i64> = None;
-    let mut skipped = 0u64;
+    let mut unparsed = Unparsed::default();
     for &nid in &chain {
         let Some(Node {
             created: Some(created),
@@ -842,7 +986,7 @@ fn stream_session(
             meta,
         }) = forest.nodes.get(&nid)
         else {
-            skipped += 1;
+            unparsed.count();
             continue;
         };
         let carried = match meta {
@@ -862,7 +1006,7 @@ fn stream_session(
             record::node(v, nid, *created, facts, carried, &mut tool_names, spans)
         })?;
         let Some(mut m) = decoded else {
-            skipped += 1;
+            unparsed.count();
             continue;
         };
 
@@ -917,7 +1061,7 @@ fn stream_session(
             break;
         }
     }
-    note_skipped_lines(&mut s, skipped);
+    unparsed.note(&mut s);
     Ok(s)
 }
 
@@ -929,8 +1073,7 @@ fn stream_session(
 #[cfg(test)]
 fn parse_db(conn: &Connection, r: &SessionRef) -> Result<Session> {
     let mut sink = crate::stream::CollectSink::default();
-    let cells = Cells::new(conn, &r.path, &crate::source::ReadSet::default(), "message_nodes")?;
-    let mut s = stream_conn(conn, r, &mut sink, &cells, false)?;
+    let mut s = stream_conn(conn, r, &mut sink, &crate::source::ReadSet::default(), false)?;
     s.messages = sink.messages;
     Ok(s)
 }
@@ -945,6 +1088,41 @@ mod tests {
 
     fn sref(id: &str) -> SessionRef {
         SessionRef::new(id, Harness::Devin, fixture())
+    }
+
+    /// The corpus store: a node appended to one session moves its certificate (and its
+    /// sub-agents', which read its forest) alone; every other session and sub-agent reads exactly
+    /// as before.
+    #[test]
+    fn corpus_rows_certify_each_session_and_move_only_with_its_rows() {
+        let world = crate::test_world("devin-corpus-rows");
+        let db = world.base.join("sessions.db");
+        let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/devin");
+        for version in std::fs::read_dir(&corpus).unwrap() {
+            std::fs::copy(version.unwrap().path().join(".local/share/devin/cli/sessions.db"), &db).unwrap();
+            let adapter = Devin::with_root(&world.base);
+            assert!(
+                adapter.discover().unwrap().refs.iter().any(|r| r.id.contains('/')),
+                "sub-agents"
+            );
+            let leaf: String = Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT session_id FROM message_nodes ORDER BY session_id LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            super::super::store::sqlite::assert_rows_move_alone(&adapter, &db, &leaf, |c| {
+                c.execute(
+                    "INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, created_at) \
+                     SELECT ?1, max(node_id) + 1, NULL, '{\"role\":\"user\",\"content\":\"zqcertified\"}', 4102444800 \
+                     FROM message_nodes WHERE session_id = ?1",
+                    [&leaf],
+                )
+                .unwrap();
+            });
+        }
     }
 
     #[test]
@@ -966,7 +1144,7 @@ mod tests {
             }
         }
         let failure = adapter
-            .stream(&reference, &ParseOptions::default(), &mut MutatingSink(&writer))
+            .stream(&reference, &Demand::LEAN, &mut MutatingSink(&writer))
             .unwrap_err();
         assert!(failure.to_string().contains("dependencies changed"), "{failure:#}");
     }
@@ -991,8 +1169,8 @@ mod tests {
             "UPDATE message_nodes SET chat_message=json_set(chat_message,'$.content',?1) WHERE session_id=?2",
             rusqlite::params!["large body ".repeat(10000), reference.id],
         )?;
-        let inline = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
-        let mut large = crate::stream::collect_with(&adapter, &reference, &ParseOptions::lazy_extra())?;
+        let inline = crate::stream::collect_with(&adapter, &reference, &Demand::RICH)?;
+        let mut large = crate::stream::collect_with(&adapter, &reference, &Demand::RICH.with_spans())?;
         let source = |s: &Session| {
             s.messages.iter().any(|m| {
                 m.content.iter().any(|b| {
@@ -1045,7 +1223,7 @@ mod tests {
         let adapter = Devin::with_root(&world.base);
         let refs = adapter.discover()?;
         let reference = refs.iter().find(|r| r.id == "fixture-beta").unwrap();
-        for options in [ParseOptions::full(), ParseOptions::lazy_extra(), ParseOptions::facts()] {
+        for options in [Demand::RICH, Demand::RICH.with_spans(), Demand::FACTS.with_spans()] {
             let s = crate::stream::collect_with(&adapter, reference, &options)?;
             assert_eq!(s.model.as_deref(), Some("fallback-model"));
             assert_eq!(s.system_prompt.as_deref(), Some("You are a checked prefix."));
@@ -1060,7 +1238,7 @@ mod tests {
         std::fs::copy(fixture(), &path)?;
         let adapter = Devin::with_root(&world.base);
         let table = adapter.discover()?;
-        let parsed = |r: &SessionRef| crate::stream::collect_with(&adapter, r, &ParseOptions::full()).unwrap();
+        let parsed = |r: &SessionRef| crate::stream::collect_with(&adapter, r, &Demand::RICH).unwrap();
         let expected: Vec<Value> = table.iter().map(|r| serde_json::to_value(parsed(r)).unwrap()).collect();
         let writer = Connection::open(&path)?;
         writer.execute_batch(
@@ -1068,7 +1246,7 @@ mod tests {
             CREATE VIEW message_nodes AS SELECT * FROM stored_nodes;",
         )?;
         let view = adapter.discover()?;
-        assert_eq!(serde_json::to_value(&view)?, serde_json::to_value(&table)?);
+        assert_eq!(serde_json::to_value(&view.refs)?, serde_json::to_value(&table.refs)?);
         for (r, expected) in view.iter().zip(expected) {
             assert_eq!(serde_json::to_value(parsed(r))?, expected, "{}", r.id);
         }
@@ -1083,7 +1261,7 @@ mod tests {
         let writer = Connection::open(&path)?;
         let adapter = Devin::with_root(&world.base);
         let reference = SessionRef::new("fixture-beta", Harness::Devin, &path);
-        let base = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
+        let base = crate::stream::collect_with(&adapter, &reference, &Demand::RICH)?;
         for (cell, skipped) in [
             (
                 "CAST('{\"role\":\"assistant\",\"content\":\"blob body\"}' AS BLOB)",
@@ -1098,7 +1276,7 @@ mod tests {
                 "UPDATE message_nodes SET chat_message={cell} \
                 WHERE session_id='fixture-beta' AND node_id=3;"
             ))?;
-            for options in [ParseOptions::full(), ParseOptions::lazy_extra()] {
+            for options in [Demand::RICH, Demand::RICH.with_spans()] {
                 let s = crate::stream::collect_with(&adapter, &reference, &options)?;
                 let noted = |s: &Session| {
                     s.cv_extra()
@@ -1132,8 +1310,8 @@ mod tests {
         )?;
         let refs = discover_conn(&conn, &path)?;
         let child = refs.iter().find(|r| r.id == "fixture-alpha/sidekick").unwrap();
-        assert_eq!(child.message_count, 5);
-        let tree = subagent_tree(&path, "fixture-alpha");
+        assert_eq!(child.message_count, Some(5));
+        let tree = subagent_tree(&path, "fixture-alpha").unwrap();
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].tool_use_id.as_deref(), Some("spawn-call"));
         let parsed = parse_db(&conn, child)?;
@@ -1171,16 +1349,16 @@ mod tests {
         )?;
         let adapter = Devin::with_root(&world.base);
         for reference in adapter.discover()? {
-            let parsed = crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())?;
+            let parsed = crate::stream::collect_with(&adapter, &reference, &Demand::RICH)?;
             assert_eq!(
                 reference.message_count,
-                parsed.messages.iter().filter(|m| m.is_turn()).count(),
+                Some(parsed.messages.iter().filter(|m| m.is_turn()).count()),
                 "{}",
                 reference.id
             );
         }
-        let tree = subagent_tree(&path, "fixture-alpha");
-        assert_eq!(tree[0].session.message_count, 5);
+        let tree = subagent_tree(&path, "fixture-alpha").unwrap();
+        assert_eq!(tree[0].session.message_count, Some(5));
         Ok(())
     }
 
@@ -1200,7 +1378,7 @@ mod tests {
         assert!(a.created_at.is_some() && a.updated_at.is_some());
         // user+assistant ON the main chain only: the superseded copies and the two tool
         // results don't count. Chain = user(12) + assistant(13) + assistant(16) = 3.
-        assert_eq!(a.message_count, 3);
+        assert_eq!(a.message_count, Some(3));
 
         let sub = &refs[1];
         assert_eq!(sub.title.as_deref(), Some("[sidekick] Fixture session alpha"));
@@ -1209,10 +1387,39 @@ mod tests {
         assert_eq!(sub.updated_at, ts_from_epoch(1_759_600_000i64 + 200));
         // The child's own chain: handoff user + 5 assistant (incl. the compaction summary)
         // = 5 conversational turns (the assistant summary is not a reply).
-        assert_eq!(sub.message_count, 5);
+        assert_eq!(sub.message_count, Some(5));
 
         // Beta: nodes 0 (system), 1 (user), 2 (corrupt), 3 (assistant) → 2.
-        assert_eq!(refs[2].message_count, 2);
+        assert_eq!(refs[2].message_count, Some(2));
+    }
+
+    /// A session and its sub-agents, read one after another at one store state, load the
+    /// session's forest once, and read as each did with a load of its own.
+    #[test]
+    fn a_parent_and_its_sub_agents_load_the_forest_once() {
+        let world = crate::test_world("devin-forest-once");
+        let path = world.base.join("sessions.db");
+        std::fs::copy(fixture(), &path).unwrap();
+        let adapter = Devin::with_root(&world.base);
+        let refs: Vec<SessionRef> = adapter
+            .discover()
+            .unwrap()
+            .refs
+            .into_iter()
+            .filter(|r| r.id.split('/').next() == Some("fixture-alpha"))
+            .collect();
+        assert!(refs.len() > 1, "a parent and its sub-agents");
+        let read = |r: &SessionRef| {
+            serde_json::to_string(&crate::stream::collect_with(&adapter, r, &Demand::RICH).unwrap()).unwrap()
+        };
+        FOREST_LOADS.with(|n| n.set(0));
+        let shared: Vec<String> = refs.iter().map(read).collect();
+        assert_eq!(FOREST_LOADS.with(|n| n.replace(0)), 1);
+        for (r, shared) in refs.iter().zip(&shared) {
+            forget_forests();
+            assert_eq!(read(r), *shared, "{}: a read with its own forest", r.id);
+        }
+        assert_eq!(FOREST_LOADS.with(|n| n.replace(0)), refs.len());
     }
 
     #[test]
@@ -1265,12 +1472,37 @@ mod tests {
     }
 
     #[test]
+    fn subagent_forests_reuse_one_database_record_and_refresh_after_writes() {
+        let world = crate::test_world("devin-forest-record");
+        let path = world.base.join("sessions.db");
+        std::fs::copy(fixture(), &path).unwrap();
+        let opens = || super::super::store::sqlite::DERIVE_OPENS.with(std::cell::Cell::get);
+        let before = opens();
+        let first = subagent_tree(&path, "fixture-alpha").unwrap();
+        assert!(!first.is_empty());
+        assert_eq!(opens(), before + 1);
+        subagent_tree(&path, "fixture-beta").unwrap();
+        assert_eq!(opens(), before + 1, "second parent does not open the database");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute(
+                "UPDATE sessions SET working_directory='/changed' WHERE id='fixture-alpha'",
+                [],
+            )
+            .unwrap();
+        let changed = subagent_tree(&path, "fixture-alpha").unwrap();
+        assert_eq!(changed[0].session.cwd.as_deref(), Some(Path::new("/changed")));
+        assert_eq!(opens(), before + 2);
+    }
+
+    #[test]
     fn subagent_tree_lists_the_live_head_and_skips_the_dangling_one() {
-        let subs = subagent_tree(&fixture(), "fixture-alpha");
+        let subs = subagent_tree(&fixture(), "fixture-alpha").unwrap();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].session.id, "fixture-alpha/sidekick");
         assert_eq!(subs[0].agent_type.as_deref(), Some("sidekick"));
-        assert_eq!(subs[0].session.message_count, 5);
+        assert_eq!(subs[0].session.message_count, Some(5));
+        assert!(subagent_tree(&fixture(), &subs[0].session.id).unwrap().is_empty());
         // ...and the parent records the ghost head.
         let conn = open_ro(&fixture()).unwrap();
         let s = parse_db(&conn, &sref("fixture-alpha")).unwrap();
@@ -1416,7 +1648,7 @@ mod tests {
         assert!(
             matches!(&a.content[0], Block::Thinking { signature, .. } if signature.as_deref() == Some("sealed.v1.fixture"))
         );
-        assert!(matches!(&a.content[1], Block::Text { text } if text == "I'll check both."));
+        assert!(matches!(&a.content[1], Block::Text { text } if text.matches_str("I'll check both.") == Some(true)));
         let tool_ids: Vec<&str> = a
             .content
             .iter()

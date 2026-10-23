@@ -66,8 +66,8 @@ def main():
                 assert counters["verified_allocation_bytes"] >= 4096
                 assert counters["peak_live_bytes"] >= counters["baseline_live_bytes"]
                 assert counters["largest_allocation_request_bytes"] > 0
-                assert counters["cumulative_allocation_requests"] is None
-                assert counters["cumulative_requested_bytes"] is None
+                assert "cumulative_allocation_requests" not in counters, "unmeasured counter reported"
+                assert "cumulative_requested_bytes" not in counters, "unmeasured counter reported"
                 assert result["messages"] == fixture["expected_messages"]
                 assert result["build_features"] == {"mmap": True, "probe_heap": True}
                 before = run("baseline", "hash", ["--raw-order"])

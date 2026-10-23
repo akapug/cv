@@ -1,6 +1,13 @@
 use super::*;
-use crate::emit::grok_qwen_tests::Frozen;
+use crate::emit::frozen::Frozen;
 use crate::emit::{EmitOptions, ThinkingMode};
+
+/// The files one Cline/Roo emit publishes into the task directory.
+const FILES: [&str; 3] = [
+    "api_conversation_history.json",
+    "task_metadata.json",
+    "ui_messages.json",
+];
 
 fn fixture() -> Result<Session> {
     let mut session = Session::new("source", Harness::Claude);
@@ -110,11 +117,7 @@ fn checked_cline_roo_match_frozen_pretty_all_modes() -> Result<()> {
                 &world.base.join(format!("new-{harness}-{mode}")),
                 &options,
             )?;
-            for name in [
-                "api_conversation_history.json",
-                "task_metadata.json",
-                "ui_messages.json",
-            ] {
+            for name in FILES {
                 let raw = fs::read(after.path.join(name))?;
                 frozen.insert(
                     format!("{harness}-{mode}-{name}"),
@@ -123,6 +126,20 @@ fn checked_cline_roo_match_frozen_pretty_all_modes() -> Result<()> {
                 let parsed: Value = serde_json::from_slice(&raw)?;
                 assert_eq!(raw, serde_json::to_vec_pretty(&parsed)?);
                 assert!(!raw.ends_with(b"\n"));
+                // Structural facts beside the digest, so a digest change can be read, not just
+                // unfrozen: the six fixture rows and their roles, the UI log a JSON array.
+                if name == "api_conversation_history.json" {
+                    let rows = parsed.as_array().unwrap();
+                    assert_eq!(
+                        rows.iter().map(|r| r["role"].as_str().unwrap()).collect::<Vec<_>>(),
+                        ["user", "assistant", "user", "system", "assistant", "user"]
+                    );
+                    assert!(rows[0]["content"][0]["text"].as_str().unwrap().starts_with("<task>"));
+                } else if name == "task_metadata.json" {
+                    assert!(parsed.is_object(), "{name}");
+                } else {
+                    assert!(parsed.is_array(), "{name}");
+                }
             }
             assert!(after
                 .resume_hint
@@ -164,11 +181,7 @@ fn checked_cline_guarded_failure_preserves_all_destination_files() -> Result<()>
         let out = world.base.join(format!("out-{text_leaf}"));
         let task = out.join("tasks/fixed");
         fs::create_dir_all(&task)?;
-        for name in [
-            "api_conversation_history.json",
-            "task_metadata.json",
-            "ui_messages.json",
-        ] {
+        for name in FILES {
             fs::write(task.join(name), "original")?;
         }
         fs::write(&path, "changed source")?;
@@ -182,11 +195,7 @@ fn checked_cline_guarded_failure_preserves_all_destination_files() -> Result<()>
             }
         )
         .is_err());
-        for name in [
-            "api_conversation_history.json",
-            "task_metadata.json",
-            "ui_messages.json",
-        ] {
+        for name in FILES {
             assert_eq!(fs::read_to_string(task.join(name))?, "original");
         }
     }

@@ -1,309 +1,467 @@
 # Changelog
 
-## Unreleased
+## 0.18.0 — 2026-10-23 — the release an agent can trust
 
-- SQLite readers cannot create harness WAL sidecars when a rollback-mode database switches to WAL during a read.
+**Breaking: commands, MCP, HTTP and JSON.** A removed name exits 2 with a pointer to its replacement.
+**Breaking: commands, MCP, HTTP and JSON.**
+- `cv index` holds a few open files per worker, not two per compressed Codex rollout, so a cold index stays under macOS's 256-file limit.
+- `cv index` defers a session whose old search baseline cannot be invalidated (catalog unopenable), names it, and completes the pass instead of aborting.
+- `cv search --json` (and MCP `search`) prints `{"hits": [...], "total": M}`, not an array; the table footer reads `N of M matches`.
+- `/api/search` adds `X-Cv-Search-Total`, every session that matched; its note says `N of M matches` when `limit` cut it.
+- `cv pack --excerpt-bytes N` (default 1600) bounds each excerpt message; the bundle's `Bounds:` line names every bound and what it cut.
+- `CV_PACK_LLM` digests send up to the model's provider-reported context window (was 60K chars), or `--context-bytes N`; the bundle states bytes sent and the limit.
+- A plain `.json` OpenSession document is discovered wherever its top-level version key sits, not only within the first 64 KiB.
+- `cv events --json` (`/api/events`, MCP) holds whole commands and error texts, newlines kept; the table marks cuts with `…`, and `--wide` prints them whole.
+- `cv search`, `/api/search`, MCP search and `-q text:` read every session the index has not seen; `--live-bytes` (`live_bytes`) now only bounds it when given.
+- `cv search --scan` (`scan=1`, `cv pack` without an index) matches each session's whole exchange, streamed, instead of its first 256 KiB.
+- `cv index --semantic` reads each session as far as the model embeds (512 tokens × median token length) and prints it; the 64 KiB head is gone.
+- The full-text index holds a persisted tool output whole, not its first MiB, and snippets find a term anywhere; `source::VERSION` 9 rereads once.
+- Hooks read at most 8 MiB of transcript and say what they left unread: `compact` names the tail it read, `start` a row's commit search span.
+- `cv show` on a pipe prints the whole transcript (no 200 KB head+tail guard); MCP `show` adds no default `last`/`max_bytes` window.
+- MCP `observe_stream` returns everything appended by default; `char_cap`, when given, is stated with a `truncated` count.
+- Cursor counts only bubbles a read keeps (capability markers dropped); a composer with external bubble cells counts at `cv index`.
+- `source::VERSION` is 8: listings rediscover once, so rc.2's cached Cursor counts are recounted.
+- `message_count` counts prompts and replies only (no tool results or sub-agent returns) and is `null`, not `0`, until counted: `ls --json`, `/api/sessions`, search rows.
+- `cv archive ls` counts turns like `cv ls`; `catalog.jsonl` keeps the raw count as `messages_written`; 0.17 rows show a dash until resynced.
+- `extra.openclaw` keys keep native camelCase (`stopReason`, `customType`, `error.errorCode`); `custom_details` and `branch_from_id` become `details` and `fromId`.
+- An IR or OpenSession 0.3 message without `kind` or `origin` is refused, not inferred from its role.
+- Fidelity-report `deltas` and `cv formats` findings are `{what, a, b, expected, where}`, replacing `{field, before, after}` and the old finding keys.
+- MCP tools omit `--follow`; a `follow` argument is refused, naming `for`.
+- `cv scry` on a pipe prints the sessions it would follow and exits 0; `--follow` follows, `--for 30s|5m|2h` bounds it.
+- Watch and `observe_stream` cursors are version 2; a 0.17 cursor starts a fresh baseline.
+- A tag-only `decision` (pre-0.15, nothing posed) reads as an assigned action, not a decision owed; the page's tagged-decision card is gone.
+- `$CLAURDVOYANT_HOME` and `$CLAURDVOYANT_MAX_STALE_SECS` exit 2, naming the `CLUSTERVISION_` variables; `claurdvoyant` directories are no longer read.
+- Renamed: `rewind --from-compaction` (the default; `--full` for everything), `deferrals --since` is `--at`, `dataset --out` is `--file`.
+- `cv tools --agent` takes an exact id or unique prefix, else exits 2; `--across` with `--agent`, `--tool` or `--timeline` exits 2.
+- An unknown `cv task events --kind` (`/api/events?kind=`) exits 2 (400) listing the known kinds, instead of listing nothing.
+- `cv workflow` exits 2 on flags it dropped: run-only flags without a run, `--revive-all` without `--revive`, `--revive` with `--json`.
+- `-q text:` without an index reads live; past `--live-bytes` or under `--frozen` it exits 2 naming `cv index` (`/api/stats`: 503).
+- `cv events`, `cv touched`, `cv blame` and their HTTP routes fail on an event-catalog error instead of answering empty.
+- Cold WAL store copies stage beside the catalog instead of `/tmp`; an unchanged Hermes or Devin store answers sub-agent forests without being copied. (akapug fork)
+- `cv rewind` counts tool calls only on top-level turns; a request snapshot replaying a closed call no longer reopens it. (akapug fork)
+- `--skills-policy` and `drop-all` still parse as `--skills` and `drop`. (akapug fork)
 
-- New-name publication fails safely when neither hard links nor exclusive rename are supported, instead of risking overwriting a concurrent writer.
+**Breaking (library): cv-core, cv-search and cv-testkit.**
+- `ParseOptions`/`ExtraProjection` → `Demand { tier, spans, offsets }`; `MessageSink::extra_projection` → `tier`; the five `Watcher` poll methods → `poll`/`try_poll(Poll { .. })`.
+- `Adapter::resume`/`try_resume`/`resume_format` → `Adapter::transcript(r, demand, Start, sink)`; `append_only` returns `bool`.
+- `Adapter::discover` returns `Discovered { refs, skipped }` (out-of-tree: `Ok(refs.into())`); `cline::discover_in` returns it, `cline_sdk::discover` fills `&mut Discovered`.
+- `Watcher::run` is gone (callers schedule `poll`); `poll_sources` → `offer_sources`.
+- `Text`: over 4 KiB is `Text::Source`; `Span` is wire form only; malformed escapes and unresolved formatting error; `matches_str` and `is_lazy` replace equality and `is_span`.
+- `lazy::json_string_span` is gone; `try_resolve_prefix` budgets decoded bytes (`max_raw` → `max`); `lazy::read_head` → `read_head_checked` (`Result`).
+- `ir::Head` → `projection::Head` (separate byte and character budgets; `push` returns `true` when full); `Counted::new` builds `Counted`; `hashing()` captures SHA-256.
+- `emit::Delta` and `formats::Finding` → `emit::Divergence {what, a, b, expected, at}`; `FindingKind::ManifestInvalid` replaces `source_file_missing` for unparseable manifests.
+- `SubagentInfo`/`claude::subagent_refs` → `ir::AgentRef`/`subagent_tree_of`; `claude::CARRIER_KEY` → `ir::CARRIER_KEY`; `SubagentEnd`, `ApiErrorNotice`, `TaskNotice` move to `lanes`.
+- Return `Result`: agent end, return, task-notice and workflow-launch reads; forest and subagent-reference APIs; `one_agent_across`; `wire::openai::tool_calls`; `store_affordances`; `json_files`.
+- Return `Result`: `codex::parse_str`, `gemini::parse_all_str[_for]`, `ingest::ingest_files`, `events::{events_for, sessions_touching, sessions_editing, edits_touching_file}`.
+- Renamed modules: `handoff` → `codex_handoff`, `loom` → `splice`, `harness::harmony` → `harness::wire::harmony`; `decode_content` takes a call-id generator (`ir::derived_call_id`).
+- `export::{ChatGptExport, ClaudeExport}` are gone: `harness::for_harness_with_root(Harness::ChatGptExport, dir)`.
+- `affordance`: `classify_tool`, `items_of`, `item_of` → `classify_tool_json`/`_view`, `items_of_view`, `item_of_view`; `Returns::ResultInPrompt` is new (Roo's `new_task`).
+- `affordance::{unwrap,rewrap}_deferred` take a `DeferredWrapper`; `wire::anthropic`'s owned `Texter`, `block_from*` and `blocks_from` are gone.
+- `distill::distill` → `prepare_distill` + `distill_pack`; `Session::first_user_text` and `searchable_text` are gone.
+- `SearchRow::to_json` → `to_json_with(&SearchRowContext)`; `scan::live_search` → `live_search_filtered`.
+- Redaction and HTML rendering take a resolver (`share_message(.., resolver)`); Markdown uses `write_md_message`/`write_md_block`; `scrub_value`/`scrub_cow` are private (`redact_with`, `redact_message`, `redact_text`).
+- `RedactOptions.keep_emails` → `classes.emails`, inverted; `task::AppendOutcome.replay_warnings` is gone.
+- `source::Published` → `Record<T>` (`Table<T: Payload>`, `admit` replaces `published`/`fresh`); `source::rename_consumer` is gone; `catalog::fill_count` is gone.
+- `resume::version` returns `String`; `resume::MarkUpdate` is `{session, mark}`; `publish::retract` is gone (`publish::Set` owns rollback).
+- New fields break exhaustive literals: `EmitOptions.parsed_at`, `PruneOptions`/`RewindOptions.skills_policy` and results' `skills`, `Stats.uncounted`, `HarnessCensus.first_error`, `LaneWork.unread`.
+- `EmitOptions.sidechain_of` is `Option<SidechainOf {root, agent}>`; `prune::prune_session` takes the `Harness` first.
+- `events::ingest_all` takes `IngestOptions`; `query::WindowPresence` is gone (`filter_refs_limited` drops it); `query::HAS_FLAGS` rows are `(name, help, Cost)`.
+- `lanes::Lane.status` is `LaneStatus`, `LaneEvent.event` is `LaneEventKind`; `STRAND_PATTERNS` is private (`text_is_waiting`).
+- `ForestTools::for_workflow` → `tools::forest_tools_selected(r, None, Some(run_id), None)`; `task::store::append_agent_event` → `TaskStore::default_store().append_agent_event`.
+- cv-search: `text_search*`, `enrich_text_snippets`, `semantic_search_filtered` → `Searcher::{search, search_in}`; `embed_all` → `embed_sessions`; `Searcher::semantic` is private (`Searcher::from`).
+- `fts::enrich_text_snippets` returns `Result<Option<String>>` (a degradation note).
+- cv-testkit: `heap::begin`/`end` return `Measurement`; `Env::enter_isolated` returns `Isolated(armed, Scope)`; `claude::user(sid, uuid, ts, text)`.
 
-- Kimi deferred wire outputs retain their parsed source identity and reject replaced files before the first read.
+**After upgrading, once.**
+- `source::VERSION` is 7: the first listing rebuilds the catalog (said on stderr; `cv index` does it ahead) and every mark, checkpoint and watch state.
+- The first `cv index` rebuilds the full-text index whole.
 
-- Hook settings and skills publish by atomic replacement, preserving existing readers, permissions, and dotfile symlinks.
+**Listing and counts.**
+- A first `cv ls` leaves Codex, Grok, Kimi, Kimi Code, Qwen, Hermes, Goose, Zed, Continue and OpenCode uncounted until a read or `cv index`.
+- `cv stats` reports "N not counted yet" (`uncounted` in `--json`, `/api/stats`); `--sort-by messages` ranks uncounted last.
+- A count survives refreshes of an unchanged source and is dropped when it changes; rewound or superseded Hermes rows no longer inflate it.
+- Kimi, Kimi Code and Grok titles are the recorded native title; Hermes, Goose and Zed list from metadata alone.
+- Cursor legacy counts exclude empty and malformed bubbles.
+- A listing racing `cv index` waits up to 5 s for it instead of discarding its update.
+- `created:` without a recorded creation time no longer matches on update time.
+- `ls --json --asc` with a query selects the same sessions as descending; absent sessions take no window slot; refreshed harnesses keep their tie order.
+- `serve`, `mcp` and followers see Gemini and Qwen projects registered after they started.
+- A read-only catalog still serves warm listings; builds without `sqlite` no longer spool unpublishable events.
+- Semantic indexing caps transcript heads at 64 KiB of decoded text.
+- `cv search`, `/api/search` and `-q text:` also read what the index has not seen, within `--live-bytes` (256 MiB); `--frozen` reads none.
+- `cv search` without an index answers from that live read instead of exiting 1.
+- Search staleness counts each session's preferred copy, not older duplicates.
+- Cold SQLite snapshots stage beside the catalog instead of in a multi-gigabyte tmpfs copy.
+- MCP `observe_stream` keeps every followed session's reader state server-side and reports `rereads`.
+- Codex rollouts over 8 MiB list the title and cwd a full read gives, not a head-and-tail sample.
 
-- Ported project context files publish only after copying succeeds; failed copies leave no partial destination and preserve existing files.
+- An append or rewrite rereads only that session: Claude forks, Grok cwd groups and Kimi Code sub-agents no longer reread; Codex rereads appended records.
+- A store write rereads only changed sessions: Hermes, Goose, OpenCode, Devin, Zed, Cursor, OpenClaw, Cline SDK databases, Gemini and Qwen `logs.json`.
+- Discovery rescans only changed sources: Kimi, Kimi Code, Goose legacy, Cline, Roo, Continue, OpenSession files and OpenClaw stores.
+- Sub-agent trees (`show --tree`, `--subagents`, lanes) reuse unchanged agents' saved scans; Codex, Hermes, Devin and OpenClaw read their registries once per state.
+- `cv index` and live search read only what was appended since the last index; compressed Codex rollouts are read in parallel.
+- One changed session rewrites only its catalog row; `cv show agent-…`, workflow-name and ghost lookups read the catalog, not rediscovery.
+- The prompt hook, task mutations, `cv task list` and `GET /api/tasks` replay only task-log events appended since a stored fold.
+- The sessions API resumes its 1024 most recent sessions of any size; `cv stats --tokens` keeps every live session's cached usage.
+- Watch checkpoints and archive resume states of any size are kept (past 64 KiB or 1 MiB they were dropped).
+- A WAL-backed SQLite copy happens once per command; an export archive past the 8 MB cache is scanned once.
+- `cv show --tree` indents once per fork above a message, so a straight chain prints flat.
 
-- HTTP overload shedding bounds retained sockets and drain work, preventing rejected clients from bypassing connection limits.
+**Reading.**
+- Global `--frozen` (`CV_FROZEN=1`) reads without updating cv stores, streaming stale events; commands that write stores or sessions exit 2.
+- Boundaries carry no invented text (Claude, OpenClaw, Goose, Hermes, Kimi, Kimi Code, Qwen); `show` labels them by kind and marks inferred ones synthesized.
+- Cursor and LM Studio (Harmony) tool calls without native ids get `cv:<format>:<position>`.
+- Codex: tool results carry only recorded status; usage-only records are notices; `[error] ` outputs stay verbatim unless cv wrote the rollout.
+- Zed and Goose report the recorded model; the provider (`extra.zed.provider`, Goose metadata) never substitutes for it.
+- Gemini, Qwen, Goose, Grok, LM Studio, OpenClaw and OpenCode report the model on every turn that records it, windowed reads included.
+- `cv distill` and `cv adopt --model` default the agent type to `general-purpose` only when the source names none.
+- A source replaced or deleted mid-read is an error, checked after slow callbacks, per mapped window, at checkpoints and at EOF.
+- Native Codex file-change records, code-mode edits included, feed `cv touched`, tool histograms and query facts without duplicating patch calls.
+- Qwen checkpoint facts live under the `qwen` bag, not `gemini`.
+- Compressed Codex rollouts need the `zstd` feature; without it they are unreadable, not parsed as JSONL.
+- ZIP uploads over 10,000 entries are refused.
+- `cv blame -L` says when its commit list was cut and marks an empty message `(no message)`; `cv show` hints spell sub-agent ids in full.
+- Claude Code 2.1.304 is the verified writer: request-ledger, `isolation-latch` and unknown records are carried, never read as turns.
+- A Claude fork sub-agent's `fork-context-ref` sets `lineage.forked_from` and `extra.claude.fork_context`; a retried request's `api_error` renders as an error.
+- Claude fork inference counts only a copied first prompt or boundary, not a SessionStart hook's earlier timestamp.
+- A workflow agent turns stale when its session's `tool-results` gains spilled outputs.
 
-- HTTP body framing errors now close the connection; malformed chunks cannot recover during draining and execute a pipelined request.
-- Resume guard sampling preserves open transcript read positions on Unix.
+**Titles and affordances.**
+- `has:subagents` matches the forest `agents` counts: Claude workflow agents and Codex and Devin forests too.
+- Kimi, Kimi Code and Hermes sub-agents join the forest; `dataset --subagents` reads every harness's forest.
+- Emitted sessions' fallback title is the `cv ls` title; Cursor CLI titles drop the leading `<timestamp>`.
+- `has:skill` and `--kind affordances` count a Claude skill loaded by slash command, once per activation.
+- Kimi Code: the latest `TodoList` is a `plan/state` row; legacy `Agent`/`AgentSwarm` calls are spawns, their results returns.
+- Roo: a `new_task` result beside user text is a `subagent_return` detail; the turn stays a prompt.
+- Tool-filtered histograms keep edit counts; native edits reconcile by call and resolved path, never guessing relative paths in compound shell commands.
 
-- Correct search defaults and fallback semantics, document affordance views and MCP window exceptions, and point the prompt-row schema to the current command.
-- MCP task tools use the actual CLI flags; generated schemas describe repeatable arguments, and the command reference shows their correct spellings.
-- Positioned (no-mmap) builds resolve large transcript text from a live, growing session, as mapped builds do; a replaced or shrunk file still fails.
-- `cv index` decodes each compressed Codex rollout once: discovery hands its decoded bytes to the sweep beside it (cold index: 15% fewer instructions).
-- Watch cursors and Kimi, Kimi Code and Qwen checkpoints serialize in a stable order: the same state always yields the same bytes.
-- OpenCode skips message and part cells that are not TEXT, UTF-8 JSON (2.x counts them as skipped lines) instead of failing the session.
-- OpenClaw: lazy reads skip an empty `event_json` row instead of failing; store discovery no longer holds whole transcripts in memory.
-- Native builds decode zstd (Codex rollouts, Zed and OpenClaw blobs) with libzstd: a cold index of compressed rollouts takes 39% fewer instructions.
-- A copied or moved `CLUSTERVISION_HOME` keeps its full-text index: baselines follow an identity stored in the index, not its path.
-- Gemini recordings read through one message codec; a 314 MB session's lazy read takes 3.4x fewer instructions.
-- Devin, OpenCode, Hermes, Zed and Goose discovery reuse cached results while their database, WAL and journal are unchanged.
-- Compressed Codex rollouts read from one mapping of their decoded bytes: first listing and `show` use about half the instructions.
-- `ls -q has:` and unchanged `cv index` detect only the adapter a session needs, once per operation: 2.9x and 1.7x fewer instructions.
-- Emitted sessions, distill sidecars and packs, dataset, pack and share files are published whole, never written into an existing file; a taken name exits 2.
-- `--force` on dataset, pack, distill `--pack` and share replaces a taken file by rename; a symlink there is replaced, other hard links keep old bytes.
-- Harness indexes cv updates on emit (Continue, OpenClaw, Gemini) and cv's config are replaced by rename; a symlinked config is replaced at its target.
-- `prune --copy-resources` refuses an existing resource directory; with `--force` the new directory replaces it whole instead of merging into it.
-- Reading SQLite harness stores no longer rewrites their `-shm`: WAL stores are opened `immutable=1` when frameless, otherwise through a private db+WAL snapshot.
+**Reshaping.**
+- `cv port --strict` help names the actual `⚠ lossy:` output marker for losses the target format cannot hold.
+- `prune`, `rewind` and `port` take `--skills keep|drop|drop-stale` (default `keep`), legacy command-file skills included.
+- `cv prune`, `cv rewind`, `cv adopt` and Claude ports check the staged session resumes before publishing; else they refuse and leave nothing.
+- `cv prune`, `cv rewind` and adoption refuse a non-JSON-record line; `cv prune` refuses an empty transcript; minted ids are UUID v7.
+- `cv rewind` copies to the end of the file (tail records like `cost-state` were dropped).
+- `cv rewind` at a cut keeps parallel calls, closes open ones, drops a malformed later line, and asks for a rerun on an unterminated one.
+- `cv rewind` refuses a bodyless turn only with `--thinking portable`; a native copy keeps it.
+- `cv port` to Codex writes the source's `cli_version`; to OpenClaw and LM Studio, no invented `usage.totalTokens` or `tokenCount: 0`.
+- `cv port` to Gemini derives message ids (UUID v5) from session and turn, so re-emits match; to Continue, a tool turn without result is refused.
+- Gemini, Grok, OpenClaw, Cline, Roo and Continue emits stage their files, publish the transcript or index last, and roll back on failure.
+- Staged emits are not crash-atomic: a crash can leave a published prefix; a failed rollback is reported.
+- OpenClaw port and emit refuse an unreadable or concurrently changed `sessions.json`; an unwritable Gemini `projects.json` fails the emit.
+- Hermes and OpenCode exports reject unreadable sources before creating any output; `--force` restores a replaced sidecar when the transcript fails.
+- Claude, Gemini and Qwen resume hints are one runnable line: `cd <dir> && <harness> --resume <id>`.
+- Qwen emission keeps absent cache counts absent; OpenCode keeps an unknown cwd empty instead of cv's own.
+- `cv splice --generate` rejects an empty completion; `pack --json` returns content, artifact paths and resume hints; `cv pack` names `LMSTUDIO_API_BASE`.
+- A refused write names the failed JSONL record, or the OS error behind a refused exclusive rename.
+
+**Doctor and hooks.**
+- `cv doctor` adds Writer versions: the newest Claude and Codex versions seen versus the newest verified, plus unknown sessions.
+- `cv hooks install codex` (user or `--scope project`) installs Claude's five hooks: compaction recovery, start context, lanes, decisions, edit guard.
+- `cv hooks install|show codex` and `cv doctor` report each Codex hook as trusted, untrusted or modified, with Codex's review step.
+- Codex's edit guard denies a conflicting edit (Codex has no `ask`), but not one over a file the same root thread's agents edited.
+- `cv hooks` and `cv hook --harness` accept every `--harness` spelling (`cc`, `claude-code`); `cv lanes --recent N` reads Codex sessions too.
+
+**Waiting commands.**
+- Every waiting command says on stderr within a second what it waits for; on a pipe, each exits within 5 s or announces itself.
+- `cv workflow --follow` takes `--for <duration>`, then renders the run as it stands.
+- `cv hook` with a terminal on stdin exits 2; `cv mcp` and `cv task … -` say what they read.
+- Followers announce a session unreadable at start once it reads, instead of guessing its message count.
+- `cv events` keeps every extracted event (the per-message `(kind, target)` dedup is gone).
+- A follower's byte mark on a compressed Codex rollout is unresolved, not resumed from a decoded prefix.
+
+**Removed.**
+- `cv watch --interval` takes seconds like `scry`; a negative `--interval` exits 2.
+- An unknown `cv pack --format` exits 2 naming `md`, `prompt`, `session`.
+- Mentions of a leftover `index.sqlite` or pre-0.9.12 `discover.json` are gone; delete either by hand.
+- MCP errors for removed properties name their replacements.
+
+**Skips: counted, reported, or warned once.**
+- A source discovery cannot open (unreadable dir, locked or corrupt database, bad export or `sessions.json`) is named by `cv doctor`, not silently empty.
+- `cv doctor --json` gains `skipped_sources`; per-file `cv: skipping` lines become one stderr summary.
+- An unreadable session file errors instead of reading empty: Continue, OpenCode, Cline, Roo, Devin, Hermes, Goose, legacy Codex `.json`.
+- Undecodable records count as `skipped_lines`: Claude (trailing partial included), Cursor, Continue, OpenCode, Cline, Roo, Goose, Zed.
+- A catalog, usage-cache, scan-cache or `config.toml` failure is said once per process and retried; nothing partial is published.
+- A Hermes compression continuation that cannot be queried errors instead of dropping `continued_in`.
+- Search names a hit whose source cannot be read; `--scan` skips unreadable sessions and names them.
+- `cv formats` reports each harness's first parse error (`first_error` in `--json`).
+- `ls --json --enrich` carries `enrich_error` for an unreadable transcript.
+- `cv workflow --revive` says when a lane's read stopped early; an unreadable run-state file is named, not claimed as a ghost launch.
+- `cv archive`, `cv pack`, `cv cat` and `cv events --subagents` name their read failures instead of dropping them.
+- `cv serve` closes a connection whose body exceeds its Content-Length.
+
+**Tooling and CI.**
+- The viewing-and-sharing manual links Compare branches to the renamed Splice composer section.
+- `cv schema --json` lists `routes` (every `cv serve` method and path) and the `subagent_row` and `task_row` keys.
+- `cv index --json` reports `changed`, `removed` and `errors` beside `indexed`.
+- Release gates: 0.17.0 compatibility, 0.16.1 upgrade over every corpus, real Codex 0.162.1 hooks, and macOS nightly and on rc tags.
+- Contributors: `tools/size-budget.txt` and `check-size.py --write` are gone (drift is reported); `tools/dump-hash.sh` is the byte-identity gate.
+
+rc.1 tagged 2026-10-22; rc.2 2026-10-23.
+
+## 0.17.0 — 2026-10-17 — stream, never materialize
+
+cv's readers now stream: a giant tool output, a 60 MB escaped string or a 64 MiB SQLite cell
+stays in its source file and is read through bounded windows, by one record codec per wire format.
+`cv index` parses on every core and decodes compressed Codex rollouts with libzstd. Freshness is
+verified on use, one record per consumer, over every primary source, sidecar and WAL, so a quiet
+session's append is never missed. Search matches the exchange (what was asked, answered and run);
+injected files, system prompts and hooks are `--kind context`. Untitled sessions are titled by
+their first prompt. `cv serve` runs on a small built-in server. Measured on a frozen 5,421-session
+fleet (Claude 38 GB, Codex 40 GB compressed, 89 GB decoded): a full index from an empty home takes
+866 s at a 715 MB footprint, an unchanged index 0.4-0.8 s. No command is renamed or removed; the
+table lists the flags, defaults, routes and MCP tool that changed.
+
+| old | new |
+|---|---|
+| `GET /api/backlog` | `GET /api/tasks?detail=1` (the old route answers 410 with this pointer) |
+| `POST /api/task/{id}/reopen` | gone (410): a closed task stays closed; open a new task and note the old id |
+| MCP `hook` | gone; a call points at `hooks_install` (it read Claude Code's hook JSON on stdin, so a call did nothing) |
+| `cv search` with no usable index scanned transcripts live | an error naming the cause and the fix; `cv search --scan` (`/api/search?scan=1`) asks for the live scan |
+| Codex plain rollouts over 8 MiB had extrapolated discovery counts | `message_count: 0` means not counted; compressed rollouts are counted in full; indexing supplies exact catalog counts |
+| `cv search` matched injected files, system prompts and hooks | matches the exchange; `--kind context` (`/api/search?kind=context`) for those, `--kind all` for both |
+| `/api/search?semantic=1&kind=context` | 400: vectors embed the exchange only |
+| `cv port --thinking native\|text\|drop`, default `native`; `cv rewind` copied reasoning byte for byte | `--thinking portable` on `port`, `rewind`, `splice`, `pack`; `port` and `rewind` default `native` when every recorded model is `claude-*`, else `portable` |
+| `prune --drop-thinking` left an inline marker per flattened block | omits the block; `cv cat <new-id> <record-uuid>#think<i>` returns it from the sidecar |
+| `prune --to <taken id>`; `dataset`, `pack`, `share`, `distill --pack` onto an existing name wrote into it | exit 2, nothing written; `--force` (`prune`, `dataset`, `pack`, `share`, `distill`) replaces by atomic rename |
+| `rewind --to` and `adopt` refused a taken target with exit 1 | exit 2; `adopt --force` still replaces; rewind requires another id |
+| `cv index` exit 1 when any session was unreadable | exit 0 with warnings when some sessions succeed; all unreadable still fails; `--strict` fails on any; `--json` lists `unreadable` |
+| `cv index --semantic --subagents` | a usage error before anything is written: run the two separately |
+| a pre-binary `embeddings.json` semantic store | not read or migrated; `cv index --semantic` rebuilds |
+
+`cv tree`, `cv prompts`, `cv compaction`, `cv timeline`, `cv board` and the other 0.15 names still
+exit 2 with their pointers; the `cvd` and `cv-mcp` shims went in 0.16.0.
+
+- Inbox table headers no longer cover the first task row, restoring clicks to expand Backlog task details.
+- `cv index` publishes search freshness baselines per session: one row's failure is reported and reread alone, no longer losing the sweep's.
+- One freshness record per consumer and session, verified on load (counts, events, search, usage); watches record file identities. Each rereads once after upgrading.
+- **Breaking:** `GET /api/backlog` is removed (410 pointer); the inbox page reads `/api/tasks?detail=1`, which adds the backlog columns.
+- **Breaking:** `POST /api/task/{id}/reopen` is removed (410): a closed task stays closed; open a new task and note the old id.
+- **Breaking:** MCP no longer offers `hook` (it reads Claude Code's hook JSON on stdin; a call did nothing); calling it points at `hooks_install`.
+- `cv search`: when live snippets cannot be generated the indexed previews stand in, with a note, as `/api/search` already did.
+- `/api/tasks/inbox/{who}` takes `since=` and `all=` like `/api/inbox`.
+- `cv archive sync` takes its inventory from the index sweep (one corpus walk, the index refreshed on the way); a home whose index cannot be written falls back to discovery.
+- A live `.jsonl` beside its writer is admitted by content (same file, sampled prefix intact), never by waiting; index, events, counts, vectors reread once.
+- Pre-binary `embeddings.json` semantic stores are no longer read or migrated (querying them already failed); `cv index --semantic` rebuilds.
+
+- HTTP rejects duplicate Host headers before routing requests.
+
+- HTTP search rejects conflicting kind, scan and semantic parameters consistently with the CLI.
+
+- Reject premature EOF in positioned JSONL reads instead of treating missing captured bytes as a partial final record.
+- Preserve concurrent directory claims during fallback publication and restoration; retain both trees when restoration is blocked.
+
+**What reads differently** (`--json` consumers):
+- **Codex `message_count` counts logical turns**, as the parser does: no duplicated event
+  echoes, injected instructions or inherited history. OpenCode, Goose, Hermes, Devin and Qwen
+  discovery counts match their parsers too; cached counts refresh once. Plain Codex rollouts over
+  8 MiB report 0 until counted, replacing the old extrapolation.
+- **An untitled session's `title` is its first exchange prompt**, in index and scan hits, labels,
+  Markdown, share and archive, never an injected AGENTS.md or environment turn; `ls --json --enrich`
+  `display_title` prefers the row's `title`.
+- **Search hits match the exchange.** Injected instructions, system prompts, skill bodies, hook
+  output, notices and compaction summaries match only with `--kind context` (or `all`); a fork's
+  copied turns hit their source once; snippets keep the original Unicode. Every indexed answer, hit
+  or miss, says how many sessions the index trails and by how long: stderr under `--json`, the
+  `X-Cv-Search-Note` header on `/api/search`.
+- **Claude `rewind` and `port` default to `native` when every recorded model is `claude-*`**, else
+  `portable`: plaintext thinking demoted to text, signature-only reasoning removed (no placeholder),
+  illegal tool IDs mapped collision-free at both ends. `rewind` reports which. `--thinking native`
+  writes what 0.16 wrote.
+- `prune --drop-thinking` omits old thinking blocks with no inline marker, removing emptied records
+  and relinking their children; `cv cat <new-id> <record-uuid>#think<i>` still retrieves each.
+- `cv doctor` and `prune` separate byte estimates from recorded prompt usage and rewritten resume
+  metadata; opaque thinking no longer counts as measured reasoning tokens. One estimator with
+  per-kind rates calibrated against `count_tokens` replaces 3.5 bytes/token; prune's revive estimate
+  anchors on recorded usage and never read more than 1% low against the API. Human labels change;
+  `--json` keys do not.
+- Session JSON (`show --json`, `/api/session/…/head`, OpenSession) may carry a top-level
+  `principal`, a string or an object, absent when unset; a splice keeps it only when every source
+  agrees (#4).
+- Generated MCP tools return a successful command's stderr (continuation hints such as
+  `task_events`'s `next: --since`) as a second content block. Read `content[0]`; do not concatenate.
+- `-q`: `a|b` is OR and `field="x"` exact metadata equality; text equality errors naming the syntax
+  to use. A harness-qualified id (`claude:abc`) discovers only that harness on a catalog miss; id
+  prefixes stay case-sensitive.
+- `cv serve` answers 400 to malformed numeric parameters (`/api/sessions?limit=abc` was ignored),
+  framing, headers and authorities. Task POSTs reject invalid JSON (400), oversized bodies (413),
+  and a non-JSON media type or forbidden origin (403).
+  `GET /api/session/{harness}/{id}/export` downloads the complete session as Markdown or OpenSession.
+- `ls --json --limit 0` prints `[]` after argument validation without touching the inventory;
+  `cv index --json` prints `{indexed, path, unreadable: [{id, harness, reason}]}`.
+- `cv dataset` keeps a session-level system prompt without duplicating explicit system messages.
+  `cv port --harness opencode` writes OpenCode 2.x rows and can bootstrap a fresh store; 1.x stores
+  still read.
+- Claude checkpoint counts keep restorable results, so `has:checkpoint` can change after the
+  recount. Cursor Agent CLI chat and ACP stores appear as sessions.
+
+**One-time costs after upgrading** (`docs/design/PERF.md`, 2026-10-14, release builds; frozen: an
+APFS clone of 5,421 sessions, Claude 38 GB, Codex 40 GB compressed; live: ~7,000 sessions):
+- **Run `cv index` first.** The full-text index rebuilds once for the exchange/context split, the
+  title rule and per-session metadata guards; afterwards a grown transcript is read from where the
+  last pass stopped. A full build from an empty home: 866 s at a 715 MB footprint frozen; 966 s,
+  RSS 3.4 GB live. Unchanged afterwards: 0.4-0.8 s frozen, 1.0-1.6 s live.
+- The first fleet read rediscovers every harness (the catalog's interpretation version changed) and
+  may print a stderr note suggesting `cv index` when the old catalog records its interpretation
+  version: `cv ls`, first run, frozen, 158-186 s. Do not pay it inside an agent's MCP call.
+- Indexing refreshes counts, events and search baselines together; usage refreshes on its first
+  token-statistics read. Affordance counts (`has:`) are recounted (Claude checkpoints, OpenCode
+  turns); watch cursors record file identities on their next pass.
+- `cv search --semantic` needs `cv index --semantic` once more: vectors embed the exchange only and
+  a pre-binary `embeddings.json` store is no longer read (not measured).
+- The task log needs no migration. The catalog upgrades automatically: legacy counts and watch
+  tables are recreated, cache columns added and discovery invalidated. No manual migration command
+  is needed. Moving a home preserves its index when transcript paths and identities stay valid.
+
+### All changes
+
+**Reading**
+- Schema includes `hook_ledger` among lane status sources and documents returned lanes; runtime lane JSON is unchanged.
+- Cursor Agent CLI chat and ACP blob stores are read: prompts, replies, tool calls, summaries, modes and lineage; numeric modes read as names.
+- Untitled sessions are titled by their first prompt everywhere (index and scan hits, labels, Markdown, share, archive), never injected AGENTS.md or environment context.
+- `ls --json --enrich` `display_title` uses the row's `title` when present and never picks harness-injected turns such as Codex AGENTS.md instructions.
+- Codex discovery counts logical turns as parsing does, excluding event echoes, injected instructions and inherited history; OpenCode, Goose, Hermes, Devin and Qwen likewise.
+- OpenCode: custom database names are discovered, WAL changes noticed, conflicting native ids refused; non-UTF-8-JSON message and part cells are skipped, not fatal.
+- OpenClaw: an empty `event_json` row is skipped; exports keep native records, branch links, compaction metadata and grouped tool results; escaped branch controls are recognized.
+- Gemini accepts escaped wrapper metadata and keeps saved-chat message classification; checkpoint replay and composite tool results read with bounded memory.
+- Kimi deferred wire outputs keep their source identity and reject replaced files; Kimi Code keeps model switches across resumed reads.
+- LM Studio exports keep empty completions that carry token usage, plus selected and alternate version identities, sparse indices and distinct alternate models.
+- Hermes exports keep modern metadata and reasoning modes; a Hermes lean read omits undemanded provider extras while keeping reasoning facts.
+- Cursor, Cline and Roo keep native timestamps, errors and model choices; a Cursor IDE shell command that failed keeps its error status.
+- Continue: exports keep native usage and cost, every grouped tool result and unrelated index entries; unsupported cache-creation counts are reported, overflowing conversions rejected.
+- Grok: a sub-agent whose metadata appears after its parent was read is picked up; Grok and Qwen replays keep physical checkpoint boundaries.
+- Goose lean reads omit undemanded native sidecars while keeping usage, model and turn kinds.
+- Claude checkpoint counts retain restorable result facts; cached counts from older views are recomputed.
+- OpenSession keeps an optional opaque `principal` through reads and transformations; a mixed-source composition keeps it only when every source agrees (#4).
+- `cv cat`, rendered views, previews and pack excerpts report text they cannot read instead of printing it empty or panicking.
+- Compaction summary scans propagate lazy read failures and keep the full summary text; affordance rows and counts do the same instead of misclassifying.
+- `cv tools --timeline` composes workflow, agent and tool filters; `cv workflow` views skip unrelated child files and journals.
+- Claude workflow revival streams selected histories and recovers valid siblings when another journal is incomplete.
+- Harness-qualified lookups discover only that harness on a catalog miss; id prefixes stay case-sensitive and ambiguity is preserved.
+- Resume hints quote shell arguments safely, including unusual paths and session identifiers.
+
+**Search**
+- HTTP live search rejects context/all scopes with 400 instead of silently searching the exchange; use indexed search for those scopes.
+- Search matches the exchange; injected instructions, system prompts and hooks are `--kind context`; fork copies hit their source once. The index rebuilds once.
+- Semantic vectors embed the exchange only, not injected context or fork copies; `cv index --semantic` re-embeds once. `/api/search?semantic=1&kind=context` is a 400.
+- `cv search` with no usable index errors at once naming the cause and fix, never scanning unasked; `--scan` (`/api/search?scan=1`) asks for the live scan.
+- Every indexed `cv search` answer, hit or miss, names how many sessions the index trails and by how long (stderr under `--json`; `X-Cv-Search-Note`).
+- `cv search`: when live snippets cannot be generated the indexed previews stand in, with a note, as `/api/search` already did.
+- `cv search`, `ls` and `show` work in a home they may not write (a sandbox deny-write rule): the index and catalog open read-only.
+- `-q` supports compact OR expressions (`a|b`) and exact metadata equality (`field="x"`); unsupported text equality reports the syntax to use.
+- Search fills the requested session limit despite dominant matching chunks or rare harness/cwd filters; equal scores rank by session id in any index order.
+- Incremental search rewrites changed session metadata, fixing stale title conjunctions; snippets map casefolded matches back to the original Unicode.
+- `cv index` exits 0 when only some sessions are unreadable: a changed source is retried once, the count warned; `--json` lists them, `--strict` fails.
+- A persisted tool output cv cannot open (another user's file) no longer fails its session's indexing: the session is indexed with a note.
+- `cv index --semantic --subagents` fails before writing anything, naming the two separate operations to run.
+- Indexing and search see one copy of a duplicated session, adopted agents included; duplicate index records and old duplicate vector rows are repaired.
+- Live search resolves lazy labels and reports demanded-text failures instead of returning incomplete matches.
+- HTTP and desktop semantic search reuse checked model and vector state, reload a changed store and reject stale model artifacts.
+
+**Reshaping**
+- Claude rewind and port default to native for all-`claude-*` sessions, portable otherwise; portable removes signature-only reasoning instead of writing placeholders; rewind reports which.
+- `--thinking portable` on `port`, `rewind`, `splice` and `pack` demotes plaintext Claude reasoning to text and maps illegal tool IDs collision-free at both ends (#21).
 - `prune --drop-thinking` omits old thinking blocks with no inline marker, removing emptied records and relinking their children; `cv cat` still retrieves them.
 - Prune's revive estimate anchors on recorded usage and the resumed branch, erring high; calibrated against the API it never read more than 1% low.
 - One token estimator with per-kind rates calibrated against `count_tokens` replaces the flat 3.5 bytes/token in doctor, prune and distill.
-- `cv serve` runs on a small built-in server: idle connections close after 5 s, excess connections get 503, and accept errors no longer stop serving.
-- `cv prune --to` refuses an existing session or sidecar name (exit 2, nothing written); `--force` replaces it by atomic rename, never truncating in place.
+- Doctor and prune distinguish stored-payload estimates, recorded prompt usage and rewritten resume metadata; opaque thinking payloads no longer imply measured reasoning tokens.
+- Prune accepts a sub-agent's transcript id or path, counts its own turns and writes a standalone session, reporting child and parent identities.
+- Prune, restamp and resume verification treat a line of Unicode spaces as malformed, as the reader does; only JSON whitespace makes a line blank.
+- Emitted sessions, distill sidecars and packs, dataset, pack and share files are published whole, never into an existing file; a taken name exits 2.
+- Rewind, adopt and share exit 2 when their output name is already taken; `prune --to` refuses an existing session or sidecar name.
+- `--force` on `prune --to`, dataset, pack, distill `--pack` and share replaces a taken file by atomic rename; hard links keep the old bytes.
+- `prune --copy-resources` refuses an existing resource directory; with `--force` the new directory replaces it whole instead of merging into it.
 - Prune, rewind, adopt, share and archive outputs publish fsynced, without needing hard links (FAT, exFAT); rewind outputs keep the source's permissions.
-- Rewind, adopt and share exit 2 when their output name is already taken.
-- A transcript replaced or rewritten after parsing fails its first lazy content read instead of silently returning the replacement's bytes.
-- Cline, Roo, LM Studio, OpenSession and account exports read through one codec each; lazy text follows Claude's span rule (decoded length over 4 KiB).
-- Claude transcripts parse through one record codec in every mode and build, using about 20% fewer instructions; malformed records get one acceptance rule everywhere.
-- Codex, Grok, Qwen, Kimi, Kimi Code and Continue read through one record codec per format: a cold Codex index takes 13% fewer instructions; bad lines skip individually.
-- OpenSession preserves optional opaque principals through reads and transformations; mixed-source compositions retain attribution only when every source agrees.
-- The first fleet read after an upgrade that invalidates the catalog prints one stderr note that it is re-discovering, suggesting `cv index`.
-- `ls --json --enrich` `display_title` uses the row's `title` when present and never picks harness-injected turns such as Codex AGENTS.md instructions.
-- Claude rewind and port default to native for all-`claude-*` sessions, portable otherwise; portable removes signature-only reasoning instead of writing placeholders; rewind reports which.
-- Backend reads and exports index repeated membership and lineage lookups; account multipart reads keep bounded descriptors and discovery reuses guarded metadata.
-- Indexing and watch space large resume snapshots by retained state size, reducing repeated serialization while allowing longer append rereads.
-- Goose, Hermes and Devin discovery count canonical turns while bounding ordinary large SQLite cells, including SQLite’s native allocations.
-- OpenClaw complete exports preserve native records, branch links, compaction metadata and grouped tool results; parent scans retain source guards.
-- Dataset exports retain session-level system prompts without duplicating explicit system messages.
-- HTTP limits concurrent connections and incomplete request lifetimes while preserving slow responses and keepalive.
+- Prune, rewind and adopt validate source aliases, native identifiers and publication boundaries, verify source identity throughout, and refuse an output that aliases its source.
+- Harness indexes cv updates on emit (Continue, OpenClaw, Gemini) and cv's config are replaced by rename; a symlinked config is replaced at its target.
+- Ported project context files publish only after copying succeeds; failed copies leave no partial destination and preserve existing files.
+- `cv port --harness opencode` writes OpenCode 2.x stores and bootstraps a fresh resumable database; existing 1.x stores still read.
+- OpenCode rehomes keep embedded attachments; an edit invalidates stale replay and an unavailable external image reports fidelity loss.
+- Distill derives findings from structured records, keeps transitive tool dependencies, and materializes only the messages `--upto` selects.
+- Dataset exports keep session-level system prompts without duplicating explicit system messages, honor `--limit 0` without parsing, and reject transcript inode aliases.
+- Pack excerpts include checked source-backed text and report unavailable prefixes; fallback recall centers Unicode snippets on their source matches.
+- Markdown preserves literal newlines and safe fences; redaction covers complete records and system text; a fatal source error leaves stdout empty.
+- `splice --generate` bounds the prompt content it selects, verifies sources, rejects an empty provider response and names the configured remote destination accurately.
 
-- Discovery, filtering and search preserve exact identities, auxiliary-file freshness, malformed-cache recovery, and errors instead of silently accepting incomplete results.
-- Claude workflow revival streams selected histories and recovers valid siblings when another journal is incomplete.
-- Codex, Grok and Qwen skip unused discovery and record payloads while preserving duplicate-key acceptance, Unicode text, system prompts and terminal errors.
-- Kimi discovery tracks auxiliary metadata; Kimi Code preserves model switches across resumed reads and avoids repeated header scans.
-- LM Studio exports preserve empty completions carrying token usage and maintain selected and alternate version identities.
-- Hermes exports preserve modern metadata and reasoning modes; replay suppression indexes candidates and checks exact large bodies without materializing strings.
-- Devin projects navigation from incremental SQLite cells, avoiding whole-body native allocations during metadata reads.
-- OpenCode discovers custom database names, checks WAL changes, preserves unknown records and refuses conflicting native session identifiers.
-- Cursor, Cline and Roo retain native timestamps, errors and model choices; Continue preserves unrelated index entries during export.
-- Shared readers bound mapped validation, propagate checked materialization failures, and avoid duplicate string encoding during JSON exports.
-- Account imports preserve multipart payloads and traverse valid long branches without arbitrary truncation.
-- Task inboxes project brief text without copying rich histories; aliases, unread cursors, reopen receipts and terminal output retain consistent semantics.
-- MCP cancellation targets individual requests, releases their resources and keeps unrelated work and the connection running.
-- HTTP rejects malformed framing, headers, authorities and numeric parameters; bounded request handling avoids payload-sized discard buffers.
-- LLM generation bounds selected prompt content, verifies sources, rejects empty provider responses and accurately describes configured remote destinations.
-- Search reuses catalog readers across results, repairs malformed metadata, preserves Unicode snippets and avoids copying complete semantic previews.
-- Unsupported semantic subagent indexing fails before writing indexes, with instructions for the supported separate indexing operations.
-- Prune, rewind and adoption validate source aliases, native identifiers and publication boundaries before replacing outputs.
-- Distill derives findings from structured records, preserves transitive tool dependencies and shares bounded token estimation across output modes.
-- Markdown preserves literal newlines and safe fences; HTML uses checked payload reads, and redaction covers complete records and system text.
-- Browser requests retain operation ownership, expose retryable failures, and preserve complete bounded ZIP imports across native and Wasm readers.
-- Test helpers isolate ambient configuration and drain subprocess pipes concurrently; build provenance recognizes linked worktrees and release archives.
+**Tasks and lanes**
+- Task appends recover an incomplete final record after validating new events, keep valid history and refuse an ambiguous complete tail.
+- Task writes return the state captured during their append, so a later concurrent write cannot change what a command reports.
+- Task inboxes project brief text without copying rich histories; aliases, unread cursors and terminal output keep consistent semantics.
+- Lane views show task-log warnings and retryable loading errors; an empty selection skips task enrichment while keeping forest totals.
+- Lane summaries index task assignments once instead of rescanning per lane; an invalid or overflowing duration is an error, not a panic.
+- `/api/tasks/inbox/{who}` takes `since=` and `all=` like `/api/inbox`.
+- Deferral matching reuses each command's task word sets; shared-word output is built only for the winning match.
 
-- Hermes reads ordinary SQLite text bodies incrementally, avoiding whole-cell native allocations while preserving copied-session deduplication and compatibility schemas.
+**Hooks**
+- Hook settings and skills publish by atomic replacement, preserving existing readers, permissions, and dotfile symlinks.
+- A lane's hook stop is scoped to its parent session; the edit-conflict hook distinguishes sibling agents from copied ones.
 
-- Selected agent and workflow views skip unrelated child files, journals and workflow bodies while preserving identity resolution and ordering.
-- MCP observation matches messages incrementally, preserves unread tails and checks cancellation during reads, projection and initial prefix scans.
-- HTTP and desktop semantic search reuse checked model and vector state, reloading changed stores and rejecting stale model artifacts.
-- Task writes return states captured during their append, avoiding repeated journal replay and interference from later concurrent writes.
-- Lane views display task-log warnings and retryable loading errors; empty selections skip task enrichment while preserving forest totals.
+**Serve, MCP and web**
+- `cv serve` runs on a small built-in server: idle connections close after 5 s, excess connections get 503, accept errors no longer stop serving.
+- HTTP limits concurrent connections and incomplete request lifetimes; overload shedding bounds retained sockets and drain work; keepalive bursts no longer strand queued requests.
+- HTTP rejects malformed framing, headers, authorities and numeric parameters; a body framing error closes the connection; task requests enforce body limits and media types.
+- `GET /api/session/{harness}/{id}/export` and the browser's download export the complete session as Markdown or OpenSession, including messages beyond the loaded page.
+- `cv archive sync` takes its inventory from the index sweep (one corpus walk, the index refreshed on the way); a home whose index cannot be written falls back to discovery.
+- MCP cancellation targets one request, releases its resources and keeps unrelated work and the connection running; a disconnect cancels and reaps children.
+- MCP bounds concurrent tools and the response backlog, preserves control replies, and releases oversized request buffers between frames.
+- MCP validates envelopes, arguments and observation filters before execution; `observe_stream` polls within the remaining timeout and matches messages incrementally.
+- Generated MCP tools stage large output in bounded memory and return successful stderr, including continuation hints, as a second content block.
+- MCP task tools use the actual CLI flags; generated schemas describe repeatable arguments, and the command reference shows their correct spellings.
+- Web: a session's identity includes its harness; search drops stale responses and merges results across the selected harnesses.
+- Web: transcript pages render before full metadata arrives, closed folds render on open, a failed page shows a retry instead of truncating or duplicating.
+- Web: compare and splice load complete histories with retries; structure views expose every root; ZIP imports are bounded and complete in native and Wasm.
 
-- Shared text construction streams canonical escaping directly, removing repeatedly grown temporary buffers while preserving checked sources and exact output.
-
-- Continue exports preserve native usage and cost, report unsupported cache-creation counts, and reject overflowing conversions before publishing.
-
-- LM Studio complete rehomes preserve selected and alternate native versions, sparse indices, roles and distinct alternate models.
-- OpenClaw discovery reuses each directory’s session index and projects transcript metadata without owning unrelated payloads.
-- Deferral matching reuses task word sets within each command and constructs shared-word output only for the winning match.
-
-- Hermes lean reads retain checked payloads and omit undemanded provider extras while preserving reasoning facts, replay suppression and rich exports.
-- Gemini and Devin project consumed display and metadata fields without transient payload trees or repeated record walks.
-- Grok and Qwen resumed reads retain checked payloads and preserve physical checkpoint boundaries.
-- Continue exports preserve every grouped tool result; OpenClaw recognizes formatted and escaped branch controls.
-- Discovery reuses dependency-guarded cache entries; catalog prefix lookup uses indexed case-sensitive ranges.
-- Session heads and JSON windows reject changed sources before returning results.
-- Queries support compact OR expressions and exact metadata equality; unsupported text equality reports actionable syntax guidance.
-- Semantic search shares query normalization, refresh skips unused vector decoding, and keyword search projects winner metadata without redundant document decoding.
-- Lane summaries index task assignments once instead of rescanning tasks per lane; invalid or overflowing durations return errors without panicking.
-- Task appends recover incomplete final records after validating new events, preserving valid history and refusing ambiguous complete tails.
-- Adoption streams checked transcripts and metadata through private stages and rejects conflicting destinations; rewind verifies source identity throughout preparation.
-- Resume hints quote shell arguments safely, including unusual paths and session identifiers.
-- Timeline composes workflow, agent and tool filters; workflow previews and tree views avoid owning unselected payloads or recursing through deep ancestry.
-- Dataset exports honor zero limits without parsing sessions.
-- HTTP task requests enforce body limits and media types; MCP validates envelopes, arguments and observation filters before execution.
-- MCP observation polling respects remaining timeout instead of sleeping a full oversized interval.
-- Browser session identity includes harness; search rejects stale responses and merges results from each selected harness.
-- Browser compare and splice load complete histories with retries; structure views expose every root and rich comparisons include block payloads.
-
-- Doctor and prune distinguish stored-payload estimates, recorded prompt usage, and rewritten resume metadata; opaque thinking payloads no longer imply measured reasoning tokens.
-- Prune accepts child transcript IDs and paths, counts their own turns, and creates standalone sessions while reporting child and parent identities.
-- Harness-qualified session lookups discover only that harness on catalog misses, preserving prefix ambiguity and leaving unrelated store freshness unchanged.
-- Semantic stores decode through bounded buffers, avoiding a second complete vector allocation during search and refresh.
-- Transcript downloads export complete remote sessions through server or native file staging while preserving paged browsing.
-- Closed transcript folds defer body rendering until opened or copied, including nested reasoning, large tool payloads, system prompts and event lists.
-- Transcript paging preserves failed continuations with visible retries and shares pending pages when reopening sessions, preventing silent truncation and duplicate messages.
-- Semantic search retains only requested ranking candidates, preserving exact score and identity order while avoiding full-store sorting.
-- Session ID lookup preserves case-sensitive prefixes and filters harnesses before decoding catalog metadata.
-- Full unredacted Markdown exports share bounded checked staging with downloads; fatal source errors leave stdout empty.
-- Splice Markdown and JSON exports stage checked source-backed messages without materializing selected bodies, preserving complete output and source freshness.
-- HTTP session downloads export complete Markdown or OpenSession documents through checked native staging, including messages beyond the loaded browser page.
-- Watch cursor creation copies only eligible reader states and stops reader eligibility serialization when its eight-state budget fills.
-- Watch cursors promptly forget vanished sessions during equal-sized fleet replacements, including unreadable replacements, so reappearing sessions start fresh.
-- Pack fallback recall retains only requested candidates, preserves stable ranking, and centers Unicode snippets on their original source matches.
-- Dataset file exports stage before publication and reject transcript inode aliases, preserving source sessions and existing outputs when transformation fails.
-- Gemini checkpoint replay transfers owned bodies and metadata without duplicate payload allocation; Zed header scans avoid copying unknown field names.
-- Cursor IDE failed shell commands retain error status when the native tool invocation itself completed.
-- Codex legacy reads and discovery use checked source views, retaining lazy bodies and bounded title prefixes with unchanged output and counts.
-- Kimi and Kimi Code retain checked bodies during lazy and complete reads, preserving usage, rotations, raw records and resume behavior.
-- Goose legacy reads retain checked text and arguments; lean reads omit undemanded native sidecars while preserving usage, model and turn kinds.
-- Hermes complete exports retain large multimodal text in checked sources and avoid duplicate reasoning-sidecar decoding.
-- Zed lazy reads retain checked decoded text and tool arguments, skipping discarded attachment bodies while preserving validation and message order.
-- Devin lazy reads retain checked bodies and arguments in shared backing, preserving chain metadata and compaction while avoiding whole selected-row copies.
-- OpenClaw branch and SQLite reads retain checked payloads, preserving visible-path order, complete metadata and source freshness.
-- OpenCode rehomes preserve checked complete native records and embedded attachments, while edits invalidate stale replay and unavailable external images report fidelity loss.
-- Cold Kimi, Kimi Code, and Qwen discovery projects counts and titles without owning unrelated transcript or state payloads.
-- OpenCode exports target native 2.x stores and bootstrap resumable fresh databases, while preserving existing 1.x store compatibility.
-- Cline, Roo, Continue and LM Studio rehomes retain checked complete payloads while preserving native output and public complete parsing.
-- OpenCode v2 shell reads retain checked command and output payloads, preserving native fallback formatting, metadata and source freshness.
-- Hermes rehomes keep large ordinary bodies in checked shared backing while preserving complete row visibility and native metadata.
-- OpenCode v1 and Hermes exports resolve checked fields per row, reuse prepared inserts, and roll back failed exports atomically.
-- Grok and Qwen classifiers stop decoding after their required prefixes while preserving complete source validation.
-- Grok and Qwen rehomes retain checked ordinary payloads through complete preparation and verification while preserving native metadata and replay behavior.
-- Grok subagent preparation recognizes missing metadata beneath sibling files and invalidates that absence when a child later appears.
-- Grok and Qwen exports stream guarded JSONL payloads while preserving native output, thinking modes, and fidelity reports.
-- OpenClaw JSONL reads reject source replacement across registry and branch selection, including owned reads, tree reads and callback failures.
-- Flat OpenClaw rehomes retain guarded message payloads through complete preparation while preserving control carriers, rich metadata and fidelity.
-- OpenClaw exports stream guarded payloads and bounded fallback titles, preserving native transcript, index and fidelity behavior.
-- Prune streams malformed JSON rows without owning their bodies, preserving exact bytes and fatal invalid UTF-8 behavior.
-- Cline and Roo exports stream guarded Anthropic history, preserving native files and fidelity without whole-session payload copies.
-- Gemini rehomes stream complete recording payloads through checked preparation, preserving native metadata, replay semantics and source freshness.
-- Continue and LM Studio exports stream checked payloads and bounded fallback titles while preserving native output and fidelity.
-- MCP releases oversized request buffers between frames instead of retaining the largest request for the server lifetime.
-- Cold SQLite snapshots reclaim abandoned copies on later reads and after MCP child cancellation, preserving live readers and producer stores.
-- MCP bounds concurrent tools and response backlog, preserves control replies, and cancels and reaps work on observed disconnect.
-- Prune declassifies Unicode prose with bounded matching while preserving contextual lowercase, token counts, sidecars and source checks.
-- Gemini exports stream guarded text and arguments, preserving pretty output and fidelity without payload-sized session copies.
-- Codex thinking presence and emission fidelity checks stop decoding after the required character while preserving source validation.
-- Claude and Codex rehomes retain checked ordinary payloads while preserving complete metadata, unknown records and source freshness.
-- Codex Text and Drop thinking modes stream checked payloads without materializing discarded reasoning or cloning complete sessions.
-- Semantic refresh selects one live copy per harness-qualified session identity, preventing duplicate-store source errors and repairing old duplicate vector rows.
-- Event publication acquires write ownership before authority validation, avoiding WAL snapshot-upgrade failures during concurrent updates.
-- Event caches bind published rows to source copy, attribution and working directory, preventing stale copied-session reuse and incompatible append prefixes.
-- Indexing skips unchanged empty transcripts when captured source guards are fresh; missing files and historical unknown signatures still invalidate.
-- Prune resolves linked tool inputs without materializing unrelated earlier assistant content, preserving metadata and sidecar fidelity.
-- Index duplicate session copies consistently with lookup, including adopted agents, and repair duplicate index records.
-- JSON listings with `--limit 0` return an empty array after argument validation without loading inventory, querying indexes, or enriching transcripts.
-- Prune revival frames corrected records with boundary searches, avoiding full-byte trimming scans while preserving output and source validation.
-- Prune revival updates usage through checked staged row projections without materializing unchanged message bodies or unrelated record fields.
-- Prune streams large Thinking and ASCII declassification mutations through checked source projections while preserving exact sidecars and revival estimates.
-- Rich lazy Cursor IDE reads retain checked payload ranges, avoiding unused bubble ownership while preserving JSON fields and record acceptance.
-- Claude export streams checked payloads and honors thinking modes without whole-session copies, preserving resumability and verified fidelity.
-- Forward JSON windows avoid constructing unselected Claude rich metadata, preserving record acceptance, selected details and final session metadata.
-- Claude checkpoint counts retain restorable result facts; cached counts from older views are recomputed.
-- Claude discovery resumes verified appends from independent metadata checkpoints, preserving complete EOF titles, timestamps and counts while replaying partial tails.
-- Browser transcript loading defers events and sub-agent reads until the first page arrives, avoiding duplicate enrichment requests and prioritizing messages.
-- Distill owns requested products per message; pack-only analysis skips sidecar rosters while preserving statistics, checked-source errors, tails and resume output.
-- Changed-session listing fetches only demanded discovery-cache rows and shares its catalog connection, avoiding unrelated serialized payload copies.
-- Serve prevents keepalive and preconnection bursts from stranding queued HTTP requests, preserving connection reuse and packaged transport behavior.
-- Cached consumers track primary file identity, detecting timestamp-restored rewrites and replacements on Unix while preserving verified append resume.
-- Incremental search rewrites changed session metadata, fixing stale title conjunctions; older indexes rebuild once to establish metadata guards.
-- Small unqueried JSON listings rank selected rows without fully ordering the inventory, preserving ties and missing-file behavior.
-- MCP startup reuses the parsed command tree and releases parser state before serving requests, preserving generated tools and command results.
-- Queries containing multiple text predicates reuse one full-text index reader, preserving each predicate’s matches and malformed-query fallback.
-- Filtered full-text searches share compact metadata decisions across index segments, avoiding repeated lookups while preserving ranking and current session labels.
-- Discovery decodes persisted metadata only for demanded matching paths, reducing first-use allocation work while preserving cache guards and exact counts.
-- FTS compaction keeps segments above 8 MiB out of the bottom tier, avoiding repeated cold-segment rewrites during small appends.
-- JSON listing enrichment drops stable inline user history after deriving a title, preserving deferred source resolution and final metadata.
-- Session list API responses reuse their completed JSON rows, avoiding a second copy of every returned row.
-- Distill findings resolve demanded text per message, avoiding whole-source Thinking retention while preserving checked-source failures and exact findings output.
-- Distill sidecars serialize borrowed payloads through bounded staging, avoiding complete output strings while preserving existing destination behavior.
-- Limited affordance queries fetch candidate counts and provenance on demand instead of loading every cached session’s counts.
-- Distill prefixes materialize only messages selected by `--upto`, preserving final session metadata and original-count validation.
-- Pack extracts stale events during its excerpt pass, preserving excerpt output and best-effort event publication while avoiding a second transcript traversal.
-- Prune-sidecar retrieval avoids owning unrelated payloads and IDs while preserving typed row acceptance, ambiguity errors, and requested content.
-- Transcript windows render before full-session metadata arrives; late metadata preserves loaded pages, pagination, expanded prompts and the current selection.
-- Distill reuses one prepared tail; findings-only analysis skips unused sidecar copies, tail rendering and token accounting.
-- Pack excerpts include checked source-backed text and report unavailable prefixes instead of silently omitting conversational content.
-- CLI JSON staging batches small writes through bounded operation buffers while preserving output, byte budgets, rollback and continuation hints.
-- Cat and rendered views report unavailable retained text instead of empty output or unresolved-text panics, while preserving lazy tool arguments.
-- Listing and discovery reuse catalog connections across read, scoped refresh and publication stages, avoiding repeated schema initialization while retaining freshness checks.
-- Splice retains only selected messages and moves them into the composition, avoiding materialization and cloning of discarded histories.
-- Fresh discovery avoids rewriting unchanged catalog rows while preserving inventory freshness, session order, source guards, and vanished-file pruning.
-- Budgeted session JSON serializes lazy messages once, preserving compact byte limits and exact pretty output; archive spools reuse compact staging.
-- Limited JSON queries evaluate only the ranked candidates needed for their window; unread lower-ranked transcripts cannot invalidate selected results.
-- Generated MCP tools stage large output in bounded memory and retain successful stderr, including continuation hints, as a second content block.
-- Cursor selected reads preserve empty editor-state fallbacks instead of failing on an empty backing range.
-- Portable Gemini replay retains checked record ranges without copying giant lines or unused metadata.
-- Large retained-text previews read bounded windows instead of scanning complete bodies before returning a short prefix.
-- Gemini reads composite tool results and formatted thoughts with bounded selected-payload memory while preserving output.
-- Goose legacy discovery streams metadata and exact counts without retaining entire transcripts.
-- Uncached session queries reduce facts in bounded parallel batches, preserving result order and publishing counts through one catalog writer.
-- Unchanged full-text refreshes avoid starting Tantivy writers while still completing pending compaction.
-- Codex lazy reads retain giant prompt, reply, reasoning and tool arguments in checked source storage across native and portable transports.
-- Catalog freshness checks every primary source identity, detecting quiet-session appends and timestamp-preserving replacements; discovery caches refresh once.
-- Claude discovery reuses validated UTF-8 to reduce initial metadata scanning while preserving strict record acceptance.
-- Doctor reuses checked generated-text lengths, avoiding repeated payload decoding while preserving source-change errors.
-- Guard Devin, Hermes and Zed database reads against source changes during streaming and discovery.
-- OpenCode discovery counts readable roles consistently, including duplicate keys and malformed headers; cached discovery refreshes once.
-- Cold WAL databases use guarded private snapshots, preserving committed WAL data without creating sidecars in harness stores.
-- Goose partial reads stage SQLite payloads in bounded memory; doctor retains typed facts without decoding large native metadata bags.
-- Verified native Codex ports stream checked payloads and compare compact fidelity facts while preserving complete records and loss reports.
-- Native JSONL exports stage bounded bytes and stream records for Codex, Grok, OpenClaw and Qwen without retaining complete output histories.
-- Doctor rejects unavailable lazy text instead of counting zero tokens; length-only reads avoid copying decoded fragments.
-- Prune stages transcript/sidecar rewrites with compact decision records, reducing memory and rejecting output paths that alias the source.
-- Diagnostics and affordance views request selected metadata facts; Claude and Cursor CLI avoid copying unrelated raw sidecars.
-- Lane summaries request response identities for usage deduplication without loading unrelated record metadata.
-- Cursor IDE partial reads stream Lexical rich text and structured tool results without retaining whole payloads.
-- Cursor IDE partial reads and doctor facts stream selected string payloads while preserving session modes and checked SQLite snapshot dependencies.
-- Cursor CLI discovery and partial reads stream selected message fields with bounded scratch and reject changed SQLite snapshot dependencies.
-- SQLite source freshness tracks rollback journal creation, edits, and removal alongside WAL dependencies.
-- Shared payload staging copies bounded chunks before appending, preventing mapped-source writes from hanging on macOS.
-- Browser message windows stage checked JSON responses without copying selected payloads into complete response trees.
-- MCP observation reads capped searchable prefixes without materializing giant text or tool arguments, preserving cursor freshness and source errors.
-- Compaction summary scans propagate lazy source read failures and preserve full summary text.
-- Kimi Code keeps large step payloads lazy and reduces memory for doctor and filtered dataset reads.
-- Affordance rows and counts propagate source text read failures instead of classifying incomplete content.
-- Staged dataset and JSON output retain checked source-backed text without copying decoded payloads into private transport.
-- Commit evidence scans tool results in bounded chunks and reports unreadable lazy sources instead of silently losing matches.
-- Search indexes source-backed text and retains complete database, WAL and sidecar freshness guards in semantic caches.
-- Live search resolves lazy labels and reports demanded text failures instead of returning incomplete matches.
-- Warm token statistics reuse bounded, dependency-validated usage rows while preserving response deduplication and exact cost totals.
-- Portable and compressed Codex reads retain giant tool outputs and assistant-event text in checked source ranges, preserving metadata, usage, error markers and resumptions.
-- LM Studio discovery projects source metadata and bounded titles without loading whole documents, including portable builds.
-- Cursor Agent CLI chat and ACP blob stores now expose native prompts, replies, tool calls, summaries, modes, and lineage.
-- Cursor numeric message modes map to readable names, retaining original values and unknown future enum values in harness metadata.
-- Codex discovery counts logical turns consistently with parsing and streaming, excluding duplicated event echoes, injected instructions and inherited history.
-- Semantic score ties use stable session identities, preserving result order and limits across incremental refreshes.
-- Full-text ranking and membership decode stored chunk IDs without allocating unrelated metadata, preserving existing indexes.
-- Search fills requested session limits despite dominant matching chunks or rare harness/cwd filters; full-text score ties remain deterministic.
-- Native structured JSON output reuses validated canonical short escapes without decoding and re-encoding whole string windows.
-- Streaming text validates short escapes without duplicate decoding while retaining strict Unicode validation and malformed-text fallback.
-- Pretty JSON scans string boundaries without interpreting every escape, preserving exact formatted output.
-- JSON show and export stream selected payloads through bounded staging, preserving exact documents and publishing only after successful source reads.
-- Continue reads giant JSON-encoded tool arguments with bounded decoding and preserves transcript identity through staged datasets.
-- LM Studio partial reads keep selected text in source spans and stream regenerated variants without materializing complete turns.
-- Dataset export streams messages into bounded private staging, preserving filters and exact training formats without retaining transcript history.
-- Large Claude tool arguments stay source-backed in partial reads; changed sources fail explicitly instead of publishing incomplete results.
-- Portable structured-argument projections use bounded file windows instead of loading encoded values.
-- Watch and archive reuse verified record checkpoints; unchanged sources avoid reparsing, and modified archive files are repaired.
-- API pagination reuses bounded, source-verified continuations and head summaries, avoiding repeated scans of earlier messages.
-- Lane summaries resolve assistant reports and bounded tool arguments without decoding unrelated message bodies.
-- Large Zed threads decode once into bounded temporary storage, avoiding repeated decompression while retaining exact replay.
-- Semantic indexing reuses unchanged vectors, tracks demanded source dependencies, and loads the embedding model only when sessions need refreshing.
-- Native Qwen JSONL resumes at finalized record boundaries; changed metadata and legacy replay formats still trigger whole reads.
-- Full-text indexing streams structured tool arguments into bounded documents without an extra serialized string.
-- Full-text indexing caps queued document capacity through Tantivy consumption, preventing concurrent large sessions from retaining an unbounded backlog.
-- Index publication reuses its catalog connection while preserving independent transactions and reporting partial failures for retry.
-- Tool histograms fold streamed events without retaining an event list.
-- Zed discovery sorts metadata and reads blobs incrementally under one SQLite snapshot, avoiding whole-blob sorting and copying.
-- Semantic embedding heads cap inline text, labels and streamed tool arguments without allocating oversized projection copies.
-- Claude discovery and fork detection inspect metadata without allocating giant message bodies.
-- Cline SDK, OpenSession and account exports read native source ranges; export metadata caching avoids repeated archive scans.
-- Kimi wire outputs use lazy source spans; Zed compressed threads replay one decoded message at a time.
-- Rich queries retain requested facts instead of whole transcripts, preserving tool, model, path and affordance matching.
-- Event indexing spills large batches to temporary files and keeps failed publication retryable.
-- Dependency freshness follows conditional fork siblings and external outputs, including missing files and relative paths.
-- Selected escaped text and decoded-length counts use one decode pass while preserving malformed-input fallback.
-- Doctor counts decoded text in bounded chunks and tool arguments without a serialized copy, preserving attribution and compaction reports.
-- Claude lazy reads borrow typed hot records and map JSONL lines, avoiding allocations proportional to giant text records.
-- Gemini lazy reads retain source ranges for message bodies and replay history; discovery skips unused payloads.
-- Continue and LM Studio discovery skip message bodies instead of constructing complete transcript trees.
-- CI now caps live Rust heap on generated large Claude, Codex and Gemini sessions and escaped span decoding.
-- JSON show windows retain selected messages; affordance views classify streamed messages instead of collecting the transcript first.
-- Text predicates match directly against the index; search snippets read source transcripts only after result filtering and limits.
-- Escaped lazy text is decoded in bounded chunks, including builds without memory mapping.
-- Cursor discovery uses indexed composer key ranges and reuses prepared bubble lookups.
-- OpenClaw SQLite reads retain navigation and selected payloads; discovery and side registries release unrelated bodies row by row.
-- Qwen discovery counts streamed turns without retaining their messages.
-- Giant Codex tool outputs preserve tool names, namespaces, timestamps and inherited-history filtering through the ordinary dispatch path.
-- Codex format detection inspects raw metadata without allocating giant output bodies, including tool-only transcripts and resumed reads.
-- Gemini accepts escaped wrapper metadata and preserves saved-chat message classification.
-- Same-size transcript edits invalidate search and event caches; checkpoint reuse requires source growth.
-- Counts, events and search track known sidecar and SQLite WAL changes independently; discovery caches invalidate when metadata interpretation changes.
-- Archive catalog cleanup scans grow geometrically instead of rereading the entire catalog after every stored session.
+**Performance** (output unchanged)
+- Large transcripts read through 8 MiB windows and single spans, never whole: `cv doctor` on 1.3 GB peaks at 22 MB, not 2.6 GB.
 - `cv index` parses on every core: a full counts recount of a 95 GB fleet went from 329 s to 61-68 s.
-- `cv search` ranks equal scores by session id, whatever order the index was written in.
-- `cv index` rebuilds the full-text index once after upgrading; afterwards a grown Claude or Codex transcript is read only from where the last pass stopped.
+- `cv index` rebuilds the full-text index once after upgrading; afterwards a grown Claude or Codex transcript is read from where the last pass stopped.
+- Native builds decode zstd (Codex rollouts, Zed and OpenClaw blobs) with libzstd: a cold index of compressed rollouts takes 39% fewer instructions.
+- A compressed Codex rollout is decoded once and read from one mapping: cold index 15% fewer instructions, first listing and `show` about half.
+- Claude transcripts parse through one record codec in every mode and build, using about 20% fewer instructions; malformed records get one acceptance rule everywhere.
+- Codex, Grok, Qwen, Kimi, Kimi Code and Continue read through one record codec per format: cold Codex index 13% fewer instructions; bad lines skip.
+- Gemini recordings read through one message codec; a 314 MB session's lazy read takes 3.4x fewer instructions.
+- Cline, Roo, LM Studio, OpenSession and account exports read through one codec each; lazy text follows Claude's span rule (decoded length over 4 KiB).
+- `ls -q has:` and unchanged `cv index` detect only the adapter a session needs, once per operation: 2.9x and 1.7x fewer instructions.
+- Devin, OpenCode, Hermes, Zed and Goose discovery reuse cached results while their database, WAL and journal are unchanged.
+- Listing beside a live Claude transcript reads only its appended bytes: a discovery pass raced by the writer is kept, not restarted.
+- Claude discovery resumes verified appends from metadata checkpoints; Kimi, Qwen and Codex discovery project counts and titles without owning transcript payloads.
+- Every harness reader keeps large bodies in the source file and decodes them in bounded windows, with or without mmap; SQLite cells stream incrementally.
+- `show`, `export`, `dataset`, `splice`, `prune`, `distill`, `doctor`, Markdown, native JSONL exports and every rehome stream checked payloads through bounded staging, never whole-session strings.
+- Semantic indexing reuses unchanged vectors, loads the embedding model only when a session needs refreshing, and decodes stores through bounded buffers.
+- Full-text indexing streams tool arguments into bounded documents, caps its queued backlog, keeps segments over 8 MiB out of the bottom tier.
+- Catalog connections are reused across discovery, refresh and publication; unchanged rows are not rewritten; limited queries evaluate only their ranked candidates.
+- Watch and archive reuse verified record checkpoints; unchanged sources are not reparsed; archive catalog cleanup scans grow geometrically.
+- Browser windows, API pagination and session-list responses reuse bounded continuations and completed rows instead of rescanning or copying.
+- CI caps live Rust heap on generated large Claude, Codex and Gemini sessions and escaped span decoding.
+
+**Fixes**
+- One freshness record per consumer and session, verified on load (counts, events, search, usage); watches record file identities. Each rereads once after upgrading.
+- A live `.jsonl` beside its writer is admitted by content (same file, sampled prefix intact), never by waiting; index, events, counts, vectors reread once.
+- Reading a live session no longer fails with "JSON source changed" when its writer appends: `.jsonl` sources may grow; truncation and rewrites still fail.
+- Large text spanned from a whole-document `.json` transcript fails its demand once the file changes, grown or not; only `.jsonl` logs may grow.
+- A transcript replaced or rewritten after parsing fails its first lazy read instead of returning the replacement's bytes; heads and windows reject changed sources.
+- Positioned (no-mmap) builds resolve large transcript text from a live, growing session, as mapped builds do; a replaced or shrunk file still fails.
+- Catalog freshness checks every primary source identity, noticing quiet-session appends, same-size edits and timestamp-preserving replacements; counts, events and search track sidecar and WAL changes.
+- Dependency freshness follows conditional fork siblings and external outputs, including missing files and relative paths.
+- Reading SQLite harness stores no longer rewrites their `-shm` or creates WAL sidecars: WAL stores open `immutable=1` when frameless, otherwise through a private snapshot.
+- A copied or moved `CLUSTERVISION_HOME` keeps its full-text index: baselines follow an identity stored in the index, not its path.
+- The first fleet read after an upgrade that invalidates the catalog prints one stderr note that it is re-discovering, suggesting `cv index`.
+- A failed prune, rewind or adopt retracts its companion file only if still cv's own, on every platform, and reports a failed retract.
+- Replacing a directory without atomic swap no longer deletes the new tree when restoring the old one fails; both are kept and named.
+- New-name publication fails safely when neither hard links nor exclusive rename are supported, instead of risking overwriting a concurrent writer.
+- Watch cursors and Kimi, Kimi Code and Qwen checkpoints serialize in a stable order; watch forgets vanished sessions, so a reappearing session starts fresh.
+- Event publication acquires write ownership before validation; event caches bind rows to source copy, attribution and cwd; large batches spill to disk, retryable.
+- Index publication reuses its catalog connection while keeping independent transactions and reporting partial failures for retry.
+- Doctor rejects unavailable lazy text instead of counting zero tokens; commit evidence scans report unreadable sources instead of silently losing matches.
+- Resume guard sampling preserves open transcript read positions on Unix.
+- Semantic score ties use stable session identities, preserving result order and limits across incremental refreshes.
+- `cv --version` build provenance recognizes linked worktrees and release archives.
+- Manual: search defaults and fallbacks, affordance views, MCP window exceptions, the calibrated estimator, `--drop-thinking` and the prompt-row schema read as the binary behaves.
+
+**Removals**
+- **Breaking:** `GET /api/backlog` is removed (410 pointer); the inbox page reads `/api/tasks?detail=1`, which adds the backlog columns.
+- **Breaking:** `POST /api/task/{id}/reopen` is removed (410): a closed task stays closed; open a new task and note the old id.
+- **Breaking:** MCP no longer offers `hook` (it reads Claude Code's hook JSON on stdin; a call did nothing); calling it points at `hooks_install`.
+- Pre-binary `embeddings.json` semantic stores are no longer read or migrated (querying them already failed); `cv index --semantic` rebuilds.
 
 ## 0.16.1 — 2026-10-12 — approvals, checkpoints, and the side files
 

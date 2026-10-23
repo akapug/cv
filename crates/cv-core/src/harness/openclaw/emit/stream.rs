@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     harness::wire::write::{self as wire, ObjectWriter},
-    lazy::Resolver,
+    lazy::{Resolver, Text},
 };
 use std::io::Write;
 
@@ -26,32 +26,31 @@ pub(super) fn content(writer: &mut dyn Write, blocks: &[Block], mode: ThinkingMo
             projected.field("type", "text")?;
             projected.field_with("text", |w| wire::text(w, &text, resolver))?;
             projected.finish()?;
-        } else if let Block::ToolUse {
-            id,
-            name,
-            input,
-            namespace: Some(namespace),
-        } = block
-        {
-            if namespace == crate::affordance::DEFERRED {
-                // The shared replay definition supplies OpenClaw's distinct {id,args} keys.
-                let (name_key, args_key) = crate::affordance::deferred_keys(Harness::OpenClaw);
-                let mut call = ObjectWriter::new(writer)?;
-                call.field("type", anthropic::OPENCLAW.tool_use.0)?;
-                call.field("id", id)?;
-                call.field("name", crate::affordance::DEFERRED)?;
-                call.field_with(anthropic::OPENCLAW.tool_use.1, |w| {
-                    let mut wrapper = ObjectWriter::new(w)?;
-                    wrapper.field(name_key, name)?;
-                    wrapper.field_with(args_key, |w| input.write_canonical(&mut &mut *w))?;
-                    wrapper.finish()
-                })?;
-                call.finish()?;
-            } else {
-                anthropic::write::block(writer, block, &anthropic::OPENCLAW, false, resolver)?;
-            }
         } else {
-            anthropic::write::block(writer, block, &anthropic::OPENCLAW, false, resolver)?;
+            match block {
+                Block::ToolUse {
+                    id,
+                    name,
+                    input,
+                    namespace: Some(namespace),
+                } if namespace == crate::affordance::DEFERRED => {
+                    // The adapter's own wrapper supplies OpenClaw's distinct {id,args} keys.
+                    let crate::affordance::DeferredWrapper { name_key, args_key } =
+                        crate::harness::openclaw::DEFERRED_WRAPPER;
+                    let mut call = ObjectWriter::new(writer)?;
+                    call.field("type", anthropic::OPENCLAW.tool_use.0)?;
+                    call.field("id", id)?;
+                    call.field("name", crate::affordance::DEFERRED)?;
+                    call.field_with(anthropic::OPENCLAW.tool_use.1, |w| {
+                        let mut wrapper = ObjectWriter::new(w)?;
+                        wrapper.field(name_key, name)?;
+                        wrapper.field_with(args_key, |w| input.write_canonical(&mut &mut *w))?;
+                        wrapper.finish()
+                    })?;
+                    call.finish()?;
+                }
+                _ => anthropic::write::block(writer, block, &anthropic::OPENCLAW, false, resolver)?,
+            }
         }
     }
     writer.write_all(b"]")?;
@@ -68,6 +67,16 @@ fn summary(writer: &mut dyn Write, msg: &crate::Message, mode: ThinkingMode, res
     wire::joined_text(writer, texts.iter().map(|v| v.as_ref()), resolver)
 }
 
+/// The first [`Block::ToolResult`] of a Tool turn, as the native row reads it.
+#[derive(Clone, Copy)]
+struct NativeResult<'a> {
+    id: &'a str,
+    content: &'a Text,
+    is_error: bool,
+    name: Option<&'a str>,
+    details: Option<&'a Value>,
+}
+
 fn tool_result(writer: &mut dyn Write, blocks: &[Block], timestamp: i64, resolver: &Resolver) -> Result<()> {
     let result = blocks.iter().find_map(|block| {
         if let Block::ToolResult {
@@ -79,21 +88,21 @@ fn tool_result(writer: &mut dyn Write, blocks: &[Block], timestamp: i64, resolve
             ..
         } = block
         {
-            Some((
-                tool_use_id.as_str(),
+            Some(NativeResult {
+                id: tool_use_id.as_str(),
                 content,
-                *is_error,
-                tool_name.as_deref(),
-                details.as_ref(),
-            ))
+                is_error: *is_error,
+                name: tool_name.as_deref(),
+                details: details.as_ref(),
+            })
         } else {
             None
         }
     });
     let mut inner = ObjectWriter::new(writer)?;
     inner.field("role", "toolResult")?;
-    inner.field("toolCallId", result.map(|r| r.0).unwrap_or(""))?;
-    if let Some(name) = result.and_then(|r| r.3) {
+    inner.field("toolCallId", result.map(|r| r.id).unwrap_or(""))?;
+    if let Some(name) = result.and_then(|r| r.name) {
         inner.field("toolName", name)?;
     }
     inner.field_with("content", |w| {
@@ -101,7 +110,7 @@ fn tool_result(writer: &mut dyn Write, blocks: &[Block], timestamp: i64, resolve
         let mut part = ObjectWriter::new(w)?;
         part.field("type", "text")?;
         part.field_with("text", |w| match result {
-            Some((_, text, _, _, _)) => wire::text(w, text, resolver),
+            Some(r) => wire::text(w, r.content, resolver),
             None => serde_json::to_writer(w, "").map_err(Into::into),
         })?;
         part.finish()?;
@@ -112,8 +121,8 @@ fn tool_result(writer: &mut dyn Write, blocks: &[Block], timestamp: i64, resolve
         w.write_all(b"]")?;
         Ok(())
     })?;
-    inner.field("isError", result.is_some_and(|r| r.2))?;
-    if let Some(details) = result.and_then(|r| r.4) {
+    inner.field("isError", result.is_some_and(|r| r.is_error))?;
+    if let Some(details) = result.and_then(|r| r.details) {
         inner.field("details", details)?;
     }
     inner.field("timestamp", timestamp)?;
@@ -121,27 +130,32 @@ fn tool_result(writer: &mut dyn Write, blocks: &[Block], timestamp: i64, resolve
 }
 
 pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    emit_after_stage(session, out_dir, opts, || Ok(()))
+}
+
+pub(super) fn emit_after_stage(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    after_stage: impl FnOnce() -> Result<()>,
+) -> Result<EmitResult> {
     wire::check_source_fields(session)?;
     let resolver = session.resolver();
     // Match explicit-title precedence, first-user selection, whitespace filtering and truncation.
-    let label = wire::fallback_title(session, Harness::OpenClaw, opts.thinking, &resolver)?;
+    let label = wire::fallback_title(session, &resolver)?;
     let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
     let cwd = effective_cwd(session, opts);
     let cwd_str = cwd
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let agents_root = if out_dir.file_name().is_some_and(|n| n == "agents") {
-        out_dir.to_path_buf()
-    } else {
-        out_dir.join("agents")
-    };
+    let agents_root = crate::emit::out_dir_within(out_dir, "agents");
     let sessions_dir = agents_root.join("main/sessions");
     let file_path = sessions_dir.join(format!("{new_id}.jsonl"));
     let created = session.created_at.or(session.updated_at).unwrap_or_else(Utc::now);
     let created_iso = created.to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut lines = JsonlStage::new();
-    let native = super::replay::Native::new(session);
+    let native = super::replay::Native::new(session, &new_id);
     lines.push_with(|w| {
         if native.header(session, w, &new_id, &cwd_str)? {
             return Ok(());
@@ -167,7 +181,7 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
         lines.push_with(|w| {
             let mut row = ObjectWriter::new(w)?;
             row.field("type", "session_info")?;
-            row.field("id", openclaw_short_id())?;
+            row.field("id", native.generated_id("title"))?;
             row.field("parentId", Value::Null)?;
             row.field("timestamp", &created_iso)?;
             row.field("name", title)?;
@@ -195,6 +209,7 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
         };
         let mut remaining = msg.content.as_slice();
         let mut first_part = true;
+        let mut part_index = 0;
         loop {
             let split = if msg.role == Role::Tool && control.is_none() {
                 remaining
@@ -213,9 +228,9 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
                 (remaining, None)
             };
             let entry_id = if first_part {
-                native.entry_id(msg)
+                native.entry_id(msg, index)
             } else {
-                openclaw_short_id()
+                native.generated_id(&format!("part:{index}:{part_index}"))
             };
             let row_parent = if first_part {
                 native.parent(msg, &parent)
@@ -275,6 +290,8 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
                 }
                 row.finish()
             })?;
+            // Id-less replayed records retain their own links and do not introduce an outer
+            // entry id to parent the next message; generated or identified records do.
             if !replayed || msg.id.is_some() {
                 parent = Some(entry_id);
             }
@@ -284,17 +301,32 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
             let Some(rest) = rest else { break };
             remaining = rest;
             first_part = false;
+            part_index += 1;
         }
         index += consumed;
     }
     // All source demands complete before opening the transcript or changing its index.
     fs::create_dir_all(&sessions_dir).with_context(|| format!("creating {}", sessions_dir.display()))?;
-    lines.publish(&file_path, opts.claim())?;
     let index_path = sessions_dir.join("sessions.json");
-    let mut index: Map<String, Value> = fs::read_to_string(&index_path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Map<String, Value>>(&t).ok())
-        .unwrap_or_default();
+    // cv's update replaces OpenClaw's index whole, so an index it cannot read as one is refused,
+    // never replaced by one holding only this session.
+    let refused = || {
+        format!(
+            "reading the OpenClaw index {}; refusing to replace it",
+            index_path.display()
+        )
+    };
+    // The index is claimed as read: the file this update was computed from, or none.
+    let (read, mut index): (Option<crate::source::FileId>, Map<String, Value>) = match fs::File::open(&index_path) {
+        Ok(mut file) => {
+            let id = crate::source::FileId::of(&file.metadata().with_context(refused)?);
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes).with_context(refused)?;
+            (id, serde_json::from_slice(&bytes).with_context(refused)?)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, Map::new()),
+        Err(e) => return Err(e).with_context(refused),
+    };
     let mut entry = Map::new();
     entry.insert("sessionId".into(), json!(new_id));
     if let Some(label) = label {
@@ -310,8 +342,20 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
     index.insert(new_id.clone(), Value::Object(entry));
     let mut index_stage = crate::harness::store::bytes::ByteStage::new();
     serde_json::to_writer_pretty(&mut index_stage, &index)?;
-    // OpenClaw's own index: cv's update replaces it whole.
-    crate::harness::store::publish_stage(index_stage, &index_path, crate::publish::Claim::Replace)?;
+    // The transcript and its index entry publish as one set, the index last: a crash between
+    // leaves an unlisted transcript, never an entry naming a missing one.
+    let mut set = crate::publish::Set::new();
+    lines.stage_into(&mut set, &file_path, opts.claim())?;
+    crate::harness::store::stage_into(&mut set, index_stage, &index_path, crate::publish::Claim::Replace)?;
+    after_stage()?;
+    // Another writer's index update since the read would be lost under ours: refuse, publish nothing.
+    if crate::source::FileId::at(&index_path) != read {
+        anyhow::bail!(
+            "the OpenClaw index {} changed while cv updated it; rerun",
+            index_path.display()
+        );
+    }
+    set.publish()?;
     Ok(EmitResult {
         path: file_path,
         new_id: new_id.clone(),

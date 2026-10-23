@@ -57,7 +57,7 @@ One selector at a time. Piped `cv show` with no selector over 200 KB prints the 
     cv prune <id> --drop-thinking --json         # snips old payloads + thinking; revives the resume gate
     → {source_id, new_id, harness, before_bytes, after_bytes, snipped_payloads, image_blocks,
        tokens_freed, dropped_turns, window_real_tokens, revived, warnings, new_path, sidecar_path,
-       copied_resources, dry_run, note}
+       copied_resources, skills, dry_run, note}
     cv resume <new_id>                           # prints `claude --resume <new_id>` (add --launch to run it)
 
  8. Port a session to another harness or directory
@@ -96,7 +96,7 @@ One selector at a time. Piped `cv show` with no selector over 200 KB prints the 
 
 13. What did I promise to do later, and does a task hold it?
     cv deferrals <id> --open-tasks               # exit 1 while any deferral is UNMATCHED — gate a closeout on it
-    cv deferrals <id> --since <msg> --json
+    cv deferrals <id> --at <msg> --json
     → [{index, timestamp, phrase, context, matched?: {task_id, title, state, shared}}]
 
 14. Hand a lane's context on without its transcript (distill)
@@ -141,5 +141,53 @@ mod tests {
         ] {
             assert!(!r.contains(old), "recipes mention the removed {old:?}");
         }
+    }
+
+    // Every `--flag` the prose names must be a long flag some command actually offers, so a
+    // renamed flag fails here instead of advertising a spelling cv rejects.
+    #[test]
+    fn flags_named_in_prose_are_real_flags() {
+        // `build_cli()` is a deep derive tree; run it on a big stack, as `schema`'s tests do.
+        let hit = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                fn collect(cmd: &clap::Command, longs: &mut std::collections::BTreeSet<String>) {
+                    for a in cmd.get_arguments() {
+                        if let Some(long) = a.get_long() {
+                            longs.insert(long.to_string());
+                        }
+                    }
+                    for sub in cmd.get_subcommands() {
+                        collect(sub, longs);
+                    }
+                }
+                let mut longs = std::collections::BTreeSet::new();
+                collect(&crate::build_cli(), &mut longs);
+                // clap's own `--help`, and the harness CLIs' `--resume` the recipes hand off to.
+                longs.extend(["help".to_string(), "resume".to_string()]);
+                let mut unknown = Vec::new();
+                for word in super::RECIPES.split_whitespace() {
+                    let Some(flag) = word.strip_prefix("--") else {
+                        continue;
+                    };
+                    let flag: String = flag
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                        .collect();
+                    assert!(!flag.is_empty(), "recipes name a bare `--`: {word:?}");
+                    if !longs.contains(flag.as_str()) {
+                        unknown.push(flag);
+                    }
+                }
+                unknown
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(
+            hit.is_empty(),
+            "recipes name flags no command offers: {:?}",
+            hit.iter().map(|f| format!("--{f}")).collect::<Vec<_>>()
+        );
     }
 }

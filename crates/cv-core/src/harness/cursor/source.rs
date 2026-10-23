@@ -52,7 +52,7 @@ pub(super) fn cell(conn: &Connection, cells: &Cells, table: &str, key: &str) -> 
 /// conversion preserves exactly String::from_utf8_lossy's replacement groups, including tails.
 struct LossyUtf8<R> {
     input: R,
-    pending: Vec<u8>,
+    chunks: crate::utf8::Chunks,
     output: Vec<u8>,
     position: usize,
     done: bool,
@@ -61,7 +61,7 @@ impl<R: Read> LossyUtf8<R> {
     fn new(input: R) -> Self {
         Self {
             input,
-            pending: Vec::new(),
+            chunks: crate::utf8::Chunks::new(crate::utf8::Verdict::Replace),
             output: Vec::new(),
             position: 0,
             done: false,
@@ -73,31 +73,16 @@ impl<R: Read> LossyUtf8<R> {
         let mut chunk = [0; 64 * 1024];
         let n = self.input.read(&mut chunk)?;
         self.done = n == 0;
-        self.pending.extend_from_slice(&chunk[..n]);
-        let mut cursor = 0;
-        while cursor < self.pending.len() {
-            match std::str::from_utf8(&self.pending[cursor..]) {
-                Ok(_) => {
-                    self.output.extend_from_slice(&self.pending[cursor..]);
-                    cursor = self.pending.len();
-                }
-                Err(error) => {
-                    let valid = cursor + error.valid_up_to();
-                    self.output.extend_from_slice(&self.pending[cursor..valid]);
-                    if let Some(len) = error.error_len() {
-                        self.output.extend_from_slice("\u{fffd}".as_bytes());
-                        cursor = valid + len;
-                    } else if self.done {
-                        self.output.extend_from_slice("\u{fffd}".as_bytes());
-                        cursor = self.pending.len();
-                    } else {
-                        cursor = valid;
-                        break;
-                    }
-                }
-            }
+        let output = &mut self.output;
+        let mut push = |text: &str| -> io::Result<()> {
+            output.extend_from_slice(text.as_bytes());
+            Ok(())
+        };
+        if self.done {
+            self.chunks.finish(&mut push)?;
+        } else {
+            self.chunks.feed(&chunk[..n], &mut push)?;
         }
-        self.pending.drain(..cursor);
         Ok(())
     }
 }

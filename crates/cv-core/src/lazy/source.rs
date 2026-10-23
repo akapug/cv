@@ -1,5 +1,7 @@
 //! Retained JSON-string backing with original source provenance and bounded decoded demands.
 use crate::json::{Json, JsonRange};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -9,28 +11,27 @@ pub struct SourceText {
     pub(crate) skip: usize,
     // Immutable producer count for a complete generated string. Private deferred transport may
     // omit this optional optimization; restored strings retain the checked decoding fallback.
-    pub(crate) known_len: Option<usize>,
+    known_len: Option<usize>,
 }
 impl PartialEq for SourceText {
     fn eq(&self, other: &Self) -> bool {
-        self.skip == other.skip && self.range.same_range(&other.range)
+        self.skip == other.skip && self.range == other.range
     }
 }
 impl Eq for SourceText {}
-#[derive(Debug)]
-struct PrefixComplete;
-impl std::fmt::Display for PrefixComplete {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("source text prefix complete")
-    }
-}
-impl std::error::Error for PrefixComplete {}
 impl SourceText {
     pub(crate) fn new(range: Arc<JsonRange>) -> Self {
         Self {
             range,
             skip: 0,
             known_len: None,
+        }
+    }
+    /// A producer-validated string whose decoded byte count is already known.
+    pub(crate) fn generated(range: Arc<JsonRange>, decoded_len: usize) -> Self {
+        Self {
+            known_len: Some(decoded_len),
+            ..Self::new(range)
         }
     }
     pub fn path(&self) -> &std::path::Path {
@@ -42,15 +43,14 @@ impl SourceText {
     pub(crate) fn json(&self) -> Json {
         Json::Source(self.range.clone())
     }
+    /// Upper bound for the retained decoded body: the range includes its two JSON quotes;
+    /// the skipped prefix counts decoded bytes. Escapes may make the actual body shorter.
     pub fn raw_len(&self) -> usize {
         usize::try_from(self.range.len().saturating_sub(2))
             .unwrap_or(usize::MAX)
             .saturating_sub(self.skip)
     }
-    pub fn try_for_each_chunk(&self, chunk: usize, f: impl FnMut(&str) -> Result<()>) -> Result<()> {
-        self.chunks(chunk, false, f)
-    }
-    fn chunks(&self, chunk: usize, prefix: bool, mut f: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    pub fn try_for_each_chunk(&self, chunk: usize, mut f: impl FnMut(&str) -> Result<()>) -> Result<()> {
         let mut skip = self.skip;
         let mut scratch = String::new();
         let mut visit = |mut part: &str| {
@@ -69,23 +69,19 @@ impl SourceText {
                 scratch.clear();
                 scratch.push_str(&part[..end]);
                 let result = f(&scratch);
-                self.range.check()?;
+                self.range.captured_source().check()?;
                 result?;
                 part = &part[end..];
             }
             Ok(())
         };
-        if prefix {
-            self.range.for_each_string_prefix_chunk(&mut visit)?;
-        } else {
-            self.range.with_view(|view| {
-                anyhow::ensure!(
-                    view.for_each_str_chunk(&mut visit)?,
-                    "source text backing is not a JSON string"
-                );
-                Ok(())
-            })?;
-        }
+        self.range.with_view(|view| {
+            anyhow::ensure!(
+                view.for_each_str_chunk(&mut visit)?,
+                "source text backing is not a JSON string"
+            );
+            Ok(())
+        })?;
         anyhow::ensure!(skip == 0, "source text prefix is past end");
         Ok(())
     }
@@ -98,7 +94,7 @@ impl SourceText {
         })?;
         Ok(output)
     }
-    /// A decoded UTF8 byte prefix; unlike raw Span caps, this carrier has strict JSON semantics.
+    /// A decoded UTF8 byte prefix with strict JSON semantics.
     pub fn try_prefix(&self, cap: usize) -> Result<String> {
         self.try_prefix_with_truncation(cap).map(|(text, _)| text)
     }
@@ -106,7 +102,7 @@ impl SourceText {
     /// Revalidate the full source guard before treating the internal prefix cutoff as success.
     pub fn try_prefix_with_truncation(&self, cap: usize) -> Result<(String, bool)> {
         let mut output = String::with_capacity(cap.min(64 * 1024));
-        let result = self.chunks(64 * 1024, true, |part| {
+        let result = self.try_for_each_chunk(64 * 1024, |part| {
             let mut end = part.len().min(cap - output.len());
             while !part.is_char_boundary(end) {
                 end -= 1;
@@ -117,12 +113,12 @@ impl SourceText {
             }
             output.push_str(&part[..end]);
             if end < part.len() {
-                return Err(PrefixComplete.into());
+                return Err(crate::stream::Stop.into());
             }
             Ok(())
         });
         let truncated = match result {
-            Err(error) if error.downcast_ref::<PrefixComplete>().is_some() => true,
+            Err(error) if error.downcast_ref::<crate::stream::Stop>().is_some() => true,
             other => {
                 other?;
                 false
@@ -201,7 +197,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
         let source = JsonSource::capture(&path).unwrap();
         let text = source
-            .read_range_value(0, source.len(), |v| v.source_text())
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |v| {
+                v.source_text()
+            })
             .unwrap()
             .unwrap();
         let resolver = Resolver::new(None);
@@ -231,7 +229,11 @@ mod tests {
             })
             .unwrap();
         let text = source
-            .read_backing_value(backing.clone(), offset, len, |view| view.source_text())
+            .read(
+                ReadInput::Backing(backing.clone(), offset, len),
+                Validation::Value,
+                |view| view.source_text(),
+            )
             .unwrap()
             .unwrap();
         assert!(matches!(text, crate::lazy::Text::Source(_)));

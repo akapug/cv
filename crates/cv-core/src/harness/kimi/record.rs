@@ -14,20 +14,44 @@ use super::*;
 use crate::harness::store::document::Fields;
 use crate::json::{JsonSource, JsonView};
 
+/// One selected record head shared by metadata and message demands. Large fields remain views.
+pub(super) struct Record<'v> {
+    pub view: JsonView<'v>,
+    pub fields: Fields<'v>,
+    pub role: Option<String>,
+}
+
+impl<'v> Record<'v> {
+    pub fn of(view: JsonView<'v>) -> Result<Option<Self>> {
+        let Some(fields) = Fields::parse(view, &["role", "content", "tool_calls", "tool_call_id"])? else {
+            return Ok(None);
+        };
+        let role = fields.string("role")?;
+        Ok(Some(Self { view, fields, role }))
+    }
+
+    pub fn title(&self) -> Result<Option<String>> {
+        if self.role.as_deref() == Some("user") {
+            super::super::wire::text_title(self.fields.get("content"))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 /// One record, or `None` to skip it (`_usage` is always `None` here: the stream folds it onto
 /// the preceding message with [`fold_usage`]). `spans` is the captured source when the demand
 /// keeps large strings in it; `names` maps earlier tool calls to their tool.
 pub(super) fn message(
-    view: JsonView<'_>,
+    record: &Record<'_>,
     spans: Option<&JsonSource>,
     enrich: &WireEnrich,
     complete: bool,
     names: &BTreeMap<String, String>,
 ) -> Result<Option<Message>> {
-    let Some(fields) = Fields::parse(view, &["role", "content", "tool_calls", "tool_call_id"])? else {
-        return Ok(None);
-    };
-    let Some(role) = fields.string("role")? else {
+    let view = record.view;
+    let fields = &record.fields;
+    let Some(role) = record.role.as_deref() else {
         return Ok(None);
     };
     let mut text = |v: JsonView<'_>| {
@@ -37,13 +61,13 @@ pub(super) fn message(
             v.text(false)
         }
     };
-    let m = match role.as_str() {
+    let m = match role {
         "_checkpoint" if complete => {
             let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
             m.extra
-                .insert(crate::harness::claude::CARRIER_KEY.into(), view.resolve()?.into_owned());
+                .insert(crate::ir::CARRIER_KEY.into(), view.resolve()?.into_owned());
             m.harness_extra_mut(Harness::Kimi)
-                .insert("record_type".into(), Value::String(role));
+                .insert("record_type".into(), Value::String(role.to_owned()));
             m
         }
         "_system_prompt" => {
@@ -79,6 +103,7 @@ pub(super) fn message(
             // Prefer the richer wire return_value if we have it; else the context text parts.
             let (content, is_error, details) = match enrich.tool_results.get(&id) {
                 Some(result) => (enrich.output(result), result.is_error, enrich.extras(result)),
+                // Context-only tool rows carry no failure flag; the wire sidecar supplies it.
                 None => (join(fields.get("content"), spans)?, false, None),
             };
             let mut m = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
@@ -101,47 +126,11 @@ pub(super) fn message(
 /// joined by newlines. Under spans a large string stays in the source and a part list is joined
 /// into the source's private decoded backing, never owned.
 pub(super) fn join(content: Option<JsonView<'_>>, spans: Option<&JsonSource>) -> Result<Text> {
-    let Some(content) = content else {
-        return Ok(Text::default());
-    };
-    if content.is_string()? {
-        return Ok(match spans {
-            Some(_) => content.source_text()?,
-            None => content.text(false)?,
-        }
-        .unwrap_or_default());
-    }
-    let Some(parts) = content.array()? else {
-        return Ok(Text::default());
-    };
-    let Some(source) = spans else {
-        let mut joined = String::new();
-        let mut first = true;
-        for part in parts {
-            if let Some(text) = part?.get("text")?.filter(|v| v.is_string().unwrap_or(false)) {
-                if !first {
-                    joined.push('\n');
-                }
-                first = false;
-                joined.push_str(text.resolve()?.as_str().unwrap_or_default());
-            }
-        }
-        return Ok(Text::Inline(joined));
-    };
-    crate::harness::store::text::append(source, &source.decoded_backing()?, |writer| {
-        let mut first = true;
-        for part in parts {
-            let Some(text) = part?.get("text")? else { continue };
-            if !text.is_string()? {
-                continue;
-            }
-            if !first {
-                writer.push("\n")?;
-            }
-            first = false;
-            writer.push_string(text)?;
-        }
-        Ok(())
+    use crate::harness::wire;
+    let backing = spans.map_or(wire::Backing::Inline, wire::Backing::Source);
+    wire::joined(content, wire::TEXT, backing, &mut |v| match spans {
+        Some(_) => v.source_text(),
+        None => v.text(false),
     })
 }
 
@@ -151,17 +140,16 @@ pub(super) const COMPACTION_SUMMARY_TAG: &str = "<system>Previous context has be
 
 /// Refine a `user` record's kind/origin from kimi-cli's own text markers (module doc). A typed
 /// prompt never starts with these tags; the harness's `system()` / `system_reminder()` helpers and
-/// `build_notification_message` always do. Only the first non-whitespace characters are read.
+/// `build_notification_message` always do. Only the first non-whitespace characters are read, up
+/// to the longest marker below.
 fn classify(message: &mut Message) -> Result<()> {
+    const MARKERS: [&str; 4] = [COMPACTION_SUMMARY_TAG, "<notification", "<system>", "<system-reminder>"];
     let Some(Block::Text { text }) = message.content.first() else {
         return Ok(());
     };
-    let (head, _) = crate::harness::store::document::text_head(
-        text,
-        &crate::lazy::Resolver::new(None),
-        COMPACTION_SUMMARY_TAG.chars().count(),
-        true,
-    )?;
+    let head_chars = MARKERS.iter().map(|marker| marker.chars().count()).max().unwrap_or(0);
+    let (head, _) =
+        crate::harness::store::document::text_head(text, &crate::lazy::Resolver::new(None), head_chars, true)?;
     let (kind, origin) = if head.starts_with(COMPACTION_SUMMARY_TAG) {
         (MessageKind::CompactionSummary, Origin::Harness)
     } else if head.starts_with("<notification") {

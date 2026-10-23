@@ -43,6 +43,7 @@
 //! namespace (`rooveterinaryinc.roo-cline` / `rooveterinaryinc.roo-code`) and `~/.roo/`. The real
 //! parsing lives here as `pub` helpers; `roo.rs` reuses them with Roo's paths + `Harness::Roo`.
 
+use crate::json::{ReadInput, Validation};
 mod prompt;
 mod writer;
 
@@ -51,7 +52,8 @@ use super::wire::anthropic;
 use super::Adapter;
 use crate::ir::*;
 use crate::json::{InvalidJson, JsonSource, JsonView};
-use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
+use crate::source::{sqlite_sidecars, Dependencies, Probe};
+use crate::stream::{Demand, Flow, MessageSink};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -69,6 +71,13 @@ pub struct Cline {
     /// SDK `sessions/` dirs (the CLI 3.x and the 4.x extension; see [`super::cline_sdk`]).
     sdk_roots: Vec<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Cline = Cline {
+    roots: Vec::new(),
+    sdk_roots: Vec::new(),
+};
 
 impl Cline {
     pub fn detect() -> Self {
@@ -90,22 +99,59 @@ impl Cline {
     }
 }
 
+/// The side files of a Cline-family task directory, every one a freshness dependency.
+pub(super) fn task_dir_dependencies(r: &SessionRef, deps: &mut Dependencies) {
+    deps.files.extend(
+        [
+            "api_conversation_history.json",
+            "ui_messages.json",
+            "task_metadata.json",
+            "history_item.json",
+        ]
+        .map(|name| r.path.join(name)),
+    );
+}
+
 impl Adapter for Cline {
     fn harness(&self) -> Harness {
         Harness::Cline
+    }
+
+    fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        if r.path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with(".messages.json"))
+        {
+            let sid = r.id.split('/').next().unwrap_or(&r.id);
+            if let Some(dir) = r.path.parent() {
+                deps.files.push(dir.join(format!("{sid}.json")));
+                if !r.id.contains('/') {
+                    if let Some(data) = dir.parent().and_then(Path::parent) {
+                        for name in super::cline_sdk::SIDE_DATABASES {
+                            let db = data.join("db").join(name);
+                            deps.files.extend(sqlite_sidecars(&db));
+                            deps.files.push(db);
+                        }
+                    }
+                }
+            }
+            return Some(());
+        }
+        task_dir_dependencies(r, deps);
+        Some(())
     }
 
     fn roots(&self) -> Vec<PathBuf> {
         self.roots.iter().chain(&self.sdk_roots).cloned().collect()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         let mut out = discover_in(&self.roots, Harness::Cline);
-        out.extend(super::cline_sdk::discover(&self.sdk_roots));
+        super::cline_sdk::discover(&self.sdk_roots, &mut out);
         Ok(out)
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             // Spawn turns, sub-agent returns and deferred tool calls, typed (`crate::affordance`).
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Cline, sink);
@@ -117,12 +163,26 @@ impl Adapter for Cline {
         })
     }
 
+    /// An SDK lead session reads its own rows of the store's side databases, which every session
+    /// of the store writes: it is certified by them ([`super::cline_sdk::side_rows`]).
+    fn rows_store(&self, r: &SessionRef) -> Option<PathBuf> {
+        super::cline_sdk::side_store(r)
+    }
+
+    fn rows_files(&self, store: &Path) -> Vec<PathBuf> {
+        super::cline_sdk::SIDE_DATABASES.map(|name| store.join(name)).into()
+    }
+
+    fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        super::cline_sdk::side_rows(store)
+    }
+
     /// The SDK store's side databases: schedule fires and team runs ([`super::cline_sdk`]).
-    fn store_affordances(&self, r: &SessionRef) -> Vec<crate::affordance::Affordance> {
+    fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
         if super::cline_sdk::is_sdk_path(&r.path) {
             return super::cline_sdk::store_affordances(r);
         }
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 
@@ -189,13 +249,17 @@ fn global_storage_roots() -> Vec<PathBuf> {
 
 /// Walk every `tasks/` root, producing one cheap `SessionRef` per `<taskId>/` dir that has an
 /// `api_conversation_history.json`. Shared by Cline and Roo (the only difference is `harness`).
-pub fn discover_in(roots: &[PathBuf], harness: Harness) -> Vec<SessionRef> {
-    let mut out = Vec::new();
+/// An unreadable `tasks/` dir, and a history that fails to read, are skipped and reported.
+pub fn discover_in(roots: &[PathBuf], harness: Harness) -> crate::Discovered {
+    let mut out = crate::Discovered::default();
     for root in roots {
-        let Ok(entries) = fs::read_dir(root) else {
+        let Some(entries) = out.keep(root, fs::read_dir(root).map_err(Into::into)) else {
             continue;
         };
-        for e in entries.filter_map(|e| e.ok()) {
+        for e in entries {
+            let Some(e) = out.keep(root, e.map_err(Into::into)) else {
+                continue;
+            };
             let dir = e.path();
             if !dir.is_dir() {
                 continue;
@@ -207,46 +271,84 @@ pub fn discover_in(roots: &[PathBuf], harness: Harness) -> Vec<SessionRef> {
             let Some(id) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
                 continue;
             };
-            if let Some(r) = scan(&dir, &id, harness) {
-                out.push(r);
+            // The scan reads the history, the metadata file's cwd and the three files' mtimes:
+            // cached under those files' identities, rescanned only when one moves.
+            let mut reads = crate::source::ReadSet::default();
+            reads.record(&dir.join("ui_messages.json"));
+            reads.record(&dir.join("task_metadata.json"));
+            let scanned =
+                crate::discover_cache::cached_scan_with_reads(&history, reads, || scan(&dir, &id, harness).map(Some));
+            if let Some(found) = crate::Skipped::listed(&history, scanned) {
+                out.push(found);
             }
         }
     }
     out
 }
 
+/// Whether one history item is a turn ([`Message::is_turn`]) as [`record`] reads it: a user or
+/// assistant item that is not a condense summary (`isSummary`), and for a user item, not one
+/// whose content is only `tool_result` blocks (a Tool turn). Reads block types, never bodies.
+fn is_turn(role: &str, record: &Fields<'_>) -> Result<bool> {
+    if !matches!(role, "user" | "assistant")
+        || record.get("isSummary").map(|v| v.as_bool()).transpose()?.flatten() == Some(true)
+    {
+        return Ok(false);
+    }
+    if role == "assistant" {
+        return Ok(true);
+    }
+    // `reasoning` is Cline's own thinking part; every other part is an Anthropic block.
+    let only_results = anthropic::only_tool_results(record.get("content"), |part| {
+        let reasoning = Fields::parse(part, &["type"])?
+            .map(|f| f.string("type"))
+            .transpose()?
+            .flatten()
+            .as_deref()
+            == Some("reasoning");
+        match reasoning {
+            true => Ok(Some(false)),
+            false => anthropic::block_kind(part, &anthropic::ANTHROPIC),
+        }
+    })?;
+    Ok(!only_results)
+}
+
+#[cfg(test)]
+static SCANNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 /// Cheap metadata-only scan of one task dir into a `SessionRef`.
-fn scan(dir: &Path, id: &str, harness: Harness) -> Option<SessionRef> {
+fn scan(dir: &Path, id: &str, harness: Harness) -> Result<SessionRef> {
+    #[cfg(test)]
+    SCANNED.lock().unwrap().push(dir.to_path_buf());
     let history = dir.join("api_conversation_history.json");
-    let source = JsonSource::capture(&history).ok()?;
-    let (mut cwd, title, message_count) = source
-        .read_document(|view| {
-            let messages = view.array()?.context("history array")?;
-            let mut cwd = None;
-            let mut title = None;
-            let mut message_count = 0;
-            for view in messages {
-                let view = view?;
-                let Some(record) = Fields::parse(view, &["role", "content"])? else {
-                    continue;
-                };
-                let role = record.string("role")?.unwrap_or_default();
-                if matches!(role.as_str(), "user" | "assistant") {
-                    message_count += 1;
+    let source = JsonSource::capture(&history)?;
+    let (mut cwd, title, message_count) = source.read(ReadInput::Document, Validation::Value, |view| {
+        let messages = view.array()?.context("history array")?;
+        let mut cwd = None;
+        let mut title = None;
+        let mut message_count = 0;
+        for view in messages {
+            let view = view?;
+            let Some(record) = Fields::parse(view, &["role", "content", "isSummary"])? else {
+                continue;
+            };
+            let role = record.string("role")?.unwrap_or_default();
+            if is_turn(&role, &record)? {
+                message_count += 1;
+            }
+            if role == "user" && (cwd.is_none() || title.is_none()) {
+                let summary = prompt::summarize(|feed| visit_text(record.get("content"), true, feed))?;
+                if cwd.is_none() {
+                    cwd = summary.cwd;
                 }
-                if role == "user" && (cwd.is_none() || title.is_none()) {
-                    let summary = prompt::summarize(|feed| visit_text(record.get("content"), true, feed))?;
-                    if cwd.is_none() {
-                        cwd = summary.cwd;
-                    }
-                    if title.is_none() {
-                        title = summary.title;
-                    }
+                if title.is_none() {
+                    title = summary.title;
                 }
             }
-            Ok((cwd, title, message_count))
-        })
-        .ok()?;
+        }
+        Ok((cwd, title, message_count))
+    })?;
 
     // created_at from the taskId (epoch millis); fall back to history mtime.
     let created_at = task_id_to_time(id);
@@ -258,15 +360,13 @@ fn scan(dir: &Path, id: &str, harness: Harness) -> Option<SessionRef> {
         cwd = cwd_from_metadata(dir);
     }
 
-    Some(SessionRef {
-        id: id.to_string(),
-        harness,
-        path: dir.to_path_buf(),
+    Ok(SessionRef {
         cwd,
         title,
         created_at,
         updated_at,
-        message_count,
+        message_count: Some(message_count),
+        ..SessionRef::new(id.to_string(), harness, dir.to_path_buf())
     })
 }
 
@@ -274,17 +374,12 @@ fn scan(dir: &Path, id: &str, harness: Harness) -> Option<SessionRef> {
 // Parsing
 // ---------------------------------------------------------------------------
 
-/// Read a task dir (`api_conversation_history.json` + sidecars) into a `Session`. Tolerant: a
-/// missing/empty/corrupt history yields an empty-message session rather than an error. Shared by
-/// Cline and Roo.
-///
-/// This is the materializing twin of [`stream_task_dir`]: it streams into a [`CollectSink`] and
-/// reattaches the messages, so it stays byte-identical with the streaming path (and never builds a
-/// whole-document `Value`). Kept as a `pub` entry point because `roo.rs`'s emit round-trip test and
-/// other callers re-parse a task dir directly.
-pub fn parse_task_dir(dir: &Path, id: &str, harness: Harness) -> Result<Session> {
+/// Test helper: [`stream_task_dir`] collected into a whole `Session`.
+#[cfg(test)]
+pub(crate) fn parse_task_dir(dir: &Path, id: &str, harness: Harness) -> Result<Session> {
+    use crate::stream::CollectSink;
     let mut sink = CollectSink::default();
-    let mut session = stream_task_dir(dir, id, harness, &ParseOptions::full(), &mut sink)?;
+    let mut session = stream_task_dir(dir, id, harness, &Demand::RICH, &mut sink)?;
     session.messages = sink.messages;
     Ok(session)
 }
@@ -296,7 +391,7 @@ pub fn stream_task_dir(
     dir: &Path,
     id: &str,
     harness: Harness,
-    opts: &ParseOptions,
+    opts: &Demand,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
     let history = dir.join("api_conversation_history.json");
@@ -327,7 +422,15 @@ pub fn stream_task_dir(
     session.created_at = task_id_to_time(id);
     session.updated_at = newest_mtime(dir).or(session.created_at);
     // ui_messages.json gives the most precise created/updated and the first user turn's timestamp.
-    let (ui_created, ui_updated, first_user_ts) = ui_message_times(dir)?;
+    // Roo also takes its store affordances from this file: one read serves both.
+    let roo = match harness {
+        Harness::Roo => super::roo::ui_times(dir),
+        _ => None,
+    };
+    let (ui_created, ui_updated, first_user_ts) = match roo {
+        Some(times) => times,
+        None => ui_message_times(dir)?,
+    };
     if let Some(c) = ui_created {
         session.created_at = Some(c);
     }
@@ -400,25 +503,30 @@ pub fn stream_task_dir(
     // metadata fallback after the body if the transcript yielded nothing.
     session.cwd = None;
 
-    let Some(source) = JsonSource::capture(&history).ok() else {
-        session.cwd = meta_cwd;
-        return Ok(session);
-    };
-    let span_path = if history.is_absolute() {
-        history.clone()
-    } else {
-        std::env::current_dir()?.join(&history)
+    // A task with no history file is an empty session; one that cannot be read is an error.
+    let source = match JsonSource::capture(&history) {
+        Ok(source) => source,
+        Err(error) if super::is_not_found(&error) => {
+            session.cwd = meta_cwd;
+            return Ok(session);
+        }
+        Err(error) => return Err(error),
     };
     sink.dependency(&history);
     if let Some(error) = sink.take_error() {
         return Err(error);
     }
     let mut stamped_first_user = false;
-    let result = source.read_archive(|items| {
-        let mut has_sources = false;
+    // An item that is not one JSON value, and a history that does not decode, are counted.
+    let mut unparsed = super::Unparsed::default();
+    let result = source.read(ReadInput::Document, Validation::Syntax, |items| {
+        let items = items.accepted_array()?;
         for view in items.into_iter().flatten() {
-            let Some(view) = view? else { continue };
-            let (boundary, message) = record(view, &mut session, opts.spans, Some(&span_path))?;
+            let Some(view) = view? else {
+                unparsed.count();
+                continue;
+            };
+            let (boundary, message) = record(view, &mut session, opts.spans)?;
             if let Some(boundary) = boundary {
                 if sink.try_message(boundary)? == Flow::Stop {
                     break;
@@ -431,38 +539,26 @@ pub fn stream_task_dir(
                         message.timestamp.get_or_insert(ts);
                     }
                 }
-                let sourced = message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        Block::ToolUse {
-                            input: crate::Json::Source(_),
-                            ..
-                        }
-                    )
-                });
-                has_sources |= sourced;
-                if sourced {
-                    source.check()?;
-                }
+                // A span demand checks its own source; the stream rechecks after a slow callback and
+                // at the end (`stream` module: who owns the source guarantee).
+                let started = std::time::Instant::now();
                 let flow = sink.try_message(message)?;
-                if sourced {
-                    source.check()?;
-                }
+                source.check_after(started)?;
                 if flow == Flow::Stop {
                     break;
                 }
             }
         }
-        if has_sources {
-            source.check()?;
-        }
+        source.check()?;
         Ok(())
     });
     if let Err(error) = result {
         if !error.is::<InvalidJson>() {
             return Err(error);
         }
+        unparsed.count();
     }
+    unparsed.note(&mut session);
 
     // cwd fallback: the first user turn's <environment_details> wins; only if it yielded nothing do
     // we fall back to the task_metadata.json hint (matching the old parse order).
@@ -473,10 +569,10 @@ pub fn stream_task_dir(
     Ok(session)
 }
 
-/// Pure parser: an `api_conversation_history.json` *array* text → `Session`. No filesystem access,
-/// so it's unit-testable with a small fixture string. Shared by Cline and Roo. Each item goes through
-/// the same record codec as [`stream_task_dir`], over an owned view.
-pub fn parse_history_str(id: &str, text: &str, harness: Harness, source_path: Option<PathBuf>) -> Session {
+/// Test helper: an `api_conversation_history.json` array text through the same record codec as
+/// [`stream_task_dir`], over an owned view.
+#[cfg(test)]
+pub(crate) fn parse_history_str(id: &str, text: &str, harness: Harness, source_path: Option<PathBuf>) -> Session {
     let mut session = Session {
         source_path,
         ..Session::new(id.to_string(), harness)
@@ -485,7 +581,7 @@ pub fn parse_history_str(id: &str, text: &str, harness: Harness, source_path: Op
         return session;
     };
     for item in &items {
-        if let Ok((boundary, message)) = record(item.into(), &mut session, false, None) {
+        if let Ok((boundary, message)) = record(item.into(), &mut session, false) {
             session.messages.extend(boundary.into_iter().chain(message));
         }
     }
@@ -588,14 +684,14 @@ fn text_views<'a>(
             } else {
                 None
             };
-            if if discovery {
-                text.is_none()
+            let selected = if discovery {
+                text.is_some()
             } else {
-                part.string("type")?.as_deref() != Some("text")
-            } {
-                continue;
+                part.string("type")?.as_deref() == Some("text")
+            };
+            if selected {
+                visit(text)?;
             }
-            visit(text)?;
         }
     }
     Ok(())
@@ -615,48 +711,43 @@ fn visit_text(content: Option<JsonView<'_>>, discovery: bool, feed: &mut dyn FnM
     })
 }
 /// The record codec, the only decoder of this format: one history item in, the condense boundary
-/// it implies and its message out. Text follows [`JsonView::lazy_text`]; `history` names the file
-/// a mapped span points into (the session's own path is the task dir).
-fn record(
-    view: JsonView<'_>,
-    session: &mut Session,
-    spans: bool,
-    history: Option<&Path>,
-) -> Result<(Option<Message>, Option<Message>)> {
+/// it implies and its message out. Text follows [`JsonView::lazy_text`]: source text names the
+/// history file it lives in (the session's own path is the task dir).
+fn record(view: JsonView<'_>, session: &mut Session, spans: bool) -> Result<(Option<Message>, Option<Message>)> {
     let Some(record) = Fields::parse(view, MESSAGE_FIELDS)? else {
         return Ok((None, None));
     };
     let metadata = Value::Object(record.project(&MESSAGE_FIELDS[..MESSAGE_FIELDS.len() - 1])?);
     let boundary = condense_boundary(&metadata, session.harness);
     let content = record.get("content");
-    let summary = if metadata.get("role").and_then(Value::as_str) == Some("user") {
+    let role = metadata.get("role").and_then(Value::as_str);
+    let summary = if role == Some("user") {
         Some(prompt::summarize(|feed| visit_text(content, false, feed))?)
     } else {
         None
     };
-    let system_text =
-        if metadata.get("role").and_then(Value::as_str) == Some("system") && session.system_prompt.is_none() {
-            let mut text = String::new();
-            text_views(content, false, |view| {
-                let mut started = false;
-                if let Some(view) = view {
-                    view.for_each_str_chunk(|chunk| {
-                        if !chunk.is_empty() && !started {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            started = true;
+    let system_text = if role == Some("system") && session.system_prompt.is_none() {
+        let mut text = String::new();
+        text_views(content, false, |view| {
+            let mut started = false;
+            if let Some(view) = view {
+                view.for_each_str_chunk(|chunk| {
+                    if !chunk.is_empty() && !started {
+                        if !text.is_empty() {
+                            text.push('\n');
                         }
-                        text.push_str(chunk);
-                        Ok(())
-                    })?;
-                }
-                Ok(())
-            })?;
-            Some(text)
-        } else {
-            None
-        };
+                        started = true;
+                    }
+                    text.push_str(chunk);
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+        Some(text)
+    } else {
+        None
+    };
     let mut blocks = Vec::new();
     if let Some(content) = content {
         if let Some(text) = content.lazy_text(spans)? {
@@ -691,23 +782,13 @@ fn record(
                         &anthropic::ANTHROPIC,
                         spans,
                         &mut |v| v.lazy_text(spans),
-                        if spans { 0 } else { u64::MAX },
+                        crate::harness::wire::joined_over(spans),
                     )?
                 };
                 if let Some(block) = block {
                     blocks.push(block);
                 }
             }
-        }
-    }
-    for block in &mut blocks {
-        let text = match block {
-            Block::Text { text } | Block::Thinking { text, .. } => Some(text),
-            Block::ToolResult { content, .. } => Some(content),
-            _ => None,
-        };
-        if let (Some(crate::Text::Span(span)), Some(history)) = (text, history) {
-            span.source = Some(history.to_path_buf());
         }
     }
     Ok((
@@ -747,7 +828,7 @@ fn condense_boundary(v: &Value, harness: Harness) -> Option<Message> {
 ///   task_metadata.json              # {cwd, files_in_context[], model_usage[]} hints
 /// ```
 ///
-/// This is the faithful inverse of [`parse_history_str`]: every IR [`Block`] maps back to the
+/// This is the faithful inverse of [`stream_task_dir`]: every IR [`Block`] maps back to the
 /// Anthropic content block the parser expects (`text`, `thinking`, `tool_use`, `tool_result`,
 /// `image`). A [`Role::Tool`] turn is written as a `user` message whose content is *only*
 /// `tool_result` blocks, which the parser reclassifies back to [`Role::Tool`].
@@ -788,7 +869,9 @@ pub fn emit_with_harness(
     let task_dir = out_dir.join("tasks").join(&new_id);
     fs::create_dir_all(&task_dir).with_context(|| format!("creating {}", task_dir.display()))?;
     let history_path = task_dir.join("api_conversation_history.json");
-    super::store::publish_stage(stage, &history_path, opts.claim())?;
+    // The three files publish as one set, the transcript last: discovery finds a task by its
+    // transcript, so a crash midway leaves nothing listed.
+    let mut set = crate::publish::Set::new();
 
     // ── task_metadata.json (cwd + model hints; sidecar the parser falls back to for cwd) ──
     let mut meta = Map::new();
@@ -801,7 +884,7 @@ pub fn emit_with_harness(
     }
     let meta_path = task_dir.join("task_metadata.json");
     let meta = serde_json::to_string_pretty(&Value::Object(meta))?;
-    crate::publish::publish_reader(&meta_path, "stage", meta.as_bytes(), opts.claim())?;
+    set.stage(&meta_path, "stage", meta.as_bytes(), opts.claim())?;
 
     // ── ui_messages.json (minimal event log carrying created/updated timestamps) ──
     let created_ms = created.timestamp_millis();
@@ -821,7 +904,9 @@ pub fn emit_with_harness(
     }
     let ui_path = task_dir.join("ui_messages.json");
     let ui = serde_json::to_string_pretty(&Value::Array(ui))?;
-    crate::publish::publish_reader(&ui_path, "stage", ui.as_bytes(), opts.claim())?;
+    set.stage(&ui_path, "stage", ui.as_bytes(), opts.claim())?;
+    super::store::stage_into(&mut set, stage, &history_path, opts.claim())?;
+    set.publish()?;
 
     let resume = match &cwd {
         Some(c) => format!(
@@ -841,61 +926,6 @@ pub fn emit_with_harness(
 // ---------------------------------------------------------------------------
 // cwd / title / timestamp helpers
 // ---------------------------------------------------------------------------
-
-/// Pull the cwd out of Cline's `<environment_details>` block. The relevant line looks like:
-/// `# Current Working Directory (/Users/me/proj) Files`. We take the text inside the parens.
-pub fn extract_cwd(text: &str) -> Option<PathBuf> {
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("# Current Working Directory") {
-            let rest = rest.trim_start();
-            let inner = rest.strip_prefix('(')?;
-            let end = inner.find(')')?;
-            let path = inner[..end].trim();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
-        }
-    }
-    None
-}
-
-/// Strip Cline's `<task>…</task>` / `<environment_details>…</environment_details>` wrappers to get a
-/// clean human title from the first user message. Returns the first non-empty line of the remaining
-/// prose, or `None` if nothing usable is left.
-pub fn clean_user_title(text: &str) -> Option<String> {
-    // Prefer the explicit `<task>…</task>` payload if present.
-    if let Some(inner) = between(text, "<task>", "</task>") {
-        let t = inner.trim();
-        if !t.is_empty() {
-            return first_line(t);
-        }
-    }
-    // Otherwise drop the environment_details block and take the first prose line.
-    let stripped = strip_block(text, "<environment_details>", "</environment_details>");
-    first_line(stripped.trim())
-}
-
-fn between<'a>(hay: &'a str, open: &str, close: &str) -> Option<&'a str> {
-    let start = hay.find(open)? + open.len();
-    let end = hay[start..].find(close)? + start;
-    Some(&hay[start..end])
-}
-
-fn strip_block(hay: &str, open: &str, close: &str) -> String {
-    if let (Some(s), Some(e)) = (hay.find(open), hay.find(close)) {
-        if e >= s {
-            let mut out = String::from(&hay[..s]);
-            out.push_str(&hay[e + close.len()..]);
-            return out;
-        }
-    }
-    hay.to_string()
-}
-
-fn first_line(text: &str) -> Option<String> {
-    text.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
-}
 
 /// `<taskId>` is a millisecond epoch timestamp string. Convert it to a UTC time, when it parses.
 fn task_id_to_time(id: &str) -> Option<DateTime<Utc>> {
@@ -989,7 +1019,7 @@ fn optional_document<T>(path: &Path, visit: impl for<'a> FnOnce(JsonView<'a>) ->
     let Ok(source) = JsonSource::capture(path) else {
         return Ok(None);
     };
-    match source.read_document(visit) {
+    match source.read(ReadInput::Document, Validation::Value, visit) {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.is::<InvalidJson>() => Ok(None),
         Err(error) => Err(error),
@@ -1004,8 +1034,8 @@ fn optional_document<T>(path: &Path, visit: impl for<'a> FnOnce(JsonView<'a>) ->
 /// - `updated`: the last event's `ts` (the caller keeps it only if it's newer than the mtime guess).
 /// - `first_user_ts`: same first `ts`, which the streaming core stamps onto the first user turn.
 ///
-/// `(created_at, updated_at, last_api_start)` extracted from a task's `ui_messages.json`.
-type UiTimes = (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+/// The three timestamp hints extracted from a task's `ui_messages.json`.
+pub(super) type UiTimes = (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
 /// Reduce timestamps while skipping UI text payloads under the original whole-Value boundary.
 fn ui_message_times(dir: &Path) -> Result<UiTimes> {
@@ -1040,6 +1070,43 @@ fn ui_message_times(dir: &Path) -> Result<UiTimes> {
 mod tests {
     use super::*;
     use crate::harness::Parse;
+    use crate::stream::CollectSink;
+
+    /// Discovery rescans a task only when one of the files its scan reads moves.
+    #[test]
+    fn discovery_rescans_only_a_task_whose_files_moved() {
+        let world = crate::test_world("cline-discovery-cache");
+        let context = crate::discover_cache::read::Context::current();
+        let _scope = context.enter();
+        let root = world.base.join("tasks");
+        for id in ["1717000000001", "1717000000002", "1717000000003"] {
+            let dir = root.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("api_conversation_history.json"),
+                r#"[{"role":"user","content":[{"type":"text","text":"<task>hi</task>"}]}]"#,
+            )
+            .unwrap();
+        }
+        let scanned = || {
+            let mut all = SCANNED.lock().unwrap();
+            let mut mine: Vec<PathBuf> = all.iter().filter(|p| p.starts_with(&root)).cloned().collect();
+            all.retain(|p| !p.starts_with(&root));
+            mine.sort();
+            mine
+        };
+        let first = discover_in(std::slice::from_ref(&root), Harness::Cline).refs;
+        assert_eq!(scanned().len(), 3);
+        let again = discover_in(std::slice::from_ref(&root), Harness::Cline).refs;
+        assert!(scanned().is_empty());
+        assert_eq!(format!("{first:?}"), format!("{again:?}"));
+        let moved = root.join("1717000000002");
+        fs::write(moved.join("task_metadata.json"), r#"{"cwd":"/meta"}"#).unwrap();
+        let refs = discover_in(std::slice::from_ref(&root), Harness::Cline).refs;
+        assert_eq!(scanned(), vec![moved.clone()]);
+        let r = refs.iter().find(|r| r.path == moved).unwrap();
+        assert_eq!(r.cwd.as_deref(), Some(Path::new("/meta")));
+    }
 
     #[test]
     fn editor_roots_do_not_repeat_default_xdg_stores() {
@@ -1056,6 +1123,39 @@ mod tests {
             task_roots(ROO_EXT_IDS, ".roo"),
             vec![storage.join(ROO_EXT_IDS[0]).join("tasks")]
         );
+    }
+
+    /// The task's three files are one publication: the transcript's claim fails after the
+    /// metadata and UI log were claimed (a directory holds its name), and every name is left as
+    /// it was, replaced files (`--force`) included.
+    #[test]
+    fn task_files_publish_together_or_not_at_all() {
+        let world = crate::test_world("cline-emit-set");
+        let mut source = Session::new("source", Harness::Claude);
+        source.messages.push(Message::new(Role::User));
+        for force in [false, true] {
+            let out = world.base.join(format!("out-{force}"));
+            let task = out.join("tasks/fixed");
+            fs::create_dir_all(task.join("api_conversation_history.json")).unwrap();
+            if force {
+                fs::write(task.join("task_metadata.json"), "old metadata").unwrap();
+                fs::write(task.join("ui_messages.json"), "old ui").unwrap();
+            }
+            let opts = crate::emit::EmitOptions {
+                new_id: Some("fixed".into()),
+                force,
+                ..Default::default()
+            };
+            assert!(emit(&source, &out, &opts).is_err());
+            assert_eq!(fs::read_dir(&task).unwrap().count(), 1 + 2 * force as usize);
+            if force {
+                assert_eq!(
+                    fs::read_to_string(task.join("task_metadata.json")).unwrap(),
+                    "old metadata"
+                );
+                assert_eq!(fs::read_to_string(task.join("ui_messages.json")).unwrap(), "old ui");
+            }
+        }
     }
 
     #[test]
@@ -1106,7 +1206,7 @@ mod tests {
             assert_eq!(owned.messages[2].timestamp.unwrap().timestamp_millis(), 1717000000022);
             assert_eq!(owned.messages[3].kind, MessageKind::CompactionBoundary);
             assert_eq!(owned.messages[3].timestamp, owned.messages[4].timestamp);
-            for opts in [ParseOptions::full(), ParseOptions::lazy(), ParseOptions::complete()] {
+            for opts in [Demand::RICH, Demand::LEAN.with_spans(), Demand::COMPLETE] {
                 let mut sink = CollectSink::default();
                 stream_task_dir(&dir, "1717000000000", harness, &opts, &mut sink).unwrap();
                 assert_eq!(
@@ -1162,7 +1262,9 @@ mod tests {
                 DateTime::<Utc>::from_timestamp_millis(1717000000001)
             );
             assert_eq!(expected.system_prompt.as_deref(), Some(body.as_str()));
-            for opts in [ParseOptions::lazy(), ParseOptions::full(), ParseOptions::complete()] {
+            // The two children that are not one JSON value are counted, not dropped silently.
+            assert_eq!(expected.extra["cv"]["skipped_lines"], 2);
+            for opts in [Demand::LEAN.with_spans(), Demand::RICH, Demand::COMPLETE] {
                 let mut sink = CollectSink::default();
                 let mut actual = stream_task_dir(&dir, "1717000000000", harness, &opts, &mut sink).unwrap();
                 actual.messages = sink.messages;
@@ -1181,7 +1283,7 @@ mod tests {
                 if opts.spans {
                     assert!(actual.messages.iter().flat_map(|m| &m.content).any(|block| matches!(
                         block,
-                        Block::Text { text: crate::Text::Span(span) } if span.source.as_deref() == Some(history.as_path())
+                        Block::Text { text: crate::Text::Source(text) } if text.path() == history.as_path()
                     )));
                 }
                 actual.materialize().unwrap();
@@ -1191,13 +1293,14 @@ mod tests {
                 );
             }
             // Discovery retains its whole-Value acceptance, unlike per-child transcript replay.
-            assert!(scan(&dir, "1717000000000", harness).is_none());
+            assert!(scan(&dir, "1717000000000", harness).is_err());
         }
         fs::write(&history, serde_json::to_vec(&records).unwrap()).unwrap();
         let r = scan(&dir, "1717000000000", Harness::Cline).unwrap();
         assert_eq!(r.title.as_deref(), Some("late selected title"));
         assert_eq!(r.cwd, Some(PathBuf::from("/selected")));
-        assert_eq!(r.message_count, 4);
+        // The prompt and the reply: the tool results, the system turn and the summary are not turns.
+        assert_eq!(r.message_count, Some(2));
         fs::write(&history, "[{\"role\":\"user\",\"content\":\"ok\"},]").unwrap();
         assert!(parse_task_dir(&dir, "1717000000000", Harness::Cline)
             .unwrap()
@@ -1223,7 +1326,9 @@ mod tests {
                 MessageKind::CompactionSummary
             ]
         );
-        assert!(matches!(&s.messages[1].content[0], Block::Thinking { text, .. } if *text == "think"));
+        assert!(
+            matches!(&s.messages[1].content[0], Block::Thinking { text, .. } if text.matches_str("think") == Some(true))
+        );
         assert_eq!(
             s.messages[0]
                 .harness_extra(Harness::Roo)
@@ -1330,22 +1435,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_cwd_from_env_details() {
-        let text = "<task>do x</task>\n<environment_details>\n# Current Working Directory (/Users/me/proj) Files\na.rs\n</environment_details>";
-        assert_eq!(extract_cwd(text), Some(PathBuf::from("/Users/me/proj")));
-        assert_eq!(extract_cwd("no cwd here"), None);
-    }
-
-    #[test]
-    fn clean_title_prefers_task_block() {
-        let text = "<task>Refactor the IR\nmore detail</task>\n<environment_details>noise</environment_details>";
-        assert_eq!(clean_user_title(text).as_deref(), Some("Refactor the IR"));
-        // Without a <task> block, fall back to first prose line after stripping env details.
-        let text2 = "Just do the thing\n<environment_details>noise</environment_details>";
-        assert_eq!(clean_user_title(text2).as_deref(), Some("Just do the thing"));
-    }
-
-    #[test]
     fn tolerates_corrupt_and_non_array() {
         assert!(parse_history_str("x", "not json", Harness::Cline, None)
             .messages
@@ -1365,7 +1454,7 @@ mod tests {
             created_at: DateTime::<Utc>::from_timestamp_millis(1717000000000),
             updated_at: DateTime::<Utc>::from_timestamp_millis(1717000005000),
             model: Some("claude-x".to_string()),
-            ..Session::new("src".to_string(), Harness::Cline)
+            ..Session::new("src", Harness::Cline)
         };
 
         let mut user = Message::new(Role::User);
@@ -1422,7 +1511,9 @@ mod tests {
         assert_eq!(parsed.title.as_deref(), Some("Fix the parser bug"));
 
         // Assistant text + tool_use blocks survive.
-        assert!(matches!(&parsed.messages[1].content[0], Block::Text { text } if text == "on it"));
+        assert!(
+            matches!(&parsed.messages[1].content[0], Block::Text { text } if text.matches_str("on it") == Some(true))
+        );
         assert!(matches!(
             &parsed.messages[1].content[1],
             Block::ToolUse { id, name, .. } if id == "toolu_1" && name == "read_file"

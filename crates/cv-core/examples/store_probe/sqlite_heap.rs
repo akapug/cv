@@ -32,9 +32,8 @@ pub struct Snapshot {
     peak_live_allocations: i64,
     stage_end_live_allocations: i64,
     largest_allocation_request_bytes: i64,
-    // SQLite's built-in status API reports live allocation counts, not cumulative requests.
-    cumulative_allocation_requests: Option<u64>,
-    cumulative_requested_bytes: Option<u64>,
+    // SQLite's built-in status API reports live allocation counts, not cumulative requests, so
+    // the snapshot has no cumulative fields: it reports only what it measured.
 }
 
 impl Accounting {
@@ -97,8 +96,6 @@ impl Accounting {
             peak_live_allocations: peak_allocations,
             stage_end_live_allocations: allocations,
             largest_allocation_request_bytes: largest_request,
-            cumulative_allocation_requests: None,
-            cumulative_requested_bytes: None,
         })
     }
 }

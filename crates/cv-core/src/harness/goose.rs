@@ -111,14 +111,14 @@
 //!   folded into user/assistant content (we recover [`Role::Tool`] heuristically). The MCP tool name
 //!   lives on the *request*, not the *response*, so a `toolResponse` only carries `tool_name` when we
 //!   can pair it to a prior request by id (we do this within a session).
-//! * `model` is reconstructed from `provider_name` + `model_config_json.model_name` when present.
+//! * `model` is `model_config_json.model_name`; `provider_name` stays in the Goose bag.
 
-use super::store::sqlite::{columns, open_ro, Cells};
+use super::store::sqlite::{open_ro, Cells, Select};
 use super::wire::anthropic;
 use super::{ts_from_epoch, Adapter};
 use crate::ir::*;
-use crate::stream::{Flow, MessageSink, ParseOptions};
-use anyhow::Result;
+use crate::stream::{Demand, Flow, MessageSink, Tier};
+use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -132,6 +132,10 @@ pub struct Goose {
     /// The `sessions/` dir, if it exists on disk.
     dir: Option<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Goose = Goose { dir: None };
 
 impl Goose {
     pub fn detect() -> Self {
@@ -202,42 +206,40 @@ impl Adapter for Goose {
         self.dir.clone().into_iter().collect()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         let Some(dir) = &self.dir else {
-            return Ok(vec![]);
+            return Ok(Default::default());
         };
-        let mut out = Vec::new();
+        let mut out = crate::Discovered::default();
         let mut seen_ids = std::collections::HashSet::new();
 
-        // Modern SQLite store.
+        // Modern SQLite store: one that cannot open or read is skipped and reported.
         if let Some(db) = self.db_path() {
-            let refs = super::store::sqlite::cached_discover(&db, || {
-                let Ok(conn) = open_ro(&db) else {
-                    return Ok(Vec::new());
-                };
-                conn.read(|reader| discover_db(reader, &db))
-            });
-            if let Ok(refs) = refs {
-                for r in refs {
-                    seen_ids.insert(r.id.clone());
-                    out.push(r);
-                }
+            let refs =
+                super::store::sqlite::cached_discover(&db, || open_ro(&db)?.read(|reader, _| discover_db(reader, &db)));
+            for r in out.keep(&db, refs).into_iter().flatten() {
+                seen_ids.insert(r.id.clone());
+                out.refs.push(r);
             }
         }
 
         // Legacy `.jsonl` files not already represented by a DB row of the same id.
-        for (name, path) in list_legacy(dir) {
+        let legacy = out.keep(dir, list_legacy(dir)).unwrap_or_default();
+        for (name, path) in legacy {
             if seen_ids.contains(&name) {
                 continue;
             }
-            if let Some(r) = discover_legacy(&name, &path) {
-                out.push(r);
+            // A legacy file is read whole (its UTF-8 inclusion contract); the ref depends on its
+            // bytes and name alone, so it is cached under the file's identity.
+            let found = crate::discover_cache::cached_scan_checked(&path, || legacy::discover(&name, &path).map(Some));
+            if let Some(found) = crate::Skipped::listed(&path, found) {
+                out.push(found);
             }
         }
         Ok(out)
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             // Spawn turns, sub-agent returns and deferred tool calls, typed (`crate::affordance`).
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Goose, sink);
@@ -246,39 +248,43 @@ impl Adapter for Goose {
             if r.path.extension().is_some_and(|e| e == "jsonl") {
                 return legacy::stream(&r.id, &r.path, opts, sink);
             }
-            let conn = open_ro(&r.path)?;
-            conn.read(|conn| stream_db_opts_with_reads(conn, r, opts, sink, conn.reads()))
+            super::store::sqlite::read(&r.path, |conn, reads| {
+                stream_db_opts_with_reads(conn, r, opts, sink, reads)
+            })
         })
     }
 
+    /// Every session's certificate ([`rows_conn`]); a legacy `.jsonl` session is its own file.
+    fn rows(&self, store: &Path) -> Option<HashMap<String, crate::source::Rows>> {
+        open_ro(store).ok()?.read(|conn, _| rows_conn(conn)).ok()
+    }
+
     /// The todo extension's state: `sessions.extension_data["todo.v0"].content` (a markdown list).
-    fn store_affordances(&self, r: &SessionRef) -> Vec<crate::affordance::Affordance> {
+    fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
         if r.path.extension().is_some_and(|e| e == "jsonl") {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let Ok(conn) = open_ro(&r.path) else {
-            return Vec::new();
-        };
-        let data: Option<String> = conn
-            .read(|reader| {
-                Ok(
-                    reader.query_row("SELECT extension_data FROM sessions WHERE id = ?1", [&r.id], |row| {
-                        row.get(0)
-                    })?,
-                )
-            })
-            .ok()
-            .flatten();
+        let conn = open_ro(&r.path)?;
+        let data: Option<String> = conn.read(|reader, _| {
+            Ok(
+                reader.query_row("SELECT extension_data FROM sessions WHERE id = ?1", [&r.id], |row| {
+                    row.get(0)
+                })?,
+            )
+        })?;
         let Some(todo) = data
-            .and_then(|d| serde_json::from_str::<Value>(&d).ok())
+            .map(|d| serde_json::from_str::<Value>(&d))
+            .transpose()?
             .and_then(|v| v.get("todo.v0").cloned())
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let items = crate::affordance::items_of(&todo);
-        crate::affordance::plan_state(crate::affordance::Kind::Plan, "extension_data[todo.v0]", items)
-            .into_iter()
-            .collect()
+        Ok(
+            crate::affordance::plan_state(crate::affordance::Kind::Plan, "extension_data[todo.v0]", items)
+                .into_iter()
+                .collect(),
+        )
     }
 }
 
@@ -300,87 +306,91 @@ fn title_expr(has: impl Fn(&str) -> bool) -> &'static str {
 }
 
 fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
-    let cols = columns(conn, "sessions");
-    let has = |c: &str| cols.contains(c);
-    let title_expr = title_expr(has);
-    let working_dir = if has("working_dir") { "working_dir" } else { "NULL" };
-    let created = if has("created_at") { "created_at" } else { "NULL" };
-    let updated = if has("updated_at") { "updated_at" } else { "NULL" };
+    let probe = Select::of(conn, "sessions");
+    let title = title_expr(|c| probe.has(c));
     // Order by updated_at when present; the column always existed in the modern schema.
-    let order = if has("updated_at") {
+    let order = if probe.has("updated_at") {
         "ORDER BY updated_at DESC"
     } else {
         ""
     };
-    let sql = format!("SELECT id, {title_expr}, {working_dir}, {created}, {updated} FROM sessions {order}");
+    let select = probe
+        .always(&["id", title])
+        .probed(&["working_dir", "created_at", "updated_at"]);
+    let sql = format!("SELECT {} FROM sessions {order}", select.list());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
-        let title: Option<String> = row.get(1).ok().flatten();
-        let wd: Option<String> = row.get(2).ok().flatten();
-        let created: Option<String> = row.get(3).ok().flatten();
-        let updated: Option<String> = row.get(4).ok().flatten();
+        let title: Option<String> = row.get(1)?;
+        let wd: Option<String> = row.get(2)?;
+        let created: Option<String> = row.get(3)?;
+        let updated: Option<String> = row.get(4)?;
         Ok((id, title, wd, created, updated))
     })?;
-    let mut counts = HashMap::<String, usize>::new();
-    let message_columns = columns(conn, "messages");
-    // Older partial stores still list known sessions when message counts are unavailable.
-    if ["session_id", "role", "content_json"]
-        .iter()
-        .all(|column| message_columns.contains(*column))
-    {
-        // One cursor pass over every row: the stream's own decoder classifies each, building no
-        // text (no `Out`), so a count is the number of turns a read of the session yields.
-        let metadata = if message_columns.contains("metadata_json") {
-            "metadata_json"
-        } else {
-            "NULL"
-        };
-        let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "messages")?;
-        let mut count_stmt = conn.prepare(&format!(
-            "SELECT session_id, role, {}, {} FROM messages",
-            cells.select("content_json"),
-            cells.select(metadata)
-        ))?;
-        let mut messages = count_stmt.query([])?;
-        let opts = ParseOptions::lazy();
-        while let Some(row) = messages.next()? {
-            let role: String = row.get(1).unwrap_or_default();
-            let metadata = match cells.cell(conn, "messages", metadata, row, 4)? {
-                Some(cell) => cells.read(cell, |v| record::metadata(v, false))?,
-                None => None,
-            };
-            let decoded = match cells.cell(conn, "messages", "content_json", row, 2)? {
-                Some(cell) => cells
-                    .read(cell, |v| record::content(v, &mut HashMap::new(), &opts, None))?
-                    .unwrap_or_default(),
-                None => Decoded::default(),
-            };
-            if is_turn(role, metadata, decoded) {
-                let id: String = row.get(0)?;
-                *counts.entry(id).or_default() += 1;
-            }
-        }
-        cells.out().0.check()?;
-    }
     let mut out = Vec::new();
-    for row in rows.flatten() {
-        let (id, title, wd, created, updated) = row;
-        let count = counts.remove(&id).unwrap_or(0);
+    for row in rows {
+        let (id, title, wd, created, updated) = row?;
         out.push(SessionRef {
-            id,
-            harness: Harness::Goose,
-            path: db.to_path_buf(),
             cwd: wd.filter(|s| !s.is_empty()).map(PathBuf::from),
             title: title
                 .filter(|s| !s.trim().is_empty())
-                .map(|t| crate::ir::truncate(&t, 80)),
+                .map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE)),
             created_at: created.as_deref().and_then(parse_ts_text),
             updated_at: updated.as_deref().and_then(parse_ts_text),
-            message_count: count,
+            message_count: None,
+            ..SessionRef::new(id, Harness::Goose, db.to_path_buf())
         });
     }
     Ok(out)
+}
+
+/// Every session's [`Rows`](crate::source::Rows) certificate: what a read of it consults besides
+/// message bodies. Its whole `sessions` row (title, cwd, model, `extension_data`, lineage); per
+/// message row, in rowid order, its rowid, `message_id`, role, `created_timestamp` (the read's
+/// order) and the byte lengths of `content_json` and `metadata_json`; and the session it was
+/// forked from ([`fork_source`]), which the earliest other holder of its first message decides.
+/// Goose rewrites rows in place (a compaction's `metadata_json`, a tool request's `tool_meta`
+/// merged into `content_json`, a moved `created_timestamp`) without touching the `sessions` row:
+/// the lengths and timestamps catch those, an equal-length rewrite of a body escapes.
+fn rows_conn(conn: &Connection) -> Result<HashMap<String, crate::source::Rows>> {
+    let mut certificates = super::store::sqlite::Certificates::default();
+    certificates.digest(conn, "SELECT id, * FROM sessions ORDER BY id")?;
+    let has = super::store::sqlite::columns(conn, "messages");
+    let column = |name: &str, expr: &str| {
+        if has.contains(name) {
+            expr.to_owned()
+        } else {
+            "NULL".to_owned()
+        }
+    };
+    certificates.rows(
+        conn,
+        &format!(
+            "SELECT session_id, id, {}, role, created_timestamp, octet_length(content_json), {} \
+             FROM messages ORDER BY session_id, id",
+            column("message_id", "message_id"),
+            column("metadata_json", "octet_length(metadata_json)"),
+        ),
+    )?;
+    let created: Vec<(String, Option<DateTime<Utc>>)> = {
+        let has = super::store::sqlite::columns(conn, "sessions");
+        let created = if has.contains("created_at") {
+            "created_at"
+        } else {
+            "NULL"
+        };
+        let mut stmt = conn.prepare(&format!("SELECT id, {created} FROM sessions"))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        rows.map(|row| row.map(|(id, at)| (id, at.as_deref().and_then(parse_ts_text))))
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for (id, created) in created {
+        let parent = fork_source(conn, &id, created);
+        certificates.fold(&id, parent.as_deref().unwrap_or("").as_bytes());
+    }
+    Ok(certificates.0)
 }
 
 /// The session `id` was forked from. `goose session --resume --fork` copies every message, with
@@ -391,7 +401,7 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
 /// holds its ids. Two indexed lookups, and only for a copied session.
 fn copied_message_id(conn: &Connection, id: &str, created_at: Option<DateTime<Utc>>) -> Option<String> {
     let created_at = created_at?;
-    if !columns(conn, "messages").contains("message_id") {
+    if !Select::of(conn, "messages").has("message_id") {
         return None;
     }
     let (first, at): (String, i64) = conn
@@ -424,11 +434,7 @@ fn earliest_holder(conn: &Connection, first: &str, excluding: Option<&str>) -> O
     .ok()?
     .flatten();
     holders
-        .filter_map(|(sid, created)| {
-            #[cfg(test)]
-            FORK_HOLDER_ROWS.with(|rows| rows.set(rows.get() + 1));
-            Some((created.as_deref().and_then(parse_ts_text)?, sid))
-        })
+        .filter_map(|(sid, created)| Some((created.as_deref().and_then(parse_ts_text)?, sid)))
         .min()
 }
 
@@ -437,32 +443,9 @@ fn earliest_holder(conn: &Connection, first: &str, excluding: Option<&str>) -> O
 fn binary_holder_ids(conn: &Connection) -> bool {
     [("sessions", "id"), ("messages", "session_id")]
         .into_iter()
-        .all(|(table, id)| {
-            let ddl = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok();
-            if !ddl.is_some_and(|ddl| !ddl.to_ascii_uppercase().contains("COLLATE")) {
-                return false;
-            }
-            let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
-                return false;
-            };
-            let Ok(columns) = stmt.query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))) else {
-                return false;
-            };
-            let mut columns = columns.flatten();
-            columns.any(|(name, kind)| name == id && kind.eq_ignore_ascii_case("TEXT"))
-        })
+        .all(|(table, id)| super::store::sqlite::binary_text_columns(conn, table, &[id]).unwrap_or(false))
 }
 
-#[cfg(test)]
-thread_local! { static FORK_HOLDER_ROWS:std::cell::Cell<usize>=const {std::cell::Cell::new(0)}; }
-
-#[cfg(test)]
 fn fork_source(conn: &Connection, id: &str, created: Option<DateTime<Utc>>) -> Option<String> {
     let first = copied_message_id(conn, id, created)?;
     let (time, parent) = earliest_holder(conn, &first, Some(id))?;
@@ -518,24 +501,14 @@ fn fork_source_scoped(
 }
 
 #[cfg(test)]
-fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
-    stream_db_opts(conn, r, &ParseOptions::full(), sink)
-}
-
-#[cfg(test)]
-fn stream_db_opts(
-    conn: &Connection,
-    r: &SessionRef,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-) -> Result<Session> {
+fn stream_db_opts(conn: &Connection, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
     stream_db_opts_with_reads(conn, r, opts, sink, &crate::source::ReadSet::default())
 }
 
 fn stream_db_opts_with_reads(
     conn: &Connection,
     r: &SessionRef,
-    opts: &ParseOptions,
+    opts: &Demand,
     sink: &mut dyn MessageSink,
     captured: &crate::source::ReadSet,
 ) -> Result<Session> {
@@ -546,29 +519,18 @@ fn stream_db_opts_with_reads(
     wal.push("-wal");
     reads.record(Path::new(&wal));
     let cells = Cells::new(conn, &r.path, &reads, "messages")?;
-    let cols = columns(conn, "sessions");
-    let has = |c: &str| cols.contains(c);
-    let title_expr = title_expr(has);
-    let sel = format!(
-        "SELECT {title}, {wd}, {created}, {updated}, {provider}, {model_cfg}, {stype}, {parent} \
-         FROM sessions WHERE id = ?1",
-        title = title_expr,
-        wd = if has("working_dir") { "working_dir" } else { "NULL" },
-        created = if has("created_at") { "created_at" } else { "NULL" },
-        updated = if has("updated_at") { "updated_at" } else { "NULL" },
-        provider = if has("provider_name") { "provider_name" } else { "NULL" },
-        model_cfg = if has("model_config_json") {
-            "model_config_json"
-        } else {
-            "NULL"
-        },
-        stype = if has("session_type") { "session_type" } else { "NULL" },
-        parent = if has("parent_session_id") {
-            "parent_session_id"
-        } else {
-            "NULL"
-        },
-    );
+    let probe = Select::of(conn, "sessions");
+    let title = title_expr(|c| probe.has(c));
+    let select = probe.always(&[title]).probed(&[
+        "working_dir",
+        "created_at",
+        "updated_at",
+        "provider_name",
+        "model_config_json",
+        "session_type",
+        "parent_session_id",
+    ]);
+    let sel = format!("SELECT {} FROM sessions WHERE id = ?1", select.list());
     /// One optional TEXT value per metadata column the query selects.
     type MetaRow = (
         Option<String>,
@@ -583,28 +545,33 @@ fn stream_db_opts_with_reads(
     let (title, wd, created, updated, provider, model_cfg, session_type, parent_id): MetaRow = conn
         .query_row(&sel, [&r.id], |row| {
             Ok((
-                row.get(0).ok().flatten(),
-                row.get(1).ok().flatten(),
-                row.get(2).ok().flatten(),
-                row.get(3).ok().flatten(),
-                row.get(4).ok().flatten(),
-                row.get(5).ok().flatten(),
-                row.get(6).ok().flatten(),
-                row.get(7).ok().flatten(),
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
             ))
         })
-        .unwrap_or((None, None, None, None, None, None, None, None));
+        .with_context(|| format!("goose session {:?}", r.id))?;
 
-    let model = reconstruct_model(provider.as_deref(), model_cfg.as_deref());
+    let model = recorded_model(model_cfg.as_deref());
     // The session's kind (`user`/`scheduled`/`sub_agent`/`hidden`/…, v13+) is a Goose fact and
     // decides where its prompts came from; the spawning session of a sub-agent (`parent_session_id`,
     // v15+) is first-class lineage.
     let session_type = session_type.filter(|t| !t.is_empty());
     let prompt_origin = prompt_origin(session_type.as_deref());
     let mut extra = serde_json::Map::new();
+    let mut bag = serde_json::Map::new();
     if let Some(t) = session_type {
-        let mut bag = serde_json::Map::new();
         bag.insert("session_type".into(), Value::String(t));
+    }
+    if let Some(provider) = provider.filter(|p| !p.is_empty()) {
+        bag.insert("provider_name".into(), Value::String(provider));
+    }
+    if !bag.is_empty() {
         extra.insert(Harness::Goose.as_str().into(), Value::Object(bag));
     }
     let created_at = created.as_deref().and_then(parse_ts_text).or(r.created_at);
@@ -614,10 +581,7 @@ fn stream_db_opts_with_reads(
         ..Default::default()
     };
 
-    let s = Session {
-        source_stamp: None,
-        id: r.id.clone(),
-        harness: Harness::Goose,
+    let mut s = Session {
         cwd: wd
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
@@ -626,81 +590,79 @@ fn stream_db_opts_with_reads(
         created_at,
         updated_at: updated.as_deref().and_then(parse_ts_text).or(r.updated_at),
         model,
-        git: None,
-        messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra,
-        principal: None,
-        system_prompt: None,
         lineage,
+        ..Session::new(r.id.clone(), Harness::Goose)
     };
     // All session metadata is known up front, so hand it to the sink before the body.
     sink.meta(&s);
 
-    let mcols = columns(conn, "messages");
-    let has_msg = |c: &str| mcols.contains(c);
-    let msg_id = if has_msg("message_id") { "message_id" } else { "NULL" };
-    let tokens = if has_msg("tokens") { "tokens" } else { "NULL" };
-    let metadata = if has_msg("metadata_json") {
-        "metadata_json"
-    } else {
-        "NULL"
-    };
+    let select = Select::of(conn, "messages")
+        .always(&["role"])
+        .cell(&cells, "content_json")
+        .always(&["created_timestamp"])
+        .probed(&["message_id"])
+        .cell(&cells, "metadata_json");
+    let (role_at, content_at, created_at) = (
+        select.index("role")?,
+        select.index("content_json")?,
+        select.index("created_timestamp")?,
+    );
+    let (id_at, metadata_at) = (select.index("message_id")?, select.index("metadata_json")?);
     let sql = format!(
-        "SELECT role, {}, created_timestamp, {msg_id}, {tokens}, {} \
-         FROM messages WHERE session_id = ?1 ORDER BY created_timestamp, id",
-        cells.select("content_json"),
-        cells.select(metadata),
+        "SELECT {} FROM messages WHERE session_id = ?1 ORDER BY created_timestamp, id",
+        select.list()
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([&r.id])?;
-    let rich = opts.wants_full_extra();
+    let rich = opts.tier >= Tier::Rich;
 
     // Track tool-request names so we can label later tool responses (forward-only state).
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut history = AgentHistory::default();
-    let mut idx = 0;
+    // A row whose content cell is not one JSON value, or whose role is not text, is counted (it
+    // still reads as it did: empty content, an empty role).
+    let mut unparsed = super::Unparsed::default();
     while let Some(row) = rows.next()? {
-        idx += 1;
-        let metadata = match cells.cell(conn, "messages", metadata, row, 6)? {
+        let metadata = match cells.cell(conn, "messages", "metadata_json", row, metadata_at)? {
             Some(cell) => cells.read(cell, |v| record::metadata(v, rich))?,
             None => None,
         };
-        let decoded = match cells.cell(conn, "messages", "content_json", row, 1)? {
+        let decoded = match cells.cell(conn, "messages", "content_json", row, content_at)? {
             Some(cell) => cells
                 .read(cell, |v| record::content(v, &mut tool_names, opts, Some(cells.out())))?
-                .unwrap_or_default(),
+                .unwrap_or_else(|| {
+                    unparsed.count();
+                    Decoded::default()
+                }),
             None => Decoded::default(),
         };
+        let role = row.get::<_, String>(role_at).unwrap_or_else(|_| {
+            unparsed.count();
+            String::new()
+        });
         let row = DbMsg {
-            role: row.get::<_, String>(0).unwrap_or_default(),
-            created: row.get::<_, Option<i64>>(3).ok().flatten(),
-            id: row.get::<_, Option<String>>(4).ok().flatten(),
-            tokens: row.get::<_, Option<i64>>(5).ok().flatten(),
+            role,
+            created: row.get::<_, Option<i64>>(created_at).ok().flatten(),
+            id: row.get::<_, Option<String>>(id_at).ok().flatten(),
             metadata,
         };
-        let Some(mut m) = row.into_message_decoded(decoded, s.model.as_deref(), &mut history, opts.wants_full_extra())
-        else {
+        let Some(mut m) = row.into_message_decoded(decoded, &mut history, opts.tier >= Tier::Rich) else {
             continue;
         };
         if m.kind == MessageKind::Prompt {
             m.origin = prompt_origin;
         }
-        // A compaction summary: emit the boundary marker first, then the summary linked to it by
-        // `parent_id` — the `CompactionBoundary` + `CompactionSummary` pair `crate::compaction`
-        // detects for every harness.
+        // A compaction summary: Goose keeps no record of the compaction itself, so cv synthesizes
+        // the boundary before it (no content, no id); `crate::compaction` pairs the two by
+        // adjacency, as it does for every harness without a parent link.
         if m.kind == MessageKind::CompactionSummary {
-            let boundary_id = format!("compact-{}", m.id.as_deref().unwrap_or(&(idx - 1).to_string()));
-            let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
-            boundary.id = Some(boundary_id.clone());
+            let mut boundary = Message::synthesized(MessageKind::CompactionBoundary, Origin::Harness);
             boundary.timestamp = m.timestamp;
-            boundary.content.push(Block::Text {
-                text: "[conversation compacted]".to_string().into(),
-            });
             if sink.message(boundary) == Flow::Stop {
                 break;
             }
-            m.parent_id = Some(boundary_id);
         }
         if sink.message(m) == Flow::Stop {
             break;
@@ -709,6 +671,7 @@ fn stream_db_opts_with_reads(
     if opts.spans {
         cells.out().0.check()?;
     }
+    unparsed.note(&mut s);
     Ok(s)
 }
 
@@ -729,23 +692,8 @@ struct DbMsg {
     role: String,
     created: Option<i64>,
     id: Option<String>,
-    tokens: Option<i64>,
     /// `messages.metadata_json` — the only place Goose records per-message usage and model.
     metadata: Option<Value>,
-}
-
-/// Whether a row is a conversational turn, by the same assembly the stream uses. Compaction
-/// history only refines rows that are never turns, so discovery needs none.
-fn is_turn(role: String, metadata: Option<Value>, decoded: Decoded) -> bool {
-    let row = DbMsg {
-        role,
-        created: None,
-        id: None,
-        tokens: None,
-        metadata,
-    };
-    row.into_message_decoded(decoded, None, &mut AgentHistory::default(), false)
-        .is_some_and(|m| m.is_turn())
 }
 
 /// What the rows before this one left in the model's context, in store order: how many there were
@@ -762,13 +710,7 @@ struct AgentHistory {
 }
 
 impl DbMsg {
-    fn into_message_decoded(
-        self,
-        decoded: Decoded,
-        session_model: Option<&str>,
-        history: &mut AgentHistory,
-        rich: bool,
-    ) -> Option<Message> {
+    fn into_message_decoded(self, decoded: Decoded, history: &mut AgentHistory, rich: bool) -> Option<Message> {
         let meta = self.metadata;
         let flag = |k: &str| meta.as_ref().and_then(|m| m.get(k)).and_then(Value::as_bool);
         let agent_visible = flag("agentVisible") != Some(false);
@@ -781,15 +723,9 @@ impl DbMsg {
         history.rows += 1;
         history.any_agent_visible |= agent_visible;
 
-        let mut m = build_message(
-            &self.role,
-            self.id,
-            self.created.and_then(ts_from_epoch),
-            self.tokens,
-            decoded,
-        )?;
+        let mut m = build_message(&self.role, self.id, self.created.and_then(ts_from_epoch), decoded)?;
         if let Some(meta) = meta {
-            apply_metadata(&mut m, meta, session_model, compaction_summary);
+            apply_metadata(&mut m, meta, compaction_summary);
         }
         if !rich {
             omit_rich_details(&mut m);
@@ -810,7 +746,7 @@ fn omit_rich_details(message: &mut Message) {
 
 /// Fold a row's `metadata_json` (`MessageMetadata`, message.rs:828-853) into the message: `usage.*`
 /// → [`Usage`] (real per-response counts and the provider-reported `cost`; the `tokens` column is
-/// never written), the inference's `provider/model` → `model` when it differs from the session's,
+/// never written), the inference's recorded model → `model`,
 /// and the whole object under `extra["goose"]["metadata"]` so `userVisible` / `agentVisible` /
 /// `isCompaction` / latency survive for consumers that care.
 ///
@@ -823,7 +759,7 @@ fn omit_rich_details(message: &mut Message) {
 /// [`MessageKind::InjectedContext`], so a user-text count or a `cv show`
 /// reads as the user saw it while the model-visible context is still there. Verified on a real
 /// 1.51.0 store.
-fn apply_metadata(m: &mut Message, meta: Value, session_model: Option<&str>, compaction_summary: bool) {
+fn apply_metadata(m: &mut Message, meta: Value, compaction_summary: bool) {
     let hidden = meta.get("userVisible") == Some(&Value::Bool(false));
     let compaction = compaction_summary || meta.pointer("/usage/isCompaction") == Some(&Value::Bool(true));
     if hidden && matches!(m.role, Role::User | Role::Assistant) {
@@ -850,63 +786,47 @@ fn apply_metadata(m: &mut Message, meta: Value, session_model: Option<&str>, com
         }
     }
     if let Some(inf) = meta.get("inference") {
-        // The same `provider/model` shape as `Session::model` (`reconstruct_model`), recorded only
-        // when it differs — the resolved snapshot, a switched provider (IR diet).
+        // The resolved snapshot the row records, else the requested model. Its provider stays
+        // in the inference metadata; it cannot stand in for an absent model.
         let model = inf
             .get("resolvedModel")
             .or_else(|| inf.get("requestedModel"))
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty());
-        let provider = inf.get("provider").and_then(Value::as_str).filter(|s| !s.is_empty());
-        let model = model.map(|name| match provider {
-            Some(p) => format!("{p}/{name}"),
-            None => name.to_string(),
-        });
-        if let Some(model) = model.filter(|model| session_model != Some(model.as_str())) {
-            m.model = Some(model);
-        }
+        m.model = model.map(str::to_owned);
     }
     if meta.is_object() {
         m.harness_extra_mut(Harness::Goose).insert("metadata".into(), meta);
     }
 }
 
-/// Reconstruct a `provider/model` string from the session's provider + model_config_json.
-fn reconstruct_model(provider: Option<&str>, model_cfg: Option<&str>) -> Option<String> {
-    let model_name = model_cfg
+/// The model's recorded name; a provider alone supplies no model fact.
+fn recorded_model(model_cfg: Option<&str>) -> Option<String> {
+    model_cfg
         .and_then(|j| serde_json::from_str::<Value>(j).ok())
-        .and_then(|v| v.get("model_name").and_then(Value::as_str).map(str::to_string));
-    match (provider.filter(|p| !p.is_empty()), model_name) {
-        (Some(p), Some(m)) => Some(format!("{p}/{m}")),
-        (None, Some(m)) => Some(m),
-        (Some(p), None) => Some(p.to_string()),
-        (None, None) => None,
-    }
+        .and_then(|v| {
+            v.get("model_name")
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 // ---------------------------------------------------------------------------
 // Legacy `.jsonl`
 // ---------------------------------------------------------------------------
 
-fn list_legacy(dir: &Path) -> Vec<(String, PathBuf)> {
+fn list_legacy(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
         if path.extension().is_some_and(|e| e == "jsonl") {
             if let Some(stem) = path.file_stem() {
                 out.push((stem.to_string_lossy().into_owned(), path));
             }
         }
     }
-    out
-}
-
-/// Project the metadata header and conversational count without retaining raw message lines.
-fn discover_legacy(name: &str, path: &Path) -> Option<SessionRef> {
-    legacy::discover(name, path)
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -932,13 +852,7 @@ struct Decoded {
 /// [`Role::Tool`] turn; an `error` block makes the message a [`MessageKind::Error`]; control
 /// content alone makes it a [`MessageKind::Notice`]. The row's `metadata_json` may refine the kind
 /// afterwards ([`apply_metadata`]).
-fn build_message(
-    role: &str,
-    id: Option<String>,
-    ts: Option<DateTime<Utc>>,
-    tokens: Option<i64>,
-    decoded: Decoded,
-) -> Option<Message> {
+fn build_message(role: &str, id: Option<String>, ts: Option<DateTime<Utc>>, decoded: Decoded) -> Option<Message> {
     let Decoded {
         blocks,
         error,
@@ -976,17 +890,6 @@ fn build_message(
     }
     m.id = id;
     m.timestamp = ts;
-    if let Some(t) = tokens {
-        if t > 0 {
-            let mut u = Usage::default();
-            if ir_role == Role::Assistant {
-                u.output_tokens = Some(t as u64);
-            } else {
-                u.input_tokens = Some(t as u64);
-            }
-            m.usage = Some(u);
-        }
-    }
     m.content = blocks;
     Some(m)
 }
@@ -1022,11 +925,11 @@ fn parse_ts_text(s: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-/// Whole-`Session` convenience over [`stream_db`] for tests: stream into a [`CollectSink`].
+/// Whole-`Session` convenience over [`stream_db_opts`] for tests: stream into a [`CollectSink`].
 #[cfg(test)]
 fn parse_db(conn: &Connection, r: &SessionRef) -> Result<Session> {
     let mut sink = crate::stream::CollectSink::default();
-    let mut s = stream_db(conn, r, &mut sink)?;
+    let mut s = stream_db_opts(conn, r, &Demand::RICH, &mut sink)?;
     s.messages = sink.messages;
     Ok(s)
 }
@@ -1035,7 +938,7 @@ fn parse_db(conn: &Connection, r: &SessionRef) -> Result<Session> {
 #[cfg(test)]
 fn parse_legacy(name: &str, path: &Path) -> Result<Session> {
     let mut sink = crate::stream::CollectSink::default();
-    let mut s = legacy::stream(name, path, &ParseOptions::full(), &mut sink)?;
+    let mut s = legacy::stream(name, path, &Demand::RICH, &mut sink)?;
     s.messages = sink.messages;
     Ok(s)
 }
@@ -1126,10 +1029,11 @@ mod tests {
     ";
 
     /// A store file holding `schema`; Goose reads cells against the file they live in.
-    fn mk(schema: &str) -> Connection {
-        let c = Connection::open(tempdir().join("sessions.db")).unwrap();
+    fn mk(schema: &str) -> (cv_testkit::World, Connection) {
+        let (world, dir) = tempdir();
+        let c = Connection::open(dir.join("sessions.db")).unwrap();
         c.execute_batch(schema).unwrap();
-        c
+        (world, c)
     }
 
     /// A message's `extra["goose"]` bag (the only place a Goose message fact may live).
@@ -1137,14 +1041,21 @@ mod tests {
         m.harness_extra(Harness::Goose).expect("extra[\"goose\"]")
     }
 
-    /// Every `extra` key, on the session and on each message, is `goose`: no flat keys anywhere.
+    /// Every `extra` key, on the session and on each message, is `goose` (or cv's own namespace,
+    /// on a turn cv synthesized): the shared IR-v2 nesting invariant
+    /// ([`crate::harness::assert_no_flat_keys`]), tightened to goose's one namespace.
     fn assert_nested_extra(s: &Session) {
+        crate::harness::assert_no_flat_keys(s);
         for k in s.extra.keys() {
             assert_eq!(k, Harness::Goose.as_str(), "flat session extra key {k:?}");
         }
         for (i, m) in s.messages.iter().enumerate() {
             for k in m.extra.keys() {
-                assert_eq!(k, Harness::Goose.as_str(), "flat extra key {k:?} on message {i}");
+                let cv = k == crate::ir::CV_NAMESPACE && m.is_synthesized();
+                assert!(
+                    cv || k == Harness::Goose.as_str(),
+                    "flat extra key {k:?} on message {i}"
+                );
             }
         }
     }
@@ -1161,9 +1072,69 @@ mod tests {
         SessionRef::new(id, Harness::Goose, at(c))
     }
 
+    /// Every corpus version: a row written to one session moves its certificate alone, and every
+    /// other session reads exactly as before ([`super::super::store::sqlite::assert_rows_move_alone`]).
+    #[test]
+    fn corpus_rows_certify_each_session_and_move_only_with_its_rows() {
+        let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/goose");
+        let mut versions: Vec<_> = std::fs::read_dir(&corpus).unwrap().map(|e| e.unwrap().path()).collect();
+        versions.sort();
+        assert!(!versions.is_empty());
+        for version in versions {
+            let world = crate::test_world("goose-corpus-rows");
+            let dir = world.base.join("sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("sessions.db");
+            std::fs::copy(version.join("sessions/sessions.db"), &db).unwrap();
+            // A session whose messages no other session holds: no fork resolution consults it.
+            let leaf: String = Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT s.id FROM sessions s WHERE EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id) \
+                     AND NOT EXISTS (SELECT 1 FROM messages m JOIN messages o ON o.message_id = m.message_id \
+                     AND o.session_id != m.session_id WHERE m.session_id = s.id) ORDER BY s.id LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            super::super::store::sqlite::assert_rows_move_alone(&Goose::with_sessions_dir(&dir), &db, &leaf, |c| {
+                c.execute(
+                    "INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json) \
+                     VALUES ('zq', ?1, 'user', '[{\"type\":\"text\",\"text\":\"zqcertified\"}]', 4102444800, '{}')",
+                    [&leaf],
+                )
+                .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn windowed_reads_keep_the_model() {
+        let _world = crate::test_world("goose-windowed");
+        let sessions = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/goose/1.54.0/sessions");
+        crate::harness::assert_windowed_models(&Goose::with_sessions_dir(&sessions));
+    }
+
+    #[test]
+    fn provider_without_model_stays_in_the_bag() {
+        let (_world, c) = mk(SCHEMA);
+        c.execute(
+            "INSERT INTO sessions (id, working_dir, provider_name) VALUES ('s', '/fixture', 'anthropic')",
+            [],
+        )
+        .unwrap();
+        let s = parse_db(&c, &sref(&c, "s")).unwrap();
+        assert!(s.model.is_none());
+        assert_eq!(s.harness_extra(Harness::Goose).unwrap()["provider_name"], "anthropic");
+        let mut m = Message::new(Role::Assistant);
+        apply_metadata(&mut m, serde_json::json!({"inference":{"provider":"anthropic"}}), false);
+        assert!(m.model.is_none());
+        assert_eq!(bag(&m)["metadata"]["inference"]["provider"], "anthropic");
+    }
+
     #[test]
     fn parses_modern_db_text_and_tools() {
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute(
             "INSERT INTO sessions (id, description, working_dir, created_at, updated_at, provider_name, model_config_json) \
              VALUES ('s1','Build a thing','/home/u/proj','2024-01-01 12:00:00','2024-01-01 12:05:00','anthropic','{\"model_name\":\"claude-sonnet-4\"}')",
@@ -1171,15 +1142,15 @@ mod tests {
         ).unwrap();
         // user text
         c.execute(
-            "INSERT INTO messages (session_id, role, content_json, created_timestamp, tokens) \
-             VALUES ('s1','user','[{\"type\":\"text\",\"text\":\"Hello\"}]',1704110400,3)",
+            "INSERT INTO messages (session_id, role, content_json, created_timestamp) \
+             VALUES ('s1','user','[{\"type\":\"text\",\"text\":\"Hello\"}]',1704110400)",
             [],
         )
         .unwrap();
         // assistant: thinking + text + tool request
         let asst = r#"[{"type":"thinking","thinking":"let me think","signature":"sig"},{"type":"text","text":"Working on it"},{"type":"toolRequest","id":"call_1","toolCall":{"status":"success","value":{"name":"shell","arguments":{"command":"ls"}}}}]"#;
         c.execute(
-            "INSERT INTO messages (session_id, role, content_json, created_timestamp, tokens) VALUES ('s1','assistant',?1,1704110401,42)",
+            "INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES ('s1','assistant',?1,1704110401)",
             [asst],
         ).unwrap();
         // tool response carried on a user message
@@ -1192,33 +1163,31 @@ mod tests {
         let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         assert_eq!(s.title.as_deref(), Some("Build a thing"));
         assert_eq!(s.cwd.as_deref().map(|p| p.to_str().unwrap()), Some("/home/u/proj"));
-        assert_eq!(s.model.as_deref(), Some("anthropic/claude-sonnet-4"));
+        assert_eq!(s.model.as_deref(), Some("claude-sonnet-4"));
         assert!(s.created_at.is_some());
         assert_eq!(s.messages.len(), 3);
 
         // user
         assert_eq!(s.messages[0].role, Role::User);
         assert_eq!(s.messages[0].text().as_deref(), Some("Hello"));
-        assert_eq!(s.messages[0].usage.as_ref().unwrap().input_tokens, Some(3));
 
         // assistant: thinking, text, tooluse
         let a = &s.messages[1];
         assert_eq!(a.role, Role::Assistant);
         assert!(
-            matches!(&a.content[0], Block::Thinking { text, signature, .. } if text == "let me think" && signature.as_deref() == Some("sig"))
+            matches!(&a.content[0], Block::Thinking { text, signature, .. } if text.matches_str("let me think") == Some(true) && signature.as_deref() == Some("sig"))
         );
-        assert!(matches!(&a.content[1], Block::Text { text } if text == "Working on it"));
+        assert!(matches!(&a.content[1], Block::Text { text } if text.matches_str("Working on it") == Some(true)));
         assert!(
             matches!(&a.content[2], Block::ToolUse { name, id, input , ..} if name == "shell" && id == "call_1" && input.resolve().unwrap().get("command").and_then(Value::as_str) == Some("ls"))
         );
-        assert_eq!(a.usage.as_ref().unwrap().output_tokens, Some(42));
 
         // tool response reclassified to Role::Tool, paired name recovered
         let t = &s.messages[2];
         assert_eq!(t.role, Role::Tool);
         assert!(
             matches!(&t.content[0], Block::ToolResult { tool_use_id, content, tool_name, is_error, .. }
-            if tool_use_id == "call_1" && content == "file1\nfile2" && tool_name.as_deref() == Some("shell") && !is_error)
+            if tool_use_id == "call_1" && content.matches_str("file1\nfile2") == Some(true) && tool_name.as_deref() == Some("shell") && !is_error)
         );
     }
 
@@ -1253,9 +1222,9 @@ mod tests {
 
         // A stub-provider turn: prompt, the injected `<turn-context>` row (hidden from the user →
         // System / injected context), the reply with real usage; the session model is
-        // provider/model and the reply's `openai/stub-model` is the same, so it is not repeated.
+        // the bare model and the reply records the same shape from its inference metadata.
         let s = parse_db(&c, &sref(&c, "20260919_3")).unwrap();
-        assert_eq!(s.model.as_deref(), Some("openai/stub-model"));
+        assert_eq!(s.model.as_deref(), Some("stub-model"));
         assert_eq!(
             kinds(&s),
             vec![
@@ -1273,7 +1242,7 @@ mod tests {
         assert_eq!(bag(&s.messages[1])["metadata"]["turnContext"], true);
         assert!(s.messages[1].text().unwrap().starts_with("<turn-context>"));
         let a = &s.messages[2];
-        assert_eq!(a.model, None, "same as the session model");
+        assert_eq!(a.model.as_deref(), Some("stub-model"), "the row's inference metadata");
         let u = a.usage.as_ref().unwrap();
         assert_eq!(
             (u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cost_usd),
@@ -1336,7 +1305,7 @@ mod tests {
         // What real 1.51.0/1.54.0 compaction writes (tests/corpus/goose): every earlier row flipped to
         // agentVisible:false, then an agent-only summary, continuation and preserved prompt, none
         // carrying `usage`. A tool-pair summary is agent-only too, but earlier rows stay visible.
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute("INSERT INTO sessions (id, working_dir) VALUES ('c','/p')", [])
             .unwrap();
         let rows = [
@@ -1390,7 +1359,7 @@ mod tests {
     #[test]
     fn fork_lineage_normalizes_seconds_and_milliseconds() {
         for milliseconds in [false, true] {
-            let conn = mk(SCHEMA);
+            let (_world, conn) = mk(SCHEMA);
             for (id, created) in [
                 ("source", "2024-01-01 00:00:00"),
                 ("fork", "2024-01-03 00:00:00"),
@@ -1451,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_family_holder_rows_are_scanned_once_per_read_scope_and_fresh_between_scopes() -> Result<()> {
+    fn fork_family_holder_is_shared_within_a_read_scope_and_fresh_between_scopes() -> Result<()> {
         let world = crate::test_world("goose-fork-family-scope");
         let path = world.base.join("sessions.db");
         let conn = Connection::open(&path)?;
@@ -1471,44 +1440,26 @@ mod tests {
         let adapter = Goose::with_sessions_dir(&world.base);
         let read = |i| -> Result<Session> {
             let reference = SessionRef::new(format!("family-{i:03}"), Harness::Goose, &path);
-            crate::stream::collect_with(&adapter, &reference, &ParseOptions::full())
+            crate::stream::collect_with(&adapter, &reference, &Demand::RICH)
         };
-        FORK_HOLDER_ROWS.with(|rows| rows.set(0));
         {
             let _scope = crate::source::read_scope();
             for i in 1..80 {
                 assert_eq!(read(i)?.lineage.forked_from.as_deref(), Some("family-000"));
             }
-            assert_eq!(FORK_HOLDER_ROWS.with(|rows| rows.get()), 80);
         }
-        FORK_HOLDER_ROWS.with(|rows| rows.set(0));
         for i in 1..4 {
             assert_eq!(read(i)?.lineage.forked_from.as_deref(), Some("family-000"));
         }
-        assert_eq!(FORK_HOLDER_ROWS.with(|rows| rows.get()), 240);
         // Exercise the real multi-session consumer without a test-provided source scope.
-        // One worker makes the existing thread-local SQL counter observable while still
-        // traversing TokenStats' production parallel worker boundary.
+        assert!(!crate::source::inventory_scoped());
         let references: Vec<_> = (1..80)
             .map(|i| SessionRef::new(format!("family-{i:03}"), Harness::Goose, &path))
             .collect();
-        let stats_control = || -> Result<()> {
-            assert!(!crate::source::inventory_scoped());
-            FORK_HOLDER_ROWS.with(|rows| rows.set(0));
-            let stats = crate::stats::TokenStats::compute(&references)?;
-            assert_eq!(stats.sessions, 79);
-            assert_eq!(stats.failed, 0);
-            assert_eq!(FORK_HOLDER_ROWS.with(|rows| rows.get()), 80);
-            assert!(!crate::source::inventory_scoped());
-            Ok(())
-        };
-        #[cfg(feature = "parallel")]
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()?
-            .install(crate::env::carry(stats_control))?;
-        #[cfg(not(feature = "parallel"))]
-        stats_control()?;
+        let stats = crate::stats::TokenStats::compute(&references)?;
+        assert_eq!(stats.sessions, 79);
+        assert_eq!(stats.failed, 0);
+        assert!(!crate::source::inventory_scoped());
         // A later operation observes changed holder metadata rather than keeping the old minimum.
         let conn = Connection::open(&path)?;
         conn.execute(
@@ -1526,7 +1477,7 @@ mod tests {
     #[test]
     fn title_prefers_the_written_name_column() {
         // Goose only ever writes `name`; `description` is a never-written default '' (v16 DDL).
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute("INSERT INTO sessions (id, name, working_dir, updated_at) VALUES ('n','Fix flaky test','/p','2026-09-01 00:00:00')", []).unwrap();
         c.execute("INSERT INTO sessions (id, description, working_dir, updated_at) VALUES ('d','Only description','/p','2026-08-01 00:00:00')", []).unwrap();
         c.execute(
@@ -1551,7 +1502,7 @@ mod tests {
 
     #[test]
     fn metadata_json_yields_usage_model_and_flags() {
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute(
             "INSERT INTO sessions (id, name, working_dir, session_type, parent_session_id, provider_name, model_config_json) \
              VALUES ('s1','t','/x','sub_agent','root-1','anthropic','{\"model_name\":\"claude-sonnet-4-5\"}')",
@@ -1585,7 +1536,7 @@ mod tests {
                 ..Default::default()
             }
         );
-        assert_eq!(s.model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        assert_eq!(s.model.as_deref(), Some("claude-sonnet-4-5"));
         // prompt / reply / the compaction pair (boundary synthesized before the agent-only summary)
         assert_eq!(
             kinds(&s),
@@ -1603,7 +1554,7 @@ mod tests {
         assert_eq!(u.cost_usd, Some(0.0041), "provider-reported cost is first-class");
         assert_eq!(
             m.model.as_deref(),
-            Some("anthropic/claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4-5-20250929"),
             "the resolved snapshot differs from the session model, so it is recorded"
         );
         assert_eq!(bag(m)["metadata"]["usage"]["costSource"], "provider_reported");
@@ -1622,7 +1573,7 @@ mod tests {
 
     #[test]
     fn prompt_origin_follows_session_type() {
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         for (id, ty) in [("u", "user"), ("s", "scheduled"), ("h", "hidden"), ("a", "acp")] {
             c.execute(
                 "INSERT INTO sessions (id, working_dir, session_type) VALUES (?1, '/x', ?2)",
@@ -1644,7 +1595,7 @@ mod tests {
 
     #[test]
     fn error_and_document_blocks_map() {
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
             .unwrap();
         let content = r#"[{"type":"error","kind":"contextLengthExceeded","message":"Maximum retry attempts (3) exceeded."},{"type":"document","data":"cGRmLWJ5dGVz","mimeType":"application/pdf","name":"q3-report.pdf"}]"#;
@@ -1661,7 +1612,7 @@ mod tests {
         assert_eq!(bag(m)["error"]["message"], "Maximum retry attempts (3) exceeded.");
         assert_eq!(m.content.len(), 2, "neither block is dropped");
         assert!(
-            matches!(&m.content[0], Block::Text { text } if text == "[error: contextLengthExceeded] Maximum retry attempts (3) exceeded.")
+            matches!(&m.content[0], Block::Text { text } if text.matches_str("[error: contextLengthExceeded] Maximum retry attempts (3) exceeded.") == Some(true))
         );
         assert!(matches!(&m.content[1], Block::File { mime, path, source }
                 if mime.as_deref() == Some("application/pdf") && path.as_deref() == Some("q3-report.pdf") && source.as_deref() == Some("base64:inline")));
@@ -1670,7 +1621,7 @@ mod tests {
 
     #[test]
     fn control_blocks_are_notices() {
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
             .unwrap();
         let rows = [
@@ -1732,7 +1683,7 @@ mod tests {
 
     #[test]
     fn bare_array_results_and_rmcp3_content_flatten() {
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
             .unwrap();
         // legacy `SuccessWithContentVec`: `value` is the content array itself, with rmcp 3 blocks
@@ -1745,7 +1696,7 @@ mod tests {
         let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         let m = &s.messages[0];
         assert!(matches!(&m.content[0], Block::ToolResult { content, is_error, .. }
-                if content == "ok\nhello\n[resource: file:///tmp/b.bin]\n[audio: audio/wav]" && !is_error));
+                if content.matches_str("ok\nhello\n[resource: file:///tmp/b.bin]\n[audio: audio/wav]") == Some(true) && !is_error));
         // a millisecond `created_timestamp` is read as milliseconds (Goose's own reader divides it
         // down to whole seconds for display; the IR keeps what the column holds)
         assert_eq!(
@@ -1756,7 +1707,7 @@ mod tests {
 
     #[test]
     fn parses_tool_error_response() {
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
             .unwrap();
         let resp = r#"[{"type":"toolResponse","id":"c9","toolResult":{"status":"error","error":"boom"}}]"#;
@@ -1767,14 +1718,14 @@ mod tests {
         .unwrap();
         let s = parse_db(&c, &sref(&c, "s1")).unwrap();
         assert!(
-            matches!(&s.messages[0].content[0], Block::ToolResult { is_error, content, .. } if *is_error && content == "boom")
+            matches!(&s.messages[0].content[0], Block::ToolResult { is_error, content, .. } if *is_error && content.matches_str("boom") == Some(true))
         );
     }
 
     #[test]
     fn delegate_result_keeps_the_child_session_id_in_details() {
         // summon's `delegate` result as Goose 1.51.0/1.54.0 write it (tests/corpus/goose).
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
             .unwrap();
         let resp = r#"[{"type":"toolResponse","id":"c1","toolResult":{"status":"success","value":{"resultType":"complete","content":[{"type":"text","text":"ok"}],"isError":false,"_meta":{"subagent_session_id":"20261011_7"}}}}]"#;
@@ -1787,7 +1738,7 @@ mod tests {
         let Block::ToolResult { details, content, .. } = &s.messages[0].content[0] else {
             panic!("a tool result")
         };
-        assert_eq!(content, "ok");
+        assert_eq!(content.inline_str(), Some("ok"));
         assert_eq!(
             details.as_ref().and_then(|d| d.pointer("/_meta/subagent_session_id")),
             Some(&Value::from("20261011_7"))
@@ -1795,8 +1746,66 @@ mod tests {
     }
 
     #[test]
-    fn discovery_count_matches_full_codec_turns_for_shapes_visibility_and_corruption() {
-        let conn = mk(SCHEMA);
+    fn metadata_listing_refills_complete_counts_for_sqlite_and_legacy_sources() -> Result<()> {
+        let w = crate::test_world("goose-deferred-counts");
+        let dir = w.home.join(".local/share/goose/sessions");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("sessions.db");
+        let writer = Connection::open(&path)?;
+        writer.execute_batch(SCHEMA)?;
+        writer.execute(
+            "INSERT INTO sessions(id,description,working_dir) VALUES ('native','Native','/native')",
+            [],
+        )?;
+        writer.execute_batch("INSERT INTO messages(session_id,role,content_json,created_timestamp) VALUES ('native','user','[{\"type\":\"text\",\"text\":\"question\"}]',1),('native','assistant','[{\"type\":\"text\",\"text\":\"answer\"}]',2)")?;
+        let legacy = dir.join("legacy.jsonl");
+        let first = "{\"description\":\"Legacy\",\"working_dir\":\"/legacy\"}\n{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"question\"}]}\n";
+        std::fs::write(&legacy, first)?;
+        let refs = crate::sessions_for(Some(Harness::Goose));
+        assert_eq!(refs.len(), 2);
+        assert!(refs.iter().all(|r| r.message_count.is_none()));
+        let adapter = Goose::with_sessions_dir(&dir);
+        for reference in &refs {
+            crate::stream::stream_counted(
+                &adapter,
+                reference,
+                &Demand::FACTS.with_spans(),
+                &mut crate::stream::Discard,
+                crate::stream::Pass::RECORD,
+            )?;
+        }
+        let check = |refs: &[SessionRef], native, legacy| {
+            assert_eq!(refs.iter().find(|r| r.id == "native").unwrap().message_count, native);
+            assert_eq!(refs.iter().find(|r| r.id == "legacy").unwrap().message_count, legacy);
+        };
+        check(&crate::sessions_for(Some(Harness::Goose)), Some(2), Some(1));
+        let refreshed = crate::discover_all();
+        check(&refreshed, Some(2), Some(1));
+        for mut reference in refreshed {
+            reference.message_count = None;
+            assert_eq!(
+                serde_json::to_value(&reference)?,
+                serde_json::to_value(refs.iter().find(|old| old.id == reference.id).unwrap())?
+            );
+        }
+        writer.execute("UPDATE sessions SET description='Renamed' WHERE id='native'", [])?;
+        let changed = crate::sessions_for(Some(Harness::Goose));
+        check(&changed, None, Some(1));
+        assert_eq!(
+            changed.iter().find(|r| r.id == "native").unwrap().title.as_deref(),
+            Some("Renamed")
+        );
+        std::fs::write(
+            &legacy,
+            format!("{first}{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"next\"}}]}}\n"),
+        )?;
+        check(&crate::sessions_for(Some(Harness::Goose)), None, None);
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_defers_counts_and_streams_preserve_shapes_visibility_and_corruption() {
+        let (_world, conn) = mk(SCHEMA);
         let giant = "雪λ\n".repeat(20000);
         let mut cases = vec![
             ("user", "null".to_owned(), None),
@@ -1904,8 +1913,11 @@ mod tests {
         }
         for reference in discover_db(&conn, &at(&conn)).unwrap() {
             let parsed = parse_db(&conn, &sref(&conn, &reference.id)).unwrap();
+            assert_eq!(reference.message_count, None);
+            let mut sink = crate::stream::CollectSink::default();
+            stream_db_opts(&conn, &reference, &Demand::LEAN.with_spans(), &mut sink).unwrap();
             assert_eq!(
-                reference.message_count,
+                sink.messages.iter().filter(|m| m.is_turn()).count(),
                 parsed.messages.iter().filter(|m| m.is_turn()).count(),
                 "{}",
                 reference.id
@@ -1915,7 +1927,7 @@ mod tests {
 
     #[test]
     fn discovery_keeps_known_sessions_when_message_count_schema_is_unavailable() -> Result<()> {
-        let conn = mk(SCHEMA);
+        let (_world, conn) = mk(SCHEMA);
         conn.execute("INSERT INTO sessions(id,working_dir) VALUES ('known','/synthetic')", [])?;
         conn.execute("DROP TABLE messages", [])?;
         for incomplete in [None, Some("CREATE TABLE messages(session_id TEXT,content_json TEXT)")] {
@@ -1925,14 +1937,14 @@ mod tests {
             let refs = discover_db(&conn, &at(&conn))?;
             assert_eq!(refs.len(), 1);
             assert_eq!(refs[0].id, "known");
-            assert_eq!(refs[0].message_count, 0);
+            assert_eq!(refs[0].message_count, None);
         }
         Ok(())
     }
 
     #[test]
-    fn discover_db_orders_and_counts() {
-        let c = mk(SCHEMA);
+    fn discover_db_orders_without_reading_message_counts() {
+        let (_world, c) = mk(SCHEMA);
         c.execute("INSERT INTO sessions (id, description, working_dir, updated_at) VALUES ('a','A','/x','2024-01-01 00:00:00')", []).unwrap();
         c.execute("INSERT INTO sessions (id, description, working_dir, updated_at) VALUES ('b','B','/y','2024-02-01 00:00:00')", []).unwrap();
         c.execute("INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES ('a','user','[{\"type\":\"text\",\"text\":\"hi\"}]',1)", []).unwrap();
@@ -1950,15 +1962,24 @@ mod tests {
         assert_eq!(refs[0].id, "b"); // updated_at DESC
         assert_eq!(refs[1].id, "a");
         assert_eq!(
-            refs[1].message_count, 2,
-            "user + assistant; the tool-result row and the corrupt row are not turns"
+            refs[1].message_count, None,
+            "discovery does not reduce the messages table"
         );
         assert_eq!(refs[0].title.as_deref(), Some("B"));
+        assert_eq!(
+            parse_db(&c, &refs[1])
+                .unwrap()
+                .messages
+                .iter()
+                .filter(|m| m.is_turn())
+                .count(),
+            2
+        );
     }
 
     #[test]
     fn old_schema_missing_columns_still_parses() {
-        let c = mk(SCHEMA_OLD);
+        let (_world, c) = mk(SCHEMA_OLD);
         c.execute(
             "INSERT INTO sessions (id, name, working_dir) VALUES ('s1','My Session','/p')",
             [],
@@ -1977,7 +1998,7 @@ mod tests {
 
     #[test]
     fn parses_legacy_jsonl() {
-        let dir = tempdir();
+        let (_world, dir) = tempdir();
         let path = dir.join("20240101_120000.jsonl");
         let content = concat!(
             "{\"description\":\"legacy chat\",\"working_dir\":\"/home/u/old\",\"created_at\":\"2024-01-01T12:00:00Z\",\"updated_at\":\"2024-01-01T12:01:00Z\"}\n",
@@ -1988,10 +2009,13 @@ mod tests {
         std::fs::write(&path, content).unwrap();
 
         // discover (header-only)
-        let r = discover_legacy("20240101_120000", &path).unwrap();
+        let r = legacy::discover("20240101_120000", &path).unwrap();
         assert_eq!(r.title.as_deref(), Some("legacy chat"));
         assert_eq!(r.cwd.as_deref().map(|p| p.to_str().unwrap()), Some("/home/u/old"));
-        assert_eq!(r.message_count, 2, "m3 is only a tool result: a Tool turn, not counted");
+        assert_eq!(
+            r.message_count, None,
+            "discovery reads metadata without reducing messages"
+        );
         assert!(r.created_at.is_some());
 
         // full parse
@@ -1999,6 +2023,7 @@ mod tests {
         assert_eq!(s.title.as_deref(), Some("legacy chat"));
         assert_eq!(s.cwd.as_deref().map(|p| p.to_str().unwrap()), Some("/home/u/old"));
         assert_eq!(s.messages.len(), 3);
+        assert_eq!(s.messages.iter().filter(|m| m.is_turn()).count(), 2);
         assert_eq!(
             kinds(&s),
             vec![
@@ -2012,14 +2037,49 @@ mod tests {
         assert_eq!(s.messages[2].role, Role::Tool);
         assert!(
             matches!(&s.messages[2].content[0], Block::ToolResult { tool_name, content, .. }
-            if tool_name.as_deref() == Some("developer__shell") && content == "/home/u/old")
+            if tool_name.as_deref() == Some("developer__shell") && content.matches_str("/home/u/old") == Some(true))
         );
+    }
+
+    /// Legacy discovery reads a whole file; an unchanged file is not read again, a new legacy
+    /// session is read alone.
+    #[test]
+    fn unchanged_legacy_files_are_not_rescanned() -> Result<()> {
+        let world = crate::test_world("goose-legacy-cache");
+        let dir = world.base.join("sessions");
+        std::fs::create_dir_all(&dir)?;
+        let context = crate::discover_cache::read::Context::current();
+        let _scope = context.enter();
+        let write = |name: &str| {
+            std::fs::write(
+                dir.join(format!("{name}.jsonl")),
+                "{\"description\":\"legacy\",\"working_dir\":\"/w\"}\n{\"role\":\"user\",\"created\":1,\"content\":[]}\n",
+            )
+        };
+        for i in 0..4 {
+            write(&format!("s{i}"))?;
+        }
+        let scanned = || {
+            let mut all = legacy::SCANNED.lock().unwrap();
+            let mine = all.iter().filter(|p| p.starts_with(&dir)).count();
+            all.retain(|p| !p.starts_with(&dir));
+            mine
+        };
+        let adapter = Goose::with_sessions_dir(&dir);
+        let first = adapter.discover()?;
+        assert_eq!((first.refs.len(), scanned()), (4, 4));
+        let again = adapter.discover()?;
+        assert_eq!((again.refs.len(), scanned()), (4, 0), "unchanged files are not reread");
+        assert_eq!(serde_json::to_value(&first.refs)?, serde_json::to_value(&again.refs)?);
+        write("s4")?;
+        assert_eq!((adapter.discover()?.refs.len(), scanned()), (5, 1));
+        Ok(())
     }
 
     #[test]
     fn legacy_without_metadata_header_is_tolerant() {
         // A header that's actually a message (no description) — we still read messages, no panic.
-        let dir = tempdir();
+        let (_world, dir) = tempdir();
         let path = dir.join("s.jsonl");
         std::fs::write(
             &path,
@@ -2034,7 +2094,7 @@ mod tests {
 
     #[test]
     fn redacted_thinking_maps() {
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
             .unwrap();
         c.execute(
@@ -2054,7 +2114,7 @@ mod tests {
         assert!(g.roots().is_empty());
     }
 
-    fn projected_session(conn: &Connection, r: &SessionRef, opts: &ParseOptions) -> Session {
+    fn projected_session(conn: &Connection, r: &SessionRef, opts: &Demand) -> Session {
         let mut sink = crate::stream::CollectSink::default();
         let mut session = stream_db_opts(conn, r, opts, &mut sink).unwrap();
         session.messages = sink.messages;
@@ -2062,7 +2122,7 @@ mod tests {
         session
     }
 
-    // ParseOptions explicitly reserves native sidecars and structured result details for full
+    // Demand explicitly reserves native sidecars and structured result details for full
     // extra demand. Lean output must retain every first-class field and ordinary content block.
     fn without_rich_message_fields(mut session: Session) -> Value {
         for message in &mut session.messages {
@@ -2078,7 +2138,7 @@ mod tests {
 
     #[test]
     fn long_text_stays_in_the_cell_and_lean_demands_drop_only_rich_fields() {
-        let c = mk(SCHEMA);
+        let (_world, c) = mk(SCHEMA);
         c.execute("INSERT INTO sessions (id, working_dir) VALUES ('large','/scratch')", [])
             .unwrap();
         let giant = "é\n\"\\".repeat(20_000);
@@ -2093,7 +2153,7 @@ mod tests {
         c.execute("INSERT INTO messages (session_id,role,content_json,created_timestamp,metadata_json) VALUES ('large','user',?1,1,?2)", rusqlite::params![content.to_string(),metadata.to_string()]).unwrap();
         let r = sref(&c, "large");
         let mut sink = crate::stream::CollectSink::default();
-        stream_db_opts(&c, &r, &ParseOptions::lazy(), &mut sink).unwrap();
+        stream_db_opts(&c, &r, &Demand::LEAN.with_spans(), &mut sink).unwrap();
         let m = &sink.messages[0];
         assert!(matches!(
             &m.content[0],
@@ -2116,31 +2176,28 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(
-            (m.kind, m.model.as_deref()),
-            (MessageKind::InjectedContext, Some("p/m"))
-        );
+        assert_eq!((m.kind, m.model.as_deref()), (MessageKind::InjectedContext, Some("m")));
         assert_eq!(
             m.usage.as_ref().map(|u| (u.input_tokens, u.cost_usd)),
             Some((Some(9), Some(0.25)))
         );
         assert!(m.extra.is_empty());
-        let lazy = projected_session(&c, &r, &ParseOptions::lazy());
-        let full = projected_session(&c, &r, &ParseOptions::full());
+        let lazy = projected_session(&c, &r, &Demand::LEAN.with_spans());
+        let full = projected_session(&c, &r, &Demand::RICH);
         assert_eq!(
             serde_json::to_value(lazy).unwrap(),
             without_rich_message_fields(full.clone())
         );
         let tool = &full.messages[0].content[2];
         assert!(
-            matches!(tool, Block::ToolResult { content, details: Some(_), .. } if *content == format!("{giant}\n[audio: audio/wav]").as_str())
+            matches!(tool, Block::ToolResult { content, details: Some(_), .. } if content.matches_str(&format!("{giant}\n[audio: audio/wav]")) == Some(true))
         );
         assert_eq!(bag(&full.messages[0])["metadata"]["operations"][0], giant.as_str());
     }
 
     #[test]
     fn checked_projection_rejects_sidecar_creation_at_early_stop() {
-        let dir = tempdir();
+        let (_world, dir) = tempdir();
         let path = dir.join("sessions.db");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(SCHEMA).unwrap();
@@ -2170,16 +2227,15 @@ mod tests {
             message: None,
         };
         let r = SessionRef::new("guard", Harness::Goose, path);
-        assert!(stream_db_opts(&conn, &r, &ParseOptions::lazy(), &mut stop).is_err());
+        assert!(stream_db_opts(&conn, &r, &Demand::LEAN.with_spans(), &mut stop).is_err());
         let mut message = stop.message.unwrap();
         assert!(message.materialize(&crate::lazy::Resolver::new(None)).is_err());
         drop(conn);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn checked_projection_invalid_body_retains_compaction_history() {
-        let dir = tempdir();
+        let (_world, dir) = tempdir();
         let path = dir.join("sessions.db");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(SCHEMA).unwrap();
@@ -2191,32 +2247,25 @@ mod tests {
         conn.execute("INSERT INTO messages (session_id,role,content_json,created_timestamp,metadata_json) VALUES ('history','user','not JSON',1,'{\"agentVisible\":false}')", []).unwrap();
         conn.execute("INSERT INTO messages (session_id,role,content_json,created_timestamp,metadata_json) VALUES ('history','user','[{\"type\":\"text\",\"text\":\"summary\"}]',2,'{\"userVisible\":false,\"agentVisible\":true}')", []).unwrap();
         let r = SessionRef::new("history", Harness::Goose, path);
-        let full = projected_session(&conn, &r, &ParseOptions::full());
+        let full = projected_session(&conn, &r, &Demand::RICH);
         assert_eq!(full.messages.len(), 2);
         assert_eq!(full.messages[1].kind, MessageKind::CompactionSummary);
         assert_eq!(
-            serde_json::to_value(projected_session(&conn, &r, &ParseOptions::lazy())).unwrap(),
-            without_rich_message_fields(projected_session(&conn, &r, &ParseOptions::full()))
+            serde_json::to_value(projected_session(&conn, &r, &Demand::LEAN.with_spans())).unwrap(),
+            without_rich_message_fields(projected_session(&conn, &r, &Demand::RICH))
         );
         assert_eq!(
-            kinds(&projected_session(&conn, &r, &ParseOptions::facts())),
+            kinds(&projected_session(&conn, &r, &Demand::FACTS.with_spans())),
             kinds(&full)
         );
         drop(conn);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
-    fn tempdir() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("cv-goose-test-{}", std::process::id()));
-        p.push(format!(
-            "{:?}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    /// A fresh directory per call: a clock stamp collides between parallel tests (macOS clocks
+    /// tick in microseconds), and two tests then share one `sessions.db`.
+    fn tempdir() -> (cv_testkit::World, PathBuf) {
+        let world = cv_testkit::World::new("goose");
+        let dir = world.base.clone();
+        (world, dir)
     }
 }

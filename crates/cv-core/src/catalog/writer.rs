@@ -1,6 +1,6 @@
 //! One owned catalog connection for a sweep's serial publication stage.
 use crate::events::{EventSpool, Provenance};
-use crate::source::Snapshot;
+use crate::source::Baseline;
 use crate::{stream::Counted, SessionRef};
 use anyhow::Result;
 
@@ -14,6 +14,9 @@ pub struct Writer {
 impl Writer {
     /// Open the shared catalog and initialize existing event/catalog schemas once.
     pub fn open() -> Option<Self> {
+        if crate::env::frozen() {
+            return None;
+        }
         #[cfg(feature = "sqlite")]
         {
             crate::events::writer_connection().map(|conn| Self { conn })
@@ -30,7 +33,7 @@ impl Writer {
         r: &SessionRef,
         from: usize,
         events: EventSpool,
-        source: &Snapshot,
+        source: &Baseline,
         prov: &Provenance,
     ) -> Result<()> {
         #[cfg(feature = "sqlite")]
@@ -44,17 +47,14 @@ impl Writer {
     }
 
     /// Counts retain their independent before-read dependencies and best-effort cache semantics.
-    pub fn record_counted(&mut self, r: &SessionRef, source: &Snapshot, counted: Counted) {
+    pub fn record_counted(&mut self, r: &SessionRef, source: &Baseline, counted: Counted) {
         #[cfg(feature = "sqlite")]
         {
             let source = source.with_reads(&counted.dependencies);
-            if source.primary.0 == 0 || !crate::source::unchanged(r, &source) {
+            if !crate::source::unchanged(r, &source) {
                 return;
             }
-            if r.message_count == 0 && counted.turns > 0 {
-                super::imp::fill_count_in(&self.conn, r, counted.turns);
-            }
-            super::imp::note_affordances_in(&mut self.conn, r, &source, || counted.counts);
+            super::imp::note_counts_in(&mut self.conn, r, &source, Some(counted.turns), || counted.counts);
         }
         #[cfg(not(feature = "sqlite"))]
         {

@@ -136,7 +136,16 @@ def giant_discovery(args, root):
             row = json.loads(child.stdout)
             peak = checked_peak(row)
             assert row["detail"]["discovered_sessions"] == 1, "giant session was skipped"
-            assert row["detail"]["discovered_turns"] == 1, "giant conversational turn was not counted"
+            # Counting is free for Devin (a row count over the message forest), so discovery
+            # reports it. Goose and Hermes would have to decode every message body to count, so
+            # discovery reports "not counted" and the native-heap check below proves the giant
+            # cell was never decoded; a full read or `cv index` certifies the number later.
+            if harness == "devin":
+                assert row["detail"]["discovered_turns"] == 1, "giant conversational turn was not counted"
+                assert row["detail"]["uncounted_sessions"] == 0, "devin discovery must count"
+            else:
+                assert row["detail"]["discovered_turns"] == 0, f"{harness} discovery decoded the giant turn to count it"
+                assert row["detail"]["uncounted_sessions"] == 1, f"{harness} discovery must report the session as not counted"
             native = row["sqlite_native_heap"]
             assert native["accounting_enabled_and_verified"], "native SQLite accounting is inactive"
             assert 0 < native["peak_above_baseline_bytes"] <= 8 * 1024 * 1024, "discovery retained a native giant cell"

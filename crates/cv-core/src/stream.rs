@@ -8,203 +8,130 @@
 //! [`Adapter::stream`](crate::harness::Adapter::stream) instead hands each [`Message`] to a
 //! [`MessageSink`] and drops it before reading the next. Retention depends on the adapter and
 //! consumer: selected payloads may remain checked source ranges, while owned fallbacks still
-//! scale with their largest message. A collecting sink retains the entire history. The
-//! whole-`Session` `parse` is recovered for free as "stream into a [`CollectSink`]" (see
-//! [`collect`]). Adapters override **one** of the two: a native `stream` (memory-savings) *or* the
-//! existing `parse` (and inherit a `stream` that bridges through it). No mutual recursion, so
-//! migration is incremental.
+//! scale with their largest message. A collecting sink retains the entire history. Every adapter
+//! implements `stream` (a store that can only be read whole hands its parsed session to
+//! [`replay`]); the whole-`Session` `parse` is "stream into a [`CollectSink`]" ([`collect`]), a
+//! blanket [`crate::harness::Parse`] impl no adapter overrides.
+//!
+//! **Who owns the source guarantee.** A reader captures its source (identity, length, the
+//! dependencies it consults) before it reads a byte and binds its descriptor to that capture. It
+//! rechecks only where something can have changed under it, and one owner places each check: the
+//! guard of a JSONL read ([`Guard`], [`jsonl::drive`]) after a slow sink callback
+//! (`SLOW_CALLBACK`), after the session metadata and after a checkpoint; the line pass once per
+//! window of mapped input; `Read::check` at EOF (descriptor and path). A
+//! consumer that publishes (a writer's commit, a cache insert, an archive rename) rechecks once,
+//! immediately before publishing; a span demand checks its own source (`lazy::Resolver`). Emitters
+//! also preflight before creating output so an already-unreadable source leaves no files behind.
+//! Any other recheck duplicates one of these.
 
-use crate::harness::Adapter;
+use crate::harness::{store::jsonl, Adapter};
 use crate::ir::{Message, Session, SessionRef};
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-/// The metadata requested when [`ParseOptions::extra`] is enabled.
-///
-/// Facts are a shared projection for read-only reducers, not a separate output schema. Adapters
-/// without a projection implementation may return full extras; consumers must not depend on the
-/// absence of unrelated fields. Existing full, bulk and lazy constructors retain their behavior.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ExtraProjection {
-    /// Existing harness metadata and structured tool-result details, without field filtering.
+/// How much of a session a read asks for. The tiers are ordered: each one is everything the one
+/// below it is plus more, so `tier >= Tier::Facts` reads "at least the reducer facts".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Tier {
+    /// The listing facts discovery reads (id, cwd, title, timestamps, writer version); a codec
+    /// that has a discovery path builds no message bodies, others read as [`Tier::Lean`].
+    Discovery,
+    /// Faithful message text and first-class IR fields, no harness metadata. The default.
     #[default]
-    Full,
-    /// Only the common reducer facts, selected before decoding unrelated large metadata.
-    ///
-    /// The fixed union is:
-    /// - message attachment type and `compactMetadata` / `compact_metadata` fields `trigger`,
-    ///   `preTokens`, `durationMs` (doctor, compaction and text labels);
-    /// - Claude `message.id`, with the same precedence as full extras (usage deduplication);
-    /// - Kimi Code `origin_kind`, Hermes `display_kind`, Codex `item_type`, OpenCode
-    ///   `metadata.source` (affordance classification);
-    /// - OpenCode `patches[].hash/files`, `snapshot.start/files` and Claude/Devin tool-result
-    ///   `details.restorable` (checkpoint affordances);
-    /// - session `permission_modes`, Devin `agent_mode`, OpenCode permission rules
-    ///   (`permission`, `pattern`, `action`) and `revert.messageID/snapshot`, and common
-    ///   `checkpoints.count/tag/files`.
-    ///
-    /// Facts preserve their existing harness bags / tool-detail locations and value semantics.
-    /// Kind, origin, usage, model, IDs and other first-class IR fields remain independent of this
-    /// projection. Session facts written at EOF must still be returned, even after a selected
-    /// message window. Format-complete demand always overrides this projection with Full.
-    ///
-    /// This mode is intended for internal reducers. It must not replace full metadata on JSON
-    /// output, conversion, redaction or watch paths, or silently add extras to existing lean
-    /// output. Source validation and dependency/provenance checks remain mandatory.
+    Lean,
+    /// [`Tier::Lean`] plus the provider response identity usage deduplication needs (Claude's
+    /// `message.id`), without other metadata.
+    Usage,
+    /// [`Tier::Usage`] plus the shared reducer facts (doctor, compaction, affordances), selected
+    /// before unrelated large metadata is decoded and kept in their usual bag / tool-detail
+    /// places. An adapter with a facts path names its facts (Claude, Kimi Code, Hermes); every
+    /// other adapter returns [`Tier::Rich`] metadata, so a consumer never depends on a field's
+    /// absence. Session facts written at EOF still arrive after a selected window. Internal
+    /// reducers only: never JSON output, conversion, redaction or watch.
     Facts,
+    /// Every harness-specific field and structured sidecar (`toolUseResult` and kin).
+    Rich,
+    /// Format-complete: [`Tier::Rich`] plus every record carried, meta records included, as
+    /// round-trippable carrier messages, so `parse → emit` loses nothing.
+    Complete,
 }
 
-/// Knobs controlling how much of each message an adapter materializes. Everything off (the
-/// [`Default`]) is the cheapest faithful pass; full-fidelity callers opt back in.
+/// A read's demand: the [`Tier`] of content it needs, and two orthogonal delivery choices.
 ///
-/// # Which constructor? (the decision rule)
-///
-/// - [`full()`](ParseOptions::full) — you will **re-emit or round-trip** the session (convert,
-///   port, `--json`, splice/loom, redact-to-file). Everything materialized, inline. Most
-///   expensive; rich read-only consumers can use lazy metadata or reducer facts.
-/// - [`bulk()`](ParseOptions::bulk) — you read **all** the text once, forward-only, and never
-///   touch `extra` (live search over small/whole-doc harnesses, dataset-style flattening of
-///   sessions you'll fully consume). Inline content, no sidecars.
-/// - [`lazy()`](ParseOptions::lazy) — you skip, partially read, or consume fields in bounded
-///   chunks: windowed/`--range` reads, metadata/event extraction, snippet scans, head-only
-///   embedding, chunk-wise indexing. Supported large fields arrive as [`Span`](crate::lazy::Span)s
-///   you resolve (possibly capped via [`Resolver::resolve_prefix`](crate::lazy::Resolver::
-///   resolve_prefix) or chunked via `for_each_chunk`). Checked sources retain descriptors and
-///   may use private backing; payload ownership is deferred until a consumer requests it.
-///   Adapters without a span path just hand you inline content, so `lazy()` is
-///   never *less* correct than `bulk()`, only cheaper when spans exist.
-///
-/// - [`facts()`](ParseOptions::facts) — doctor, compaction and affordance reducers need their
-///   shared metadata facts, but not unrelated raw sidecars. Unsupported adapters may still return
-///   full metadata. Use [`lazy_extra()`](ParseOptions::lazy_extra) when all extras are part of the
-///   requested output.
-///
-/// Rule of thumb: owned round-trip ⇒ `full`, bounded content ⇒ `lazy`, reducers ⇒ `facts`.
-#[derive(Debug, Clone, Default)]
-pub struct ParseOptions {
-    /// Populate the harness-specific `extra` maps — most importantly Claude's `toolUseResult`
-    /// sidecar (structured patches, file contents, command stdout), which is `clone`d per tool
-    /// turn and can dwarf the visible transcript. Bulk text consumers (index/search/dataset) never
-    /// read it; only full-fidelity paths (json export, cross-harness convert/port, round-trips) do.
-    pub extra: bool,
-    /// Select the metadata projection when `extra` is enabled. Ignored when `extra` is false;
-    /// `complete` always demands full metadata. Unsupported adapters may retain full extras.
-    pub extra_projection: ExtraProjection,
-    /// Request provider response identity needed to deduplicate usage, without unrelated rich
-    /// extras. Claude retains its string `message.id`; other harnesses may ignore this demand.
-    /// Full `extra` remains authoritative when both are requested.
-    pub usage_identity: bool,
-    /// Emit large content as lazy [`Span`](crate::lazy::Span)s into the source instead of owned
-    /// strings. Partial readers and chunk-wise reducers can avoid retaining complete decoded
-    /// fields. Resolving every span into an owned string loses that benefit. Adapters without
-    /// span support ignore this flag; adapters may still allocate during record interpretation.
+/// Pick the smallest tier the consumer reads: re-emit or round-trip ⇒ [`Demand::COMPLETE`];
+/// `--json` and rich views ⇒ [`Demand::RICH`]; reducers ⇒ [`Demand::FACTS`]; usage totals ⇒
+/// [`Demand::USAGE`]; text ⇒ [`Demand::LEAN`]. Add [`with_spans`](Demand::with_spans) when the
+/// consumer skips, windows or chunks large fields (they arrive as checked source ranges;
+/// adapters without a span path hand inline content, so spans are never less correct).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Demand {
+    pub tier: Tier,
+    /// Large content stays in the source as [`Span`](crate::lazy::Span)s / checked source
+    /// ranges instead of owned strings. Adapters without span support ignore it.
     pub spans: bool,
-    /// Stamp each message's source **byte offset** into
-    /// `Message.extra[`[`offsets::OFFSET_KEY`](crate::offsets::OFFSET_KEY)`]` (the offset of the
-    /// record line that produced it). Only `cv rewind`'s message-to-byte pass turns this on —
-    /// ordinary lazy/bulk/full consumers never see the stamp, so their output is unchanged.
-    /// Adapters that don't track byte positions (everything but claude/codex JSONL) ignore it.
-    /// Implies nothing by itself: the adapters only stamp on their span-tracking paths, so use
-    /// [`lazy_offsets()`](ParseOptions::lazy_offsets) (spans + offsets) rather than setting it solo.
+    /// Stamp each message's record byte offset into
+    /// `Message.extra[`[`offsets::OFFSET_KEY`](crate::offsets::OFFSET_KEY)`]` (`cv rewind`'s
+    /// message-to-byte pass). Only span-tracking JSONL paths (Claude, Codex) stamp.
     pub offsets: bool,
-    /// **Format-complete**: lose nothing on parse. Carry every record — including the
-    /// non-conversational meta records the lean passes skip (mode/permission-mode/attachment/
-    /// queue-operation/last-prompt/hook telemetry/…) — as round-trippable carrier messages, so a
-    /// `parse → emit` round-trip reproduces the original byte-for-byte (modulo key order). Off by
-    /// default so the conversational passes (render/dataset/index) stay exactly as they were; turned
-    /// on by conversion/round-trip/[`prune`](crate::prune)-via-IR paths that must not drop a field.
-    /// Implies [`extra`](ParseOptions::extra). Adapters that can't yet carry every record ignore it.
-    pub complete: bool,
 }
 
-impl ParseOptions {
-    /// Full fidelity: every harness-specific field materialized, inline content. Used by [`collect`]
-    /// / `parse` and by conversion/round-trip paths that must lose nothing.
-    pub fn full() -> Self {
-        ParseOptions {
-            extra: true,
-            ..Default::default()
+impl Demand {
+    pub const DISCOVERY: Demand = Demand::of(Tier::Discovery);
+    pub const LEAN: Demand = Demand::of(Tier::Lean);
+    pub const USAGE: Demand = Demand::of(Tier::Usage);
+    pub const FACTS: Demand = Demand::of(Tier::Facts);
+    pub const RICH: Demand = Demand::of(Tier::Rich);
+    pub const COMPLETE: Demand = Demand::of(Tier::Complete);
+
+    /// The tier, inline, without offsets.
+    pub const fn of(tier: Tier) -> Self {
+        Demand {
+            tier,
+            spans: false,
+            offsets: false,
         }
     }
 
-    /// The lean bulk-text pass: faithful message text, no fat `extra` sidecars, inline content
-    /// (these consumers read everything, so spans wouldn't help). Used by index/search/dataset.
-    pub fn bulk() -> Self {
-        ParseOptions::default()
+    /// The same demand with large content left in the source.
+    pub const fn with_spans(self) -> Self {
+        Demand { spans: true, ..self }
     }
 
-    /// Format-complete, lossless: full `extra` **and** every record carried (incl. meta records the
-    /// other passes skip), inline content. For `parse → emit` round-trips that must reproduce the
-    /// source losslessly. The strongest fidelity setting.
-    pub fn complete() -> Self {
-        ParseOptions {
-            extra: true,
-            complete: true,
-            ..Default::default()
+    /// The same demand, inline.
+    pub const fn inline(self) -> Self {
+        Demand { spans: false, ..self }
+    }
+
+    /// The same demand with record offsets stamped.
+    pub const fn with_offsets(self) -> Self {
+        Demand { offsets: true, ..self }
+    }
+
+    /// The tier one message is built at, given its sink's [`MessageSink::tier`]: a sink may
+    /// narrow a [`Tier::Rich`] read to [`Tier::Facts`], never below and never a complete read.
+    pub fn for_sink(&self, sink: &dyn MessageSink) -> Tier {
+        if self.tier == Tier::Rich {
+            sink.tier().clamp(Tier::Facts, Tier::Rich)
+        } else {
+            self.tier
         }
     }
+}
 
-    /// Partial-access pass: lazy content [`Span`](crate::lazy::Span)s so unread giant fields are
-    /// never materialized. For windowed reads / pagination (Phase 2).
-    pub fn lazy() -> Self {
-        ParseOptions {
-            spans: true,
-            ..Default::default()
-        }
-    }
+/// The one early-stop signal. A chunk, character or record callback that has what it needs
+/// returns `Err(Stop.into())`; the code that started that traversal reads it back with
+/// [`stopped`]. Source and decoder failures are never `Stop`, so they stay errors, and an
+/// enclosing checked read still revalidates its source after the stop.
+#[derive(Debug, thiserror::Error)]
+#[error("traversal stopped early")]
+pub struct Stop;
 
-    /// [`lazy()`](ParseOptions::lazy) **plus** the harness-specific `extra` sidecars and metadata
-    /// (`subtype`, `compactMetadata`, `isCompactSummary`, attribution, …).
-    /// Sidecars and other rich metadata can themselves be large: only supported content fields
-    /// become spans. For rich lazy output; bounded reducers should request [`facts()`](Self::facts).
-    pub fn lazy_extra() -> Self {
-        ParseOptions {
-            spans: true,
-            extra: true,
-            ..Default::default()
-        }
-    }
-
-    /// Internal reducer pass: lazy content and the shared metadata facts projection.
-    /// Adapters that do not implement projection keep their established full-extra behavior.
-    pub fn facts() -> Self {
-        ParseOptions {
-            extra: true,
-            extra_projection: ExtraProjection::Facts,
-            usage_identity: true,
-            ..Self::lazy()
-        }
-    }
-
-    /// Whether an adapter should project the shared facts instead of full rich metadata.
-    pub fn facts_only(&self) -> bool {
-        self.extra && !self.complete && self.extra_projection == ExtraProjection::Facts
-    }
-
-    /// Whether full metadata is demanded, including the overriding format-complete mode.
-    /// Projection-aware producers use this for large sidecars; producers without a facts path
-    /// continue to honor `extra` and may return full metadata for Facts requests.
-    pub fn wants_full_extra(&self) -> bool {
-        self.complete || (self.extra && self.extra_projection == ExtraProjection::Full)
-    }
-
-    /// Usage aggregation: lazy content and response identity, without large rich sidecars.
-    pub fn usage() -> Self {
-        ParseOptions {
-            usage_identity: true,
-            ..Self::lazy()
-        }
-    }
-
-    /// [`lazy()`](ParseOptions::lazy) plus per-message byte-offset stamping — the pass `cv rewind`
-    /// makes to map a message to its record ([`offsets`](crate::offsets)). Everything else should
-    /// use plain `lazy()`.
-    pub fn lazy_offsets() -> Self {
-        ParseOptions {
-            spans: true,
-            offsets: true,
-            ..Default::default()
-        }
+/// A traversal's result with [`Stop`] read back: `Some` ran to the end, `None` was stopped.
+pub fn stopped<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.is::<Stop>() => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -227,12 +154,12 @@ pub enum Flow {
 /// full `parse`) always does. Sinks that must render a header ahead of the body (e.g. `cv show`)
 /// use it; most sinks ignore it and just read the returned `Session` afterward.
 pub trait MessageSink {
-    /// Rich fields needed for the next delivered message. This advisory construction demand
-    /// never weakens the parse options' record acceptance, source checks or EOF session metadata.
-    /// Unsupported adapters may keep full fields. Wrappers combine/forward their consumers'
-    /// demand; Facts retains the common reducer union needed by counting and affordances.
-    fn extra_projection(&self) -> ExtraProjection {
-        ExtraProjection::Full
+    /// The richest tier the next delivered message needs. Advisory: under a [`Tier::Rich`] read
+    /// an adapter with a facts path may build that message at [`Tier::Facts`]
+    /// ([`Demand::for_sink`]); record acceptance, source checks and EOF session facts never
+    /// weaken. Wrappers forward or combine their consumers' tiers.
+    fn tier(&self) -> Tier {
+        Tier::Rich
     }
 
     fn message(&mut self, m: Message) -> Flow;
@@ -260,11 +187,29 @@ pub trait MessageSink {
     /// membership). Adapters report before reading; wrappers must forward the notification.
     fn dependency(&mut self, _path: &std::path::Path) {}
 
+    /// [`dependency`](MessageSink::dependency) on an append-only file of which the adapter
+    /// consults the head, never what is appended: its growth leaves the reader's output as it
+    /// was ([`crate::source::ReadSet::record_append_only`]). Wrappers forward it; a recorder
+    /// that does not know it records the path exactly. Default:
+    /// [`dependency`](MessageSink::dependency).
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        self.dependency(path);
+    }
+
     /// The adapter is between records, holding nothing back, `offset` bytes into the file: may it
     /// take a [`Checkpoint`] here? Only a sink that can put everything it holds into one says
     /// yes, so a pass through any other sink never takes one. Default: no.
     fn wants_checkpoint(&mut self, _offset: u64) -> bool {
         false
+    }
+
+    /// [`wants_checkpoint`](MessageSink::wants_checkpoint) at the last settled position of a read
+    /// (its EOF): a sink that spaces its checkpoints takes this one regardless of the spacing, so
+    /// every read leaves its mark where it stopped and the next pass over the grown file reads
+    /// only the appended bytes. Wrappers forward it with their own conditions. Default:
+    /// [`wants_checkpoint`](MessageSink::wants_checkpoint).
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        self.wants_checkpoint(offset)
     }
 
     /// Add this sink's state to `cp` (the adapter's is already in) and pass it on to any sink
@@ -276,17 +221,42 @@ pub trait MessageSink {
 /// Run an adapter boundary with a consumer error guard. Legacy adapter loops can keep using
 /// `message() -> Flow`; failures stop delivery immediately and surface after the adapter returns,
 /// including errors raised by metadata, dependencies, checkpoints or an EOF-only sink check.
-/// An intentional stop remains successful. Any staged output from a failed pass must be discarded.
+/// An intentional stop succeeds only without source or consumer errors; it never suppresses
+/// invalidation detected during completion. Discard staged output from every failed pass.
 pub fn checked<T>(sink: &mut dyn MessageSink, read: impl FnOnce(&mut dyn MessageSink) -> Result<T>) -> Result<T> {
-    let mut guard = ErrorGuard {
+    guard(sink, None, |guard| read(guard))
+}
+
+/// [`checked`] over a read of the captured transcript `backing`, whose descriptor the guard
+/// rechecks after a slow callback ([`jsonl::Read::SLOW_CALLBACK`]), after the session metadata
+/// and after a checkpoint, before the reader touches mapped bytes again ([`Guard`]).
+pub(crate) fn guarded<T>(
+    sink: &mut dyn MessageSink,
+    backing: &jsonl::Read,
+    read: impl FnOnce(&mut Guard<'_>) -> Result<T>,
+) -> Result<T> {
+    guard(sink, Some(backing), read)
+}
+
+fn guard<'a, T>(
+    sink: &'a mut dyn MessageSink,
+    backing: Option<&'a jsonl::Read>,
+    read: impl FnOnce(&mut Guard<'a>) -> Result<T>,
+) -> Result<T> {
+    let mut guard = Guard {
         inner: sink,
-        error: None,
-        failed: false,
+        latch: Latch::default(),
+        backing,
     };
     if let Some(error) = guard.take_error() {
         return Err(error);
     }
     let result = read(&mut guard);
+    // Held output and a fast failing callback may follow the last line-pass check. Completion
+    // belongs here, including errors: a changed backing outranks the consumer error it caused.
+    if let Some(backing) = backing {
+        backing.check()?;
+    }
     let error = guard.take_error();
     // An inner checked boundary may already have returned the original diagnostic while its
     // failed outer sink now reports only a persistent failure marker. Preserve that Result.
@@ -299,69 +269,157 @@ pub fn checked<T>(sink: &mut dyn MessageSink, read: impl FnOnce(&mut dyn Message
     }
 }
 
-struct ErrorGuard<'a> {
-    inner: &'a mut dyn MessageSink,
+/// A sink's first error, held until taken, and the failure it leaves: once failed, a sink stops
+/// delivery and, after the error is taken, reports that it "has already failed".
+#[derive(Default)]
+pub struct Latch {
     error: Option<anyhow::Error>,
     failed: bool,
 }
-impl ErrorGuard<'_> {
-    fn capture(&mut self) {
-        if let Some(error) = self.inner.take_error() {
-            self.failed = true;
-            self.error.get_or_insert(error);
+impl Latch {
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+    /// Record a failure; the first error is the one reported.
+    pub fn fail(&mut self, error: anyhow::Error) {
+        self.failed = true;
+        self.error.get_or_insert(error);
+    }
+    /// Latch an error `inner` reports, if any.
+    pub fn capture(&mut self, inner: &mut dyn MessageSink) {
+        if let Some(error) = inner.take_error() {
+            self.fail(error);
         }
+    }
+    /// The held error once, then the persistent "`what` has already failed" marker.
+    pub fn take(&mut self, what: &str) -> Option<anyhow::Error> {
+        self.error
+            .take()
+            .or_else(|| self.failed.then(|| anyhow::anyhow!("{what} has already failed")))
+    }
+    /// [`take`](Self::take), asking `inner` for its error only when this latch holds none.
+    pub fn take_or(&mut self, inner: &mut dyn MessageSink, what: &str) -> Option<anyhow::Error> {
+        if self.error.is_none() {
+            self.capture(inner);
+        }
+        self.take(what)
     }
 }
-impl MessageSink for ErrorGuard<'_> {
-    fn extra_projection(&self) -> ExtraProjection {
-        self.inner.extra_projection()
+
+/// The consumer guard of a checked read: a consumer's first failure stops delivery and is
+/// returned after the reader. Over a captured transcript ([`guarded`]) it also owns the backing
+/// checks: after a callback slower than [`jsonl::Read::SLOW_CALLBACK`] (a consumer that writes
+/// or blocks), and always after the session metadata and a checkpoint (the next resume depends
+/// on the file being intact). A failed check is the read's error, latched like a consumer's, so
+/// the reader stops before its mapping is touched again.
+pub(crate) struct Guard<'a> {
+    inner: &'a mut dyn MessageSink,
+    latch: Latch,
+    backing: Option<&'a jsonl::Read>,
+}
+impl Guard<'_> {
+    /// A callback or a backing check has failed: the reader must stop.
+    pub(crate) fn failed(&self) -> bool {
+        self.latch.failed()
     }
-    fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.capture();
-        self.error.take().or_else(|| {
-            self.failed
-                .then(|| anyhow::anyhow!("stream consumer has already failed"))
-        })
+    /// The timer for a callback, when the guard has a backing to check after it.
+    fn start(&self) -> Option<std::time::Instant> {
+        self.backing.map(|_| std::time::Instant::now())
     }
-    fn message(&mut self, m: Message) -> Flow {
-        if self.failed {
-            return Flow::Stop;
-        }
-        match self.inner.try_message(m) {
-            Ok(flow) => flow,
-            Err(error) => {
-                self.failed = true;
-                self.error = Some(error);
-                Flow::Stop
+    /// After a callback that began at `started`: recheck the backing if it was slow (or, with
+    /// `None`, always), and latch what the consumer reported.
+    fn after(&mut self, started: Option<std::time::Instant>, forced: bool) {
+        self.latch.capture(self.inner);
+        let Some(backing) = self.backing else {
+            return;
+        };
+        if forced || started.is_some_and(|started| started.elapsed() >= jsonl::Read::SLOW_CALLBACK) {
+            if let Err(error) = backing.check_backing() {
+                self.latch.fail(error);
             }
         }
     }
+}
+impl MessageSink for Guard<'_> {
+    fn tier(&self) -> Tier {
+        self.inner.tier()
+    }
+    fn take_error(&mut self) -> Option<anyhow::Error> {
+        self.latch.capture(self.inner);
+        self.latch.take("stream consumer")
+    }
+    fn message(&mut self, m: Message) -> Flow {
+        if self.latch.failed() {
+            return Flow::Stop;
+        }
+        let started = self.start();
+        let flow = self.inner.try_message(m).unwrap_or_else(|error| {
+            self.latch.fail(error);
+            Flow::Stop
+        });
+        self.after(started, false);
+        if self.latch.failed() {
+            Flow::Stop
+        } else {
+            flow
+        }
+    }
     fn meta(&mut self, s: &Session) {
-        if !self.failed {
+        if !self.latch.failed() {
             self.inner.meta(s);
-            self.capture();
+            self.after(None, true);
         }
     }
     fn dependency(&mut self, path: &std::path::Path) {
-        if !self.failed {
+        if !self.latch.failed() {
+            let started = self.start();
             self.inner.dependency(path);
-            self.capture();
+            self.after(started, false);
+        }
+    }
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if !self.latch.failed() {
+            let started = self.start();
+            self.inner.append_only_dependency(path);
+            self.after(started, false);
         }
     }
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
-        if self.failed {
+        if self.latch.failed() {
             return false;
         }
+        let started = self.start();
         let wants = self.inner.wants_checkpoint(offset);
-        self.capture();
-        wants && !self.failed
+        self.after(started, false);
+        wants && !self.latch.failed()
+    }
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        if self.latch.failed() {
+            return false;
+        }
+        let started = self.start();
+        let wants = self.inner.wants_final_checkpoint(offset);
+        self.after(started, false);
+        wants && !self.latch.failed()
     }
     fn checkpoint(&mut self, cp: &mut Checkpoint) {
-        if !self.failed {
+        if !self.latch.failed() {
             self.inner.checkpoint(cp);
-            self.capture();
+            self.after(None, true);
         }
     }
+}
+
+/// Where an [`Adapter::transcript`] read starts and ends.
+#[derive(Debug, Clone, Copy)]
+pub enum Start<'c> {
+    /// The whole session.
+    Whole,
+    /// From a checkpoint an earlier read of the same file took (then shorter), to EOF.
+    Checkpoint(&'c Checkpoint),
+    /// The first `len` bytes of an append-only transcript, read as that past state's EOF: the
+    /// session as it was when the file was `len` bytes long ([`Adapter::append_only`]).
+    Prefix(u64),
 }
 
 /// A point a pass over an append-only transcript can resume from: `offset` is the byte after the
@@ -385,8 +443,12 @@ impl Checkpoint {
     /// Store `layer`'s state (serialization of these plain structs cannot fail; if it did, the
     /// layer would be missing and a resume would decline).
     pub fn put(&mut self, layer: &str, state: &impl Serialize) {
-        if let Ok(v) = serde_json::to_value(state) {
-            self.state.insert(layer.to_string(), v);
+        match serde_json::to_value(state) {
+            Ok(v) => {
+                self.state.insert(layer.to_string(), v);
+            }
+            // A release build keeps the documented decline; a debug build refuses to ship it.
+            Err(error) => debug_assert!(false, "checkpoint layer {layer:?} did not serialize: {error}"),
         }
     }
 
@@ -426,44 +488,35 @@ impl<F: FnMut(Message) -> Flow> MessageSink for F {
 /// this wrapper latches a `Result` error, stops future delivery and exposes it to checked passes.
 pub struct TryFnSink<F> {
     callback: F,
-    error: Option<anyhow::Error>,
-    failed: bool,
+    latch: Latch,
 }
 impl<F: FnMut(Message) -> Result<Flow>> TryFnSink<F> {
     pub fn new(callback: F) -> Self {
         Self {
             callback,
-            error: None,
-            failed: false,
+            latch: Latch::default(),
         }
     }
 }
 impl<F: FnMut(Message) -> Result<Flow>> MessageSink for TryFnSink<F> {
     fn message(&mut self, message: Message) -> Flow {
-        if self.failed {
+        if self.latch.failed() {
             return Flow::Stop;
         }
-        match (self.callback)(message) {
-            Ok(flow) => flow,
-            Err(error) => {
-                self.failed = true;
-                self.error = Some(error);
-                Flow::Stop
-            }
-        }
+        (self.callback)(message).unwrap_or_else(|error| {
+            self.latch.fail(error);
+            Flow::Stop
+        })
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.error.take().or_else(|| {
-            self.failed
-                .then(|| anyhow::anyhow!("message callback has already failed"))
-        })
+        self.latch.take("message callback")
     }
 }
 
 /// Fans one adapter pass into two sinks, so a single read of a transcript feeds multiple consumers
 /// — e.g. `cv index` driving the FTS [`ChunkSink`] and the event-catalog
 /// [`EventSink`](crate::events::EventSink) off the same `stream()`. Each message is cloned once
-/// while both sinks are live; under [`ParseOptions::lazy`] large content is a
+/// while both sinks are live; under [`Demand::with_spans`] large content is a
 /// [`Span`](crate::lazy::Span) handle, so the clone stays O(small).
 ///
 /// Flow semantics: the stream continues until **both** sinks have said [`Flow::Stop`], and a sink
@@ -474,8 +527,7 @@ pub struct TeeSink<'a> {
     b: &'a mut dyn MessageSink,
     a_stopped: bool,
     b_stopped: bool,
-    error: Option<anyhow::Error>,
-    failed: bool,
+    latch: Latch,
 }
 
 impl<'a> TeeSink<'a> {
@@ -485,18 +537,15 @@ impl<'a> TeeSink<'a> {
             b,
             a_stopped: false,
             b_stopped: false,
-            error: None,
-            failed: false,
+            latch: Latch::default(),
         }
     }
 }
 
 impl TeeSink<'_> {
     fn capture(&mut self) {
-        let error = self.a.take_error().or_else(|| self.b.take_error());
-        if let Some(error) = error {
-            self.failed = true;
-            self.error.get_or_insert(error);
+        if let Some(error) = self.a.take_error().or_else(|| self.b.take_error()) {
+            self.latch.fail(error);
         }
     }
     fn deliver(sink: &mut dyn MessageSink, m: Message, stopped: &mut bool) -> Result<()> {
@@ -505,65 +554,76 @@ impl TeeSink<'_> {
     }
 }
 impl MessageSink for TeeSink<'_> {
-    fn extra_projection(&self) -> ExtraProjection {
-        if (!self.a_stopped && self.a.extra_projection() == ExtraProjection::Full)
-            || (!self.b_stopped && self.b.extra_projection() == ExtraProjection::Full)
-        {
-            ExtraProjection::Full
-        } else {
-            ExtraProjection::Facts
-        }
+    fn tier(&self) -> Tier {
+        let live = |stopped: bool, tier: Tier| if stopped { Tier::Facts } else { tier };
+        live(self.a_stopped, self.a.tier()).max(live(self.b_stopped, self.b.tier()))
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.capture();
-        self.error.take().or_else(|| {
-            self.failed
-                .then(|| anyhow::anyhow!("stream consumer has already failed"))
-        })
+        self.latch.take("stream consumer")
     }
     fn dependency(&mut self, path: &std::path::Path) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         self.a.dependency(path);
         self.capture();
-        if !self.failed {
+        if !self.latch.failed() {
             self.b.dependency(path);
             self.capture();
         }
     }
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if self.latch.failed() {
+            return;
+        }
+        self.a.append_only_dependency(path);
+        self.capture();
+        if !self.latch.failed() {
+            self.b.append_only_dependency(path);
+            self.capture();
+        }
+    }
     fn meta(&mut self, s: &Session) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         self.a.meta(s);
         self.capture();
-        if !self.failed {
+        if !self.latch.failed() {
             self.b.meta(s);
             self.capture();
         }
     }
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
-        if self.failed {
+        if self.latch.failed() {
             return false;
         }
         let wants = self.a.wants_checkpoint(offset) && self.b.wants_checkpoint(offset);
         self.capture();
-        wants && !self.failed
+        wants && !self.latch.failed()
+    }
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        if self.latch.failed() {
+            return false;
+        }
+        let wants = self.a.wants_final_checkpoint(offset) && self.b.wants_final_checkpoint(offset);
+        self.capture();
+        wants && !self.latch.failed()
     }
     fn checkpoint(&mut self, cp: &mut Checkpoint) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         self.a.checkpoint(cp);
         self.capture();
-        if !self.failed {
+        if !self.latch.failed() {
             self.b.checkpoint(cp);
             self.capture();
         }
     }
     fn message(&mut self, m: Message) -> Flow {
-        if self.failed {
+        if self.latch.failed() {
             return Flow::Stop;
         }
         let result = match (self.a_stopped, self.b_stopped) {
@@ -577,10 +637,9 @@ impl MessageSink for TeeSink<'_> {
             (true, true) => Ok(()),
         };
         if let Err(error) = result {
-            self.failed = true;
-            self.error = Some(error);
+            self.latch.fail(error);
         }
-        if self.failed || (self.a_stopped && self.b_stopped) {
+        if self.latch.failed() || (self.a_stopped && self.b_stopped) {
             Flow::Stop
         } else {
             Flow::Continue
@@ -622,18 +681,18 @@ pub fn replay(mut session: Session, sink: &mut dyn MessageSink) -> Result<Sessio
 /// at full fidelity. This is the default body of [`Adapter::parse`](crate::harness::Adapter::parse)
 /// for adapters that implement a native `stream`.
 pub fn collect(adapter: &dyn Adapter, r: &SessionRef) -> Result<Session> {
-    let mut session = collect_with(adapter, r, &ParseOptions::full())?;
+    let mut session = collect_with(adapter, r, &Demand::RICH)?;
     // Full-fidelity parse: resolve any lazy content spans so the returned `Session` owns all its
     // content inline (safe for `--json` serialization, cross-harness emit, `Deref` reads, etc.).
     session.materialize()?;
     Ok(session)
 }
 
-/// Like [`collect`] but with explicit [`ParseOptions`] and **without** materializing — the returned
+/// Like [`collect`] but with explicit [`Demand`] and **without** materializing — the returned
 /// session may carry lazy content [`Span`]s. Consumers that hold the whole session but read it once
 /// (e.g. dataset export) use this and resolve per block, so a giant field is never owned wholesale.
 /// Use [`collect`] (or call `.materialize()`) when you need owned inline content.
-pub fn collect_with(adapter: &dyn Adapter, r: &SessionRef, opts: &ParseOptions) -> Result<Session> {
+pub fn collect_with(adapter: &dyn Adapter, r: &SessionRef, opts: &Demand) -> Result<Session> {
     let mut sink = CollectSink::default();
     let mut session = stream_counted(adapter, r, opts, &mut sink, Pass::RECORD)?.session;
     session.messages = sink.messages;
@@ -657,7 +716,7 @@ pub struct Pass<'a> {
     /// larger suffix to reread on the next append.
     pub amortized: bool,
     /// Publish what a whole read counted to the catalog, against a source snapshot taken before
-    /// the read: a "not counted" (`0`) row gets the parse's turn count, so `cv ls` shows the real
+    /// the read (never from a [`Demand::COMPLETE`] read): a "not counted" (`0`) row gets the parse's turn count, so `cv ls` shows the real
     /// number from the first full read on, and the affordance counts that let `has:<kind>` answer
     /// from the catalog are recorded unless still fresh. A sweep that parses on many threads
     /// leaves this off and publishes [`Counted`] itself, on one.
@@ -705,7 +764,7 @@ pub struct Streamed {
 /// Source receipt for an operation that stages output before publication.
 /// Validate after resolving all demanded payloads, before exposing the completed stage.
 pub struct StagedReadGuard {
-    source: crate::source::Snapshot,
+    source: crate::source::Baseline,
     reads: crate::source::ReadSet,
     primary: std::path::PathBuf,
 }
@@ -727,61 +786,35 @@ impl StagedReadGuard {
 pub fn stream_counted(
     adapter: &dyn Adapter,
     r: &SessionRef,
-    opts: &ParseOptions,
+    opts: &Demand,
     sink: &mut dyn MessageSink,
     pass: Pass<'_>,
 ) -> Result<Streamed> {
-    struct Guarded<'a> {
-        sink: &'a mut dyn MessageSink,
-        guard: StagedReadGuard,
-    }
-    impl MessageSink for Guarded<'_> {
-        fn extra_projection(&self) -> ExtraProjection {
-            self.sink.extra_projection()
-        }
-        fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.sink.take_error()
-        }
-        fn meta(&mut self, session: &Session) {
-            self.sink.meta(session);
-        }
-        fn dependency(&mut self, path: &std::path::Path) {
-            self.guard.reads.record(path);
-            self.sink.dependency(path);
-        }
-        fn wants_checkpoint(&mut self, offset: u64) -> bool {
-            self.sink.wants_checkpoint(offset)
-        }
-        fn checkpoint(&mut self, cp: &mut Checkpoint) {
-            self.sink.checkpoint(cp);
-        }
-        fn message(&mut self, message: Message) -> Flow {
-            crate::source::record_message_reads(&message, &self.guard.primary, &mut self.guard.reads);
-            self.sink.message(message)
-        }
-    }
     // Captured before the adapter opens anything; a guarded pass's covers the resume source.
-    let mut guarded = None;
-    let (sink, source): (&mut dyn MessageSink, _) = if pass.guard {
+    let guard = pass.guard.then(|| {
         let primary = adapter.resume_source(r);
-        let source = crate::source::Probe::default().snapshot_from(r, &primary);
-        let guard = StagedReadGuard {
-            source: source.clone(),
+        StagedReadGuard {
+            source: crate::source::Probe::default().snapshot_from(r, &primary),
             reads: Default::default(),
             primary,
-        };
-        (guarded.insert(Guarded { sink, guard }), Some(source))
-    } else {
-        (sink, pass.record.then(|| crate::source::Probe::default().snapshot(r)))
+        }
+    });
+    let source = match &guard {
+        Some(guard) => Some(guard.source.clone()),
+        None => pass.record.then(|| crate::source::Probe::default().snapshot(r)),
     };
     let mut counting = Counting::new(r, sink, pass.every);
     counting.amortized = pass.amortized;
+    counting.guard = guard;
     let session = match pass.from {
         Some(cp) => {
             let state = cp.get::<CounterState>(COUNTER_LAYER).ok_or(Declined)?;
-            counting.restore(state, cp.offset);
-            counting.space_after(cp);
-            adapter.try_resume(r, opts, &mut counting, cp)?.ok_or(Declined)?
+            if !counting.restore(state, cp.offset) {
+                counting.space_after(cp);
+            }
+            adapter
+                .transcript(r, opts, Start::Checkpoint(cp), &mut counting)?
+                .ok_or(Declined)?
         }
         None => adapter.try_stream(r, opts, &mut counting)?,
     };
@@ -792,19 +825,25 @@ pub fn stream_counted(
         .take()
         .or_else(|| pass.from.cloned())
         .filter(|_| !counting.stopped);
-    let counted = (!counting.stopped).then(|| Counted {
-        turns: counting.turns,
-        dependencies: counting.dependencies,
-        counts: counting.affordances.finish(&session, &adapter.store_affordances(r)),
-    });
-    if let (true, Some(source), Some(counted)) = (pass.record, &source, &counted) {
+    let counted = (!counting.stopped)
+        .then(|| -> Result<Counted> {
+            Ok(Counted {
+                turns: counting.turns,
+                dependencies: counting.dependencies,
+                counts: counting.affordances.finish(&session, &adapter.store_affordances(r)?),
+            })
+        })
+        .transpose()?;
+    // A complete read also carries what left the conversation (rewound and superseded rows,
+    // carriers) for round-trip: it never certifies what the session counts.
+    if let (true, Some(source), Some(counted)) = (pass.record && opts.tier != Tier::Complete, &source, &counted) {
         counted.record_with_source(r, source);
     }
     Ok(Streamed {
         session,
         counted,
         last,
-        guard: guarded.map(|g| g.guard),
+        guard: counting.guard.take(),
     })
 }
 
@@ -819,11 +858,10 @@ pub struct Counted {
 
 impl Counted {
     /// Publish against the dependencies captured before this pass, including any side-store rows.
-    pub fn record_with_source(&self, r: &SessionRef, source: &crate::source::Snapshot) {
+    pub fn record_with_source(&self, r: &SessionRef, source: &crate::source::Baseline) {
         let source = source.with_reads(&self.dependencies);
         if crate::source::unchanged(r, &source) {
-            note_turns(r, self.turns);
-            crate::catalog::note_affordances_with_source(r, &source, || self.counts.clone());
+            crate::catalog::note_counted_with_source(r, &source, self.turns, || self.counts.clone());
         }
     }
 }
@@ -840,8 +878,18 @@ struct CounterState {
     messages: usize,
     turns: usize,
     counts: std::collections::BTreeMap<String, u32>,
-    #[serde(default = "crate::source::ReadSet::unrecorded")]
     dependencies: crate::source::ReadSet,
+    /// At a read's end mark: the last spaced checkpoint before it, so a pass resumed there keeps
+    /// the schedule (and the consumers the doc boundaries) a whole pass has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor: Option<Anchor>,
+}
+
+/// Where the spaced checkpoints stood at an end mark: the last one's offset and encoded size.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct Anchor {
+    offset: u64,
+    state_bytes: u64,
 }
 
 // Count the complete owned snapshot without allocating another JSON buffer. Value serialization
@@ -873,13 +921,18 @@ struct Counting<'a> {
     affordances: crate::affordance::Counter,
     dependencies: crate::source::ReadSet,
     stopped: bool,
-    failed: bool,
-    error: Option<anyhow::Error>,
+    latch: Latch,
+    /// Records what a guarded pass read, for its [`StagedReadGuard`].
+    guard: Option<StagedReadGuard>,
     /// Take a checkpoint every this many bytes (`None`: never).
     every: Option<u64>,
     last_offset: u64,
     amortized: bool,
     spacing: u64,
+    /// The encoded size of the last checkpoint's state, in an amortized pass.
+    state_bytes: u64,
+    /// The checkpoint about to be taken is the read's end mark.
+    ending: bool,
     last: Option<Checkpoint>,
     /// The primary's identity before the adapter opened it: a file replaced at any later point is
     /// not the one this pass's spans point into.
@@ -895,12 +948,14 @@ impl<'a> Counting<'a> {
             affordances: crate::affordance::Counter::new(r),
             dependencies: Default::default(),
             stopped: false,
-            failed: false,
-            error: None,
+            latch: Latch::default(),
+            guard: None,
             every,
             last_offset: 0,
             amortized: false,
             spacing: every.unwrap_or(0),
+            state_bytes: 0,
+            ending: false,
             last: None,
             stamp: crate::lazy::SourceStamp::capture(&r.path),
         }
@@ -921,11 +976,14 @@ impl<'a> Counting<'a> {
 
     fn space_after(&mut self, cp: &Checkpoint) {
         if self.amortized {
-            self.spacing = self.every.unwrap_or(0).max(checkpoint_bytes(cp));
+            self.state_bytes = checkpoint_bytes(cp);
+            self.spacing = self.every.unwrap_or(0).max(self.state_bytes);
         }
     }
 
-    fn restore(&mut self, state: CounterState, offset: u64) {
+    /// Restore the counts and the checkpoint schedule; `true` when `state` is an end mark's,
+    /// whose schedule is its anchor's rather than the checkpoint's own.
+    fn restore(&mut self, state: CounterState, offset: u64) -> bool {
         self.messages = state.messages;
         self.turns = state.turns;
         self.dependencies = state.dependencies;
@@ -936,31 +994,47 @@ impl<'a> Counting<'a> {
             .collect();
         self.affordances.restore(counts);
         self.last_offset = offset;
+        let Some(anchor) = state.anchor else { return false };
+        self.last_offset = anchor.offset;
+        self.state_bytes = anchor.state_bytes;
+        if self.amortized {
+            self.spacing = self.every.unwrap_or(0).max(anchor.state_bytes);
+        }
+        true
     }
 }
 
 impl MessageSink for Counting<'_> {
-    fn extra_projection(&self) -> ExtraProjection {
-        self.inner.extra_projection()
+    fn tier(&self) -> Tier {
+        self.inner.tier()
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        let error = self.error.take().or_else(|| self.inner.take_error());
-        self.failed |= error.is_some();
-        self.stopped |= self.failed;
-        error.or_else(|| {
-            self.failed
-                .then(|| anyhow::anyhow!("counting stream has already failed"))
-        })
+        let error = self.latch.take_or(self.inner, "counting stream");
+        self.stopped |= self.latch.failed();
+        error
     }
     fn dependency(&mut self, path: &std::path::Path) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         self.dependencies.record(path);
+        if let Some(guard) = &mut self.guard {
+            guard.reads.record(path);
+        }
         self.inner.dependency(path);
     }
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if self.latch.failed() {
+            return;
+        }
+        self.dependencies.record_append_only(path);
+        if let Some(guard) = &mut self.guard {
+            guard.reads.record_append_only(path);
+        }
+        self.inner.append_only_dependency(path);
+    }
     fn meta(&mut self, s: &Session) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         // A sink that builds its resolver from the meta session (`session.resolver()`) holds the
@@ -973,29 +1047,43 @@ impl MessageSink for Counting<'_> {
         }
     }
     fn message(&mut self, m: Message) -> Flow {
-        if self.failed {
+        if self.latch.failed() {
             return Flow::Stop;
         }
         self.messages += 1;
         self.turns += usize::from(m.is_turn());
         if let Err(error) = self.affordances.note(&m) {
-            self.error = Some(error);
-            self.failed = true;
+            self.latch.fail(error);
             self.stopped = true;
             return Flow::Stop;
+        }
+        if let Some(guard) = &mut self.guard {
+            crate::source::record_message_reads(&m, Some(&guard.primary), &mut guard.reads);
         }
         let flow = self.inner.message(m);
         self.stopped |= flow == Flow::Stop;
         flow
     }
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
+        self.ending = false;
         !self.stopped
             && self.every.is_some()
             && offset >= self.last_offset.saturating_add(self.spacing)
             && self.inner.wants_checkpoint(offset)
     }
+    /// The spacing aside: any position past the last checkpoint, by at least the size of that
+    /// checkpoint's state in an amortized pass (a mark costs no more to write and restore than
+    /// the reread it saves).
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        self.ending = !self.stopped
+            && self.every.is_some()
+            && offset > self.last_offset
+            && offset - self.last_offset >= self.state_bytes
+            && self.inner.wants_final_checkpoint(offset);
+        self.ending
+    }
     fn checkpoint(&mut self, cp: &mut Checkpoint) {
-        if self.failed {
+        if self.latch.failed() {
             return;
         }
         let counts = self
@@ -1011,54 +1099,23 @@ impl MessageSink for Counting<'_> {
                 turns: self.turns,
                 counts,
                 dependencies: self.dependencies.clone(),
+                anchor: self.ending.then_some(Anchor {
+                    offset: self.last_offset,
+                    state_bytes: self.state_bytes,
+                }),
             },
         );
         self.inner.checkpoint(cp);
-        self.space_after(cp);
-        self.last_offset = cp.offset;
+        if !std::mem::take(&mut self.ending) {
+            self.space_after(cp);
+            self.last_offset = cp.offset;
+        }
         self.last = Some(cp.clone());
-    }
-}
-
-/// A whole-session read of `r` counted `turns`: fill a "not counted" catalog row (see
-/// [`stream_counted`]).
-fn note_turns(r: &SessionRef, turns: usize) {
-    if r.message_count == 0 && turns > 0 {
-        crate::catalog::fill_count(r, turns);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn metadata_projection_preserves_existing_modes_and_complete_precedence() {
-        for opts in [
-            ParseOptions::full(),
-            ParseOptions::lazy_extra(),
-            ParseOptions::complete(),
-        ] {
-            assert!(opts.wants_full_extra());
-            assert!(!opts.facts_only());
-        }
-        for opts in [ParseOptions::bulk(), ParseOptions::lazy(), ParseOptions::usage()] {
-            assert!(!opts.wants_full_extra());
-            assert!(!opts.facts_only());
-        }
-        let facts = ParseOptions::facts();
-        assert!(facts.extra && facts.spans && facts.usage_identity);
-        assert!(facts.facts_only());
-        assert!(!facts.wants_full_extra());
-        let complete = ParseOptions {
-            complete: true,
-            ..facts.clone()
-        };
-        assert!(complete.wants_full_extra());
-        assert!(!complete.facts_only());
-        let disabled = ParseOptions { extra: false, ..facts };
-        assert!(!disabled.facts_only());
-        assert!(!disabled.wants_full_extra());
-    }
-
     use super::*;
     use crate::ir::{Block, Role};
 
@@ -1070,24 +1127,24 @@ mod tests {
 
     #[test]
     fn extra_construction_demand_forwards_and_unions_without_losing_counter_facts() {
-        struct Demand(ExtraProjection);
-        impl MessageSink for Demand {
-            fn extra_projection(&self) -> ExtraProjection {
+        struct Wants(Tier);
+        impl MessageSink for Wants {
+            fn tier(&self) -> Tier {
                 self.0
             }
             fn message(&mut self, _: Message) -> Flow {
                 Flow::Stop
             }
         }
-        let mut facts = Demand(ExtraProjection::Facts);
-        let mut full = Demand(ExtraProjection::Full);
+        let mut facts = Wants(Tier::Facts);
+        let mut full = Wants(Tier::Rich);
         let mut tee = TeeSink::new(&mut facts, &mut full);
-        assert_eq!(tee.extra_projection(), ExtraProjection::Full);
+        assert_eq!(tee.tier(), Tier::Rich);
         tee.b_stopped = true;
-        assert_eq!(tee.extra_projection(), ExtraProjection::Facts);
+        assert_eq!(tee.tier(), Tier::Facts);
         let r = SessionRef::new("facts", crate::Harness::Claude, "source");
         let mut counter = Counting::new(&r, &mut facts, None);
-        assert_eq!(counter.extra_projection(), ExtraProjection::Facts);
+        assert_eq!(counter.tier(), Tier::Facts);
         let mut result = Message::new(Role::Tool);
         result.content.push(Block::ToolResult {
             tool_use_id: "c".into(),
@@ -1102,14 +1159,14 @@ mod tests {
             .affordances
             .finish(&Session::new("facts", crate::Harness::Claude), &[]);
         assert_eq!(counted.get(&crate::affordance::Kind::Checkpoint), Some(&1));
-        let mut guard = ErrorGuard {
+        let mut guard = Guard {
             inner: &mut facts,
-            error: None,
-            failed: false,
+            latch: Latch::default(),
+            backing: None,
         };
-        assert_eq!(guard.extra_projection(), ExtraProjection::Facts);
+        assert_eq!(guard.tier(), Tier::Facts);
         let affordance = crate::affordance::AffordanceSink::new(crate::Harness::Claude, &mut guard);
-        assert_eq!(affordance.extra_projection(), ExtraProjection::Facts);
+        assert_eq!(affordance.tier(), Tier::Facts);
     }
 
     /// A sink that records the texts it saw and stops after `stop_after` messages.
@@ -1235,19 +1292,6 @@ mod tests {
         counting.dependency(&extra);
         let mut cp = Checkpoint::new(1);
         counting.checkpoint(&mut cp);
-        let mut legacy = cp.clone();
-        legacy
-            .state
-            .get_mut(COUNTER_LAYER)
-            .unwrap()
-            .as_object_mut()
-            .unwrap()
-            .remove("dependencies");
-        let legacy_state = legacy.get::<CounterState>(COUNTER_LAYER).unwrap();
-        assert!(!crate::source::unchanged(
-            &r,
-            &base.with_reads(&legacy_state.dependencies)
-        ));
         let state = cp.get::<CounterState>(COUNTER_LAYER).unwrap();
         let events_resumed = crate::events::EventSink::resume(&cp).unwrap();
         let mut keep = Keep::default();
@@ -1370,10 +1414,10 @@ mod tests {
         fn roots(&self) -> Vec<std::path::PathBuf> {
             Vec::new()
         }
-        fn discover(&self) -> Result<Vec<SessionRef>> {
-            Ok(Vec::new())
+        fn discover(&self) -> Result<crate::Discovered> {
+            Ok(Default::default())
         }
-        fn stream(&self, r: &SessionRef, _: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+        fn stream(&self, r: &SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
             let session = Session::new(&r.id, r.harness);
             sink.meta(&session);
             for n in 1..=3 {
@@ -1387,9 +1431,9 @@ mod tests {
             self.ended.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(session)
         }
-        fn store_affordances(&self, _: &SessionRef) -> Vec<crate::affordance::Affordance> {
+        fn store_affordances(&self, _: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
             self.side_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 
@@ -1420,7 +1464,7 @@ mod tests {
                     stream_counted(
                         &adapter,
                         &r,
-                        &ParseOptions::lazy(),
+                        &Demand::LEAN.with_spans(),
                         &mut failing,
                         crate::stream::Pass {
                             every: Some(1),
@@ -1430,7 +1474,7 @@ mod tests {
                     )
                     .map(|_| ())
                 } else {
-                    stream_counted(&adapter, &r, &ParseOptions::lazy(), &mut failing, Pass::RECORD).map(|_| ())
+                    stream_counted(&adapter, &r, &Demand::LEAN.with_spans(), &mut failing, Pass::RECORD).map(|_| ())
                 };
                 assert!(
                     result
@@ -1505,9 +1549,9 @@ mod tests {
         for checked_entry in [false, true] {
             let mut failing = FailingSink::new(FailAt::Message, Default::default());
             let result = if checked_entry {
-                adapter.try_stream(&r, &ParseOptions::lazy(), &mut failing)
+                adapter.try_stream(&r, &Demand::LEAN.with_spans(), &mut failing)
             } else {
-                adapter.stream(&r, &ParseOptions::lazy(), &mut failing)
+                adapter.stream(&r, &Demand::LEAN.with_spans(), &mut failing)
             };
             assert_eq!(result.unwrap_err().to_string(), "source projection unavailable");
             assert_eq!(failing.seen, 2);
@@ -1549,7 +1593,7 @@ mod tests {
             title: None,
             created_at: None,
             updated_at: None,
-            message_count: 0,
+            message_count: None,
         }
     }
 
@@ -1560,7 +1604,7 @@ mod tests {
         let done = stream_counted(
             &*adapter,
             r,
-            &ParseOptions::lazy(),
+            &Demand::LEAN.with_spans(),
             &mut keep,
             crate::stream::Pass {
                 from,
@@ -1696,7 +1740,7 @@ mod tests {
                 .unwrap()
                 .stream(
                     &transcript(crate::Harness::Qwen, before.clone()),
-                    &ParseOptions::full(),
+                    &Demand::RICH,
                     &mut sink,
                 )
                 .unwrap();
@@ -1715,7 +1759,7 @@ mod tests {
         let adapter = crate::harness::for_harness(crate::Harness::Qwen).unwrap();
         let mut keep = Keep::default();
         assert!(adapter
-            .resume(&legacy, &ParseOptions::lazy(), &mut keep, cp)
+            .transcript(&legacy, &Demand::LEAN.with_spans(), Start::Checkpoint(cp), &mut keep)
             .unwrap()
             .is_none());
         assert!(
@@ -1759,7 +1803,7 @@ mod tests {
             let done = stream_counted(
                 &*adapter,
                 &r,
-                &ParseOptions::lazy(),
+                &Demand::LEAN.with_spans(),
                 &mut Keep::default(),
                 crate::stream::Pass {
                     from: Some(final_cp),

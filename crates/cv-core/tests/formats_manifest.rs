@@ -29,13 +29,7 @@ fn adapters_and_manifests_agree() {
     if !findings.is_empty() {
         let mut report = String::new();
         for f in &findings {
-            report.push_str(&format!(
-                "  {:<14} {:<28} {:<40} {}\n",
-                f.harness,
-                format!("{:?}", f.kind),
-                f.item,
-                f.detail
-            ));
+            report.push_str(&format!("  {:<14} {:<28} {:<40} {}\n", f.at, f.a, f.what, f.b));
         }
         panic!("{} manifest/adapter disagreement(s):\n{report}", findings.len());
     }

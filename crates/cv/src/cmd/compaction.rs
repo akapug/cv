@@ -6,9 +6,8 @@ use crate::util::{fmt_duration, fmt_int, short_id};
 use anyhow::Result;
 use cv_core::ir::{truncate, SessionRef};
 
-/// List every compaction boundary in `r` — when it happened, why (trigger), the pre-compaction
-/// context size, and the summary that seeded the next window. With `summaries`, print each
-/// summary's full text.
+/// Print boundaries for r. JSON and summaries include full summary text; ordinary terminal
+/// rows demand only a bounded preview.
 pub(crate) fn print_compactions(r: &SessionRef, summaries: bool, json: bool) -> Result<()> {
     let comps = if json || summaries {
         cv_core::compaction::detect(r, true)?

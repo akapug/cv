@@ -16,77 +16,64 @@
 //! hundreds of thousands of ASCII floats. Layout, all integers little-endian:
 //!
 //! ```text
-//! [8]  magic  b"CVEMBED\x02"
+//! [8]  magic  b"CVEMBED" + the stored-format version byte (cv_core::source::VERSION)
 //! u32  dim          (vector dimensionality)
 //! u32  count        (number of records)
 //! u64  meta_len
-//! […]  meta JSON    ({ model, records: [{id, harness, cwd, title, preview, dates}…] })
+//! […]  meta JSON    ({ model, records: [{session, label, preview, source}…] })
 //! […]  vectors      (count × dim × f32 LE, record i's vector at offset i·dim)
 //! ```
 //!
 //! The metadata stays JSON (it's small, schema-evolvable via serde defaults); only the bulk —
-//! the vectors — is fixed-width. A store written by an older build (pure JSON, starts with `{`)
-//! still loads, and [`semantic_search`] migrates the legacy default `embeddings.json` to the
-//! binary default path on first use.
+//! the vectors — is fixed-width. A pre-binary all-JSON store is rejected like any bad magic:
+//! `cv index --semantic` rebuilds it.
+
+#[cfg(test)]
+#[path = "semantic_actual_probe.rs"]
+mod actual_probe;
 
 use crate::Hit;
 use anyhow::{bail, Context, Result};
-use cv_core::source::{Probe, ReadSet, Snapshot};
+use cv_core::source::{Baseline, Probe, ReadSet};
 use model2vec_rs::model::StaticModel;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const PROJECTION_VERSION: u32 = 1;
-
 /// A small, strong static-embedding model (~30MB, 256-dim). Distilled from a sentence encoder.
 const MODEL_REPO: &str = "minishlab/potion-base-8M";
 
-/// Store header magic: `CVEMBED` + format version 2 (version 1 was the implicit all-JSON store).
-const MAGIC: &[u8; 8] = b"CVEMBED\x02";
+/// Store header magic: `CVEMBED` + the one stored-format version ([`cv_core::source::VERSION`]):
+/// a cv that changes what any store means, or what a stored vector embeds
+/// ([`crate::semantic_corpus::DocSink`]), bumps it and re-embeds. 5: rows hold the discovered
+/// `SessionRef`; 2 re-spelled its fields; 1 was the implicit all-JSON store.
+const MAGIC: &[u8; 8] = &{
+    let mut magic = *b"CVEMBED\0";
+    magic[7] = cv_core::source::VERSION as u8;
+    magic
+};
 
-/// Exact discovery hints visible to the reader, kept separately from its derived metadata.
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-struct ReferenceHints {
-    cwd: Option<PathBuf>,
-    title: Option<String>,
-    created_at: Option<chrono::DateTime<chrono::Utc>>,
-    updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    message_count: usize,
-}
-impl From<&cv_core::SessionRef> for ReferenceHints {
-    fn from(r: &cv_core::SessionRef) -> Self {
-        Self {
-            cwd: r.cwd.clone(),
-            title: r.title.clone(),
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-            message_count: r.message_count,
-        }
-    }
+/// Whether the store at `path` is of another `CVEMBED` format version: a refresh re-embeds it
+/// whole, where a query names the command that rebuilds it. Anything else (this version, or
+/// bytes that are no store at all) is for [`load_store_metadata`] to judge.
+fn older_format(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 8];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok_and(|()| head[..7] == MAGIC[..7] && head != *MAGIC)
 }
 
 /// Per-session metadata, persisted as the store's JSON block (everything but the vector).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RecordMeta {
-    id: String,
-    harness: String,
-    cwd: Option<String>,
-    title: Option<String>,
+    /// The discovered ref, exactly as discovery handed it: the row is fresh while discovery hands
+    /// the same one (and its source is unchanged). Hits read their identity, cwd and dates here.
+    session: cv_core::SessionRef,
+    /// What hits call the session: its own title, else its first prompt.
+    label: Option<String>,
     /// A short preview of the body, for display in hits.
     preview: String,
-    /// Unix-seconds session dates, surfaced on hits. `serde(default)` keeps stores written
-    /// before these fields loading cleanly (their hits are just dateless until the next
-    /// `embed_all`).
-    #[serde(default)]
-    created_at: Option<i64>,
-    #[serde(default)]
-    updated_at: Option<i64>,
-    #[serde(default)]
-    source_path: Option<PathBuf>,
-    #[serde(default)]
-    source: Option<Snapshot>,
-    #[serde(default)]
-    hints: Option<ReferenceHints>,
+    source: Option<Baseline>,
 }
 
 /// The JSON block inside the binary store (deserialize side; serialization uses a borrowed twin
@@ -94,9 +81,6 @@ struct RecordMeta {
 #[derive(serde::Deserialize)]
 struct MetaBlock {
     model: String,
-    #[serde(default)]
-    projection: u32,
-    #[serde(default)]
     model_reads: Option<ReadSet>,
     records: Vec<RecordMeta>,
 }
@@ -105,7 +89,6 @@ struct MetaBlock {
 /// `vectors[i*dim..(i+1)*dim]`).
 struct Store {
     model: String,
-    projection: u32,
     model_reads: Option<ReadSet>,
     dim: usize,
     meta: Vec<RecordMeta>,
@@ -118,70 +101,10 @@ impl Store {
     }
 }
 
-// ---- legacy (pre-binary) store --------------------------------------------------------------
-
-/// The old all-JSON store layout, kept so existing `embeddings.json` files load + migrate.
-#[derive(serde::Deserialize)]
-struct LegacyStore {
-    model: String,
-    records: Vec<LegacyRecord>,
-}
-
-#[derive(serde::Deserialize)]
-struct LegacyRecord {
-    id: String,
-    harness: String,
-    cwd: Option<String>,
-    title: Option<String>,
-    preview: String,
-    #[serde(default)]
-    created_at: Option<i64>,
-    #[serde(default)]
-    updated_at: Option<i64>,
-    vector: Vec<f32>,
-}
-
-impl From<LegacyStore> for Store {
-    fn from(old: LegacyStore) -> Store {
-        let dim = old.records.first().map(|r| r.vector.len()).unwrap_or(0);
-        let mut meta = Vec::with_capacity(old.records.len());
-        let mut vectors = Vec::with_capacity(old.records.len() * dim);
-        for r in old.records {
-            // A malformed row (wrong dim) would shear the flat block; skip it instead.
-            if r.vector.len() != dim {
-                continue;
-            }
-            vectors.extend_from_slice(&r.vector);
-            meta.push(RecordMeta {
-                id: r.id,
-                harness: r.harness,
-                cwd: r.cwd,
-                title: r.title,
-                preview: r.preview,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-                source_path: None,
-                source: None,
-                hints: None,
-            });
-        }
-        Store {
-            model: old.model,
-            projection: 0,
-            model_reads: None,
-            dim,
-            meta,
-            vectors,
-        }
-    }
-}
-
 // ---- store I/O -------------------------------------------------------------------------------
 
 /// Serialize + write the store atomically (temp + rename).
 fn save_store(path: &Path, store: &Store) -> Result<()> {
-    #[cfg(test)]
-    actual_probe::record(2);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -190,13 +113,11 @@ fn save_store(path: &Path, store: &Store) -> Result<()> {
         #[derive(serde::Serialize)]
         struct MetaBlockRef<'a> {
             model: &'a str,
-            projection: u32,
             model_reads: &'a Option<ReadSet>,
             records: &'a [RecordMeta],
         }
         serde_json::to_vec(&MetaBlockRef {
             model: &store.model,
-            projection: store.projection,
             model_reads: &store.model_reads,
             records: &store.meta,
         })
@@ -219,7 +140,6 @@ fn save_store(path: &Path, store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// Load a store: the binary format, or (transparently) a legacy all-JSON store.
 // Parsing the metadata validates the complete declared binary extent. Vector contents are
 // arbitrary f32 bits; defer their ownership until a consumer actually needs retained vectors.
 struct VectorBacking {
@@ -237,10 +157,8 @@ impl VectorBacking {
         );
         Ok(())
     }
-    fn decode(mut self) -> Result<Vec<f32>> {
+    fn decode_vectors(mut self) -> Result<Vec<f32>> {
         use std::io::Read;
-        #[cfg(test)]
-        VECTOR_DECODES.with(|count| count.set(count.get() + 1));
         let mut vectors = Vec::with_capacity(self.bytes / 4);
         let mut wire = [0u8; 16 * 1024];
         let mut remaining = self.bytes;
@@ -261,6 +179,19 @@ impl VectorBacking {
         Ok(vectors)
     }
 }
+#[cfg(not(test))]
+impl VectorBacking {
+    fn decode(self) -> Result<Vec<f32>> {
+        self.decode_vectors()
+    }
+}
+#[cfg(test)]
+impl VectorBacking {
+    fn decode(self) -> Result<Vec<f32>> {
+        VECTOR_DECODES.with(|count| count.set(count.get() + 1));
+        self.decode_vectors()
+    }
+}
 #[cfg(test)]
 thread_local! { static VECTOR_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
@@ -278,24 +209,11 @@ fn load_store_metadata(path: &Path) -> Result<(Store, Option<VectorBacking>)> {
         .with_context(|| format!("reading embedding store {} — run `embed_all` first", path.display()))?;
     let file_len = file.metadata()?.len();
     let mut input = std::io::BufReader::new(file);
-    let mut first = [0u8; 1];
-    let n = input.read(&mut first)?;
-    if n == 1 && first[0] == b'{' {
-        // Legacy JSON keeps its existing owned decoder, but does not need another full wire copy.
-        let prefixed = std::io::Cursor::new(first).chain(input);
-        let legacy: LegacyStore = serde_json::from_reader(prefixed).context("parsing legacy JSON embedding store")?;
-        return Ok((legacy.into(), None));
-    }
     let mut header = [0u8; 24];
-    header[0] = first[0];
-    let complete_header = if n == 0 {
-        false
-    } else {
-        match input.read_exact(&mut header[1..]) {
-            Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => false,
-            Err(error) => return Err(error).context("reading embedding store header"),
-        }
+    let complete_header = match input.read_exact(&mut header) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => false,
+        Err(error) => return Err(error).context("reading embedding store header"),
     };
     if !complete_header || &header[..8] != MAGIC {
         bail!(
@@ -339,7 +257,6 @@ fn load_store_metadata(path: &Path) -> Result<(Store, Option<VectorBacking>)> {
     Ok((
         Store {
             model: meta.model,
-            projection: meta.projection,
             model_reads: meta.model_reads,
             dim,
             meta: meta.records,
@@ -415,9 +332,46 @@ fn artifact_root(paths: &[PathBuf; 3]) -> Result<PathBuf> {
     Ok(parent.to_path_buf())
 }
 
+/// The tokens a vector embeds: model2vec's `encode` limit. Before tokenizing it cuts the text to
+/// this many times the tokenizer's median token length in characters (`truncate_str`), so a
+/// session's vector depends on that many characters of its body and no more.
+const INPUT_TOKENS: usize = 512;
+
+/// The characters of a body the model reads ([`INPUT_TOKENS`] × the median byte length of the
+/// tokenizer's vocabulary, as model2vec computes it), from the model's `tokenizer.json`.
+fn input_chars(model: &Path) -> Result<usize> {
+    let path = model.join("tokenizer.json");
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    #[derive(serde::Deserialize)]
+    struct Tokenizer {
+        model: Model,
+    }
+    #[derive(serde::Deserialize)]
+    struct Model {
+        vocab: Vocab,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Vocab {
+        Map(std::collections::HashMap<String, serde::de::IgnoredAny>),
+        Pieces(Vec<(String, serde::de::IgnoredAny)>),
+    }
+    let tokenizer: Tokenizer =
+        serde_json::from_slice(&bytes).with_context(|| format!("reading the vocabulary of {}", path.display()))?;
+    let mut lens: Vec<usize> = match tokenizer.model.vocab {
+        Vocab::Map(map) => map.keys().map(String::len).collect(),
+        Vocab::Pieces(pieces) => pieces.iter().map(|(piece, _)| piece.len()).collect(),
+    };
+    lens.sort_unstable();
+    Ok(INPUT_TOKENS * lens.get(lens.len() / 2).copied().unwrap_or(1))
+}
+
+/// The characters of each session's body the cached model embeds; `None` without a cached model.
+pub fn embedded_chars() -> Result<Option<usize>> {
+    resolve_model(false)?.map(|spec| input_chars(&spec.path)).transpose()
+}
+
 fn load_model(spec: &ModelSpec) -> Result<StaticModel> {
-    #[cfg(test)]
-    actual_probe::record(1);
     anyhow::ensure!(
         spec.reads.fresh(&mut Probe::default()),
         "embedding model artifacts changed before loading"
@@ -441,42 +395,58 @@ pub fn embed_all(path: &Path) -> Result<usize> {
 }
 
 pub fn embed_sessions(path: &Path, refs: &[cv_core::SessionRef]) -> Result<usize> {
+    embed_with(path, refs, crate::read_corpus_doc, load_model, save_store)
+}
+
+/// Read each changed session's body as far as the model reads it: [`input_chars`] characters,
+/// at most four bytes each, so the vector is the one the whole body would give.
+fn embed_with(
+    path: &Path,
+    refs: &[cv_core::SessionRef],
+    mut read: impl FnMut(&cv_core::SessionRef, usize) -> Result<(crate::Doc, ReadSet)>,
+    mut load: impl FnMut(&ModelSpec) -> Result<StaticModel>,
+    save: impl FnMut(&Path, &Store) -> Result<()>,
+) -> Result<usize> {
     let _sources = cv_core::source::read_scope();
     if refs.is_empty() {
         return refresh(
             path,
             refs,
             &model_id(),
-            PROJECTION_VERSION,
             ReadSet::default(),
-            crate::read_corpus_doc,
+            |r| read(r, 0),
             |_| anyhow::bail!("empty semantic inventory unexpectedly demanded a model"),
-            save_store,
+            save,
         );
     }
     // No model acquisition is needed to remove the last session or publish an empty inventory.
-    let spec = resolve_model(!refs.is_empty())?;
+    let spec = resolve_model(true)?;
     let key = spec.as_ref().map_or_else(model_id, |s| s.key.clone());
     let reads = spec.as_ref().map_or_else(ReadSet::default, |s| s.reads.clone());
     let mut model = None;
+    let mut head = None;
     refresh(
         path,
         refs,
         &key,
-        PROJECTION_VERSION,
         reads,
-        |reference| {
-            #[cfg(test)]
-            actual_probe::record(0);
-            crate::read_corpus_doc(reference)
+        |r| {
+            let bytes = match head {
+                Some(bytes) => bytes,
+                None => *head.insert(4 * input_chars(&spec.as_ref().context("embedding model is not cached")?.path)?),
+            };
+            read(r, bytes)
         },
         |bodies| {
             if model.is_none() {
-                model = Some(load_model(spec.as_ref().context("embedding model is not cached")?)?);
+                model = Some(load(spec.as_ref().context("embedding model is not cached")?)?);
             }
-            Ok(model.as_ref().unwrap().encode(bodies))
+            Ok(model
+                .as_ref()
+                .unwrap()
+                .encode_with_args(bodies, Some(INPUT_TOKENS), 1024))
         },
-        save_store,
+        save,
     )
 }
 
@@ -509,6 +479,8 @@ fn model_reads(root: &Path) -> Result<ReadSet> {
             reads.record(&base.join(name));
         }
     }
+    // A local model root can be 0_StaticEmbedding with its configuration one directory up.
+    // In hub snapshots this parent file is normally absent; its absence is stamped too.
     if let Some(parent) = root.parent() {
         reads.record(&parent.join("config_sentence_transformers.json"));
     }
@@ -538,25 +510,22 @@ fn canonical_refs(refs: &[cv_core::SessionRef]) -> Vec<&cv_core::SessionRef> {
 }
 
 // The three injected operations keep refresh/publication tests independent of model downloads.
-#[allow(clippy::too_many_arguments)]
 fn refresh(
     path: &Path,
     refs: &[cv_core::SessionRef],
     model: &str,
-    projection: u32,
     model_reads: ReadSet,
     mut read: impl FnMut(&cv_core::SessionRef) -> Result<(crate::Doc, ReadSet)>,
     mut encode: impl FnMut(&[String]) -> Result<Vec<Vec<f32>>>,
     mut save: impl FnMut(&Path, &Store) -> Result<()>,
 ) -> Result<usize> {
     let refs = canonical_refs(refs);
-    let (mut old, vector_backing) = if path.exists() {
+    let (mut old, vector_backing) = if path.exists() && !older_format(path) {
         load_store_metadata(path)?
     } else {
         (
             Store {
                 model: model.into(),
-                projection,
                 model_reads: None,
                 dim: 0,
                 meta: vec![],
@@ -565,38 +534,35 @@ fn refresh(
             None,
         )
     };
-    let compatible = old.model == model
-        && old.projection == projection
-        && old.model_reads.as_ref().is_some_and(|r| r.fresh(&mut Probe::default()));
-    // Old stores may contain duplicate identities from earlier refreshes. Ambiguous rows must
-    // all be replaced, even if one path's provenance looks fresh: do not silently choose a vector.
-    let mut lookup = std::collections::HashMap::new();
-    for (i, r) in old.meta.iter().enumerate() {
-        lookup
-            .entry((r.harness.as_str(), r.id.as_str()))
-            .and_modify(|index| *index = None)
-            .or_insert(Some(i));
-    }
+    let compatible = old.model == model && old.model_reads.as_ref().is_some_and(|r| r.fresh(&mut Probe::default()));
+    // The header's source::VERSION already rejects stores predating unique row publication.
+    let lookup: std::collections::HashMap<_, _> = old
+        .meta
+        .iter()
+        .enumerate()
+        .map(|(i, r)| ((r.session.harness.as_str(), r.session.id.as_str()), i))
+        .collect();
     let mut keep = vec![false; old.meta.len()];
     let mut changed = Vec::new();
     let mut before = Probe::default();
     for &r in &refs {
         let snapshot = before.snapshot(r);
-        let reused = compatible
-            && lookup
-                .get(&(r.harness.as_str(), r.id.as_str()))
-                .copied()
-                .flatten()
-                .is_some_and(|i| {
-                    let m = &old.meta[i];
-                    let fresh = m.source_path.as_ref() == Some(&r.path)
-                        && m.hints.as_ref() == Some(&ReferenceHints::from(r))
-                        && m.source.as_ref().is_some_and(|old| old.fresh(&snapshot, &mut before));
-                    keep[i] |= fresh;
-                    fresh
-                });
-        if !reused {
-            changed.push((r, snapshot));
+        let reusable = lookup.get(&(r.harness.as_str(), r.id.as_str())).copied().filter(|&i| {
+            let m = &old.meta[i];
+            // A session of a shared store whose own rows certify unchanged keeps its row.
+            compatible
+                && m.session == *r
+                && m.source
+                    .as_ref()
+                    .is_some_and(|old| old.fresh(&snapshot, &mut before) || old.rows_fresh(r, &snapshot, &mut before))
+        });
+        if let Some(i) = reusable {
+            keep[i] = true;
+        }
+        if reusable.is_none() {
+            // A shared store's certificate as of this snapshot, before the read.
+            let rows = before.rows(r);
+            changed.push((r, cv_core::source::Baseline { rows, ..snapshot }));
         }
     }
     drop(lookup);
@@ -628,23 +594,16 @@ fn refresh(
         old.dim = 0;
     }
     old.model = model.into();
-    old.projection = projection;
     old.model_reads = Some(model_reads);
     let mut pending = Vec::new();
     let mut bodies = Vec::new();
     for (r, snapshot) in changed {
         let (doc, reads) = read(r)?;
         pending.push(RecordMeta {
-            id: doc.id,
-            harness: doc.harness,
-            cwd: doc.cwd,
-            title: doc.title,
+            session: r.clone(),
+            label: doc.title,
             preview: preview(&doc.body, 200),
-            created_at: doc.created_at,
-            updated_at: doc.updated_at,
-            source_path: Some(r.path.clone()),
             source: Some(snapshot.with_reads(&reads)),
-            hints: Some(ReferenceHints::from(r)),
         });
         bodies.push(doc.body);
         if bodies.len() >= EMBED_BATCH {
@@ -657,16 +616,17 @@ fn refresh(
     let rows: std::collections::HashMap<_, _> = old
         .meta
         .iter()
-        .map(|m| ((m.harness.as_str(), m.id.as_str()), m))
+        .map(|m| ((m.session.harness.as_str(), m.session.id.as_str()), m))
         .collect();
     for &r in &refs {
         let row = rows
             .get(&(r.harness.as_str(), r.id.as_str()))
             .context("semantic session missing after refresh")?;
         anyhow::ensure!(
-            row.source
-                .as_ref()
-                .is_some_and(|s| s.fresh(&after.snapshot(r), &mut after)),
+            row.source.as_ref().is_some_and(|s| {
+                let now = after.snapshot(r);
+                s.fresh(&now, &mut after) || s.rows_fresh(r, &now, &mut after)
+            }),
             "semantic source changed during refresh: {}",
             r.id
         );
@@ -712,8 +672,8 @@ fn encode_batch(
 
 /// Embed `query` and return the top-`k` sessions by cosine similarity.
 ///
-/// Legacy stores still load and migrate to the binary format. Stores without recorded model
-/// artifact identities must refresh once through `cv index --semantic` before querying.
+/// Stores without recorded model artifact identities must refresh once through
+/// `cv index --semantic` before querying.
 ///
 /// The store's recorded model must match the model the query would embed under (including a
 /// `CV_SEARCH_MODEL` override), and the query vector's dimensionality must match the store's —
@@ -730,28 +690,7 @@ pub fn semantic_search_filtered(
     k: usize,
     filter: crate::SearchFilter<'_>,
 ) -> Result<Vec<Hit>> {
-    migrate_legacy_sibling(path);
-    let store = load_store(path)?;
-    if store.meta.is_empty() {
-        return Ok(Vec::new());
-    }
-    anyhow::ensure!(
-        store.projection == PROJECTION_VERSION,
-        "semantic projection version changed — run cv index --semantic to rebuild vectors"
-    );
-    let spec = resolve_model(false)?.context("embedding model is not cached — run cv index --semantic")?;
-    validate_store_model(&store, &spec, path)?;
-    let model = load_model(&spec)?;
-    let q = model.encode_single(query);
-    if q.len() != store.dim {
-        bail!(
-            "query embedding has dim {}, but store {} has dim {} — run `cv index --semantic` to re-embed",
-            q.len(),
-            path.display(),
-            store.dim
-        );
-    }
-    Ok(rank_filtered(&store, &q, k, filter))
+    SemanticSearch::new(Some(path.to_path_buf())).search(query, k, filter)
 }
 
 /// Service-owned semantic state. Construction reads no store/model; the first semantic request
@@ -767,6 +706,12 @@ impl SemanticSearch {
         }
     }
     pub fn search(&self, query: &str, k: usize, filter: crate::SearchFilter<'_>) -> Result<Vec<Hit>> {
+        Ok(self.search_counted(query, k, filter)?.0)
+    }
+
+    /// [`search`](Self::search), and how many stored sessions the filter admits: every one of
+    /// them is ranked, so that is the number of matches the top `k` are drawn from.
+    pub fn search_counted(&self, query: &str, k: usize, filter: crate::SearchFilter<'_>) -> Result<(Vec<Hit>, usize)> {
         self.inner.search(
             query,
             k,
@@ -817,7 +762,7 @@ impl<M> ResidentState<M> {
         resolve: impl FnOnce() -> Result<Option<ModelSpec>>,
         load: impl FnOnce(&ModelSpec) -> Result<M>,
         encode: impl FnOnce(&M, &str) -> Vec<f32>,
-    ) -> Result<Vec<Hit>> {
+    ) -> Result<(Vec<Hit>, usize)> {
         let path = &self.path;
         let mut before = Probe::default();
         if self
@@ -828,7 +773,6 @@ impl<M> ResidentState<M> {
             // Release the old generation before loading another; a failed replacement never
             // leaves an old answer available as fallback.
             self.store = None;
-            migrate_legacy_sibling(path);
             let mut reads = ReadSet::default();
             reads.record(path);
             let mut store = load_store(path)?;
@@ -840,9 +784,9 @@ impl<M> ResidentState<M> {
             // Refresh provenance is validated by the cold decoder but has no consumer in
             // resident ranking. Keep hit fields and model guards, not unused source witnesses.
             for record in &mut store.meta {
-                record.source_path = None;
                 record.source = None;
-                record.hints = None;
+                record.session.title = None;
+                record.session.path = PathBuf::new();
             }
             self.store = Some(CachedStore { store, reads });
         }
@@ -854,12 +798,8 @@ impl<M> ResidentState<M> {
                 "embedding store changed during search: {}",
                 path.display()
             );
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
-        anyhow::ensure!(
-            cached.store.projection == PROJECTION_VERSION,
-            "semantic projection version changed — run cv index --semantic to rebuild vectors"
-        );
         // Resolution checks paths/revisions and artifact metadata, never model bodies.
         let spec = resolve()?.context("embedding model is not cached — run cv index --semantic")?;
         validate_store_model(&cached.store, &spec, path)?;
@@ -889,6 +829,7 @@ impl<M> ResidentState<M> {
             cached.store.dim
         );
         let hits = rank_filtered(&cached.store, &q, k, filter);
+        let admitted = cached.store.meta.iter().filter(|meta| admits(filter, meta)).count();
         let mut after = Probe::default();
         anyhow::ensure!(
             cached.reads.fresh(&mut after),
@@ -899,7 +840,7 @@ impl<M> ResidentState<M> {
             spec.reads.fresh(&mut after),
             "embedding model artifacts changed during search"
         );
-        Ok(hits)
+        Ok((hits, admitted))
     }
 }
 struct ResidentSearch<M> {
@@ -926,7 +867,7 @@ impl<M> ResidentSearch<M> {
         resolve: impl FnOnce() -> Result<Option<ModelSpec>>,
         load: impl FnOnce(&ModelSpec) -> Result<M>,
         encode: impl FnOnce(&M, &str) -> Vec<f32>,
-    ) -> Result<Vec<Hit>> {
+    ) -> Result<(Vec<Hit>, usize)> {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -962,28 +903,6 @@ fn validate_store_model(store: &Store, spec: &ModelSpec, path: &Path) -> Result<
     Ok(())
 }
 
-/// One-time upgrade: when `path` is absent but the old default `embeddings.json` exists alongside
-/// it, convert that JSON store into the binary format at `path`. Best-effort (a failure just means
-/// `load_store` reports the missing file); the legacy file is left untouched.
-fn migrate_legacy_sibling(path: &Path) {
-    if path.exists() || path.file_name().is_none() {
-        return;
-    }
-    let legacy = path.with_file_name("embeddings.json");
-    if legacy == path || !legacy.exists() {
-        return;
-    }
-    if let Ok(store) = load_store(&legacy) {
-        if save_store(path, &store).is_ok() {
-            eprintln!(
-                "(migrated legacy embedding store {} → {})",
-                legacy.display(),
-                path.display()
-            );
-        }
-    }
-}
-
 /// Brute-force cosine ranking of the store against an already-embedded query, mapping the top-`k`
 /// records to [`Hit`]s. Split from [`semantic_search`] so the record→hit projection (dates,
 /// preview-as-snippet) is testable without loading the embedding model.
@@ -1015,8 +934,14 @@ impl Ord for RankedRow<'_> {
         other
             .score
             .total_cmp(&self.score)
-            .then_with(|| self.meta.id.cmp(&other.meta.id))
-            .then_with(|| self.meta.harness.cmp(&other.meta.harness))
+            .then_with(|| self.meta.session.id.cmp(&other.meta.session.id))
+            .then_with(|| {
+                self.meta
+                    .session
+                    .harness
+                    .as_str()
+                    .cmp(other.meta.session.harness.as_str())
+            })
     }
 }
 
@@ -1027,11 +952,7 @@ fn ranked_rows<'a>(store: &'a Store, q: &[f32], k: usize, filter: crate::SearchF
     let query = CosineQuery::new(q);
     let mut winners = std::collections::BinaryHeap::new();
     for (index, meta) in store.meta.iter().enumerate() {
-        if !filter.harness.is_none_or(|h| meta.harness == h)
-            || !filter
-                .cwd
-                .is_none_or(|needle| meta.cwd.as_ref().is_some_and(|cwd| cwd.contains(needle)))
-        {
+        if !admits(filter, meta) {
             continue;
         }
         let candidate = RankedRow {
@@ -1053,6 +974,17 @@ fn ranked_rows<'a>(store: &'a Store, q: &[f32], k: usize, filter: crate::SearchF
     winners.into_sorted_vec()
 }
 
+/// Whether `filter` admits a stored session: its harness, and its cwd containing the needle.
+fn admits(filter: crate::SearchFilter<'_>, meta: &RecordMeta) -> bool {
+    filter.harness.is_none_or(|h| meta.session.harness.as_str() == h)
+        && filter.cwd.is_none_or(|needle| {
+            meta.session
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| cwd.to_string_lossy().contains(needle))
+        })
+}
+
 fn rank_filtered(store: &Store, q: &[f32], k: usize, filter: crate::SearchFilter<'_>) -> Vec<Hit> {
     let scored = ranked_rows(store, q, k, filter);
     scored
@@ -1061,18 +993,19 @@ fn rank_filtered(store: &Store, q: &[f32], k: usize, filter: crate::SearchFilter
             let score = row.score;
             let r = &store.meta[row.index];
             Hit {
-                id: r.id.clone(),
-                harness: r.harness.clone(),
-                cwd: r.cwd.clone(),
-                title: r.title.clone(),
+                id: r.session.id.clone(),
+                harness: r.session.harness.as_str().into(),
+                cwd: r.session.cwd.as_ref().map(|p| p.display().to_string()),
+                title: r.label.clone(),
                 score,
                 snippet: r.preview.clone(),
-                created_at: r.created_at,
-                updated_at: r.updated_at,
+                created_at: r.session.created_at.map(|t| t.timestamp()),
+                updated_at: r.session.updated_at.map(|t| t.timestamp()),
                 // Semantic store doesn't fold the sub-agent forest (yet); no provenance to carry.
                 parent_id: None,
                 agent_id: None,
                 workflow: None,
+                session: None,
             }
         })
         .collect()
@@ -1163,7 +1096,7 @@ mod tests {
             title: None,
             created_at: None,
             updated_at: None,
-            message_count: 1,
+            message_count: Some(1),
         }
     }
     fn fake_doc(r: &cv_core::SessionRef, dependency: Option<&Path>) -> Result<(crate::Doc, ReadSet)> {
@@ -1175,18 +1108,7 @@ mod tests {
                 body.push_str(&std::fs::read_to_string(path)?);
             }
         }
-        Ok((
-            crate::Doc {
-                id: r.id.clone(),
-                harness: r.harness.as_str().into(),
-                cwd: None,
-                title: None,
-                body,
-                created_at: None,
-                updated_at: None,
-            },
-            reads,
-        ))
+        Ok((crate::Doc { title: None, body }, reads))
     }
     fn fake_encode(bodies: &[String]) -> Result<Vec<Vec<f32>>> {
         Ok(bodies
@@ -1221,11 +1143,10 @@ mod tests {
                 &store_path,
                 &refs,
                 "fake",
-                PROJECTION_VERSION,
                 ReadSet::default(),
                 |r| {
                     let text = text.expect("fresh carrier guard must avoid reading").clone();
-                    let mut sink = crate::semantic_corpus::DocSink::new(cv_core::Resolver::new(None));
+                    let mut sink = crate::semantic_corpus::DocSink::new(cv_core::Resolver::new(None), 64 * 1024);
                     let mut message = cv_core::Message::new(cv_core::Role::User);
                     message.content.push(cv_core::Block::Text { text });
                     sink.message(message);
@@ -1234,7 +1155,7 @@ mod tests {
                     }
                     let (mut doc, _) = fake_doc(r, None)?;
                     doc.body = sink.body.into_string();
-                    doc.title = sink.first_user_text;
+                    doc.title = sink.first_prompt;
                     Ok((doc, sink.reads))
                 },
                 |bodies| {
@@ -1299,7 +1220,6 @@ mod tests {
             &store_path,
             &refs,
             "same-revision",
-            1,
             reads.clone(),
             |r| fake_doc(r, None),
             fake_encode,
@@ -1310,7 +1230,6 @@ mod tests {
             &store_path,
             &refs,
             "same-revision",
-            1,
             reads.clone(),
             |_| panic!("unchanged model must reuse"),
             |_| panic!(),
@@ -1324,7 +1243,6 @@ mod tests {
             &store_path,
             &refs,
             "same-revision",
-            1,
             model_reads(&first).unwrap(),
             |r| {
                 count.set(count.get() + 1);
@@ -1369,9 +1287,8 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
-            crate::read_corpus_doc,
+            |r| crate::read_corpus_doc(r, 64 * 1024),
             |bodies| {
                 count.set(count.get() + bodies.len());
                 assert_eq!(bodies[0].len(), 64 * 1024);
@@ -1383,12 +1300,11 @@ mod tests {
         .unwrap();
         assert_eq!(count.get(), 1);
         let saved = load_store(&path).unwrap();
-        assert_eq!(saved.meta[0].title.as_deref(), Some("Inspect the file"));
+        assert_eq!(saved.meta[0].label.as_deref(), Some("Inspect the file"));
         refresh(
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |_| panic!("fresh native source should not parse"),
             |_| panic!("fresh native source should not load model"),
@@ -1433,7 +1349,7 @@ mod tests {
             }
             let path = dir.join(format!("{kind}.bin"));
             let mut r = fixture_ref(&source, "perf");
-            r.message_count = if kind == "arguments" { 2 } else { 1 };
+            r.message_count = Some(if kind == "arguments" { 2 } else { 1 });
             let refs = [r];
             let mut calls = 0;
             let baseline = cv_testkit::heap::begin();
@@ -1441,9 +1357,8 @@ mod tests {
                 &path,
                 &refs,
                 "fake",
-                PROJECTION_VERSION,
                 ReadSet::default(),
-                crate::read_corpus_doc,
+                |r| crate::read_corpus_doc(r, 64 * 1024),
                 |bodies| {
                     calls += 1;
                     assert_eq!(bodies.len(), 1);
@@ -1452,10 +1367,10 @@ mod tests {
                         assert_eq!(bodies[0].len(), 64 * 1024);
                         assert!(bodies[0].starts_with(prefix));
                         assert!(bodies[0][prefix.len()..].bytes().all(|b| b == b'x'));
-                    } else if kind == "plain-text" {
-                        assert_eq!(bodies[0], "x".repeat(64 * 1024));
                     } else {
-                        assert_eq!(bodies[0], format!("{}\n", "x".repeat(64 * 1024 / 6)));
+                        // Checked source text caps decoded bytes, independently of JSON escaping.
+                        assert_eq!(bodies[0].len(), 64 * 1024);
+                        assert!(bodies[0].bytes().all(|b| b == b'x'));
                     }
                     fake_encode(bodies)
                 },
@@ -1473,7 +1388,6 @@ mod tests {
                 &path,
                 &refs,
                 "fake",
-                PROJECTION_VERSION,
                 ReadSet::default(),
                 |_| panic!("unchanged producer must not parse"),
                 |_| panic!("unchanged producer must not embed"),
@@ -1506,12 +1420,10 @@ mod tests {
                 &path,
                 std::slice::from_ref(r),
                 "fake",
-                1,
                 ReadSet::default(),
                 |r| {
                     count.set(count.get() + 1);
                     let (mut d, reads) = fake_doc(r, None)?;
-                    d.cwd = Some("/derived/cwd".into());
                     d.title = Some("derived title".into());
                     Ok((d, reads))
                 },
@@ -1527,7 +1439,7 @@ mod tests {
         r.title = Some("new hint".into());
         run(&r);
         assert_eq!(count.get(), 2);
-        r.message_count += 1;
+        r.message_count = Some(r.message_count.map_or(1, |n| n + 1));
         run(&r);
         assert_eq!(count.get(), 3);
         r.cwd = Some("/other/hint".into());
@@ -1541,13 +1453,37 @@ mod tests {
         assert_eq!(count.get(), 6);
         run(&r);
         assert_eq!(count.get(), 6);
-        let mut old = load_store(&path).unwrap();
-        old.projection = 0;
-        save_store(&path, &old).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A store an older cv wrote re-embeds whole on refresh; a query still names the rebuild.
+    #[test]
+    fn semantic_refresh_replaces_an_older_format_store() {
+        let dir = std::env::temp_dir().join(format!("cv-semantic-older-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("session.jsonl");
+        let path = dir.join("vectors.bin");
+        std::fs::write(&input, "body").unwrap();
+        let mut prior = *MAGIC;
+        prior[7] -= 1;
+        std::fs::write(&path, [&prior[..], &[0; 64]].concat()).unwrap();
         assert!(semantic_search(&path, "query", 1)
             .unwrap_err()
             .to_string()
-            .contains("projection version changed"));
+            .contains("bad magic"));
+        let r = fixture_ref(&input, "a");
+        let n = refresh(
+            &path,
+            std::slice::from_ref(&r),
+            "fake",
+            ReadSet::default(),
+            |r| fake_doc(r, None),
+            fake_encode,
+            save_store,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(load_store(&path).unwrap().meta[0].session, r);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1569,7 +1505,6 @@ mod tests {
                 &store,
                 &refs,
                 "fake",
-                1,
                 ReadSet::default(),
                 |r| {
                     read.set(read.get() + 1);
@@ -1588,12 +1523,11 @@ mod tests {
             1
         );
         assert_eq!((read.get(), encoded.get(), saved.get()), (1, 1, 1));
-        assert_eq!(load_store(&store).unwrap().meta[0].source_path.as_ref(), Some(&a));
+        assert_eq!(load_store(&store).unwrap().meta[0].session.path, a);
         refresh(
             &store,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |_| panic!("warm copies must not read"),
             |_| panic!("warm copies must not encode"),
@@ -1605,7 +1539,6 @@ mod tests {
             &store,
             &reversed,
             "fake",
-            1,
             ReadSet::default(),
             |_| panic!("reordered copies must not read"),
             |_| panic!("reordered copies must not encode"),
@@ -1617,7 +1550,6 @@ mod tests {
             &rebuilt,
             &reversed,
             "fake",
-            1,
             ReadSet::default(),
             |r| fake_doc(r, None),
             fake_encode,
@@ -1625,43 +1557,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read(&store).unwrap(), std::fs::read(rebuilt).unwrap());
-        // Legacy duplicate rows are ambiguous even when their provenance is fresh. Poison one
-        // vector and require a new projection, rather than silently retaining the last row.
-        let mut legacy = load_store(&store).unwrap();
-        legacy
-            .meta
-            .push(serde_json::from_value(serde_json::to_value(&legacy.meta[0]).unwrap()).unwrap());
-        legacy.vectors.resize(legacy.vectors.len() + legacy.dim, 999.0);
-        save_store(&store, &legacy).unwrap();
-        read.set(0);
-        encoded.set(0);
-        saved.set(0);
-        refresh(
-            &store,
-            &refs,
-            "fake",
-            1,
-            ReadSet::default(),
-            |r| {
-                read.set(read.get() + 1);
-                fake_doc(r, None)
-            },
-            |b| {
-                encoded.set(encoded.get() + b.len());
-                fake_encode(b)
-            },
-            |p, s| {
-                saved.set(saved.get() + 1);
-                save_store(p, s)
-            },
-        )
-        .unwrap();
-        assert_eq!((read.get(), encoded.get(), saved.get()), (1, 1, 1));
-        assert_eq!(load_store(&store).unwrap().meta.len(), 1);
-        assert_eq!(
-            load_store(&store).unwrap().vectors,
-            fake_encode(&["identical".into()]).unwrap().concat()
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1690,7 +1585,6 @@ mod tests {
                 &store,
                 &refs,
                 "fake",
-                1,
                 ReadSet::default(),
                 |r| fake_doc(r, None),
                 fake_encode,
@@ -1703,14 +1597,17 @@ mod tests {
             stored
                 .meta
                 .iter()
-                .find(|m| m.harness == "openclaw")
-                .unwrap()
-                .source_path
-                .as_ref(),
+                .find(|m| m.session.harness == cv_core::Harness::OpenClaw)
+                .map(|m| &m.session.path),
             Some(&b)
         );
         assert_eq!(
-            stored.meta.iter().find(|m| m.harness == "openclaw").unwrap().preview,
+            stored
+                .meta
+                .iter()
+                .find(|m| m.session.harness == cv_core::Harness::OpenClaw)
+                .unwrap()
+                .preview,
             "newer divergent content"
         );
         let rebuild = dir.join("rebuilt");
@@ -1719,7 +1616,6 @@ mod tests {
             &rebuild,
             &reversed,
             "fake",
-            1,
             ReadSet::default(),
             |r| fake_doc(r, None),
             fake_encode,
@@ -1734,17 +1630,14 @@ mod tests {
                 .unwrap()
                 .meta
                 .iter()
-                .find(|m| m.harness == "openclaw")
-                .unwrap()
-                .source_path
-                .as_ref(),
+                .find(|m| m.session.harness == cv_core::Harness::OpenClaw)
+                .map(|m| &m.session.path),
             Some(&a)
         );
         refresh(
             &store,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |_| panic!("warm fallback must not read"),
             |_| panic!("warm fallback must not encode"),
@@ -1757,7 +1650,6 @@ mod tests {
             &store,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |r| fake_doc(r, None),
             |_| panic!("all-missing copy must not encode"),
@@ -1779,12 +1671,11 @@ mod tests {
         std::fs::write(&a, "a").unwrap();
         std::fs::write(&b, "bb").unwrap();
         let refs = [fixture_ref(&a, "a"), fixture_ref(&b, "b")];
-        let run = |model: &str, version, count: &std::cell::Cell<usize>| {
+        let run = |model: &str, count: &std::cell::Cell<usize>| {
             refresh(
                 &path,
                 &refs,
                 model,
-                version,
                 ReadSet::default(),
                 |r| {
                     count.set(count.get() + 1);
@@ -1796,14 +1687,13 @@ mod tests {
             .unwrap()
         };
         let count = std::cell::Cell::new(0);
-        assert_eq!(run("fake", 1, &count), 2);
+        assert_eq!(run("fake", &count), 2);
         assert_eq!(count.get(), 2);
         let initial = std::fs::read(&path).unwrap();
         refresh(
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |_| panic!("unchanged rows must not parse"),
             |_| panic!("must not load model"),
@@ -1822,29 +1712,25 @@ mod tests {
                 .set_times(std::fs::FileTimes::new().set_modified(modified))
                 .unwrap();
             count.set(0);
-            run("fake", 1, &count);
+            run("fake", &count);
             assert_eq!(count.get(), 1, "same-size restored-mtime primary cannot reuse vector");
         }
         std::fs::write(&a, "changed primary").unwrap();
         count.set(0);
-        run("fake", 1, &count);
+        run("fake", &count);
         assert_eq!(count.get(), 1);
         // Absence was recorded before the initial projection, so an adopted sidecar invalidates.
         std::fs::write(&dep, "output").unwrap();
         count.set(0);
-        run("fake", 1, &count);
+        run("fake", &count);
         assert_eq!(count.get(), 2);
         count.set(0);
-        run("other", 1, &count);
-        assert_eq!(count.get(), 2);
-        count.set(0);
-        run("other", 2, &count);
+        run("other", &count);
         assert_eq!(count.get(), 2);
         refresh(
             &path,
             &refs[..1],
             "other",
-            2,
             ReadSet::default(),
             |_| panic!("removal needs no parsing"),
             |_| panic!("removal needs no model"),
@@ -1875,7 +1761,6 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |r| fake_doc(r, None),
             encode,
@@ -1888,7 +1773,6 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |_| panic!("unchanged source must not parse"),
             |_| panic!("unchanged must not encode"),
@@ -1903,7 +1787,6 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |_| panic!("corrupt store must fail before parsing"),
             |_| panic!("corrupt store must not encode"),
@@ -1918,7 +1801,6 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |r| fake_doc(r, None),
             encode,
@@ -1935,7 +1817,6 @@ mod tests {
             &path,
             &refs,
             "new-model",
-            1,
             ReadSet::default(),
             |r| fake_doc(r, None),
             encode,
@@ -1947,7 +1828,6 @@ mod tests {
             &path,
             &[],
             "new-model",
-            1,
             ReadSet::default(),
             |_| panic!("empty refresh must not parse"),
             |_| panic!("empty must not encode"),
@@ -1972,7 +1852,6 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |r| fake_doc(r, None),
             fake_encode,
@@ -1986,7 +1865,6 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |r| fake_doc(r, None),
             |_| panic!("missing selected source must not encode"),
@@ -2000,7 +1878,6 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |r| fake_doc(r, None),
             fake_encode,
@@ -2012,7 +1889,6 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |r| fake_doc(r, None),
             |_| anyhow::bail!("injected model failure"),
@@ -2024,7 +1900,6 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |r| {
                 let doc = fake_doc(r, None)?;
@@ -2041,7 +1916,6 @@ mod tests {
             &path,
             &refs,
             "fake",
-            1,
             ReadSet::default(),
             |r| {
                 count.set(count.get() + 1);
@@ -2056,22 +1930,20 @@ mod tests {
     }
 
     #[test]
-    fn semantic_legacy_metadata_rebuilds_once_and_save_failure_cleans_temp() {
-        let dir = std::env::temp_dir().join(format!("cv-semantic-legacy-{}", uuid::Uuid::new_v4()));
+    fn semantic_refresh_reads_once_and_save_failure_cleans_temp() {
+        let dir = std::env::temp_dir().join(format!("cv-semantic-once-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
         let input = dir.join("input.jsonl");
         let path = dir.join("store");
         std::fs::write(&input, "new").unwrap();
         let refs = [fixture_ref(&input, "a")];
-        let mut old = store(vec![(meta("a", None), vec![1., 2.])]);
-        old.projection = 0;
+        let old = store(vec![(meta("a", None), vec![1., 2.])]);
         save_store(&path, &old).unwrap();
         let count = std::cell::Cell::new(0);
         refresh(
             &path,
             &refs,
             "test",
-            1,
             ReadSet::default(),
             |r| {
                 count.set(count.get() + 1);
@@ -2086,7 +1958,6 @@ mod tests {
             &path,
             &refs,
             "test",
-            1,
             ReadSet::default(),
             |_| panic!(),
             |_| panic!(),
@@ -2106,16 +1977,14 @@ mod tests {
 
     fn meta(id: &str, dates: Option<(i64, i64)>) -> RecordMeta {
         RecordMeta {
-            id: id.into(),
-            harness: "claude".into(),
-            cwd: None,
-            title: Some(format!("title-{id}")),
+            session: cv_core::SessionRef {
+                created_at: dates.and_then(|(c, _)| chrono::DateTime::from_timestamp(c, 0)),
+                updated_at: dates.and_then(|(_, u)| chrono::DateTime::from_timestamp(u, 0)),
+                ..cv_core::SessionRef::new(id, cv_core::Harness::Claude, "")
+            },
+            label: Some(format!("title-{id}")),
             preview: format!("preview-{id}"),
-            created_at: dates.map(|(c, _)| c),
-            updated_at: dates.map(|(_, u)| u),
-            source_path: None,
             source: None,
-            hints: None,
         }
     }
 
@@ -2123,7 +1992,6 @@ mod tests {
         let dim = records.first().map(|(_, v)| v.len()).unwrap_or(0);
         let mut s = Store {
             model: "test".into(),
-            projection: PROJECTION_VERSION,
             model_reads: Some(ReadSet::default()),
             dim,
             meta: Vec::new(),
@@ -2137,6 +2005,25 @@ mod tests {
         s
     }
 
+    /// The head a vector reads is the model's: 512 tokens × the vocabulary's median byte length
+    /// (model2vec's `truncate_str`), read from either vocabulary layout of `tokenizer.json`.
+    #[test]
+    fn input_chars_is_the_models_input_limit() {
+        let dir = cv_testkit::temp_dir("semantic-input-chars");
+        for (vocab, median) in [
+            (
+                serde_json::json!({"a": 0, "bb": 1, "cccc": 2, "dddddd": 3, "eeeeeeeee": 4}),
+                4,
+            ),
+            (serde_json::json!([["a", 0.0], ["bbb", -1.0], ["cc", -2.0]]), 2),
+        ] {
+            let tokenizer = serde_json::json!({"model": {"type": "WordPiece", "vocab": vocab}});
+            std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+            assert_eq!(input_chars(&dir).unwrap(), INPUT_TOKENS * median);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn resident_spec(artifact: &Path) -> ModelSpec {
         let mut reads = ReadSet::default();
         reads.record(artifact);
@@ -2148,24 +2035,20 @@ mod tests {
     }
     fn write_resident_store(path: &Path, spec: &ModelSpec, flipped: bool) {
         let mut second = meta("b", None);
-        second.harness = "codex".into();
-        second.cwd = Some("/resident".into());
+        second.session.harness = cv_core::Harness::Codex;
+        second.session.cwd = Some("/resident".into());
         let mut store = store(vec![
             (meta("a", None), if flipped { vec![0.0, 1.0] } else { vec![1.0, 0.0] }),
             (second, if flipped { vec![1.0, 0.0] } else { vec![0.0, 1.0] }),
         ]);
-        store.meta[0].source_path = Some(path.with_extension("source"));
-        store.meta[0].source = Some(Snapshot {
-            primary: (7, 9),
-            dependencies: None,
+        store.meta[0].session.path = path.with_extension("source");
+        store.meta[0].source = Some(Baseline {
+            primary: None,
+            stamp: None,
+            rows: None,
         });
-        store.meta[0].hints = Some(ReferenceHints {
-            cwd: None,
-            title: Some("unused refresh title".repeat(4096)),
-            created_at: None,
-            updated_at: None,
-            message_count: 17,
-        });
+        store.meta[0].session.title = Some("unused refresh title".repeat(4096));
+        store.meta[0].session.message_count = Some(17);
         store.model = spec.key.clone();
         store.model_reads = Some(spec.reads.clone());
         save_store(path, &store).unwrap();
@@ -2205,7 +2088,11 @@ mod tests {
                 vec![1.0, 0.0]
             }
         };
-        let ask = |query, filter| search.search(query, 1, filter, || Ok(Some(resident_spec(&artifact))), load, encode);
+        let ask = |query, filter| {
+            search
+                .search(query, 1, filter, || Ok(Some(resident_spec(&artifact))), load, encode)
+                .map(|(hits, _)| hits)
+        };
         VECTOR_DECODES.with(|count| count.set(0));
         assert_eq!(ask("horizontal", crate::SearchFilter::default()).unwrap()[0].id, "a");
         assert_eq!(ask("vertical", crate::SearchFilter::default()).unwrap()[0].id, "b");
@@ -2214,7 +2101,8 @@ mod tests {
                 "horizontal",
                 crate::SearchFilter {
                     harness: Some("codex"),
-                    cwd: Some("resident")
+                    cwd: Some("resident"),
+                    ..Default::default()
                 }
             )
             .unwrap()[0]
@@ -2235,7 +2123,9 @@ mod tests {
             .store
             .meta
             .iter()
-            .all(|record| record.source_path.is_none() && record.source.is_none() && record.hints.is_none()));
+            .all(|record| record.session.path.as_os_str().is_empty()
+                && record.source.is_none()
+                && record.session.title.is_none()));
         // Atomic index publication reloads only the store, retaining the unchanged model.
         write_resident_store(&path, &resident_spec(&artifact), true);
         assert_eq!(ask("horizontal", crate::SearchFilter::default()).unwrap()[0].id, "b");
@@ -2369,7 +2259,8 @@ mod tests {
                             },
                             |_, _| vec![1.0, 0.0],
                         )
-                        .unwrap();
+                        .unwrap()
+                        .0;
                     assert_eq!(hits[0].id, "a");
                     decodes.fetch_add(VECTOR_DECODES.with(|count| count.get()), Ordering::Relaxed);
                 });
@@ -2400,7 +2291,8 @@ mod tests {
                 },
                 |_, _| vec![0.0, 1.0],
             )
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(hits[0].id, "b");
         assert_eq!(loads.load(Ordering::Relaxed), 2);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
@@ -2473,8 +2365,12 @@ mod tests {
             (0..4096)
                 .map(|i| {
                     let mut record = meta(&format!("session-{:04}", (i * 37) % 4096), None);
-                    record.harness = if i % 3 == 0 { "codex" } else { "claude" }.into();
-                    record.cwd = Some(format!("/repo/{}", i % 7));
+                    record.session.harness = if i % 3 == 0 {
+                        cv_core::Harness::Codex
+                    } else {
+                        cv_core::Harness::Claude
+                    };
+                    record.session.cwd = Some(format!("/repo/{}", i % 7).into());
                     let vector = match i % 19 {
                         0 => vec![0.0, 0.0],
                         1 => vec![f32::NAN, 1.0],
@@ -2496,6 +2392,7 @@ mod tests {
                 crate::SearchFilter {
                     harness: Some("codex"),
                     cwd: Some("/repo/2"),
+                    ..Default::default()
                 },
             ] {
                 let mut oracle: Vec<_> = store
@@ -2503,16 +2400,20 @@ mod tests {
                     .iter()
                     .enumerate()
                     .filter(|(_, record)| {
-                        filter.harness.is_none_or(|h| record.harness == h)
-                            && filter
-                                .cwd
-                                .is_none_or(|needle| record.cwd.as_ref().is_some_and(|cwd| cwd.contains(needle)))
+                        filter.harness.is_none_or(|h| record.session.harness.as_str() == h)
+                            && filter.cwd.is_none_or(|needle| {
+                                record
+                                    .session
+                                    .cwd
+                                    .as_ref()
+                                    .is_some_and(|cwd| cwd.to_string_lossy().contains(needle))
+                            })
                     })
                     .map(|(i, record)| {
                         (
                             cosine(&[1.0, 0.0], store.vector(i)),
-                            record.id.as_str(),
-                            record.harness.as_str(),
+                            record.session.id.as_str(),
+                            record.session.harness.as_str(),
                         )
                     })
                     .collect();
@@ -2526,7 +2427,13 @@ mod tests {
                     assert!(ranked.len() <= limit);
                     let actual: Vec<_> = ranked
                         .iter()
-                        .map(|row| (row.score.to_bits(), row.meta.id.as_str(), row.meta.harness.as_str()))
+                        .map(|row| {
+                            (
+                                row.score.to_bits(),
+                                row.meta.session.id.as_str(),
+                                row.meta.session.harness.as_str(),
+                            )
+                        })
                         .collect();
                     let expected: Vec<_> = oracle
                         .iter()
@@ -2547,7 +2454,7 @@ mod tests {
     fn rank_ties_do_not_depend_on_vector_row_order() {
         let records = || {
             let mut codex = meta("a", None);
-            codex.harness = "codex".into();
+            codex.session.harness = cv_core::Harness::Codex;
             vec![
                 (meta("b", None), vec![1.0, 0.0]),
                 (codex, vec![1.0, 0.0]),
@@ -2581,22 +2488,25 @@ mod tests {
             .map(|i| (meta(&format!("other-{i}"), None), vec![1.0, 0.0]))
             .collect();
         let mut wanted = meta("wanted", None);
-        wanted.harness = "codex".into();
-        wanted.cwd = Some("/repo/mixed.Path/project".into());
+        wanted.session.harness = cv_core::Harness::Codex;
+        wanted.session.cwd = Some("/repo/mixed.Path/project".into());
         records.push((wanted, vec![0.5, 0.5]));
         let store = store(records);
         for filter in [
             crate::SearchFilter {
                 harness: Some("codex"),
                 cwd: None,
+                ..Default::default()
             },
             crate::SearchFilter {
                 harness: None,
                 cwd: Some("mixed.Path/proj"),
+                ..Default::default()
             },
             crate::SearchFilter {
                 harness: Some("codex"),
                 cwd: Some("mixed.Path/proj"),
+                ..Default::default()
             },
         ] {
             let hits = rank_filtered(&store, &[1.0, 0.0], 1, filter);
@@ -2610,7 +2520,8 @@ mod tests {
             1,
             crate::SearchFilter {
                 harness: None,
-                cwd: Some("MIXED")
+                cwd: Some("MIXED"),
+                ..Default::default()
             }
         )
         .is_empty());
@@ -2670,7 +2581,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("embeddings.bin");
         let mut record = meta("escaped", None);
-        record.title = Some("\n\"\\雪".repeat(4096));
+        record.label = Some("\n\"\\雪".repeat(4096));
         // Cross multiple decode-buffer boundaries, retaining every float bit including NaNs.
         let vector: Vec<_> = (0..20_003u32)
             .map(|i| f32::from_bits(i.wrapping_mul(2_654_435_761)))
@@ -2679,7 +2590,7 @@ mod tests {
         save_store(&path, &original).unwrap();
         let encoded = std::fs::read(&path).unwrap();
         let loaded = load_store(&path).unwrap();
-        assert_eq!(loaded.meta[0].title, original.meta[0].title);
+        assert_eq!(loaded.meta[0].label, original.meta[0].label);
         assert_eq!(
             loaded.vectors.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             original.vectors.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
@@ -2741,49 +2652,12 @@ mod tests {
         assert_eq!(back.model, "test");
         assert_eq!(back.dim, 3);
         assert_eq!(back.meta.len(), 2);
-        assert_eq!(back.meta[0].id, "a");
-        assert_eq!(back.meta[0].created_at, Some(1));
-        assert_eq!(back.meta[1].title.as_deref(), Some("title-b"));
+        assert_eq!(back.meta[0].session.id, "a");
+        assert_eq!(back.meta[0].session.created_at.map(|t| t.timestamp()), Some(1));
+        assert_eq!(back.meta[1].label.as_deref(), Some("title-b"));
         assert_eq!(back.vectors, s.vectors); // bit-exact through to_le_bytes/from_le_bytes
                                              // And the loaded store ranks like the in-memory one.
         assert_eq!(rank(&back, &[0.25, -1.5, 3.0], 1)[0].id, "a");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// An embedding store written by an older build (pure JSON, with or without the date fields)
-    /// must still load — and `migrate_legacy_sibling` upgrades it to the binary default path.
-    #[test]
-    fn legacy_json_store_loads_and_migrates() {
-        let json = r#"{
-            "model": "minishlab/potion-base-8M",
-            "records": [{
-                "id": "old", "harness": "claude", "cwd": null, "title": "t",
-                "preview": "p", "vector": [0.5, 0.5]
-            }]
-        }"#;
-        let dir = std::env::temp_dir().join(format!("cv-emb-legacy-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let legacy_path = dir.join("embeddings.json");
-        std::fs::write(&legacy_path, json).unwrap();
-
-        // Loads directly (dateless fields default to None), ranks, and maps to a hit.
-        let store = load_store(&legacy_path).unwrap();
-        assert_eq!(store.dim, 2);
-        assert_eq!(store.meta.len(), 1);
-        assert_eq!(store.meta[0].created_at, None);
-        let hits = rank(&store, &[0.5, 0.5], 1);
-        assert_eq!(hits[0].id, "old");
-        assert_eq!(hits[0].created_at, None);
-
-        // Sibling migration: a missing binary store next to the legacy JSON gets created.
-        let bin_path = dir.join("embeddings.bin");
-        migrate_legacy_sibling(&bin_path);
-        assert!(bin_path.exists(), "legacy store should migrate to the binary path");
-        let migrated = load_store(&bin_path).unwrap();
-        assert_eq!(migrated.meta.len(), 1);
-        assert_eq!(migrated.vectors, vec![0.5, 0.5]);
-        assert!(legacy_path.exists(), "legacy file is left in place");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2800,7 +2674,3 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
-
-#[cfg(test)]
-#[path = "semantic_actual_probe.rs"]
-mod actual_probe;

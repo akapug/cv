@@ -11,7 +11,7 @@ the user saw: `say`/`ask` events), `history_item.json` (the task-history row), `
 | shell | `execute_command`, `read_command_output` | as above, plus ui `command` / `command_output` | yes | ToolUse / ToolResult |
 | todo / plan list | `update_todo_list` | tool call; the list itself lives in ui messages | yes | ToolUse `update_todo_list` |
 | modes | `switch_mode`, `--mode`, `history_item.mode` | tool call; the task's mode in `history_item.json` | yes | ToolUse; `extra.roo.mode` |
-| sub-agents | `new_task` (child task, own dir) | parent: tool call + ui `subtask_result`; child: `history_item.parentTaskId` | yes | child session with `lineage.parent` |
+| sub-agents | `new_task` (child task, own dir) | parent: tool call + ui `subtask_result`; child: `history_item.parentTaskId` | yes | child session with `lineage.parent`; matched mixed-turn result is a `subagent_return` detail |
 | follow-up question | `ask_followup_question` | tool call + ui `followup` ask + the answer as `user_feedback` | yes | ToolUse, then the answer turn |
 | completion | `attempt_completion` | tool call + ui `completion_result` | yes | ToolUse |
 | checkpoints | shadow git per task | ui `checkpoint_saved` (commit hash); git repo in `checkpoints/` | yes (repo not copied) | `checkpoint/create` (store, `ui_messages.json`) |

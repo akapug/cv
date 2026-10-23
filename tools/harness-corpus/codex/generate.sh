@@ -78,7 +78,8 @@ default_tools_approval_mode = "approve"
 trust_level = "trusted"
 TOML
 
-run() { echo "--- codex exec $*" | cut -c1-140; "$BIN" exec --skip-git-repo-check -C "$PROJECT" "$@" </dev/null >>"$WORK/exec.log" 2>&1 || echo "    (exit $?)"; }
+HOOK_ARGS=()
+run() { echo "--- codex exec $*" | cut -c1-140; "$BIN" exec --skip-git-repo-check "${HOOK_ARGS[@]}" -C "$PROJECT" "$@" </dev/null >>"$WORK/exec.log" 2>&1 || echo "    (exit $?)"; }
 last_id() { ls -t "$CODEX_HOME"/sessions/*/*/*/rollout-*.jsonl | head -1 | sed -E 's/.*-([0-9a-f-]{36})\.jsonl$/\1/'; }
 want() { case " $ONLY " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 SCEN=()
@@ -116,6 +117,41 @@ if want subagent; then # 7 sub-agents (multi_agent feature)
   SCEN+=("subagent")
 fi
 
+if want hooks; then
+  # One prior real editor gives start a catalog row and edit a live competing writer.
+  CV="${CV_HOOK_BINARY:?hooks scenario needs an absolute CV_HOOK_BINARY}"
+  export CLUSTERVISION_HOME="$WORK/cv-home" CV_ENDPOINT="corpus:hooks"
+  mkdir -p "$CLUSTERVISION_HOME"
+  run "Use tools.apply_patch through functions.exec to apply this exact patch (one line per comma): *** Begin Patch, *** Update File: notes.txt, @@, -TODO: fix, +READY: fix, *** End Patch. Reply only edited."
+  "$CV" index >"$WORK/index.log" 2>&1
+  "$CV" task decide "hook fixture choice" --for corpus:hooks --default left --option right >"$WORK/decision.log"
+  "$CV" hooks install codex >"$WORK/install.log"
+  HOOK_ARGS=(--dangerously-bypass-hook-trust)
+  # Keep raw live payload/output evidence next to the scratch store, then scrub before copying.
+  python3 -I - "$CODEX_HOME/hooks.json" "$HERE/hook_capture.py" "$WORK/hooks.jsonl" <<'PYHOOK'
+import json, shlex, sys
+path, capture, log = sys.argv[1:]
+with open(path) as source:
+    settings = json.load(source)
+for groups in settings["hooks"].values():
+    for group in groups:
+        for handler in group["hooks"]:
+            command = handler["command"]
+            assert command.endswith(" --harness codex"), command
+            handler["command"] = shlex.join(["python3", "-I", capture, log]) + " " + command
+with open(path, "w") as output:
+    json.dump(settings, output)
+PYHOOK
+  run "Do not use tools. Say the number of cv decisions owed that the hooks reported, and one earlier session id."
+  id="$(last_id)"
+  run -c model_auto_compact_token_limit=200 resume "$id" "Do not use tools. Say whether context compacted and which cv command reads the lost context."
+  run "Use tools.apply_patch through functions.exec with this exact patch (one line per comma): *** Begin Patch, *** Update File: notes.txt, @@, -READY: fix, +DONE: fix, *** End Patch. If permission is denied, report denied and stop. Do not use any other tool."
+  run --enable multi_agent "Spawn exactly one sub-agent with task 'reply with the single word ok', wait for it, and report its answer. Do not retry or follow up."
+  python3 -I "$HERE/check_hooks.py" "$WORK/hooks.jsonl" "$CLUSTERVISION_HOME/lanes.jsonl" "$CV"
+  [ "$(cat notes.txt)" = "READY: fix" ] || { echo "guarded patch was applied" >&2; exit 1; }
+  SCEN+=("hooks")
+fi
+
 CALLS="$(corpus_calls)"
 echo "model calls: $CALLS"
 
@@ -127,7 +163,10 @@ for f in session_index.jsonl history.jsonl; do
   [ -e "$CODEX_HOME/$f" ] && cp "$CODEX_HOME/$f" "$OUT/.codex/"
 done
 [ -d "$CODEX_HOME/archived_sessions" ] && cp -R "$CODEX_HOME/archived_sessions" "$OUT/.codex/"
+if want hooks; then cp "$WORK/hooks.jsonl" "$OUT/hooks.jsonl"; fi
 corpus_scrub "$OUT"
+GENERATOR_DIRTY=false
+[ -z "$(git -C "$HERE" status --porcelain -- . ../key_proxy.py ../lib.sh)" ] || GENERATOR_DIRTY=true
 corpus_manifest "$OUT" \
   "harness=\"codex\"" "version=\"$V\"" "generated=\"$(date -u +%Y-%m-%d)\"" \
   "model=\"$MODEL via Z.ai coding endpoint, through key_proxy.py --translate responses\"" \
@@ -135,5 +174,5 @@ corpus_manifest "$OUT" \
   "model_calls=$CALLS" \
   "scenarios=[$(printf '"%s",' "${SCEN[@]}" | sed 's/,$//')]" \
   "skipped=[]" \
-  "generator_commit=\"$(git -C "$HERE" rev-parse --short HEAD)\""
+  "generator_commit=\"$(git -C "$HERE" rev-parse --short HEAD)\"" "generator_dirty=$GENERATOR_DIRTY"
 corpus_size_check "$OUT"

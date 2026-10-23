@@ -16,7 +16,7 @@ record types (`dist/main.mjs`), and the stores in `crates/cv-core/tests/corpus/k
 | tool error | `tool.result.result.isError` | yes | `ToolResult{is_error}` |
 | thinking | `content.part{part:{type:"think"}}` | yes | `Thinking` (empty ones dropped) |
 | image input (`ReadMediaFile`) | image part in `tool.result.output` | **no**: the model used `Bash`/`Read` on `dot.png` | `Image` inside the `ToolResult` |
-| todo list (`TodoList`) | tool call + `tools.update_store{key,value}` | yes | `ToolUse`; record carried |
+| todo list (`TodoList`) | tool call + `tools.update_store{key,value}` | yes | `ToolUse`; latest todo `plan/state` (presence only under Facts) |
 | plan mode (`EnterPlanMode`/`ExitPlanMode`) | `plan_mode.enter/exit`, `plan.revision`, `agents/main/plans/<slug>.md`, `plan/<slug>/v1.md` | yes | `ToolUse`; records carried; plan files not read |
 | background shell (`run_in_background`), `TaskOutput` | `task.started`, `task.terminated`, `agents/main/tasks/<id>.json`, `tasks/<id>/output.log`; completion as `context.append_message` origin `task` | yes (`WaitFor`, `TaskStop`, `TaskList` not called) | `notice`/Harness for `task.terminated`; the notification `injected_context`/Scheduler |
 | schedules (`CronCreate`/`CronList`/`CronDelete`) | `cron.add`, `cron.delete` | yes; `cron.fired` not (needs a live process at the scheduled time) | `ToolUse`; records carried |

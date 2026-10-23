@@ -7,6 +7,8 @@ use crate::{emit::ThinkingMode, lazy::Resolver, Harness, Json, Message, Text};
 use anyhow::Result;
 use std::io::Write;
 
+/// The one Codex envelope, `{"type":kind,"timestamp":…,"payload":…}`, with the payload written
+/// in place.
 pub(super) fn record(
     lines: &mut JsonlStage,
     timestamp: &str,
@@ -22,6 +24,12 @@ pub(super) fn record(
         payload(writer)?;
         writer.write_all(b"}")?;
         Ok(())
+    })
+}
+/// [`record`] with an owned payload value.
+pub(super) fn value(lines: &mut JsonlStage, timestamp: &str, kind: &str, payload: &serde_json::Value) -> Result<()> {
+    record(lines, timestamp, kind, |writer| {
+        Ok(serde_json::to_writer(writer, payload)?)
     })
 }
 pub(super) fn message_string(
@@ -71,39 +79,37 @@ pub(super) fn message(
         .content
         .iter()
         .filter_map(|block| crate::emit::thinking::text(block, Harness::Codex, mode, resolver).transpose());
-    match (texts.next().transpose()?, texts.next().transpose()?, event_type) {
-        (Some(value), None, Some(event_type)) if value.inline_str().is_some() => {
-            return super::push_text(
-                lines,
-                timestamp,
-                role,
-                content_type,
-                event_type,
-                value.inline_str().unwrap(),
-            )
-        }
-        (None, None, Some(event_type)) => {
-            return super::push_text(lines, timestamp, role, content_type, event_type, "")
-        }
-        _ => {}
+    // A twinned turn of one inline text (or none) is written straight from that string.
+    let first = texts.next().transpose()?;
+    let only = match (&first, texts.next().transpose()?) {
+        (Some(value), None) => value.inline_str(),
+        (None, None) => Some(""),
+        _ => None,
+    };
+    match only.filter(|_| event_type.is_some()) {
+        Some(only) => twins(lines, timestamp, role, content_type, event_type, &|writer| {
+            Ok(serde_json::to_writer(writer, only)?)
+        }),
+        None => twins(lines, timestamp, role, content_type, event_type, &|writer| {
+            message_string(writer, message, resolver, mode)
+        }),
     }
-    twins(lines, timestamp, role, content_type, event_type, &|writer| {
-        message_string(writer, message, resolver, mode)
-    })
 }
 pub(super) fn text(lines: &mut JsonlStage, timestamp: &str, value: &Text, resolver: &Resolver) -> Result<()> {
-    if let Some(inline) = value.inline_str() {
-        return super::push_text(lines, timestamp, "assistant", "output_text", "agent_message", inline);
-    }
     twins(
         lines,
         timestamp,
         "assistant",
         "output_text",
         Some("agent_message"),
-        &|writer| string(writer, value, resolver, ""),
+        &|writer| match value.inline_str() {
+            Some(inline) => Ok(serde_json::to_writer(writer, inline)?),
+            None => string(writer, value, resolver, ""),
+        },
     )
 }
+/// A text turn as Codex's legacy pair: the `response_item` message and, when `event_type` names
+/// one, its `event_msg` twin, both carrying the same `body` string.
 fn twins(
     lines: &mut JsonlStage,
     timestamp: &str,

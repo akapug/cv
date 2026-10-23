@@ -27,4 +27,5 @@
 
 - [Command reference](reference.md)
 - [Architecture](architecture.md)
+- [Compatibility promise](compatibility.md)
 - [Troubleshooting & FAQ](troubleshooting.md)

@@ -1,0 +1,11 @@
+# Written by tools/harness-corpus. Never regenerate a committed version in place.
+harness = "claude"
+version = "2.1.304"
+generated = "2026-10-19"
+model = "glm-5.3-flash (switch target glm-5.3) via Z.ai's Anthropic endpoint, through key_proxy.py"
+model_calls = 82
+scenarios = ["chat","resume","session_name","model_switch","compaction","fork_session","thinking","hooks","claude_md","tools","parallel_tools","tool_error","permission_denied","large_tool_result","write","notebook","file_history","image_input","image_tool_result","plan_mode","task_list","subagent","custom_agent_type","send_message","fork_subagent","background_agent","agent_notification","background_bash","task_notification","cron","schedule_wakeup","mcp","tool_search_deferred","skill_slash_command","skill_tool","workflow","worktree","web_fetch","structured_output","provider_error","api_error_retry","max_turns","interrupt"]
+skipped = ["monitor (remote feature flag tengu_amber_sentinel; never on for a third-party endpoint)"]
+generator_commit = "7ad73584"
+tree = "generator_commit is the branch head; the one uncommitted edit in the worktree was crates/cv-core/src/writer_version.rs (the roster, outside tools/harness-corpus)"
+proxy = "key_proxy.py --translate passthrough; the errors scenario is answered by the proxy (500 on CORPUS-PROVIDER-ERROR), never forwarded"

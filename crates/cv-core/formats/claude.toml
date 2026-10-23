@@ -19,13 +19,17 @@ store = [
 
 [upstream]
 repo = "Claude Code (Bun binary, ~/.local/share/claude/versions/<v>; npm @anthropic-ai/claude-code)"
-commit = "2.1.296 (corpus tests/corpus/claude/2.1.296; earlier verification 2.1.278)"
-date = "2026-10-11"
+commit = "2.1.304 (corpus tests/corpus/claude/2.1.304; earlier 2.1.296, 2.1.278)"
+date = "2026-10-19"
 
 [types]
 mode = { status = "carried", note = "UI mode" }
 "permission-mode" = { status = "carried", note = "permission mode" }
 "atis-latch" = { status = "carried", note = "latch state" }
+"isolation-latch" = { status = "carried", note = "isolation side latch {side} (2.1.30x)" }
+"api-request" = { status = "carried", note = "request ledger (2.1.300+): one per API call — params, base/keep + tail blob hashes, cacheControl, requestDigest" }
+"api-request-shape" = { status = "carried", note = "request ledger: the system prompt + tool schemas one or more requests sent, keyed by shapeHash" }
+"api-request-blob" = { status = "carried", note = "request ledger: one request message keyed by hash; its `message` is a request body, never a turn" }
 "last-prompt" = { status = "carried", note = "loader leaf pointer {leafUuid, lastPrompt, explicit?, rewound?}" }
 "queue-operation" = { status = "carried", note = "input queue" }
 "cost-state" = { status = "carried", note = "cumulative cost / durations / modelUsage" }
@@ -87,5 +91,6 @@ result = { status = "carried", note = "legacy sub-agent telemetry / journal resu
 "attachment.read_truncation_notice" = { status = "generic", note = "rendered → injected context" }
 "attachment.plan_mode" = { status = "generic", note = "rendered → injected context" }
 "attachment.structured_output" = { status = "generic", note = "--json-schema result; rendered → injected context" }
+"attachment.max_turns_reached" = { status = "generic", note = "--max-turns hit {maxTurns, turnCount, exitCommitted} (2.1.302+); never rendered, so carried only" }
 # Store layout the adapter walks (see `store` above) — path segments, not record types.
 "assistant.synthetic" = { status = "generic", note = "model `<synthetic>` / isApiErrorMessage → System notice or error" }

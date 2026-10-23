@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""Parsimony gate: product code per crate stays within a checked-in budget, and the tree holds no
-committed evidence. Growth is allowed only by editing tools/size-budget.txt in the same change, so
-it is a decision a reviewer sees, not drift. The budget also ratchets down: one more than
-SLACK above the measured size fails, so freed room is not silently refilled.
+"""Report product/test size drift against the last release, and check repository hygiene.
+
+The baseline is the tree at tag `v<workspace version>` (Cargo.toml still says the last release
+during development), read from git's blobs: nothing is committed and nothing is refreshed per
+commit. Drift is printed as GitHub `::notice::` annotations and never fails; a module growing is a
+question for design review, not a failure. Hygiene (committed measurement artifacts, design docs
+over the line cap) still fails. Without the tag (a shallow clone) the drift is not measured:
+`git fetch --no-tags --depth=1 origin refs/tags/<tag>:refs/tags/<tag>` brings it.
 
 Product lines: non-blank lines of crates/<crate>/src/**/*.rs outside `#[cfg(test)]` items (a test
 module, import or helper is skipped to its matching brace or `;`, with strings, raw strings, char
 literals and comments masked), excluding tests.rs files, `tests` directories and files declared
 only as `#[cfg(test)] mod` (including `#[path]` ones).
-Run from the repository root: python3 -I tools/check-size.py [--write]"""
+Run from the repository root: python3 -I tools/check-size.py"""
 
 import pathlib
+import posixpath
 import re
 import subprocess
 import sys
 
-BUDGET = pathlib.Path("tools/size-budget.txt")
-SLACK = 0.05
 DOC_MAX_LINES = 250
 CFG_TEST = re.compile(r"#\[(cfg\((test|all\(test\b[^\]]*)\)|test)\]")  # cfg(test) items and #[test] fns
 MOD_DECL = re.compile(r"\bmod\s+(\w+)\s*;")
+RAW_STRING = re.compile(r'b?r(#*)"')
+CHAR_LITERAL = re.compile(r"'(\\.[^']*|[^\\'])'")
 PATH_ATTR = re.compile(r'#\[path\s*=\s*"([^"]+)"\]')
 
 
@@ -41,17 +46,17 @@ def code_mask(text: str) -> list[bool]:
                     depth, j = depth - 1, j + 2
                 else:
                     j += 1
-        elif (m := re.match(r'b?r(#*)"', text[i:])) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+        elif (m := RAW_STRING.match(text, i)) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
             close = '"' + m.group(1)
-            j = text.find(close, i + m.end())
+            j = text.find(close, m.end())
             j = n if j < 0 else j + len(close)
         elif c == '"' or text.startswith('b"', i) and (i == 0 or not text[i - 1].isalnum()):
             j = i + (2 if c == "b" else 1)
             while j < n and text[j] != '"':
                 j += 2 if text[j] == "\\" else 1
             j += 1
-        elif c == "'" and (m := re.match(r"'(\\.[^']*|[^\\'])'", text[i:])):
-            j = i + m.end()  # a char literal; a lifetime has no closing quote and stays code
+        elif c == "'" and (m := CHAR_LITERAL.match(text, i)):
+            j = m.end()  # a char literal; a lifetime has no closing quote and stays code
         else:
             i += 1
             continue
@@ -81,11 +86,11 @@ def item_end(text: str, mask: list[bool], start: int) -> int:
     return len(text)
 
 
-def strip_test_items(path: pathlib.Path, excluded: set[pathlib.Path]) -> str:
+def strip_test_items(path: str, text: str, excluded: set[str]) -> str:
     """The file's text without `#[cfg(test)]` items; test-only module files go into `excluded`."""
-    text = path.read_text(encoding="utf-8", errors="replace")
     mask = code_mask(text)
     out, pos = [], 0
+    name, parent = posixpath.basename(path), posixpath.dirname(path)
     for m in CFG_TEST.finditer(text):
         if m.start() < pos or not mask[m.start()]:
             continue
@@ -93,38 +98,69 @@ def strip_test_items(path: pathlib.Path, excluded: set[pathlib.Path]) -> str:
         item = text[m.end():end]
         if decl := MOD_DECL.search(item):
             attr = PATH_ATTR.search(item)
-            base = path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.with_suffix("")
+            base = parent if name in ("mod.rs", "lib.rs", "main.rs") else path.removesuffix(".rs")
             if attr:
-                excluded.add((path.parent / attr.group(1)).resolve())
+                excluded.add(posixpath.normpath(posixpath.join(parent, attr.group(1))))
             else:
-                excluded.add((base / f"{decl.group(1)}.rs").resolve())
-                excluded.add((base / decl.group(1) / "mod.rs").resolve())
+                excluded.add(f"{base}/{decl.group(1)}.rs")
+                excluded.add(f"{base}/{decl.group(1)}/mod.rs")
         out.append(text[pos:m.start()])
         pos = end
     out.append(text[pos:])
     return "".join(out)
 
 
-def product_lines(crate: pathlib.Path) -> int:
-    files = sorted((crate / "src").rglob("*.rs"))
-    excluded: set[pathlib.Path] = set()
-    stripped = {path: strip_test_items(path, excluded) for path in files}
-    total = 0
-    for path in files:
-        if path.name == "tests.rs" or "tests" in path.relative_to(crate / "src").parts[:-1]:
-            continue
-        if path.resolve() in excluded:
-            continue
-        total += sum(1 for line in stripped[path].splitlines() if line.strip())
-    return total
+def counted(path: str) -> bool:
+    """`crates/<crate>/src/**/*.rs` and `crates/<crate>/tests/**/*.rs`."""
+    parts = path.split("/")
+    return len(parts) > 3 and parts[0] == "crates" and parts[2] in ("src", "tests") and path.endswith(".rs")
 
 
-def measure() -> dict[str, int]:
-    return {
-        crate.name: product_lines(crate)
-        for crate in sorted(pathlib.Path("crates").iterdir())
-        if (crate / "src").is_dir()
-    }
+def working_tree() -> dict[str, str]:
+    return {p.as_posix(): p.read_text(encoding="utf-8", errors="replace")
+            for p in sorted(pathlib.Path("crates").rglob("*.rs")) if counted(p.as_posix())}
+
+
+def tag_tree(tag: str) -> dict[str, str] | None:
+    """Every counted file at `tag`, from git's blobs; None when the tag is not in this clone."""
+    listed = subprocess.run(["git", "ls-tree", "-r", "--name-only", tag, "--", "crates"], capture_output=True, text=True)
+    if listed.returncode != 0:
+        return None
+    paths = [path for path in listed.stdout.splitlines() if counted(path)]
+    blobs = subprocess.run(["git", "cat-file", "--batch"], input="".join(f"{tag}:{p}\n" for p in paths).encode(),
+                           capture_output=True, check=True).stdout
+    files, at = {}, 0
+    for path in paths:
+        header_end = blobs.index(b"\n", at)
+        size = int(blobs[at:header_end].split()[2])
+        files[path] = blobs[header_end + 1:header_end + 1 + size].decode("utf-8", errors="replace")
+        at = header_end + 1 + size + 1
+    return files
+
+
+def module_key(crate: str, path: str) -> str:
+    """`crate:module` where a module is a top-level file or directory under src, and `harness/*`
+    and `cmd/*` split one level deeper (an adapter or a command is the unit a lane owns)."""
+    parts = path.split("/")[3:]
+    key = "/".join(parts[:2]) if parts[0] in ("harness", "cmd") and len(parts) > 1 else parts[0]
+    return f"{crate}:{key.removesuffix('.rs')}"
+
+
+def measure(files: dict[str, str]) -> dict[str, int]:
+    """Product lines per crate and per module (`crate:module`), test lines per crate (`crate:tests`)."""
+    sizes: dict[str, int] = {}
+    excluded: set[str] = set()
+    stripped = {path: strip_test_items(path, text, excluded) for path, text in files.items() if path.split("/")[2] == "src"}
+    for path, text in files.items():
+        crate = path.split("/")[1]
+        every = sum(1 for line in text.splitlines() if line.strip())
+        product = 0
+        if path in stripped and posixpath.basename(path) != "tests.rs" and "tests" not in path.split("/")[3:-1] and path not in excluded:
+            product = sum(1 for line in stripped[path].splitlines() if line.strip())
+            sizes[module_key(crate, path)] = sizes.get(module_key(crate, path), 0) + product
+        sizes[crate] = sizes.get(crate, 0) + product
+        sizes[f"{crate}:tests"] = sizes.get(f"{crate}:tests", 0) + every - product
+    return sizes
 
 
 def tracked(*patterns: str) -> list[str]:
@@ -133,40 +169,30 @@ def tracked(*patterns: str) -> list[str]:
 
 
 def main() -> int:
-    sizes = measure()
-    if "--write" in sys.argv:
-        BUDGET.write_text(
-            "# Product lines per crate (tools/check-size.py). Raise a number only as a reviewed decision.\n"
-            + "".join(f"{name} {lines}\n" for name, lines in sizes.items())
-        )
-        print(f"wrote {BUDGET}")
-        return 0
+    version = re.search(r'^version = "([^"]+)"', pathlib.Path("Cargo.toml").read_text(), re.M)
+    tag = f"v{version.group(1)}"
+    now = measure(working_tree())
+    base = tag_tree(tag)
+    if base is None:
+        print(f"::warning::size drift not measured: tag {tag} is not in this clone "
+              f"(git fetch --no-tags --depth=1 origin refs/tags/{tag}:refs/tags/{tag})")
+    else:
+        before = measure(base)
+        for name in sorted(now.keys() | before.keys()):
+            lines, previous = now.get(name, 0), before.get(name, 0)
+            if lines != previous:
+                print(f"::notice title=size {name}::{lines} lines ({lines - previous:+d} since {tag})")
+    for crate in sorted(name for name in now if ":" not in name):
+        since = f" ({now[crate] - before.get(crate, 0):+d} since {tag})" if base is not None else ""
+        print(f"{crate:12} {now[crate]:7} product lines{since}")
 
-    failures = []
-    budget = {}
-    for line in BUDGET.read_text().splitlines():
-        if line.strip() and not line.startswith("#"):
-            name, lines = line.split()
-            budget[name] = int(lines)
-    for name, lines in sizes.items():
-        limit = budget.get(name)
-        if limit is None:
-            failures.append(f"{name}: {lines} product lines and no budget (add it to {BUDGET})")
-        elif lines > limit:
-            failures.append(f"{name}: {lines} product lines exceed the budget of {limit} by {lines - limit}")
-        elif lines < limit / (1 + SLACK):
-            failures.append(f"{name}: budget {limit} is more than {SLACK:.0%} above the {lines} measured; lower it")
-        print(f"{name:12} {lines:7} / {limit if limit is not None else '-'}")
-    for name in budget.keys() - sizes.keys():
-        failures.append(f"{name}: budgeted but no such crate; remove it from {BUDGET}")
-
+    failures: list[str] = []
     for path in tracked("docs/*.json", "docs/**/*.json", "tools/profiling/results/*"):
         failures.append(f"{path}: measurements belong in commit messages, not committed files")
     for path in tracked("docs/design/*.md"):
         n = len(pathlib.Path(path).read_text().splitlines())
         if n > DOC_MAX_LINES:
             failures.append(f"{path}: {n} lines; design docs stay under {DOC_MAX_LINES} (history lives in git)")
-
     for failure in failures:
         print(f"FAIL {failure}", file=sys.stderr)
     return 1 if failures else 0

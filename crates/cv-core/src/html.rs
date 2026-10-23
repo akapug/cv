@@ -5,7 +5,9 @@
 //! session-derived string is HTML-escaped (see [`escape`]) so a transcript containing `<script>`
 //! etc. can never inject markup into the page.
 
-use crate::ir::{human_bytes, Block, Message, Role, Usage};
+use crate::ir::{human_bytes, Block, Harness, Message, Role, Usage};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 
 fn render_usage(u: &Usage, out: &mut String) {
     let mut parts: Vec<String> = Vec::new();
@@ -154,26 +156,28 @@ fn role_class(r: Role) -> &'static str {
     }
 }
 
-/// A stable, distinct color for each harness badge.
-fn harness_color(name: &str) -> &'static str {
-    match name {
-        "claude" => "#d97757",
-        "codex" => "#10a37f",
-        "grok" => "#1d1d1f",
-        "opencode" => "#5b6ee1",
-        "gemini" => "#4285f4",
-        "hermes" => "#8e44ad",
-        "openclaw" => "#b8860b",
-        "cursor" => "#111111",
-        "kimi" => "#0050ff",
-        "qwen" => "#6a3ec0",
-        "lmstudio" => "#2563eb",
-        "cline" => "#0aa",
-        "roo" => "#e0533d",
-        "continue" => "#444",
-        "goose" => "#7a5c3e",
-        "devin" => "#3b6ee8",
-        _ => "#555",
+/// A stable color for each harness badge; the five without one of their own share the neutral.
+fn harness_color(h: Harness) -> &'static str {
+    match h {
+        Harness::Claude => "#d97757",
+        Harness::Codex => "#10a37f",
+        Harness::Grok => "#1d1d1f",
+        Harness::OpenCode => "#5b6ee1",
+        Harness::Gemini => "#4285f4",
+        Harness::Hermes => "#8e44ad",
+        Harness::OpenClaw => "#b8860b",
+        Harness::Cursor => "#111111",
+        Harness::Kimi => "#0050ff",
+        Harness::Qwen => "#6a3ec0",
+        Harness::LmStudio => "#2563eb",
+        Harness::Cline => "#0aa",
+        Harness::Roo => "#e0533d",
+        Harness::Continue => "#444",
+        Harness::Goose => "#7a5c3e",
+        Harness::Devin => "#3b6ee8",
+        Harness::KimiCode | Harness::Zed | Harness::ChatGptExport | Harness::ClaudeExport | Harness::OpenSession => {
+            "#555"
+        }
     }
 }
 
@@ -218,7 +222,7 @@ pub fn share_begin(meta: &ShareMeta) -> String {
     let _ = write!(
         out,
         "<span class=\"badge\" style=\"background:{}\">{}</span>",
-        harness_color(meta.harness.as_str()),
+        harness_color(meta.harness),
         escape(meta.harness.as_str()),
     );
     if meta.redacted {
@@ -252,18 +256,9 @@ pub fn share_begin(meta: &ShareMeta) -> String {
 
 /// One message card. `idx` becomes the anchor id (`#m0`, `#m1`, …) used by keyboard nav.
 /// A source error may leave a prefix in `out`; callers must discard the staged card on failure.
-pub fn share_message(m: &Message, idx: usize, out: &mut String) -> anyhow::Result<()> {
-    share_message_with_resolver(m, idx, out, &crate::Resolver::new(None))
-}
-
 /// Render lazy text using the caller's session source for implicit spans. Failed source reads
 /// leave only a staged prefix, which the caller must discard.
-pub fn share_message_with_resolver(
-    m: &Message,
-    idx: usize,
-    out: &mut String,
-    resolver: &crate::Resolver,
-) -> anyhow::Result<()> {
+pub fn share_message(m: &Message, idx: usize, out: &mut String, resolver: &crate::Resolver) -> anyhow::Result<()> {
     use std::fmt::Write as _;
     let role = role_class(m.role);
     let _ = writeln!(out, "<section class=\"msg msg-{role}\" id=\"m{idx}\">");
@@ -427,8 +422,8 @@ fn input_preview(input: &crate::Json) -> anyhow::Result<String> {
     if let Some(preview) = input.with_view(|view| {
         for key in KEYS {
             if let Some(field) = view.get(key)? {
-                if let Some(head) = crate::projection::string_prefix(field, 81)? {
-                    return Ok(Some(crate::ir::truncate(&head, 80)));
+                if let Some(head) = crate::projection::Head::of_string(field, 80)? {
+                    return Ok(Some(head));
                 }
             }
         }
@@ -436,9 +431,7 @@ fn input_preview(input: &crate::Json) -> anyhow::Result<String> {
     })? {
         return Ok(preview);
     }
-    let mut head = crate::projection::Head::new(81 * 4);
-    head.push_json(input)?;
-    Ok(crate::ir::truncate(head.as_str(), 80))
+    input.with_view(|view| crate::projection::Head::of_json(view, 80))
 }
 
 /// The 🔮 share theme: dark by default (deep violet-black with a soft crystal glow), light via
@@ -753,13 +746,8 @@ mod tests {
         });
 
         Session {
-            source_stamp: None,
-            id: "abc123".into(),
-            harness: Harness::Claude,
             cwd: Some("/home/<user>/proj".into()),
             title: Some("Test & <Session>".into()),
-            created_at: None,
-            updated_at: None,
             model: Some("claude-opus".into()),
             git: Some(GitInfo {
                 branch: Some("dev".into()),
@@ -767,11 +755,7 @@ mod tests {
                 remote: None,
             }),
             messages: vec![system, user, assistant, tool],
-            source_path: None,
-            extra: serde_json::Map::new(),
-            principal: None,
-            system_prompt: None,
-            lineage: crate::ir::Lineage::default(),
+            ..Session::new("abc123", Harness::Claude)
         }
     }
 
@@ -801,7 +785,7 @@ mod tests {
         let meta = sample_share_meta(redacted);
         let mut doc = share_begin(&meta);
         for (i, m) in session.messages.iter().enumerate() {
-            share_message(m, i, &mut doc).unwrap();
+            share_message(m, i, &mut doc, &crate::Resolver::new(None)).unwrap();
         }
         doc.push_str(&share_end(&meta, 3, "0.9.11"));
         doc
@@ -928,7 +912,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&body)?)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let text = source
-            .read_range_value(0, source.len(), |view| view.source_text())?
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
+                view.source_text()
+            })?
             .unwrap();
         let mut lazy = Message::new(Role::Assistant);
         lazy.content = vec![
@@ -952,13 +938,13 @@ mod tests {
         owned.materialize(&crate::Resolver::new(None))?;
         let mut before = String::new();
         let mut after = String::new();
-        share_message(&owned, 0, &mut before)?;
-        share_message(&lazy, 0, &mut after)?;
+        share_message(&owned, 0, &mut before, &crate::Resolver::new(None))?;
+        share_message(&lazy, 0, &mut after, &crate::Resolver::new(None))?;
         assert_eq!(before, after);
         assert!(!after.contains("<script>bad"));
         assert!(after.contains("&lt;script&gt;bad"));
         std::fs::write(&path, b"changed")?;
-        assert!(share_message(&lazy, 0, &mut String::new()).is_err());
+        assert!(share_message(&lazy, 0, &mut String::new(), &crate::Resolver::new(None)).is_err());
         Ok(())
     }
 }

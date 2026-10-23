@@ -1,5 +1,5 @@
 //! LLM-backed features over sessions: the abstractive digest behind `cv pack` (`CV_PACK_LLM`) and
-//! the `--generate` continuation of `cv splice`/`cv loom`, via OpenRouter / Anthropic / a local
+//! the `--generate` continuation of `cv splice`, via OpenRouter / Anthropic / a local
 //! OpenAI-compatible server. Two blocking POSTs on `ureq`; no async stack.
 //!
 //! Provider is chosen by environment: `LMSTUDIO_API_BASE` (local, wins), then `OPENROUTER_API_KEY`,
@@ -21,14 +21,44 @@ pub(crate) struct DigestOptions {
     /// Model id (OpenRouter provider-prefixed, e.g. `anthropic/claude-…`, or an Anthropic model).
     /// Overrides the provider default when set.
     pub model: Option<String>,
-    /// Digest a whole project (all sessions for a cwd) rather than a single session.
+    /// Label the prompt as project-scoped; the caller assembles any multi-session input.
     pub project: bool,
+    /// Bytes of rendered transcript the model may receive (`cv pack --context-bytes`). Unset: the
+    /// model's own context window, asked of the provider (see [`TranscriptLimit`]).
+    pub context_bytes: Option<usize>,
 }
 
-/// The transcript is truncated to this many characters before being sent to the model. We keep a
-/// head + tail so both the framing of the session and its conclusions survive. ~60k chars is a few
-/// tens of thousands of tokens — comfortably within a small-model context while staying cheap.
-const TRANSCRIPT_BUDGET: usize = 60_000;
+/// A digest and what it was made from: `sent` of the transcript's `transcript` bytes, under
+/// `limit`. A transcript over the limit keeps its head and tail around a marker.
+#[derive(Debug, Clone)]
+pub(crate) struct Digest {
+    pub text: String,
+    pub sent: usize,
+    pub transcript: usize,
+    pub limit: TranscriptLimit,
+}
+
+/// How many transcript bytes a digest may send, and where that number came from. Derived from the
+/// model's context window in tokens: every token covers at least one byte of text, so a prompt of
+/// `n` bytes is at most `n` tokens, and the transcript gets the window less the requested output
+/// ([`DIGEST_MAX_TOKENS`]) and the rest of the prompt's bytes. Never more than fits; for typical
+/// text (several bytes per token) well under the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranscriptLimit {
+    pub bytes: usize,
+    /// `--context-bytes`, or `<model>'s <n>-token context (<provider>)`.
+    pub source: String,
+}
+
+impl std::fmt::Display for TranscriptLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} bytes, from {}", self.bytes, self.source)
+    }
+}
+
+/// The digest's output cap, requested of every provider: a digest is terse memory, and the
+/// transcript limit reserves exactly this much of the window for it.
+const DIGEST_MAX_TOKENS: usize = 4096;
 
 /// System prompt steering the model toward durable memory rather than a transcript recap.
 const SYSTEM_PROMPT: &str = "You are distilling an AI coding-agent session into durable project \
@@ -47,19 +77,106 @@ pub(crate) fn available_provider() -> Option<&'static str> {
 ///
 /// Picks a provider from the environment, builds a prompt from the rendered session, calls the
 /// chat model, and returns its Markdown text.
-pub(crate) fn digest(session: &cv_core::Session, opts: &DigestOptions) -> Result<String> {
-    let provider = provider_from_env().ok_or_else(|| {
-        anyhow!(
-            "no LLM API key found: set OPENROUTER_API_KEY (preferred) or ANTHROPIC_API_KEY \
-             to enable the digest"
-        )
-    })?;
-    let prompt = build_prompt(session, opts)?;
+pub(crate) fn digest(session: &cv_core::Session, opts: &DigestOptions) -> Result<Digest> {
+    let provider = provider_from_env().ok_or_else(no_provider)?;
     let model = opts
         .model
         .clone()
         .unwrap_or_else(|| provider.default_model().to_string());
-    call_model(&provider, &model, &prompt)
+    let limit = match opts.context_bytes {
+        Some(bytes) => TranscriptLimit {
+            bytes,
+            source: "--context-bytes".into(),
+        },
+        None => {
+            let window = context_window(&provider, &model)?;
+            let overhead = SYSTEM_PROMPT.len() + frame(opts, "", true).len();
+            let bytes = window.checked_sub(DIGEST_MAX_TOKENS + overhead).with_context(|| {
+                format!("{model}'s {window}-token context leaves no room for a transcript; pass --context-bytes")
+            })?;
+            TranscriptLimit {
+                bytes,
+                source: format!("{model}'s {window}-token context ({})", provider.name()),
+            }
+        }
+    };
+    let built = build_prompt(session, opts, limit.bytes)?;
+    let text = call_model(&provider, &model, &built.prompt)?;
+    Ok(Digest {
+        text,
+        sent: built.sent,
+        transcript: built.transcript,
+        limit,
+    })
+}
+
+/// The model's context window in tokens, as its provider reports it: Anthropic's Models API
+/// `max_input_tokens`, OpenRouter's model list `context_length`, LM Studio's `/api/v0/models`
+/// `max_context_length`. A server that reports none is an error naming `--context-bytes`.
+fn context_window(provider: &Provider, model: &str) -> Result<usize> {
+    let agent = agent(Duration::from_secs(30));
+    let ask = |what: &str| {
+        format!(
+            "asking {} for {model}'s context window ({what}); or pass --context-bytes",
+            provider.name()
+        )
+    };
+    match provider {
+        Provider::Anthropic { key } => {
+            let req = agent
+                .get(&format!("https://api.anthropic.com/v1/models/{model}"))
+                .set("x-api-key", key)
+                .set("anthropic-version", "2023-06-01");
+            let v = read_json(req.call(), "Anthropic").with_context(|| ask("GET /v1/models"))?;
+            anthropic_window(&v).with_context(|| ask("max_input_tokens"))
+        }
+        Provider::OpenRouter { key } => {
+            let req = openrouter_headers(agent.get("https://openrouter.ai/api/v1/models"), key);
+            let v = read_json(req.call(), "OpenRouter").with_context(|| ask("GET /api/v1/models"))?;
+            openrouter_window(&v, model).with_context(|| ask("context_length"))
+        }
+        Provider::LmStudio { base } => {
+            let root = base.strip_suffix("/v1").unwrap_or(base);
+            let v = read_json(agent.get(&format!("{root}/api/v0/models")).call(), "LM Studio")
+                .with_context(|| ask(&format!("GET {root}/api/v0/models")))?;
+            lmstudio_window(&v, model).with_context(|| ask("max_context_length"))
+        }
+    }
+}
+
+fn token_count(v: &Value) -> Option<usize> {
+    v.as_u64().and_then(|n| usize::try_from(n).ok())
+}
+
+fn anthropic_window(v: &Value) -> Result<usize> {
+    token_count(&v["max_input_tokens"]).context("the model object has no max_input_tokens")
+}
+
+fn openrouter_window(v: &Value, model: &str) -> Result<usize> {
+    let entry = v["data"]
+        .as_array()
+        .and_then(|models| models.iter().find(|m| m["id"].as_str() == Some(model)))
+        .with_context(|| format!("{model} is not in the model list"))?;
+    token_count(&entry["context_length"]).context("the model entry has no context_length")
+}
+
+/// LM Studio names its models by id; the placeholder `local-model` means the one loaded model.
+fn lmstudio_window(v: &Value, model: &str) -> Result<usize> {
+    let models = v["data"].as_array().context("no data array")?;
+    let loaded: Vec<&Value> = models
+        .iter()
+        .filter(|m| m["state"].as_str() == Some("loaded"))
+        .collect();
+    let entry = match models.iter().find(|m| m["id"].as_str() == Some(model)) {
+        Some(entry) => entry,
+        None => match loaded.as_slice() {
+            [only] if model == "local-model" => *only,
+            _ => bail!("{model} is not one model the server lists"),
+        },
+    };
+    token_count(&entry["loaded_context_length"])
+        .or_else(|| token_count(&entry["max_context_length"]))
+        .context("the model entry has no context length")
 }
 
 /// The provider we resolved from the environment, carrying the API key.
@@ -70,7 +187,8 @@ enum Provider {
     Anthropic {
         key: String,
     },
-    /// A configured OpenAI-compatible server (LM Studio, Ollama, vLLM, …).
+    /// A configured OpenAI-compatible server (LM Studio, Ollama, vLLM, …); the variant name
+    /// does not restrict which compatible server can supply the endpoint.
     LmStudio {
         base: String,
     },
@@ -144,12 +262,31 @@ fn provider_from_env() -> Option<Provider> {
     None
 }
 
-/// Build the user prompt: the (possibly truncated) rendered transcript plus instructions.
-fn build_prompt(session: &cv_core::Session, opts: &DigestOptions) -> Result<String> {
-    let mut output = TranscriptBudget::new(TRANSCRIPT_BUDGET);
-    cv_core::render::write_markdown(session, &mut output, &session.resolver())?;
-    let (transcript, truncated) = output.finish()?;
+/// A digest prompt and how much of the transcript it carries.
+struct Prompt {
+    prompt: String,
+    /// Transcript bytes sent (the marker included when cut).
+    sent: usize,
+    /// The whole rendered transcript's bytes.
+    transcript: usize,
+}
 
+/// Build the user prompt: the rendered transcript, cut to `limit` bytes (head and tail around a
+/// marker) when longer, plus instructions.
+fn build_prompt(session: &cv_core::Session, opts: &DigestOptions, limit: usize) -> Result<Prompt> {
+    let mut output = TranscriptBudget::new(limit);
+    cv_core::render::write_markdown(session, &mut output, &session.resolver())?;
+    let whole = output.total;
+    let (transcript, truncated) = output.finish()?;
+    Ok(Prompt {
+        prompt: frame(opts, &transcript, truncated),
+        sent: transcript.len(),
+        transcript: whole,
+    })
+}
+
+/// The user prompt around a (possibly cut) transcript.
+fn frame(opts: &DigestOptions, transcript: &str, truncated: bool) -> String {
     let scope = if opts.project {
         "Distill this into durable PROJECT memory (it may span more than one session)."
     } else {
@@ -167,9 +304,9 @@ fn build_prompt(session: &cv_core::Session, opts: &DigestOptions) -> Result<Stri
     }
     prompt.push_str("Here is the session transcript:\n\n");
     prompt.push_str("<transcript>\n");
-    prompt.push_str(&transcript);
+    prompt.push_str(transcript);
     prompt.push_str("\n</transcript>\n");
-    Ok(prompt)
+    prompt
 }
 
 /// Retain the same head/tail byte budget as `budget` while rendering. All source fields
@@ -179,6 +316,8 @@ struct TranscriptBudget {
     head: Vec<u8>,
     tail: std::collections::VecDeque<u8>,
     truncated: bool,
+    /// Every byte written, kept or not: the whole transcript's size.
+    total: usize,
 }
 const TRANSCRIPT_MARKER: &str = "\n\n[… transcript truncated …]\n\n";
 impl TranscriptBudget {
@@ -188,6 +327,7 @@ impl TranscriptBudget {
             head: Vec::new(),
             tail: std::collections::VecDeque::new(),
             truncated: false,
+            total: 0,
         }
     }
     fn keep_tail(&mut self, bytes: &[u8]) {
@@ -227,6 +367,7 @@ impl TranscriptBudget {
 }
 impl std::io::Write for TranscriptBudget {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.total += bytes.len();
         if !self.truncated && bytes.len() <= self.limit.saturating_sub(self.head.len()) {
             self.head.extend_from_slice(bytes);
         } else {
@@ -293,6 +434,7 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
         Provider::OpenRouter { key } => {
             let body = json!({
                 "model": model,
+                "max_tokens": DIGEST_MAX_TOKENS,
                 "messages": [
                     { "role": "system", "content": SYSTEM_PROMPT },
                     { "role": "user", "content": prompt },
@@ -305,7 +447,7 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
         Provider::Anthropic { key } => {
             let body = json!({
                 "model": model,
-                "max_tokens": 4096,
+                "max_tokens": DIGEST_MAX_TOKENS,
                 "system": SYSTEM_PROMPT,
                 "messages": [
                     { "role": "user", "content": prompt },
@@ -322,6 +464,7 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
             // OpenAI-compatible /chat/completions; LM Studio ignores auth, so we send none.
             let body = json!({
                 "model": model,
+                "max_tokens": DIGEST_MAX_TOKENS,
                 "messages": [
                     { "role": "system", "content": SYSTEM_PROMPT },
                     { "role": "user", "content": prompt },
@@ -339,6 +482,15 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
 
 /// Pull the assistant text out of an OpenAI-shaped chat response
 /// (`choices[0].message.content`), with a clear error naming `who` when the shape is off.
+/// The one refusal when no provider is configured, naming every variable
+/// [`provider_from_env`] reads.
+fn no_provider() -> anyhow::Error {
+    anyhow!(
+        "no LLM provider: set OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or LMSTUDIO_API_BASE \
+         (=local for a free local LM Studio server)"
+    )
+}
+
 fn extract_openai_text(v: &Value, who: &str) -> Result<String> {
     v["choices"][0]["message"]["content"]
         .as_str()
@@ -398,15 +550,10 @@ pub(crate) struct GenerateOptions {
 }
 
 /// Generate the next assistant turn given a session's conversation — the generative half of looming.
-/// Forking/grafting happens in [`cv_core::loom`]; this produces a fresh continuation to append. With
+/// Forking/grafting happens in [`cv_core::splice`]; this produces a fresh continuation to append. With
 /// `LMSTUDIO_API_BASE` set this runs against a local model — free, offline looming.
 pub(crate) fn generate(session: &cv_core::Session, opts: &GenerateOptions) -> Result<String> {
-    let provider = provider_from_env().ok_or_else(|| {
-        anyhow!(
-            "no LLM provider: set OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or LMSTUDIO_API_BASE \
-             (=local for a free local LM Studio server)"
-        )
-    })?;
+    let provider = provider_from_env().ok_or_else(no_provider)?;
     let model = opts
         .model
         .clone()
@@ -424,9 +571,24 @@ pub(crate) fn generate(session: &cv_core::Session, opts: &GenerateOptions) -> Re
     )
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+impl ChatMessage {
+    fn new(role: &str, content: &str) -> Self {
+        Self {
+            role: role.to_owned(),
+            content: content.to_owned(),
+        }
+    }
+}
+
 /// Flatten a session's IR messages into provider chat messages (`{role, content}`), collapsing
 /// content blocks to text (tool calls/results become readable notes).
-fn to_chat_messages(session: &cv_core::Session) -> Result<Vec<Value>> {
+fn to_chat_messages(session: &cv_core::Session) -> Result<Vec<ChatMessage>> {
     use cv_core::ir::{Block, Role};
     let reads = session.source_reads();
     let resolver = session.resolver();
@@ -468,7 +630,7 @@ fn to_chat_messages(session: &cv_core::Session) -> Result<Vec<Value>> {
         if text.is_empty() {
             continue;
         }
-        out.push(json!({ "role": role, "content": text }));
+        out.push(ChatMessage::new(role, text));
     }
     anyhow::ensure!(
         reads.fresh(&mut cv_core::source::Probe::default()),
@@ -482,19 +644,19 @@ fn call_chat(
     provider: &Provider,
     model: &str,
     system: Option<&str>,
-    messages: &[Value],
+    messages: &[ChatMessage],
     max_tokens: u32,
 ) -> Result<String> {
-    let approx: usize = messages.iter().map(|m| m["content"].as_str().map_or(0, str::len)).sum();
+    let approx: usize = messages.iter().map(|m| m.content.len()).sum();
     egress_notice(provider, model, approx);
     let agent = agent(Duration::from_secs(180));
 
     // OpenAI-compatible providers (OpenRouter, LM Studio) share a body/parse shape.
-    let openai_call = |url: String, bearer: Option<&str>| -> Result<String> {
-        let mut msgs: Vec<Value> = Vec::new();
+    let openai_call = |who: &str, url: String, bearer: Option<&str>| -> Result<String> {
+        let mut msgs: Vec<ChatMessage> = Vec::new();
         if let Some(s) = system {
             if !s.is_empty() {
-                msgs.push(json!({ "role": "system", "content": s }));
+                msgs.push(ChatMessage::new("system", s));
             }
         }
         msgs.extend(messages.iter().cloned());
@@ -504,15 +666,16 @@ fn call_chat(
             req = openrouter_headers(req, b);
         }
         let v = read_json(req.send_json(body), "chat").with_context(|| format!("POST to {url}"))?;
-        v["choices"][0]["message"]["content"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("chat response missing message content: {v}"))
+        extract_openai_text(&v, who)
     };
 
     match provider {
-        Provider::OpenRouter { key } => openai_call("https://openrouter.ai/api/v1/chat/completions".into(), Some(key)),
-        Provider::LmStudio { base } => openai_call(format!("{base}/chat/completions"), None),
+        Provider::OpenRouter { key } => openai_call(
+            "OpenRouter",
+            "https://openrouter.ai/api/v1/chat/completions".into(),
+            Some(key),
+        ),
+        Provider::LmStudio { base } => openai_call("LM Studio", format!("{base}/chat/completions"), None),
         Provider::Anthropic { key } => {
             let (sys, msgs) = normalize_for_anthropic(system, messages)?;
             let mut body = json!({ "model": model, "max_tokens": max_tokens, "messages": msgs });
@@ -541,38 +704,36 @@ fn call_chat(
 ///    Non-assistant roles (tool, anything unknown) normalize to `user`.
 /// 3. **Leading-user guarantee** — the first message must be `user`; a transcript opening on an
 ///    assistant turn gets a small synthetic user preamble. An empty message list is an error.
-fn normalize_for_anthropic(system: Option<&str>, messages: &[Value]) -> Result<(Option<String>, Vec<Value>)> {
+fn normalize_for_anthropic(
+    system: Option<&str>,
+    messages: &[ChatMessage],
+) -> Result<(Option<String>, Vec<ChatMessage>)> {
     let mut sys = system.unwrap_or("").to_string();
-    let mut msgs: Vec<Value> = Vec::new();
+    let mut msgs: Vec<ChatMessage> = Vec::new();
     for m in messages {
-        let role = m["role"].as_str().unwrap_or("user");
+        let role = m.role.as_str();
         if role == "system" {
-            if let Some(c) = m["content"].as_str() {
-                if !sys.is_empty() {
-                    sys.push('\n');
-                }
-                sys.push_str(c);
+            if !sys.is_empty() {
+                sys.push('\n');
             }
+            sys.push_str(&m.content);
             continue;
         }
         // Normalize any non-system role to user/assistant.
         let role = if role == "assistant" { "assistant" } else { "user" };
-        let content = m["content"].as_str().unwrap_or("").to_string();
+        let content = &m.content;
         match msgs.last_mut() {
-            Some(prev) if prev["role"] == role => {
+            Some(prev) if prev.role == role => {
                 // Coalesce: append onto the previous same-role turn.
-                let merged = format!("{}\n{}", prev["content"].as_str().unwrap_or(""), content);
-                prev["content"] = json!(merged);
+                prev.content.push('\n');
+                prev.content.push_str(content);
             }
-            _ => msgs.push(json!({ "role": role, "content": content })),
+            _ => msgs.push(ChatMessage::new(role, content)),
         }
     }
     // Anthropic requires the first message to be `user`.
-    if msgs.first().map(|m| m["role"] == "assistant").unwrap_or(false) {
-        msgs.insert(
-            0,
-            json!({ "role": "user", "content": "(continue the transcript below)" }),
-        );
+    if msgs.first().is_some_and(|m| m.role == "assistant") {
+        msgs.insert(0, ChatMessage::new("user", "(continue the transcript below)"));
     }
     if msgs.is_empty() {
         bail!("nothing to send to Anthropic after normalizing messages");
@@ -585,6 +746,43 @@ mod tests {
     use super::*;
     use cv_core::ir::{Block, Harness, Message, Role, Session};
 
+    /// A test's transcript limit; a digest derives its own from the model ([`TranscriptLimit`]).
+    const TEST_LIMIT: usize = 60_000;
+
+    #[test]
+    fn context_windows_read_each_providers_own_field() {
+        let anthropic = json!({"id": "claude-x", "max_input_tokens": 200_000, "max_tokens": 64_000});
+        assert_eq!(anthropic_window(&anthropic).unwrap(), 200_000);
+        assert!(anthropic_window(&json!({"id": "claude-x"})).is_err());
+
+        let openrouter = json!({"data": [
+            {"id": "a/one", "context_length": 8192},
+            {"id": "a/two", "context_length": 131_072},
+        ]});
+        assert_eq!(openrouter_window(&openrouter, "a/two").unwrap(), 131_072);
+        assert!(openrouter_window(&openrouter, "a/three").is_err());
+
+        let lmstudio = json!({"data": [
+            {"id": "big", "state": "not-loaded", "max_context_length": 131_072},
+            {"id": "small", "state": "loaded", "max_context_length": 32_768, "loaded_context_length": 4096},
+        ]});
+        assert_eq!(lmstudio_window(&lmstudio, "big").unwrap(), 131_072);
+        // The loaded context is what the server accepts; the placeholder names the one loaded model.
+        assert_eq!(lmstudio_window(&lmstudio, "small").unwrap(), 4096);
+        assert_eq!(lmstudio_window(&lmstudio, "local-model").unwrap(), 4096);
+        assert!(lmstudio_window(&lmstudio, "absent").is_err());
+    }
+
+    #[test]
+    fn a_prompt_under_the_limit_reports_the_whole_transcript_sent() {
+        let s = sample_session();
+        let built = build_prompt(&s, &DigestOptions::default(), TEST_LIMIT).unwrap();
+        assert_eq!(built.sent, built.transcript);
+        let cut = build_prompt(&s, &DigestOptions::default(), 64).unwrap();
+        assert_eq!(cut.transcript, built.transcript);
+        assert!(cut.sent < cut.transcript && cut.prompt.contains("transcript truncated"));
+    }
+
     fn msg(role: Role, text: &str) -> Message {
         let mut m = Message::new(role);
         m.content.push(Block::Text {
@@ -595,24 +793,11 @@ mod tests {
 
     fn sample_session() -> Session {
         Session {
-            source_stamp: None,
-            id: "test-session".to_string(),
-            harness: Harness::Claude,
-            cwd: None,
-            title: None,
-            created_at: None,
-            updated_at: None,
-            model: None,
-            git: None,
             messages: vec![
                 msg(Role::User, "How do I fix the build?"),
                 msg(Role::Assistant, "The bug lives in src/lib.rs; pin reqwest to 0.12."),
             ],
-            source_path: None,
-            extra: Default::default(),
-            principal: None,
-            system_prompt: None,
-            lineage: cv_core::ir::Lineage::default(),
+            ..Session::new("test-session", Harness::Claude)
         }
     }
 
@@ -648,7 +833,7 @@ mod tests {
                 to_chat_messages(&session).is_err(),
                 "must reject stale arguments before egress"
             );
-            assert!(build_prompt(&session, &DigestOptions::default()).is_err());
+            assert!(build_prompt(&session, &DigestOptions::default(), TEST_LIMIT).is_err());
         }
     }
 
@@ -699,17 +884,20 @@ mod tests {
         use std::io::Write;
         for text in ["small".to_string(), "λ🌙\nbody".repeat(20_000)] {
             for chunk in [1, 3, 4096, text.len()] {
-                let mut writer = TranscriptBudget::new(TRANSCRIPT_BUDGET);
+                let mut writer = TranscriptBudget::new(TEST_LIMIT);
                 for bytes in text.as_bytes().chunks(chunk) {
                     writer.write_all(bytes).unwrap();
                 }
-                assert_eq!(writer.finish().unwrap(), budget(&text, TRANSCRIPT_BUDGET));
+                assert_eq!(writer.finish().unwrap(), budget(&text, TEST_LIMIT));
             }
         }
         let mut session = sample_session();
         session.messages.push(msg(Role::Assistant, &"λ🌙\nbody".repeat(20_000)));
-        let expected = budget(&cv_core::render::to_markdown(&session).unwrap(), TRANSCRIPT_BUDGET);
-        let prompt = build_prompt(&session, &DigestOptions::default()).unwrap();
+        let expected = budget(&cv_core::render::to_markdown(&session).unwrap(), TEST_LIMIT);
+        let built = build_prompt(&session, &DigestOptions::default(), TEST_LIMIT).unwrap();
+        let prompt = built.prompt;
+        assert_eq!(built.transcript, cv_core::render::to_markdown(&session).unwrap().len());
+        assert_eq!(built.sent, expected.0.len());
         assert!(expected.1);
         assert!(prompt.contains(&format!("<transcript>\n{}\n</transcript>", expected.0)));
     }
@@ -718,7 +906,7 @@ mod tests {
     fn prompt_contains_transcript_and_instructions() {
         let s = sample_session();
         let opts = DigestOptions::default();
-        let prompt = build_prompt(&s, &opts).unwrap();
+        let prompt = build_prompt(&s, &opts, TEST_LIMIT).unwrap().prompt;
 
         // Transcript content is present.
         assert!(prompt.contains("How do I fix the build?"));
@@ -738,16 +926,16 @@ mod tests {
             project: true,
             ..Default::default()
         };
-        let prompt = build_prompt(&s, &opts).unwrap();
+        let prompt = build_prompt(&s, &opts, TEST_LIMIT).unwrap().prompt;
         assert!(prompt.contains("PROJECT memory"));
     }
 
     #[test]
     fn budget_truncates_head_and_tail_with_marker() {
         let big = format!("HEAD_MARKER{}TAIL_MARKER", "x".repeat(200_000));
-        let (out, truncated) = budget(&big, TRANSCRIPT_BUDGET);
+        let (out, truncated) = budget(&big, TEST_LIMIT);
         assert!(truncated);
-        assert!(out.len() <= TRANSCRIPT_BUDGET + 64);
+        assert!(out.len() <= TEST_LIMIT + 64);
         assert!(out.starts_with("HEAD_MARKER"));
         assert!(out.ends_with("TAIL_MARKER"));
         assert!(out.contains("transcript truncated"));
@@ -755,7 +943,7 @@ mod tests {
 
     #[test]
     fn budget_passthrough_when_small() {
-        let (out, truncated) = budget("small", TRANSCRIPT_BUDGET);
+        let (out, truncated) = budget("small", TEST_LIMIT);
         assert!(!truncated);
         assert_eq!(out, "small");
     }
@@ -764,7 +952,7 @@ mod tests {
     fn budget_respects_char_boundaries() {
         // Multibyte chars right around the cut points must not panic or split.
         let big = format!("é{}é", "あ".repeat(100_000));
-        let (out, truncated) = budget(&big, TRANSCRIPT_BUDGET);
+        let (out, truncated) = budget(&big, TEST_LIMIT);
         assert!(truncated);
         // Round-trips as valid UTF-8 (implicit: String construction would have panicked otherwise).
         assert!(out.contains("transcript truncated"));
@@ -805,18 +993,18 @@ mod tests {
         s.messages.push(asst);
 
         let msgs = to_chat_messages(&s).unwrap();
-        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
         // system, user, assistant, tool→user, (empty dropped), assistant(tool_use note)
         assert_eq!(roles, ["system", "user", "assistant", "user", "assistant"]);
-        assert_eq!(msgs[0]["content"], "be terse");
-        assert!(msgs[3]["content"].as_str().unwrap().contains("[tool result] exit 0"));
-        assert!(msgs[4]["content"].as_str().unwrap().contains("[tool call: Bash"));
+        assert_eq!(msgs[0].content, "be terse");
+        assert!(msgs[3].content.contains("[tool result] exit 0"));
+        assert!(msgs[4].content.contains("[tool call: Bash"));
     }
 
     // ───────────────────── Anthropic normalization (the documented invariants) ─────────────────────
 
-    fn m(role: &str, content: &str) -> Value {
-        json!({ "role": role, "content": content })
+    fn m(role: &str, content: &str) -> ChatMessage {
+        ChatMessage::new(role, content)
     }
 
     #[test]
@@ -852,7 +1040,7 @@ mod tests {
     #[test]
     fn anthropic_guarantees_leading_user() {
         let (_, out) = normalize_for_anthropic(None, &[m("assistant", "previously…")]).unwrap();
-        assert_eq!(out[0]["role"], "user", "first message must be user");
+        assert_eq!(out[0].role, "user", "first message must be user");
         assert_eq!(out[1], m("assistant", "previously…"));
         // The synthesized preamble must not merge into the assistant turn.
         assert_eq!(out.len(), 2);
@@ -871,6 +1059,14 @@ mod tests {
     }
 
     // ───────────────────────── response extraction error paths ─────────────────────────
+
+    #[test]
+    fn the_no_provider_refusal_names_every_variable_provider_from_env_reads() {
+        let message = no_provider().to_string();
+        for name in ["OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "LMSTUDIO_API_BASE"] {
+            assert!(message.contains(name), "{message}");
+        }
+    }
 
     #[test]
     fn openai_extraction_happy_and_sad() {
@@ -917,7 +1113,10 @@ mod tests {
     fn live_digest() {
         let s = sample_session();
         let out = digest(&s, &DigestOptions::default()).expect("digest failed");
-        assert!(!out.trim().is_empty(), "expected non-empty digest");
-        eprintln!("--- digest ---\n{out}");
+        assert!(!out.text.trim().is_empty(), "expected non-empty digest");
+        eprintln!(
+            "--- digest ({} of {} bytes, limit {}) ---\n{}",
+            out.sent, out.transcript, out.limit, out.text
+        );
     }
 }

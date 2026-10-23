@@ -38,9 +38,8 @@ pub(super) fn discover(conn: &Connection, db: &Path, cwd: Option<&Path>, out: &m
                 continue;
             };
             let mut count = 0;
-            for bubble in bubbles.into_iter().flatten() {
-                bubble?;
-                count += 1;
+            for view in bubbles.into_iter().flatten() {
+                count += usize::from(bubble(view?, true)?.is_some_and(|message| message.is_turn()));
             }
             if count == 0 {
                 continue;
@@ -49,8 +48,8 @@ pub(super) fn discover(conn: &Connection, db: &Path, cwd: Option<&Path>, out: &m
                 cwd: cwd.map(Path::to_path_buf),
                 title: title
                     .filter(|s| !s.trim().is_empty())
-                    .map(|s| crate::ir::truncate(&s, 80)),
-                message_count: count,
+                    .map(|s| crate::ir::truncate(&s, crate::projection::Head::TITLE)),
+                message_count: Some(count),
                 ..SessionRef::new(format!("legacy:{tab_id}"), Harness::Cursor, db.to_path_buf())
             });
         }
@@ -67,7 +66,9 @@ pub(super) fn stream(
     spans: bool,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
-    let _snapshot = conn.is_autocommit().then(|| conn.unchecked_transaction()).transpose()?;
+    // Keep cell lookup and subsequent body reads on one SQLite snapshot; reuse an existing
+    // transaction when the caller already opened one.
+    let _snapshot = crate::harness::store::sqlite::snapshot(conn)?;
     let cells = Cells::new(conn, &r.path, reads, "ItemTable")?;
     let cell = source::cell(conn, &cells, "ItemTable", CHAT_KEY)?.context("legacy chatdata missing")?;
     let session = cells
@@ -133,11 +134,11 @@ mod tests {
         for (index, (text, expected)) in [
             (
                 r#"{"tabs":[{"tabId":"a","chatTitle":"A","bubbles":[{"type":"user","text":"1"},2]},{"tabId":"a","bubbles":[3]}]}"#,
-                Some(vec![("a", Some("A"), 2), ("a", None, 1)]),
+                Some(vec![("a", Some("A"), Some(1))]),
             ),
             (
                 r#"{"tabs":[{"tabId":"obsolete","bubbles":[1]}],"tabs":[{"tabId":"a","bubbles":[2],"bubbles":[3,4]}]}"#,
-                Some(vec![("a", None, 2)]),
+                Some(vec![]),
             ),
             (r#"{"tabs":[{"tabId":"a","bubbles":[1],"bubbles":false}]}"#, Some(vec![])),
             (r#"{"tabs":[null,1,[],{"tabId":"a","bubbles":[]}]}"#, Some(vec![])),

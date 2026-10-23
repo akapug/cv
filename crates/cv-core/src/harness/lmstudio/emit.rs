@@ -14,17 +14,23 @@ use crate::{
 use std::borrow::Cow;
 use std::io::{BufWriter, Write};
 
-fn projected<'a>(block: &'a Block, mode: ThinkingMode, resolver: &Resolver) -> Result<Option<(Cow<'a, Block>, bool)>> {
+/// A projected block, and whether it renders as a thinking step (the step's `style: thinking`).
+struct Projected<'a> {
+    block: Cow<'a, Block>,
+    thinking: bool,
+}
+
+fn projected<'a>(block: &'a Block, mode: ThinkingMode, resolver: &Resolver) -> Result<Option<Projected<'a>>> {
     if let Block::Thinking { text, .. } = block {
         let fate = fate(block, Harness::LmStudio, mode, resolver)?;
         if let Some(value) = text_with_fate(block, fate) {
-            return Ok(Some((
-                match value {
+            return Ok(Some(Projected {
+                block: match value {
                     Cow::Borrowed(_) => Cow::Borrowed(block),
                     Cow::Owned(text) => Cow::Owned(Block::Text { text }),
                 },
-                false,
-            )));
+                thinking: false,
+            }));
         }
         if fate == crate::emit::ThinkingFate::Drop {
             return Ok(None);
@@ -32,9 +38,15 @@ fn projected<'a>(block: &'a Block, mode: ThinkingMode, resolver: &Resolver) -> R
         if crate::emit::thinking::first_character(text, resolver, false)?.is_none() {
             return Ok(None);
         }
-        return Ok(Some((Cow::Borrowed(block), true)));
+        return Ok(Some(Projected {
+            block: Cow::Borrowed(block),
+            thinking: true,
+        }));
     }
-    Ok(Some((Cow::Borrowed(block), false)))
+    Ok(Some(Projected {
+        block: Cow::Borrowed(block),
+        thinking: false,
+    }))
 }
 fn part(w: &mut dyn Write, block: &Block, resolver: &Resolver) -> Result<()> {
     match block {
@@ -84,8 +96,8 @@ fn parts(w: &mut dyn Write, block: &Block, resolver: &Resolver) -> Result<()> {
     w.write_all(b"]")?;
     Ok(())
 }
-fn blocks<'a>(msg: &'a Message, mode: ThinkingMode, resolver: &Resolver) -> Result<Vec<(Cow<'a, Block>, bool)>> {
-    let blocks = msg
+fn blocks<'a>(msg: &'a Message, mode: ThinkingMode, resolver: &Resolver) -> Result<Vec<Projected<'a>>> {
+    let mut blocks = msg
         .content
         .iter()
         .filter_map(|b| match projected(b, mode, resolver) {
@@ -94,9 +106,8 @@ fn blocks<'a>(msg: &'a Message, mode: ThinkingMode, resolver: &Resolver) -> Resu
             Err(e) => Some(Err(e)),
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut blocks = blocks;
-    blocks.retain(|(b, _)| {
-        !matches!(b.as_ref(), Block::File { .. } | Block::Image { .. }) || emit_file_part(b).is_some()
+    blocks.retain(|p| {
+        !matches!(p.block.as_ref(), Block::File { .. } | Block::Image { .. }) || emit_file_part(&p.block).is_some()
     });
     Ok(blocks)
 }
@@ -109,7 +120,7 @@ fn native_usage(msg: &Message) -> bool {
             .is_some_and(|usage| usage.input_tokens.is_some() || usage.output_tokens.is_some())
 }
 
-fn represented(msg: &Message, blocks: &[(Cow<'_, Block>, bool)]) -> bool {
+fn represented(msg: &Message, blocks: &[Projected<'_>]) -> bool {
     !blocks.is_empty() || native_usage(msg)
 }
 
@@ -119,7 +130,7 @@ fn write_version(
     msg: &Message,
     created: chrono::DateTime<Utc>,
     resolver: &Resolver,
-    blocks: &[(Cow<'_, Block>, bool)],
+    blocks: &[Projected<'_>],
 ) -> Result<()> {
     let mut version = ObjectWriter::new(w)?;
     version.field(
@@ -130,6 +141,7 @@ fn write_version(
             "singleStep"
         },
     )?;
+    // LM Studio has no tool role: tool results use a user turn with bracketed text parts.
     version.field(
         "role",
         if msg.role == Role::Assistant {
@@ -154,14 +166,14 @@ fn write_version(
                 step.field("type", "contentBlock")?;
                 step.field("role", "assistant")?;
                 step.field_with("content", |w| match blocks.get(i) {
-                    Some((block, _)) => parts(w, block, resolver),
+                    Some(p) => parts(w, &p.block, resolver),
                     None => {
                         w.write_all(b"[]")?;
                         Ok(())
                     }
                 })?;
                 step.field("stepIdentifier", &step_id)?;
-                if blocks.get(i).is_some_and(|(_, thinking)| *thinking) {
+                if blocks.get(i).is_some_and(|p| p.thinking) {
                     step.field("style", json!({"type":"thinking"}))?;
                 }
                 if !attached {
@@ -194,12 +206,11 @@ fn write_version(
     } else {
         version.field_with("content", |w| {
             w.write_all(b"[")?;
-            for (i, (b, _)) in blocks.iter().enumerate() {
+            for (i, p) in blocks.iter().enumerate() {
                 if i != 0 {
                     w.write_all(b",")?;
-                } // one part per represented block
-                  // Strip the single-part array by directly writing its content to a wrapper.
-                part(w, b, resolver)?;
+                }
+                part(w, &p.block, resolver)?;
             }
             w.write_all(b"]")?;
             Ok(())
@@ -224,14 +235,11 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOp
         .new_id
         .clone()
         .unwrap_or_else(|| created.timestamp_millis().to_string());
-    let conversations = if out_dir.file_name().is_some_and(|name| name == "conversations") {
-        out_dir.to_path_buf()
-    } else {
-        out_dir.join("conversations")
-    };
+    // `--out` naming convention (same as qwen's `projects_dir`): the flag may name the CLI's
+    // store root or the store dir inside it; accept either and write where the CLI reads.
+    let conversations = crate::emit::out_dir_within(out_dir, "conversations");
     let file_path = conversations.join(format!("{new_id}.conversation.json"));
-    let title = super::super::wire::write::fallback_title(session, Harness::LmStudio, opts.thinking, &resolver)?
-        .unwrap_or_else(|| "Untitled".into());
+    let title = super::super::wire::write::fallback_title(session, &resolver)?.unwrap_or_else(|| "Untitled".into());
     let mut stage = BufWriter::with_capacity(64 * 1024, ByteStage::new());
     {
         let mut pretty = PrettyJson::new(&mut stage, 0);
@@ -308,7 +316,8 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOp
             w.write_all(b"]")?;
             Ok(())
         })?;
-        root.field("tokenCount", 0)?;
+        // No `tokenCount`: LM Studio records the last generation's prompt token count there, a
+        // fact the IR does not hold, and writing 0 claimed an empty context.
         root.field("pinned", false)?;
         if let Some(sp) = &session.system_prompt {
             root.field("systemPrompt", sp)?;
@@ -327,7 +336,7 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::grok_qwen_tests::Frozen;
+    use crate::emit::frozen::Frozen;
 
     /// One emitted conversation, frozen: its length and SHA-256.
     fn digest(bytes: &[u8]) -> Value {
@@ -392,7 +401,7 @@ mod tests {
         )?;
         let adapter = LmStudio::with_root(&world.home);
         let reference = SessionRef::new("source", Harness::LmStudio, &path);
-        let complete = crate::stream::collect_with(&adapter, &reference, &ParseOptions::complete())?;
+        let complete = crate::stream::collect_with(&adapter, &reference, &Demand::COMPLETE)?;
         assert_eq!(complete.messages.len(), 3);
         assert_eq!(complete.model.as_deref(), Some("selected"));
         let selected = &complete.messages[1];
@@ -405,7 +414,7 @@ mod tests {
         assert_eq!(alternate.model.as_deref(), Some("alternate"));
         assert!(alternate.content.is_empty());
         assert_eq!(alternate.usage.as_ref().unwrap().output_tokens, Some(2));
-        for options in [ParseOptions::full(), ParseOptions::default()] {
+        for options in [Demand::RICH, Demand::LEAN] {
             let visible = crate::stream::collect_with(&adapter, &reference, &options)?;
             assert_eq!(visible.messages.len(), 2);
             assert!(visible.messages[1].content.is_empty());
@@ -427,7 +436,7 @@ mod tests {
         let reparsed = crate::stream::collect_with(
             &adapter,
             &SessionRef::new("copy", Harness::LmStudio, &emitted.path),
-            &ParseOptions::complete(),
+            &Demand::COMPLETE,
         )?;
         assert_eq!(reparsed.model, complete.model);
         assert_eq!(
@@ -472,9 +481,9 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&doc)?)?;
         let adapter = LmStudio::with_root(&world.home);
         let r = SessionRef::new("source", Harness::LmStudio, &path);
-        let opts = ParseOptions {
+        let opts = Demand {
             spans: true,
-            ..ParseOptions::complete()
+            ..Demand::COMPLETE
         };
         let session = crate::stream::collect_with(&adapter, &r, &opts)?;
         assert_eq!(session.messages.len(), 5);
@@ -501,7 +510,7 @@ mod tests {
             "invalid selection fell back to the last version"
         );
         let copied = SessionRef::new("copy", Harness::LmStudio, &emitted.path);
-        let reparsed = crate::stream::collect_with(&adapter, &copied, &ParseOptions::complete())?;
+        let reparsed = crate::stream::collect_with(&adapter, &copied, &Demand::COMPLETE)?;
         let mut expected = session.clone();
         expected.materialize()?;
         assert_eq!(
@@ -509,7 +518,7 @@ mod tests {
             serde_json::to_value(&expected.messages)?
         );
         assert_eq!(reparsed.model, expected.model);
-        let visible = crate::stream::collect_with(&adapter, &copied, &ParseOptions::full())?;
+        let visible = crate::stream::collect_with(&adapter, &copied, &Demand::RICH)?;
         assert_eq!(visible.messages.len(), 2);
         assert_eq!(visible.messages[0].text().as_deref(), Some(payload.as_str()));
         assert_eq!(visible.messages[1].text().as_deref(), Some(payload.as_str()));
@@ -543,7 +552,7 @@ mod tests {
         let session = crate::stream::collect_with(
             &adapter,
             &SessionRef::new("source", Harness::LmStudio, &path),
-            &ParseOptions::complete(),
+            &Demand::COMPLETE,
         )?;
         assert_eq!(session.messages.len(), 3);
         assert_eq!(

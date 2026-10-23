@@ -1,9 +1,8 @@
 //! Checked complete records retain the public `extra._record` contract.
-use super::Block;
 use super::{Harness, Message};
 use crate::{harness::wire::write::ObjectWriter, Json};
 use anyhow::Result;
-use serde::{ser::SerializeMap, Serialize, Serializer};
+use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::io::Write;
 
@@ -51,7 +50,7 @@ impl CompleteRecord {
                     extra: message
                         .extra
                         .iter()
-                        .filter(|(key, _)| key.as_str() != crate::harness::claude::CARRIER_KEY)
+                        .filter(|(key, _)| key.as_str() != crate::ir::CARRIER_KEY)
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect(),
                     complete_record: None,
@@ -60,7 +59,7 @@ impl CompleteRecord {
         } else {
             Vec::new()
         };
-        messages[0].extra.remove(crate::harness::claude::CARRIER_KEY);
+        messages[0].extra.remove(crate::ir::CARRIER_KEY);
         messages[0].complete_record = Some(std::sync::Arc::new(Self {
             harness,
             value,
@@ -113,57 +112,63 @@ impl CompleteRecord {
             _ => Ok(false),
         })
     }
-    pub(crate) fn write(&self, writer: &mut dyn Write, include_identity: bool) -> Result<()> {
+    /// The one serialization of a retained record: its native entries in source order (the
+    /// identity keys left out), then the identity the reader attached. serde delegates here.
+    pub(crate) fn write(&self, writer: &mut dyn Write) -> Result<()> {
         self.value.with_view(|view| {
             let mut out = ObjectWriter::new(writer)?;
             view.for_each_entry(|key, value| {
-                if !self.identity.contains_key(key) && (include_identity || !matches!(key, "id" | "type" | "sessionID"))
-                {
+                if !self.identity.contains_key(key) {
                     out.field_with(key, |mut w| value.write_canonical(&mut w))?;
                 }
                 Ok(())
             })?;
-            if include_identity {
-                for (key, value) in &self.identity {
-                    out.field(key, value)?;
-                }
+            for (key, value) in &self.identity {
+                out.field(key, value)?;
             }
             out.finish()
         })
     }
 }
+/// serde for owned consumers (`to_value`, pretty printers): [`CompleteRecord::write`]'s bytes,
+/// read back as a value, so the two can never disagree.
+fn via_writer<S: Serializer>(
+    serializer: S,
+    write: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+) -> std::result::Result<S::Ok, S::Error> {
+    let mut bytes = Vec::new();
+    write(&mut bytes).map_err(serde::ser::Error::custom)?;
+    serde_json::from_slice::<Value>(&bytes)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
 impl Serialize for CompleteRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let value = self.value.resolve().map_err(serde::ser::Error::custom)?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| serde::ser::Error::custom("complete record is not an object"))?;
-        let mut out = serializer.serialize_map(None)?;
-        for (key, value) in object {
-            if !self.identity.contains_key(key) {
-                out.serialize_entry(key, value)?;
-            }
-        }
-        for (key, value) in &self.identity {
-            out.serialize_entry(key, value)?;
-        }
-        out.end()
+        via_writer(serializer, |w| self.write(w))
     }
 }
+/// `Message::extra` with the retained record under the carrier key: the owned map when there is
+/// no record to carry, else [`write_extra`]'s bytes.
 pub(crate) struct Extra<'a>(pub &'a Message);
+impl Extra<'_> {
+    /// No owned facts and no record to carry: `extra` is omitted.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.extra.is_empty() && self.0.complete_record.is_none()
+    }
+}
 impl Serialize for Extra<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut out = serializer.serialize_map(None)?;
-        for (key, value) in &self.0.extra {
-            out.serialize_entry(key, value)?;
+        match carried(self.0) {
+            None => self.0.extra.serialize(serializer),
+            Some(_) => via_writer(serializer, |w| write_extra(self.0, w)),
         }
-        // An explicit owned edit wins over the retained checked record.
-        if !self.0.extra.contains_key(crate::harness::claude::CARRIER_KEY) {
-            if let Some(record) = &self.0.complete_record {
-                out.serialize_entry(crate::harness::claude::CARRIER_KEY, record.as_ref())?;
-            }
-        }
-        out.end()
+    }
+}
+/// The retained record `extra` carries: an explicit owned edit under the carrier key wins.
+fn carried(message: &Message) -> Option<&CompleteRecord> {
+    match message.extra.contains_key(crate::ir::CARRIER_KEY) {
+        true => None,
+        false => message.complete_record.as_deref(),
     }
 }
 pub(crate) fn write_extra(message: &Message, writer: &mut dyn Write) -> Result<()> {
@@ -171,113 +176,10 @@ pub(crate) fn write_extra(message: &Message, writer: &mut dyn Write) -> Result<(
     for (key, value) in &message.extra {
         out.field(key, value)?;
     }
-    if !message.extra.contains_key(crate::harness::claude::CARRIER_KEY) {
-        if let Some(record) = &message.complete_record {
-            out.field_with(crate::harness::claude::CARRIER_KEY, |w| record.write(w, true))?;
-        }
+    if let Some(record) = carried(message) {
+        out.field_with(crate::ir::CARRIER_KEY, |w| record.write(w))?;
     }
     out.finish()
-}
-fn same_json(a: &Json, b: &Json) -> bool {
-    match (a, b) {
-        (Json::Owned(a), Json::Owned(b)) => a == b,
-        (Json::Source(a), Json::Source(b)) => a.same_range(b),
-        _ => false,
-    }
-}
-fn same_block(a: &Block, b: &Block) -> bool {
-    match (a, b) {
-        (Block::Text { text: a }, Block::Text { text: b }) => a == b,
-        (
-            Block::Thinking {
-                text: a,
-                signature: asig,
-                encrypted: ae,
-                redacted: ar,
-            },
-            Block::Thinking {
-                text: b,
-                signature: bsig,
-                encrypted: be,
-                redacted: br,
-            },
-        ) => a == b && asig == bsig && ae == be && ar == br,
-        (
-            Block::ToolUse {
-                id: a,
-                name: an,
-                input: ai,
-                namespace: ans,
-            },
-            Block::ToolUse {
-                id: b,
-                name: bn,
-                input: bi,
-                namespace: bns,
-            },
-        ) => a == b && an == bn && ans == bns && same_json(ai, bi),
-        (
-            Block::ToolResult {
-                tool_use_id: a,
-                content: ac,
-                is_error: ae,
-                tool_name: an,
-                status: as_,
-                details: ad,
-            },
-            Block::ToolResult {
-                tool_use_id: b,
-                content: bc,
-                is_error: be,
-                tool_name: bn,
-                status: bs,
-                details: bd,
-            },
-        ) => a == b && ac == bc && ae == be && an == bn && as_ == bs && ad == bd,
-        (
-            Block::Image {
-                media_type: a,
-                data_ref: ar,
-            },
-            Block::Image {
-                media_type: b,
-                data_ref: br,
-            },
-        ) => a == b && ar == br,
-        (
-            Block::File {
-                mime: a,
-                path: ap,
-                source: as_,
-            },
-            Block::File {
-                mime: b,
-                path: bp,
-                source: bs,
-            },
-        ) => a == b && ap == bp && as_ == bs,
-        _ => false,
-    }
-}
-fn same_usage(a: &Option<super::Usage>, b: &Option<super::Usage>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => {
-            a.input_tokens == b.input_tokens
-                && a.output_tokens == b.output_tokens
-                && a.cache_read_tokens == b.cache_read_tokens
-                && a.cache_creation_tokens == b.cache_creation_tokens
-                && a.reasoning_tokens == b.reasoning_tokens
-                && match (a.cost_usd, b.cost_usd) {
-                    // Preserve Value serialization's null normalization for nonfinite costs;
-                    // an absent cost is omitted and therefore remains distinct from null.
-                    (Some(a), Some(b)) => (a == b) || (!a.is_finite() && !b.is_finite()),
-                    (None, None) => true,
-                    _ => false,
-                }
-        }
-        _ => false,
-    }
 }
 pub(crate) fn same_envelope(a: &Message, b: &Message) -> bool {
     a.id == b.id
@@ -287,20 +189,15 @@ pub(crate) fn same_envelope(a: &Message, b: &Message) -> bool {
         && a.origin == b.origin
         && a.timestamp == b.timestamp
         && a.model == b.model
-        && same_usage(&a.usage, &b.usage)
+        && a.usage == b.usage
         && a.extra
             .iter()
-            .filter(|(key, _)| key.as_str() != crate::harness::claude::CARRIER_KEY)
-            .eq(b
-                .extra
-                .iter()
-                .filter(|(key, _)| key.as_str() != crate::harness::claude::CARRIER_KEY))
+            .filter(|(key, _)| key.as_str() != crate::ir::CARRIER_KEY)
+            .eq(b.extra.iter().filter(|(key, _)| key.as_str() != crate::ir::CARRIER_KEY))
 }
 
 pub(crate) fn same_message(a: &Message, b: &Message) -> bool {
-    same_envelope(a, b)
-        && a.content.len() == b.content.len()
-        && a.content.iter().zip(&b.content).all(|(a, b)| same_block(a, b))
+    same_envelope(a, b) && a.content == b.content
 }
 #[cfg(any(feature = "sqlite", test))]
 pub(crate) fn same_except_first_text(a: &Message, b: &Message) -> bool {
@@ -308,13 +205,9 @@ pub(crate) fn same_except_first_text(a: &Message, b: &Message) -> bool {
         && a.content.len() == b.content.len()
         && matches!(
             (a.content.first(), b.content.first()),
-            (Some(Block::Text { .. }), Some(Block::Text { .. }))
+            (Some(super::Block::Text { .. }), Some(super::Block::Text { .. }))
         )
-        && a.content
-            .iter()
-            .skip(1)
-            .zip(b.content.iter().skip(1))
-            .all(|(a, b)| same_block(a, b))
+        && a.content.iter().skip(1).eq(b.content.iter().skip(1))
 }
 
 #[cfg(test)]
@@ -339,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_usage_comparison_matches_serialized_value_oracle() {
+    fn usage_equality_is_serialized_equality() {
         let mut usages = vec![None];
         for cost in [
             None,
@@ -379,7 +272,7 @@ mod tests {
         for a in &usages {
             for b in &usages {
                 assert_eq!(
-                    same_usage(a, b),
+                    a == b,
                     serde_json::to_value(a).unwrap() == serde_json::to_value(b).unwrap(),
                     "{a:?} vs {b:?}"
                 );

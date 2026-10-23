@@ -82,7 +82,10 @@ verbatim carrier record under `ParseOptions::complete`) and `cv_byte_offset`.
   `relocated` (`{relocatedCwd}`, forks), `pr-link`
   (`{prNumber, prUrl, prRepository}`), `frame-link`, `content-replacement` (`{replacements}` applied at
   load — forks/microcompact), `artifact-comment-monitor`, `artifact-autoreact-ledger`,
-  `file-history-snapshot`. **`summary` records are no longer written** (gone since ~2.1.25x; still read).
+  `file-history-snapshot`, `file-history-delta`, `worktree-state`, `isolation-latch`, the request ledger
+  `api-request` / `api-request-shape` / `api-request-blob` and a fork child's `fork-context-ref` (all
+  four 2.1.30x; see the 2.1.304 entry below). **`summary` records are no longer written** (gone since
+  ~2.1.25x; still read).
   Most records since ~2.1.25x carry BOTH `sessionId` and snake-case `session_id`, plus `slug`,
   `entrypoint`, `userType`, `version`, `gitBranch`; user turns add `promptId`, `origin{kind:human|…}`,
   `promptSource`, `turnOrigin`, `permissionMode`; assistant turns add `requestId`, `effort`,
@@ -98,7 +101,8 @@ verbatim carrier record under `ParseOptions::complete`) and `cv_byte_offset`.
   `total_tokens_reminder`, `batching_reminder_sent`, `bash_output_audience_note`, `queued_command`
   (task notifications / queued prompts — the biggest by bytes), `silent_turn_reminder`,
   `edited_text_file` (`{filename, snippet}`), `task_reminder`, `deferred_tools_delta`,
-  `agent_listing_delta`, `mcp_instructions_delta`, `skill_listing`, `command_permissions`,
+  `agent_listing_delta`, `mcp_instructions_delta`, `skill_listing`, `invoked_skills`,
+  `command_permissions`,
   `environment`, `date`/`date_change`, `model`, `instructions` (CLAUDE.md files), `session_context`,
   `remote_session_change`, `prompt_snapshot` (the whole system prompt + tool schemas; not re-sent),
   `auto_mode`, `goal_status`, `task_status`, `file` (an `@`-mentioned file), `compact_file_reference`,
@@ -110,6 +114,20 @@ verbatim carrier record under `ParseOptions::complete`) and `cv_byte_offset`.
   `extra["claude"]["attachment_type"]`. `prompt_snapshot` is the exception: its
   `attachment.systemPrompt[]` sections are joined into **`Session::system_prompt`** (the latest
   snapshot wins — a resume re-snapshots), and it is a session fact, never a message.
+- **`invoked_skills` is the restore set, not a prompt delta.** Its payload is
+  `attachment.skills[]`, one `{name, path, content}` per skill the session invoked, with `content` the
+  text as it was rendered then (a `Base directory for this skill: …` header, the body, and — for a
+  skill invoked with arguments — the invocation's `ARGUMENTS:` tail; a skill over the per-skill cap
+  ends with the truncation marker). Claude Code writes ALL of them back as one attachment at every
+  compaction, and `--resume` rebuilds the store from the records after the last compact boundary.
+  Nothing else forgets an entry, so a skill invoked once returns at every later compaction with its
+  old text, even after its file changed or the skill was removed. `path` is `<source>:<name>`, source
+  `userSettings` (the config dir), `projectSettings` (the recorded `cwd`'s `.claude`) or
+  `bundled`/`plugin:<plugin>`; a user or project skill's file is `skills/<name>/SKILL.md`, else the
+  legacy `commands/<name>.md` a slash command became (a nested `a:b` name is `commands/a/b.md`).
+  `cv prune`, `cv rewind` and `cv port` (to Claude) take `--skills keep|drop|drop-stale` and rewrite
+  those records in the session they write — `drop-stale` drops an entry whose file is gone at every
+  root or no longer matches the stored text — never the source.
 - **Synthetic assistant notices:** `assistant` lines with `message.model == "<synthetic>"` are Claude
   Code's own client-side rows, never sent to the API: `isApiErrorMessage:true` + `error`
   (`invalid_request`/`rate_limit`/…) for "Prompt is too long" (with `errorDetails` ONLY when it came from
@@ -124,7 +142,9 @@ verbatim carrier record under `ParseOptions::complete`) and `cv_byte_offset`.
   non-advisor/compaction iteration** (falling back to the top-level counters), and its turn gate refuses
   client-side with a synthesized "Prompt is too long" when that + a byte estimate of everything after the
   record ≥ context window − min(max_output, 20k) − 3k. `cv prune` pins both — revive is **on by
-  default** since 0.11.0; `--no-revive` preserves the original `usage` records byte-for-byte.
+  default** since 0.11.0; `--no-revive` preserves the original `usage` records byte-for-byte. A pinned
+  record carries the count it replaced as a top-level `_cv_orig_ctx` (cv's own key; a later prune
+  prices that record from it, `record::Facts::orig_ctx`).
 - **Persisted tool outputs:** a too-large `tool_result` is replaced by the stub
   `<persisted-output>\nOutput too large (NNKB). Full output saved to: <session>/tool-results/<id>.txt\n\n
   Preview (first 2KB):\n…</persisted-output>` — the model saw only the stub; cv keeps it as content and
@@ -221,6 +241,37 @@ verbatim carrier record under `ParseOptions::complete`) and `cv_byte_offset`.
   `turnPosition{promptIndex, turnIndex}`. Outside `projects/`: `tasks/<sessionId>/<n>.json`
   (TaskCreate), `file-history/<sessionId>/<hash>@v<n>` (checkpoint backups), and background-task output
   and pasted images under `$CLAUDE_CODE_TMPDIR` (default `/tmp/claude-<uid>/<encoded-cwd>/<sessionId>/`).
+- **2.1.304 (corpus `crates/cv-core/tests/corpus/claude/2.1.304/`, generated headless):** the **request
+  ledger** (since 2.1.300, "transcripts record each API request's system prompt, tools and parameters"):
+  every API call leaves three bookkeeping records — `api-request` `{id, timestamp, version, querySource,
+  shapeHash, params{model, betas, max_tokens, thinking, context_management, output_config}, base?, keep,
+  tail[], cacheControl[{path, value}], requestDigest, agentId?}`, `api-request-shape` `{shapeHash,
+  shape{system[], tools[]}}` (the system prompt and every tool schema, one record per distinct shape) and
+  `api-request-blob` `{hash, message}` (one request message, content-addressed; no `version`). A request's
+  messages are the `base` request's first `keep` messages followed by the `tail` blobs, so a transcript
+  reproduces every request byte-for-byte; `assistant` turns carry `requestRef` = the `api-request.id`.
+  It nearly doubles a transcript and no flag turns it off. cv carries all three under `complete` (a
+  blob's `message` is a request body, never a turn) and drops them otherwise. **Fork sub-agents**
+  (`subagent_type: fork`, on by default in `-p` since 2.1.302): the child transcript opens with
+  `fork-context-ref` `{agentId, parentSessionId, parentLastUuid, contextLength}` — its context is the
+  parent up to that uuid — and its meta.json adds `agentType: "fork", isFork, model, finished`; cv sets
+  `lineage.forked_from` and `extra.claude.fork_context{parent_last_uuid, context_length}`. **Retried
+  requests** (2.1.302+): `system/api_error` with `source: "request_retry"`, no `content`, `error{message,
+  status, requestId, formatted, connection, isNetworkDown, rateLimits, noResponse}`, `retryAttempt`,
+  `maxRetries`, `retryInMs`, one per attempt (a rate-limited session wrote 1,143); the synthetic assistant
+  after the last failure may add `apiErrorIsTransient`. cv renders a retry as `kind: error` from
+  `error.formatted` (else `message`) plus `(retry N of M)`. New bookkeeping: `isolation-latch` `{side}`
+  (no `version`; interactive sessions), attachment `max_turns_reached` `{maxTurns, turnCount,
+  exitCommitted}` (`--max-turns`; never rendered) and `invoked_skills`; new fields:
+  `agent_listing_delta.builtInPluginTypes`, `skill_listing.digests`, `deferred_tools_delta.loadedNames`,
+  `hook_*.agentId`, `structured_output.{agentId, slug}`, user `mcpMeta`, task notifications
+  `joinedNoticeRunIds/joinedNoticeLengths/joinedNoticeOwn`, `turn_duration.pendingWorkflowCount`. A
+  third-party server tool (Z.ai's `webReader` behind `WebSearch`) leaves `server_tool_use` and
+  `tool_result` blocks inside an `assistant` message. The binary's record roster also names
+  `ended-by-model`, `agent-color`, `agent-setting`, `bridge-session`, `history-suppression`,
+  `attribution-snapshot`, `dev-mods`, `memory-mode`, `observer-ref` (none observed): every unknown type,
+  with or without a `message`, is carried under `complete`. A transcript holding only `ai-title` /
+  `agent-name` records has no `version` anywhere; `cv doctor` counts it as an unknown writer version.
 - **cv surfacing:** `cv show <id> --tree` appends the sub-agent forest (direct + per-workflow, with journaled
   outcomes); `cv show <id> --subagents` lists every agent with its return; `cv show <id> --agent <aid>`
   renders one sub-agent transcript; `cv events <id> --subagents` extracts the whole forest's tool activity,
@@ -612,7 +663,8 @@ is *there*, not in the `.sql`), `src/config/sessions/*`,
   `origin: subagent`; a user turn's `provenance` (kept in `extra.openclaw.provenance`) maps `inter_session` from a
   sub-agent to `kind: subagent_return`, other `inter_session` to `origin: subagent`, `internal_system` cron to
   `origin: scheduler` and other `internal_system` to `injected_context`. A `nested-tool.v1` record is a `notice`
-  with its details in `extra.openclaw.custom_details`. `usage{input, output, cacheRead, cacheWrite, cost{total}}` fills
+  with its details in `extra.openclaw.details`. Bag keys copied from a record keep their native camelCase
+  (`stopReason`, `customType`, `error.errorCode`); only cv's own keys (`record_type`, `usage_raw`) are snake_case. `usage{input, output, cacheRead, cacheWrite, cost{total}}` fills
   `Usage` including **`cost_usd`**; OpenClaw reports no reasoning-token count.
   `formats/openclaw.toml` `[types]` is the checked entry/role/block vocabulary.
 

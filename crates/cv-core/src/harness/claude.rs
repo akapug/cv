@@ -1,37 +1,44 @@
 //! Claude Code adapter — `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`, plus the same
 //! layout under any extra roots (`$CLAUDE_CONFIG_DIR`, `$CLUSTERVISION_CLAUDE_ROOTS`, the
-//! `claude-roots` file; see [`Claude::new`]).
+//! `claude-roots` file; see [`Claude::detect`]).
 //!
 //! See `docs/FORMATS.md`. Key points: one session per `.jsonl` file; each line is a typed record;
 //! `cwd` is read from inside the transcript (the dir-name encoding is lossy), and the conversation is
 //! threaded via `uuid`/`parentUuid`.
 
 use super::{parse_ts, Adapter};
+use crate::json::{ReadInput, Validation};
+use crate::source::{Dependencies, Probe};
 
 /// `cv adopt`: move a sub-agent stranded by a dead session into a live one — Claude-only byte
 /// surgery on this store's layout, so it lives beside the adapter that knows it.
 pub mod adopt;
 pub(crate) mod emit;
 mod fork;
+mod hook;
 mod metadata;
-mod record;
+mod notification;
+pub(crate) mod record;
 pub(crate) mod replay;
 /// The sidecar tree beside a transcript (`subagents/`, `workflows/`, `journal.jsonl`): every path
 /// spelled once, and the one journal parser.
 pub mod sidecar;
+pub mod skills;
+use super::store::jsonl;
 use super::wire::anthropic;
 use crate::ir::*;
 use crate::ir::{MessageKind, Origin};
-use crate::json::{Json, JsonSource};
+use crate::json::JsonSource;
+use crate::lanes::{ApiErrorNotice, SubagentEnd, TaskNotice};
 use crate::lazy::Text;
-use crate::stream::{Checkpoint, CollectSink, Flow, MessageSink, ParseOptions, ADAPTER_LAYER};
+use crate::stream::{Checkpoint, CollectSink, Demand, Flow, MessageSink, Start, Tier};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+pub(crate) use emit::verify_derived;
 pub use emit::{emit, verify_claude_resumable};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::fs;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -41,6 +48,59 @@ pub struct Claude {
     /// under a `*` entry) is read without rebuilding the adapter.
     entries: Vec<PathBuf>,
 }
+
+/// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
+/// where the store lives ([`super::rootless`]).
+pub(crate) static ROOTLESS: Claude = Claude { entries: Vec::new() };
+
+/// The newest `compact_boundary` record in the last `tail` bytes of a transcript: its
+/// `compactMetadata` `(trigger, preTokens)`. The tail is read through the one line reader from
+/// `len - tail` (the cut line is rejected, never guessed at); `None` when the file cannot be
+/// opened or the tail holds no boundary.
+pub fn last_compact_boundary(path: &Path, tail: u64) -> Result<Option<(Option<String>, Option<u64>)>> {
+    let Ok(read) = jsonl::Read::open(path) else {
+        return Ok(None);
+    };
+    let len = read.source().len();
+    let mut last = None;
+    read.snapshot(len.saturating_sub(tail), len, |line| {
+        let Some(head) = line
+            .view
+            .map(|view| record::Head::parse(view, record::Demand::Compact))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(Flow::Continue);
+        };
+        if head.top.string("subtype")?.as_deref() == Some("compact_boundary") {
+            let meta = head
+                .top
+                .get("compactMetadata")
+                .map(|m| super::store::document::Fields::parse(m, &["trigger", "preTokens"]))
+                .transpose()?
+                .flatten();
+            let pre = meta
+                .as_ref()
+                .and_then(|m| m.get("preTokens"))
+                .map(|v| v.as_number())
+                .transpose()?
+                .flatten()
+                .and_then(|n| n.as_u64());
+            last = Some((meta.as_ref().map(|m| m.string("trigger")).transpose()?.flatten(), pre));
+        }
+        Ok(Flow::Continue)
+    })?;
+    Ok(last)
+}
+
+/// What a derived Claude copy rewrites: `sessionId` (and the `session_id` some hook records
+/// carry), `agentId`/`isSidechain` on a sub-agent line made standalone, `parentUuid` at a re-root.
+pub(crate) const IDENTITY: super::Identity = super::Identity {
+    session_keys: &["sessionId", "session_id"],
+    agent_key: "agentId",
+    sidechain_key: "isSidechain",
+    parent_key: "parentUuid",
+};
 
 /// Files Claude Code keeps at the top of a config dir. A directory that holds one of them but no
 /// `projects/` is a config dir with no sessions yet, not a projects dir: reading it as one would
@@ -52,6 +112,40 @@ const CONFIG_MARKERS: [&str; 5] = [
     "history.jsonl",
     "CLAUDE.md",
 ];
+
+/// The roots `claude-roots` lists, read once per file state: `detect` runs once per session in
+/// per-session loops (a source's primary path, a search's staleness), and read the file each time.
+fn configured_roots(path: &Path) -> Option<std::sync::Arc<[PathBuf]>> {
+    use crate::source::FileId;
+    use std::sync::{Arc, Mutex, PoisonError};
+    type Memo = std::collections::HashMap<PathBuf, (FileId, Arc<[PathBuf]>)>;
+    static MEMO: Mutex<Option<Memo>> = Mutex::new(None);
+    let before = FileId::at(path)?;
+    if let Some((_, roots)) = MEMO
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|memo| memo.get(path))
+        .filter(|(seen, _)| *seen == before)
+    {
+        return Some(Arc::clone(roots));
+    }
+    let text = fs::read_to_string(path).ok()?;
+    let roots: Arc<[PathBuf]> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(PathBuf::from)
+        .collect();
+    // A write during the read stores nothing: the next call reads the file as it then stands.
+    if FileId::at(path) == Some(before) {
+        MEMO.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(Default::default)
+            .insert(path.to_path_buf(), (before, Arc::clone(&roots)));
+    }
+    Some(roots)
+}
 
 impl Claude {
     /// Collect the root entries, in priority order:
@@ -82,13 +176,8 @@ impl Claude {
         let cv_home = crate::env::var_os("CLUSTERVISION_HOME")
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|h| h.join(".clustervision")));
-        if let Some(text) = cv_home.and_then(|d| fs::read_to_string(d.join("claude-roots")).ok()) {
-            entries.extend(
-                text.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                    .map(PathBuf::from),
-            );
+        if let Some(listed) = cv_home.and_then(|d| configured_roots(&d.join("claude-roots"))) {
+            entries.extend(listed.iter().cloned());
         }
         let entries = entries
             .into_iter()
@@ -173,21 +262,181 @@ impl Adapter for Claude {
         Harness::Claude
     }
 
+    /// A skill a slash command loaded and a `<task-notification>` a stopped task queued: both
+    /// injected context Claude Code writes as user turns.
+    fn record_affordance(
+        &self,
+        m: &Message,
+        first: &crate::affordance::FirstText<'_>,
+    ) -> Result<Option<crate::affordance::RecordHit>> {
+        use crate::affordance::{Kind, RecordHit};
+        if m.kind != MessageKind::InjectedContext {
+            return Ok(None);
+        }
+        if m.origin == Origin::Harness
+            && m.harness_extra(Harness::Claude)
+                .is_none_or(|bag| !bag.contains_key("sourceToolUseID"))
+            && first.starts_with("Base directory for this skill:")?
+        {
+            return Ok(Some(RecordHit {
+                kind: Kind::Skill,
+                action: "load",
+                tool: "slash command",
+            }));
+        }
+        Ok(first.starts_with("<task-notification>")?.then_some(RecordHit {
+            kind: Kind::BackgroundJob,
+            action: "complete",
+            tool: "task-notification",
+        }))
+    }
+
+    /// `<agent>.meta.json`'s `description`, as the reader copies it into the bag.
+    fn agent_description<'s>(&self, s: &'s Session) -> Option<&'s str> {
+        s.harness_extra(Harness::Claude)
+            .and_then(|bag| bag.get("agent_description"))
+            .and_then(Value::as_str)
+    }
+
+    fn subagent_end(&self, transcript: &std::path::Path) -> Result<Option<SubagentEnd>> {
+        Ok(Some(subagent_end(transcript)?))
+    }
+
+    fn task_notices(&self, parent: &SessionRef) -> Result<std::collections::HashMap<String, TaskNotice>> {
+        task_notices(&parent.path)
+    }
+
+    /// Claude Code writes one JSONL line per content block of a streamed response, each
+    /// repeating the response's `usage`, and a resumed session copies its predecessor's history
+    /// into the new file, so the same `message.id` recurs within and across transcripts.
+    fn usage_key(&self, m: &Message) -> Option<String> {
+        m.harness_extra(Harness::Claude)
+            .and_then(|b| b.get("message.id"))
+            .and_then(Value::as_str)
+            .map(|id| format!("claude:{id}"))
+    }
+
+    fn capabilities(&self) -> super::Capabilities {
+        use crate::affordance::Denial;
+        super::Capabilities {
+            denials: &[
+                Denial {
+                    prefix: "Permission to use ",
+                    also: Some(" denied"),
+                },
+                Denial {
+                    prefix: "The user doesn't want to proceed with this tool use",
+                    also: None,
+                },
+            ],
+            edit_guard: Some(crate::hooks::EditGuard::Ask),
+            // `SubagentStart`/`SubagentStop` rows name the parent session.
+            lane_stops: Some(crate::lanes::StopScope::Parent),
+            deferred_wrapper: None,
+            // Native spans retain the same full-extra metadata.
+            rich_spans: true,
+        }
+    }
+
+    fn hook_event(&self, payload: &serde_json::Value) -> Result<Option<crate::hooks::Event>> {
+        hook::hook_event(payload)
+    }
+
+    fn agent_transcript(&self, parent: &SessionRef, agent_session: &str, workflow: Option<&str>) -> Option<PathBuf> {
+        hook::agent_transcript(&parent.path, agent_session, workflow)
+    }
+
+    fn last_compact_boundary(&self, transcript: &Path, tail: u64) -> Result<Option<(Option<String>, Option<u64>)>> {
+        last_compact_boundary(transcript, tail)
+    }
+
+    fn identity(&self) -> Option<super::Identity> {
+        Some(IDENTITY)
+    }
+
+    /// A `.jsonl` transcript only ever grows by appended lines.
+    fn append_only(&self, r: &SessionRef) -> bool {
+        r.path.extension().is_some_and(|e| e == "jsonl")
+    }
+
+    /// The `subagents/` sidecar: directly spawned agents and, a tier deeper, workflow agents.
+    fn forest(
+        &self,
+        r: &SessionRef,
+        demand: crate::SubagentDemand,
+        workflow: Option<&str>,
+        select: &(dyn Fn(&str, Option<&str>) -> bool + Sync),
+    ) -> Result<Vec<crate::AgentRef>> {
+        subagent_tree_filtered(&r.path, demand, workflow, &select)
+    }
+
+    /// The `workflows/` state files and the agent transcripts their runs left.
+    fn workflows(&self) -> Option<&'static dyn super::Workflows> {
+        Some(&super::claude_workflow::RUNS)
+    }
+
+    /// Anthropic's models are named `claude-*`; Claude Code's `<synthetic>` records name no model
+    /// and carry no foreign thinking.
+    fn native_thinking(&self, model: &str) -> bool {
+        model == "<synthetic>" || model.starts_with("claude-")
+    }
+
+    /// Claude Code records an attachment's type beside the injected turn (`hook_success`, …).
+    fn attachment_kind<'m>(&self, m: &'m crate::ir::Message) -> Option<&'m str> {
+        m.extra.get("claude")?.get("attachment_type")?.as_str()
+    }
+
+    fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        if r.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("agent-"))
+        {
+            deps.files.push(r.path.with_extension("meta.json"));
+        }
+        deps.directories.push(r.path.with_extension("").join("tool-results"));
+        // Every agent transcript lives under `<session>/subagents/`, a workflow agent a tier deeper
+        // in `subagents/workflows/<run>/`; the nearest `workflows` ancestor is that tier, not the
+        // session's own `workflows/` state dir.
+        if let Some(session) = r
+            .path
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "subagents"))
+            .and_then(Path::parent)
+        {
+            // By identity, not entry by entry: an agent reads a few of its parent's spilled outputs
+            // and those are in its read set; declaring the whole directory file by file made one
+            // agent row carry thousands of entries it never read.
+            deps.files.push(session.join("tool-results"));
+        }
+        if let Some(config) = r
+            .path
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "projects"))
+            .and_then(Path::parent)
+        {
+            deps.directories.push(config.join("tasks").join(&r.id));
+        }
+        Some(())
+    }
+
     fn roots(&self) -> Vec<PathBuf> {
         self.resolve_roots()
     }
 
-    fn discover(&self) -> Result<Vec<SessionRef>> {
+    fn discover(&self) -> Result<crate::Discovered> {
         // Session files sit at projects/<encoded>/<sid>.jsonl (depth 2) in every root. Subagent
         // transcripts live deeper (…/<sid>/subagents/…), which max_depth(2) naturally excludes.
         // Collect paths (cheap), then scan (read + parse) them in parallel. The same session id in
         // two roots (a transcript copied into another config dir to resume there) is listed twice,
         // once per file; `crate::find` resolves such an id to the most recently updated copy.
+        // An unreadable directory, and a transcript whose scan fails, are skipped and reported.
+        let mut walk_errors = Vec::new();
         let paths: Vec<_> = self
             .resolve_roots()
             .iter()
             .flat_map(|root| WalkDir::new(root).min_depth(2).max_depth(2))
-            .filter_map(|e| e.ok())
+            .filter_map(|e| e.map_err(|e| walk_errors.extend(crate::Skipped::walk(&e))).ok())
             .map(|e| e.into_path())
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
             // `cv prune` writes a `<id>.flat.jsonl` sidecar next to the session it creates; it has the
@@ -198,57 +447,66 @@ impl Adapter for Claude {
                     .is_some_and(|n| n.ends_with(".flat.jsonl"))
             })
             .collect();
-        Ok(crate::par_discovery_filter_map(paths, |path| {
-            cached_metadata(&path, true)
-        }))
+        let mut found: crate::Discovered =
+            crate::par_discovery_filter_map(paths, |path| crate::Skipped::listed(&path, cached_metadata(&path)))
+                .into_iter()
+                .collect();
+        found.skipped.extend(walk_errors);
+        Ok(found)
     }
 
-    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
-        crate::stream::checked(sink, |sink| {
-            let session = new_session_for(&r.id, Some(r.path.clone()), opts);
-            let s = read(session, &r.path, 0, None, opts, sink, &mut || Ok(()))?;
-            Ok(with_fork_source(s, &r.path, sink))
-        })
+    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
+        self.transcript(r, opts, Start::Whole, sink)?
+            .context("a whole read never declines")
     }
 
-    fn resume_format(&self) -> Option<u32> {
-        Some(RESUME_FORMAT)
-    }
-
-    /// The state at a line boundary is the session accumulated so far (the spawn tracker holds
-    /// nothing there: Claude's spawns all return later, as their own records).
-    fn resume(
+    /// A checkpoint keeps the session accumulated so far (the spawn tracker holds nothing at a
+    /// line boundary: Claude's spawns all return later, as their own records). A prefix read is
+    /// the session as it was, without the other files a fork source is found in.
+    fn transcript(
         &self,
         r: &SessionRef,
-        opts: &ParseOptions,
+        opts: &Demand,
+        from: Start<'_>,
         sink: &mut dyn MessageSink,
-        from: &Checkpoint,
     ) -> Result<Option<Session>> {
         crate::stream::checked(sink, |sink| {
-            let Some(session) = from.get::<Session>(ADAPTER_LAYER) else {
+            let session = match from {
+                Start::Checkpoint(cp) => match jsonl::restore(cp) {
+                    Some(session) => session,
+                    None => return Ok(None),
+                },
+                _ => new_session_for(&r.id, Some(r.path.clone()), opts),
+            };
+            let read = jsonl::Read::open(&r.path)?;
+            let codec = Transcript { session, opts };
+            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
+            let Some(s) = jsonl::drive(&read, from, codec, &mut spawns)? else {
                 return Ok(None);
             };
-            let s = read(session, &r.path, from.offset, None, opts, sink, &mut || Ok(()))?;
-            Ok(Some(with_fork_source(s, &r.path, sink)))
+            Ok(Some(match from {
+                Start::Prefix(_) => s,
+                _ => with_fork_source(s, &r.path, sink),
+            }))
         })
     }
 
     /// The task list (`TaskCreate`/`TaskUpdate`) Claude Code keeps beside the transcripts:
     /// `<config>/tasks/<session id>/<n>.json`.
-    fn store_affordances(&self, r: &SessionRef) -> Vec<crate::affordance::Affordance> {
-        task_list(&r.path, &r.id).into_iter().collect()
+    fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
+        Ok(task_list(&r.path, &r.id)?.into_iter().collect())
+    }
+
+    fn copied_before(&self, r: &SessionRef, sink: &mut dyn MessageSink) -> Option<chrono::DateTime<chrono::Utc>> {
+        fork::copied_before(&r.path, sink)
     }
 }
-
-/// What a checkpoint's adapter state means: bump when the session the stream accumulates, or what
-/// a record parses to, changes.
-const RESUME_FORMAT: u32 = 1;
 
 /// A `--fork-session` copy names no source; the records it shares with one do ([`fork`]). Runs
 /// after every stream, whole or resumed, since it reads other files.
 fn with_fork_source(mut s: Session, path: &Path, sink: &mut dyn MessageSink) -> Session {
     if s.lineage.parent.is_none() && s.lineage.forked_from.is_none() {
-        s.lineage.forked_from = fork::source_tracked(path, sink);
+        s.lineage.forked_from = fork::source_tracked(path, sink).map(|(id, _)| id);
     }
     s
 }
@@ -260,7 +518,7 @@ fn with_fork_source(mut s: Session, path: &Path, sink: &mut dyn MessageSink) -> 
 /// for provenance when known. This is the whole-`Session` convenience over [`stream_str`].
 pub fn parse_str(id: &str, text: &str, source_path: Option<PathBuf>) -> Session {
     let mut sink = CollectSink::default();
-    let mut session = stream_str(id, text, source_path, &ParseOptions::full(), &mut sink);
+    let mut session = stream_str(id, text, source_path, &Demand::RICH, &mut sink);
     session.messages = sink.messages;
     session
 }
@@ -272,128 +530,71 @@ pub fn stream_str(
     id: &str,
     text: &str,
     source_path: Option<PathBuf>,
-    opts: &ParseOptions,
+    opts: &Demand,
     sink: &mut dyn MessageSink,
 ) -> Session {
     let mut session = new_session_for(id, source_path, opts);
     let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
     // Pure-string path (parse_str, tests): no file offsets, so all content stays inline.
-    super::for_each_json_line_str(text, |v| {
-        record::ingest(&mut session, (&v).into(), None, opts, &mut spawns, &mut false).unwrap_or(Flow::Stop)
+    let mut skipped = super::Unparsed::default();
+    let result = jsonl::slice(text.as_bytes(), |line| match line.view {
+        Some(view) => record::record(&mut session, view, None, opts, &mut spawns),
+        None => {
+            skipped.0 += u64::from(!line.blank);
+            Ok(Flow::Continue)
+        }
     });
+    skipped.note(&mut session);
+    super::note_read_error(&mut session, result);
+    if let Some(error) = spawns.take_error() {
+        super::note_read_error(&mut session, Err(error));
+    }
     session
 }
 
-/// How many messages a full parse of the transcript's first `len` bytes yields — the count a
-/// parse would have returned when the file was `len` bytes long, since a Claude transcript only
-/// grows by appending. `check` runs at every line, including lines that emit no message.
-pub(crate) fn count_prefix(r: &SessionRef, len: u64) -> Result<usize> {
-    count_prefix_checked(r, len, &mut || Ok(()))
+/// The Claude record codec over one captured transcript: each record accumulates into the session
+/// (a checkpoint's, or a fresh shell at 0). The shared driver owns source identity checks.
+struct Transcript<'r> {
+    session: Session,
+    opts: &'r Demand,
 }
 
-pub(crate) fn count_prefix_checked(r: &SessionRef, len: u64, check: &mut dyn FnMut() -> Result<()>) -> Result<usize> {
-    let mut n = 0usize;
-    let mut count = |_: Message| {
-        n += 1;
-        Flow::Continue
-    };
-    let opts = ParseOptions::full();
-    read(
-        new_session_for(&r.id, Some(r.path.clone()), &opts),
-        &r.path,
-        0,
-        Some(len),
-        &opts,
-        &mut count,
-        check,
-    )?;
-    Ok(n)
-}
-
-/// Stream the transcript's first `len` bytes: the session as it was at that length.
-pub(crate) fn stream_prefix(
-    r: &SessionRef,
-    len: u64,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-) -> Result<Session> {
-    crate::stream::checked(sink, |sink| {
-        read(
-            new_session_for(&r.id, Some(r.path.clone()), opts),
-            &r.path,
-            0,
-            Some(len),
-            opts,
-            sink,
-            &mut || Ok(()),
-        )
-    })
-}
-
-/// The one Claude read: lines `from..to` (EOF by default) of the captured transcript, each through
-/// the record codec, accumulating into `session` (a checkpoint's state, or a fresh shell at 0).
-/// After every finished line the sink may take a [`Checkpoint`] holding the session so far; a
-/// partial last line is read but re-read whole next time. A message holding a source descriptor
-/// makes the reader recheck the source's identity before going on, and once more at the end.
-fn read(
-    mut session: Session,
-    path: &Path,
-    from: u64,
-    to: Option<u64>,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<Session> {
-    let source = JsonSource::capture(path)?;
-    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    source.check_metadata(file.metadata()?)?;
-    let to = to.map_or(source.len(), |to| to.min(source.len()));
-    let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
-    let mut published = false;
-    crate::stream::checked(&mut spawns, |sink| {
-        crate::harness::store::jsonl::for_each_line(&source, &file, from, to, |line| {
-            check()?;
-            if let Some(view) = line.view {
-                let mut sourced = false;
-                let flow = record::ingest(&mut session, view, Some(line.at), opts, sink, &mut sourced)?;
-                if sourced {
-                    published = true;
-                    source.check()?;
-                }
-                if flow == Flow::Stop {
-                    return Ok(Flow::Stop);
-                }
-            }
-            // Only after a line its writer finished: a partial last line is re-read whole next time.
-            if line.complete && sink.wants_checkpoint(line.end) {
-                let mut cp = Checkpoint::new(line.end);
-                cp.put(ADAPTER_LAYER, &session);
-                sink.checkpoint(&mut cp);
-            }
-            Ok(Flow::Continue)
-        })
-    })?;
-    if published {
-        source.check_metadata(file.metadata()?)?;
-        source.check()?;
+impl jsonl::Codec for Transcript<'_> {
+    fn record(&mut self, view: crate::json::JsonView<'_>, at: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
+        record::record(&mut self.session, view, Some(at), self.opts, sink)
     }
-    Ok(session)
+
+    fn demand(&self) -> Demand {
+        *self.opts
+    }
+
+    fn session(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    fn state(&self) -> impl serde::Serialize + '_ {
+        &self.session
+    }
+
+    fn finish(self, _: bool, _: &mut dyn MessageSink) -> Result<Session> {
+        Ok(self.session)
+    }
 }
 
 /// An empty Claude [`Session`] shell, ready to accumulate records. A sub-agent transcript (by its
 /// path) starts with its lineage already filled in — see [`apply_subagent_lineage`].
 #[cfg(test)]
 fn new_session(id: &str, source_path: Option<PathBuf>) -> Session {
-    new_session_for(id, source_path, &ParseOptions::full())
+    new_session_for(id, source_path, &Demand::RICH)
 }
 
-fn new_session_for(id: &str, source_path: Option<PathBuf>, opts: &ParseOptions) -> Session {
+fn new_session_for(id: &str, source_path: Option<PathBuf>, opts: &Demand) -> Session {
     let mut s = Session {
         source_path,
         ..Session::new(id.to_string(), Harness::Claude)
     };
     if let Some(p) = s.source_path.clone() {
-        apply_subagent_lineage(&mut s, &p, !opts.usage_identity || opts.extra || opts.complete);
+        apply_subagent_lineage(&mut s, &p, opts.tier != Tier::Usage);
     }
     s
 }
@@ -431,7 +632,10 @@ fn apply_subagent_lineage(s: &mut Session, path: &std::path::Path, rich: bool) {
     if !rich {
         return;
     }
-    let (agent_type, description, tool_use_id) = read_meta(&path.with_extension("meta.json"));
+    let (agent_type, description, tool_use_id) = read_meta(&path.with_extension("meta.json")).unwrap_or_else(|error| {
+        crate::env::warn_once("agent metadata", format!("{}: {error:#}", path.display()));
+        Default::default()
+    });
     s.lineage.spawned_by_tool_use = tool_use_id;
     let bag = s.harness_extra_mut(Harness::Claude);
     if let Some(t) = agent_type {
@@ -466,9 +670,6 @@ fn note_conversation_metadata(
         session.updated_at = Some(session.updated_at.map_or(ts, |u| u.max(ts)));
     }
 }
-
-/// `extra` key under which a [`carrier_record`] stashes the verbatim original meta record.
-pub const CARRIER_KEY: &str = "_record";
 
 /// The record field holding a tool result's structured sidecar — and the key the sidecar is parked
 /// under inside [`Block::ToolResult::details`] when it is a bare scalar (see
@@ -507,14 +708,7 @@ fn user_kind_from_head(origin: Origin, head: &str) -> (MessageKind, Origin) {
     }
     if head.starts_with("<task-notification>") {
         let summary = tag_inner(head, "summary").unwrap_or("").trim_start();
-        if summary.starts_with("Agent ")
-            || memchr::memchr2_iter(b'w', b'W', summary.as_bytes()).any(|at| {
-                summary
-                    .as_bytes()
-                    .get(at..at + 8)
-                    .is_some_and(|word| word.eq_ignore_ascii_case(b"workflow"))
-            })
-        {
+        if summary.starts_with("Agent ") || notification::contains_ascii_insensitive(summary.as_bytes(), b"workflow") {
             return (MessageKind::SubagentReturn, Origin::Subagent);
         }
     }
@@ -542,89 +736,15 @@ fn persisted_output(text: &str) -> Option<(String, Option<String>)> {
     Some((path.to_string(), size))
 }
 
-/// Sub-agent transcripts spawned by `parent_path`'s session (Claude Code's Task tool). They live at
-/// `<projects>/<encoded>/<sid>/subagents/<agent>.jsonl` — a sibling `subagents/` dir next to the
-/// parent's `<sid>.jsonl`. Returned as lightweight refs (newest first), scanned in parallel.
-pub fn subagent_refs(parent_path: &std::path::Path) -> Vec<SessionRef> {
-    let Some(dir) = sidecar::subagents_dir(parent_path) else {
-        return vec![];
-    };
-    let mut paths: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
-                paths.push(p);
-            }
-        }
-    }
-    let mut refs = crate::par_filter_map(paths, |p| scan(&p).ok());
-    refs.sort_by_key(|r| std::cmp::Reverse(r.created_at));
-    refs
-}
-
-/// A sub-agent transcript enriched with the metadata Claude Code records *around* it: the
-/// `*.meta.json` sidecar (agent type / human description / the spawning tool_use id), the workflow
-/// it belongs to (when spawned by a `Workflow`), and — for workflow agents — the structured result
-/// the orchestrator journaled (`status` + `summary`, the agent's *real* return value).
-///
-/// This is the second dimension of a Claude session that flat parsing misses entirely: a deep
-/// session fans out into hundreds of these, and the meta/journal sidecars are where their *purpose*
-/// and *outcome* live.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SubagentInfo {
-    /// The transcript itself (id = `agent-<agentId>`), parseable like any other session.
-    pub session: SessionRef,
-    /// `agentType` from the sidecar: the subagent kind (`general-purpose`, `Explore`,
-    /// `workflow-subagent`, a named custom agent, …).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_type: Option<String>,
-    /// `description` from the sidecar: the human one-line task the parent gave it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// `toolUseId` from the sidecar: the `Agent`/`Task` tool_use in the *parent* transcript that
-    /// spawned this agent. Links the child back to the exact turn that launched it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_use_id: Option<String>,
-    /// The workflow run id (`wf_…`) this agent belongs to, or `None` for a directly-spawned
-    /// (`Agent`/`Task`) sub-agent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<String>,
-    /// For workflow agents: the journaled outcome status (`done` / `partial` / `failed` / …).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_status: Option<String>,
-    /// For workflow agents: the journaled result summary — the agent's structured return value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_summary: Option<String>,
-}
-
-impl SubagentInfo {
-    /// `agentId` (the `agent-<id>` stem with the `agent-` prefix stripped) — the key the workflow
-    /// journal and the transcript records use.
-    pub fn agent_id(&self) -> &str {
-        self.session.id.strip_prefix("agent-").unwrap_or(&self.session.id)
-    }
-}
-
 /// The full sub-agent forest a Claude session spawned: every directly-spawned (`Agent`/`Task`)
 /// sub-agent **and** every `Workflow` sub-agent (which live one level deeper, under
 /// `subagents/workflows/<wf>/`), each enriched with its `*.meta.json` sidecar and — for workflow
 /// agents — the orchestrator's journaled result.
 ///
-/// Flat [`subagent_refs`] only sees the top-level `subagents/*.jsonl`, so it misses the entire
-/// workflow tier (which on a heavy session is the *majority* of the agents) and drops the
-/// meta/journal sidecars that carry each agent's purpose and outcome. Newest first.
-pub fn subagent_tree(parent_path: &std::path::Path) -> Vec<SubagentInfo> {
+/// The workflow tier is, on a heavy session, the *majority* of the agents, and the meta/journal
+/// sidecars carry each agent's purpose and outcome. Newest first.
+pub fn subagent_tree(parent_path: &std::path::Path) -> Result<Vec<AgentRef>> {
     subagent_tree_inner(parent_path, crate::SubagentDemand::Rich, None, &|_, _| true)
-}
-
-/// Token aggregation needs the full forest and its metadata order, without task descriptions or
-/// journaled return bodies. Unchanged child metadata reuses the versioned discovery scan cache.
-pub(crate) fn subagent_session_refs(parent_path: &std::path::Path) -> Vec<SessionRef> {
-    subagent_tree_inner(parent_path, crate::SubagentDemand::Sessions, None, &|_, _| true)
-        .into_iter()
-        .map(|s| s.session)
-        .collect()
 }
 
 pub(crate) fn subagent_tree_filtered(
@@ -632,7 +752,7 @@ pub(crate) fn subagent_tree_filtered(
     demand: crate::SubagentDemand,
     workflow: Option<&str>,
     select: &(impl Fn(&str, Option<&str>) -> bool + Sync),
-) -> Vec<SubagentInfo> {
+) -> Result<Vec<AgentRef>> {
     subagent_tree_inner(parent_path, demand, workflow, select)
 }
 
@@ -641,36 +761,53 @@ fn subagent_tree_inner(
     demand: crate::SubagentDemand,
     workflow: Option<&str>,
     select: &(impl Fn(&str, Option<&str>) -> bool + Sync),
-) -> Vec<SubagentInfo> {
+) -> Result<Vec<AgentRef>> {
+    let forest = subagent_forest(parent_path, demand, workflow, select);
+    // The agents this read scanned are saved by the read itself, as discovery saves its own:
+    // `show --tree`, lanes and `events --subagents` in a later process reuse them instead of
+    // rescanning every transcript. A save that fails is said once and retried next time.
+    crate::discover_cache::persist(false);
+    forest
+}
+
+fn subagent_forest(
+    parent_path: &Path,
+    demand: crate::SubagentDemand,
+    workflow: Option<&str>,
+    select: &(impl Fn(&str, Option<&str>) -> bool + Sync),
+) -> Result<Vec<AgentRef>> {
     let Some(base) = sidecar::subagents_dir(parent_path) else {
-        return vec![];
+        return Ok(vec![]);
     };
 
-    let mut out: Vec<SubagentInfo> = Vec::new();
+    let mut out: Vec<AgentRef> = Vec::new();
 
     // Tier 1: directly-spawned sub-agents at `subagents/agent-*.jsonl`.
     if workflow.is_none() {
-        out.extend(agents_in_dir(&base, None, demand, select));
+        out.extend(agents_in_dir(&base, None, demand, select)?);
     }
 
     // Tier 2: workflow sub-agents at `subagents/workflows/<wf>/agent-*.jsonl`, grouped by run id,
     // each annotated with the result the workflow `journal.jsonl` recorded for its agentId.
-    if let Some(rd) = sidecar::workflow_runs_dir(parent_path).and_then(|d| fs::read_dir(d).ok()) {
+    if let Some(dir) = sidecar::workflow_runs_dir(parent_path) {
+        let rd = super::side_entries(&dir)?;
         let wf_dirs: Vec<PathBuf> = rd
-            .flatten()
+            .into_iter()
             .map(|e| e.path())
             .filter(|p| workflow.is_none_or(|run| p.file_name().and_then(|name| name.to_str()) == Some(run)))
             .filter(|p| p.is_dir())
             .collect();
         let groups = crate::par_flat_map(wf_dirs, |wf_dir| {
             let run_id = wf_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            agents_in_dir(&wf_dir, Some(&run_id), demand, select)
+            vec![agents_in_dir(&wf_dir, Some(&run_id), demand, select)]
         });
-        out.extend(groups);
+        for group in groups {
+            out.extend(group?);
+        }
     }
 
     out.sort_by_key(|s| std::cmp::Reverse(s.session.created_at));
-    out
+    Ok(out)
 }
 
 /// A run's journal as [`sidecar::journal_results`] reads it: `agentId → full result`.
@@ -697,10 +834,10 @@ fn agents_in_dir(
     wf: Option<&str>,
     demand: crate::SubagentDemand,
     select: &(impl Fn(&str, Option<&str>) -> bool + Sync),
-) -> Vec<SubagentInfo> {
+) -> Result<Vec<AgentRef>> {
     let mut paths: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = fs::read_dir(dir) {
-        for e in rd.flatten() {
+    {
+        for e in super::side_entries(dir)? {
             let p = e.path();
             // Only `agent-*.jsonl`; skip `journal.jsonl` and the `.meta.json` sidecars.
             let is_agent = p.extension().and_then(|x| x.to_str()) == Some("jsonl")
@@ -720,86 +857,102 @@ fn agents_in_dir(
     let journal = if rich && wf.is_some() && !paths.is_empty() {
         #[cfg(test)]
         record_forest_read("journal", &dir.join("journal.jsonl"));
-        sidecar::journal_results(dir)
+        sidecar::journal_results_checked(dir)?
     } else {
         JournalResults::new()
     };
     crate::par_discovery_filter_map(paths, |p| {
-        #[cfg(test)]
-        record_forest_read("transcript", &p);
-        let session = if rich {
-            scan(&p).ok()?
-        } else {
-            // Retain the old open-failure exclusion even on a metadata cache hit.
-            fs::File::open(&p).ok()?;
-            cached_metadata(&p, false)?
-        };
-        let meta = match demand {
-            crate::SubagentDemand::Rich => read_meta(&p.with_extension("meta.json")),
-            crate::SubagentDemand::Tools => (read_agent_type(&p.with_extension("meta.json")), None, None),
-            crate::SubagentDemand::Sessions => (None, None, None),
-        };
-        let agent_id = session.id.strip_prefix("agent-").unwrap_or(&session.id).to_string();
-        let (status, summary) = wf
-            .and_then(|_| journal.get(&agent_id))
-            .map(sidecar::result_summary)
-            .unwrap_or((None, None));
-        Some(SubagentInfo {
-            session,
-            agent_type: meta.0,
-            description: meta.1,
-            tool_use_id: meta.2,
-            workflow: wf.map(str::to_owned),
-            result_status: status,
-            result_summary: summary,
-        })
+        Some((|| -> Result<Option<AgentRef>> {
+            #[cfg(test)]
+            record_forest_read("transcript", &p);
+            // Every demand reads the agent's metadata through the per-file scan cache: a Rich
+            // forest (`show --tree`, `--subagents`, the sessions API, lanes) rescanned every
+            // agent transcript on every call. An unopenable transcript fails the forest even on a
+            // cache hit.
+            fs::File::open(&p)?;
+            let session = match cached_metadata(&p)? {
+                Some(session) => session,
+                None => return Ok(None),
+            };
+            let meta = match demand {
+                crate::SubagentDemand::Rich => read_meta(&p.with_extension("meta.json"))?,
+                crate::SubagentDemand::Tools => (read_agent_type(&p.with_extension("meta.json"))?, None, None),
+                crate::SubagentDemand::Sessions => (None, None, None),
+            };
+            let agent_id = session.id.strip_prefix("agent-").unwrap_or(&session.id).to_string();
+            let (status, summary) = wf
+                .and_then(|_| journal.get(&agent_id))
+                .map(sidecar::result_summary)
+                .unwrap_or((None, None));
+            Ok(Some(AgentRef {
+                session,
+                agent_type: meta.0,
+                description: meta.1,
+                tool_use_id: meta.2,
+                workflow: wf.map(str::to_owned),
+                result_status: status,
+                result_summary: summary,
+            }))
+        })())
     })
+    .into_iter()
+    .collect::<Result<Vec<_>>>()
+    .map(|rows| rows.into_iter().flatten().collect())
 }
 
 /// Tool analytics demand the agent type, not the task description or spawning-call metadata.
-fn read_agent_type(path: &Path) -> Option<String> {
+fn read_agent_type(path: &Path) -> Result<Option<String>> {
     #[cfg(test)]
     record_forest_read("metadata", path);
-    let source = JsonSource::capture(path).ok()?;
-    source
-        .read_document(|view| crate::affordance::input::field_string(view, "agentType"))
-        .ok()
-        .flatten()
+    let source = match JsonSource::capture(path) {
+        Ok(source) => source,
+        Err(error) if super::is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    source.read(ReadInput::Document, Validation::Value, |view| {
+        crate::affordance::input::field_string(view, "agentType")
+    })
 }
 
-/// Read an `agent-*.meta.json` sidecar → `(agentType, description, toolUseId)`. Any read/parse
-/// failure (or an absent file) is a clean `(None, None, None)`.
-fn read_meta(path: &std::path::Path) -> (Option<String>, Option<String>, Option<String>) {
+/// Missing metadata is optional; corrupt or unreadable metadata is an error.
+fn read_meta(path: &Path) -> Result<(Option<String>, Option<String>, Option<String>)> {
     #[cfg(test)]
     record_forest_read("metadata", path);
-    let Ok(txt) = fs::read_to_string(path) else {
-        return (None, None, None);
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
-        return (None, None, None);
-    };
+    let v = sidecar::read(path)?;
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-    (s("agentType"), s("description"), s("toolUseId"))
+    Ok((s("agentType"), s("description"), s("toolUseId")))
 }
 
 /// The sub-agent's final return value as text: the last assistant text turn in its transcript
 /// (what a `general-purpose`/`Explore` agent hands back to its parent, surfaced in the parent's
 /// `Agent` tool_result). Reads one record at a time and retains the last substantive assistant text.
-/// `None` for an empty/unreadable transcript or one with no substantive assistant text.
-pub fn subagent_return(path: &std::path::Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    let mut last: Option<String> = None;
-    super::for_each_json_line(BufReader::new(file), |v| {
-        if v.get("type").and_then(Value::as_str) == Some("assistant") {
-            if let Some(Value::Array(items)) = v.get("message").and_then(|m| m.get("content")) {
+/// `None` for an empty transcript or one with no substantive assistant text; failed reads return an error.
+pub fn subagent_return(path: &std::path::Path) -> Result<Option<String>> {
+    let read = jsonl::Read::open(path)?;
+    let mut last = None;
+    read.lines(0, |line| {
+        let Some(head) = line
+            .view
+            .map(|view| record::Head::parse(view, record::Demand::Message))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(Flow::Continue);
+        };
+        if head.ty == "assistant" {
+            let items = head.top.get("message").map(|m| m.get("content")).transpose()?.flatten();
+            if let Some(items) = items.map(|v| v.array()).transpose()?.flatten() {
                 let mut buf = String::new();
-                for it in items {
-                    if it.get("type").and_then(Value::as_str) == Some("text") {
-                        if let Some(t) = it.get("text").and_then(Value::as_str) {
+                for item in items {
+                    let Some(fields) = super::store::document::Fields::parse(item?, &["type", "text"])? else {
+                        continue;
+                    };
+                    if fields.string("type")?.as_deref() == Some("text") {
+                        if let Some(text) = fields.string("text")? {
                             if !buf.is_empty() {
                                 buf.push('\n');
                             }
-                            buf.push_str(t);
+                            buf.push_str(&text);
                         }
                     }
                 }
@@ -808,119 +961,126 @@ pub fn subagent_return(path: &std::path::Path) -> Option<String> {
                 }
             }
         }
-        Flow::Continue
-    });
-    last
+        Ok(Flow::Continue)
+    })?;
+    Ok(last)
 }
 
-/// Where a sub-agent transcript ends: the timestamp of its last conversational record (`user` or
-/// `assistant`) and of its last `SubagentStop` hook attachment. Claude Code appends a
-/// `SubagentStop` attachment each time the agent stops; a `SendMessage` resume appends new turns
-/// after it. So `stopped_at > last_turn_at` means the agent is parked — finished or waiting —
-/// and `last_turn_at > stopped_at` (or no stop at all) means it is running, or died without the
-/// hook firing (a harness restart). Keeps timing and error facts, discarding ordinary content after each record.
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct SubagentEnd {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_turn_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stopped_at: Option<DateTime<Utc>>,
-    /// The last API-error notice (`isApiErrorMessage`) with no real turn after it — what killed
-    /// the agent, if anything did. A resume clears it (the next real record is a new turn).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_error: Option<ApiErrorNotice>,
-}
-
-/// One of Claude Code's synthetic API-error notices, as the transcript records it: the notice
-/// text (`You've hit your session limit · resets 9pm (America/New_York)`, `Prompt is too long`),
-/// the `error` class (`rate_limit`, `invalid_request`), the HTTP status when present, and the
-/// quota's reset instant (`quotaLimits.resetsAt`, epoch seconds) for a rate limit.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
-pub struct ApiErrorNotice {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ts: Option<DateTime<Utc>>,
-    pub text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resets_at: Option<DateTime<Utc>>,
-}
-
-impl SubagentEnd {
-    /// Parked (a `SubagentStop` fired after the last turn)? `None` when the transcript has no
-    /// stop record at all — which is *also* what a killed harness leaves behind, so the caller
-    /// pairs this with the parent's `<task-notification>` status before saying "running".
-    pub fn stopped(&self) -> Option<bool> {
-        let stop = self.stopped_at?;
-        Some(self.last_turn_at.is_none_or(|t| stop >= t))
-    }
-}
-
-pub fn subagent_end(path: &std::path::Path) -> SubagentEnd {
+pub fn subagent_end(path: &std::path::Path) -> Result<SubagentEnd> {
     let mut end = SubagentEnd::default();
-    let Ok(file) = fs::File::open(path) else {
-        return end;
-    };
-    super::for_each_json_line(BufReader::new(file), |v| {
-        let ts = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
-        match v.get("type").and_then(Value::as_str) {
-            Some(kind @ ("user" | "assistant")) => {
+    let read = jsonl::Read::open(path)?;
+    let result = read.lines(0, |line| {
+        let Some(head) = line
+            .view
+            .map(|view| record::Head::parse(view, record::Demand::Message))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(Flow::Continue);
+        };
+        let ts = head.top.string("timestamp")?.as_deref().and_then(parse_ts);
+        match head.ty.as_str() {
+            kind @ ("user" | "assistant") => {
                 if let Some(ts) = ts {
                     end.last_turn_at = Some(end.last_turn_at.map_or(ts, |t: DateTime<Utc>| t.max(ts)));
                 }
-                let msg = v.get("message").unwrap_or(&Value::Null);
-                if v.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false) {
-                    let text = msg
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .map(|blocks| {
-                            blocks
-                                .iter()
-                                .filter_map(|b| b.get("text").and_then(Value::as_str))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .or_else(|| msg.get("content").and_then(Value::as_str).map(str::to_string))
-                        .unwrap_or_default();
+                let message = head
+                    .top
+                    .get("message")
+                    .map(|m| super::store::document::Fields::parse(m, &["content", "model"]))
+                    .transpose()?
+                    .flatten();
+                if head
+                    .top
+                    .get("isApiErrorMessage")
+                    .map(|v| v.as_bool())
+                    .transpose()?
+                    .flatten()
+                    == Some(true)
+                {
+                    let mut text = String::new();
+                    if let Some(content) = message.as_ref().and_then(|m| m.get("content")) {
+                        if let Some(blocks) = content.array()? {
+                            let mut first = true;
+                            for block in blocks {
+                                let Some(fields) = super::store::document::Fields::parse(block?, &["text"])? else {
+                                    continue;
+                                };
+                                if let Some(part) = fields.string("text")? {
+                                    if !first {
+                                        text.push(' ');
+                                    }
+                                    first = false;
+                                    text.push_str(&part);
+                                }
+                            }
+                        } else if content.is_string()? {
+                            text = content.resolve()?.as_str().unwrap_or_default().to_string();
+                        }
+                    }
+                    let status = head
+                        .top
+                        .get("apiErrorStatus")
+                        .map(|v| v.as_number())
+                        .transpose()?
+                        .flatten()
+                        .and_then(|n| n.as_u64());
+                    let resets_at = line
+                        .view
+                        .unwrap()
+                        .get("quotaLimits")?
+                        .map(|v| v.get("resetsAt"))
+                        .transpose()?
+                        .flatten()
+                        .map(|v| v.as_number())
+                        .transpose()?
+                        .flatten()
+                        .and_then(|n| n.as_i64())
+                        .and_then(|s| DateTime::from_timestamp(s, 0));
                     end.api_error = Some(ApiErrorNotice {
                         ts,
                         text,
-                        error: v.get("error").and_then(Value::as_str).map(str::to_string),
-                        status: v.get("apiErrorStatus").and_then(Value::as_u64),
-                        resets_at: v
-                            .pointer("/quotaLimits/resetsAt")
-                            .and_then(Value::as_i64)
-                            .and_then(|s| DateTime::from_timestamp(s, 0)),
+                        error: head.top.string("error")?,
+                        status,
+                        resets_at,
                     });
-                } else if kind == "user" || msg.get("model").and_then(Value::as_str) != Some(SYNTHETIC_MODEL) {
-                    // A real turn after the notice: the agent was resumed; the error is history.
+                } else if kind == "user"
+                    || message
+                        .as_ref()
+                        .map(|m| m.string("model"))
+                        .transpose()?
+                        .flatten()
+                        .as_deref()
+                        != Some(SYNTHETIC_MODEL)
+                {
                     end.api_error = None;
                 }
             }
-            Some("attachment")
-                if v.pointer("/attachment/hookEvent").and_then(Value::as_str) == Some("SubagentStop") =>
-            {
-                if let Some(ts) = ts {
-                    end.stopped_at = Some(end.stopped_at.map_or(ts, |t: DateTime<Utc>| t.max(ts)));
+            "attachment" => {
+                let hook = head
+                    .top
+                    .get("attachment")
+                    .map(|v| v.get("hookEvent"))
+                    .transpose()?
+                    .flatten();
+                if hook
+                    .map(|v| crate::projection::string_prefix(v, 13))
+                    .transpose()?
+                    .flatten()
+                    .as_deref()
+                    == Some("SubagentStop")
+                {
+                    if let Some(ts) = ts {
+                        end.stopped_at = Some(end.stopped_at.map_or(ts, |t: DateTime<Utc>| t.max(ts)));
+                    }
                 }
             }
             _ => {}
         }
-        Flow::Continue
+        Ok(Flow::Continue)
     });
-    end
-}
-
-/// The harness-side status of one sub-agent, as the parent transcript's `<task-notification>`
-/// records report it (`completed` / `failed` / `killed` / `stopped`), with the notification's
-/// timestamp. A notification fires each time the agent stops, so this is the LAST one per
-/// agent id.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TaskNotice {
-    pub status: String,
-    pub ts: Option<DateTime<Utc>>,
+    result?;
+    Ok(end)
 }
 
 /// Scan a parent transcript for `<task-notification>` records and reduce them to the last notice
@@ -931,78 +1091,85 @@ pub struct TaskNotice {
 /// (`message.content`). Most notifications exist only as the former — on one real session 1,229
 /// against 105 — so reading only user turns misses the status of most lanes. Content is read only
 /// for records that start with the tag.
-pub fn task_notices(parent_path: &std::path::Path) -> std::collections::HashMap<String, TaskNotice> {
+pub fn task_notices(parent_path: &std::path::Path) -> Result<std::collections::HashMap<String, TaskNotice>> {
     let mut map = std::collections::HashMap::new();
-    let Ok(file) = fs::File::open(parent_path) else {
-        return map;
-    };
-    super::for_each_json_line(BufReader::new(file), |v| {
-        let content = match v.get("type").and_then(Value::as_str) {
-            Some("user") => v.pointer("/message/content"),
-            Some("queue-operation") => v.get("content"),
+    let read = jsonl::Read::open(parent_path)?;
+    let result = read.lines(0, |line| {
+        let Some(head) = line
+            .view
+            .map(|view| record::Head::parse(view, record::Demand::Message))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(Flow::Continue);
+        };
+        let content = match head.ty.as_str() {
+            "user" => head.top.get("message").map(|m| m.get("content")).transpose()?.flatten(),
+            "queue-operation" => head.top.get("content"),
             _ => None,
         };
-        let Some(Value::String(content)) = content else {
-            return Flow::Continue;
+        let Some(content) = content.filter(|v| v.is_string().unwrap_or(false)) else {
+            return Ok(Flow::Continue);
         };
-        if !content.trim_start().starts_with("<task-notification>") {
-            return Flow::Continue;
+        let body = content.source_text()?.unwrap_or_default();
+        let (prefix, _) = super::store::document::text_head(&body, &crate::lazy::Resolver::new(None), 32, true)?;
+        if !prefix.starts_with("<task-notification>") {
+            return Ok(Flow::Continue);
         }
+        let content = content.resolve()?;
+        let content = content.as_str().unwrap_or_default();
         if let (Some(id), Some(status)) = (tag_inner(content, "task-id"), tag_inner(content, "status")) {
             map.insert(
                 id.trim().to_string(),
                 TaskNotice {
                     status: status.trim().to_string(),
-                    ts: v.get("timestamp").and_then(Value::as_str).and_then(parse_ts),
+                    ts: head.top.string("timestamp")?.as_deref().and_then(parse_ts),
                 },
             );
         }
-        Flow::Continue
+        Ok(Flow::Continue)
     });
-    map
+    result?;
+    Ok(map)
 }
 
 /// Cheap metadata-only scan for `discover`.
-fn cached_metadata(path: &Path, warn: bool) -> Option<SessionRef> {
-    crate::discover_cache::cached_scan_continued(path, metadata::CONTINUATION_VERSION, |from| {
-        match scan_at(path, from) {
-            Ok((reference, checkpoint)) => {
-                let continuation = checkpoint.and_then(|checkpoint| {
-                    let head = crate::resume::MarkHead::of(path, &checkpoint, metadata::CONTINUATION_VERSION)?;
-                    Some(crate::discover_cache::ScanContinuation {
-                        head,
-                        checkpoint,
-                        dependencies: Default::default(),
-                    })
-                });
-                (Some(reference), continuation)
-            }
-            Err(error) => {
-                if warn {
-                    eprintln!("cv: skipping {}: {error:#}", path.display());
-                }
-                (None, None)
-            }
-        }
+/// The cached metadata scan of one transcript: `Ok(None)` only when the cache refuses the
+/// result, `Err` with the reason a scan failed.
+fn cached_metadata(path: &Path) -> Result<Option<SessionRef>> {
+    crate::discover_cache::cached_scan_continued(path, metadata::LAYER, |from| {
+        let (reference, checkpoint) = scan_at(path, from)?;
+        let continuation = checkpoint.and_then(|checkpoint| {
+            let head = crate::resume::MarkHead::of(path, &checkpoint, metadata::LAYER)?;
+            Some(crate::discover_cache::ScanContinuation {
+                head,
+                checkpoint,
+                dependencies: Default::default(),
+            })
+        });
+        Ok((Some(reference), continuation))
     })
 }
 
+#[cfg(test)]
 fn scan(path: &Path) -> Result<SessionRef> {
     Ok(scan_at(path, None)?.0)
 }
 
 fn scan_at(path: &Path, from: Option<&Checkpoint>) -> Result<(SessionRef, Option<Checkpoint>)> {
-    let source = JsonSource::capture(path)?;
-    let file = fs::File::open(path)?;
-    source.check_metadata(file.metadata()?)?;
+    let read = jsonl::Read::open(path)?;
+    let source = read.source();
     let (mut scan, offset) = metadata::Scan::restore(path, from);
     anyhow::ensure!(offset <= source.len(), "discovery checkpoint outside source");
     #[cfg(test)]
     metadata::FRAMED.with(|frames| frames.borrow_mut().push((offset, source.len() - offset)));
-    scan.read(&source, &file, offset)?;
-    source.check_metadata(file.metadata()?)?;
+    #[cfg(test)]
+    record_forest_read("scan", path);
+    scan.read(&read, offset)?;
     let checkpoint = scan.checkpoint();
-    Ok((scan.finish(), checkpoint))
+    let (session, writer_version) = scan.finish();
+    crate::discover_cache::read::Context::current().observe_writer(&session, writer_version.as_deref());
+    Ok((session, checkpoint))
 }
 
 /// The classification shared by owned and borrowed records. Content storage never chooses kind.
@@ -1143,6 +1310,7 @@ const CLAUDE_EXTRA_TOP: &[&str] = &[
     "parentToolUseID",
     "toolUseID",
     "sourceToolAssistantUUID",
+    "sourceToolUseID",
     "attributionAgent",
     "attributionMcpServer",
     "attributionMcpTool",
@@ -1193,26 +1361,79 @@ impl Claude {
 
 /// `<config>/tasks/<session id>/*.json` (`{id, subject, description, status, blocks, blockedBy}`)
 /// as the session's plan, found from the transcript's own path (`<config>/projects/<p>/<id>.jsonl`).
-fn task_list(transcript: &Path, id: &str) -> Option<crate::affordance::Affordance> {
-    let config = transcript
+fn task_list(transcript: &Path, id: &str) -> Result<Option<crate::affordance::Affordance>> {
+    let Some(config) = transcript
         .ancestors()
-        .find(|a| a.file_name().is_some_and(|n| n == "projects"))?
-        .parent()?;
+        .find(|a| a.file_name().is_some_and(|n| n == "projects"))
+        .and_then(Path::parent)
+    else {
+        return Ok(None);
+    };
     let dir = config.join("tasks").join(id);
-    let items: Vec<_> = crate::affordance::json_files(&dir)
+    let items: Vec<_> = crate::affordance::json_files(&dir)?
         .iter()
         .filter_map(|(_, v)| crate::affordance::item_of(v))
         .collect();
-    crate::affordance::plan_state(crate::affordance::Kind::Plan, "tasks/", items)
+    Ok(crate::affordance::plan_state(
+        crate::affordance::Kind::Plan,
+        "tasks/",
+        items,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `claude-roots` is read once per file state, however many sessions ask for an adapter.
+    #[test]
+    fn claude_roots_are_read_once_per_file_state() {
+        let world = crate::test_world("claude-roots-memo");
+        let path = world.base.join("claude-roots");
+        std::fs::write(&path, "/one\n# note\n/two\n").unwrap();
+        let first = configured_roots(&path).unwrap();
+        assert_eq!(&*first, [PathBuf::from("/one"), PathBuf::from("/two")]);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &configured_roots(&path).unwrap()),
+            "unchanged: not reread"
+        );
+        std::fs::write(&path, "/three\n").unwrap();
+        assert_eq!(&*configured_roots(&path).unwrap(), [PathBuf::from("/three")]);
+    }
     use crate::lazy::INLINE_MAX;
+    use crate::Json;
     use std::sync::LazyLock;
 
     static NO_BAG: LazyLock<Map<String, Value>> = LazyLock::new(Map::new);
+
+    /// A workflow agent at `<session>/subagents/workflows/<run>/agent-*.jsonl` reads its session's
+    /// spilled outputs, so `<session>/tool-results` is its dependency, not `subagents/tool-results`.
+    #[test]
+    fn workflow_agent_depends_on_its_sessions_tool_results() {
+        let session = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "tests/corpus/claude/2.1.304/.claude/projects/-home-corpus-project/e55ea121-48f2-441c-a430-fd701a8d9604",
+        );
+        for agent in [
+            session.join("subagents/workflows/wf_5039b6e7-1a7/agent-ac6a8f09d2adefeb4.jsonl"),
+            session.join("subagents/agent-direct.jsonl"),
+        ] {
+            let r = SessionRef::new("agent", Harness::Claude, agent.clone());
+            let mut deps = crate::source::Dependencies::default();
+            ROOTLESS
+                .dependencies(&r, &mut crate::source::Probe::default(), &mut deps)
+                .unwrap();
+            assert!(
+                deps.files.contains(&session.join("tool-results")),
+                "{agent:?}: {:?}",
+                deps.files
+            );
+            assert!(
+                !deps.files.iter().any(|f| f.ends_with("subagents/tool-results")),
+                "{:?}",
+                deps.files
+            );
+        }
+    }
 
     /// The message's `extra["claude"]` bag (empty when it recorded nothing).
     fn cl(m: &Message) -> &Map<String, Value> {
@@ -1232,6 +1453,39 @@ mod tests {
     }
 
     #[test]
+    fn leftovers_slash_skill_projection_keeps_tool_correlation() -> Result<()> {
+        let body = "Base directory for this skill: /skills/test\n\nDo the task";
+        let records = [
+            serde_json::json!({"type":"user","uuid":"slash","isMeta":true,"message":{"role":"user","content":body}}),
+            serde_json::json!({"type":"assistant","uuid":"call","message":{"role":"assistant","content":[{"type":"tool_use","id":"skill-call","name":"Skill","input":{"skill":"test"}}]}}),
+            serde_json::json!({"type":"user","uuid":"tool-body","isMeta":true,"sourceToolUseID":"skill-call","message":{"role":"user","content":body}}),
+        ];
+        let wire = records.iter().map(|r| format!("{r}\n")).collect::<String>();
+        for opts in [Demand::RICH, Demand::FACTS.with_spans(), Demand::COMPLETE] {
+            let mut sink = CollectSink::default();
+            let mut session = stream_str("skills", &wire, None, &opts, &mut sink);
+            session.messages = sink.messages;
+            assert_eq!(
+                session
+                    .messages
+                    .iter()
+                    .filter(|m| m
+                        .harness_extra(Harness::Claude)
+                        .is_some_and(|bag| bag.get("sourceToolUseID") == Some(&serde_json::json!("skill-call"))))
+                    .count(),
+                1
+            );
+            let rows = crate::affordance::of_session(&session)?;
+            assert_eq!(
+                rows.iter().filter(|r| r.kind == crate::affordance::Kind::Skill).count(),
+                2,
+                "slash activation plus the Skill call, without counting its body twice"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn complete_mode_carries_dropped_meta_records() {
         // A session mixing conversational turns with the meta records the lean passes drop.
         let sid = "s1";
@@ -1245,7 +1499,7 @@ mod tests {
 
         // Default (full, not complete): meta records dropped — only the 2 conversational turns.
         let mut sink = CollectSink::default();
-        stream_str(sid, &text, None, &ParseOptions::full(), &mut sink);
+        stream_str(sid, &text, None, &Demand::RICH, &mut sink);
         let convo: Vec<_> = sink
             .messages
             .iter()
@@ -1256,7 +1510,7 @@ mod tests {
 
         // Complete: every record present; the 3 meta records become carriers holding the original.
         let mut sink = CollectSink::default();
-        let session = stream_str(sid, &text, None, &ParseOptions::complete(), &mut sink);
+        let session = stream_str(sid, &text, None, &Demand::COMPLETE, &mut sink);
         let carriers: Vec<_> = sink
             .messages
             .iter()
@@ -1280,6 +1534,92 @@ mod tests {
     }
 
     #[test]
+    fn request_ledger_and_unknown_records_are_bookkeeping() {
+        // 2.1.300+: every API call leaves an `api-request` (params, blob hashes), its
+        // `api-request-shape` (system prompt + tools) and `api-request-blob`s (one message each,
+        // content-addressed). A blob has a `message`, but it is a request body, never a turn; the
+        // same goes for a record type cv has never met.
+        let text = [
+            r#"{"type":"user","sessionId":"s1","uuid":"u0","timestamp":"2026-10-19T00:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"api-request-shape","sessionId":"s1","shapeHash":"h1","timestamp":"2026-10-19T00:00:00Z","version":"2.1.304","shape":{"system":[{"type":"text","text":"sys"}],"tools":[]}}"#,
+            r#"{"type":"api-request-blob","sessionId":"s1","hash":"b1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"api-request","sessionId":"s1","id":"r1","timestamp":"2026-10-19T00:00:00Z","version":"2.1.304","querySource":"sdk","shapeHash":"h1","params":{"model":"m","max_tokens":1},"keep":0,"tail":["b1"],"cacheControl":[],"requestDigest":"d"}"#,
+            r#"{"type":"isolation-latch","side":"web","sessionId":"s1"}"#,
+            r#"{"type":"never-seen-before","sessionId":"s1","message":{"role":"user","content":"not a turn"}}"#,
+            r#"{"type":"assistant","sessionId":"s1","uuid":"a1","parentUuid":"u0","timestamp":"2026-10-19T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        ]
+        .join("\n");
+        let mut sink = CollectSink::default();
+        stream_str("s1", &text, None, &Demand::RICH, &mut sink);
+        assert_eq!(sink.messages.len(), 2, "full mode: the two turns only");
+        let mut sink = CollectSink::default();
+        stream_str("s1", &text, None, &Demand::COMPLETE, &mut sink);
+        let carried: Vec<&str> = sink
+            .messages
+            .iter()
+            .filter_map(|m| m.extra.get(CARRIER_KEY)?.get("type")?.as_str())
+            .collect();
+        assert_eq!(
+            carried,
+            [
+                "api-request-shape",
+                "api-request-blob",
+                "api-request",
+                "isolation-latch",
+                "never-seen-before"
+            ]
+        );
+    }
+
+    #[test]
+    fn fork_context_ref_is_fork_lineage() {
+        // 2.1.302+: a fork sub-agent's transcript opens with where its context was cut from.
+        let text = [
+            r#"{"type":"fork-context-ref","agentId":"a1","parentSessionId":"parent","parentLastUuid":"u9","contextLength":10}"#,
+            r#"{"type":"assistant","sessionId":"parent","uuid":"a1","parentUuid":null,"isSidechain":true,"agentId":"a1","timestamp":"2026-10-19T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"forked"}]}}"#,
+        ]
+        .join("\n");
+        let s = parse_str("a1", &text, None);
+        assert_eq!(s.lineage.forked_from.as_deref(), Some("parent"));
+        assert_eq!(
+            s.extra["claude"]["fork_context"],
+            serde_json::json!({"parent_last_uuid": "u9", "context_length": 10})
+        );
+        assert_eq!(s.messages.len(), 1);
+    }
+
+    #[test]
+    fn retried_request_api_error_is_an_error_notice() {
+        // 2.1.302+: a retry is an `api_error` with no `content`; the error object and the retry
+        // counters say what happened. Older records with `content` still read as before.
+        let text = [
+            r#"{"type":"system","subtype":"api_error","level":"error","error":{"message":"429 {\"type\":\"error\"}","status":429,"requestId":"req","formatted":"429 rate limit reached"},"retryInMs":547,"retryAttempt":1,"maxRetries":10,"source":"request_retry","uuid":"e1","timestamp":"2026-10-19T00:00:00Z","sessionId":"s1","version":"2.1.302"}"#,
+            r#"{"type":"system","subtype":"api_error","level":"error","cause":{"code":"ConnectionRefused"},"retryAttempt":1,"uuid":"e2","timestamp":"2026-10-19T00:00:01Z","content":"Connection refused, retrying"}"#,
+            r#"{"type":"system","subtype":"api_error","level":"error","error":"bare string","uuid":"e3","timestamp":"2026-10-19T00:00:02Z"}"#,
+            r#"{"type":"system","subtype":"api_error","level":"error","uuid":"e4","timestamp":"2026-10-19T00:00:03Z"}"#,
+        ]
+        .join("\n");
+        let s = parse_str("s1", &text, None);
+        let texts: Vec<_> = s
+            .messages
+            .iter()
+            .map(|m| (m.kind, m.text().unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                (MessageKind::Error, "429 rate limit reached (retry 1 of 10)".to_string()),
+                (MessageKind::Error, "Connection refused, retrying".to_string()),
+                (MessageKind::Error, "bare string".to_string()),
+            ]
+        );
+        let bag = cl(&s.messages[0]);
+        assert_eq!(bag["retryAttempt"], 1);
+        assert_eq!(bag["source"], "request_retry");
+        assert_eq!(bag["error"]["status"], 429);
+    }
+
+    #[test]
     fn rendered_attachments_surface_as_system_reminders() {
         // Since ~2.1.23x the system reminders Claude Code appends to the prompt are `attachment`
         // records; `rendered[].content` is exactly what the model saw. Unrendered ones (a hook that
@@ -1292,7 +1632,7 @@ mod tests {
         ]
         .join("\n");
         let mut sink = CollectSink::default();
-        stream_str("s1", &text, None, &ParseOptions::bulk(), &mut sink);
+        stream_str("s1", &text, None, &Demand::LEAN, &mut sink);
         assert_eq!(
             sink.messages.len(),
             3,
@@ -1311,13 +1651,13 @@ mod tests {
 
         // full: the attachment object rides along
         let mut sink = CollectSink::default();
-        stream_str("s1", &text, None, &ParseOptions::full(), &mut sink);
+        stream_str("s1", &text, None, &Demand::RICH, &mut sink);
         assert_eq!(cl(&sink.messages[1])["attachment"]["filename"], "/x.md");
         assert_eq!(cl(&sink.messages[1])["renderedInHumanTurn"], true);
 
         // complete: both attachments carried verbatim; the rendered one still carries its text
         let mut sink = CollectSink::default();
-        stream_str("s1", &text, None, &ParseOptions::complete(), &mut sink);
+        stream_str("s1", &text, None, &Demand::COMPLETE, &mut sink);
         assert_eq!(sink.messages.len(), 4);
         let carried: Vec<_> = sink
             .messages
@@ -1343,7 +1683,7 @@ mod tests {
         ]
         .join("\n");
         let mut sink = CollectSink::default();
-        let session = stream_str("s1", &text, None, &ParseOptions::full(), &mut sink);
+        let session = stream_str("s1", &text, None, &Demand::RICH, &mut sink);
         let e1 = &sink.messages[1];
         assert_eq!(e1.role, Role::System);
         assert_eq!(e1.kind, MessageKind::Error);
@@ -1364,7 +1704,7 @@ mod tests {
 
         // complete: the record keeps its own shape for round-trip
         let mut sink = CollectSink::default();
-        stream_str("s1", &text, None, &ParseOptions::complete(), &mut sink);
+        stream_str("s1", &text, None, &Demand::COMPLETE, &mut sink);
         assert_eq!(sink.messages[1].role, Role::Assistant);
         assert_eq!(
             sink.messages[1].kind,
@@ -1373,12 +1713,13 @@ mod tests {
         );
         assert_eq!(sink.messages[1].model.as_deref(), Some("<synthetic>"));
 
-        // scan(): message_count skips both notices
+        // Discovery counts the user turn and the real reply: the API error and the synthetic
+        // notice are not turns.
         let dir = std::env::temp_dir().join(format!("cv-claude-scan-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s1.jsonl");
         std::fs::write(&p, format!("{text}\n")).unwrap();
-        assert_eq!(scan(&p).unwrap().message_count, 2);
+        assert_eq!(scan(&p).unwrap().message_count, Some(2));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1397,7 +1738,7 @@ mod tests {
         ]
         .join("\n");
         let mut sink = CollectSink::default();
-        let session = stream_str("s1", &text, None, &ParseOptions::full(), &mut sink);
+        let session = stream_str("s1", &text, None, &Demand::RICH, &mut sink);
         assert_eq!(
             session.title.as_deref(),
             Some("My rename"),
@@ -1419,7 +1760,7 @@ mod tests {
         assert_eq!(sink.messages.len(), 1, "bookkeeping records are not turns");
 
         let mut sink = CollectSink::default();
-        stream_str("s1", &text, None, &ParseOptions::complete(), &mut sink);
+        stream_str("s1", &text, None, &Demand::COMPLETE, &mut sink);
         assert_eq!(
             sink.messages.len(),
             9,
@@ -1450,7 +1791,7 @@ mod tests {
             "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":stub}]}})
         .to_string();
         let mut sink = CollectSink::default();
-        stream_str("s1", &line, None, &ParseOptions::bulk(), &mut sink);
+        stream_str("s1", &line, None, &Demand::LEAN, &mut sink);
         let Block::ToolResult { content, details, .. } = &sink.messages[0].content[0] else {
             panic!("expected a tool result");
         };
@@ -1466,39 +1807,22 @@ mod tests {
             "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}})
         .to_string();
         let mut sink = CollectSink::default();
-        stream_str("s1", &plain, None, &ParseOptions::bulk(), &mut sink);
+        stream_str("s1", &plain, None, &Demand::LEAN, &mut sink);
         let Block::ToolResult { details, .. } = &sink.messages[0].content[0] else {
             panic!()
         };
         assert!(details.is_none());
     }
 
-    /// Every record field the Claude adapter keeps that the IR does not first-class, with the
-    /// spelling Claude itself uses. Nesting them under `extra["claude"]` (IR v2) is what keeps the
-    /// top level of `extra` free for cv's own bookkeeping.
-    const FORMER_FLAT_KEYS: &[&str] = &[
-        "logicalParentUuid",
-        "isSidechain",
-        "isMeta",
-        "isCompactSummary",
-        "isApiErrorMessage",
-        "agentId",
-        "slug",
-        "version",
-        "requestId",
-        "parentToolUseID",
-        "toolUseID",
-        "sourceToolAssistantUUID",
-        "attributionAgent",
-        "attributionMcpServer",
-        "attributionMcpTool",
-        "attributionSkill",
-        "userType",
-        "message.id",
-        "message.stop_reason",
-        "message.stop_sequence",
-        "message.stop_details",
-    ];
+    /// Every bag key `collect_extra` produces for the kitchen-sink meta record, derived from the
+    /// capture lists themselves (plus the `sourceToolUseID` special case) so this test cannot
+    /// drift from the codec's lists.
+    fn expected_bag_keys() -> Vec<String> {
+        let mut keys: Vec<String> = CLAUDE_EXTRA_TOP.iter().map(|k| k.to_string()).collect();
+        keys.push("sourceToolUseID".into());
+        keys.extend(CLAUDE_EXTRA_MSG.iter().map(|k| format!("{MESSAGE_EXTRA_PREFIX}{k}")));
+        keys
+    }
 
     /// Two records covering everything `collect_extra` captures: one carrying every non-first-class
     /// field, one carrying a `toolUseResult` sidecar.
@@ -1510,7 +1834,8 @@ mod tests {
             "isCompactSummary": true, "isApiErrorMessage": false,
             "agentId": "a4a55af", "slug": "magical-wondering-rabbit", "version": "2.1.278",
             "requestId": "req_123", "parentToolUseID": "toolu_parent", "toolUseID": "toolu_self",
-            "sourceToolAssistantUUID": "u-src", "attributionAgent": "general-purpose",
+            "sourceToolAssistantUUID": "u-src", "sourceToolUseID": "toolu_self",
+            "attributionAgent": "general-purpose",
             "attributionMcpServer": "scry", "attributionMcpTool": "sql",
             "attributionSkill": "code-review", "userType": "internal",
             "message": {"role": "user", "content": "hi", "id": "msg_abc", "stop_reason": "tool_use",
@@ -1542,8 +1867,8 @@ mod tests {
 
         // 2. Every remaining Claude fact is in the bag, with Claude's own spelling.
         let meta = &s.messages[0];
-        for k in FORMER_FLAT_KEYS {
-            assert!(cl(meta).contains_key(*k), "`{k}` must live in extra[\"claude\"]");
+        for k in expected_bag_keys() {
+            assert!(cl(meta).contains_key(&k), "`{k}` must live in extra[\"claude\"]");
         }
         assert_eq!(cl(meta)["agentId"], "a4a55af");
         assert_eq!(cl(meta)["message.stop_reason"], "tool_use");
@@ -1565,13 +1890,7 @@ mod tests {
         let path = dir.join("s1.jsonl");
         // A bookkeeping record so the carrier key is exercised too.
         std::fs::write(&path, format!("{{\"type\":\"mode\",\"sessionId\":\"s1\"}}\n{text}")).unwrap();
-        let opts = ParseOptions {
-            extra: true,
-            complete: true,
-            spans: true,
-            offsets: true,
-            ..Default::default()
-        };
+        let opts = Demand::COMPLETE.with_spans().with_offsets();
         let mut sink = CollectSink::default();
         stream_file("s1", &path, &opts, &mut sink);
         let allowed = ["claude", CARRIER_KEY, crate::offsets::OFFSET_KEY];
@@ -1734,6 +2053,22 @@ mod tests {
             cl(m).get("subtype").and_then(Value::as_str),
             Some("turn_duration" | "agents_killed")
         )));
+    }
+
+    #[test]
+    fn bodyless_compaction_is_declared_without_transcript_text() {
+        let s = parse_str(
+            "s",
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"b","parentUuid":"p","compactMetadata":{"trigger":"auto","preTokens":42}}"#,
+            None,
+        );
+        let m = &s.messages[0];
+        assert!(m.content.is_empty() && m.is_synthesized());
+        assert_eq!(m.kind, MessageKind::CompactionBoundary);
+        assert_eq!(m.id.as_deref(), Some("b"));
+        assert_eq!(m.parent_id.as_deref(), Some("p"));
+        assert_eq!(cl(m)["compactMetadata"]["preTokens"], 42);
+        assert!(crate::render::turn_label(m).contains("compaction_boundary"));
     }
 
     #[test]
@@ -1930,14 +2265,14 @@ mod tests {
             .join("\n"),
         )
         .unwrap();
-        let end = subagent_end(&agent);
+        let end = subagent_end(&agent).unwrap();
         assert_eq!(end.stopped(), Some(true), "{end:?}");
         // A resume appends turns after the stop: no longer stopped.
         let mut resumed = std::fs::read_to_string(&agent).unwrap();
         resumed.push('\n');
         resumed.push_str(r#"{"type":"user","uuid":"u2","timestamp":"2026-10-01T00:05:00Z","message":{"role":"user","content":"poll it in the foreground"}}"#);
         std::fs::write(&agent, resumed).unwrap();
-        assert_eq!(subagent_end(&agent).stopped(), Some(false));
+        assert_eq!(subagent_end(&agent).unwrap().stopped(), Some(false));
         // No stop record at all: unknown (a killed harness looks like this too).
         let fresh = dir.join("agent-a2.jsonl");
         std::fs::write(
@@ -1945,7 +2280,7 @@ mod tests {
             r#"{"type":"user","uuid":"u","timestamp":"2026-10-01T00:00:00Z","message":{"role":"user","content":"go"}}"#,
         )
         .unwrap();
-        assert_eq!(subagent_end(&fresh).stopped(), None);
+        assert_eq!(subagent_end(&fresh).unwrap().stopped(), None);
 
         let parent = dir.join("parent.jsonl");
         std::fs::write(
@@ -1960,7 +2295,7 @@ mod tests {
             .join("\n"),
         )
         .unwrap();
-        let notices = task_notices(&parent);
+        let notices = task_notices(&parent).unwrap();
         assert_eq!(notices.len(), 3, "{notices:?}");
         assert_eq!(notices["a1"].status, "killed");
         assert_eq!(notices["a2"].status, "completed", "queue-operation records count");
@@ -2027,15 +2362,65 @@ mod tests {
         drop(jf);
 
         FOREST_READS.lock().unwrap().0 = Some(root.clone());
-        let tree = subagent_tree(&parent);
+        let tree = subagent_tree(&parent).unwrap();
         assert_eq!(tree.len(), 3, "two tiers: 1 direct + 2 workflow");
+        // A Rich forest over unchanged transcripts scans none of them again; a change rescans
+        // exactly the changed one.
+        let scans = |before: usize| -> Vec<PathBuf> {
+            FOREST_READS.lock().unwrap().1[before..]
+                .iter()
+                .filter(|(kind, _)| *kind == "scan")
+                .map(|(_, path)| path.clone())
+                .collect()
+        };
+        let before = FOREST_READS.lock().unwrap().1.len();
+        let again = subagent_tree(&parent).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&tree).unwrap()
+        );
+        assert_eq!(
+            scans(before),
+            Vec::<PathBuf>::new(),
+            "an unchanged forest was rescanned"
+        );
+        let unchanged = std::fs::read(&a1).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&a1)
+            .unwrap()
+            .write_all(b"{\"type\":\"user\",\"uuid\":\"z\",\"parentUuid\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"later\"}}\n")
+            .unwrap();
+        let before = FOREST_READS.lock().unwrap().1.len();
+        subagent_tree(&parent).unwrap();
+        assert_eq!(scans(before), std::slice::from_ref(&a1), "one change, one rescan");
+        std::fs::write(&a1, &unchanged).unwrap();
+        // A second process starts with no scan cache of its own: it reads the rows the first
+        // one saved, and one change is still one rescan.
+        subagent_tree(&parent).unwrap();
+        crate::discover_cache::forget_process_cache();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&a1)
+            .unwrap()
+            .write_all(b"{\"type\":\"user\",\"uuid\":\"z2\",\"parentUuid\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"later\"}}\n")
+            .unwrap();
+        let before = FOREST_READS.lock().unwrap().1.len();
+        subagent_tree(&parent).unwrap();
+        assert_eq!(
+            scans(before),
+            std::slice::from_ref(&a1),
+            "a new process: one change, one rescan"
+        );
+        std::fs::write(&a1, unchanged).unwrap();
 
         let before = FOREST_READS.lock().unwrap().1.len();
         let candidates = std::sync::atomic::AtomicUsize::new(0);
         let tools = subagent_tree_filtered(&parent, crate::SubagentDemand::Tools, Some("wf_abc-123"), &|id, run| {
             candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             id == "agent-a222" && run == Some("wf_abc-123")
-        });
+        })
+        .unwrap();
         assert_eq!(
             candidates.load(std::sync::atomic::Ordering::Relaxed),
             2,
@@ -2052,7 +2437,7 @@ mod tests {
         assert!(tools[0].description.is_none() && tools[0].result_summary.is_none());
         let reads: Vec<_> = FOREST_READS.lock().unwrap().1[before..]
             .iter()
-            .filter(|(_, path)| path.starts_with(&root))
+            .filter(|(kind, path)| *kind != "scan" && path.starts_with(&root))
             .cloned()
             .collect();
         assert_eq!(
@@ -2067,16 +2452,17 @@ mod tests {
         let before = FOREST_READS.lock().unwrap().1.len();
         let sessions = subagent_tree_filtered(&parent, crate::SubagentDemand::Sessions, None, &|id, _| {
             id == "agent-a111"
-        });
+        })
+        .unwrap();
         assert_eq!(sessions.len(), 1);
         let reads: Vec<_> = FOREST_READS.lock().unwrap().1[before..]
             .iter()
-            .filter(|(_, path)| path.starts_with(&root))
+            .filter(|(kind, path)| *kind != "scan" && path.starts_with(&root))
             .cloned()
             .collect();
         assert_eq!(reads, [("transcript", a1.clone())]);
         let selected_rich =
-            subagent_tree_filtered(&parent, crate::SubagentDemand::Rich, None, &|id, _| id == "agent-a222");
+            subagent_tree_filtered(&parent, crate::SubagentDemand::Rich, None, &|id, _| id == "agent-a222").unwrap();
         assert_eq!(
             serde_json::to_value(&selected_rich[0]).unwrap(),
             serde_json::to_value(original).unwrap()
@@ -2086,7 +2472,14 @@ mod tests {
         let refs: Vec<_> = tree.iter().map(|s| &s.session).collect();
         for _ in 0..2 {
             assert_eq!(
-                serde_json::to_vec(&subagent_session_refs(&parent)).unwrap(),
+                serde_json::to_vec(
+                    &subagent_tree_filtered(&parent, crate::SubagentDemand::Sessions, None, &|_, _| true)
+                        .unwrap()
+                        .into_iter()
+                        .map(|s| s.session)
+                        .collect::<Vec<_>>()
+                )
+                .unwrap(),
                 serde_json::to_vec(&refs).unwrap(),
                 "cold and cached refs preserve both tiers and ordering"
             );
@@ -2096,23 +2489,13 @@ mod tests {
         let usage = stream_file(
             "a111",
             &subs.join("agent-a111.jsonl"),
-            &ParseOptions::usage(),
+            &Demand::USAGE.with_spans(),
             &mut sink,
         );
         assert_eq!(usage.lineage.parent.as_deref(), Some("sess"));
         assert!(usage.lineage.spawned_by_tool_use.is_none());
         assert!(!usage.extra.contains_key("claude"));
-        let path = Some(subs.join("agent-a111.jsonl"));
-        let full = new_session_for("a111", path.clone(), &ParseOptions::full());
-        let both = new_session_for(
-            "a111",
-            path,
-            &ParseOptions {
-                usage_identity: true,
-                ..ParseOptions::full()
-            },
-        );
-        assert_eq!(serde_json::to_vec(&full).unwrap(), serde_json::to_vec(&both).unwrap());
+        let full = new_session_for("a111", Some(subs.join("agent-a111.jsonl")), &Demand::RICH);
         assert_eq!(full.lineage.spawned_by_tool_use.as_deref(), Some("toolu_77"));
 
         let direct = tree.iter().find(|s| s.agent_id() == "a111").expect("direct agent");
@@ -2122,7 +2505,10 @@ mod tests {
         assert!(direct.workflow.is_none());
         assert_eq!(direct.result_status, None); // direct agents report via parent tool_result
                                                 // its return value = the last assistant text turn.
-        assert_eq!(subagent_return(&direct.session.path).as_deref(), Some("done one"));
+        assert_eq!(
+            subagent_return(&direct.session.path).unwrap().as_deref(),
+            Some("done one")
+        );
 
         let w1 = tree.iter().find(|s| s.agent_id() == "a222").expect("wf agent 1");
         assert_eq!(w1.workflow.as_deref(), Some("wf_abc-123"));
@@ -2178,11 +2564,11 @@ mod tests {
         let reference = SessionRef::new("source", Harness::Claude, path.clone());
         let adapter = Claude::with_config_dir(&world.proj);
         for opts in [
-            ParseOptions::lazy(),
-            ParseOptions::lazy_extra(),
-            ParseOptions::bulk(),
-            ParseOptions::full(),
-            ParseOptions::complete(),
+            Demand::LEAN.with_spans(),
+            Demand::RICH.with_spans(),
+            Demand::LEAN,
+            Demand::RICH,
+            Demand::COMPLETE,
         ] {
             let mut sink = CollectSink::default();
             let mut actual = adapter.stream(&reference, &opts, &mut sink).unwrap();
@@ -2194,13 +2580,23 @@ mod tests {
                 };
                 match input {
                     Json::Source(range) => {
-                        assert!(opts.spans && !opts.complete && i < inputs.len() && inputs[i].len() > INLINE_MAX);
+                        assert!(
+                            opts.spans
+                                && opts.tier != Tier::Complete
+                                && i < inputs.len()
+                                && inputs[i].len() > INLINE_MAX
+                        );
                         let start = range.offset() as usize;
                         assert_eq!(&text[start..start + range.len() as usize], inputs[i]);
                         assert_eq!(range.path(), path);
                     }
                     Json::Owned(_) => {
-                        assert!(!opts.spans || opts.complete || i == inputs.len() || inputs[i].len() <= INLINE_MAX);
+                        assert!(
+                            !opts.spans
+                                || opts.tier == Tier::Complete
+                                || i == inputs.len()
+                                || inputs[i].len() <= INLINE_MAX
+                        );
                     }
                 }
                 let expected = inputs
@@ -2211,7 +2607,13 @@ mod tests {
         }
         // Strings have no source file: their inputs are always owned.
         let mut sink = CollectSink::default();
-        stream_str("source", &text, Some(path.clone()), &ParseOptions::lazy(), &mut sink);
+        stream_str(
+            "source",
+            &text,
+            Some(path.clone()),
+            &Demand::LEAN.with_spans(),
+            &mut sink,
+        );
         assert!(sink.messages.iter().flat_map(|m| &m.content).all(|b| !matches!(
             b,
             Block::ToolUse {
@@ -2234,7 +2636,7 @@ mod tests {
         fs::write(&path, text).unwrap();
         let adapter = Claude::with_config_dir(&world.proj);
         let reference = SessionRef::new("source", Harness::Claude, path.clone());
-        for opts in [ParseOptions::lazy(), ParseOptions::lazy_extra()] {
+        for opts in [Demand::LEAN.with_spans(), Demand::RICH.with_spans()] {
             let mut sink = CollectSink::default();
             let mut actual = adapter.stream(&reference, &opts, &mut sink).unwrap();
             actual.messages = sink.messages;
@@ -2263,11 +2665,19 @@ mod tests {
         fs::write(&path, &text).unwrap();
         let reference = SessionRef::new("source", Harness::Claude, path.clone());
         let adapter = Claude::with_config_dir(&world.proj);
-        let mut cp = Checkpoint::new(first.len() as u64);
-        cp.put(ADAPTER_LAYER, &new_session("source", Some(path.clone())));
+        let cp = jsonl::checkpoint::<Transcript>(
+            first.len() as u64,
+            Demand::LEAN.with_spans(),
+            &new_session("source", Some(path.clone())),
+        );
         let mut sink = CollectSink::default();
         adapter
-            .resume(&reference, &ParseOptions::lazy(), &mut sink, &cp)
+            .transcript(
+                &reference,
+                &Demand::LEAN.with_spans(),
+                crate::stream::Start::Checkpoint(&cp),
+                &mut sink,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(sink.messages.len(), 1);
@@ -2281,7 +2691,7 @@ mod tests {
         assert!(range.offset() >= first.len() as u64);
         assert_eq!(Json::Source(range.clone()).resolve().unwrap()["id"], "second");
         // Deleting the path keeps an existing Unix mmap readable but invalidates its captured
-        // identity. The operation must stop before another callback and return the source error.
+        // identity. A slow callback must stop the operation before another callback.
         struct Deleting {
             path: PathBuf,
             calls: usize,
@@ -2295,6 +2705,7 @@ mod tests {
                     self.captured = Some(input.clone());
                 }
                 fs::remove_file(&self.path).unwrap();
+                std::thread::sleep(jsonl::Read::SLOW_CALLBACK * 10);
                 Flow::Continue
             }
             fn wants_checkpoint(&mut self, _offset: u64) -> bool {
@@ -2311,15 +2722,128 @@ mod tests {
             captured: None,
         };
         assert!(adapter
-            .stream(&reference, &ParseOptions::lazy(), &mut deleting)
+            .stream(&reference, &Demand::LEAN.with_spans(), &mut deleting)
             .is_err());
         assert_eq!(deleting.calls, 1);
         assert_eq!(deleting.checkpoints, 0);
         assert!(deleting.captured.unwrap().resolve().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn native_json_inputs_check_completion_only_after_source_publication() {
+    fn callback_truncation_is_rejected_before_resuming_mapped_records() {
+        if !crate::harness::store::jsonl::tests::in_child(
+            "harness::claude::tests::callback_truncation_is_rejected_before_resuming_mapped_records",
+        ) {
+            return;
+        }
+        struct Mutate {
+            path: PathBuf,
+            original: Vec<u8>,
+            file: fs::File,
+            at: &'static str,
+            replace: bool,
+            mutate: bool,
+            calls: usize,
+            checkpoints: usize,
+            held: Option<Message>,
+        }
+        impl Mutate {
+            fn change(&mut self, at: &str) {
+                if self.mutate && (self.at == at || (self.at == "ignored-wants" && at == "wants")) {
+                    if self.replace {
+                        fs::rename(&self.path, self.path.with_extension("moved")).unwrap();
+                        fs::write(&self.path, &self.original).unwrap();
+                    }
+                    self.file.set_len(0).unwrap();
+                    self.mutate = false;
+                    // A callback that changed the file is a slow one by construction; the reader
+                    // checks the backing after a slow callback, before touching the mapping again.
+                    std::thread::sleep(jsonl::Read::SLOW_CALLBACK * 10);
+                }
+            }
+        }
+        impl MessageSink for Mutate {
+            fn message(&mut self, message: Message) -> Flow {
+                self.calls += 1;
+                self.held = Some(message);
+                self.change("message");
+                Flow::Continue
+            }
+            fn wants_checkpoint(&mut self, _: u64) -> bool {
+                self.change("wants");
+                self.at == "checkpoint"
+            }
+            fn checkpoint(&mut self, _: &mut Checkpoint) {
+                self.checkpoints += 1;
+                self.change("checkpoint");
+            }
+        }
+        let world = crate::test_world("claude-callback-truncation");
+        let path = world.proj.join("source.jsonl");
+        for spans in [false, true] {
+            let first = serde_json::json!({"type":"user","uuid":"first","message":{"role":"user","content":"owned ".repeat(1000)}});
+            let tail = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"tail\"}}\n".repeat(1000);
+            let original = format!("{first}\n{tail}").into_bytes();
+            for at in ["message", "wants", "checkpoint", "ignored-wants"] {
+                let original = if at == "ignored-wants" {
+                    [
+                        b"{\"type\":\"custom-title\",\"customTitle\":\"metadata first\"}\n".as_slice(),
+                        &original,
+                    ]
+                    .concat()
+                } else {
+                    original.clone()
+                };
+                for (mutate, replace) in [(false, false), (true, false), (true, true)] {
+                    fs::write(&path, &original).unwrap();
+                    let mut sink = Mutate {
+                        path: path.clone(),
+                        original: original.clone(),
+                        file: fs::OpenOptions::new().write(true).open(&path).unwrap(),
+                        at,
+                        replace,
+                        mutate,
+                        calls: 0,
+                        checkpoints: 0,
+                        held: None,
+                    };
+                    let reference = SessionRef::new("source", Harness::Claude, path.clone());
+                    let opts = if spans { Demand::LEAN.with_spans() } else { Demand::RICH };
+                    let result = Claude::with_config_dir(&world.proj).stream(&reference, &opts, &mut sink);
+                    assert_eq!(result.is_err(), mutate, "spans={spans},at={at},replace={replace}");
+                    if mutate {
+                        assert_eq!(
+                            sink.calls,
+                            usize::from(at != "ignored-wants"),
+                            "do not resume the mapped framer after a callback shrinks it"
+                        );
+                        assert_eq!(sink.checkpoints, usize::from(at == "checkpoint"));
+                        if at == "ignored-wants" {
+                            assert!(
+                                sink.held.is_none(),
+                                "metadata checkpoint polling precedes every delivered message"
+                            );
+                            continue;
+                        }
+                        let Block::Text { text } = &sink.held.as_ref().unwrap().content[0] else {
+                            panic!("first text")
+                        };
+                        assert_eq!(matches!(text, Text::Source(_)), spans);
+                        if let Text::Inline(text) = text {
+                            assert_eq!(text, &"owned ".repeat(1000));
+                        }
+                    } else {
+                        assert_eq!(sink.calls, 1001);
+                        assert_eq!(fs::read(&path).unwrap(), original);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_json_inputs_verify_completion_even_after_owned_early_stop() {
         let world = crate::test_world("claude-json-input-completion");
         let path = world.proj.join("source.jsonl");
         let record = |input: Value| {
@@ -2333,23 +2857,56 @@ mod tests {
         let tiny = record(serde_json::json!({"path": "x"}));
         let reference = SessionRef::new("source", Harness::Claude, path.clone());
         let adapter = Claude::with_config_dir(&world.proj);
-        fs::write(&path, &tiny).unwrap();
-        let mut owned = None;
-        let mut remove_tiny = |message: Message| {
-            owned = Some(message);
-            fs::remove_file(&path).unwrap();
-            Flow::Stop
-        };
+        fs::write(&path, tiny.clone() + &tiny).unwrap();
+        let mut stable_calls = 0;
         adapter
-            .stream(&reference, &ParseOptions::lazy(), &mut remove_tiny)
+            .stream(&reference, &Demand::LEAN.with_spans(), &mut |_: Message| {
+                stable_calls += 1;
+                Flow::Stop
+            })
             .unwrap();
-        assert!(matches!(
-            &owned.unwrap().content[0],
-            Block::ToolUse {
-                input: Json::Owned(_),
-                ..
+        assert_eq!(
+            stable_calls, 1,
+            "intentional stop succeeds while the captured source is unchanged"
+        );
+        struct RemoveOwned {
+            path: PathBuf,
+            owned: Option<Message>,
+            calls: usize,
+            checkpoints: usize,
+        }
+        impl MessageSink for RemoveOwned {
+            fn message(&mut self, message: Message) -> Flow {
+                self.calls += 1;
+                self.owned = Some(message);
+                fs::remove_file(&self.path).unwrap();
+                Flow::Stop
             }
-        ));
+            fn wants_checkpoint(&mut self, _: u64) -> bool {
+                true
+            }
+            fn checkpoint(&mut self, _: &mut Checkpoint) {
+                self.checkpoints += 1;
+            }
+        }
+        let mut deleting = RemoveOwned {
+            path: path.clone(),
+            owned: None,
+            calls: 0,
+            checkpoints: 0,
+        };
+        assert!(adapter
+            .stream(&reference, &Demand::LEAN.with_spans(), &mut deleting)
+            .is_err());
+        assert_eq!((deleting.calls, deleting.checkpoints), (1, 0));
+        let Block::ToolUse {
+            input: Json::Owned(input),
+            ..
+        } = &deleting.owned.as_ref().unwrap().content[0]
+        else {
+            panic!("tiny tool input should remain owned and usable");
+        };
+        assert_eq!(input["path"], "x");
         // A later callback that emits only owned inputs need not stat the source on that record,
         // but completion must reject invalidation of an earlier published Source descriptor.
         let large = record(serde_json::json!({"body": "x".repeat(INLINE_MAX)}));
@@ -2363,7 +2920,7 @@ mod tests {
             Flow::Continue
         };
         assert!(adapter
-            .stream(&reference, &ParseOptions::lazy(), &mut remove_later)
+            .stream(&reference, &Demand::LEAN.with_spans(), &mut remove_later)
             .is_err());
         assert_eq!(calls, 2);
     }
@@ -2388,16 +2945,16 @@ mod tests {
         drop(f);
 
         let r = SessionRef {
-            message_count: 1,
+            message_count: Some(1),
             ..SessionRef::new("s", Harness::Claude, path.clone())
         };
         // Lazy parse → expect a Span; resolving it must equal `big`.
         let mut sink = CollectSink::default();
-        let mut s = stream_file(&r.id, &path, &ParseOptions::lazy(), &mut sink);
+        let mut s = stream_file(&r.id, &path, &Demand::LEAN.with_spans(), &mut sink);
         s.messages = sink.messages;
         match &s.messages[0].content[0] {
             Block::Text { text } => {
-                assert!(text.is_span(), "large content should be a span");
+                assert!(text.is_lazy(), "large content should be a span");
                 let resolver = s.resolver();
                 assert_eq!(text.try_resolve(&resolver).unwrap(), big.as_str());
             }
@@ -2407,7 +2964,7 @@ mod tests {
         s.materialize().unwrap();
         match &s.messages[0].content[0] {
             Block::Text { text } => {
-                assert!(!text.is_span());
+                assert!(!text.is_lazy());
                 assert_eq!(text.inline_str(), Some(big.as_str()));
             }
             _ => panic!("expected text block"),
@@ -2416,17 +2973,13 @@ mod tests {
     }
 
     /// Stream a transcript file through the one reader.
-    fn stream_file(id: &str, path: &Path, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Session {
-        read(
-            new_session_for(id, Some(path.to_path_buf()), opts),
-            path,
-            0,
-            None,
-            opts,
-            sink,
-            &mut || Ok(()),
-        )
-        .unwrap()
+    fn stream_file(id: &str, path: &Path, opts: &Demand, sink: &mut dyn MessageSink) -> Session {
+        // A prefix through EOF: the whole transcript, without the fork-source lookup.
+        let r = SessionRef::new(id, Harness::Claude, path);
+        ROOTLESS
+            .transcript(&r, opts, Start::Prefix(u64::MAX), sink)
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -2476,9 +3029,9 @@ mod tests {
             fs::write(&path, &text).unwrap();
             let r = scan(&path).unwrap();
             for opts in [
-                ParseOptions::lazy(),
-                ParseOptions::lazy_offsets(),
-                ParseOptions::lazy_extra(),
+                Demand::LEAN.with_spans(),
+                Demand::LEAN.with_spans().with_offsets(),
+                Demand::RICH.with_spans(),
             ] {
                 let mut whole = Capture::default();
                 let session = Claude::with_config_dir(&dir).stream(&r, &opts, &mut whole).unwrap();
@@ -2492,7 +3045,7 @@ mod tests {
                 for (cp, seen) in &whole.checkpoints {
                     let mut rest = Capture::default();
                     let resumed = Claude::with_config_dir(&dir)
-                        .resume(&r, &opts, &mut rest, cp)
+                        .transcript(&r, &opts, crate::stream::Start::Checkpoint(cp), &mut rest)
                         .unwrap()
                         .unwrap();
                     assert_eq!(
@@ -2553,7 +3106,7 @@ mod tests {
         }
         drop(f);
 
-        let opts = ParseOptions::lazy_offsets();
+        let opts = Demand::LEAN.with_spans().with_offsets();
         let mut full = CollectSink::default();
         stream_file("s", &path, &opts, &mut full);
         let full = full.messages;
@@ -2588,7 +3141,7 @@ mod tests {
 
         // And bulk/full options never stamp (their output stays byte-identical to before).
         let mut bulk = CollectSink::default();
-        stream_file("s", &path, &ParseOptions::bulk(), &mut bulk);
+        stream_file("s", &path, &Demand::LEAN, &mut bulk);
         assert!(bulk
             .messages
             .iter()
@@ -2599,7 +3152,7 @@ mod tests {
 
     #[test]
     fn bulk_opts_skip_extra_but_keep_text() {
-        // The bulk path (`ParseOptions::bulk()`) must NOT materialize the fat `toolUseResult`
+        // The bulk path (`Demand::LEAN`) must NOT materialize the fat `toolUseResult`
         // sidecar — that's the whole point of gating `extra` for index/search/dataset — while the
         // full path (`parse`) keeps it. The searchable text must be identical either way.
         let text = fixture("rich_blocks.jsonl");
@@ -2612,7 +3165,7 @@ mod tests {
         );
 
         let mut sink = CollectSink::default();
-        let mut bulk = stream_str("s1", &text, None, &ParseOptions::bulk(), &mut sink);
+        let mut bulk = stream_str("s1", &text, None, &Demand::LEAN, &mut sink);
         bulk.messages = sink.messages;
         for m in &bulk.messages {
             assert!(m.extra.is_empty(), "bulk opts must leave every message's extra empty");
@@ -2623,9 +3176,16 @@ mod tests {
                 "bulk opts must not materialize the fat sidecar onto the block either"
             );
         }
+        let searchable = |s: &Session| {
+            let mut out = String::new();
+            for m in &s.messages {
+                m.append_searchable(&mut out).unwrap();
+            }
+            out
+        };
         assert_eq!(
-            full.searchable_text().unwrap(),
-            bulk.searchable_text().unwrap(),
+            searchable(&full),
+            searchable(&bulk),
             "gating extra must not change searchable text"
         );
     }
@@ -2639,7 +3199,7 @@ mod tests {
             seen += 1;
             Flow::Stop
         };
-        let _ = stream_str("s1", &text, None, &ParseOptions::bulk(), &mut sink);
+        let _ = stream_str("s1", &text, None, &Demand::LEAN, &mut sink);
         assert_eq!(seen, 1, "Stop after the first message must halt streaming");
     }
 }

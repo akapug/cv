@@ -39,7 +39,6 @@ fn opencode_db_path(out_dir: &Path) -> PathBuf {
 /// `session_v2`/`session_message`. Fresh bootstrap and row publication are atomic.
 /// Tool results fold onto assistant tools; native v2 uses content[] and structured errors.
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    crate::harness::wire::write::check_source_fields(session)?;
     #[cfg(not(feature = "sqlite"))]
     {
         let _ = (session, out_dir, opts);
@@ -47,6 +46,8 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     }
     #[cfg(feature = "sqlite")]
     {
+        // Reject unreadable sources before creating output; each store also guards its commit.
+        crate::harness::wire::write::check_source_fields(session)?;
         emit_opencode_db(session, out_dir, opts)
     }
 }
@@ -86,12 +87,8 @@ fn emit_opencode_db(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Re
         |row| row.get(0),
     )?;
     if v2 || empty {
-        let cwd = if cwd_str.is_empty() {
-            std::env::current_dir()?.to_string_lossy().into_owned()
-        } else {
-            cwd_str.clone()
-        };
-        v2::write_database(session, opts, &new_id, &cwd, &mut conn).context(
+        // Empty is the store's unknown-directory sentinel, as on the v1 path.
+        v2::write_database(session, opts, &new_id, &cwd_str, &mut conn).context(
             "exporting native OpenCode 2.x store (requires complete session_v2/session_message/project schema)",
         )?;
     } else {
@@ -337,6 +334,7 @@ fn write_database(
     drop(part_insert);
     drop(message_insert);
     drop(session_insert);
+    // Revalidate after source reads and before committing any staged database changes.
     crate::harness::wire::write::check_source_fields(session)?;
     tx.commit()?;
     Ok(())
@@ -344,6 +342,8 @@ fn write_database(
 
 /// The `state` object of an OpenCode `tool` part: the call's `input`, plus — when the session
 /// paired one with it — the result's status, output-or-error and structured `details`.
+/// This v1 layout hoists title/time into state and folds other details into metadata;
+/// `emit/v2.rs::tool_state` uses the v2 details envelope instead.
 ///
 /// `input` is `None` for an **orphan** result (see [`emit_opencode_db`]): the call itself is not in
 /// this session, so there are no arguments to record, only what came back.
@@ -403,6 +403,34 @@ fn tool_state(
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
+    #[test]
+    fn unknown_cwd_stays_empty_and_complete_verification_is_declared() -> Result<()> {
+        let world = crate::test_world("opencode-unknown-cwd");
+        let mut session = Session::new("source", crate::Harness::Claude);
+        let mut message = crate::Message::new(Role::User);
+        message.content.push(Block::Text { text: "hello".into() });
+        session.messages.push(message);
+        let (result, report) = crate::emit::emit_report(
+            &session,
+            crate::Harness::OpenCode,
+            &world.base.join("out"),
+            &EmitOptions {
+                parsed_at: ParsedAt::Complete,
+                ..Default::default()
+            },
+        )?;
+        let conn = rusqlite::Connection::open(&result.path)?;
+        let cwd: String = conn.query_row("SELECT directory FROM session_v2 WHERE id=?1", [&result.new_id], |r| {
+            r.get(0)
+        })?;
+        assert!(cwd.is_empty());
+        assert!(report
+            .deltas
+            .iter()
+            .any(|d| d.what == "verification demand" && d.expected));
+        Ok(())
+    }
+
     #[test]
     fn exported_v1_store_uses_lookup_indexes_with_unrelated_rows() -> Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;

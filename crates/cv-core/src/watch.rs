@@ -9,10 +9,9 @@ use crate::harness;
 use crate::ir::{Harness, Message, SessionRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 mod read;
-pub use read::{read as read_tail, read_session, read_session_into, ReadPass, ReadState};
+pub use read::{read as read_tail, read_session, read_session_into, Held, ReadPass, ReadState};
 
 /// What changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,12 +49,7 @@ impl Filter {
             }
         }
         if let Some(needle) = &self.cwd_contains {
-            let hit = r
-                .cwd
-                .as_ref()
-                .map(|p| p.to_string_lossy().contains(needle))
-                .unwrap_or(false);
-            if !hit {
+            if !r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(needle)) {
                 return false;
             }
         }
@@ -67,15 +61,52 @@ fn resolve_checked(r: &SessionRef, mark: Mark, check: &mut dyn FnMut() -> anyhow
     check()?;
     let count = match mark {
         Mark::Messages(n) => n,
-        Mark::Bytes(len) => match r.harness {
-            Harness::Claude => harness::claude::count_prefix_checked(r, len, check)?,
-            Harness::Codex => harness::codex::count_prefix_checked(r, len, check)?,
-            Harness::Qwen => harness::qwen::count_prefix_checked(r, len, check)?,
-            _ => anyhow::bail!("watch byte mark unsupported for {}", r.harness),
-        },
+        Mark::Bytes(len) if append_only(r) => count_prefix(r, len, check)?,
+        Mark::Bytes(_) => anyhow::bail!("watch byte mark unsupported for {}", r.harness),
     };
     check()?;
     Ok(count)
+}
+
+/// How many messages a whole read of `r`'s first `len` bytes yields: the count a read would have
+/// returned when the append-only transcript was `len` bytes long ([`crate::stream::Start::Prefix`]).
+/// `check` runs at every finished line the reader could resume after (its checkpoint offers),
+/// blank ones included.
+pub(crate) fn count_prefix(
+    r: &SessionRef,
+    len: u64,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<usize> {
+    struct Count<'c> {
+        messages: usize,
+        check: &'c mut dyn FnMut() -> anyhow::Result<()>,
+        error: Option<anyhow::Error>,
+    }
+    impl crate::MessageSink for Count<'_> {
+        fn message(&mut self, _: Message) -> crate::Flow {
+            self.messages += 1;
+            crate::Flow::Continue
+        }
+        fn wants_checkpoint(&mut self, _: u64) -> bool {
+            if let Err(error) = (self.check)() {
+                self.error = Some(error);
+            }
+            false
+        }
+        fn take_error(&mut self) -> Option<anyhow::Error> {
+            self.error.take()
+        }
+    }
+    let adapter = harness::rootless(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+    let mut count = Count {
+        messages: 0,
+        check,
+        error: None,
+    };
+    adapter
+        .transcript(r, &crate::Demand::RICH, crate::stream::Start::Prefix(len), &mut count)?
+        .ok_or_else(|| anyhow::anyhow!("{} declined a byte prefix of {}", r.harness, r.path.display()))?;
+    Ok(count.messages)
 }
 
 /// Where a follower stands in one session.
@@ -90,12 +121,11 @@ pub enum Mark {
     Bytes(u64),
 }
 
-/// Transcripts that only ever grow by appending lines, so a byte length pins a past state: Claude
-/// and plain Codex `.jsonl`, plus Qwen's chronological `projects/...` ChatRecords. Compressed
-/// Codex and Qwen's legacy Gemini replay are excluded: their byte prefix is not a logical prefix.
+/// A transcript that only ever grows by appending lines, so a byte length pins a past state
+/// ([`harness::Adapter::append_only`]). A byte mark on any other session (a compressed rollout, a
+/// rewritten recording) resolves to nothing.
 fn append_only(r: &SessionRef) -> bool {
-    (matches!(r.harness, Harness::Claude | Harness::Codex) && r.path.extension().is_some_and(|e| e == "jsonl"))
-        || (r.harness == Harness::Qwen && harness::qwen::is_session_jsonl(&r.path))
+    harness::rootless(r.harness).is_some_and(|adapter| adapter.append_only(r))
 }
 
 /// Record where `r` stands now, as cheaply as possible: one `stat` for an append-only transcript,
@@ -146,9 +176,7 @@ pub fn tail(r: &SessionRef, skip: usize, keep: usize) -> Option<(usize, Vec<Mess
         total += 1;
         crate::stream::Flow::Continue
     };
-    let session = adapter
-        .try_stream(r, &crate::stream::ParseOptions::full(), &mut sink)
-        .ok()?;
+    let session = adapter.try_stream(r, &crate::stream::Demand::RICH, &mut sink).ok()?;
     // As `stream::collect` does: own any lazy content (full-fidelity streams rarely produce any).
     let resolver = session.resolver();
     for m in &mut kept {
@@ -161,12 +189,9 @@ pub fn tail(r: &SessionRef, skip: usize, keep: usize) -> Option<(usize, Vec<Mess
 pub fn resolve(r: &SessionRef, mark: Mark) -> Option<usize> {
     match mark {
         Mark::Messages(n) => Some(n),
-        Mark::Bytes(len) => match r.harness {
-            Harness::Claude => harness::claude::count_prefix(r, len).ok(),
-            Harness::Codex => harness::codex::count_prefix(r, len).ok(),
-            Harness::Qwen => harness::qwen::count_prefix(r, len).ok(),
-            _ => None,
-        },
+        Mark::Bytes(len) => append_only(r)
+            .then(|| count_prefix(r, len, &mut || Ok(())).ok())
+            .flatten(),
     }
 }
 
@@ -174,7 +199,7 @@ pub fn resolve(r: &SessionRef, mark: Mark) -> Option<usize> {
 #[derive(Debug, Clone)]
 struct State {
     /// Cheap change signal from discovery (no full parse needed to detect change).
-    trigger: (usize, Option<i64>),
+    trigger: (Option<usize>, Option<i64>),
     /// How far we've already reported.
     mark: Mark,
     /// Messages past `mark` were left unread when a bounded poll's budget ran out: the next poll
@@ -184,26 +209,47 @@ struct State {
     read: Option<ReadState>,
 }
 
+impl State {
+    /// Whether the session must be read again: its trigger moved, a bounded poll left messages
+    /// pending, or its source no longer matches the recorded baseline.
+    fn stale(&self, trigger: (Option<usize>, Option<i64>), r: &SessionRef) -> bool {
+        self.trigger != trigger
+            || self.pending
+            || self
+                .read
+                .as_ref()
+                .map_or(matches!(self.mark, Mark::Messages(_)), |read| {
+                    !read.baseline_unchanged(r)
+                })
+    }
+}
+
 /// One session's position, as the cursor carries it. The field names are the wire: `t` the
 /// trigger, `n` the parsed count, `b` a byte baseline not yet resolved (see [`Mark::Bytes`]),
-/// `more` the pending flag. Optional fields keep a cursor issued before they existed decoding.
+/// `more` the pending flag. Exactly one of `n` and `b` holds the mark.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pos {
-    t: (usize, Option<i64>),
-    n: usize,
+    t: (Option<usize>, Option<i64>),
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    n: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     b: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     more: bool,
+    /// A reader state riding inline: what cursors before 0.18 carried for up to eight sessions.
+    /// Still read; never written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     r: Option<ReadState>,
+    /// The generation of this session's reader state in the issuing process's [`Readers`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    h: Option<u64>,
 }
 
 impl From<&State> for Pos {
     fn from(s: &State) -> Pos {
         let (n, b) = match s.mark {
-            Mark::Messages(n) => (n, None),
-            Mark::Bytes(len) => (0, Some(len)),
+            Mark::Messages(n) => (Some(n), None),
+            Mark::Bytes(len) => (None, Some(len)),
         };
         Pos {
             t: s.trigger,
@@ -211,20 +257,17 @@ impl From<&State> for Pos {
             b,
             more: s.pending,
             r: None,
+            h: None,
         }
     }
 }
 
-impl From<Pos> for State {
-    fn from(p: Pos) -> State {
-        State {
-            trigger: p.t,
-            mark: match p.b {
-                Some(len) => Mark::Bytes(len),
-                None => Mark::Messages(p.n),
-            },
-            pending: p.more,
-            read: p.r,
+impl Pos {
+    fn mark(&self) -> Option<Mark> {
+        match (self.n, self.b) {
+            (Some(n), None) => Some(Mark::Messages(n)),
+            (None, Some(len)) => Some(Mark::Bytes(len)),
+            _ => None,
         }
     }
 }
@@ -240,7 +283,7 @@ pub struct Cursor {
     o: BTreeMap<String, Pos>,
 }
 
-const CURSOR_VERSION: u32 = 1;
+const CURSOR_VERSION: u32 = 2;
 
 impl Cursor {
     /// The compact string a caller carries between polls.
@@ -248,9 +291,12 @@ impl Cursor {
         serde_json::to_string(self).expect("a cursor serializes")
     }
 
-    /// `None` when `s` is not a cursor this build issued (unparseable, or another version).
+    /// `None` when `s` is not a cursor this build issued (unparseable, another version, or a
+    /// position without exactly one mark).
     pub fn decode(s: &str) -> Option<Cursor> {
-        serde_json::from_str::<Cursor>(s).ok().filter(|c| c.v == CURSOR_VERSION)
+        serde_json::from_str::<Cursor>(s)
+            .ok()
+            .filter(|c| c.v == CURSOR_VERSION && c.o.values().all(|p| p.mark().is_some()))
     }
 
     /// How many sessions the cursor positions.
@@ -263,6 +309,73 @@ impl Cursor {
     }
 }
 
+/// The reader states behind the cursors one process issued, one per observed session: each
+/// cursor position names its state's generation, and the state stays here, not on the wire. The
+/// bound is one state per session this process observed, whatever the number of sessions or the
+/// size of a state. A position whose generation is not here (a cursor another process issued,
+/// or a second observer of the session replaced its state) reads that session from its start
+/// once; [`Watcher::rereads`] counts those, and `observe_stream` reports them.
+pub struct Readers {
+    states: std::sync::Mutex<std::collections::HashMap<String, (u64, ReadState)>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl Default for Readers {
+    fn default() -> Self {
+        // Generations start at a per-process point, so another process's cursor does not name
+        // one of ours by coincidence.
+        let start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+            ^ (u64::from(std::process::id()) << 40);
+        Self {
+            states: Default::default(),
+            next: std::sync::atomic::AtomicU64::new(start),
+        }
+    }
+}
+
+impl Readers {
+    fn get(&self, key: &str, generation: u64) -> Option<ReadState> {
+        let states = self.states.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        states
+            .get(key)
+            .filter(|(held, _)| *held == generation)
+            .map(|(_, read)| read.clone())
+    }
+
+    fn put(&self, key: &str, read: &ReadState) -> u64 {
+        let generation = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.to_string(), (generation, read.clone()));
+        generation
+    }
+
+    /// How many sessions hold a reader state.
+    pub fn len(&self) -> usize {
+        self.states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether `key` holds a reader state. A `Readers` serves every observer
+    /// in its process, so a test asserting on `len` races with unrelated
+    /// sessions: the per-key question is the isolation-proof one.
+    pub fn contains(&self, key: &str) -> bool {
+        self.states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(key)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// A stateful poller. Call [`poll`](Watcher::poll) repeatedly, or [`run`](Watcher::run) to loop;
 /// [`to_cursor`](Watcher::to_cursor) / [`from_cursor`](Watcher::from_cursor) carry the state
 /// across processes. Every poller in cv (`cv scry`, `cv watch`, MCP `await_omen` and
@@ -271,9 +384,52 @@ impl Cursor {
 pub struct Watcher {
     filter: Filter,
     seen: BTreeMap<String, State>,
+    /// The sessions whose reader state is the one stored under this generation in a
+    /// [`Readers`]: written by [`Watcher::to_cursor`] only for states that changed.
+    held: BTreeMap<String, u64>,
+    /// Updated sessions read from their start for want of a reader state ([`Watcher::rereads`]).
+    rereads: usize,
     /// Where sessions come from: [`crate::discover_all`] (stat the fleet, the default) or
     /// [`crate::sessions`] (the catalog fast path, for a poller that runs every few seconds).
-    discover: fn() -> Vec<SessionRef>,
+    discover: Box<dyn FnMut() -> Vec<SessionRef>>,
+}
+
+/// What one [`Watcher::poll`] asks for.
+pub struct Poll<'c> {
+    /// Messages offered across the call; the rest stay pending.
+    pub max: usize,
+    /// An unreadable session or unresolvable prior position is an error, not a skip.
+    pub strict: bool,
+    /// Offered messages keep source-backed payloads; the callback resolves them through checked
+    /// APIs, and a source change before acceptance fails the poll.
+    pub retained: bool,
+    /// Run before discovery, between sessions and at read and projection boundaries.
+    pub checked: Option<&'c mut dyn FnMut() -> anyhow::Result<()>>,
+}
+
+impl Default for Poll<'_> {
+    fn default() -> Self {
+        Poll {
+            max: usize::MAX,
+            strict: false,
+            retained: false,
+            checked: None,
+        }
+    }
+}
+
+struct SessionPoll<'a> {
+    kind: EventKind,
+    reference: &'a SessionRef,
+    adapter: &'a dyn harness::Adapter,
+    previous: Option<&'a ReadState>,
+    from: usize,
+    max: usize,
+}
+struct Delivery {
+    pass: ReadPass,
+    taken: usize,
+    stopped: bool,
 }
 
 impl Watcher {
@@ -284,14 +440,31 @@ impl Watcher {
     }
 
     /// [`Watcher::new`] over another session source (see [`Watcher::discover`]).
-    pub fn with_discovery(filter: Filter, emit_existing: bool, discover: fn() -> Vec<SessionRef>) -> Self {
+    pub fn with_discovery(
+        filter: Filter,
+        emit_existing: bool,
+        discover: impl FnMut() -> Vec<SessionRef> + 'static,
+    ) -> Self {
+        Self::with_discovery_until(filter, emit_existing, discover, || false)
+    }
+
+    /// [`Watcher::with_discovery`] whose baseline read stops once `expired` says so, for a
+    /// follower bounded by a deadline; [`Watcher::following`] tells how far it got.
+    pub fn with_discovery_until(
+        filter: Filter,
+        emit_existing: bool,
+        discover: impl FnMut() -> Vec<SessionRef> + 'static,
+        mut expired: impl FnMut() -> bool,
+    ) -> Self {
         let mut w = Watcher {
             filter,
             seen: BTreeMap::new(),
-            discover,
+            held: BTreeMap::new(),
+            rereads: 0,
+            discover: Box::new(discover),
         };
         if !emit_existing {
-            w.prime();
+            w.prime(&mut expired);
         }
         w
     }
@@ -302,7 +475,7 @@ impl Watcher {
     pub fn try_with_discovery(
         filter: Filter,
         emit_existing: bool,
-        discover: fn() -> Vec<SessionRef>,
+        discover: impl FnMut() -> Vec<SessionRef> + 'static,
         mut check: impl FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<Self> {
         check()?;
@@ -328,7 +501,12 @@ impl Watcher {
                 }
                 let adapter =
                     harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("unknown watch harness"))?;
-                let pass = read::read_tail_into(adapter.as_ref(), &r, None, usize::MAX, &mut Baseline, &mut check)?;
+                let demand = read::Demand {
+                    output: Some(&mut Baseline),
+                    check: Some(&mut check),
+                    ..Default::default()
+                };
+                let pass = read::pass(adapter.as_ref(), &r, None, usize::MAX, usize::MAX, demand)?;
                 (Mark::Messages(pass.total), pass.accepted(pass.total))
             };
             check()?;
@@ -345,55 +523,99 @@ impl Watcher {
         Ok(watcher)
     }
 
-    /// Resume from a [`Cursor`]: the watcher stands exactly where the one that issued it stood.
-    pub fn from_cursor(filter: Filter, cursor: Cursor, discover: fn() -> Vec<SessionRef>) -> Self {
+    /// Resume from a [`Cursor`]: the watcher stands exactly where the one that issued it stood,
+    /// with each session's reader state from `readers` where the cursor names it.
+    pub fn from_cursor(
+        filter: Filter,
+        cursor: Cursor,
+        discover: impl FnMut() -> Vec<SessionRef> + 'static,
+        readers: &Readers,
+    ) -> Self {
+        let mut held = BTreeMap::new();
+        let seen = cursor
+            .o
+            .into_iter()
+            .filter_map(|(k, p)| {
+                let mark = p.mark()?;
+                let read = match p
+                    .h
+                    .and_then(|generation| Some((generation, readers.get(&k, generation)?)))
+                {
+                    Some((generation, read)) => {
+                        held.insert(k.clone(), generation);
+                        Some(read)
+                    }
+                    None => p.r,
+                };
+                let state = State {
+                    trigger: p.t,
+                    mark,
+                    pending: p.more,
+                    read,
+                };
+                Some((k, state))
+            })
+            .collect();
         Watcher {
             filter,
-            seen: cursor.o.into_iter().map(|(k, p)| (k, State::from(p))).collect(),
-            discover,
+            seen,
+            held,
+            rereads: 0,
+            discover: Box::new(discover),
         }
     }
 
-    /// Where this watcher stands, to hand to [`Watcher::from_cursor`] later.
-    pub fn to_cursor(&self) -> Cursor {
-        // Keep the existing positions for every session, with at most eight <=64 KiB optional
-        // reader states. Omitted/older states replay once, preserving output and wire version.
-        let mut readers = 0;
-        Cursor {
-            v: CURSOR_VERSION,
-            o: self
-                .seen
-                .iter()
-                .map(|(k, s)| {
-                    let mut pos = Pos::from(s);
-                    if readers < 8 {
-                        if let Some(read) = s.read.as_ref().filter(|read| read.fits_cache(64 * 1024)) {
-                            pos.r = Some(read.clone());
-                            readers += 1;
-                        }
-                    }
-                    (k.clone(), pos)
-                })
-                .collect(),
+    /// Where this watcher stands, to hand to [`Watcher::from_cursor`] later. Every position
+    /// rides the wire; each reader state stays in `readers`, stored again only when it changed.
+    pub fn to_cursor(&mut self, readers: &Readers) -> Cursor {
+        let mut o = BTreeMap::new();
+        for (k, s) in &self.seen {
+            let mut pos = Pos::from(s);
+            if let Some(read) = &s.read {
+                let generation = *self.held.entry(k.clone()).or_insert_with(|| readers.put(k, read));
+                pos.h = Some(generation);
+            }
+            o.insert(k.clone(), pos);
         }
+        Cursor { v: CURSOR_VERSION, o }
+    }
+
+    /// Updated sessions this watcher read from their start because it held no reader state for
+    /// them: the cost a cursor carried to another process, or a shared session, pays once.
+    pub fn rereads(&self) -> usize {
+        self.rereads
     }
 
     fn key(r: &SessionRef) -> String {
         format!("{}:{}", r.harness.as_str(), r.id)
     }
 
-    fn trigger_of(r: &SessionRef) -> (usize, Option<i64>) {
+    /// How many sessions hold a position (the count a follower announces once primed).
+    pub fn following(&self) -> usize {
+        self.seen.len()
+    }
+
+    fn trigger_of(r: &SessionRef) -> (Option<usize>, Option<i64>) {
         (r.message_count, r.updated_at.map(|t| t.timestamp_millis()))
     }
 
     /// Record current state without emitting anything.
-    fn prime(&mut self) {
+    fn prime(&mut self, expired: &mut impl FnMut() -> bool) {
         for r in self.discover() {
+            if expired() {
+                return;
+            }
             // The cheap discover `message_count` is NOT the parsed IR length for several harnesses
             // (codex/hermes/claude add reasoning/tool/system turns), so seeding from it makes the
             // first `Updated` poll re-emit messages that predate the watcher. Record the true
             // baseline instead — a byte mark where the transcript is append-only (see [`baseline`]).
-            let (mark, read) = capture_baseline(&r, || baseline(&r).unwrap_or(Mark::Messages(r.message_count)));
+            // A session without one (unreadable now) stays unseen: the next poll surfaces it as
+            // New rather than following it from a guessed position, which would replay or skip.
+            let (mark, read) = capture_baseline(&r, || baseline(&r));
+            let Some(mark) = mark else {
+                continue;
+            };
+            self.held.remove(&Self::key(&r));
             self.seen.insert(
                 Self::key(&r),
                 State {
@@ -408,8 +630,9 @@ impl Watcher {
 
     /// The sessions to follow, oldest-touched first, so a bounded poll yields a chronological
     /// slice. Followers use full discovery independently of catalog synchronization. The
-    /// identity-aware per-file scan cache avoids reparsing unchanged transcripts.
-    fn discover(&self) -> Vec<SessionRef> {
+    /// identity-aware per-file scan cache avoids reparsing unchanged transcripts. Public as the
+    /// one-shot form of a follower: its current state is this list.
+    pub fn discover(&mut self) -> Vec<SessionRef> {
         let mut refs: Vec<SessionRef> = (self.discover)()
             .into_iter()
             .filter(|r| self.filter.matches(r))
@@ -441,56 +664,13 @@ impl Watcher {
         refs
     }
 
-    /// Poll once and return any events since the previous poll.
-    pub fn poll(&mut self) -> Vec<SessionEvent> {
-        let mut events = Vec::new();
-        self.poll_bounded(usize::MAX, |ev| {
-            let n = ev.new_messages.len();
-            events.push(ev);
-            n
-        });
-        events
-    }
-
-    /// Poll once, offering each session's newly appended messages to `take` — at most
-    /// `max_messages` across the call — which returns how many of them it consumed. What it
-    /// leaves (and every message past the budget) stays pending: the next poll re-reads that
-    /// session even if its cheap trigger has not moved. Returns whether anything is pending.
-    pub fn poll_bounded(&mut self, max_messages: usize, mut take: impl FnMut(SessionEvent) -> usize) -> bool {
-        self.poll_bounded_inner(max_messages, &mut take, false, false, None)
-            .unwrap_or(false)
-    }
-
-    /// A demanded bounded read: source/materialization failures are errors, so callers cannot
-    /// return a successful cursor for output that could not be read. The legacy polling API
-    /// remains best effort and leaves unreadable sessions retryable.
-    pub fn try_poll_bounded(
-        &mut self,
-        max_messages: usize,
-        mut take: impl FnMut(SessionEvent) -> usize,
-    ) -> anyhow::Result<bool> {
-        self.poll_bounded_inner(max_messages, &mut take, true, false, None)
-    }
-
-    /// Checked polling retaining source-backed message payloads. The callback must resolve
-    /// demanded content through checked APIs; source changes before acceptance fail the poll.
-    pub fn try_poll_bounded_retained(
-        &mut self,
-        max_messages: usize,
-        mut take: impl FnMut(SessionEvent) -> usize,
-    ) -> anyhow::Result<bool> {
-        self.poll_bounded_inner(max_messages, &mut take, true, true, None)
-    }
-
-    /// Retained bounded polling with cooperative checks during discovery/read/projection
-    /// boundaries. Successful output and EOF/cursor semantics match the ordinary retained poll.
-    pub fn try_poll_bounded_retained_checked(
-        &mut self,
-        max_messages: usize,
-        mut check: impl FnMut() -> anyhow::Result<()>,
-        mut take: impl FnMut(SessionEvent) -> usize,
-    ) -> anyhow::Result<bool> {
-        self.poll_bounded_inner(max_messages, &mut take, true, true, Some(&mut check))
+    /// Poll once under `poll`, offering each session's newly appended messages to `take`, which
+    /// returns how many of them it consumed. What it leaves (and every message past
+    /// [`Poll::max`]) stays pending: the next poll re-reads that session even if its cheap
+    /// trigger has not moved. Returns whether anything is pending. Best effort: an error is
+    /// "nothing pending" and leaves every position retryable; [`try_poll`](Self::try_poll) says why.
+    pub fn poll(&mut self, poll: Poll<'_>, take: impl FnMut(SessionEvent) -> usize) -> bool {
+        self.try_poll(poll, take).unwrap_or(false)
     }
 
     /// Deliver new messages one at a time in discovery/message order. `check` runs before
@@ -502,104 +682,113 @@ impl Watcher {
         mut check: impl FnMut() -> anyhow::Result<()>,
         mut take: impl FnMut(EventKind, &SessionRef, Message) -> anyhow::Result<crate::Flow>,
     ) -> anyhow::Result<bool> {
-        struct Consumer<'a, F> {
-            kind: EventKind,
-            reference: &'a SessionRef,
-            take: &'a mut F,
-            taken: usize,
-            stopped: bool,
-            error: Option<anyhow::Error>,
-        }
-        impl<F: FnMut(EventKind, &SessionRef, Message) -> anyhow::Result<crate::Flow>> crate::MessageSink for Consumer<'_, F> {
-            fn take_error(&mut self) -> Option<anyhow::Error> {
-                self.error.take()
-            }
-            fn message(&mut self, message: Message) -> crate::Flow {
-                match (self.take)(self.kind, self.reference, message) {
-                    Ok(flow) => {
-                        self.taken += 1;
-                        self.stopped = flow == crate::Flow::Stop;
-                        flow
-                    }
-                    Err(error) => {
-                        self.error = Some(error);
-                        crate::Flow::Stop
-                    }
-                }
-            }
-        }
-        let _reads = crate::source::read_scope();
-        check()?;
-        let refs = self.discover_live();
-        check()?;
-        for (key, r) in refs {
-            check()?;
-            let trigger = Self::trigger_of(&r);
-            let (kind, previous_count) = match self.seen.get(&key) {
-                None => (EventKind::New, 0),
-                Some(state)
-                    if state.trigger != trigger
-                        || state.pending
-                        || state
-                            .read
-                            .as_ref()
-                            .map_or(matches!(state.mark, Mark::Messages(_)), |read| {
-                                !read.baseline_unchanged(&r)
-                            }) =>
-                {
-                    let previous = resolve_checked(&r, state.mark, &mut check)?;
-                    (EventKind::Updated, previous)
-                }
-                Some(_) => continue,
-            };
-            check()?;
-            let Some(adapter) = harness::for_harness(r.harness) else {
-                continue;
-            };
-            let mut consumer = Consumer {
-                kind,
-                reference: &r,
-                take: &mut take,
-                taken: 0,
-                stopped: false,
-                error: None,
-            };
-            let previous = self.seen.get(&key).and_then(|state| state.read.as_ref());
-            let pass = read::read_tail_into(
-                adapter.as_ref(),
-                &r,
-                previous,
-                previous_count,
-                &mut consumer,
-                &mut check,
-            )?;
-            check()?;
-            let seen_to = previous_count.min(pass.total) + consumer.taken;
-            let pending = !pass.reached_eof || pass.total > seen_to;
-            self.seen.insert(
-                key,
-                State {
-                    trigger,
-                    mark: Mark::Messages(seen_to),
-                    pending,
-                    read: Some(pass.accepted(seen_to)),
-                },
-            );
-            if consumer.stopped {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        self.poll_sessions(
+            Poll {
+                strict: true,
+                checked: Some(&mut check),
+                ..Poll::default()
+            },
+            |session, check| {
+                let mut taken = 0;
+                let mut stopped = false;
+                let mut consumer = crate::TryFnSink::new(|message| {
+                    let flow = take(session.kind, session.reference, message)?;
+                    taken += 1;
+                    stopped = flow == crate::Flow::Stop;
+                    Ok(flow)
+                });
+                let pass = read::pass(
+                    session.adapter,
+                    session.reference,
+                    session.previous,
+                    session.from,
+                    session.max,
+                    read::Demand {
+                        output: Some(&mut consumer),
+                        check: Some(check),
+                        ..Default::default()
+                    },
+                )?;
+                Ok(Delivery { pass, taken, stopped })
+            },
+        )
     }
 
-    fn poll_bounded_inner(
+    /// [`poll`](Self::poll), with failures returned: under [`Poll::strict`] an unreadable session
+    /// or an unresolvable prior position is an error; otherwise it stays retryable.
+    /// [`Poll::checked`] failures are always errors.
+    pub fn try_poll(&mut self, poll: Poll<'_>, mut take: impl FnMut(SessionEvent) -> usize) -> anyhow::Result<bool> {
+        let retained = poll.retained;
+        let controlled = poll.checked.is_some();
+        self.poll_sessions(poll, |session, check| {
+            let mut pass = read::pass(
+                session.adapter,
+                session.reference,
+                session.previous,
+                session.from,
+                session.max,
+                read::Demand {
+                    retained,
+                    check: (retained && controlled).then_some(check),
+                    ..Default::default()
+                },
+            )?;
+            let messages = std::mem::take(&mut pass.messages);
+            let offered = messages.len();
+            let taken = if offered == 0 {
+                0
+            } else {
+                take(SessionEvent {
+                    kind: session.kind,
+                    reference: session.reference.clone(),
+                    new_messages: messages,
+                })
+                .min(offered)
+            };
+            if retained {
+                anyhow::ensure!(
+                    pass.accepted(session.from.min(pass.total))
+                        .fresh_with(session.adapter, session.reference),
+                    "watched source changed during retained projection"
+                );
+            }
+            Ok(Delivery {
+                pass,
+                taken,
+                stopped: false,
+            })
+        })
+    }
+
+    /// One trigger and position rule for every message delivery shape.
+    fn next_change(
+        &self,
+        key: &str,
+        r: &SessionRef,
+        check: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<(EventKind, usize)>> {
+        match self.seen.get(key) {
+            None => Ok(Some((EventKind::New, 0))),
+            Some(state) if state.stale(Self::trigger_of(r), r) => {
+                resolve_checked(r, state.mark, check).map(|from| Some((EventKind::Updated, from)))
+            }
+            Some(_) => Ok(None),
+        }
+    }
+
+    /// The per-session callback owns delivery; this loop alone owns discovery, change detection,
+    /// budgets and cursor acceptance. An error leaves the session's previous position intact.
+    fn poll_sessions(
         &mut self,
-        max_messages: usize,
-        take: &mut impl FnMut(SessionEvent) -> usize,
-        strict: bool,
-        retained: bool,
-        mut check: Option<&mut dyn FnMut() -> anyhow::Result<()>>,
+        poll: Poll<'_>,
+        mut deliver: impl FnMut(SessionPoll<'_>, &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<Delivery>,
     ) -> anyhow::Result<bool> {
+        let Poll {
+            max,
+            strict,
+            checked: mut check,
+            ..
+        } = poll;
         let controlled = check.is_some();
         let mut check = || match check.as_mut() {
             Some(check) => check(),
@@ -613,101 +802,80 @@ impl Watcher {
         let mut pending = false;
         for (key, r) in refs {
             check()?;
-            let trigger = Self::trigger_of(&r);
-            let (kind, prev_len) = match self.seen.get(&key) {
-                None => (EventKind::New, 0),
-                Some(state)
-                    if state.trigger != trigger
-                        || state.pending
-                        || state
-                            .read
-                            .as_ref()
-                            .map_or(matches!(state.mark, Mark::Messages(_)), |read| {
-                                !read.baseline_unchanged(&r)
-                            }) =>
-                {
-                    let previous = if controlled {
-                        Some(resolve_checked(&r, state.mark, &mut check)?)
-                    } else {
-                        resolve(&r, state.mark)
-                    };
-                    let Some(prev_len) = previous else {
-                        if strict {
-                            anyhow::bail!(
-                                "could not resolve prior watch position: {} {}",
-                                r.harness,
-                                r.path.display()
-                            );
-                        }
-                        continue; // unreadable right now: keep the position, a transient failure is not a skip
-                    };
-                    (EventKind::Updated, prev_len)
-                }
-                Some(_) => continue,
+            let change = self.next_change(&key, &r, &mut check);
+            let (kind, from) = match change {
+                Ok(Some(change)) => change,
+                Ok(None) => continue,
+                Err(error) if strict || controlled => return Err(error),
+                Err(_) => continue,
             };
-            let room = max_messages.saturating_sub(consumed);
+            check()?;
             let Some(adapter) = harness::for_harness(r.harness) else {
+                anyhow::ensure!(
+                    !strict,
+                    "no adapter for watched {} session {}",
+                    r.harness,
+                    r.path.display()
+                );
                 continue;
             };
             let previous = self.seen.get(&key).and_then(|state| state.read.as_ref());
-            let result = if retained && controlled {
-                read::read_retained_checked(adapter.as_ref(), &r, previous, prev_len, room, &mut check)
-            } else {
-                let read = if retained { read::read_retained } else { read_tail };
-                read(adapter.as_ref(), &r, previous, prev_len, room)
-            };
-            let mut pass = match result {
-                Ok(pass) => pass,
+            if kind == EventKind::Updated && previous.is_none() {
+                self.rereads += 1;
+            }
+            let result = deliver(
+                SessionPoll {
+                    kind,
+                    reference: &r,
+                    adapter: adapter.as_ref(),
+                    previous,
+                    from,
+                    max: max.saturating_sub(consumed),
+                },
+                &mut check,
+            );
+            let Delivery { pass, taken, stopped } = match result {
+                Ok(delivery) => delivery,
                 Err(error) if strict => {
                     return Err(error.context(format!("reading watched {} session {}", r.harness, r.path.display())))
                 }
                 Err(_) => continue,
             };
-            let total = pass.total;
-            let new_messages = std::mem::take(&mut pass.messages);
-            // A mark past the end of a rewritten transcript: nothing to re-emit (see the tests).
-            let prev_len = prev_len.min(total);
-            let offered = new_messages.len();
-            let taken = if offered == 0 {
-                0
-            } else {
-                take(SessionEvent {
-                    kind,
-                    reference: r.clone(),
-                    new_messages,
-                })
-                .min(offered)
-            };
-            if retained {
-                anyhow::ensure!(
-                    pass.accepted(prev_len).fresh_with(adapter.as_ref(), &r),
-                    "watched source changed during retained projection"
-                );
-            }
             check()?;
-            consumed += taken;
-            let seen_to = prev_len + taken;
-            let left = total > seen_to;
+            consumed = consumed.saturating_add(taken);
+            let seen_to = from.min(pass.total) + taken;
+            let left = !pass.reached_eof || pass.total > seen_to;
             pending |= left;
+            self.held.remove(&key);
             self.seen.insert(
                 key,
                 State {
-                    trigger,
+                    trigger: Self::trigger_of(&r),
                     mark: Mark::Messages(seen_to),
                     pending: left,
                     read: Some(pass.accepted(seen_to)),
                 },
             );
+            if stopped {
+                return Ok(true);
+            }
         }
         Ok(pending)
     }
 
-    /// Observe sources on the same discovery/filter loop without first reading their message
-    /// tails. The consumer validates both source and derived artifact freshness, performs its one required read and
-    /// returns the completed count/baseline only after publication succeeds. Failure leaves the
-    /// previous position untouched, so the next poll retries even without a new append.
-    pub fn poll_sources(
+    /// Offer every followed source on the same discovery/filter loop, without first reading its
+    /// message tail. The consumer validates source and derived artifact freshness itself,
+    /// performs its one required read and returns the completed count/baseline only after
+    /// publication succeeds. Failure leaves the previous position untouched, so the next poll
+    /// retries even without a new append.
+    ///
+    /// A followed source is offered again only when [`poll`](Self::poll) would read it (its
+    /// trigger moved, or its source no longer matches the accepted baseline) or when `kept`
+    /// says the consumer's own output for it no longer stands. An unchanged fleet costs one
+    /// baseline check and one `kept` per session, not one consumer validation each.
+    pub fn offer_sources(
         &mut self,
+        mut kept: impl FnMut(&SessionRef) -> bool,
         mut take: impl FnMut(EventKind, &SessionRef, usize) -> Option<(usize, ReadState)>,
     ) -> usize {
         let _reads = crate::source::read_scope();
@@ -717,6 +885,7 @@ impl Watcher {
             let trigger = Self::trigger_of(&r);
             let (kind, previous) = match self.seen.get(&key) {
                 None => (EventKind::New, 0),
+                Some(state) if !state.stale(trigger, &r) && kept(&r) => continue,
                 Some(state) => {
                     let Some(previous) = resolve(&r, state.mark) else {
                         continue;
@@ -727,6 +896,7 @@ impl Watcher {
             let Some((total, read)) = take(kind, &r, previous) else {
                 continue;
             };
+            self.held.remove(&key);
             self.seen.insert(
                 key,
                 State {
@@ -740,21 +910,23 @@ impl Watcher {
         }
         accepted
     }
-
-    /// Poll forever, invoking `on_event` for each event. Blocks the calling thread.
-    pub fn run<F: FnMut(SessionEvent)>(&mut self, interval: Duration, mut on_event: F) -> ! {
-        loop {
-            for ev in self.poll() {
-                on_event(ev);
-            }
-            std::thread::sleep(interval);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    static READERS: std::sync::LazyLock<Readers> = std::sync::LazyLock::new(Readers::default);
+
+    /// Every pending event of one unbounded poll.
+    fn events(watcher: &mut Watcher) -> Vec<SessionEvent> {
+        let mut events = Vec::new();
+        watcher.poll(Poll::default(), |event| {
+            let taken = event.new_messages.len();
+            events.push(event);
+            taken
+        });
+        events
+    }
 
     fn sref(harness: Harness, path: std::path::PathBuf) -> SessionRef {
         SessionRef {
@@ -765,7 +937,7 @@ mod tests {
             title: None,
             created_at: None,
             updated_at: None,
-            message_count: 0,
+            message_count: None,
         }
     }
 
@@ -787,7 +959,7 @@ mod tests {
             refs
         }
         for discovery in [copies as fn() -> Vec<SessionRef>, reversed] {
-            let watcher = Watcher::with_discovery(Filter::default(), true, discovery);
+            let mut watcher = Watcher::with_discovery(Filter::default(), true, discovery);
             let selected = watcher.discover();
             assert_eq!(selected.len(), 2, "different harnesses retain separate positions");
             assert_eq!(
@@ -803,7 +975,7 @@ mod tests {
             refs[2].cwd = Some("/elsewhere".into());
             refs
         }
-        let watcher = Watcher::with_discovery(
+        let mut watcher = Watcher::with_discovery(
             Filter {
                 cwd_contains: Some("requested".into()),
                 ..Default::default()
@@ -824,11 +996,11 @@ mod tests {
             let dir = std::path::PathBuf::from(crate::env::var_os("CLUSTERVISION_HOME").unwrap());
             let mut old = sref(Harness::Claude, dir.join("old.jsonl"));
             old.updated_at = chrono::DateTime::from_timestamp(1, 0);
-            old.message_count = 1;
+            old.message_count = Some(1);
             let mut new = old.clone();
             new.path = dir.join("new.jsonl");
             new.updated_at = chrono::DateTime::from_timestamp(2, 0);
-            new.message_count = 3; // Hold the trigger fixed; source freshness must catch append.
+            new.message_count = Some(3); // Hold the trigger fixed; source freshness must catch append.
             vec![old, new]
         }
         let row = |text: &str| {
@@ -842,7 +1014,7 @@ mod tests {
         std::fs::write(&old, row("old-copy")).unwrap();
         std::fs::write(&new, (0..3).map(|n| row(&format!("new-{n}"))).collect::<String>()).unwrap();
         let mut watcher = Watcher::with_discovery(Filter::default(), true, discovery);
-        let first = watcher.poll();
+        let first = events(&mut watcher);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].reference.path, new);
         assert_eq!(first[0].new_messages.len(), 3);
@@ -853,11 +1025,11 @@ mod tests {
             .unwrap()
             .write_all(row("new-3").as_bytes())
             .unwrap();
-        let next = watcher.poll();
+        let next = events(&mut watcher);
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].new_messages.len(), 1);
         assert_eq!(next[0].new_messages[0].text().as_deref(), Some("new-3"));
-        assert!(watcher.poll().is_empty());
+        assert!(events(&mut watcher).is_empty());
     }
 
     #[test]
@@ -903,7 +1075,7 @@ mod tests {
             vec![SessionRef::new("prefix-cursor", Harness::Claude, PATH.get().unwrap())]
         }
         let mut watcher = Watcher::with_discovery(Filter::default(), false, discover);
-        let before = serde_json::to_value(watcher.to_cursor()).unwrap();
+        let before = serde_json::to_value(watcher.to_cursor(&READERS)).unwrap();
         use std::io::Write;
         writeln!(
             std::fs::OpenOptions::new()
@@ -929,7 +1101,7 @@ mod tests {
             format!("{error:#}").contains("cancelled while resolving byte prefix"),
             "{error:#}"
         );
-        assert_eq!(serde_json::to_value(watcher.to_cursor()).unwrap(), before);
+        assert_eq!(serde_json::to_value(watcher.to_cursor(&READERS)).unwrap(), before);
         let mut texts = Vec::new();
         watcher
             .try_poll_messages(
@@ -945,6 +1117,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(texts, ["appended\n"]);
+    }
+
+    #[test]
+    fn a_session_unreadable_at_prime_is_announced_new_not_followed_from_a_guess() {
+        static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let world = crate::test_world("unreadable-at-prime");
+        PATH.set(world.base.join("later.jsonl")).unwrap();
+        fn discover() -> Vec<SessionRef> {
+            vec![SessionRef::new("later", Harness::Claude, PATH.get().unwrap())]
+        }
+        let mut watcher = Watcher::with_discovery(Filter::default(), false, discover);
+        assert_eq!(watcher.following(), 0, "an unreadable session got a guessed position");
+        let lines = [
+            serde_json::json!({"type":"user", "uuid":"u0", "message":{"role":"user", "content":"one"}}),
+            serde_json::json!({"type":"user", "uuid":"u1", "message":{"role":"user", "content":"two"}}),
+        ];
+        std::fs::write(PATH.get().unwrap(), cv_testkit::jsonl(&lines)).unwrap();
+        let events = events(&mut watcher);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::New);
+        assert_eq!(events[0].new_messages.len(), 2);
     }
 
     #[test]
@@ -981,9 +1174,9 @@ mod tests {
                 read: Some(read),
             },
         );
-        let cursor = watcher.to_cursor();
+        let cursor = watcher.to_cursor(&READERS);
         for incremental in [false, true] {
-            let mut watcher = Watcher::from_cursor(Filter::default(), cursor.clone(), discover);
+            let mut watcher = Watcher::from_cursor(Filter::default(), cursor.clone(), discover, &READERS);
             let mut texts = Vec::new();
             if incremental {
                 watcher
@@ -1000,7 +1193,7 @@ mod tests {
                     )
                     .unwrap();
             } else {
-                for event in watcher.poll() {
+                for event in events(&mut watcher) {
                     for message in event.new_messages {
                         let mut text = String::new();
                         message.append_searchable(&mut text).unwrap();
@@ -1075,14 +1268,14 @@ mod tests {
             )
             .unwrap());
         assert_eq!(delivered, ["message-0\n", "message-1\n"]);
-        let cursor = Cursor::decode(&watcher.to_cursor().encode()).unwrap();
-        let mut resumed = Watcher::from_cursor(Filter::default(), cursor, discover);
-        let before_failure = resumed.to_cursor().encode();
+        let cursor = Cursor::decode(&watcher.to_cursor(&READERS).encode()).unwrap();
+        let mut resumed = Watcher::from_cursor(Filter::default(), cursor, discover, &READERS);
+        let before_failure = resumed.to_cursor(&READERS).encode();
         assert!(resumed
             .try_poll_messages(|| Ok(()), |_, _, _| anyhow::bail!("projection failed"))
             .is_err());
         assert_eq!(
-            resumed.to_cursor().encode(),
+            resumed.to_cursor(&READERS).encode(),
             before_failure,
             "failed projection advanced position"
         );
@@ -1132,16 +1325,20 @@ mod tests {
         assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
         assert_eq!(count, 1, "cancellation did not stop the active read");
         assert!(
-            watcher.to_cursor().is_empty(),
+            watcher.to_cursor(&READERS).is_empty(),
             "failed read accepted its delivered prefix"
         );
         stop.set(false);
         let error = watcher
-            .try_poll_bounded_retained_checked(
-                1,
-                || {
-                    anyhow::ensure!(!stop.get(), "cancelled during projection");
-                    Ok(())
+            .try_poll(
+                Poll {
+                    max: 1,
+                    strict: true,
+                    retained: true,
+                    checked: Some(&mut || {
+                        anyhow::ensure!(!stop.get(), "cancelled during projection");
+                        Ok(())
+                    }),
                 },
                 |_| {
                     stop.set(true);
@@ -1151,7 +1348,7 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("cancelled during projection"));
         assert!(
-            watcher.to_cursor().is_empty(),
+            watcher.to_cursor(&READERS).is_empty(),
             "cancelled projection accepted its position"
         );
         let error = watcher
@@ -1167,14 +1364,15 @@ mod tests {
             format!("{error:#}").contains("source changed") || format!("{error:#}").contains("identity changed"),
             "{error:#}"
         );
-        assert!(watcher.to_cursor().is_empty(), "stale match advanced position");
+        assert!(watcher.to_cursor(&READERS).is_empty(), "stale match advanced position");
     }
 
     #[test]
-    fn cursor_reader_budget_preserves_positions_and_wire_selection() {
-        let _world = crate::test_world("watch-cursor_reader_budget_preserves_positions_and_wire_selection");
+    fn every_observed_session_keeps_its_reader_state_whatever_its_size() {
+        let _world = crate::test_world("watch-every-reader-state");
+        let readers = Readers::default();
         let mut watcher = Watcher::with_discovery(Filter::default(), true, Vec::new);
-        for n in 0..16 {
+        for n in 0..32 {
             let r = sref(
                 Harness::Claude,
                 std::path::PathBuf::from("/nonexistent/cv-watch-budget"),
@@ -1188,44 +1386,48 @@ mod tests {
             watcher.seen.insert(
                 format!("claude:{n}"),
                 State {
-                    trigger: (n, None),
+                    trigger: (Some(n), None),
                     mark: Mark::Messages(n),
                     pending: n % 2 == 0,
                     read: Some(read),
                 },
             );
         }
-        // Prior wire selection: size eligibility first, then the first eight eligible
-        // reader states in the map's iteration order. Positions always survive both limits.
-        let mut readers = 0;
-        let expected: BTreeMap<_, _> = watcher
-            .seen
-            .iter()
-            .map(|(key, state)| {
-                let mut pos = Pos::from(state);
-                pos.r = state.read.clone().filter(|read| read.fits_cache(64 * 1024));
-                if pos.r.is_some() {
-                    readers += 1;
-                    if readers > 8 {
-                        pos.r = None;
-                    }
-                }
-                (key.clone(), pos)
-            })
-            .collect();
-        let cursor = watcher.to_cursor();
-        assert_eq!(cursor.len(), 16);
-        assert_eq!(cursor.o.values().filter(|pos| pos.r.is_some()).count(), 8);
-        assert_eq!(
-            serde_json::to_value(&cursor.o).unwrap(),
-            serde_json::to_value(expected).unwrap()
+        // The contract: every position rides the wire, no reader state does, and every state,
+        // of any size, is kept once for its session (32 here; 0.17 kept eight, under 64 KiB).
+        let cursor = watcher.to_cursor(&readers);
+        assert_eq!(cursor.len(), 32);
+        assert_eq!(readers.len(), 32);
+        assert!(cursor.o.values().all(|pos| pos.r.is_none() && pos.h.is_some()));
+        assert!(cursor.encode().len() < 32 * 128, "positions only on the wire");
+        for (key, state) in &watcher.seen {
+            let pos = &cursor.o[key];
+            let expected = Pos::from(state);
+            assert_eq!(pos.t, expected.t, "{key}: trigger must survive intact");
+            assert_eq!(pos.n, expected.n, "{key}: message mark must survive intact");
+            assert_eq!(pos.b, expected.b, "{key}: byte mark must survive intact");
+            assert_eq!(pos.more, expected.more, "{key}: pending must survive intact");
+        }
+        let mut resumed = Watcher::from_cursor(
+            Filter::default(),
+            Cursor::decode(&cursor.encode()).unwrap(),
+            Vec::new,
+            &readers,
         );
-        let resumed = Watcher::from_cursor(Filter::default(), Cursor::decode(&cursor.encode()).unwrap(), Vec::new);
         for (key, state) in &watcher.seen {
             let restored = &resumed.seen[key];
             assert_eq!(restored.mark, state.mark);
             assert_eq!(restored.pending, state.pending);
+            assert_eq!(
+                serde_json::to_value(restored.read.as_ref().unwrap()).unwrap(),
+                serde_json::to_value(state.read.as_ref().unwrap()).unwrap(),
+                "{key}: the state comes back whole"
+            );
         }
+        // An unchanged state is not stored again; another process's readers know none of them.
+        assert_eq!(resumed.to_cursor(&readers).encode(), cursor.encode());
+        let elsewhere = Watcher::from_cursor(Filter::default(), cursor, Vec::new, &Readers::default());
+        assert!(elsewhere.seen.values().all(|state| state.read.is_none()));
     }
 
     #[test]
@@ -1250,34 +1452,45 @@ mod tests {
             o: [(
                 "claude:original".into(),
                 Pos {
-                    t: (0, None),
-                    n: 12,
+                    t: (Some(0), None),
+                    n: Some(12),
                     b: None,
                     more: false,
                     r: None,
+                    h: None,
                 },
             )]
             .into_iter()
             .collect(),
         };
         for source_poll in [false, true] {
-            let mut watcher = Watcher::from_cursor(Filter::default(), cursor.clone(), replacement);
+            let mut watcher = Watcher::from_cursor(Filter::default(), cursor.clone(), replacement, &READERS);
             if source_poll {
-                assert_eq!(watcher.poll_sources(|_, _, _| None), 0);
+                assert_eq!(watcher.offer_sources(|_| true, |_, _, _| None), 0);
             } else {
                 assert!(watcher
-                    .try_poll_bounded(1, |_| panic!("missing source emitted"))
+                    .try_poll(
+                        Poll {
+                            max: 1,
+                            strict: true,
+                            ..Poll::default()
+                        },
+                        |_| panic!("missing source emitted")
+                    )
                     .is_err());
             }
-            let encoded = watcher.to_cursor().encode();
+            let encoded = watcher.to_cursor(&READERS).encode();
             let cursor = Cursor::decode(&encoded).unwrap();
             assert!(cursor.is_empty(), "vanished position survived: {encoded}");
-            let mut resumed = Watcher::from_cursor(Filter::default(), cursor, original);
-            resumed.poll_sources(|kind, _, previous| {
-                assert_eq!(kind, EventKind::New);
-                assert_eq!(previous, 0, "reappeared identity inherited its removed position");
-                None
-            });
+            let mut resumed = Watcher::from_cursor(Filter::default(), cursor, original, &READERS);
+            resumed.offer_sources(
+                |_| true,
+                |kind, _, previous| {
+                    assert_eq!(kind, EventKind::New);
+                    assert_eq!(previous, 0, "reappeared identity inherited its removed position");
+                    None
+                },
+            );
         }
     }
 
@@ -1463,6 +1676,34 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A byte mark carried in on a compressed rollout (a cursor from elsewhere, a hand-made
+    /// position) is not resumed: its byte prefix is not a transcript prefix, so it resolves to
+    /// nothing instead of a count of the decoded stream's first bytes.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_compressed_rollout_is_never_byte_resumed() {
+        let _world = crate::test_world("watch-a_compressed_rollout_is_never_byte_resumed");
+        let dir = std::env::temp_dir().join(format!("cv-watch-zst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zst = dir.join("rollout-2026-01-01T00-00-00-019e0000-0000-7000-8000-000000000001.jsonl.zst");
+        std::fs::write(&zst, zstd::encode_all(CODEX.as_bytes(), 1).unwrap()).unwrap();
+        let r = sref(Harness::Codex, zst);
+        let full = harness::for_harness(Harness::Codex).unwrap().parse(&r).unwrap();
+        assert!(!full.messages.is_empty(), "the compressed fixture parses");
+        // Its reader declines a byte prefix outright: decoded offsets are not file positions.
+        assert!(count_prefix(&r, CODEX.len() as u64, &mut || Ok(())).is_err());
+        assert_ne!(baseline(&r), Some(Mark::Bytes(CODEX.len() as u64)));
+        for len in [1, CODEX.len() as u64 / 2, CODEX.len() as u64] {
+            assert_eq!(resolve(&r, Mark::Bytes(len)), None, "byte mark {len}");
+            assert!(
+                resolve_checked(&r, Mark::Bytes(len), &mut || Ok(())).is_err(),
+                "byte mark {len}"
+            );
+        }
+        assert_eq!(resolve(&r, Mark::Messages(2)), Some(2));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The cursor is the watcher's state and nothing else: a bounded poll takes what the budget
     /// allows and leaves the rest pending; a watcher resumed from the encoded cursor drains exactly
     /// the remainder; an idle poll then yields nothing. The session source is pluggable so this
@@ -1481,7 +1722,7 @@ mod tests {
             let len = std::fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0);
             let mut r = sref(Harness::Claude, path);
             r.id = "cursor-test".into();
-            r.message_count = len; // the cheap trigger: the file grew
+            r.message_count = Some(len); // the cheap trigger: the file grew
             vec![r]
         }
         let full = std::fs::read(concat!(
@@ -1496,8 +1737,8 @@ mod tests {
         let before = adapter.parse(&r).unwrap().messages.len();
 
         // Baseline: nothing emitted, one position recorded, as a byte mark (no parse).
-        let w = Watcher::with_discovery(Filter::default(), false, discover);
-        let cursor = w.to_cursor();
+        let mut w = Watcher::with_discovery(Filter::default(), false, discover);
+        let cursor = w.to_cursor(&READERS);
         assert_eq!(cursor.len(), 1);
         let encoded = cursor.encode();
         assert!(
@@ -1517,41 +1758,47 @@ mod tests {
             after > before + 1,
             "fixture must grow by several messages ({before} → {after})"
         );
-        let mut w = Watcher::from_cursor(Filter::default(), Cursor::decode(&encoded).unwrap(), discover);
+        let mut w = Watcher::from_cursor(Filter::default(), Cursor::decode(&encoded).unwrap(), discover, &READERS);
         let mut got = Vec::new();
-        let pending = w.poll_bounded(3, |mut ev| {
-            assert_eq!(ev.kind, EventKind::Updated);
-            assert!(ev.new_messages.len() >= 2);
-            got.push(ev.new_messages.remove(0));
-            1
-        });
+        let pending = w.poll(
+            Poll {
+                max: 3,
+                ..Poll::default()
+            },
+            |mut ev| {
+                assert_eq!(ev.kind, EventKind::Updated);
+                assert!(ev.new_messages.len() >= 2);
+                got.push(ev.new_messages.remove(0));
+                1
+            },
+        );
         assert!(pending);
         assert_eq!(got.len(), 1);
-        let encoded = w.to_cursor().encode();
+        let encoded = w.to_cursor(&READERS).encode();
         assert!(encoded.contains("\"more\":true"), "{encoded}");
 
         // Resumed from that cursor with no budget: exactly the remainder, nothing twice.
-        let mut w = Watcher::from_cursor(Filter::default(), Cursor::decode(&encoded).unwrap(), discover);
-        let events = w.poll();
-        assert_eq!(events.len(), 1);
-        got.extend(events.into_iter().next().unwrap().new_messages);
+        let mut w = Watcher::from_cursor(Filter::default(), Cursor::decode(&encoded).unwrap(), discover, &READERS);
+        let resumed = events(&mut w);
+        assert_eq!(resumed.len(), 1);
+        got.extend(resumed.into_iter().next().unwrap().new_messages);
         assert_eq!(got.len(), after - before, "the appended tail, once");
         let want = adapter.parse(&r).unwrap().messages;
         assert_eq!(
             serde_json::to_value(&got).unwrap(),
             serde_json::to_value(&want[before..]).unwrap()
         );
-        assert!(w.poll().is_empty(), "idle: nothing pending, trigger unchanged");
+        assert!(events(&mut w).is_empty(), "idle: nothing pending, trigger unchanged");
         assert!(
-            !w.to_cursor().encode().contains("more"),
+            !w.to_cursor(&READERS).encode().contains("more"),
             "nothing pending rides the cursor"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn optional_resume_state_is_bounded_and_old_cursors_keep_positions() {
-        let _world = crate::test_world("watch-optional_resume_state_is_bounded_and_old_cursors_keep_positions");
+    fn cursor_carries_positions_only_and_marks_are_exclusive() {
+        let _world = crate::test_world("watch-cursor-positions-only");
         let mut watcher = Watcher::with_discovery(Filter::default(), true, Vec::new);
         let r = sref(
             Harness::Claude,
@@ -1561,21 +1808,39 @@ mod tests {
             watcher.seen.insert(
                 format!("session-{i}"),
                 State {
-                    trigger: (i, None),
+                    trigger: (Some(i), None),
                     mark: Mark::Messages(i),
                     pending: true,
                     read: Some(ReadState::baseline(&r)),
                 },
             );
         }
-        let cursor = watcher.to_cursor();
+        let cursor = watcher.to_cursor(&READERS);
         assert_eq!(cursor.len(), 32);
-        assert_eq!(cursor.o.values().filter(|pos| pos.r.is_some()).count(), 8);
-        assert!(cursor.encode().len() < 512 * 1024 + 4096);
-        let old = Cursor::decode(r#"{"v":1,"o":{"old":{"t":[8,null],"n":3,"more":true}}}"#).unwrap();
-        assert_eq!(old.o["old"].n, 3);
-        assert!(old.o["old"].more);
-        assert!(old.o["old"].r.is_none());
+        assert!(
+            cursor.o.values().all(|pos| pos.r.is_none()),
+            "no reader state rides the wire"
+        );
+        assert!(cursor.encode().len() < 32 * 128);
+        let sparse = Cursor::decode(r#"{"v":2,"o":{"s":{"t":[8,null],"n":3,"more":true}}}"#).unwrap();
+        assert_eq!(sparse.o["s"].n, Some(3));
+        let byte_mark = Pos::from(&State {
+            trigger: (None, None),
+            mark: Mark::Bytes(5),
+            pending: false,
+            read: None,
+        });
+        assert_eq!(serde_json::to_string(&byte_mark).unwrap(), r#"{"t":[null,null],"b":5}"#);
+        assert!(sparse.o["s"].more);
+        assert!(sparse.o["s"].r.is_none());
+        for unmarked in [r#"{"t":[null,null],"n":0,"b":5}"#, r#"{"t":[null,null]}"#] {
+            assert!(
+                Cursor::decode(&format!(r#"{{"v":2,"o":{{"x":{unmarked}}}}}"#)).is_none(),
+                "{unmarked}"
+            );
+        }
+        let v1 = r#"{"v":1,"o":{"x":{"t":[8,null],"n":3}}}"#;
+        assert!(Cursor::decode(v1).is_none(), "a 0.17 cursor starts a fresh baseline");
     }
 
     #[test]
@@ -1590,31 +1855,83 @@ mod tests {
         let mut watcher = Watcher::with_discovery(Filter::default(), true, discover);
         for _ in 0..2 {
             assert_eq!(
-                watcher.poll_sources(|kind, _, previous| {
-                    assert_eq!(kind, EventKind::New);
-                    assert_eq!(previous, 0);
-                    None
-                }),
+                watcher.offer_sources(
+                    |_| true,
+                    |kind, _, previous| {
+                        assert_eq!(kind, EventKind::New);
+                        assert_eq!(previous, 0);
+                        None
+                    }
+                ),
                 0
             );
-            assert!(watcher.to_cursor().is_empty());
+            assert!(watcher.to_cursor(&READERS).is_empty());
         }
         assert_eq!(
-            watcher.poll_sources(|kind, r, previous| {
-                assert_eq!(kind, EventKind::New);
-                assert_eq!(previous, 0);
-                Some((4, ReadState::baseline(r)))
-            }),
+            watcher.offer_sources(
+                |_| true,
+                |kind, r, previous| {
+                    assert_eq!(kind, EventKind::New);
+                    assert_eq!(previous, 0);
+                    Some((4, ReadState::baseline(r)))
+                }
+            ),
             1
         );
         assert_eq!(
-            watcher.poll_sources(|kind, r, previous| {
-                assert_eq!(kind, EventKind::Updated);
-                assert_eq!(previous, 4);
-                Some((4, ReadState::baseline(r)))
-            }),
+            watcher.offer_sources(
+                |_| true,
+                |kind, r, previous| {
+                    assert_eq!(kind, EventKind::Updated);
+                    assert_eq!(previous, 4);
+                    Some((4, ReadState::baseline(r)))
+                }
+            ),
             1
         );
+    }
+
+    #[test]
+    fn an_unchanged_source_is_offered_once_and_one_change_offers_it_once_more() {
+        let world = crate::test_world("watch-unchanged-source-offered-once");
+        let path = world.base.join("offered.jsonl");
+        let line = |i: usize| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"user","uuid":format!("u{i}"),"message":{"role":"user","content":"hi"}})
+            )
+        };
+        std::fs::write(&path, line(0)).unwrap();
+        let discovered = path.clone();
+        let mut watcher = Watcher::with_discovery(Filter::default(), true, move || {
+            vec![sref(Harness::Claude, discovered.clone())]
+        });
+        let mut offers = 0;
+        let mut offer = |watcher: &mut Watcher, kept: bool| {
+            watcher.offer_sources(
+                |_| kept,
+                |_, r, _| {
+                    offers += 1;
+                    let adapter = harness::for_harness(r.harness).unwrap();
+                    let pass = read::read(adapter.as_ref(), r, None, 0, 0).ok()?;
+                    Some((pass.total, pass.accepted(pass.total)))
+                },
+            )
+        };
+        assert_eq!(offer(&mut watcher, true), 1);
+        for _ in 0..3 {
+            assert_eq!(offer(&mut watcher, true), 0, "an unchanged source is not offered again");
+        }
+        assert_eq!(
+            offer(&mut watcher, false),
+            1,
+            "the consumer's own output went: offer again"
+        );
+        std::fs::write(&path, format!("{}{}", line(0), line(1))).unwrap();
+        assert_eq!(offer(&mut watcher, true), 1, "one change, one offer");
+        assert_eq!(offer(&mut watcher, true), 0);
+        drop(offer);
+        assert_eq!(offers, 3);
     }
 
     #[test]
@@ -1628,10 +1945,23 @@ mod tests {
         }
         let mut watcher = Watcher::with_discovery(Filter::default(), true, discover);
         assert!(watcher
-            .try_poll_bounded(1, |_| panic!("failed source emitted a message"))
+            .try_poll(
+                Poll {
+                    max: 1,
+                    strict: true,
+                    ..Poll::default()
+                },
+                |_| panic!("failed source emitted a message")
+            )
             .is_err());
-        assert!(watcher.to_cursor().is_empty());
-        assert!(!watcher.poll_bounded(1, |_| panic!("failed source emitted a message")));
-        assert!(watcher.to_cursor().is_empty());
+        assert!(watcher.to_cursor(&READERS).is_empty());
+        assert!(!watcher.poll(
+            Poll {
+                max: 1,
+                ..Poll::default()
+            },
+            |_| panic!("failed source emitted a message")
+        ));
+        assert!(watcher.to_cursor(&READERS).is_empty());
     }
 }

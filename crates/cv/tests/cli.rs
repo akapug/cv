@@ -13,13 +13,13 @@ use std::process::Command;
 use std::{fs, str};
 
 /// A planted secret that `cv export --redact` must scrub (matches cv_core::redact's sk- recognizer).
-const SECRET: &str = "sk-abcDEF1234567890ghijkl";
+use cv_testkit::corpus::{self, SECRET};
 
-/// A legacy decision: opened assigned to `who` and tagged `decision`, with nothing posed — the
-/// shape `cv task open --tags decision` wrote before it was refused. Stamped a few seconds
-/// ahead so it sorts after anything the test just opened.
-fn plant_legacy_tag_decision(w: &World, id: &str, title: &str, who: &str) {
-    let ts = chrono_at(3);
+/// A tag-only decision: opened assigned to `who` and tagged `decision`, with nothing posed — the
+/// shape `cv task open --tags decision` wrote before it was refused; it reads as an assigned
+/// action. Stamped a few seconds ahead so it sorts after anything the test just opened.
+fn plant_tag_only_decision(w: &World, id: &str, title: &str, who: &str) {
+    let ts = cv_testkit::now_rfc3339_at(3);
     w.append_task_log(&[
         serde_json::json!({"id": id, "task_id": id, "ts": ts, "by": "cv", "event": "opened",
             "title": title, "channel": "tasks", "assignee": who}),
@@ -35,52 +35,9 @@ fn assistant_line(uuid: &str, ts: &str, blocks: serde_json::Value) -> serde_json
     )
 }
 
-/// The standard two-session corpus:
-/// - `alphasess`: created 2026-01-01, updated 2026-06-01, 3 messages, title "alpha adventures",
-///   contains "zebrafish", a planted secret, and an Edit on /work/proj/src/widget.rs.
-/// - `betasess`: created 2026-03-01, updated 2026-03-02, 4 messages, no title.
-///
-/// Orderings disagree on purpose: updated → alpha first; created → beta first; messages → beta.
+/// The standard two-session corpus, shared with every suite that plants it (see cv-testkit).
 fn standard_corpus(w: &World) {
-    w.write_session(
-        "alphasess",
-        &[
-            serde_json::json!({"type": "ai-title", "aiTitle": "alpha adventures"}),
-            user_line("u1", "2026-01-01T10:00:00Z", "please fix the zebrafish migration"),
-            assistant_line(
-                "a1",
-                "2026-01-02T10:00:00Z",
-                serde_json::json!([
-                    {"type": "text", "text": format!("on it — found a leaked key {SECRET} in the env")},
-                    {"type": "tool_use", "id": "t1", "name": "Edit",
-                     "input": {"file_path": "/work/proj/src/widget.rs", "old_string": "a", "new_string": "b"}}
-                ]),
-            ),
-            serde_json::json!({
-                "type": "user", "uuid": "u2", "sessionId": "s", "timestamp": "2026-06-01T10:00:00Z",
-                "message": {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": "edited ok", "is_error": false}
-                ]}
-            }),
-        ],
-    );
-    w.write_session(
-        "betasess",
-        &[
-            user_line("b1", "2026-03-01T09:00:00Z", "how many quokkas in the census"),
-            assistant_line(
-                "b2",
-                "2026-03-01T09:05:00Z",
-                serde_json::json!([{"type": "text", "text": "seventeen quokkas"}]),
-            ),
-            user_line("b3", "2026-03-02T09:00:00Z", "thanks"),
-            assistant_line(
-                "b4",
-                "2026-03-02T09:01:00Z",
-                serde_json::json!([{"type": "text", "text": "anytime"}]),
-            ),
-        ],
-    );
+    corpus::standard(w);
 }
 
 /// Index of `needle`'s first occurrence, with a labeled panic when missing.
@@ -90,6 +47,27 @@ fn pos(hay: &str, needle: &str) -> usize {
 }
 
 // ───────────────────────────── ls ─────────────────────────────
+
+#[test]
+fn removed_rewind_from_compaction_exits_two_with_a_pointer() {
+    let w = World::new("rewind-from-compaction");
+    let (ok, code, _, err) = w.cv(&["rewind", "any", "--from-compaction"]);
+    assert!(!ok && code == 2, "{err}");
+    assert!(err.contains("--from-compaction") && err.contains("--full"), "{err}");
+}
+
+#[test]
+fn removed_claurdvoyant_variables_exit_two_with_a_pointer() {
+    let w = World::new("claurdvoyant-env");
+    for (old, new) in [
+        ("CLAURDVOYANT_HOME", "CLUSTERVISION_HOME"),
+        ("CLAURDVOYANT_MAX_STALE_SECS", "CLUSTERVISION_MAX_STALE_SECS"),
+    ] {
+        let (ok, code, _, err) = w.cv_env(&["ls"], &[(old, "1")]);
+        assert!(!ok && code == 2, "{old}: {err}");
+        assert!(err.contains(old) && err.contains(new), "{err}");
+    }
+}
 
 #[test]
 fn ls_sort_modes_and_filters() {
@@ -147,7 +125,8 @@ fn ls_json_emits_the_same_rows_machine_readably() {
     assert_eq!(rows[0]["id"], "alphasess", "updated order:\n{out}");
     assert_eq!(rows[0]["harness"], "claude");
     assert_eq!(rows[0]["title"], "alpha adventures");
-    assert_eq!(rows[0]["message_count"], 3);
+    // The prompt and the reply; the tool result is no turn.
+    assert_eq!(rows[0]["message_count"], 2);
     assert_eq!(rows[0]["cwd"], "/work/proj");
     assert!(
         rows[0]["created_at"].as_str().unwrap().starts_with("2026-01-01"),
@@ -182,6 +161,27 @@ fn ls_json_emits_the_same_rows_machine_readably() {
     assert!(rows.is_empty(), "{out}");
 }
 
+/// `text:` with no full-text index answers from the live read when it covers every session, as
+/// it does here; with nothing read live (`--frozen`) there is no answer: exit 2 naming `cv index`,
+/// never an empty (or, under `NOT`, a full) listing that looks like one.
+#[test]
+fn a_text_query_with_no_index_reads_live_or_exits_2() {
+    let w = World::new("ls-text-no-index");
+    standard_corpus(&w);
+    let (out, _) = w.cv_ok(&["ls", "--json", "-q", "text:zebrafish"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        ["alphasess"]
+    );
+    for query in ["text:needle", "NOT text:needle"] {
+        let (ok, code, out, err) = w.cv(&["--frozen", "ls", "--json", "-q", query]);
+        assert!(!ok && code == 2, "{query}: exit {code}\n{out}\n{err}");
+        assert!(out.trim().is_empty(), "{query}: {out}");
+        assert!(err.contains("cv index"), "{query}: {err}");
+    }
+}
+
 #[test]
 fn ls_json_zero_limit_validates_inputs_without_creating_a_catalog() {
     let w = World::new("ls-json-zero");
@@ -209,10 +209,11 @@ fn ls_json_zero_limit_validates_inputs_without_creating_a_catalog() {
     assert!(!err.is_empty());
 }
 
-/// Codex rows on the committed corpus: `display_title` is the row's `title`, never the injected
-/// AGENTS.md or environment-context turn that opens every rollout.
+/// Codex sessions on the committed corpus are titled by their first prompt, never the injected
+/// AGENTS.md or environment-context turn that opens every rollout: the row's `title` and
+/// `display_title`, and the title of every index and live-scan hit.
 #[test]
-fn ls_json_enrich_codex_display_title_is_the_listed_title() {
+fn codex_titles_are_the_first_prompt_in_listings_and_hits() {
     fn copy(from: &std::path::Path, to: &std::path::Path) {
         fs::create_dir_all(to).unwrap();
         for entry in fs::read_dir(from).unwrap() {
@@ -236,6 +237,39 @@ fn ls_json_enrich_codex_display_title_is_the_listed_title() {
         for row in &rows {
             assert!(row["title"].is_string(), "{row}");
             assert_eq!(row["display_title"], row["title"], "{}: {row}", version.display());
+        }
+        let titles: std::collections::HashMap<_, _> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    cv_core::label_from(row["title"].as_str(), None),
+                )
+            })
+            .collect();
+        let needle = rows
+            .iter()
+            .filter_map(|row| row["title"].as_str())
+            .flat_map(str::split_whitespace)
+            .find(|word| word.len() >= 5 && word.chars().all(char::is_alphanumeric))
+            .expect("fixture prompt term");
+        w.cv_ok(&["index"]);
+        for scan in [false, true] {
+            let mut args = vec!["search", "--json", "--limit", "100"];
+            if scan {
+                args.push("--scan");
+            }
+            let (out, _) = w.cv_ok(&[args.as_slice(), &[needle]].concat());
+            let (hits, _) = search_json(&out);
+            assert!(!hits.is_empty(), "{} scan={scan} term={needle}", version.display());
+            for hit in hits {
+                assert_eq!(
+                    hit["title"].as_str(),
+                    titles.get(hit["id"].as_str().unwrap()).map(String::as_str),
+                    "{} scan={scan}",
+                    version.display()
+                );
+            }
         }
     }
 }
@@ -313,30 +347,27 @@ fn search_fallback_messaging_and_index_path() {
     let w = World::new("search");
     standard_corpus(&w);
 
-    // No index yet: a live scan with an explicit note, that still finds the content.
+    // No index yet: every session is unindexed, so the live read (all of it by default) answers
+    // and the footer says so; never an unasked scan.
     let (out, err) = w.cv_ok(&["search", "zebrafish"]);
-    assert!(err.contains("no index yet"), "want live-scan note, got stderr:\n{err}");
-    assert!(err.contains("scanning live"), "{err}");
+    assert!(out.contains("alphases") && out.contains("no index yet"), "{out}");
+    assert!(!err.contains("scanning"), "{err}");
+    // --frozen reads nothing live: no index is then an error naming the cause and both cures.
+    let (out, err) = w.cv_fails(&["--frozen", "search", "zebrafish"]);
+    assert!(err.contains("no full-text index") && err.contains("cv index"), "{err}");
+    assert!(err.contains("--scan"), "{err}");
+    assert!(out.is_empty(), "{out}");
+    // `--scan` asks for the live scan, which announces itself and still finds the content.
+    let (out, err) = w.cv_ok(&["search", "zebrafish", "--scan"]);
+    assert!(err.contains("scanning every transcript live"), "{err}");
     assert!(out.contains("alphases"), "{out}");
     assert!(out.to_lowercase().contains("zebrafish"), "snippet expected:\n{out}");
-
-    // A stale legacy sqlite index gets a cleanup nudge.
-    fs::write(w.cv_home.join("index.sqlite"), b"stale").unwrap();
-    let (_, err) = w.cv_ok(&["search", "zebrafish"]);
-    assert!(
-        err.contains("legacy sqlite index no longer used"),
-        "want legacy-index note, got stderr:\n{err}"
-    );
-    fs::remove_file(w.cv_home.join("index.sqlite")).unwrap();
 
     // Build the index; search must now use it (no live-scan note) and still hit.
     let (out, _) = w.cv_ok(&["index"]);
     assert!(out.contains("indexed 2 top-level session(s)"), "{out}");
     let (out, err) = w.cv_ok(&["search", "zebrafish"]);
-    assert!(
-        !err.contains("scanning live"),
-        "indexed search must not live-scan:\n{err}"
-    );
+    assert!(!err.contains("scanning"), "indexed search must not live-scan:\n{err}");
     assert!(out.contains("alphases"), "{out}");
 
     // The index is authoritative: a miss is a miss (with the index hint), not a fallback.
@@ -354,13 +385,13 @@ fn search_json_emits_machine_readable_hits() {
     let w = World::new("searchjson");
     standard_corpus(&w);
 
-    // Live-scan path (no index yet): the note stays on stderr; stdout is exactly one JSON
-    // array with the FULL session id (the table truncates to "alphases"), the snippet the
+    // Live-scan path (`--scan`): the note stays on stderr; stdout is exactly one JSON
+    // object, `{hits, total}`, each hit with the FULL session id (the table truncates to "alphases"), the snippet the
     // table would print, and an explicit null score (a live scan has none).
-    let (out, err) = w.cv_ok(&["search", "zebrafish", "--json"]);
-    assert!(err.contains("scanning live"), "{err}");
-    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
-    assert_eq!(rows.len(), 1, "{out}");
+    let (out, err) = w.cv_ok(&["search", "zebrafish", "--json", "--scan"]);
+    assert!(err.contains("scanning every transcript live"), "{err}");
+    let (rows, total) = search_json(&out);
+    assert_eq!((rows.len(), total), (1, 1), "{out}");
     assert_eq!(rows[0]["id"], "alphasess", "full id, not the 8-char prefix:\n{out}");
     assert_eq!(rows[0]["harness"], "claude");
     assert_eq!(rows[0]["title"], "alpha adventures");
@@ -378,25 +409,27 @@ fn search_json_emits_machine_readable_hits() {
         "{out}"
     );
 
-    // A live-scan miss is an empty array — valid JSON, no prose on stdout.
-    let (out, _) = w.cv_ok(&["search", "xyzzyplugh", "--json"]);
-    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
-    assert!(rows.is_empty(), "{out}");
+    // A live-scan miss is empty hits — valid JSON, no prose on stdout.
+    let (out, _) = w.cv_ok(&["search", "xyzzyplugh", "--json", "--scan"]);
+    let (rows, total) = search_json(&out);
+    assert!(rows.is_empty() && total == 0, "{out}");
 
-    // --limit bounds the array; the "stopped at" footer moves to stderr, keeping stdout pure.
-    // ("the" appears in both fixture sessions on the live path.)
-    let (out, err) = w.cv_ok(&["search", "the", "--json", "--limit", "1"]);
-    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
-    assert_eq!(rows.len(), 1, "{out}");
-    assert!(err.contains("stopped at 1"), "{err}");
+    // --limit bounds the hits and `total` counts every match; the "N of M" footer goes to
+    // stderr, keeping stdout pure. ("the" appears in both fixture sessions on the live path.)
+    let (out, err) = w.cv_ok(&["search", "the", "--json", "--limit", "1", "--scan"]);
+    let (rows, total) = search_json(&out);
+    assert_eq!((rows.len(), total), (1, 2), "{out}");
+    assert!(err.contains("1 of 2 matches"), "{err}");
+    let (out, _) = w.cv_ok(&["search", "the", "--limit", "1", "--scan"]);
+    assert!(out.contains("1 of 2 matches; use --limit for more"), "{out}");
 
     // Indexed path: same hit, still the full id, now with a real BM25 score and dates off
     // the index.
     w.cv_ok(&["index"]);
     let (out, err) = w.cv_ok(&["search", "zebrafish", "--json"]);
-    assert!(!err.contains("scanning live"), "{err}");
-    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
-    assert_eq!(rows.len(), 1, "{out}");
+    assert!(!err.contains("scanning"), "{err}");
+    let (rows, total) = search_json(&out);
+    assert_eq!((rows.len(), total), (1, 1), "{out}");
     assert_eq!(rows[0]["id"], "alphasess", "{out}");
     assert!(rows[0]["score"].as_f64().unwrap() > 0.0, "{out}");
     // Provenance keys ride on indexed hits too (null: the fixture has no sub-agent lanes).
@@ -412,18 +445,36 @@ fn search_json_emits_machine_readable_hits() {
         "{out}"
     );
 
-    // Indexed miss and non-matching --harness filter: empty arrays, still valid JSON.
+    // Indexed miss and non-matching --harness filter: empty hits, still valid JSON.
     let (out, _) = w.cv_ok(&["search", "xyzzyplugh", "--json"]);
-    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
-    assert!(rows.is_empty(), "{out}");
+    let (rows, total) = search_json(&out);
+    assert!(rows.is_empty() && total == 0, "{out}");
     let (out, _) = w.cv_ok(&["search", "zebrafish", "--json", "--harness", "codex"]);
-    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
-    assert!(rows.is_empty(), "{out}");
+    let (rows, total) = search_json(&out);
+    assert!(rows.is_empty() && total == 0, "{out}");
+
+    // The index counts past --limit too: every match, the filter applied.
+    let (out, err) = w.cv_ok(&["search", "the", "--json", "--limit", "1"]);
+    let (rows, total) = search_json(&out);
+    assert_eq!((rows.len(), total), (1, 2), "{out}");
+    assert!(err.contains("1 of 2 matches"), "{err}");
+    let (out, _) = w.cv_ok(&["search", "the", "--json", "--limit", "1", "--harness", "claude"]);
+    let (_, filtered) = search_json(&out);
+    assert!(filtered <= 2, "{out}");
+    let (out, _) = w.cv_ok(&["search", "the", "--limit", "5"]);
+    assert!(out.contains("2 of 2 matches") && !out.contains("use --limit"), "{out}");
+}
+
+/// `cv search --json`'s stdout: `{"hits": [...], "total": M}`, as its hits and total.
+fn search_json(out: &str) -> (Vec<serde_json::Value>, u64) {
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
+    let hits = v["hits"].as_array().expect("a hits array").clone();
+    (hits, v["total"].as_u64().expect("a total"))
 }
 
 /// The staleness disclosure: once the corpus has outrun the index, a hit list must say so (a
 /// non-empty answer can still be missing rows), a miss must say so, and --json moves it to
-/// stderr so stdout stays a pure array — `cv mcp` relays stderr as its own content block.
+/// stderr so stdout stays pure JSON — `cv mcp` relays stderr as its own content block.
 #[test]
 fn search_discloses_index_staleness() {
     let w = World::new("searchstale");
@@ -446,27 +497,136 @@ fn search_discloses_index_staleness() {
         writeln!(
             f,
             "{}",
-            user_line("u9", "2026-06-02T00:00:00Z", "more zebrafish tail work")
+            user_line(
+                "new-project-session",
+                "u9",
+                "2026-06-02T00:00:00Z",
+                "more zebrafish tail work"
+            )
         )
         .unwrap();
     }
 
-    // The human hit list carries the footer…
-    let (out, _) = w.cv_ok(&["search", "zebrafish"]);
-    assert!(out.contains("behind for 1 session"), "{out}");
-    // …--json keeps the array pure and puts the note on stderr…
-    let (out, err) = w.cv_ok(&["search", "zebrafish", "--json"]);
-    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
-    assert_eq!(rows.len(), 1, "{out}");
-    assert!(err.contains("behind for 1 session"), "{err}");
-    // …and a miss names it too.
-    let (out, _) = w.cv_ok(&["search", "xyzzyplugh"]);
-    assert!(out.contains("behind for 1 session"), "{out}");
+    // The grown suffix is read live: the hit list finds the new text and says what it read; with
+    // no --live-bytes nothing bounds the read, so the footer names no budget…
+    let (out, _) = w.cv_ok(&["search", "tail"]);
+    assert!(out.contains("alphases") && out.contains("read 1 session(s)"), "{out}");
+    assert!(!out.contains("behind") && !out.contains("budget"), "{out}");
+    // …--json keeps stdout pure and puts the footer on stderr…
+    let (out, err) = w.cv_ok(&["search", "tail", "--json"]);
+    let (rows, total) = search_json(&out);
+    assert_eq!((rows.len(), total), (1, 1), "{out}");
+    assert!(err.contains("read 1 session(s)"), "{err}");
+    // …a budget too small for the delta leaves it to the index, and a hit list or a miss says so…
+    for query in ["zebrafish", "xyzzyplugh"] {
+        let (out, _) = w.cv_ok(&["search", query, "--live-bytes", "10"]);
+        assert!(
+            out.contains("behind for 1 session") && out.contains("over the --live-bytes budget"),
+            "{out}"
+        );
+    }
+    let (out, _) = w.cv_ok(&["search", "tail", "--live-bytes", "10"]);
+    assert!(out.contains("no matches"), "{out}");
+    // …and --frozen answers from the index alone and says so.
+    let (out, _) = w.cv_ok(&["--frozen", "search", "tail"]);
+    assert!(out.contains("no matches") && out.contains("--frozen"), "{out}");
 
     // A fresh pass quiets it again.
     w.cv_ok(&["index"]);
     let (_, err) = w.cv_ok(&["search", "zebrafish", "--json"]);
-    assert!(!err.contains("behind"), "{err}");
+    assert!(!err.contains("behind") && !err.contains("live:"), "{err}");
+}
+
+/// A sandbox that denies writes to the cv home (here the home made read-only, as a deny-write
+/// profile makes it) still searches, lists and shows from the index and catalog it finds there.
+/// Text appended after indexing is found by the live read of the suffix, which writes nothing;
+/// `--frozen` answers from the index alone. Nothing announces a scan.
+#[cfg(unix)]
+#[test]
+fn read_only_home_answers_from_the_index() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::new("searchro");
+    standard_corpus(&w);
+    w.cv_ok(&["index"]);
+    let mut lines = fs::read_to_string(w.transcript("betasess")).unwrap();
+    lines.push_str(&format!(
+        "{}\n",
+        user_line("new-project-session", "b9", "2026-03-02T09:00:00Z", "zqlatecomer")
+    ));
+    fs::write(w.transcript("betasess"), lines).unwrap();
+    let set_mode = |mode: u32| {
+        let mut dirs = vec![w.cv_home.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path.clone());
+                    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+                } else {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(mode & 0o666)).unwrap();
+                }
+            }
+        }
+        fs::set_permissions(&w.cv_home, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o555);
+    let found = w.cv(&["search", "zebrafish", "--json"]);
+    let late = w.cv(&["search", "zqlatecomer"]);
+    let frozen = w.cv(&["--frozen", "search", "zqlatecomer"]);
+    let listed = w.cv(&["ls", "--json"]);
+    let shown = w.cv(&["show", "alphasess"]);
+    set_mode(0o755);
+
+    let (ok, _, out, err) = found;
+    assert!(ok, "{err}");
+    let (rows, total) = search_json(&out);
+    assert_eq!((rows.len(), total), (1, 1), "{out}");
+    assert_eq!(rows[0]["id"], "alphasess");
+    assert!(
+        rows[0]["score"].as_f64().is_some(),
+        "an indexed hit carries its score: {out}"
+    );
+    assert!(!err.contains("scanning") && !err.contains("unusable"), "{err}");
+    let (ok, _, out, err) = late;
+    assert!(
+        ok && out.contains("betases") && out.contains("read 1 session(s)") && !err.contains("scanning"),
+        "the live suffix answered, not a scan:\n{out}\n{err}"
+    );
+    let (ok, _, out, err) = frozen;
+    assert!(
+        ok && out.contains("no matches"),
+        "the index alone answered:\n{out}\n{err}"
+    );
+    let (ok, _, out, err) = listed;
+    assert!(ok, "{err}");
+    assert_eq!(
+        serde_json::from_str::<Vec<serde_json::Value>>(&out).unwrap().len(),
+        2,
+        "{out}"
+    );
+    let (ok, _, out, err) = shown;
+    assert!(ok && out.contains("zebrafish"), "{out}\n{err}");
+}
+
+/// An index that exists but cannot be opened fails at once, naming its path, the cause and both
+/// ways forward; it never turns into a scan of every transcript.
+#[test]
+fn unusable_index_fails_fast_with_the_cause() {
+    let w = World::new("searchbad");
+    standard_corpus(&w);
+    let index = w.cv_home.join("tantivy");
+    fs::create_dir_all(&index).unwrap();
+    fs::write(index.join("meta.json"), b"{not json").unwrap();
+    let started = std::time::Instant::now();
+    let (out, err) = w.cv_fails(&["search", "zebrafish"]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains("unusable") && err.contains(&*index.to_string_lossy()),
+        "{err}"
+    );
+    assert!(err.contains("cv index") && err.contains("--scan"), "{err}");
+    assert!(!err.contains("scanning"), "{err}");
 }
 
 // ───────────────────────────── show windows ─────────────────────────────
@@ -607,8 +767,9 @@ fn show_range_windowing() {
     assert_eq!(v["messages"].as_array().unwrap().len(), 0, "{out}");
 }
 
-/// `--thinking <native|text|drop>` means the same thing on every command that emits a session, and
-/// nothing else answers to that word. The modes differ in whether a turn whose only content is
+/// `--thinking <native|text|drop|portable>` means the same thing on every command that emits a
+/// session, and nothing else answers to that word. `rewind` writes Claude only and offers the two
+/// it can honor (`native`, `portable`), says so in its help, and refuses the others. The modes differ in whether a turn whose only content is
 /// provider-signed reasoning survives a target that cannot hold the signature.
 #[test]
 fn thinking_mode_is_one_word_on_every_emitting_command() {
@@ -627,6 +788,22 @@ fn thinking_mode_is_one_word_on_every_emitting_command() {
         }
     }
 
+    let (ok, _, out, err) = w.cv(&["rewind", "--help"]);
+    assert!(ok, "cv rewind --help failed:\n{err}");
+    for mode in ["native", "portable"] {
+        assert!(
+            out.contains(mode),
+            "cv rewind --help must offer --thinking {mode}:\n{out}"
+        );
+    }
+    assert!(
+        out.contains("`text` and `drop` are"),
+        "rewind's help names the values it refuses:\n{out}"
+    );
+    let (_, code, _, err) = w.cv(&["rewind", "alphasess", "--thinking", "drop"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("drop"), "the refused value is quoted back:\n{err}");
+
     // An unknown mode is rejected by name, listing what is valid.
     let (_, _, _, err) = w.cv(&["port", "alphasess", "--thinking", "sideways"]);
     assert!(err.contains("sideways"), "the bad value is quoted back:\n{err}");
@@ -635,6 +812,18 @@ fn thinking_mode_is_one_word_on_every_emitting_command() {
     let (_, code, _, err) = w.cv(&["prune", "alphasess", "--thinking"]);
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("--drop-thinking"), "{err}");
+}
+
+/// `--interval` is seconds as a number on both pollers; a negative one is a usage error.
+#[test]
+fn interval_is_seconds_and_negative_is_a_usage_error() {
+    let w = World::new("interval");
+    standard_corpus(&w);
+    for cmd in ["scry", "watch"] {
+        let (_, code, _, err) = w.cv(&[cmd, "--interval=-1"]);
+        assert_eq!(code, 2, "cv {cmd}: {err}");
+        assert!(err.contains("--interval"), "cv {cmd}: {err}");
+    }
 }
 
 // ───────────────────────────── export ─────────────────────────────
@@ -656,7 +845,10 @@ fn export_formats() {
     let (windowed, _) = w.cv_ok(&["export", "alphasess", "--format", "md", "--range", "0.."]);
     assert_eq!(out, windowed);
     let giant = "🌙\\\"\n".repeat(16384);
-    let giant_path = w.write_session("giant-export", &[user_line("g", "2026-01-01T10:00:00Z", &giant)]);
+    let giant_path = w.write_session(
+        "giant-export",
+        &[user_line("giant-export", "g", "2026-01-01T10:00:00Z", &giant)],
+    );
     let (full, _) = w.cv_ok(&["export", "giant-export", "--format", "md"]);
     let (windowed, _) = w.cv_ok(&["export", "giant-export", "--format", "md", "--range", "0.."]);
     assert_eq!(full, windowed);
@@ -668,6 +860,7 @@ fn export_formats() {
         .unwrap()
         .write_all(b"\xff\n")
         .unwrap();
+    // Pin Claude so this assertion exercises its malformed-record policy explicitly.
     let (with_invalid_row, _) = w.cv_ok(&["export", "giant-export", "--format", "md", "--harness", "claude"]);
     assert_eq!(with_invalid_row, full);
 
@@ -1228,18 +1421,22 @@ fn dataset_file_publication_matches_stdout_and_preserves_transcript_aliases() {
     let (expected, _) = w.cv_ok(&["dataset"]);
     let output = w.base.join("training.jsonl");
     fs::write(&output, b"previous artifact").unwrap();
-    let (_, code, _, error) = w.cv(&["dataset", "--out", output.to_str().unwrap()]);
+    let (_, code, _, error) = w.cv(&["dataset", "--file", output.to_str().unwrap()]);
     assert_eq!(code, 2, "{error}");
     assert!(error.contains("already exists"), "{error}");
     assert_eq!(fs::read(&output).unwrap(), b"previous artifact");
-    let (stdout, _) = w.cv_ok(&["dataset", "--out", output.to_str().unwrap(), "--force"]);
+    // `--out` is a directory everywhere else; the old spelling points at `--file`.
+    let (_, code, _, error) = w.cv(&["dataset", "--out", output.to_str().unwrap()]);
+    assert_eq!(code, 2, "{error}");
+    assert!(error.contains("--file"), "{error}");
+    let (stdout, _) = w.cv_ok(&["dataset", "--file", output.to_str().unwrap(), "--force"]);
     assert!(stdout.is_empty());
     assert_eq!(fs::read(&output).unwrap(), expected.as_bytes());
 
     // Even --force never replaces one of the dataset's own source transcripts.
     let source = w.transcript("alphasess");
     let original = fs::read(&source).unwrap();
-    let (_, error) = w.cv_fails(&["dataset", "--limit", "1", "--out", source.to_str().unwrap(), "--force"]);
+    let (_, error) = w.cv_fails(&["dataset", "--limit", "1", "--file", source.to_str().unwrap(), "--force"]);
     assert!(error.contains("aliases source transcript"), "{error}");
     assert_eq!(fs::read(&source).unwrap(), original);
     assert_eq!(w.cv_ok(&["dataset"]).0, expected);
@@ -1251,7 +1448,7 @@ fn dataset_file_publication_matches_stdout_and_preserves_transcript_aliases() {
         let symlink = w.base.join("source-symlink.jsonl");
         std::os::unix::fs::symlink(&source, &symlink).unwrap();
         for alias in [&hardlink, &symlink] {
-            let (_, error) = w.cv_fails(&["dataset", "--out", alias.to_str().unwrap(), "--force"]);
+            let (_, error) = w.cv_fails(&["dataset", "--file", alias.to_str().unwrap(), "--force"]);
             assert!(error.contains("aliases source transcript"), "{error}");
             assert_eq!(fs::read(alias).unwrap(), original);
         }
@@ -1275,12 +1472,12 @@ fn dataset_file_publication_replaces_the_name_not_the_linked_file() {
     fs::hard_link(&target, &hardlink).unwrap();
     let output = w.base.join("output-symlink.jsonl");
     symlink(&target, &output).unwrap();
-    w.cv_ok(&["dataset", "--out", output.to_str().unwrap(), "--force"]);
+    w.cv_ok(&["dataset", "--file", output.to_str().unwrap(), "--force"]);
     assert!(!output.is_symlink());
     assert_eq!(fs::read(&output).unwrap(), expected.as_bytes());
     assert_eq!(fs::metadata(&output).unwrap().permissions().mode() & 0o777, 0o600);
     assert_eq!(fs::read(&target).unwrap(), b"previous artifact");
-    w.cv_ok(&["dataset", "--out", target.to_str().unwrap(), "--force"]);
+    w.cv_ok(&["dataset", "--file", target.to_str().unwrap(), "--force"]);
     assert_eq!(fs::read(&target).unwrap(), expected.as_bytes());
     assert_eq!(fs::read(&hardlink).unwrap(), b"previous artifact");
 }
@@ -1503,14 +1700,21 @@ fn blame_outside_repo_and_missing_file() {
     let w = World::new("blame");
     standard_corpus(&w);
 
-    // A path that exists nowhere, outside any git repo: must not panic. Either outcome (clean
-    // degradation to catalog-only mode, or a clear error) is fine — but never a panic/signal.
-    let (_ok, code, out, err) = w.cv(&["blame", "/not/a/file"]);
-    assert_ne!(code, -1, "cv blame died by signal\nstderr:\n{err}");
-    assert!(!err.contains("panicked"), "panic in blame:\n{err}");
+    // A path that exists nowhere, outside any git repo: blame degrades to catalog-only mode,
+    // says so first, and finds no session that edited it.
+    let (ok, code, out, err) = w.cv(&["blame", "/not/a/file"]);
     assert!(
-        out.contains("not inside a git repository") || !err.trim().is_empty(),
-        "blame must explain itself\nstdout:\n{out}\nstderr:\n{err}"
+        ok && code == 0,
+        "blame degrades, never fails\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(
+        out.starts_with("(not inside a git repository — event-catalog matches only, no commit correlation)\n"),
+        "blame names its mode first:\n{out}"
+    );
+    // Nothing was indexed in this world, so the catalog has no edit events to match.
+    assert!(
+        out.contains("no edit events found — run `cv index` first"),
+        "no session edited it:\n{out}"
     );
 }
 
@@ -1528,11 +1732,11 @@ fn show_tree_renders() {
         "cycle-tree",
         &[
             claude::with(
-                user_line("c1", "2026-01-01T10:00:00Z", "first-cycle"),
+                user_line("cycle-tree", "c1", "2026-01-01T10:00:00Z", "first-cycle"),
                 serde_json::json!({"parentUuid":"c2"}),
             ),
             claude::with(
-                user_line("c2", "2026-01-01T10:01:00Z", "second-cycle"),
+                user_line("cycle-tree", "c2", "2026-01-01T10:01:00Z", "second-cycle"),
                 serde_json::json!({"parentUuid":"c1"}),
             ),
         ],
@@ -1551,9 +1755,8 @@ fn stats_and_ls_asc() {
     standard_corpus(&w);
 
     let (out, _) = w.cv_ok(&["stats"]);
-    assert!(out.contains("2 session(s) · 7 message(s)"), "{out}");
+    assert!(out.contains("2 session(s) · 6 message(s)"), "{out}");
     assert!(out.contains("claude"), "{out}");
-
     // `ls` is newest first; `--asc` prints the same rows oldest → newest (the old `timeline` feed).
     let (out, _) = w.cv_ok(&["ls"]);
     assert!(pos(&out, "alphases") < pos(&out, "betasess"), "{out}");
@@ -1574,6 +1777,46 @@ fn stats_and_ls_asc() {
 }
 
 #[test]
+fn stats_reports_uncounted_sessions_beside_the_total() {
+    let w = World::new("stats-uncounted");
+    standard_corpus(&w);
+    let (out, _) = w.cv_ok(&["stats"]);
+    assert!(out.contains("2 session(s) · 6 message(s)\n"), "{out}");
+    // A Codex listing defers its count: the sum stays honest and says what it left out.
+    let dir = w.home.join(".codex/sessions/2026/01/01");
+    std::fs::create_dir_all(&dir).unwrap();
+    let id = "019a0000-0000-7000-8000-0000000000aa";
+    let rollout = [
+        serde_json::json!({"timestamp": "2026-01-01T10:00:00Z", "type": "session_meta",
+            "payload": {"id": id, "cwd": "/work/proj", "timestamp": "2026-01-01T10:00:00Z"}}),
+        serde_json::json!({"timestamp": "2026-01-01T10:00:01Z", "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}}),
+    ];
+    std::fs::write(
+        dir.join(format!("rollout-2026-01-01T10-00-00-{id}.jsonl")),
+        cv_testkit::jsonl(&rollout),
+    )
+    .unwrap();
+    let (out, _) = w.cv_ok(&["stats"]);
+    assert!(out.contains("3 session(s) · 6 message(s) · 1 not counted yet"), "{out}");
+    let (out, _) = w.cv_ok(&["stats", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (v["messages"].as_u64(), v["uncounted"].as_u64()),
+        (Some(6), Some(1)),
+        "{out}"
+    );
+    // The table prints a dash for it, and `--sort-by messages` ranks it after every counted row.
+    let (out, _) = w.cv_ok(&["ls", "--sort-by", "messages"]);
+    assert!(out.contains("– msg"), "{out}");
+    assert!(pos(&out, "betasess") < pos(&out, "alphases"), "{out}");
+    assert!(pos(&out, "alphases") < pos(&out, "019a0000"), "{out}");
+    let (out, _) = w.cv_ok(&["ls", "--json", "--harness", "codex"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert!(rows[0]["message_count"].is_null(), "{out}");
+}
+
+#[test]
 fn stats_tokens_totals_usage_per_model() {
     let w = World::new("stats-tokens");
     let reply = |uuid: &str, id: &str, model: &str| {
@@ -1588,7 +1831,7 @@ fn stats_tokens_totals_usage_per_model() {
     w.write_session(
         "toksess",
         &[
-            user_line("u1", "2026-03-01T09:00:00Z", "go"),
+            user_line("toksess", "u1", "2026-03-01T09:00:00Z", "go"),
             reply("a1", "msg_1", "claude-opus-5-5"),
             // The same streamed response's second content-block line: one call, not two.
             reply("a2", "msg_1", "claude-opus-5-5"),
@@ -1642,11 +1885,16 @@ fn extra_claude_roots_are_listed_and_read() {
     standard_corpus(&w);
     let seat_proj = w.home.join("seats/bonsai/claude/projects/-work-proj");
     fs::create_dir_all(&seat_proj).unwrap();
-    let seat_line = user_line("s1", "2026-07-01T10:00:00Z", "the seat asks about narwhals");
+    let seat_line = user_line("seatsess", "s1", "2026-07-01T10:00:00Z", "the seat asks about narwhals");
     fs::write(seat_proj.join("seatsess.jsonl"), format!("{seat_line}\n")).unwrap();
     let env_proj = w.base.join("elsewhere/projects/-work-proj");
     fs::create_dir_all(&env_proj).unwrap();
-    let env_line = user_line("e1", "2026-07-02T10:00:00Z", "the env root asks about axolotls");
+    let env_line = user_line(
+        "envsess",
+        "e1",
+        "2026-07-02T10:00:00Z",
+        "the env root asks about axolotls",
+    );
     fs::write(env_proj.join("envsess.jsonl"), format!("{env_line}\n")).unwrap();
 
     // Not configured yet: the seat session is invisible, exactly as before.
@@ -1659,8 +1907,9 @@ fn extra_claude_roots_are_listed_and_read() {
     assert!(out.contains("zebrafish"), "the default root still works:\n{out}");
     let (out, _) = w.cv_ok(&["ls"]);
     assert!(out.contains("3 session(s)"), "{out}");
+    w.cv_ok(&["index"]);
     let (out, _) = w.cv_ok(&["search", "narwhals"]);
-    assert!(out.contains("seatsess"), "{out}");
+    assert!(out.contains("seatsess"), "the index covers the extra root:\n{out}");
 
     let roots = w.base.join("elsewhere");
     let (ok, _, out, err) = w.cv_env(
@@ -1673,14 +1922,18 @@ fn extra_claude_roots_are_listed_and_read() {
 
 // ───────────────────────────── task substrate: identity + sanitizing ─────────────────────────────
 
-/// Extract the task id `cv task open` prints on its own line (the uuid-shaped one).
-fn opened_task_id(stdout: &str) -> String {
-    stdout
-        .lines()
-        .map(str::trim)
-        .find(|l| l.len() == 36 && l.chars().filter(|c| *c == '-').count() == 4)
-        .unwrap_or_else(|| panic!("no task id in open output:\n{stdout}"))
-        .to_string()
+/// The id of the one task titled `title`, read from the task projection
+/// (`task list --all --json`), not from the human line `open`/`decide` print.
+fn task_id_titled(w: &World, title: &str) -> String {
+    let (json, _) = w.cv_ok(&["task", "list", "--all", "--json"]);
+    let tasks: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    let ids: Vec<&str> = tasks
+        .iter()
+        .filter(|t| t["title"] == title)
+        .map(|t| t["task_id"].as_str().expect("task_id"))
+        .collect();
+    assert_eq!(ids.len(), 1, "one task titled {title:?}:\n{json}");
+    ids[0].to_string()
 }
 
 /// G4: identity is environment, not assertion — CV_ENDPOINT is the default `--from`, an explicit
@@ -1691,7 +1944,8 @@ fn task_identity_resolution_order() {
 
     // Open needs no ceremony: bare command records "cv".
     let (out, _) = w.cv_ok(&["task", "open", "first task"]);
-    let id = opened_task_id(&out);
+    let id = task_id_titled(&w, "first task");
+    assert!(out.lines().any(|l| l.trim() == id), "open prints its id:\n{out}");
     let (json, _) = w.cv_ok(&["task", "show", &id, "--json"]);
     assert!(json.contains(r#""opened_by": "cv""#), "{json}");
 
@@ -1734,13 +1988,27 @@ fn task_surfaces_sanitize_and_age() {
     let w = World::new("task-ansi");
 
     let bomb = "evil\u{1b}]0;pwned\u{7}title \u{1b}[31mred\nline";
-    let (out, _) = w.cv_ok(&["task", "open", bomb]);
-    let id = opened_task_id(&out);
+    w.cv_ok(&["task", "open", bomb]);
+    let id = task_id_titled(&w, bomb);
 
     let (out, _) = w.cv_ok(&["task", "list"]);
     assert!(!out.contains('\u{1b}'), "list leaks ESC:\n{out:?}");
     assert!(out.contains("eviltitle red line"), "stripped title renders:\n{out}");
-    assert!(out.contains("0s") || out.contains("1s"), "age column present:\n{out}");
+    // The age column, read from the script format (`id state assignee repo age title blocked_by`).
+    let (tsv, _) = w.cv_ok(&["task", "list", "--tsv"]);
+    let row: Vec<&str> = tsv
+        .lines()
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .find(|f| f[0] == id)
+        .unwrap_or_else(|| panic!("no row for {id}:\n{tsv}"));
+    let age = row[4];
+    assert!(
+        age.len() >= 2
+            && age[..age.len() - 1].bytes().all(|b| b.is_ascii_digit())
+            && age.ends_with(['s', 'm', 'h', 'd']),
+        "age is a count and a unit: {age:?} in {row:?}"
+    );
+    assert!(!row[5].contains('\u{1b}'), "tsv title leaks ESC: {row:?}");
 
     let (out, _) = w.cv_ok(&["task", "show", &id]);
     assert!(!out.contains('\u{1b}'), "show leaks ESC:\n{out:?}");
@@ -1758,8 +2026,8 @@ fn task_surfaces_sanitize_and_age() {
 #[test]
 fn task_land_facet_verbs_and_flags_are_removed_with_pointers() {
     let w = World::new("task-land-removed");
-    let (out, _) = w.cv_ok(&["task", "open", "finish it"]);
-    let id = opened_task_id(&out);
+    w.cv_ok(&["task", "open", "finish it"]);
+    let id = task_id_titled(&w, "finish it");
     let removed: &[&[&str]] = &[
         &["task", "propose", &id, "--branch", "x"],
         &["task", "reroute", &id, "--to", "y"],
@@ -1833,15 +2101,15 @@ fn task_open_relations_tags_and_file_bodies() {
     )
     .unwrap();
 
-    let (out, _) = w.cv_ok(&[
+    w.cv_ok(&[
         "task",
         "open",
         "FOUNDATION: the thing others wait on",
         "--tags",
         "lean,deploy",
     ]);
-    let a = opened_task_id(&out);
-    let (out, _) = w.cv_ok(&[
+    let a = task_id_titled(&w, "FOUNDATION: the thing others wait on");
+    w.cv_ok(&[
         "task",
         "open",
         "DEPENDENT: needs the foundation",
@@ -1852,9 +2120,9 @@ fn task_open_relations_tags_and_file_bodies() {
         "--tags",
         "lean",
     ]);
-    let b = opened_task_id(&out);
-    let (out, _) = w.cv_ok(&["task", "open", "UPSTREAM: blocks the foundation", "--blocks", &a]);
-    let c = opened_task_id(&out);
+    let b = task_id_titled(&w, "DEPENDENT: needs the foundation");
+    w.cv_ok(&["task", "open", "UPSTREAM: blocks the foundation", "--blocks", &a]);
+    let c = task_id_titled(&w, "UPSTREAM: blocks the foundation");
 
     // The body came from the file.
     let (json, _) = w.cv_ok(&["task", "show", &b, "--json"]);
@@ -1988,7 +2256,7 @@ fn task_sweep_names_merged_branches_and_missing_issue_paths_without_closing() {
     fs::write(repo.join("plan.md"), "plan").unwrap();
 
     let r = repo.to_str().unwrap();
-    let (out, _) = w.cv_ok(&[
+    w.cv_ok(&[
         "task",
         "open",
         "K-RAN: run claim",
@@ -1997,7 +2265,7 @@ fn task_sweep_names_merged_branches_and_missing_issue_paths_without_closing() {
         "--body",
         "one commit on branch `k-ran`, not pushed",
     ]);
-    let merged = opened_task_id(&out);
+    let merged = task_id_titled(&w, "K-RAN: run claim");
     w.cv_ok(&[
         "task",
         "open",
@@ -2008,7 +2276,7 @@ fn task_sweep_names_merged_branches_and_missing_issue_paths_without_closing() {
         "work is on `p3b1`",
     ]);
     w.cv_ok(&["task", "open", "PLAN: keep", "--repo", r, "--issue", "plan.md"]);
-    let (out, _) = w.cv_ok(&[
+    w.cv_ok(&[
         "task",
         "open",
         "GONE: issue file deleted",
@@ -2017,7 +2285,7 @@ fn task_sweep_names_merged_branches_and_missing_issue_paths_without_closing() {
         "--issue",
         "docs/gone.md",
     ]);
-    let gone = opened_task_id(&out);
+    let gone = task_id_titled(&w, "GONE: issue file deleted");
     w.cv_ok(&[
         "task",
         "open",
@@ -2086,10 +2354,10 @@ fn normalize(s: &str) -> String {
 #[test]
 fn task_inbox_orders_decisions_first_and_renders_markdown() {
     let w = World::new("inbox-md");
-    let (out, _) = w.cv_ok(&["task", "open", "the claimed one", "--body", "claimed body"]);
-    let c = opened_task_id(&out);
+    w.cv_ok(&["task", "open", "the claimed one", "--body", "claimed body"]);
+    let c = task_id_titled(&w, "the claimed one");
     assert!(w.cv_env(&["task", "claim", &c], &[("CV_ENDPOINT", "ember")]).0);
-    let (out, _) = w.cv_ok(&[
+    w.cv_ok(&[
         "task",
         "open",
         "write the docs",
@@ -2098,7 +2366,7 @@ fn task_inbox_orders_decisions_first_and_renders_markdown() {
         "--body",
         "First line of the action.\n\nSecond paragraph.",
     ]);
-    let a = opened_task_id(&out);
+    let a = task_id_titled(&w, "write the docs");
     w.cv_ok(&[
         "task",
         "note",
@@ -2107,7 +2375,7 @@ fn task_inbox_orders_decisions_first_and_renders_markdown() {
         "--from",
         "orchestrator:x",
     ]);
-    let (out, _) = w.cv_ok(&[
+    w.cv_ok(&[
         "task",
         "decide",
         "P6: WHO MAY REFILL a purse",
@@ -2122,32 +2390,29 @@ fn task_inbox_orders_decisions_first_and_renders_markdown() {
         "--from",
         "orchestrator:x",
     ]);
-    let d = opened_task_id(&out);
-    plant_legacy_tag_decision(
+    let d = task_id_titled(&w, "P6: WHO MAY REFILL a purse");
+    plant_tag_only_decision(
         &w,
         "01a0f000-0000-7000-8000-00000000000b",
-        "legacy decision by tag",
+        "tagged, never posed",
         "ember",
     );
 
     let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
-    let dec = out.find("decisions owed (2):").expect(&out);
-    let assigned = out.find("assigned actions (1):").expect(&out);
+    let dec = out.find("decisions owed (1):").expect(&out);
+    let assigned = out.find("assigned actions (2):").expect(&out);
     let claimed = out.find("claimed work (1):").expect(&out);
     assert!(dec < assigned && assigned < claimed, "group order:\n{out}");
-    assert!(
-        out.find("P6: WHO MAY REFILL").unwrap() < out.find("legacy decision by tag").unwrap(),
-        "{out}"
-    );
+    assert!(assigned < out.find("tagged, never posed").unwrap(), "{out}");
 
     let (md, _) = w.cv_ok(&["task", "inbox", "ember", "--md"]);
     let got = normalize(&md);
     let expected = "\
 # Inbox for ember — <ts>
 
-2 decision(s) owed · 1 assigned action(s) · 1 claimed · 3 unread
+1 decision(s) owed · 2 assigned action(s) · 1 claimed · 3 unread
 
-## Decisions owed (2)
+## Decisions owed (1)
 
 ### 1. P6: WHO MAY REFILL a purse
 
@@ -2159,13 +2424,9 @@ fn task_inbox_orders_decisions_first_and_renders_markdown() {
 
 today anyone may fund any purse.
 
-### 2. legacy decision by tag
+## Assigned actions (2)
 
-`<id>` · open · waiting <age> ago by cv · **unread** (last: cv)
-
-## Assigned actions (1)
-
-### 3. write the docs
+### 2. write the docs
 
 `<id>` · open · waiting <age> ago by cv · **unread** (last: orchestrator:x)
 
@@ -2176,6 +2437,10 @@ Second paragraph.
 notes (1):
 
 - _orchestrator:x, <ts>:_ a note with two lines
+
+### 3. tagged, never posed
+
+`<id>` · open · waiting <age> ago by cv · **unread** (last: cv)
 
 ## Claimed work (1)
 
@@ -2195,14 +2460,14 @@ claimed body
 #[test]
 fn task_show_notes_last_and_grep() {
     let w = World::new("notes-filter");
-    let (out, _) = w.cv_ok(&[
+    w.cv_ok(&[
         "task",
         "open",
         "EMBER: everything only ember can do",
         "--assignee",
         "ember",
     ]);
-    let parent = opened_task_id(&out);
+    let parent = task_id_titled(&w, "EMBER: everything only ember can do");
     for n in [
         "move the build base from /tank (slow) to NVMe?",
         "PUSH also ~/dev/cv: one unsigned commit.",
@@ -2229,7 +2494,7 @@ fn task_show_notes_last_and_grep() {
 fn task_note_reads_stdin_and_open_absolutizes_issue() {
     let w = World::new("stdin-paths");
     fs::write(w.base.join("PLAN.md"), "# plan\n").unwrap();
-    let (ok, _, out, err) = w.cv_stdin(
+    let (ok, _, _, err) = w.cv_stdin(
         &[
             "task",
             "open",
@@ -2242,7 +2507,7 @@ fn task_note_reads_stdin_and_open_absolutizes_issue() {
         "a `code span` body\nwith two lines\n",
     );
     assert!(ok, "{err}");
-    let a = opened_task_id(&out);
+    let a = task_id_titled(&w, "with a heredoc body");
     let (json, _) = w.cv_ok(&["task", "show", &a, "--json"]);
     let t: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(t["body"], "a `code span` body\nwith two lines\n");
@@ -2261,23 +2526,23 @@ fn task_note_reads_stdin_and_open_absolutizes_issue() {
     let (out, _) = w.cv_ok(&["task", "show", &a]);
     assert!(out.contains("note from stdin"), "{out}");
 
-    let (out, _) = w.cv_ok(&["task", "open", "handle", "--issue", "#42"]);
-    let b = opened_task_id(&out);
+    w.cv_ok(&["task", "open", "handle", "--issue", "#42"]);
+    let b = task_id_titled(&w, "handle");
     let (json, _) = w.cv_ok(&["task", "show", &b, "--json"]);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&json).unwrap()["issue"],
         "#42"
     );
-    let (out, _) = w.cv_ok(&["task", "open", "url", "--issue", "https://x.y/issues/4"]);
-    let c = opened_task_id(&out);
+    w.cv_ok(&["task", "open", "url", "--issue", "https://x.y/issues/4"]);
+    let c = task_id_titled(&w, "url");
     let (json, _) = w.cv_ok(&["task", "show", &c, "--json"]);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&json).unwrap()["issue"],
         "https://x.y/issues/4"
     );
     // A relative path that does not exist yet is still rooted at the cwd.
-    let (out, _) = w.cv_ok(&["task", "open", "future doc", "--issue", "docs/later.md"]);
-    let d = opened_task_id(&out);
+    w.cv_ok(&["task", "open", "future doc", "--issue", "docs/later.md"]);
+    let d = task_id_titled(&w, "future doc");
     let (json, _) = w.cv_ok(&["task", "show", &d, "--json"]);
     let issue = serde_json::from_str::<serde_json::Value>(&json).unwrap()["issue"]
         .as_str()
@@ -2296,38 +2561,10 @@ fn seeded_old_and_new(w: &World) -> (String, String) {
     w.seed_task_log(&[
         serde_json::json!({"id": old, "task_id": old, "ts": "2026-01-01T00:00:00Z", "by": "orchestrator:old",
             "event": "opened", "title": "OLD: from another project", "channel": "tasks", "assignee": "ember"}),
-        serde_json::json!({"id": new, "task_id": new, "ts": chrono_now(), "by": "orchestrator:new",
+        serde_json::json!({"id": new, "task_id": new, "ts": cv_testkit::now_rfc3339(), "by": "orchestrator:new",
             "event": "opened", "title": "NEW: today's task", "channel": "tasks", "assignee": "ember"}),
     ]);
     (old, new)
-}
-
-/// An RFC 3339 "now" for seeded events (the test crate has no chrono: derive it from cv itself).
-fn chrono_now() -> String {
-    chrono_at(0)
-}
-
-/// [`chrono_now`] shifted by `offset` seconds.
-fn chrono_at(offset: u64) -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + offset;
-    // days since epoch → civil date (Howard Hinnant's algorithm), UTC, minute precision is plenty
-    let days = secs / 86_400;
-    let (h, m, s) = ((secs % 86_400) / 3600, (secs % 3600) / 60, secs % 60);
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 /// A bare `list`/`inbox` is scoped to the last 14 days (or tasks involving `$CV_ENDPOINT`) and
@@ -2378,7 +2615,7 @@ fn task_list_and_inbox_scope_to_recent_and_all_shows_old() {
 #[test]
 fn task_inbox_unread_and_events_since() {
     let w = World::new("unread-events");
-    let (out, _) = w.cv_ok(&[
+    w.cv_ok(&[
         "task",
         "open",
         "A: touched by the orchestrator last",
@@ -2387,8 +2624,8 @@ fn task_inbox_unread_and_events_since() {
         "--from",
         "orchestrator:x",
     ]);
-    let a = opened_task_id(&out);
-    let (out, _) = w.cv_ok(&[
+    let a = task_id_titled(&w, "A: touched by the orchestrator last");
+    w.cv_ok(&[
         "task",
         "open",
         "B: ember spoke last",
@@ -2397,9 +2634,9 @@ fn task_inbox_unread_and_events_since() {
         "--from",
         "orchestrator:x",
     ]);
-    let b = opened_task_id(&out);
+    let b = task_id_titled(&w, "B: ember spoke last");
     w.cv_ok(&["task", "note", &b, "on it", "--from", "ember"]);
-    let (out, _) = w.cv_ok(&[
+    w.cv_ok(&[
         "task",
         "open",
         "C: web ember spoke last",
@@ -2408,7 +2645,7 @@ fn task_inbox_unread_and_events_since() {
         "--from",
         "orchestrator:x",
     ]);
-    let c = opened_task_id(&out);
+    let c = task_id_titled(&w, "C: web ember spoke last");
     w.cv_ok(&["task", "note", &c, "via the page", "--from", "web:ember"]);
 
     let (out, _) = w.cv_ok(&["task", "inbox", "ember", "--unread"]);
@@ -2450,6 +2687,10 @@ fn task_inbox_unread_and_events_since() {
     );
     let (out, _) = w.cv_ok(&["task", "events", "--task", &b]);
     assert_eq!(out.lines().count(), 2, "{out}");
+    // An unknown kind is a usage error naming the known tags, not an empty feed.
+    let (_, code, _, err) = w.cv(&["task", "events", "--kind", "note,bogus"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("bogus") && err.contains("status_set"), "{err}");
     let (_, err) = w.cv_fails(&["task", "events", "--since", "whenever"]);
     assert!(err.contains("cannot read"), "{err}");
 
@@ -2477,231 +2718,6 @@ fn task_inbox_unread_and_events_since() {
     assert!(err.contains("removed in 0.15.0") && err.contains("--not-by"), "{err}");
 }
 
-// ───────────────────────────── the inbox on cv serve ─────────────────────────────
-
-/// A minimal HTTP/1.1 client over a TcpStream (the test crate has no HTTP dependency).
-fn http(addr: &str, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-    use std::io::{Read, Write};
-    let mut s = std::net::TcpStream::connect(addr).expect("connect to cv serve");
-    s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
-    let body = body.unwrap_or("");
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    s.write_all(req.as_bytes()).unwrap();
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw).unwrap();
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
-    let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
-    (status, body.to_string())
-}
-
-/// Start `cv serve` on an ephemeral port in this world; returns (child, addr).
-fn serve(w: &World, who: &str) -> (std::process::Child, String) {
-    use std::io::{BufRead, BufReader};
-    let mut child = w
-        .cv_command()
-        .args(["serve", "--port", "0", "--who", who])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("cv serve starts");
-    let stderr = child.stderr.take().unwrap();
-    let mut lines = BufReader::new(stderr).lines();
-    let banner = lines.next().expect("a banner line").expect("readable");
-    let addr = banner
-        .split("http://")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .unwrap_or_else(|| panic!("no address in banner: {banner}"))
-        .to_string();
-    // Keep draining stderr so the child never blocks on a full pipe.
-    std::thread::spawn(move || for _ in lines {});
-    (child, addr)
-}
-
-/// The page and the CLI are one store: GET the inbox for a fixture assignee (one decision, one
-/// action), POST resolve / done / note / discuss, and `cv task show --brief` reflects every event
-/// with the author `web:<assignee>`. The event feed route is the same query as `cv task events`.
-#[test]
-fn the_inbox_records_the_same_events_as_the_cli() {
-    let w = World::new("serve");
-    let (out, _) = w.cv_ok(&[
-        "task",
-        "decide",
-        "PAY §7: tariff",
-        "--for",
-        "ember",
-        "--default",
-        "1 credit/unit",
-        "--option",
-        "free tier",
-        "--from",
-        "orchestrator:x",
-    ]);
-    let d = opened_task_id(&out);
-    let (out, _) = w.cv_ok(&[
-        "task",
-        "open",
-        "push dregg-infra",
-        "--assignee",
-        "ember",
-        "--from",
-        "orchestrator:x",
-    ]);
-    let a = opened_task_id(&out);
-    let (mut child, addr) = serve(&w, "ember");
-    let result = std::panic::catch_unwind(|| {
-        // The page itself is served inline; it names its own origin story.
-        let (status, html) = http(&addr, "GET", "/", None);
-        assert_eq!(status, 200);
-        assert!(
-            html.contains("<title>cv inbox</title>") && html.contains("/api/inbox"),
-            "{}",
-            &html[..200.min(html.len())]
-        );
-        assert!(
-            !html.contains("<script src=") && !html.contains("<link rel=\"stylesheet\""),
-            "no external resources"
-        );
-        // A DNS-named Host is refused (rebinding).
-        let (status, _) = {
-            use std::io::{Read, Write};
-            let mut s = std::net::TcpStream::connect(&addr).unwrap();
-            s.write_all(b"GET /api/inbox HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n")
-                .unwrap();
-            let mut raw = String::new();
-            s.read_to_string(&mut raw).unwrap();
-            (
-                raw.split_whitespace().nth(1).unwrap_or("0").parse::<u16>().unwrap_or(0),
-                raw,
-            )
-        };
-        assert_eq!(status, 403);
-
-        let (status, body) = http(&addr, "GET", "/api/inbox?who=ember", None);
-        assert_eq!(status, 200, "{body}");
-        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(page["who"], "ember");
-        assert_eq!(page["counts"]["decisions"], 1);
-        assert_eq!(page["counts"]["assigned"], 1);
-        let items = page["items"].as_array().unwrap();
-        assert_eq!(items[0]["reason"], "decision_owed");
-        assert_eq!(items[0]["decision"]["default"], "1 credit/unit");
-        assert_eq!(items[0]["decision"]["alternatives"], serde_json::json!(["free tier"]));
-        assert_eq!(items[1]["reason"], "assigned_open");
-        // Without ?who the server's --who applies.
-        let (status, body) = http(&addr, "GET", "/api/inbox", None);
-        assert_eq!(status, 200);
-        assert!(body.contains("\"who\":\"ember\""), "{body}");
-
-        // Act: a note, then "needs discussion", then resolve with an option, then done.
-        let (status, body) = http(
-            &addr,
-            "POST",
-            &format!("/api/task/{d}/note"),
-            Some(r#"{"text":"reading PAY first"}"#),
-        );
-        assert_eq!(status, 200, "{body}");
-        assert!(body.contains("\"by\":\"web:ember\""), "{body}");
-        let (status, body) = http(
-            &addr,
-            "POST",
-            &format!("/api/task/{d}/discuss"),
-            Some(r#"{"text":"what is a unit?"}"#),
-        );
-        assert_eq!(status, 200, "{body}");
-        let (status, body) = http(
-            &addr,
-            "POST",
-            &format!("/api/task/{d}/resolve"),
-            Some(r#"{"choice":"free tier","note":"for October"}"#),
-        );
-        assert_eq!(status, 200, "{body}");
-        assert!(body.contains("\"task_state\":\"resolved\""), "{body}");
-        let (status, body) = http(
-            &addr,
-            "POST",
-            &format!("/api/task/{d}/resolve"),
-            Some(r#"{"accept_default":true}"#),
-        );
-        assert_eq!(status, 400, "a second resolution is refused: {body}");
-        let (status, body) = http(
-            &addr,
-            "POST",
-            &format!("/api/task/{a}/done"),
-            Some(r#"{"observed":"pushed"}"#),
-        );
-        assert_eq!(status, 200, "{body}");
-        let (status, body) = http(&addr, "POST", &format!("/api/task/{a}/done"), Some("{}"));
-        assert_eq!(status, 400, "{body}");
-        let (status, body) = http(&addr, "POST", &format!("/api/task/{a}/frobnicate"), Some("{}"));
-        assert_eq!(status, 400, "{body}");
-        let (status, body) = http(&addr, "POST", &format!("/api/task/{a}/note"), Some("not json"));
-        assert_eq!(status, 400, "{body}");
-
-        // The closed items show under the page's Resolved filter; reopen brings a NEW task.
-        let (status, body) = http(&addr, "GET", "/api/inbox?who=ember", None);
-        assert_eq!(status, 200);
-        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(page["items"].as_array().unwrap().len(), 0);
-        assert_eq!(page["closed"].as_array().unwrap().len(), 2);
-        let (status, body) = http(&addr, "POST", &format!("/api/task/{a}/reopen"), Some("{}"));
-        assert_eq!(status, 200, "{body}");
-        let (status, body) = http(&addr, "GET", "/api/inbox?who=ember", None);
-        assert_eq!(status, 200);
-        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let items = page["items"].as_array().unwrap();
-        assert_eq!(items.len(), 1, "{body}");
-        assert_eq!(items[0]["title"], "push dregg-infra");
-        assert!(
-            items[0]["tags"].as_array().unwrap().iter().any(|t| t == "reopened"),
-            "{body}"
-        );
-
-        // One task, with its history; the event feed is the same query as `cv task events`.
-        let (status, body) = http(&addr, "GET", &format!("/api/task/{d}?events=1"), None);
-        assert_eq!(status, 200);
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["effective_state"], "resolved");
-        assert!(v["events"].as_array().unwrap().len() >= 6, "{body}");
-        let (status, body) = http(&addr, "GET", "/api/events?since=1h&kind=resolved,done", None);
-        assert_eq!(status, 200);
-        let rows: Vec<serde_json::Value> = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(rows.len(), 2, "{body}");
-        assert!(rows.iter().all(|r| r["by"] == "web:ember"), "{body}");
-    });
-    let _ = child.kill();
-    let _ = child.wait();
-    if let Err(e) = result {
-        std::panic::resume_unwind(e);
-    }
-
-    // The CLI sees exactly what the page recorded, with the web author.
-    let (out, _) = w.cv_ok(&["task", "show", &d, "--brief"]);
-    assert!(out.contains("[resolved]"), "{out}");
-    assert!(
-        out.contains("resolved: free tier — by web:ember,") && out.contains("· for October"),
-        "{out}"
-    );
-    assert!(out.contains("web:ember") && out.contains("reading PAY first"), "{out}");
-    assert!(out.contains("NEEDS DISCUSSION: what is a unit?"), "{out}");
-    assert!(
-        out.contains("tags:     discuss"),
-        "a decision is posed, never tagged:\n{out}"
-    );
-    let (out, _) = w.cv_ok(&["task", "show", &a, "--brief"]);
-    assert!(
-        out.contains("[done]") && out.contains("self-reported") && out.contains("(pushed)"),
-        "{out}"
-    );
-    let (json, _) = w.cv_ok(&["task", "show", &a, "--events"]);
-    assert!(json.contains("\"by\": \"web:ember\""), "{json}");
-    let (out, _) = w.cv_ok(&["task", "events", "--since", "1h", "--kind", "resolved,done"]);
-    assert_eq!(out.lines().count(), 2, "the CLI feed and /api/events agree:\n{out}");
-}
 // ───────────────────────────── distill ─────────────────────────────
 
 /// Walk `parentUuid` back from the newest threaded record, the way Claude Code loads a session on
@@ -3079,167 +3095,6 @@ fn adopt_reaches_extra_claude_roots_and_never_targets_the_dead_session() {
     assert!(out.contains(&aid[..8]), "a seat session lists by id too: {out}");
 }
 
-/// Provisional resolutions: the orchestrator poses and resolves on the default at once
-/// (`decide --provisional`); the decider's inbox lists it under "made for you (veto?)", not as
-/// owed; a third party cannot override it; the decider vetoes with `--choice` (or confirms, here
-/// through the page's `{confirm: true}`), and `show` keeps both resolutions.
-#[test]
-fn task_provisional_resolution_veto_and_confirm() {
-    let w = World::new("provisional");
-    let (out, _) = w.cv_ok(&[
-        "task",
-        "decide",
-        "build base: /tank or NVMe",
-        "--for",
-        "ember",
-        "--default",
-        "keep /tank",
-        "--option",
-        "move to NVMe",
-        "--provisional",
-        "--from",
-        "orchestrator:o",
-    ]);
-    let d = opened_task_id(&out);
-    assert!(
-        out.contains("resolved") && out.contains("provisionally on the default"),
-        "{out}"
-    );
-    let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
-    assert!(
-        out.starts_with("made for you (veto?) (1):"),
-        "not owed, its own group:\n{out}"
-    );
-    assert!(
-        out.contains("⇒ made: keep /tank — by orchestrator:o · veto to: move to NVMe"),
-        "{out}"
-    );
-    assert!(out.contains("cv task resolve <id> --confirm --from ember"), "{out}");
-    let (json, _) = w.cv_ok(&["task", "inbox", "ember", "--json"]);
-    assert!(json.contains("\"provisional\""), "{json}");
-    let (out, _) = w.cv_ok(&["task", "show", &d]);
-    assert!(out.contains("[resolved]") && out.contains("PROVISIONAL"), "{out}");
-    assert!(out.contains("veto?:    cv task resolve"), "{out}");
-
-    // The poser cannot pick a non-default provisionally; a third party cannot override.
-    let (out, _) = w.cv_ok(&[
-        "task",
-        "decide",
-        "Q2",
-        "--for",
-        "ember",
-        "--default",
-        "a",
-        "--option",
-        "b",
-        "--from",
-        "orchestrator:o",
-    ]);
-    let d2 = opened_task_id(&out);
-    let (_, err) = w.cv_fails(&[
-        "task",
-        "resolve",
-        &d2,
-        "--choice",
-        "b",
-        "--provisional",
-        "--from",
-        "orchestrator:o",
-    ]);
-    assert!(err.contains("stands on the default"), "{err}");
-    let (_, err) = w.cv_fails(&[
-        "task",
-        "resolve",
-        &d,
-        "--choice",
-        "move to NVMe",
-        "--from",
-        "lane:someone",
-    ]);
-    assert!(err.contains("only the decision's assignee (ember)"), "{err}");
-    let (_, err) = w.cv_fails(&["task", "resolve", &d2, "--confirm", "--from", "ember"]);
-    assert!(err.contains("no provisional resolution to confirm"), "{err}");
-    // No identity: the cure names the decision's owner, never a guess.
-    let (_, err) = w.cv_fails(&["task", "resolve", &d2, "--accept-default"]);
-    assert!(
-        err.contains("records WHO decided") && err.contains("--accept-default --from ember"),
-        "{err}"
-    );
-
-    // The decider vetoes: a new resolution replaces the provisional one, which is kept.
-    let (out, _) = w.cv_ok(&["task", "resolve", &d, "--choice", "move to NVMe", "--from", "ember"]);
-    assert!(out.contains("→ move to NVMe (by ember)"), "{out}");
-    let (out, _) = w.cv_ok(&["task", "show", &d]);
-    assert!(out.contains("provisionally: keep /tank — by orchestrator:o"), "{out}");
-    assert!(
-        out.contains("resolved: move to NVMe — by ember") && !out.contains("PROVISIONAL"),
-        "{out}"
-    );
-    let (json, _) = w.cv_ok(&["task", "show", &d, "--json"]);
-    let t: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(t["decision"]["resolution"]["choice"], "move to NVMe");
-    assert!(t["decision"]["resolution"].get("provisional").is_none(), "{json}");
-    assert_eq!(t["decision"]["superseded_provisional"]["provisional"], true, "{json}");
-    let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
-    assert!(
-        out.contains("(inbox empty for ember)") || !out.contains("made for you"),
-        "{out}"
-    );
-    // A second answer is refused as it always was.
-    let (_, err) = w.cv_fails(&["task", "resolve", &d, "--accept-default", "--from", "ember"]);
-    assert!(err.contains("cannot apply resolved"), "{err}");
-
-    // Confirm through the page.
-    let (out, _) = w.cv_ok(&[
-        "task",
-        "decide",
-        "Q3",
-        "--for",
-        "ember",
-        "--default",
-        "x",
-        "--option",
-        "y",
-        "--provisional",
-        "--from",
-        "orchestrator:o",
-    ]);
-    let d3 = opened_task_id(&out);
-    let (mut child, addr) = serve(&w, "ember");
-    let result = std::panic::catch_unwind(|| {
-        let (status, body) = http(&addr, "GET", "/api/inbox?who=ember", None);
-        assert_eq!(status, 200, "{body}");
-        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(page["counts"]["provisional"], 1, "{body}");
-        assert_eq!(page["counts"]["decisions"], 1, "Q2 is still owed; Q3 is not: {body}");
-        let made: Vec<&serde_json::Value> = page["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|i| i["reason"] == "provisional")
-            .collect();
-        assert_eq!(made.len(), 1, "{body}");
-        assert_eq!(made[0]["title"], "Q3");
-        let (status, body) = http(
-            &addr,
-            "POST",
-            &format!("/api/task/{d3}/resolve"),
-            Some(r#"{"confirm":true}"#),
-        );
-        assert_eq!(status, 200, "{body}");
-    });
-    let _ = child.kill();
-    let _ = child.wait();
-    if let Err(e) = result {
-        std::panic::resume_unwind(e);
-    }
-    let (json, _) = w.cv_ok(&["task", "show", &d3, "--json"]);
-    let t: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(t["decision"]["resolution"]["by"], "web:ember");
-    assert_eq!(t["decision"]["resolution"]["choice"], "x");
-    assert_eq!(t["decision"]["superseded_provisional"]["by"], "orchestrator:o");
-}
-
 // ───────────────────────────── tools --timeline → cat ─────────────────────────────
 
 /// Every timeline entry carries its call's id, and that id is what `cv cat` takes: on screen and
@@ -3318,6 +3173,40 @@ fn timeline_ids_reach_cat() {
     assert!(reads.iter().all(|event| event["tool"] == "Read"));
     let (_, error) = w.cv_fails(&["tools", "alphasess", "--timeline", "--workflow", "absent"]);
     assert!(error.contains("no workflow"), "{error}");
+
+    // One `--agent` grammar on every view: an exact id, else a unique prefix; several matches or
+    // none exit 2 and list the candidates, like a session id.
+    let twin = serde_json::json!([{"type":"tool_use","id":"twin-read","name":"Read","input":{"file_path":"t.rs"}}]);
+    fs::write(
+        w.proj
+            .join("alphasess/subagents/workflows/wf_first/agent-first-twin.jsonl"),
+        cv_testkit::jsonl(&[assistant_line("first-twin", "2026-01-03T10:00:00Z", twin)]),
+    )
+    .unwrap();
+    for extra in [&["--json"][..], &["--timeline", "--json"][..]] {
+        let mut args = vec!["tools", "alphasess", "--agent", "first"];
+        args.extend_from_slice(extra);
+        let (_, code, _, error) = w.cv(&args);
+        assert_eq!(code, 2, "{args:?}: {error}");
+        assert!(error.contains("first-agent") && error.contains("first-twin"), "{error}");
+        let mut args = vec!["tools", "alphasess", "--agent", "first-a"];
+        args.extend_from_slice(extra);
+        w.cv_ok(&args);
+        let mut args = vec!["tools", "alphasess", "--agent", "nobody"];
+        args.extend_from_slice(extra);
+        let (_, code, _, error) = w.cv(&args);
+        assert_eq!(code, 2, "{args:?}: {error}");
+    }
+
+    // Two views are not silently collapsed into one.
+    for args in [
+        &["tools", "alphasess", "--agent", "first-agent", "--tool", "Edit"][..],
+        &["tools", "alphasess", "--across", "--agent", "first-agent"][..],
+        &["tools", "alphasess", "--across", "--timeline"][..],
+    ] {
+        let (_, code, _, error) = w.cv(args);
+        assert_eq!(code, 2, "{args:?}: {error}");
+    }
 }
 
 #[test]
@@ -3326,7 +3215,7 @@ fn doctor_labels_payload_estimates_and_recorded_usage_without_changing_accountin
     w.write_session(
         "accounting",
         &[
-            user_line("u", "2026-01-01T10:00:00Z", "hello"),
+            user_line("accounting", "u", "2026-01-01T10:00:00Z", "hello"),
             claude::with(
                 assistant_line(
                     "a",
@@ -3372,7 +3261,12 @@ fn prune_child_id_and_path_select_child_and_emit_discoverable_standalone() {
     let w = World::new("prune-child-source");
     let parent = w.write_session(
         "prune-parent",
-        &[user_line("parent-u", "2026-01-01T00:00:00Z", "parent-only")],
+        &[user_line(
+            "prune-parent",
+            "parent-u",
+            "2026-01-01T00:00:00Z",
+            "parent-only",
+        )],
     );
     let child_dir = parent.parent().unwrap().join("prune-parent/subagents");
     fs::create_dir_all(&child_dir).unwrap();
@@ -3467,7 +3361,7 @@ fn splice_rejects_invalid_exports_before_source_reads_or_generation() {
 fn claude_portable_rewind_and_port_handle_proxy_records() {
     let w = World::new("claude-portable-proxy");
     let ids = ["Bash:0#hex", "Bash_0_hex", "cv_tool_0", "Bash#0:hex"];
-    let mut rows = vec![user_line("u", "2026-01-01T00:00:00Z", "continue")];
+    let mut rows = vec![user_line("prune-parent", "u", "2026-01-01T00:00:00Z", "continue")];
     for (index, model) in [Some("gpt-6.1-sol"), Some("claude-proxy"), None]
         .into_iter()
         .enumerate()
@@ -3582,7 +3476,7 @@ fn claude_rewind_and_port_default_to_native_for_genuine_claude_sessions() {
         serde_json::json!({"type":"thinking","thinking":"","signature":"sig-a"}),
         serde_json::json!({"type":"thinking","thinking":"plan","signature":"sig-b"}),
     ];
-    let mut rows = vec![user_line("u", "2026-01-01T00:00:00Z", "continue")];
+    let mut rows = vec![user_line("proxy-source", "u", "2026-01-01T00:00:00Z", "continue")];
     for (index, block) in thinking.iter().enumerate() {
         let parent = if index == 0 {
             "u".to_string()
@@ -3656,4 +3550,487 @@ fn claude_rewind_and_port_default_to_native_for_genuine_claude_sessions() {
         }
     }
     assert_eq!(signatures, ["sig-a", "sig-b"]);
+}
+
+/// A writer appending to a session while `cv` reads it is the normal state of a live transcript:
+/// `show` and `doctor` read the prefix they captured, and listing keeps the session.
+#[test]
+fn show_and_doctor_read_a_session_its_writer_is_appending_to() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let w = World::new("live-writer");
+    let turn = |i: usize| {
+        let ts = format!("2026-01-01T10:{:02}:{:02}Z", (i / 60) % 60, i % 60);
+        [
+            user_line(
+                "livesess",
+                &format!("u{i}"),
+                &ts,
+                &format!("prompt {i} {}", "context ".repeat(600)),
+            ),
+            assistant_line(
+                &format!("a{i}"),
+                &ts,
+                serde_json::json!([{"type": "text", "text": format!("reply {i} {}", "detail ".repeat(600))}]),
+            ),
+        ]
+    };
+    let path = w.write_session("livesess", &(0..300).flat_map(turn).collect::<Vec<_>>());
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            for i in 300.. {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                for line in turn(i) {
+                    // Two writes: readers see a partial last line between them.
+                    let line = format!("{line}\n");
+                    let (head, tail) = line.split_at(line.len() / 2);
+                    file.write_all(head.as_bytes()).unwrap();
+                    file.write_all(tail.as_bytes()).unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        // Stops the writer however this closure exits, so a failed assertion cannot hang the scope.
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _stop = Stop(&stop);
+        for _ in 0..3 {
+            let (prompts, _) = w.cv_ok(&["show", "livesess", "--kind", "prompt"]);
+            assert!(prompts.contains("prompt 299 "), "the captured prefix is shown");
+            w.cv_ok(&["doctor", "livesess"]);
+            let (rows, _) = w.cv_ok(&["ls", "--json"]);
+            assert!(rows.contains("\"livesess\""), "{rows}");
+        }
+    });
+}
+
+/// An unreadable persisted output fails the whole session's publication; repair retries it.
+#[test]
+fn index_json_rejects_unreadable_tool_output_and_retries_after_repair() {
+    let w = World::new("index-unreadable-output");
+    let output = w.base.join("elsewhere").join("tool-results").join("big.txt");
+    fs::create_dir_all(&output).unwrap(); // Deterministic failed read, including as root.
+    let stub = format!(
+        "<persisted-output>\nOutput too large (66KB). Full output saved to: {}\n\nPreview (first 2KB):\nzqpreview\n</persisted-output>",
+        output.display()
+    );
+    w.write_session(
+        "degraded",
+        &[
+            user_line("degraded", "u1", "2026-01-01T10:00:00Z", "run the big command"),
+            claude::tool_result("u2", "2026-01-01T10:01:00Z", "t1", &stub),
+        ],
+    );
+    let (stdout, error) = w.cv_fails(&["index", "--json", "--strict"]);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        error.contains("degraded") && error.contains(output.to_str().unwrap()),
+        "{error}"
+    );
+    fs::remove_dir(&output).unwrap();
+    fs::write(&output, "zqrestored").unwrap();
+    let (json, _) = w.cv_ok(&["index", "--json", "--strict"]);
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(report["indexed"], 1, "{report}");
+    assert_eq!(report["errors"], 0, "{report}");
+    let (hits, _) = w.cv_ok(&["search", "zqrestored"]);
+    assert!(hits.contains("degraded"), "{hits}");
+}
+
+/// The skip policy's second channel, under an injected failure: a project directory cv cannot
+/// read hides its sessions, and `cv doctor` names it (INTERFACE-V2 §8: the store has bytes, the
+/// listing has zero), while a healthy store records nothing.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_project_dir_is_named_by_doctor_not_silently_empty() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::new("skipped-source-doctor");
+    w.write_session("visible", &[user_line("visible", "u", "2026-01-01T10:00:00Z", "hello")]);
+    let (healthy, _) = w.cv_ok(&["doctor", "visible", "--json"]);
+    let healthy: serde_json::Value = serde_json::from_str(&healthy).unwrap();
+    assert!(healthy.get("skipped_sources").is_none(), "{healthy}");
+
+    let locked = w.home.join(".claude/projects/-work-locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(
+        locked.join("hidden.jsonl"),
+        cv_testkit::jsonl(&[user_line("visible", "h", "2026-01-01T11:00:00Z", "unseen")]),
+    )
+    .unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let denied = fs::read_dir(&locked).is_err();
+    let run = || {
+        let (ls, ls_err) = w.cv_ok(&["ls", "--json", "--fresh"]);
+        let (doctor, _) = w.cv_ok(&["doctor", "visible", "--json"]);
+        let (human, _) = w.cv_ok(&["doctor", "visible"]);
+        (ls, ls_err, doctor, human)
+    };
+    let (ls, ls_err, doctor, human) = run();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    if !denied {
+        return; // a superuser reads through mode 000: there is no failure to inject
+    }
+    assert!(ls.contains("visible") && !ls.contains("hidden"), "{ls}");
+    assert!(ls_err.contains("1 source(s) could not be read"), "{ls_err}");
+    let doctor: serde_json::Value = serde_json::from_str(&doctor).unwrap();
+    let skipped = doctor["skipped_sources"].as_array().expect("the doctor row");
+    assert_eq!(skipped.len(), 1, "{doctor}");
+    assert_eq!(skipped[0]["harness"], "claude");
+    assert_eq!(skipped[0]["path"], locked.to_str().unwrap());
+    assert!(
+        human.contains("Unreadable sources: 1 (the store has bytes, the listing has zero)"),
+        "{human}"
+    );
+
+    // Readable again, the next discovery replaces the row: nothing is skipped.
+    w.cv_ok(&["ls", "--fresh"]);
+    let (doctor, _) = w.cv_ok(&["doctor", "visible", "--json"]);
+    let doctor: serde_json::Value = serde_json::from_str(&doctor).unwrap();
+    assert!(doctor.get("skipped_sources").is_none(), "{doctor}");
+}
+
+/// The skip policy's third channel under an injected failure: a catalog that is not a database
+/// (a truncated or overwritten file) degrades ONCE. Every consumer that opens it in one process
+/// falls back to scanning, the listing is the same, and stderr says so in exactly one line.
+#[test]
+fn a_garbled_catalog_degrades_once_per_process() {
+    let w = World::new("garbled-catalog-warns-once");
+    w.write_session("listed", &[user_line("listed", "u", "2026-01-01T10:00:00Z", "hello")]);
+    let (healthy, healthy_err) = w.cv_ok(&["ls", "--json"]);
+    assert!(!healthy_err.contains("unavailable"), "{healthy_err}");
+    let catalog = w.cv_home.join("catalog.db");
+    for sidecar in ["catalog.db-wal", "catalog.db-shm"] {
+        let _ = fs::remove_file(w.cv_home.join(sidecar));
+    }
+    fs::write(&catalog, b"SQLite format 3\0 truncated").unwrap();
+    let (degraded, err) = w.cv_ok(&["ls", "--json"]);
+    assert_eq!(degraded, healthy, "scanning lists what the catalog listed");
+    let warnings: Vec<_> = err.lines().filter(|l| l.contains("unavailable")).collect();
+    assert_eq!(warnings.len(), 1, "{err}");
+    assert!(
+        warnings[0].starts_with("cv: the catalog unavailable, continuing without it:"),
+        "{err}"
+    );
+}
+
+// Frozen reads are process-level policy: exercise the real CLI and its complete store tree.
+fn frozen_store_snapshot(root: &std::path::Path) -> Vec<(PathBuf, std::time::SystemTime, Vec<u8>)> {
+    let mut out = Vec::new();
+    if root.exists() {
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(frozen_store_snapshot(&path));
+            } else {
+                out.push((
+                    path.clone(),
+                    fs::metadata(&path).unwrap().modified().unwrap(),
+                    fs::read(path).unwrap(),
+                ));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[test]
+fn frozen_show_leaves_unknown_counts_while_default_certifies() {
+    for frozen in [false, true] {
+        let w = World::new("frozen-counts");
+        let dir = w.home.join(".codex/sessions/2026/01/01");
+        fs::create_dir_all(&dir).unwrap();
+        let id = "019a0000-0000-7000-8000-0000000000aa";
+        fs::write(
+            dir.join(format!("rollout-2026-01-01T10-00-00-{id}.jsonl")),
+            cv_testkit::jsonl(&[
+                serde_json::json!({"timestamp": "2026-01-01T10:00:00Z", "type": "session_meta",
+                "payload": {"id": id, "cwd": "/work/proj", "timestamp": "2026-01-01T10:00:00Z"}}),
+                serde_json::json!({"timestamp": "2026-01-01T10:00:01Z", "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}}),
+            ]),
+        )
+        .unwrap();
+        let count = || {
+            let (out, _) = w.cv_ok(&["ls", "--json", "--harness", "codex"]);
+            serde_json::from_str::<serde_json::Value>(&out).unwrap()[0]["message_count"].clone()
+        };
+        assert!(count().is_null());
+        let before = frozen_store_snapshot(&w.cv_home);
+        let mut args = vec!["show", id, "--json"];
+        if frozen {
+            args.push("--frozen");
+        }
+        w.cv_ok(&args);
+        if frozen {
+            assert_eq!(before, frozen_store_snapshot(&w.cv_home));
+        }
+        assert_eq!(
+            count(),
+            if frozen {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(1)
+            }
+        );
+    }
+}
+
+#[test]
+fn frozen_reads_preserve_every_store_and_stream_stale_events() {
+    let w = World::new("frozen-stores");
+    standard_corpus(&w);
+    w.cv_ok(&["index"]);
+    // Prime the usage tables, then change a target so returning stale event rows cannot pass.
+    w.cv_ok(&["stats", "--tokens", "--json"]);
+    let path = w.proj.join("alphasess.jsonl");
+    let body = fs::read_to_string(&path)
+        .unwrap()
+        .replace("widget.rs", "frozen-refresh.rs");
+    fs::write(path, body).unwrap();
+    let before = frozen_store_snapshot(&w.cv_home);
+    assert!(before.iter().any(|(p, _, _)| p.ends_with("catalog.db")));
+    for args in [
+        vec!["ls", "--json", "--fresh"],
+        vec!["show", "alphasess", "--json"],
+        vec!["events", "alphasess", "--json"],
+        vec!["events", "alphasess", "--kind", "file_edit", "--json"],
+        vec!["search", "zebrafish", "--json"],
+        vec!["search", "zebrafish", "--scan", "--json"],
+        vec!["stats", "--json"],
+        vec!["stats", "--tokens", "--json"],
+    ] {
+        let mut frozen = vec!["--frozen"];
+        frozen.extend_from_slice(&args);
+        let (out, _) = w.cv_ok(&frozen);
+        assert_eq!(before, frozen_store_snapshot(&w.cv_home), "{args:?}");
+        if args[0] == "events" {
+            let rows: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
+            assert!(!rows.is_empty(), "stale events must stream: {out}");
+            assert_eq!(rows[0]["target"], "/work/proj/src/frozen-refresh.rs", "{out}");
+        }
+    }
+    let (frozen, _) = w.cv_ok(&["events", "alphasess", "--json", "--frozen"]);
+    let (ordinary, _) = w.cv_ok(&["events", "alphasess", "--json"]);
+    assert_eq!(frozen, ordinary);
+    // Fresh catalog rows remain readable under the flag, too.
+    assert_eq!(ordinary, w.cv_ok(&["--frozen", "events", "alphasess", "--json"]).0);
+}
+
+#[test]
+fn frozen_env_and_cold_home_never_create_stores() {
+    let w = World::new("frozen-cold");
+    standard_corpus(&w);
+    let cold = w.cv_home.join("absent");
+    let env = [("CV_FROZEN", "1"), ("CLUSTERVISION_HOME", cold.to_str().unwrap())];
+    for args in [
+        vec!["ls", "--json"],
+        vec!["show", "alphasess", "--json"],
+        vec!["events", "alphasess", "--json"],
+        vec!["search", "zebrafish", "--scan"],
+        vec!["stats", "--tokens", "--json"],
+    ] {
+        let (ok, _, out, err) = w.cv_env(&args, &env);
+        assert!(ok, "{args:?}: {out} {err}");
+        assert!(!cold.exists(), "{args:?} created the catalog directory");
+    }
+}
+
+#[test]
+fn frozen_writer_commands_exit_two_before_resolving_or_writing() {
+    let w = World::new("frozen-writers");
+    let before = frozen_store_snapshot(&w.cv_home);
+    for args in [
+        vec!["index"],
+        vec!["hooks", "install"],
+        vec!["hooks", "remove"],
+        vec!["prune", "missing"],
+        vec!["rewind", "missing", "--at", "0"],
+        vec!["adopt", "missing"],
+        vec!["port", "missing", "--harness", "claude"],
+        vec!["task", "list"],
+        vec!["archive", "sync"],
+        vec!["watch"],
+        vec!["config", "--add-export", "/absent"],
+    ] {
+        let mut frozen = vec!["--frozen"];
+        frozen.extend_from_slice(&args);
+        let (ok, code, _, err) = w.cv(&frozen);
+        assert!(
+            !ok && code == 2 && err.contains("--frozen") && err.contains("writes"),
+            "{args:?}: {code} {err}"
+        );
+        assert_eq!(before, frozen_store_snapshot(&w.cv_home));
+    }
+    let (ok, code, _, err) = w.cv_env(&["index"], &[("CV_FROZEN", "1")]);
+    assert!(!ok && code == 2 && err.contains("--frozen"), "{err}");
+    w.cv_ok(&["ls", "--frozen", "--json"]);
+    w.cv_ok(&["hooks", "show", "--frozen", "--json"]);
+}
+
+#[test]
+fn frozen_events_match_catalog_order_and_keep_every_event() {
+    let w = World::new("frozen-event-order");
+    w.write_session("eventorder", &[
+        user_line("eventorder", "u1", "2026-01-01T10:00:00Z", "fix it"),
+        assistant_line("a1", "2026-01-01T10:00:01Z", serde_json::json!([
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/work/a"}},
+            {"type": "tool_use", "id": "t2", "name": "Edit", "input": {"file_path": "/work/a", "old_string": "a", "new_string": "b"}},
+            {"type": "tool_use", "id": "t3", "name": "Edit", "input": {"file_path": "/work/a", "old_string": "b", "new_string": "c"}},
+            {"type": "tool_use", "id": "t4", "name": "Bash", "input": {"command": "true"}}
+        ])),
+    ]);
+    let (frozen, _) = w.cv_ok(&["--frozen", "events", "eventorder", "--json"]);
+    let (ordinary, _) = w.cv_ok(&["events", "eventorder", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&ordinary).unwrap();
+    // Both edits of /work/a are rows: no dedup on (message, kind, target).
+    assert_eq!(rows.len(), 4, "{ordinary}");
+    assert_eq!(frozen, ordinary);
+}
+
+#[test]
+fn frozen_catalog_does_not_migrate_or_touch_live_wal() {
+    let w = World::new("frozen-catalog-open");
+    standard_corpus(&w);
+    w.cv_ok(&["ls", "--json"]);
+    let conn = rusqlite::Connection::open(w.cv_home.join("catalog.db")).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; CREATE TABLE frozen_probe(value); INSERT INTO frozen_probe VALUES(1);",
+    )
+    .unwrap();
+    let before = frozen_store_snapshot(&w.cv_home);
+    w.cv_ok(&["--frozen", "ls", "--json"]);
+    let (events, _) = w.cv_ok(&["--frozen", "events", "alphasess", "--json"]);
+    assert!(events.contains("file_edit"), "{events}");
+    assert_eq!(before, frozen_store_snapshot(&w.cv_home));
+    // A catalog of an older interpretation must not be upgraded by a frozen read.
+    conn.execute_batch("UPDATE catalog_meta SET value='0' WHERE key='discovery_version';")
+        .unwrap();
+    drop(conn);
+    let before = frozen_store_snapshot(&w.cv_home);
+    w.cv_ok(&["--frozen", "ls", "--json"]);
+    w.cv_ok(&["--frozen", "events", "alphasess", "--json"]);
+    assert_eq!(before, frozen_store_snapshot(&w.cv_home));
+}
+
+#[test]
+fn archive_ls_names_each_skipped_catalog_line() {
+    let w = World::new("archive-corrupt-catalog");
+    fs::write(w.cv_home.join("catalog.jsonl"), "\n{broken\n").unwrap();
+    let (_, error) = w.cv_ok(&["archive", "ls"]);
+    assert!(error.contains("skipping corrupt catalog line 2"), "{error}");
+}
+
+/// The policy reaches all three reshape doors and must not mistake legacy command files for
+/// deleted skills. JSON and provenance at the default keep their existing shape.
+#[test]
+fn cli_skills_policy_on_prune_rewind_and_port() {
+    use serde_json::{json, Value};
+    let w = World::new("skills-policy");
+    let commands = w.home.join(".claude/commands/a");
+    fs::create_dir_all(&commands).unwrap();
+    fs::write(
+        commands.join("b.md"),
+        "---\ndescription: current command\n---\n\nCurrent command.\n",
+    )
+    .unwrap();
+    let source = w.write_session("skills-source", &[
+        user_line("skills-source", "u", "2026-01-01T00:00:00Z", "continue"),
+        json!({"type":"attachment", "uuid":"r", "parentUuid":"u", "isSidechain":false,
+            "cwd":"/work/proj", "attachment":{"type":"invoked_skills", "skills":[
+                {"name":"a:b", "path":"userSettings:a:b", "content":"Base directory for this skill: /skills/a:b\n\nCurrent command."},
+                {"name":"gone", "path":"userSettings:gone", "content":"Gone."}
+            ]}, "rendered":[{"content":"Old restored text"}], "renderedRole":"system"}),
+        claude::with(user_line("skills-source", "u2", "2026-01-01T00:01:00Z", "next"), json!({"parentUuid":"r"})),
+    ]);
+    let before = fs::read(&source).unwrap();
+    for command in ["prune", "rewind", "port"] {
+        for policy in ["keep", "drop-stale", "drop"] {
+            let out = w.base.join(format!("{command}-{policy}"));
+            let new_id = format!("derived-{command}-{policy}");
+            let mut args = vec![command, "claude:skills-source", "--skills", policy];
+            if command == "prune" {
+                args.extend(["--to", &new_id, "--json"]);
+            } else {
+                args.extend(["--out", out.to_str().unwrap(), "--thinking", "native"]);
+                if command == "rewind" {
+                    args.extend(["--to", &new_id, "--full", "--json"]);
+                } else {
+                    args.push("--no-context");
+                }
+            }
+            if command != "port" && policy != "keep" {
+                let mut dry = args.clone();
+                dry.push("--dry-run");
+                let (stdout, _) = w.cv_ok(&dry);
+                let report: Value = serde_json::from_str(&stdout).unwrap();
+                assert!(report["dry_run"].as_bool().unwrap());
+                assert!(report["new_path"].is_null());
+                assert_eq!(report["skills"]["dropped"], if policy == "drop" { 2 } else { 1 });
+            }
+            let (stdout, _) = w.cv_ok(&args);
+            let output = if command == "port" {
+                // This fixture has one cwd and port writes one project subdirectory.
+                let project = fs::read_dir(&out).unwrap().next().unwrap().unwrap().path();
+                fs::read_dir(project)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+                    .unwrap()
+            } else {
+                let report: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(report.get("skills").is_some(), policy != "keep");
+                if policy != "keep" {
+                    assert_eq!(report["skills"]["dropped"], if policy == "drop" { 2 } else { 1 });
+                }
+                if command == "rewind" {
+                    let receipt: Value =
+                        serde_json::from_slice(&fs::read(report["provenance_path"].as_str().unwrap()).unwrap())
+                            .unwrap();
+                    assert_eq!(receipt.get("skills").is_some(), policy != "keep");
+                }
+                PathBuf::from(report["new_path"].as_str().unwrap())
+            };
+            let records: Vec<Value> = fs::read_to_string(output)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let restored = records
+                .iter()
+                .find(|r| r.pointer("/attachment/type") == Some(&json!("invoked_skills")))
+                .unwrap();
+            let names: Vec<_> = restored["attachment"]["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                names,
+                match policy {
+                    "keep" => vec!["a:b", "gone"],
+                    "drop-stale" => vec!["a:b"],
+                    _ => vec![],
+                }
+            );
+            assert_eq!(restored.get("rendered").is_some(), policy == "keep");
+        }
+    }
+    assert_eq!(fs::read(source).unwrap(), before);
+    for command in ["prune", "rewind", "port"] {
+        let (_, code, _, _) = w.cv(&[command, "claude:skills-source", "--skills", "invalid"]);
+        assert_eq!(code, 2);
+    }
+    let (_, code, _, error) = w.cv(&["port", "claude:skills-source", "--harness", "codex", "--skills", "drop"]);
+    assert_eq!(code, 2);
+    assert!(error.contains("requires a Claude target"));
 }

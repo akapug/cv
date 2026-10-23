@@ -28,12 +28,26 @@
         "StructuredOutput"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1,
         "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "StructuredOutput": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -76,12 +90,33 @@
         "ExitWorktree"
       ],
       "usage_messages": 4,
+      "model_messages": 4,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1,
         "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "EnterWorktree": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "ExitWorktree": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -124,6 +159,7 @@
         "Agent"
       ],
       "usage_messages": 6,
+      "model_messages": 6,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 1,
@@ -132,6 +168,19 @@
         "hook/output": 3,
         "subagent_return/return": 1,
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "Agent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -157,10 +206,16 @@
           },
           "tools": [],
           "usage_messages": 2,
+          "model_messages": 2,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
           "lineage": {
             "parent": "491559c8-a17d-4944-b591-a5b247edfd74",
             "spawned_by_tool_use": "call_6d828690c97b40249a63b93b"
@@ -211,6 +266,7 @@
         "TaskList"
       ],
       "usage_messages": 6,
+      "model_messages": 6,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -221,6 +277,33 @@
         "plan/read": 1,
         "plan/state": 1,
         "plan/update": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "TaskCreate": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "TaskList": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "TaskUpdate": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 4,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -276,12 +359,33 @@
         "mcp__corpus__add"
       ],
       "usage_messages": 9,
+      "model_messages": 9,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1,
         "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "ToolSearch": {
+            "calls": 4,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "mcp__corpus__add": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 5,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -318,12 +422,26 @@
         "WebFetch"
       ],
       "usage_messages": 3,
+      "model_messages": 3,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1,
         "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "WebFetch": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -360,6 +478,7 @@
         "Bash"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -367,6 +486,19 @@
         "approval/deny": 1,
         "approval/state": 1,
         "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "Bash": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 1
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -407,6 +539,7 @@
         "Bash"
       ],
       "usage_messages": 4,
+      "model_messages": 4,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -415,6 +548,19 @@
         "background_job/complete": 1,
         "background_job/start": 1,
         "hook/output": 3
+      },
+      "tool_histogram": {
+        "tools": {
+          "Bash": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -459,12 +605,26 @@
         "Read"
       ],
       "usage_messages": 6,
+      "model_messages": 6,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1,
         "hook/output": 3
+      },
+      "tool_histogram": {
+        "tools": {
+          "Read": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 1,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -563,6 +723,7 @@
         "NotebookEdit"
       ],
       "usage_messages": 21,
+      "model_messages": 21,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -571,6 +732,47 @@
         "approval/state": 1,
         "checkpoint/state": 1,
         "hook/output": 7
+      },
+      "tool_histogram": {
+        "tools": {
+          "Bash": {
+            "calls": 4,
+            "edits": 0,
+            "reads": 0,
+            "commands": 4,
+            "errors": 0
+          },
+          "Edit": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "NotebookEdit": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "Read": {
+            "calls": 4,
+            "edits": 0,
+            "reads": 4,
+            "commands": 0,
+            "errors": 0
+          },
+          "Write": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 11,
+        "total_errors": 2
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -634,6 +836,7 @@
         "SendMessage"
       ],
       "usage_messages": 15,
+      "model_messages": 15,
       "compaction_boundaries": [],
       "subagent_spawns": 2,
       "subagent_returns": 3,
@@ -642,6 +845,26 @@
         "hook/output": 6,
         "subagent_return/return": 3,
         "subagent_spawn/spawn": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "Agent": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "SendMessage": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 3,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -675,10 +898,24 @@
             "Read"
           ],
           "usage_messages": 3,
+          "model_messages": 3,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {},
+          "tool_histogram": {
+            "tools": {
+              "Read": {
+                "calls": 1,
+                "edits": 0,
+                "reads": 1,
+                "commands": 0,
+                "errors": 0
+              }
+            },
+            "total_calls": 1,
+            "total_errors": 0
+          },
           "lineage": {
             "parent": "94f6ae0a-e4a9-4668-99dd-e43bd58d1484",
             "spawned_by_tool_use": "call_1ceaff5e8c954cc183237f3c"
@@ -709,10 +946,16 @@
           },
           "tools": [],
           "usage_messages": 4,
+          "model_messages": 4,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
           "lineage": {
             "parent": "94f6ae0a-e4a9-4668-99dd-e43bd58d1484",
             "spawned_by_tool_use": "call_256f96271f954fe68aedec78"
@@ -758,6 +1001,7 @@
       },
       "tools": [],
       "usage_messages": 6,
+      "model_messages": 6,
       "compaction_boundaries": [
         0
       ],
@@ -767,6 +1011,11 @@
         "approval/state": 1,
         "fork/fork": 1,
         "hook/output": 3
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {
         "forked_from": "e3418e9d-2035-4c08-b449-b31d2831ca4e"
@@ -811,6 +1060,7 @@
         "Agent"
       ],
       "usage_messages": 6,
+      "model_messages": 6,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 1,
@@ -819,6 +1069,19 @@
         "hook/output": 3,
         "subagent_return/return": 1,
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "Agent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -844,10 +1107,16 @@
           },
           "tools": [],
           "usage_messages": 2,
+          "model_messages": 2,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
           "lineage": {
             "parent": "b6031422-389e-4ede-97c6-588200bd450f",
             "spawned_by_tool_use": "call_5803e8aed8e14f27917529a9"
@@ -881,12 +1150,18 @@
       },
       "tools": [],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1,
         "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -944,6 +1219,7 @@
       },
       "tools": [],
       "usage_messages": 8,
+      "model_messages": 8,
       "compaction_boundaries": [
         22
       ],
@@ -952,6 +1228,11 @@
       "affordances": {
         "approval/state": 1,
         "hook/output": 6
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -1009,6 +1290,7 @@
         "ScheduleWakeup"
       ],
       "usage_messages": 10,
+      "model_messages": 10,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -1019,6 +1301,40 @@
         "schedule/delete": 1,
         "schedule/fire": 1,
         "schedule/list": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "CronCreate": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "CronDelete": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "CronList": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "ScheduleWakeup": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 5,
+        "total_errors": 1
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -1062,13 +1378,27 @@
         "Skill"
       ],
       "usage_messages": 5,
+      "model_messages": 5,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1,
         "hook/output": 3,
-        "skill/load": 1
+        "skill/load": 2
+      },
+      "tool_histogram": {
+        "tools": {
+          "Skill": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -1110,6 +1440,7 @@
         "Workflow"
       ],
       "usage_messages": 6,
+      "model_messages": 6,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 1,
@@ -1118,6 +1449,19 @@
         "hook/output": 3,
         "subagent_return/return": 1,
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "Workflow": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -1143,10 +1487,16 @@
           },
           "tools": [],
           "usage_messages": 2,
+          "model_messages": 2,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
           "lineage": {
             "parent": "fc2a257c-05d1-422a-813e-c446155d90b4"
           },
@@ -1173,10 +1523,16 @@
           },
           "tools": [],
           "usage_messages": 2,
+          "model_messages": 2,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
           "lineage": {
             "parent": "fc2a257c-05d1-422a-813e-c446155d90b4"
           },

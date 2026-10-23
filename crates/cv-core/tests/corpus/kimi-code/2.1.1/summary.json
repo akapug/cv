@@ -12,11 +12,17 @@
       },
       "tools": [],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "approval/state": 1
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "__kimi_env_model__",
@@ -47,6 +53,7 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -54,6 +61,11 @@
         "approval/state": 1,
         "branch/branch": 1,
         "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "__kimi_env_model__",
@@ -84,6 +96,7 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -92,6 +105,11 @@
         "branch/branch": 1,
         "fork/fork": 1,
         "hook/output": 2
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {
         "forked_from": "394727b0-b9f3-48a8-ba09-db98727c722d"
@@ -251,7 +269,7 @@
         "assistant/reply"
       ],
       "blocks": {
-        "text": 94,
+        "text": 93,
         "thinking": 16,
         "tool_result": 26,
         "tool_use": 26
@@ -285,6 +303,7 @@
         "AgentSwarm"
       ],
       "usage_messages": 44,
+      "model_messages": 44,
       "compaction_boundaries": [
         135
       ],
@@ -301,6 +320,7 @@
         "hook/output": 19,
         "plan/enter": 1,
         "plan/exit": 1,
+        "plan/state": 1,
         "plan/write": 2,
         "schedule/create": 1,
         "schedule/delete": 1,
@@ -308,6 +328,145 @@
         "skill/load": 2,
         "subagent_return/return": 3,
         "subagent_spawn/spawn": 3
+      },
+      "tool_histogram": {
+        "tools": {
+          "Agent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "AgentSwarm": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "Bash": {
+            "calls": 4,
+            "edits": 0,
+            "reads": 0,
+            "commands": 4,
+            "errors": 1
+          },
+          "CreateGoal": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "CronCreate": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "CronDelete": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "CronList": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "Edit": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "EnterPlanMode": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "ExitPlanMode": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "FetchURL": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "Glob": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "Read": {
+            "calls": 4,
+            "edits": 0,
+            "reads": 4,
+            "commands": 0,
+            "errors": 1
+          },
+          "Skill": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "TaskOutput": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "TodoList": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "UpdateGoal": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "Write": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "mcp__corpus__add": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 26,
+        "total_errors": 2
       },
       "lineage": {},
       "model": "__kimi_env_model__",
@@ -330,11 +489,17 @@
           },
           "tools": [],
           "usage_messages": 1,
+          "model_messages": 1,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {
             "approval/state": 1
+          },
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
           },
           "lineage": {
             "parent": "de6f5485-ae7f-4f68-821e-230bdde5dc56",
@@ -360,11 +525,17 @@
           },
           "tools": [],
           "usage_messages": 1,
+          "model_messages": 1,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {
             "approval/state": 1
+          },
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
           },
           "lineage": {
             "parent": "de6f5485-ae7f-4f68-821e-230bdde5dc56",
@@ -390,11 +561,17 @@
           },
           "tools": [],
           "usage_messages": 1,
+          "model_messages": 1,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {
             "approval/state": 1
+          },
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
           },
           "lineage": {
             "parent": "de6f5485-ae7f-4f68-821e-230bdde5dc56",

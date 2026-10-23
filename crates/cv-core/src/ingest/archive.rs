@@ -5,12 +5,14 @@ use std::io::{Read, Seek};
 /// Bound actual decoded content, including archives whose size headers are forged.
 #[derive(Clone, Copy)]
 pub struct Limits {
+    pub entries: usize,
     pub entry_bytes: u64,
     pub total_bytes: u64,
 }
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            entries: 10_000,
             entry_bytes: 256 * 1024 * 1024,
             total_bytes: 512 * 1024 * 1024,
         }
@@ -22,6 +24,12 @@ impl Default for Limits {
 /// the upload instead of quietly omitting transcript history or required companion files.
 pub fn extract(reader: impl Read + Seek, limits: Limits) -> Result<Vec<(String, Vec<u8>)>> {
     let mut archive = zip::ZipArchive::new(reader).context("not a readable zip")?;
+    anyhow::ensure!(
+        archive.len() <= limits.entries,
+        "zip has {} entries, exceeding the extraction limit ({})",
+        archive.len(),
+        limits.entries
+    );
     let mut files = Vec::new();
     let mut total = 0u64;
     for index in 0..archive.len() {
@@ -74,11 +82,24 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
     #[test]
+    fn archive_entry_count_is_bounded_even_for_empty_files() {
+        let bytes = archive(&[("a", b""), ("b", b"")]);
+        let result = extract(
+            Cursor::new(bytes),
+            Limits {
+                entries: 2,
+                ..Limits::default()
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("entries"));
+    }
+    #[test]
     fn nested_entries_and_exact_limits_are_preserved() {
         let bytes = archive(&[("nested/session.jsonl", b"1234"), ("nested/meta.json", b"12")]);
         let extracted = extract(
             Cursor::new(bytes),
             Limits {
+                entries: 10,
                 entry_bytes: 4,
                 total_bytes: 6,
             },
@@ -98,6 +119,7 @@ mod tests {
         assert!(extract(
             Cursor::new(&bytes),
             Limits {
+                entries: 10,
                 entry_bytes: 3,
                 total_bytes: 20
             }
@@ -108,6 +130,7 @@ mod tests {
         assert!(extract(
             Cursor::new(&bytes),
             Limits {
+                entries: 10,
                 entry_bytes: 4,
                 total_bytes: 6
             }
@@ -136,6 +159,7 @@ mod tests {
         assert!(extract(
             Cursor::new(bytes),
             Limits {
+                entries: 10,
                 entry_bytes: 8,
                 total_bytes: 16
             }

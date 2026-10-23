@@ -1,26 +1,23 @@
 use super::*;
+use crate::ir::Harness;
 use serde_json::json;
 
 const SID: &str = "11111111-1111-4111-8111-111111111111";
 const SHA: &str = "63cef473b771e07a2b5060e50373a41a27d54c0e";
 
-/// A temp `projects/`-style dir named the way Claude files sessions launched from `/work/proj`.
-fn tmpdir() -> PathBuf {
-    let d = std::env::temp_dir()
-        .join(format!("cv-rewind-test-{}", uuid::Uuid::new_v4()))
-        .join("-work-proj");
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
-fn cleanup(dir: &Path) {
-    std::fs::remove_dir_all(dir.parent().unwrap()).ok();
-}
-
 fn write_jsonl(path: &Path, lines: &[Value]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let body: String = lines.iter().map(|l| l.to_string() + "\n").collect();
     std::fs::write(path, body).unwrap();
+}
+
+fn append(path: &Path, bytes: &[u8]) {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
 }
 
 fn rec(ty: &str, uuid: &str, parent: Option<&str>, message: Value) -> Value {
@@ -125,6 +122,62 @@ fn sref(path: &Path, id: &str) -> SessionRef {
     r
 }
 
+/// The records a real transcript ends with AFTER its last message — none of them a message, and
+/// none carrying a `uuid`. The measured defect: `cv rewind --full` of a 238-record session wrote
+/// 235, dropping exactly these three shapes.
+fn tail_records() -> Vec<Value> {
+    vec![
+        json!({"type": "bridge-session", "sessionId": SID, "bridgeSessionId": "cse_1", "lastSequenceNum": 0}),
+        json!({"type": "history-suppression", "sessionId": SID, "cause": "env_owner_mismatch", "ts": "2026-10-01T22:25:24.554Z"}),
+        json!({"type": "cost-state", "sessionId": SID, "totalCostUSD": 0, "totalLinesAdded": 0}),
+    ]
+}
+
+/// A prompt, its answer, then the tail above: two messages, five records.
+fn session_tailed(dir: &Path) -> PathBuf {
+    let mut lines = vec![
+        rec("user", "u0", None, text("user", "land the gate fix")),
+        rec("assistant", "a0", Some("u0"), text("assistant", "landed")),
+    ];
+    lines.extend(tail_records());
+    let path = dir.join(format!("{SID}.jsonl"));
+    write_jsonl(&path, &lines);
+    path
+}
+
+/// The synthetic case from the measured evidence (task7336 `critical-tail`): two messages and an
+/// `invoked_skills` attachment record whose `rendered` is a string (so the codec surfaces no
+/// message for it). `cv show` counts 2 messages and stops at the prompt.
+fn session_attachment_tail(dir: &Path) -> PathBuf {
+    session_tailed_attachment_with(dir, false)
+}
+/// [`session_attachment_tail`] plus a trailing record with a `type` claiming a turn and no
+/// `message` body.
+fn session_attachment_and_bad_tail(dir: &Path) -> PathBuf {
+    session_tailed_attachment_with(dir, true)
+}
+fn session_tailed_attachment_with(dir: &Path, bad_tail: bool) -> PathBuf {
+    let mut lines = vec![
+        rec("user", "u0", None, text("user", "go")),
+        rec("assistant", "a0", Some("u0"), text("assistant", "done")),
+        json!({"type": "attachment", "uuid": "at1", "parentUuid": "a0", "sessionId": SID,
+               "cwd": "/work/proj", "isSidechain": false,
+               "attachment": {"type": "invoked_skills", "skills": [
+                   {"name": "fresh", "path": "userSettings:fresh", "content": "the amber key"}]},
+               "rendered": "padding"}),
+    ];
+    if bad_tail {
+        lines.push(json!({"type": "user", "sessionId": SID, "uuid": "bad1"}));
+    }
+    let path = dir.join(format!("{SID}.jsonl"));
+    write_jsonl(&path, &lines);
+    path
+}
+
+fn ty(v: &Value) -> &str {
+    v["type"].as_str().unwrap()
+}
+
 /// The stream index (the `cv show --range` counting) of the message with this uuid.
 fn idx_of(path: &Path, uuid: &str) -> usize {
     let s = crate::harness::claude::parse_str("x", &std::fs::read_to_string(path).unwrap(), Some(path.to_path_buf()));
@@ -143,6 +196,7 @@ fn opts(at: CutAt, out: &Path) -> RewindOptions {
         dry_run: false,
         generator: "cv-test".into(),
         thinking: Some(crate::emit::ThinkingMode::Native),
+        skills_policy: SkillsPolicy::Keep,
     }
 }
 
@@ -181,7 +235,8 @@ fn chain(lines: &[Value]) -> Vec<String> {
 
 #[test]
 fn cut_at_message_index_starts_at_the_last_boundary_before_it() {
-    let dir = tmpdir();
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
     let src = session(&dir);
     let out = dir.join("out");
     let cut = idx_of(&src, "a2");
@@ -218,12 +273,12 @@ fn cut_at_message_index_starts_at_the_last_boundary_before_it() {
     // Out of range is a clear error, not a silent clamp.
     let err = rewind_session(&sref(&src, SID), &opts(CutAt::Message(999), &dir.join("x"))).unwrap_err();
     assert!(err.to_string().contains("message(s)"), "{err}");
-    cleanup(&dir);
 }
 
 #[test]
 fn cut_at_commit_sha_lands_on_the_tool_result_that_made_it() {
-    let dir = tmpdir();
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
     let src = session(&dir);
     let out = dir.join("out");
     // The full sha resolves through the 7-digit `[main 63cef47]` the commit printed — and the
@@ -254,12 +309,12 @@ fn cut_at_commit_sha_lands_on_the_tool_result_that_made_it() {
     let msg = err.to_string();
     assert!(msg.contains("abcdef1234") && msg.contains("git commit"), "{msg}");
     assert!(!none.exists());
-    cleanup(&dir);
 }
 
 #[test]
 fn from_compaction_takes_the_preserved_segment_and_full_takes_everything() {
-    let dir = tmpdir();
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
     let src = session(&dir);
     let out = dir.join("out");
     let cut = idx_of(&src, "a5");
@@ -284,12 +339,365 @@ fn from_compaction_takes_the_preserved_segment_and_full_takes_everything() {
         (1, "full", None)
     );
     assert_eq!(full.lines_written, 16);
-    cleanup(&dir);
+}
+
+/// `CutAt::End` copies bookkeeping after the last message, rewriting its session identity too.
+#[test]
+fn end_copies_the_records_after_the_last_message() {
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = session_tailed(&dir);
+    let before = std::fs::read(&src).unwrap();
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::End, &dir.join("out"))).unwrap();
+
+    let got = read_lines(&res.new_path);
+    assert_eq!(
+        got.iter().map(ty).collect::<Vec<_>>(),
+        [
+            "user",
+            "assistant",
+            "bridge-session",
+            "history-suppression",
+            "cost-state"
+        ]
+    );
+    // The tail is the source's records, restamped and nothing else.
+    assert_eq!(got[2]["bridgeSessionId"], "cse_1");
+    assert_eq!(got[3]["cause"], "env_owner_mismatch");
+    assert_eq!(got[4]["totalCostUSD"], 0);
+    assert!(got
+        .iter()
+        .all(|v| v["sessionId"] == "22222222-2222-4222-8222-222222222222"));
+    // Nothing was left behind: the copy runs to the end of the source as read.
+    assert_eq!((res.cut_line, res.end_line, res.lines_written), (2, 5, 5));
+    assert_eq!((res.omitted_lines, res.omitted_bytes), (0, 0));
+    assert_eq!(std::fs::read(&src).unwrap(), before, "the source must never change");
+}
+
+/// An explicit cut ends at its message record, omitting later bookkeeping.
+#[test]
+fn an_explicit_cut_still_ends_at_its_message_record() {
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = session_tailed(&dir);
+    let cut = idx_of(&src, "a0"); // the last message
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::Message(cut), &dir.join("out"))).unwrap();
+
+    let got = read_lines(&res.new_path);
+    assert_eq!(got.iter().map(ty).collect::<Vec<_>>(), ["user", "assistant"]);
+    assert_eq!((res.cut_line, res.end_line), (2, 2));
+    assert_eq!(res.omitted_lines, 3);
+}
+
+/// A bodyless native user record is bookkeeping and survives a full byte copy.
+#[test]
+fn a_native_copy_carries_a_bodyless_turn_record_verbatim() {
+    // The Claude codec carries a `user` record with no `message` as bookkeeping, so a byte copy
+    // keeps it and the attachment after it rides along to EOF.
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = session_attachment_and_bad_tail(&dir);
+    let out = dir.join("out");
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::End, &out)).unwrap();
+    let copied = std::fs::read_to_string(out.join(format!("{}.jsonl", res.new_id))).unwrap();
+    assert!(copied.contains("\"uuid\":\"bad1\""), "{copied}");
+    assert!(copied.contains("invoked_skills"), "{copied}");
+}
+
+#[test]
+fn a_portable_copy_refuses_a_bodyless_turn_record_instead_of_dropping_it() {
+    // Portable replay re-emits every record through the reader, which takes nothing out of a
+    // bodyless turn: refuse before publishing rather than mint a session missing a record.
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = session_attachment_and_bad_tail(&dir);
+    let before = std::fs::read(&src).unwrap();
+    let out = dir.join("out");
+    let mut o = opts(CutAt::End, &out);
+    o.thinking = Some(crate::emit::ThinkingMode::Portable);
+    let err = rewind_session(&sref(&src, SID), &o).unwrap_err();
+
+    let msg = err.to_string();
+    assert!(msg.contains("line 4"), "{msg}");
+    assert!(msg.contains("`user`") && msg.contains("no `message` body"), "{msg}");
+    assert!(msg.contains("bad1"), "the refusal names the record: {msg}");
+    assert!(msg.contains("without re-emitting"), "{msg}");
+    // Nothing was published, and no staged copy was left behind.
+    assert!(!out.join("22222222-2222-4222-8222-222222222222.jsonl").exists());
+    assert!(!out.join("22222222-2222-4222-8222-222222222222.rewind.json").exists());
+    assert!(std::fs::read_dir(&out)
+        .unwrap()
+        .flatten()
+        .all(|e| !e.file_name().to_string_lossy().contains("rewind")));
+    assert_eq!(std::fs::read(&src).unwrap(), before, "the source is untouched");
+}
+
+#[test]
+fn without_the_unreadable_record_the_attachment_rides_along() {
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = session_attachment_tail(&dir);
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::End, &dir.join("out"))).unwrap();
+
+    let got = read_lines(&res.new_path);
+    assert_eq!(
+        got.iter().map(ty).collect::<Vec<_>>(),
+        ["user", "assistant", "attachment"]
+    );
+    assert_eq!(got[2]["attachment"]["skills"][0]["name"], "fresh");
+    assert_eq!(got[2]["rendered"], "padding");
+    assert_eq!(got[2]["sessionId"], "22222222-2222-4222-8222-222222222222");
+    assert_eq!(res.omitted_lines, 0);
+}
+
+#[test]
+fn end_refuses_invalid_json_tail_in_native_and_staged_copies() {
+    for thinking in [crate::emit::ThinkingMode::Native, crate::emit::ThinkingMode::Portable] {
+        for tail in ["{\"type\":\"cost-state\"", "not-json\n", "{\"type\":}\n", "\u{000c}\n"] {
+            let world = crate::test_world("rewind");
+            let dir = world.proj.clone();
+            let src = session_tailed(&dir);
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&src)
+                .unwrap()
+                .write_all(tail.as_bytes())
+                .unwrap();
+            let before = std::fs::read(&src).unwrap();
+            let out = dir.join("out");
+            let options = RewindOptions {
+                thinking: Some(thinking),
+                ..opts(CutAt::End, &out)
+            };
+            let result = rewind_session(&sref(&src, SID), &options);
+            assert!(result.is_err(), "invalid tail published under {thinking:?}: {tail:?}");
+            assert!(std::fs::read_dir(&out).unwrap().next().is_none());
+            assert_eq!(std::fs::read(&src).unwrap(), before);
+            // A deliberate cut need not validate the bytes it omits.
+            let cut = rewind_session(
+                &sref(&src, SID),
+                &RewindOptions {
+                    at: CutAt::Message(1),
+                    ..options
+                },
+            )
+            .unwrap();
+            assert_eq!(cut.lines_written, 2);
+            assert_eq!(cut.omitted_lines, 4);
+        }
+    }
+}
+
+/// An explicit cut whose message leaves a call open scans on past the cut (`Closing`) for the
+/// result. A malformed line on the way is a future record the cut never meant to copy: it is
+/// omitted, and the result after it still closes the call. The same bytes under `End` sit inside
+/// the copied window and refuse, so the omission is the cut's, not a relaxed parse.
+#[test]
+fn an_explicit_cut_omits_a_malformed_line_while_it_closes_an_open_call() {
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = dir.join(format!("{SID}.jsonl"));
+    write_jsonl(
+        &src,
+        &[
+            rec("user", "u0", None, text("user", "read it")),
+            rec("assistant", "a0", Some("u0"), bash("t1", "cat notes")),
+        ],
+    );
+    let mut tail = b"not-json\n".to_vec();
+    for v in [
+        rec("user", "t1r", Some("a0"), result("t1", "notes")),
+        rec("assistant", "a1", Some("t1r"), text("assistant", "read")),
+    ] {
+        tail.extend(v.to_string().into_bytes());
+        tail.push(b'\n');
+    }
+    append(&src, &tail);
+    let cut = idx_of(&src, "a0");
+
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::Message(cut), &dir.join("out"))).unwrap();
+    assert_eq!(uuids(&read_lines(&res.new_path)), ["u0", "a0", "t1r"]);
+    assert_eq!((res.cut_line, res.end_line), (2, 4));
+    assert_eq!((res.closed_tool_calls, res.open_tool_calls), (1, 0));
+    assert_eq!(res.omitted_lines, 2, "the malformed line and the turn after the close");
+
+    let err = rewind_session(&sref(&src, SID), &opts(CutAt::End, &dir.join("end"))).unwrap_err();
+    assert!(
+        err.to_string().contains("line 3 is not a complete JSON record"),
+        "{err}"
+    );
+}
+
+/// The same, with the call never closed: the scan reaches EOF, the open call is reported, and a
+/// live session's half-written last line (no newline) is omitted rather than refused.
+#[test]
+fn an_explicit_cut_left_open_omits_a_half_written_last_line() {
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = dir.join(format!("{SID}.jsonl"));
+    write_jsonl(
+        &src,
+        &[
+            rec("user", "u0", None, text("user", "read it")),
+            rec("assistant", "a0", Some("u0"), bash("t1", "cat notes")),
+        ],
+    );
+    let cut = idx_of(&src, "a0");
+    append(&src, b"{\"type\":\"user\"");
+    let before = std::fs::read(&src).unwrap();
+
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::Message(cut), &dir.join("out"))).unwrap();
+    assert_eq!(uuids(&read_lines(&res.new_path)), ["u0", "a0"]);
+    assert_eq!((res.closed_tool_calls, res.open_tool_calls), (0, 1));
+    assert_eq!(res.omitted_lines, 1);
+    assert_eq!(std::fs::read(&src).unwrap(), before, "the source must never change");
+}
+
+/// Under `End` the last line of the captured prefix is copied, so a half-written one refuses; with
+/// no newline the session may still be appending it, and the refusal says to rerun before it says
+/// to repair. The same bytes WITH a newline are a finished bad record: no rerun is offered.
+#[test]
+fn end_names_a_rerun_for_an_unterminated_last_line_only() {
+    for (tail, rerun) in [
+        ("{\"type\":\"cost-state\"", true),
+        ("{\"type\":\"cost-state\"\n", false),
+    ] {
+        let world = crate::test_world("rewind");
+        let dir = world.proj.clone();
+        let src = session_tailed(&dir);
+        append(&src, tail.as_bytes());
+        let out = dir.join("out");
+        let msg = rewind_session(&sref(&src, SID), &opts(CutAt::End, &out))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("line 6"), "{msg}");
+        assert_eq!(
+            msg.contains("unterminated") && msg.contains("rerun the rewind"),
+            rerun,
+            "{msg}"
+        );
+        assert_eq!(msg.contains("not a complete JSON record"), !rerun, "{msg}");
+        assert!(std::fs::read_dir(&out).unwrap().next().is_none(), "nothing published");
+    }
+}
+
+#[test]
+fn present_message_body_variants_remain_parser_compatible() {
+    for body in [
+        json!(null),
+        json!(false),
+        json!(7),
+        json!("bad"),
+        json!([]),
+        json!({}),
+        json!({"content": null}),
+        json!({"content": 7}),
+        json!({"content": {}}),
+    ] {
+        for ty in ["user", "assistant"] {
+            let world = crate::test_world("rewind");
+            let dir = world.proj.clone();
+            let src = session_tailed(&dir);
+            let bad = rec(ty, "invalid-body", Some("a0"), body.clone());
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&src)
+                .unwrap()
+                .write_all((bad.to_string() + "\n").as_bytes())
+                .unwrap();
+            let before = std::fs::read(&src).unwrap();
+            let out = dir.join("out");
+            let parsed = crate::harness::claude::parse_str("synthetic", std::str::from_utf8(&before).unwrap(), None);
+            assert_eq!(parsed.messages.len(), 3, "present body produces a message: {body}");
+            let result = rewind_session(&sref(&src, SID), &opts(CutAt::End, &out)).unwrap();
+            assert_eq!(read_lines(&result.new_path)[5]["message"], body);
+            assert_eq!((result.lines_written, result.omitted_lines), (6, 0));
+            assert_eq!(std::fs::read(&src).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn valid_empty_content_and_unknown_tail_survive_all_copy_paths() {
+    for thinking in [crate::emit::ThinkingMode::Native, crate::emit::ThinkingMode::Portable] {
+        let world = crate::test_world("rewind");
+        let dir = world.proj.clone();
+        let src = session_attachment_tail(&dir);
+        let extra = [
+            rec("user", "empty", Some("a0"), json!({"role":"user", "content":[]})),
+            json!({"type":"future-state", "sessionId":SID, "payload":{"untouched":true}}),
+        ];
+        for v in extra {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&src)
+                .unwrap()
+                .write_all((v.to_string() + "\n").as_bytes())
+                .unwrap();
+        }
+        let options = RewindOptions {
+            thinking: Some(thinking),
+            ..opts(CutAt::End, &dir.join("out"))
+        };
+        let res = rewind_session(&sref(&src, SID), &options).unwrap();
+        let got = read_lines(&res.new_path);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[4]["payload"]["untouched"], true);
+        assert_eq!(got[4]["sessionId"], res.new_id);
+        assert_eq!((res.end_line, res.omitted_lines), (5, 0));
+        assert_eq!(got[2]["attachment"]["skills"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn full_changes_start_but_end_still_includes_compacted_tail() {
+    for full in [false, true] {
+        let world = crate::test_world("rewind");
+        let dir = world.proj.clone();
+        let src = session(&dir);
+        for tail in tail_records() {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&src)
+                .unwrap()
+                .write_all((tail.to_string() + "\n").as_bytes())
+                .unwrap();
+        }
+        let res = rewind_session(
+            &sref(&src, SID),
+            &RewindOptions {
+                full,
+                ..opts(CutAt::End, &dir.join("out"))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (res.start_line, res.end_line, res.omitted_lines),
+            (if full { 1 } else { 8 }, 20, 0)
+        );
+        assert_eq!(read_lines(&res.new_path).last().unwrap()["type"], "cost-state");
+    }
+}
+
+#[test]
+fn empty_and_metadata_only_sources_refuse_without_publication() {
+    for body in ["", "\n", "{\"type\":\"cost-state\",\"sessionId\":\"synthetic\"}\n"] {
+        let world = crate::test_world("rewind");
+        let dir = world.proj.clone();
+        let src = dir.join(format!("{SID}.jsonl"));
+        std::fs::write(&src, body).unwrap();
+        let out = dir.join("out");
+        let err = rewind_session(&sref(&src, SID), &opts(CutAt::End, &out)).unwrap_err();
+        assert!(err.to_string().contains("no messages"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(std::fs::read_to_string(src).unwrap(), body);
+    }
 }
 
 #[test]
 fn a_cut_between_parallel_results_runs_on_until_the_calls_close() {
-    let dir = tmpdir();
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
     let src = session(&dir);
     let res = rewind_session(
         &sref(&src, SID),
@@ -303,12 +711,12 @@ fn a_cut_between_parallel_results_runs_on_until_the_calls_close() {
     let got = read_lines(&res.new_path);
     assert_eq!(uuids(&got).last(), Some(&"t2r"));
     assert!(res.warnings.is_empty(), "{:?}", res.warnings);
-    cleanup(&dir);
 }
 
 #[test]
 fn provenance_sidecar_records_source_cut_and_start_and_the_source_is_untouched() {
-    let dir = tmpdir();
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
     let src = session(&dir);
     let before = std::fs::read(&src).unwrap();
     let out = dir.join("out");
@@ -353,12 +761,12 @@ fn provenance_sidecar_records_source_cut_and_start_and_the_source_is_untouched()
     // An existing target is refused, never overwritten.
     let err = rewind_session(&sref(&src, SID), &opts(CutAt::End, &out)).unwrap_err();
     assert!(err.to_string().contains("already exists"), "{err}");
-    cleanup(&dir);
 }
 
 #[test]
 fn subagent_transcript_becomes_a_standalone_resumable_session() {
-    let dir = tmpdir();
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
     let parent = dir.join(format!("{SID}.jsonl"));
     write_jsonl(
         &parent,
@@ -430,12 +838,12 @@ fn subagent_transcript_becomes_a_standalone_resumable_session() {
     )
     .unwrap();
     assert_eq!(short.cut_line, 3);
-    cleanup(&dir);
 }
 
 #[test]
 fn commit_evidence_reports_only_git_proof_of_the_queried_shas() {
-    let dir = tmpdir();
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
     let src = session(&dir);
     let r = sref(&src, SID);
     let ev = commit_evidence(&r, &[SHA.to_string(), "0123456789abcdef".into()]).unwrap();
@@ -444,12 +852,12 @@ fn commit_evidence_reports_only_git_proof_of_the_queried_shas() {
     assert!(ev[0].byte_offset.is_none(), "plain lazy() streams carry no offsets");
     assert!(commit_evidence(&r, &["fedcba9876".into()]).unwrap().is_empty());
     assert!(commit_evidence(&r, &["not-a-sha".into()]).unwrap().is_empty());
-    cleanup(&dir);
 }
 
 #[test]
 fn file_mentions_finds_needles_across_chunk_boundaries() {
-    let dir = tmpdir();
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
     let p = dir.join("big.jsonl");
     // Straddle the 4 MiB read boundary with one needle; put the other at the very end.
     let mut body = vec![b'x'; (4 << 20) - 3];
@@ -461,7 +869,6 @@ fn file_mentions_finds_needles_across_chunk_boundaries() {
         file_mentions(&p, &["abcdef1", "9876543", "1111111"]).unwrap(),
         [true, true, false]
     );
-    cleanup(&dir);
 }
 
 #[test]
@@ -502,7 +909,8 @@ fn git_verbs_classify_created_and_pushed() {
 #[test]
 fn rewind_prefix_receipt_accepts_appends_and_rejects_source_mutations() {
     for mutation in ["append", "rewrite", "replace", "rewrite-grow", "truncate"] {
-        let dir = tmpdir();
+        let world = crate::test_world("rewind");
+        let dir = world.proj.clone();
         let path = dir.join(format!("{SID}.jsonl"));
         let initial = rec("user", "u", None, text("user", "original prefix"));
         write_jsonl(&path, &[initial]);
@@ -564,13 +972,13 @@ fn rewind_prefix_receipt_accepts_appends_and_rejects_source_mutations() {
             .unwrap()
             .flatten()
             .all(|entry| !entry.file_name().to_string_lossy().starts_with(".cv-rewind-")));
-        cleanup(&dir);
     }
 }
 
 #[test]
 fn rewind_rejects_output_ids_that_escape_the_output_directory() {
-    let dir = tmpdir();
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
     let source = dir.join(format!("{SID}.jsonl"));
     write_jsonl(&source, &[rec("user", "u", None, text("user", "original"))]);
     let reference = SessionRef::from_path(&source, Harness::Claude);
@@ -597,5 +1005,286 @@ fn rewind_rejects_output_ids_that_escape_the_output_directory() {
         assert_eq!(std::fs::read(&source).unwrap(), original);
     }
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
-    cleanup(&dir);
+}
+
+#[test]
+fn checked_derivation_preserves_large_results_and_closes_parallel_calls() {
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let path = dir.join(format!("{SID}.jsonl"));
+    let payload = "λ payload\n".repeat(200000);
+    write_jsonl(
+        &path,
+        &[
+            rec("user", "u", None, text("user", "read both")),
+            rec(
+                "assistant",
+                "a",
+                Some("u"),
+                json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"toolu_a","name":"Read","input":{"file_path":"a"}},
+            {"type":"tool_use","id":"toolu_b","name":"Read","input":{"file_path":"b"}}]}),
+            ),
+            rec("user", "r1", Some("a"), result("toolu_a", &payload)),
+            rec("user", "r2", Some("r1"), result("toolu_b", "second")),
+            rec("assistant", "future", Some("r2"), text("assistant", "future")),
+        ],
+    );
+    let original = std::fs::read_to_string(&path).unwrap();
+    let result = rewind_session(
+        &sref(&path, SID),
+        &RewindOptions {
+            full: true,
+            ..opts(CutAt::Message(1), &dir.join("out"))
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        (result.closed_tool_calls, result.open_tool_calls, result.lines_written),
+        (2, 0, 4)
+    );
+    let expected: String = original
+        .lines()
+        .take(4)
+        .map(|line| crate::restamp_line(line, &result.new_id).unwrap() + "\n")
+        .collect();
+    assert_eq!(std::fs::read_to_string(&result.new_path).unwrap(), expected);
+    crate::harness::claude::emit::verify_claude_resumable(&result.new_path, None).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A cut whose call is answered only after the user's next prompt: the copy stops at the prompt,
+/// so the rewind would hold a call its source answers. It is refused before anything is published.
+#[test]
+fn a_cut_that_would_leave_an_answered_call_open_is_refused_and_leaves_nothing() {
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = dir.join(format!("{SID}.jsonl"));
+    write_jsonl(
+        &src,
+        &[
+            rec("user", "u0", None, text("user", "read it")),
+            rec("assistant", "a0", Some("u0"), bash("t1", "cat notes")),
+            rec("user", "u1", Some("a0"), text("user", "never mind")),
+            rec("assistant", "a1", Some("u1"), text("assistant", "stopping")),
+            rec("user", "t1r", Some("a1"), result("t1", "notes")),
+        ],
+    );
+    let out = dir.join("out");
+    let err = rewind_session(&sref(&src, SID), &opts(CutAt::Message(idx_of(&src, "a0")), &out))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tool_use t1 has no tool_result"), "{err}");
+    assert!(err.contains("nothing was written"), "{err}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    // A call its source never answers either (a live session's last) is kept.
+    let live = dir.join("live");
+    write_jsonl(
+        &live.join(format!("{SID}.jsonl")),
+        &[
+            rec("user", "u0", None, text("user", "read it")),
+            rec("assistant", "a0", Some("u0"), bash("t1", "cat notes")),
+        ],
+    );
+    let src = live.join(format!("{SID}.jsonl"));
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::End, &live.join("out"))).unwrap();
+    assert_eq!(uuids(&read_lines(&res.new_path)), ["u0", "a0"]);
+}
+
+/// Claude Code writes each parallel `tool_use` of one response as its own record: a cut at the
+/// first keeps its siblings and runs on to both results, so no answered call is left open.
+#[test]
+fn a_cut_at_one_of_a_responses_parallel_calls_keeps_its_siblings() {
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = dir.join(format!("{SID}.jsonl"));
+    let call = |id: &str| {
+        let mut m = bash(id, "cat notes");
+        m["id"] = json!("msg_1");
+        m
+    };
+    write_jsonl(
+        &src,
+        &[
+            rec("user", "u0", None, text("user", "read both")),
+            rec("assistant", "a0", Some("u0"), call("t1")),
+            rec("assistant", "a1", Some("a0"), call("t2")),
+            rec("user", "t1r", Some("a0"), result("t1", "one")),
+            rec("user", "t2r", Some("a1"), result("t2", "two")),
+            rec("assistant", "a2", Some("t2r"), text("assistant", "both read")),
+        ],
+    );
+    let res = rewind_session(
+        &sref(&src, SID),
+        &opts(CutAt::Message(idx_of(&src, "a0")), &dir.join("out")),
+    )
+    .unwrap();
+    assert_eq!(uuids(&read_lines(&res.new_path)), ["u0", "a0", "a1", "t1r", "t2r"]);
+    assert_eq!((res.closed_tool_calls, res.open_tool_calls), (2, 0));
+    assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+}
+
+/// Past the cut only a result for an open call is copied: a result written before its own call
+/// (Claude Code records them out of order) would leave the copy's leaf pointing at a call the
+/// copy does not hold.
+#[test]
+fn a_result_for_no_open_call_ends_the_copy() {
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = dir.join(format!("{SID}.jsonl"));
+    write_jsonl(
+        &src,
+        &[
+            rec("user", "u0", None, text("user", "read it")),
+            rec(
+                "assistant",
+                "a0",
+                Some("u0"),
+                json!({"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
+                    {"type": "tool_use", "id": "t3", "name": "Bash", "input": {}}]}),
+            ),
+            rec("user", "t1r", Some("a0"), result("t1", "notes")),
+            rec("user", "t2r", Some("a1"), result("t2", "early")),
+            rec("assistant", "a1", Some("t1r"), bash("t2", "cat more")),
+        ],
+    );
+    let res = rewind_session(
+        &sref(&src, SID),
+        &opts(CutAt::Message(idx_of(&src, "a0")), &dir.join("out")),
+    )
+    .unwrap();
+    assert_eq!(uuids(&read_lines(&res.new_path)), ["u0", "a0", "t1r"]);
+    // `t3` is never answered, in the source either.
+    assert_eq!((res.closed_tool_calls, res.open_tool_calls), (1, 1));
+}
+
+/// An empty line is blank: copied verbatim, never an error.
+#[test]
+fn an_empty_line_is_copied_like_any_blank_one() {
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = dir.join(format!("{SID}.jsonl"));
+    write_jsonl(
+        &src,
+        &[
+            rec("user", "u0", None, text("user", "go")),
+            rec("assistant", "a0", Some("u0"), text("assistant", "done")),
+        ],
+    );
+    let body = std::fs::read_to_string(&src).unwrap().replacen('\n', "\n\n", 1);
+    std::fs::write(&src, body).unwrap();
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::End, &dir.join("out"))).unwrap();
+    assert_eq!(std::fs::read_to_string(res.new_path).unwrap().lines().nth(1), Some(""));
+}
+
+// ---------------------------------------------------------------------------
+// task/10455 — the request snapshot is physical evidence, never a tool event
+// ---------------------------------------------------------------------------
+
+/// A top-level `api-request-blob` record embedding a verbatim message, the shape a request
+/// snapshot carries: the same `message.content` blocks a turn has, under a type no turn has.
+fn blob(uuid: &str, message: Value) -> Value {
+    json!({"type": "api-request-blob", "sessionId": SID, "uuid": uuid,
+           "parentUuid": null, "isSidechain": false, "message": message})
+}
+
+fn sidechain_rec(ty: &str, uuid: &str, parent: Option<&str>, message: Value) -> Value {
+    let mut v = rec(ty, uuid, parent, message);
+    v["isSidechain"] = json!(true);
+    v
+}
+
+/// Read `v` the way the rewind pass does (a captured source, so `Facts` has its byte ranges),
+/// then feed it to the tracker.
+fn track(v: &Value, open: &mut HashMap<String, Option<String>>, closed: Option<&mut usize>) {
+    let world = crate::test_world("rewind");
+    let path = world.proj.join("record.jsonl");
+    std::fs::write(&path, v.to_string()).unwrap();
+    let source = crate::json::JsonSource::capture(&path).unwrap();
+    let facts = source
+        .read(
+            crate::json::ReadInput::Range(0, source.len()),
+            crate::json::Validation::Value,
+            |view| Ok(Facts::parse(view)?.0),
+        )
+        .unwrap();
+    track_tool_calls(&facts, open, closed);
+}
+
+fn ids(open: &HashMap<String, Option<String>>) -> Vec<&str> {
+    let mut ids: Vec<&str> = open.keys().map(String::as_str).collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn a_snapshot_replaying_a_closed_use_reopens_nothing() {
+    let mut open = HashMap::new();
+    track(&rec("assistant", "a1", None, bash("toolu_x", "ls")), &mut open, None);
+    track(&rec("user", "r1", Some("a1"), result("toolu_x", "ok")), &mut open, None);
+    track(&blob("snap1", bash("toolu_x", "ls")), &mut open, None);
+    assert!(open.is_empty(), "{open:?}");
+}
+
+#[test]
+fn a_real_assistant_use_after_the_pair_opens_one() {
+    let mut open = HashMap::new();
+    track(&rec("assistant", "a1", None, bash("toolu_x", "ls")), &mut open, None);
+    track(&rec("user", "r1", Some("a1"), result("toolu_x", "ok")), &mut open, None);
+    track(
+        &rec("assistant", "a2", Some("r1"), bash("toolu_y", "pwd")),
+        &mut open,
+        None,
+    );
+    assert_eq!(ids(&open), ["toolu_y"]);
+}
+
+#[test]
+fn a_snapshot_result_neither_closes_nor_counts() {
+    let mut open = HashMap::new();
+    let mut closed = 0usize;
+    track(&rec("assistant", "a1", None, bash("toolu_x", "ls")), &mut open, None);
+    track(&blob("snap1", result("toolu_x", "ok")), &mut open, Some(&mut closed));
+    assert_eq!(ids(&open), ["toolu_x"]);
+    assert_eq!(closed, 0);
+    track(
+        &rec("user", "r1", Some("a1"), result("toolu_x", "ok")),
+        &mut open,
+        Some(&mut closed),
+    );
+    assert!(open.is_empty(), "{open:?}");
+    assert_eq!(closed, 1);
+}
+
+#[test]
+fn a_same_id_snapshot_replay_stays_closed_but_a_real_reissue_reopens() {
+    let mut open = HashMap::new();
+    track(&rec("assistant", "a1", None, bash("toolu_a", "ls")), &mut open, None);
+    track(&rec("user", "r1", Some("a1"), result("toolu_a", "ok")), &mut open, None);
+    track(&blob("snap1", bash("toolu_a", "ls")), &mut open, None);
+    assert!(open.is_empty(), "{open:?}");
+    track(
+        &rec("assistant", "a2", Some("r1"), bash("toolu_a", "ls")),
+        &mut open,
+        None,
+    );
+    assert_eq!(ids(&open), ["toolu_a"]);
+}
+
+#[test]
+fn sidechain_records_still_count_as_conversation() {
+    let mut open = HashMap::new();
+    track(
+        &sidechain_rec("assistant", "a1", None, bash("toolu_s", "ls")),
+        &mut open,
+        None,
+    );
+    assert_eq!(ids(&open), ["toolu_s"]);
+    track(
+        &sidechain_rec("user", "r1", Some("a1"), result("toolu_s", "ok")),
+        &mut open,
+        None,
+    );
+    assert!(open.is_empty(), "{open:?}");
 }

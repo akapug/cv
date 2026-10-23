@@ -7,11 +7,7 @@ use super::*;
 use crate::json::JsonView;
 
 pub(super) fn string(view: Option<JsonView<'_>>) -> Result<Option<String>> {
-    let Some(view) = view else { return Ok(None) };
-    if !view.is_string()? {
-        return Ok(None);
-    }
-    Ok(view.resolve()?.as_str().map(str::to_string))
+    view.map(|view| view.string()).transpose().map(Option::flatten)
 }
 fn boolean(view: Option<JsonView<'_>>) -> Result<Option<bool>> {
     view.map(JsonView::as_bool).transpose().map(Option::flatten)
@@ -150,13 +146,13 @@ fn nonempty(view: Option<JsonView<'_>>, spans: bool) -> Result<Option<crate::Tex
         .filter(|text| !matches!(text, crate::Text::Inline(s) if s.is_empty())))
 }
 
-/// One chain node's `chat_message` as one message. `node` is the node's metadata facts and
+/// One chain node's `chat_message` as one message. `facts` is the node's metadata facts and
 /// `carried` the metadata values its bag keeps; `tools` pairs results with their calls.
 pub(super) fn node(
     chat: JsonView<'_>,
     nid: i64,
     created: i64,
-    node: Option<&NodeFacts>,
+    facts: Option<&NodeFacts>,
     carried: Vec<(&'static str, Value)>,
     tools: &mut HashMap<String, String>,
     spans: bool,
@@ -165,7 +161,7 @@ pub(super) fn node(
     // The message's own metadata object (inside `chat_message`, distinct from the node column).
     let mmeta = chat.get("metadata")?;
     let ext = get(mmeta, "extensions")?;
-    let is_prefix = node.is_some_and(|n| n.is_system_prefix);
+    let is_prefix = facts.is_some_and(|n| n.is_system_prefix);
     let is_user_input = boolean(get(mmeta, "is_user_input")?)?.unwrap_or(false);
     // The lead's brief to a sub-agent is a `user` prompt typed by another agent.
     let is_handoff = boolean(get(ext, "subagent/handoff")?)?.unwrap_or(false);
@@ -184,7 +180,7 @@ pub(super) fn node(
     };
     // Compaction marks the node, whatever the role it copied into (observed live: system nodes
     // carrying `subagent/handoff_history`/`compact/*`/`devin-rs/summary` extension sidecars).
-    if node.is_some_and(|n| n.is_summary) {
+    if facts.is_some_and(|n| n.is_summary) {
         m.kind = MessageKind::CompactionSummary;
     }
 
@@ -242,11 +238,7 @@ pub(super) fn node(
                     cache_creation_tokens: get("cache_creation_tokens")?,
                     ..Default::default()
                 };
-                if u.input_tokens.is_some()
-                    || u.output_tokens.is_some()
-                    || u.cache_read_tokens.is_some()
-                    || u.cache_creation_tokens.is_some()
-                {
+                if !u.is_empty() {
                     m.usage = Some(u);
                 }
             }
@@ -431,12 +423,12 @@ pub(super) fn compaction(view: JsonView<'_>) -> Result<serde_json::Map<String, V
         let scanned = content.for_each_str_chunk(|chunk| {
             scan.push(chunk);
             if scan.ended {
-                return Err(HistoryComplete.into());
+                return Err(crate::stream::Stop.into());
             }
             Ok(())
         });
         if let Err(error) = scanned {
-            if error.downcast_ref::<HistoryComplete>().is_none() {
+            if error.downcast_ref::<crate::stream::Stop>().is_none() {
                 return Err(error);
             }
         }
@@ -448,9 +440,6 @@ pub(super) fn compaction(view: JsonView<'_>) -> Result<serde_json::Map<String, V
     }
     Ok(out)
 }
-#[derive(Debug, thiserror::Error)]
-#[error("history path complete")]
-struct HistoryComplete;
 
 #[derive(Default)]
 struct HistoryPath {

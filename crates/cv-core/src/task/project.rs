@@ -31,9 +31,17 @@ pub struct TaskFilter {
     pub decisions: Option<bool>,
 }
 
-/// The state vocabulary [`TaskFilter::state`] accepts: every [`TaskState`] string, as [`list`]
-/// matches them.
-pub const STATE_VOCABULARY: [&str; 6] = ["open", "claimed", "done", "abandoned", "superseded", "resolved"];
+/// The state vocabulary [`TaskFilter::state`] accepts: every [`TaskState`]'s spelling, in
+/// [`TaskState::ALL`] order.
+pub const STATE_VOCABULARY: [&str; 6] = {
+    let mut words = [""; 6];
+    let mut i = 0;
+    while i < TaskState::ALL.len() {
+        words[i] = TaskState::ALL[i].as_str();
+        i += 1;
+    }
+    words
+};
 
 /// List tasks matching `filter`, oldest first (task ids are time-sortable uuid v7).
 ///
@@ -41,20 +49,13 @@ pub const STATE_VOCABULARY: [&str; 6] = ["open", "claimed", "done", "abandoned",
 /// result — a typo'd `--state redy` used to look exactly like "no matching tasks" on every
 /// surface (CLI, MCP, HTTP), which all inherit this rejection.
 pub fn list<'m>(model: &'m TaskReadModel, filter: &TaskFilter) -> Result<Vec<&'m TaskProjection>, String> {
-    if let Some(state) = &filter.state {
-        if !STATE_VOCABULARY.contains(&state.as_str()) {
-            return Err(format!(
-                "unknown state {state:?} (expected one of {})",
-                STATE_VOCABULARY.join("|")
-            ));
-        }
-    }
+    let state = filter.state.as_deref().map(str::parse::<TaskState>).transpose()?;
     Ok(model
         .tasks
         .values()
         .filter(|t| {
-            if let Some(state) = &filter.state {
-                if t.state.as_str() != state {
+            if let Some(state) = state {
+                if t.state != state {
                     return false;
                 }
             } else if !filter.include_terminal && t.state.is_terminal() {
@@ -135,22 +136,10 @@ pub fn parse_since(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String>
             .checked_sub_signed(d)
             .ok_or_else(|| format!("duration {s:?} is outside the supported date range"));
     }
-    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
-        return Ok(t.with_timezone(&Utc));
+    if let Some(t) = parse_stamp(s) {
+        return Ok(t);
     }
-    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M",
-    ] {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-            if let Some(t) = Local.from_local_datetime(&ndt).single() {
-                return Ok(t.with_timezone(&Utc));
-            }
-        }
-    }
+    use chrono::{Local, NaiveDate, TimeZone};
     if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let ndt = nd.and_hms_opt(0, 0, 0).expect("midnight exists");
         if let Some(t) = Local.from_local_datetime(&ndt).single() {
@@ -166,6 +155,27 @@ pub fn parse_since(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String>
     ))
 }
 
+/// An RFC 3339 timestamp or one of the four local datetime spellings, as UTC.
+fn parse_stamp(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        return Some(t.with_timezone(&Utc));
+    }
+    use chrono::{Local, NaiveDateTime, TimeZone};
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            if let Some(t) = Local.from_local_datetime(&ndt).single() {
+                return Some(t.with_timezone(&Utc));
+            }
+        }
+    }
+    None
+}
+
 /// Parse a `--by` deadline: a duration from `now` (`3d`, `48h`, `1w`), a bare date (`2026-10-03`
 /// = the end of that local day), a local datetime (`2026-10-03T18:00`), or RFC 3339.
 pub fn parse_deadline(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
@@ -175,22 +185,10 @@ pub fn parse_deadline(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, Stri
             .checked_add_signed(d)
             .ok_or_else(|| format!("deadline {s:?} is outside the supported date range"));
     }
-    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
-        return Ok(t.with_timezone(&Utc));
+    if let Some(t) = parse_stamp(s) {
+        return Ok(t);
     }
-    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M",
-    ] {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-            if let Some(t) = Local.from_local_datetime(&ndt).single() {
-                return Ok(t.with_timezone(&Utc));
-            }
-        }
-    }
+    use chrono::{Local, NaiveDate, TimeZone};
     if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let ndt = nd.and_hms_opt(23, 59, 59).expect("end of day exists");
         if let Some(t) = Local.from_local_datetime(&ndt).single() {
@@ -222,7 +220,8 @@ pub fn parse_duration(s: &str) -> Option<chrono::Duration> {
 }
 
 /// The millisecond timestamp a UUID v7 carries in its first 48 bits, if `s` is one (or a prefix
-/// long enough to hold them: the first 12 hex digits).
+/// long enough to hold them plus the version nibble: at least 13 hex digits, ignoring hyphens).
+/// Shorter task-id prefixes can select tasks but cannot supply a --since timestamp.
 pub fn uuid_v7_timestamp(s: &str) -> Option<DateTime<Utc>> {
     let hex: String = s.chars().filter(|c| *c != '-').take(13).collect();
     if hex.len() < 13 || !hex.chars().all(|c| c.is_ascii_hexdigit()) || &hex[12..13] != "7" {
@@ -253,10 +252,9 @@ pub fn blocks<'m>(model: &'m TaskReadModel, task_id: &str) -> Vec<&'m TaskProjec
         .collect()
 }
 
-/// The tag that marked a task as a decision before `posed` existed (and that `pose` kept writing
-/// until 0.15.0). A tag-only decision in an old log still lands in its assignee's inbox under
-/// `decisions owed`; a new one is refused at write time ([`super::ReduceError::BareDecisionTag`]) —
-/// a decision is posed, with options, never tagged.
+/// The tag that marked a task as a decision before `posed` existed (0.15.0). Writing it to a task
+/// with nothing posed is refused ([`super::ReduceError::BareDecisionTag`]): a decision is posed,
+/// with options, never tagged.
 pub const DECISION_TAG: &str = "decision";
 /// A decision the decider parked for discussion (`cv task discuss` / the page's "needs discussion"):
 /// it stays open and resolvable, but it is no longer *owed* — the ball is with whoever posed it.
@@ -285,7 +283,7 @@ pub fn unique_prefix_len<'a>(ids: impl IntoIterator<Item = &'a str>, min: usize)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxReason {
-    /// A live decision (a posed one, or a task tagged [`DECISION_TAG`]) assigned to you: someone
+    /// A live posed decision assigned to you: someone
     /// is waiting on your call, not your work. Listed before everything else.
     DecisionOwed,
     /// A decision you parked with [`DISCUSS_TAG`]: open, still yours to resolve, but the next
@@ -344,13 +342,13 @@ pub fn inbox<'m>(model: &'m TaskReadModel, endpoint: &str) -> Vec<InboxEntry<'m>
 
 fn base_inbox_reason(task: &TaskProjection, endpoint: &str) -> Option<(InboxReason, DateTime<Utc>)> {
     let assigned = task.assignee.as_deref().is_some_and(|have| same_actor(have, endpoint));
-    if assigned && !task.state.is_terminal() && (task.is_decision() || task.tags.iter().any(|t| t == DECISION_TAG)) {
+    if assigned && !task.state.is_terminal() && task.is_decision() {
         if task.tags.iter().any(|t| t == DISCUSS_TAG) {
             // Parked: ages from the discussion request (its last event), not from the pose.
             return Some((InboxReason::Discussing, task.last_ts));
         }
         // A posed decision ages from when it was asked, not from the last note on it.
-        let since = task.decision.as_ref().map(|d| d.posed_at).unwrap_or(task.last_ts);
+        let since = task.decision.as_ref().map_or(task.last_ts, |d| d.posed_at);
         return Some((InboxReason::DecisionOwed, since));
     }
     match task.state {
@@ -360,7 +358,7 @@ fn base_inbox_reason(task: &TaskProjection, endpoint: &str) -> Option<(InboxReas
     }
 }
 
-/// Compact human age for terminal rows: `42s`, `12m`, `5h`, `3d`. Truncating division at each
+/// Compact human age for inbox items, deadline phrases and terminal rows: `42s`, `12m`, `5h`, `3d`. Truncating division at each
 /// unit boundary; future timestamps (clock skew) saturate to `0s`, never a negative.
 pub fn age_short(since: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let secs = now.signed_duration_since(since).num_seconds().max(0);

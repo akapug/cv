@@ -8,7 +8,7 @@
 # <out-dir> is normally crates/cv-core/tests/corpus/claude/<version>; it must not exist yet. Needs:
 # install.sh <version> run first, python3, git, uuidgen, ~/.zai-key. Env: ZAI_KEY_FILE (default
 # ~/.zai-key), CORPUS_MODEL (default glm-5.3-flash), CORPUS_MODEL_ALT (the model-switch target,
-# default glm-5.3), MAX_CALLS (default 80).
+# default glm-5.3), MAX_CALLS (default 100; a full run makes about 85).
 #
 # Every scenario is listed in AFFORDANCES.md with the record it is meant to leave.
 set -euo pipefail
@@ -17,7 +17,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 V="${1:?usage: generate.sh <version> <out-dir>}"; OUT="${2:?usage: generate.sh <version> <out-dir>}"; shift 2
 KEEP=0
-ONLY="chat tools image plan tasks agents background schedule mcp skill workflow worktree web structured interrupt"
+ONLY="chat tools image plan tasks agents background schedule mcp skill workflow worktree web structured errors maxturns interrupt"
 while [ $# -gt 0 ]; do
   case "$1" in --keep) KEEP=1 ;; --only) ONLY="$2"; shift ;; *) echo "unknown arg $1" >&2; exit 2 ;; esac; shift
 done
@@ -25,7 +25,7 @@ mkdir -p "$(dirname "$OUT")"; OUT="$(cd "$(dirname "$OUT")" && pwd -P)/$(basenam
 [ ! -e "$OUT" ] || { echo "refusing: $OUT exists (add a new version instead of regenerating)" >&2; exit 1; }
 BIN="${HARNESS_VERSIONS:-$HOME/tools/harness-versions}/claude/$V/node_modules/.bin/claude"
 [ -x "$BIN" ] || { echo "claude $V not installed: run $HERE/install.sh $V" >&2; exit 1; }
-MODEL="${CORPUS_MODEL:-glm-5.3-flash}"; ALT="${CORPUS_MODEL_ALT:-glm-5.3}"; MAX_CALLS="${MAX_CALLS:-80}"
+MODEL="${CORPUS_MODEL:-glm-5.3-flash}"; ALT="${CORPUS_MODEL_ALT:-glm-5.3}"; MAX_CALLS="${MAX_CALLS:-100}"
 UPSTREAM="https://api.z.ai/api/anthropic"
 
 corpus_work
@@ -120,9 +120,10 @@ cc() {
 newid() { uuidgen | tr 'A-Z' 'a-z'; }
 want() { case " $ONLY " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 SCEN=(); SKIP=()
-# Small tool sets keep each session's prompt_snapshot attachment (the full tool schemas) small.
-# The prompt_snapshot attachment (system prompt + every tool schema, ~6-80 KB) is kept in the chat and
-# tools sessions and switched off elsewhere, so the corpus holds the record without paying for it 15 times.
+# Small tool sets keep each session's request ledger small: since 2.1.300 every API call leaves an
+# `api-request-shape` (the system prompt + every tool schema, ~6-40 KB, one per distinct shape) and
+# content-addressed `api-request-blob`s. The older prompt_snapshot attachment records the same prompt
+# once more; it is kept in the chat session only and switched off everywhere else.
 NOSKILLS=(--disable-slash-commands --system-prompt-snapshot off)
 SNAP=(--disable-slash-commands)
 
@@ -138,7 +139,7 @@ if want chat; then   # multi-turn, resume, a named session, a model switch, /com
 fi
 if want tools; then  # read/edit/write/shell, parallel calls, an error, a denial, an oversized result, a notebook
   id="$(newid)"
-  T=(--tools "Read,Edit,Write,Bash,NotebookEdit" "${SNAP[@]}")
+  T=(--tools "Read,Edit,Write,Bash,NotebookEdit" "${NOSKILLS[@]}")
   # File checkpointing (file-history-snapshot records, file-history/ backups) is off in -p unless asked
   # for; a small Bash output cap makes `seq 1 1000` spill to tool-results/<id>.txt as a long one would.
   E=(CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=1 BASH_MAX_OUTPUT_LENGTH=2000)
@@ -176,13 +177,16 @@ if want agents; then # Agent tool: a foreground sub-agent, a custom agent type, 
     "Use the Agent tool with subagent_type echoer to echo the word ok, then use the Agent tool with subagent_type general-purpose and the prompt 'Read a.txt and reply with its first line' and report both answers."
   cc -- --resume "$id" --tools "Agent,Read,SendMessage" --allowedTools "Agent Read SendMessage" "${NOSKILLS[@]}" \
     "Use SendMessage to the echoer agent you started (by its agent id) asking it to echo the word again, and report its reply."
-  # Asked as a fork (no subagent_type, CLAUDE_CODE_FORK_SUBAGENT=1). In 2.1.296 on a third-party
-  # endpoint the child is a plain general-purpose agent (no inherited context): forking did not engage.
+  # Asked as a fork (`subagent_type: fork`, named: a model that omits the type gets a general-purpose
+  # child with `launchedWithDefaults`). Since 2.1.302 fork sub-agents are on by default in `-p`: the
+  # child's transcript opens with a `fork-context-ref` (parent session + the uuid its context was cut
+  # at) and its meta.json says `agentType: fork, isFork: true`. (2.1.296 spawned a plain general-purpose
+  # child even with CLAUDE_CODE_FORK_SUBAGENT=1.)
   cc CLAUDE_CODE_FORK_SUBAGENT=1 -- --tools "Agent" --allowedTools "Agent" "${NOSKILLS[@]}" \
-    "Use the Agent tool without a subagent_type (a fork of yourself) with the prompt 'Reply with the single word forked.' and report its reply."
+    "Use the Agent tool with subagent_type set to exactly fork (a fork of yourself) and the prompt 'Reply with the single word forked.' and report its reply."
   cc -- --tools "Agent,Read" --allowedTools "Agent Read" "${NOSKILLS[@]}" \
     "Use the Agent tool with run_in_background set to true, subagent_type echoer, to echo the word later. Then wait for its completion notification and report the word."
-  SCEN+=("subagent" "custom_agent_type" "send_message" "agent_default_type" "background_agent" "agent_notification")
+  SCEN+=("subagent" "custom_agent_type" "send_message" "fork_subagent" "background_agent" "agent_notification")
 fi
 if want background; then # background Bash and Monitor (a deferred tool, loaded through ToolSearch)
   # Monitor is not reachable here: it is gated on a remote feature flag (tengu_amber_sentinel) that a
@@ -191,7 +195,6 @@ if want background; then # background Bash and Monitor (a deferred tool, loaded 
     "Run this command with the Bash tool with run_in_background set to true: sleep 3; echo corpus-done   Then end your turn without any other tool call. When its task-notification arrives, report the output in one line."
   SCEN+=("background_bash" "task_notification")
   SKIP+=("monitor (remote feature flag tengu_amber_sentinel; never on for a third-party endpoint)")
-  SKIP+=("fork_subagent (CLAUDE_CODE_FORK_SUBAGENT=1 still spawned a general-purpose child)")
 fi
 if want schedule; then # timers: CronCreate/CronList/CronDelete and ScheduleWakeup (none fire in -p)
   cc -- --tools "CronCreate,CronList,CronDelete,ScheduleWakeup" --allowedTools "CronCreate CronList CronDelete ScheduleWakeup" "${NOSKILLS[@]}" \
@@ -230,6 +233,19 @@ if want structured; then # --json-schema: the StructuredOutput tool
     "What is 6 times 7? Answer in the structured output."
   SCEN+=("structured_output")
 fi
+if want errors; then # a provider failure: the proxy answers CORPUS-PROVIDER-ERROR with a 500 (never forwarded), so
+  # Claude Code retries once (CLAUDE_CODE_MAX_RETRIES=1: a `system/api_error` retry record) and gives up (a
+  # synthetic `assistant` API-error turn); then the same session resumes normally.
+  id="$(newid)"
+  cc -- --session-id "$id" --tools "" "${NOSKILLS[@]}" "CORPUS-PROVIDER-ERROR: reply with the single word ok."
+  cc -- --resume "$id" --tools "" "${NOSKILLS[@]}" "Reply with the single word recovered."
+  SCEN+=("provider_error" "api_error_retry")
+fi
+if want maxturns; then # --max-turns: the run stops after one model turn, leaving a max_turns_reached attachment
+  cc -- --max-turns 1 --tools "Read" --allowedTools "Read" "${NOSKILLS[@]}" \
+    "Read a.txt with the Read tool, then read b.txt with the Read tool, then report both first lines."
+  SCEN+=("max_turns")
+fi
 if want interrupt; then # an interrupted turn: SIGINT while a tool is running
   id="$(newid)"
   echo "--- claude (interrupted)"
@@ -237,7 +253,9 @@ if want interrupt; then # an interrupted turn: SIGINT while a tool is running
     --tools "Bash" --allowedTools "Bash(sleep *)" "${NOSKILLS[@]}" "Run with Bash: sleep 40   and then say done." \
     </dev/null >>"$WORK/run.log" 2>&1) &
   ipid=$!
-  for _ in $(seq 60); do grep -q '"Bash"' "$CLAUDE_CONFIG_DIR"/projects/*/"$id".jsonl 2>/dev/null && break; sleep 0.5; done
+  # Wait for the model's Bash tool_use (not the tool's schema: since 2.1.300 the request ledger
+  # writes every tool name into the transcript before the model has answered).
+  for _ in $(seq 60); do grep -Eq '"type":"tool_use","id":"[^"]*","name":"Bash"' "$CLAUDE_CONFIG_DIR"/projects/*/"$id".jsonl 2>/dev/null && break; sleep 0.5; done
   sleep 1; kill -INT "$ipid" 2>/dev/null || true; wait "$ipid" 2>/dev/null || true
   SCEN+=("interrupt")
 fi

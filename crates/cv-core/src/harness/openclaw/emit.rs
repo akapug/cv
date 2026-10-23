@@ -15,7 +15,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 /// Emit into OpenClaw's `agents/<agentId>/sessions/<sid>.jsonl` transcript (v3 parent-linked) plus
-/// a `sessions.json` index entry. Mirrors `harness/openclaw.rs`'s reader: a `{type:session,…}`
+/// a `sessions.json` index entry. Mirrors `harness/openclaw/record.rs`: a `{type:session,…}`
 /// header line followed by `{type:message,id,parentId,timestamp,message:{role,content,…}}` lines.
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
     stream::emit(session, out_dir, opts)
@@ -27,9 +27,11 @@ mod stream;
 mod tests;
 
 /// IR [`Usage`](crate::ir::Usage) → OpenClaw's `usage{input, output, cacheRead, cacheWrite,
-/// totalTokens, cost{total}}`, reversing [`openclaw::parse_usage`]'s names. Only the fields present
-/// are written, so an OpenClaw source round-trips with the same key set; `None` when the turn
-/// carried no counts and no cost (nothing its reader would accept).
+/// cost{total}}`, reversing [`openclaw::parse_usage`]'s names. Only the fields present are written;
+/// `None` when the turn carried no counts and no cost (nothing its reader would accept).
+/// `totalTokens` is never written: the IR holds no recorded total, and OpenClaw's own reader
+/// (`normalizeUsage`, `computeUsageTokenTotals`) takes an absent total as input + output +
+/// cacheRead + cacheWrite.
 fn openclaw_usage(usage: Option<&crate::ir::Usage>) -> Option<Value> {
     let u = usage?;
     let mut m = Map::new();
@@ -46,16 +48,10 @@ fn openclaw_usage(usage: Option<&crate::ir::Usage>) -> Option<Value> {
     if let Some(c) = u.cost_usd {
         m.insert("cost".into(), json!({ "total": c }));
     }
-    if m.is_empty() {
-        return None;
-    }
-    m.insert(
-        "totalTokens".into(),
-        json!(u.input_tokens.unwrap_or(0).saturating_add(u.output_tokens.unwrap_or(0))),
-    );
-    Some(Value::Object(m))
+    (!m.is_empty()).then_some(Value::Object(m))
 }
 
-fn openclaw_short_id() -> String {
-    Uuid::new_v4().simple().to_string()[..8].to_string()
+/// OpenClaw's eight-hex entry IDs, stable for a target session and a record identity.
+fn openclaw_short_id(namespace: &Uuid, key: &str) -> String {
+    Uuid::new_v5(namespace, key.as_bytes()).simple().to_string()[..8].to_string()
 }

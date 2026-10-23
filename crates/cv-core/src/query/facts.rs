@@ -56,7 +56,7 @@ pub struct SessionFacts<'a> {
     text_sets: &'a TextSets,
     events: OnceCell<Vec<Event>>,
     forest: OnceCell<crate::tools::ForestTools>,
-    tree: OnceCell<Vec<crate::SubagentInfo>>,
+    tree: OnceCell<Vec<crate::AgentRef>>,
     workflows: OnceCell<Vec<crate::Workflow>>,
     compactions: OnceCell<usize>,
     affordances: OnceCell<HashSet<crate::affordance::Kind>>,
@@ -82,8 +82,9 @@ impl<'a> SessionFacts<'a> {
     fn events(&self) -> anyhow::Result<&[Event]> {
         if self.events.get().is_none() {
             let mut rows = Vec::new();
+            let mut extractor = events::EventExtractor::default();
             for (i, message) in self.session.messages.iter().enumerate() {
-                events::extract_into(message, i, self.session.cwd.as_deref(), &mut rows)?;
+                extractor.extract(message, i, self.session.cwd.as_deref(), None, None, &mut rows)?;
             }
             let _ = self.events.set(rows);
         }
@@ -98,8 +99,11 @@ impl<'a> SessionFacts<'a> {
     }
 
     /// The sub-agent forest as lightweight infos (type + ref + journaled outcome).
-    fn tree(&self) -> &[crate::SubagentInfo] {
-        self.tree.get_or_init(|| crate::subagent_tree_of(self.r))
+    fn tree(&self) -> anyhow::Result<&[crate::AgentRef]> {
+        if self.tree.get().is_none() {
+            let _ = self.tree.set(crate::subagent_tree_of(self.r)?);
+        }
+        Ok(self.tree.get().expect("tree initialized"))
     }
 
     fn workflows(&self) -> &[crate::Workflow] {
@@ -111,7 +115,7 @@ impl<'a> SessionFacts<'a> {
         if self.affordances.get().is_none() {
             let mut rows = crate::affordance::of_session(self.session)?;
             if let Some(a) = crate::harness::for_harness(self.r.harness) {
-                rows.extend(a.store_affordances(self.r));
+                rows.extend(a.store_affordances(self.r)?);
             }
             let _ = self.affordances.set(rows.into_iter().map(|a| a.kind).collect());
         }
@@ -154,7 +158,7 @@ impl ExtFacts for SessionFacts<'_> {
                 agent.agent != crate::tools::ORCHESTRATOR
                     && agent.histogram.tools.keys().any(|value| value.to_lowercase() == needle)
             }),
-            FieldId::Agent => self.tree().iter().any(|info| {
+            FieldId::Agent => self.tree()?.iter().any(|info| {
                 info.agent_type
                     .as_deref()
                     .is_some_and(|value| value.to_lowercase() == needle)
@@ -208,14 +212,12 @@ impl ExtFacts for SessionFacts<'_> {
                 },
                 |f| f.images,
             ),
-            "subagents" => {
-                self.session.harness == crate::ir::Harness::Claude
-                    && self
-                        .session
-                        .source_path
-                        .as_deref()
-                        .is_some_and(|p| !crate::harness::claude::subagent_refs(p).is_empty())
-            }
+            // The forest `agents` counts, asked for membership only unless already read.
+            "subagents" => match self.tree.get() {
+                Some(tree) => !tree.is_empty(),
+                None => !crate::subagent_tree_filtered_of(self.r, crate::SubagentDemand::Sessions, None, |_, _| true)?
+                    .is_empty(),
+            },
             "compacted" => self.compaction_count()? > 0,
             "workflows" => !self.workflows().is_empty(),
             other => match crate::affordance::Kind::parse(other) {
@@ -233,7 +235,7 @@ impl ExtFacts for SessionFacts<'_> {
         })))
     }
     fn agent_type(&self, needle: &str) -> anyhow::Result<Tri> {
-        Ok(Tri::of(self.tree().iter().any(|info| {
+        Ok(Tri::of(self.tree()?.iter().any(|info| {
             info.agent_type
                 .as_deref()
                 .is_some_and(|t| t.to_lowercase().contains(needle))
@@ -247,7 +249,7 @@ impl ExtFacts for SessionFacts<'_> {
     }
     fn count(&self, field: FieldId) -> anyhow::Result<Option<u64>> {
         Ok(match field {
-            FieldId::Agents => Some(self.tree().len() as u64),
+            FieldId::Agents => Some(self.tree()?.len() as u64),
             FieldId::Workflows => Some(self.workflows().len() as u64),
             FieldId::Compactions => Some(self.compaction_count()? as u64),
             _ => None,
@@ -305,35 +307,19 @@ impl ReducedFacts {
     }
 }
 
-struct PendingTarget(String);
-impl crate::spill::Record for PendingTarget {
-    type ReadState = ();
-    fn heap_bytes(&self) -> usize {
-        self.0.capacity()
-    }
-    fn write(&self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
-        writer.write_all(&(self.0.len() as u64).to_le_bytes())?;
-        writer.write_all(self.0.as_bytes())?;
-        Ok(())
-    }
-    fn read(reader: &mut impl std::io::BufRead, _: &mut ()) -> anyhow::Result<Self> {
-        let mut len = [0; 8];
-        reader.read_exact(&mut len)?;
-        let len = usize::try_from(u64::from_le_bytes(len))?;
-        let mut bytes = vec![0; len];
-        reader.read_exact(&mut bytes)?;
-        Ok(Self(String::from_utf8(bytes)?))
-    }
-}
-
 struct FactSink {
     facts: ReducedFacts,
     tools: Vec<String>,
     exact_tools: Vec<String>,
     targets: Vec<String>,
     exact_targets: Vec<String>,
-    pending_targets: crate::spill::Ordered<PendingTarget>,
+    pending_targets: crate::spill::Ordered<String>,
     events: bool,
+    /// The same extractor [`SessionFacts::events`] runs over a collected session, fed one streamed
+    /// message at a time: one extraction path, so a native edit and its visible call count once.
+    extractor: events::EventExtractor,
+    index: usize,
+    rows: Vec<events::Event>,
     fail: Option<anyhow::Error>,
 }
 
@@ -359,6 +345,9 @@ impl FactSink {
             targets,
             exact_targets: query.exact_needles(FieldId::Touched),
             pending_targets: Default::default(),
+            extractor: Default::default(),
+            index: 0,
+            rows: Vec::new(),
             fail: None,
         }
     }
@@ -394,14 +383,14 @@ impl FactSink {
         if self.targets_settled() {
             self.pending_targets = Default::default();
         } else if !absolute {
-            self.pending_targets.push(PendingTarget(target))?;
+            self.pending_targets.push(target)?;
         }
         Ok(())
     }
 
     fn finish(mut self, session: &Session) -> anyhow::Result<ReducedFacts> {
         for row in self.pending_targets.rows()? {
-            let PendingTarget(p) = row?;
+            let p = row?;
             let path = std::path::Path::new(&p);
             let resolved = match session.cwd.as_deref() {
                 Some(cwd) => cwd.join(path).to_string_lossy().to_lowercase(),
@@ -432,8 +421,10 @@ impl FactSink {
         }
         self.facts.images |= m.content.iter().any(|b| matches!(b, Block::Image { .. }));
         if self.events {
-            let rows = events::extract(m, 0, None)?;
-            for e in rows {
+            let mut rows = std::mem::take(&mut self.rows);
+            self.extractor.extract(m, self.index, None, None, None, &mut rows)?;
+            self.index += 1;
+            for e in rows.drain(..) {
                 self.facts.errors |= e.kind == "error";
                 self.facts.has_tools |= e.tool.is_some();
                 if !self.tools.is_empty() {
@@ -457,6 +448,8 @@ impl FactSink {
                     }
                 }
             }
+            events::release_scratch(&mut rows);
+            self.rows = rows;
         }
         Ok(())
     }
@@ -538,7 +531,7 @@ pub fn matches_streamed(
 
 struct StreamedMatch {
     decision: anyhow::Result<bool>,
-    source: crate::source::Snapshot,
+    source: crate::source::Baseline,
     counted: Option<crate::stream::Counted>,
 }
 
@@ -570,7 +563,13 @@ fn reduce_streamed(
         .iter()
         .any(|flag| crate::affordance::Kind::parse(flag).is_some());
     let source = probe.snapshot(r);
-    let read = crate::stream::stream_counted(adapter, r, &crate::ParseOptions::lazy(), &mut sink, Default::default())?;
+    let read = crate::stream::stream_counted(
+        adapter,
+        r,
+        &crate::Demand::LEAN.with_spans(),
+        &mut sink,
+        Default::default(),
+    )?;
     let (session, counted) = (read.session, read.counted);
     if affordances {
         sink.facts.counts = counted.as_ref().map(|c| c.counts.clone());
@@ -622,7 +621,9 @@ struct RefQuery<'a> {
     heavy: bool,
     table: Option<crate::catalog::AffordanceTable>,
     demand_counts: bool,
-    reader: Option<Option<crate::catalog::Reader>>,
+    /// Opened on the first counted demand. A failed open is not remembered (the catalog's door
+    /// warns once): the next demand tries again.
+    reader: Option<crate::catalog::Reader>,
     probe: crate::source::Probe,
 }
 
@@ -636,7 +637,7 @@ impl<'a> RefQuery<'a> {
             query,
             text_sets,
             heavy: query.needs_parse() || query.needs_index() || query.needs_events() || query.needs_forest(),
-            table: (query.needs_counted() && !demand_counts).then(crate::catalog::AffordanceTable::load),
+            table: None,
             demand_counts,
             reader: None,
             probe: crate::source::Probe::default(),
@@ -650,47 +651,39 @@ impl<'a> RefQuery<'a> {
         if !self.heavy && !self.query.needs_counted() {
             return Ok(Tri::True);
         }
-        if self.demand_counts {
-            // The existing evaluator may settle metadata/index Boolean branches without counts.
-            let without_counts = self.query.eval(&Facts {
-                r,
-                session: None,
-                ext: &RefFacts {
-                    id: &r.id,
-                    text_sets: self.text_sets,
-                    counts: None,
-                },
-            })?;
-            if !matches!(without_counts, Tri::Unknown) || !self.query.needs_counted() {
-                return Ok(without_counts);
-            }
-            let counts = self
-                .reader
-                .get_or_insert_with(crate::catalog::Reader::open)
-                .as_ref()
-                .and_then(|reader| reader.counts_with_probe(r, &self.probe.snapshot(r), &mut self.probe));
-            return self.query.eval(&Facts {
-                r,
-                session: None,
-                ext: &RefFacts {
-                    id: &r.id,
-                    text_sets: self.text_sets,
-                    counts,
-                },
-            });
+        // Metadata and indexed text can settle a Boolean branch without opening the catalog.
+        let without_counts = self.query.eval(&Facts {
+            r,
+            session: None,
+            ext: &RefFacts {
+                id: &r.id,
+                text_sets: self.text_sets,
+                counts: None,
+            },
+        })?;
+        if !matches!(without_counts, Tri::Unknown) || !self.query.needs_counted() {
+            return Ok(without_counts);
         }
-        let facts = RefFacts {
-            id: &r.id,
-            text_sets: self.text_sets,
-            counts: self
-                .table
+        let counts = if self.demand_counts {
+            if self.reader.is_none() {
+                self.reader = crate::catalog::Reader::open();
+            }
+            self.reader
                 .as_ref()
-                .and_then(|t| t.counts_with_probe(r, &self.probe.snapshot(r), &mut self.probe)),
+                .and_then(|reader| reader.counts_with_probe(r, &self.probe.snapshot(r), &mut self.probe))
+        } else {
+            self.table
+                .get_or_insert_with(crate::catalog::AffordanceTable::load)
+                .counts_with_probe(r, &self.probe.snapshot(r), &mut self.probe)
         };
         self.query.eval(&Facts {
             r,
             session: None,
-            ext: &facts,
+            ext: &RefFacts {
+                id: &r.id,
+                text_sets: self.text_sets,
+                counts,
+            },
         })
     }
 
@@ -702,17 +695,8 @@ impl<'a> RefQuery<'a> {
     }
 }
 
-/// Which matching refs occupy a ranked machine-readable window.
-#[derive(Clone, Copy)]
-pub enum WindowPresence {
-    /// Only refs with readable file metadata occupy the window (`ls --json`).
-    Existing,
-    /// Every matching ref occupies the window; existence is checked after selecting/reversing
-    /// it (`ls --json --asc` retains this historical selection rule).
-    Any,
-}
-
-/// Select at most `limit` matches from already-ranked refs. Unlike [`filter_refs`], this has no
+/// Select at most `limit` matches from already-ranked refs; only refs with readable file metadata
+/// occupy the window. Unlike [`filter_refs`], this has no
 /// exact-total contract: only reads needed to decide the requested window can fail it. An
 /// unreadable lower-ranked tail is never evaluated. Stable ties and ranking belong to the caller;
 /// selected refs preserve their input order. A read error leaves the caller's list intact.
@@ -724,7 +708,6 @@ pub fn filter_refs_limited(
     query: &SessionQuery,
     text_sets: &TextSets,
     limit: usize,
-    presence: WindowPresence,
 ) -> anyhow::Result<()> {
     if limit == 0 {
         refs.clear();
@@ -732,12 +715,12 @@ pub fn filter_refs_limited(
     }
     let _reads = crate::source::read_scope();
     let mut plan = RefQuery::with_counts_mode(query, text_sets, true);
-    let mut writer: Option<Option<crate::catalog::Writer>> = None;
+    let mut writer: Option<crate::catalog::Writer> = None;
     let mut keep = vec![false; refs.len()];
     let mut selected = 0;
     for (index, r) in refs.iter().enumerate() {
-        // An absent ref cannot appear in an Existing window, so its body is not needed.
-        if matches!(presence, WindowPresence::Existing) && r.path.metadata().is_err() {
+        // An absent ref cannot appear in the window, so its body is not needed.
+        if plan.probe.size(&r.path).is_none() {
             continue;
         }
         let matches = match plan.cheap(r)? {
@@ -746,7 +729,10 @@ pub fn filter_refs_limited(
             Tri::Unknown => {
                 let matched = plan.reduce(r)?;
                 if let Some(counted) = matched.counted {
-                    if let Some(writer) = writer.get_or_insert_with(crate::catalog::Writer::open) {
+                    if writer.is_none() {
+                        writer = crate::catalog::Writer::open();
+                    }
+                    if let Some(writer) = &mut writer {
                         writer.record_counted(r, &matched.source, counted);
                     }
                 }
@@ -851,7 +837,7 @@ mod tests {
             title: None,
             created_at: None,
             updated_at: None,
-            message_count: 0,
+            message_count: None,
         }
     }
 
@@ -866,20 +852,26 @@ mod tests {
     }
 
     #[test]
-    fn demand_counts_follow_existing_boolean_shortcircuits_without_opening_reader() {
+    fn counts_follow_boolean_shortcircuits_without_loading_reader_or_table() {
         let r = missing_source();
         for expression in [
             "id:absent AND has:plan",
             "id:indexed-session OR has:plan",
             "text:hit OR has:plan",
+            "has:plan OR text:hit",
+            "text:miss AND has:plan",
+            "has:plan AND text:miss",
+            "NOT (text:miss AND has:plan)",
         ] {
             let query = SessionQuery::parse(expression).unwrap();
             let texts = text_sets(&query, &r);
-            let mut plan = RefQuery::with_counts_mode(&query, &texts, true);
-            let result = plan.cheap(&r).unwrap();
-            assert!(!matches!(result, Tri::Unknown), "{expression}");
-            assert!(plan.reader.is_none(), "{expression} should not demand counts");
-            assert!(plan.table.is_none());
+            for demand_counts in [false, true] {
+                let mut plan = RefQuery::with_counts_mode(&query, &texts, demand_counts);
+                let result = plan.cheap(&r).unwrap();
+                assert!(!matches!(result, Tri::Unknown), "{expression}");
+                assert!(plan.reader.is_none(), "{expression} should not demand counts");
+                assert!(plan.table.is_none(), "{expression} should not load counts");
+            }
         }
     }
 
@@ -912,14 +904,14 @@ mod tests {
         };
         assert_eq!(fresh(), [false, false, false]);
         let mut zero = refs.clone();
-        filter_refs_limited(&mut zero, &query, &TextSets::empty(), 0, WindowPresence::Existing).unwrap();
+        filter_refs_limited(&mut zero, &query, &TextSets::empty(), 0).unwrap();
         assert_eq!(fresh(), [false, false, false]);
         let mut initial = refs.clone();
-        filter_refs_limited(&mut initial, &query, &TextSets::empty(), 1, WindowPresence::Existing).unwrap();
+        filter_refs_limited(&mut initial, &query, &TextSets::empty(), 1).unwrap();
         assert_eq!(initial[0].id, refs[1].id);
         assert_eq!(fresh(), [true, true, false]);
         let mut warm = refs.clone();
-        filter_refs_limited(&mut warm, &query, &TextSets::empty(), 1, WindowPresence::Existing).unwrap();
+        filter_refs_limited(&mut warm, &query, &TextSets::empty(), 1).unwrap();
         assert_eq!(warm[0].id, initial[0].id);
         assert_eq!(fresh(), [true, true, false]);
         // The warm prefix is decided by cheap cached facts; only Unknown invokes reduce.
@@ -927,10 +919,10 @@ mod tests {
         let mut plan = RefQuery::with_counts_mode(&query, &texts, true);
         assert!(matches!(plan.cheap(&refs[0]).unwrap(), Tri::False));
         assert!(matches!(plan.cheap(&refs[1]).unwrap(), Tri::True));
-        assert_eq!(plan.reader.as_ref().unwrap().as_ref().unwrap().counts_work(), (2, 2));
+        assert_eq!(plan.reader.as_ref().unwrap().counts_work(), (2, 2));
         assert!(plan.table.is_none());
         assert!(matches!(plan.cheap(&refs[2]).unwrap(), Tri::Unknown));
-        assert_eq!(plan.reader.as_ref().unwrap().as_ref().unwrap().counts_work(), (3, 2));
+        assert_eq!(plan.reader.as_ref().unwrap().counts_work(), (3, 2));
         for source in ["has:plan,errors", "has:errors,plan"] {
             let mixed = SessionQuery::parse(source).unwrap();
             assert!(mixed.needs_counted() && mixed.needs_events());
@@ -974,23 +966,23 @@ mod tests {
         ];
         let query = SessionQuery::parse("tool:edit").unwrap();
         let mut one = refs.clone();
-        filter_refs_limited(&mut one, &query, &TextSets::empty(), 1, WindowPresence::Existing).unwrap();
+        filter_refs_limited(&mut one, &query, &TextSets::empty(), 1).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].id, "good");
         let mut two = refs.clone();
-        assert!(filter_refs_limited(&mut two, &query, &TextSets::empty(), 2, WindowPresence::Existing).is_err());
+        assert!(filter_refs_limited(&mut two, &query, &TextSets::empty(), 2).is_err());
         assert_eq!(
             two.iter().map(|r| &r.id).collect::<Vec<_>>(),
             refs.iter().map(|r| &r.id).collect::<Vec<_>>()
         );
         assert!(filter_refs(&mut refs.clone(), &query, &TextSets::empty()).is_err());
         let mut zero = refs;
-        filter_refs_limited(&mut zero, &query, &TextSets::empty(), 0, WindowPresence::Any).unwrap();
+        filter_refs_limited(&mut zero, &query, &TextSets::empty(), 0).unwrap();
         assert!(zero.is_empty());
     }
 
     #[test]
-    fn limited_window_presence_preserves_ascending_preselection_and_boolean_shortcircuit() {
+    fn limited_window_skips_absent_refs_and_boolean_shortcircuits() {
         let world = crate::test_world("query_window_presence");
         let missing = missing_source();
         let path = world.home.join("present-unreadable.jsonl");
@@ -1000,18 +992,8 @@ mod tests {
         let query = SessionQuery::parse("tool:edit OR text:hit").unwrap();
         let texts = TextSets::resolve(&query, |_| refs.iter().map(|r| r.id.clone()).collect());
         let mut existing = refs.clone();
-        filter_refs_limited(&mut existing, &query, &texts, 1, WindowPresence::Existing).unwrap();
+        filter_refs_limited(&mut existing, &query, &texts, 1).unwrap();
         assert_eq!(existing[0].id, present.id);
-        let mut any = refs.clone();
-        filter_refs_limited(&mut any, &query, &texts, 1, WindowPresence::Any).unwrap();
-        assert_eq!(any[0].id, missing.id);
-        // All rows share rank in this input. Window selection retains the exact stable tie order.
-        let mut all = refs.clone();
-        filter_refs_limited(&mut all, &query, &texts, usize::MAX, WindowPresence::Any).unwrap();
-        assert_eq!(
-            all.iter().map(|r| &r.id).collect::<Vec<_>>(),
-            refs.iter().map(|r| &r.id).collect::<Vec<_>>()
-        );
     }
 
     #[test]
@@ -1138,7 +1120,7 @@ mod tests {
         r.cwd = Some("/Stale/Discovery".into());
         r.title = Some("discovery title".into());
         let adapter = crate::harness::for_harness(r.harness).unwrap();
-        let full = crate::stream::collect_with(adapter.as_ref(), &r, &crate::ParseOptions::lazy()).unwrap();
+        let full = crate::stream::collect_with(adapter.as_ref(), &r, &crate::Demand::LEAN.with_spans()).unwrap();
         assert_eq!(full.cwd.as_deref(), Some(std::path::Path::new("/Late/Work")));
         for required in [
             "model=earlymodel AND model=latemodel",
@@ -1354,7 +1336,7 @@ mod tests {
             sink.note_target(format!("relative-{i}.rs")).unwrap();
         }
         sink.note_target("missing.rs".into()).unwrap();
-        assert!(sink.pending_targets.temporary_bytes().unwrap() > 0);
+        assert!(sink.pending_targets.spilled_bytes().unwrap() > 0);
         let mut shell = Session::new("facts", crate::Harness::Claude);
         shell.cwd = Some("/late/work".into());
         let facts = sink.finish(&shell).unwrap();
@@ -1374,7 +1356,7 @@ mod tests {
         .unwrap();
         let r = SessionRef::new("invalid-sidecar", crate::Harness::Claude, path);
         let adapter = crate::harness::for_harness(r.harness).unwrap();
-        let full = crate::stream::collect_with(adapter.as_ref(), &r, &crate::ParseOptions::lazy()).unwrap();
+        let full = crate::stream::collect_with(adapter.as_ref(), &r, &crate::Demand::LEAN.with_spans()).unwrap();
         let query = SessionQuery::parse("compactions=0").unwrap();
         let texts = TextSets::default();
         assert_eq!(full.messages.len(), 0);

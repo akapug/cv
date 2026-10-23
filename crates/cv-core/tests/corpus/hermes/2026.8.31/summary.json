@@ -18,10 +18,16 @@
       },
       "tools": [],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0,
@@ -62,10 +68,38 @@
         "terminal"
       ],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "patch": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "read_file": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 2,
+            "commands": 0,
+            "errors": 0
+          },
+          "terminal": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 2,
+            "errors": 0
+          }
+        },
+        "total_calls": 5,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0,
@@ -116,6 +150,7 @@
         "session_search"
       ],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -124,6 +159,61 @@
         "background_job/start": 1,
         "plan/write": 1,
         "schedule/create": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "cronjob": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "execute_code": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "memory": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "process": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "session_search": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "terminal": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          },
+          "todo": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 7,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -150,11 +240,25 @@
         "skill_manage"
       ],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "skill/manage": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "skill_manage": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -175,10 +279,16 @@
       },
       "tools": [],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0,
@@ -207,11 +317,32 @@
         "terminal"
       ],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 0,
       "affordances": {
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "delegate_task": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "terminal": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -231,10 +362,16 @@
           },
           "tools": [],
           "usage_messages": 0,
+          "model_messages": 0,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
           "lineage": {
             "parent": "20261011_175452_1868fe"
           },
@@ -268,10 +405,31 @@
         "tool_call/mcp__corpus__add"
       ],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "mcp__corpus__add": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "tool_describe": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0,
@@ -289,10 +447,16 @@
       },
       "tools": [],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0,
@@ -318,10 +482,24 @@
         "terminal"
       ],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "terminal": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0,
@@ -341,10 +519,16 @@
       },
       "tools": [],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": null,
       "skipped_lines": 0,
@@ -379,7 +563,7 @@
         "assistant/reply"
       ],
       "blocks": {
-        "text": 20,
+        "text": 19,
         "thinking": 9,
         "tool_result": 1,
         "tool_use": 1
@@ -388,12 +572,26 @@
         "read_file"
       ],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [
         18
       ],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "read_file": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 1,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0,
@@ -421,11 +619,17 @@
       },
       "tools": [],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "fork/fork": 1
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {
         "forked_from": "20261011_175610_2e9cca"
@@ -462,6 +666,7 @@
         "delegate_task"
       ],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 0,
@@ -469,6 +674,19 @@
         "goal/state": 1,
         "schedule/state": 2,
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "delegate_task": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "glm-5.3-flash",
@@ -488,10 +706,16 @@
           },
           "tools": [],
           "usage_messages": 0,
+          "model_messages": 0,
           "compaction_boundaries": [],
           "subagent_spawns": 0,
           "subagent_returns": 0,
           "affordances": {},
+          "tool_histogram": {
+            "tools": {},
+            "total_calls": 0,
+            "total_errors": 0
+          },
           "lineage": {
             "parent": "20261011_180504_6229e7"
           },
@@ -514,10 +738,16 @@
       },
       "tools": [],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "glm-5.3-flash",
       "skipped_lines": 0,

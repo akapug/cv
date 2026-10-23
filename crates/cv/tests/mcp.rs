@@ -217,18 +217,17 @@ fn handshake_and_tool_schemas() {
         );
     }
 
-    // `show` advertises its MCP window defaults, and `--json` is never the caller's to set.
+    // `show` says no window is the whole transcript, and `--json` is never the caller's to set.
     let show = tools.iter().find(|t| t["name"] == "show").unwrap();
     let desc = show["description"].as_str().unwrap();
-    assert!(desc.contains("LAST 50") && desc.contains("200000"), "{desc}");
+    assert!(desc.contains("returns the whole transcript"), "{desc}");
     let props = &show["inputSchema"]["properties"];
     assert!(props.get("json").is_none(), "json must not be a property: {props}");
     assert_eq!(props["last"]["type"], "integer", "{props}");
     assert_eq!(show["inputSchema"]["required"], json!(["id"]), "{show}");
 }
 
-/// The generated tools run the real commands: `show` with no window gets the MCP default and
-/// returns the IR as JSON, `cat` (no JSON form) returns text, a non-zero exit is a tool error
+/// The generated tools run the real commands: `show` with no window returns the whole IR as JSON, `cat` (no JSON form) returns text, a non-zero exit is a tool error
 /// carrying stderr, and a protocol mistake is -32602 before anything runs.
 #[test]
 fn generated_tools_run_the_real_commands() {
@@ -517,10 +516,18 @@ fn observe_stream_bounded_read_only_tail() {
     assert_eq!(v["count"], 0, "absent corpus → zero messages: {text}");
     assert_eq!(v["messages"].as_array().unwrap().len(), 0, "{text}");
     assert_eq!(v["more_pending"], false, "{text}");
-    assert!(
-        v["cursor"].as_str().unwrap().contains("\"v\":1"),
-        "cursor is versioned: {text}"
+    // The cursor's encoding is opaque; its contract is that it resumes: replayed, the call is no
+    // longer a baseline and still drains nothing.
+    let empty = v["cursor"].as_str().expect("a cursor").to_string();
+    let (text, is_err) = s.call_tool(
+        102,
+        "observe_stream",
+        json!({"cwd_contains": "/no/such/dir", "since_cursor": empty}),
     );
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["baseline"], false, "the empty-corpus cursor resumes: {text}");
+    assert_eq!(v["count"], 0, "{text}");
 
     // 2) Baseline over the REAL fixture corpus emits no backlog (only future activity is tailed),
     //    and hands back a cursor recording the current tail.
@@ -792,4 +799,64 @@ fn cancellation_targets_one_typed_request_and_preserves_connection() {
         .as_str()
         .unwrap()
         .contains("MCP request cancelled"));
+}
+
+#[test]
+fn windowed_show_matches_cli_bytes_and_http_message_frames() {
+    let mut server = Server::spawn("window-doors");
+    let scope = (*cv_core::env::Env::current()).clone().enter();
+    for key in cv_testkit::CLEARED_ENV {
+        scope.remove(key);
+    }
+    for (key, value) in server.world.env() {
+        scope.set(key, value);
+    }
+    for (flag, value, args, query) in [
+        ("first", json!(0), vec!["--first", "0"], "start=0&end=0&extra=1"),
+        ("first", json!(1), vec!["--first", "1"], "start=0&end=1&extra=1"),
+        ("last", json!(1), vec!["--last", "1"], "start=1&end=2&extra=1"),
+        ("last", json!(0), vec!["--last", "0"], "start=2&end=2&extra=1"),
+        ("last", json!(100), vec!["--last", "100"], "start=0&end=2&extra=1"),
+        ("range", json!("1.."), vec!["--range", "1.."], "start=1&extra=1"),
+        ("range", json!("..1"), vec!["--range", "..1"], "start=0&end=1&extra=1"),
+        ("max_bytes", json!(0), vec!["--max-bytes", "0"], "start=0&end=1&extra=1"),
+        ("range", json!("1..2"), vec!["--range", "1..2"], "start=1&end=2&extra=1"),
+        (
+            "range",
+            json!("9..10"),
+            vec!["--range", "9..10"],
+            "start=9&end=10&extra=1",
+        ),
+        (
+            "around",
+            json!(0),
+            vec!["--around", "0", "--context", "0"],
+            "start=0&end=1&extra=1",
+        ),
+    ] {
+        let mut cli = vec!["show", "alphasess", "--json"];
+        cli.extend(args);
+        let (expected, _) = server.world.cv_ok(&cli);
+        let mut arguments = json!({"id":"alphasess"});
+        if flag == "around" {
+            arguments["context"] = json!(0);
+        }
+        arguments[flag] = value;
+        let (actual, error) = server.call_tool(100, "show", arguments);
+        assert!(!error, "{actual}");
+        assert_eq!(actual.as_bytes(), expected.as_bytes(), "{cli:?}");
+        let session: Value = serde_json::from_str(&expected).unwrap();
+        let staged = cv_core::api::route_staged(&["api", "session", "claude", "alphasess", "messages"], query)
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.status, 200);
+        let mut body = Vec::new();
+        staged.body.copy_to(&mut body).unwrap();
+        let http: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&session["messages"]).unwrap(),
+            serde_json::to_vec(&http["messages"]).unwrap(),
+            "{query}"
+        );
+    }
 }

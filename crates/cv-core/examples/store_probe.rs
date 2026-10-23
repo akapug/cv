@@ -1,7 +1,7 @@
 //! One explicitly rooted, read-only operation per process. See examples/store_probe.md.
 
 use anyhow::{bail, Context, Result};
-use cv_core::{Adapter, Block, Flow, Harness, Message, ParseOptions, Session, SessionRef};
+use cv_core::{Adapter, Block, Demand, Flow, Harness, Message, Session, SessionRef};
 use serde_json::{json, Map, Value};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ struct Args {
     id: String,
     path: PathBuf,
     root: PathBuf,
-    mode: String,
+    mode: Mode,
     materialize: bool,
     span: Option<(u64, u64)>,
     escaped: bool,
@@ -40,10 +40,59 @@ struct Args {
     sqlite_heap: bool,
 }
 
+/// The `--mode` vocabulary, parsed once so no later stage re-matches raw strings.
+#[derive(Clone, Copy)]
+enum Mode {
+    Lazy,
+    LazyExtra,
+    Facts,
+    Bulk,
+    Full,
+    Complete,
+}
+
+impl Mode {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "lazy" => Mode::Lazy,
+            "lazy-extra" => Mode::LazyExtra,
+            "facts" => Mode::Facts,
+            "bulk" => Mode::Bulk,
+            "full" => Mode::Full,
+            "complete" => Mode::Complete,
+            _ => return None,
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Mode::Lazy => "lazy",
+            Mode::LazyExtra => "lazy-extra",
+            Mode::Facts => "facts",
+            Mode::Bulk => "bulk",
+            Mode::Full => "full",
+            Mode::Complete => "complete",
+        }
+    }
+
+    /// The stream demand each mode names.
+    fn demand(self) -> Demand {
+        match self {
+            Mode::Bulk => Demand::LEAN,
+            Mode::Full => Demand::RICH,
+            Mode::Complete => Demand::COMPLETE,
+            Mode::LazyExtra => Demand::RICH.with_spans(),
+            Mode::Facts => Demand::FACTS.with_spans(),
+            Mode::Lazy => Demand::LEAN.with_spans(),
+        }
+    }
+}
+
 fn args() -> Result<Args> {
     let mut argv = std::env::args().skip(1);
     let mut positional = Vec::new();
-    let (mut root, mut mode, mut materialize) = (None, "lazy".to_string(), false);
+    let (mut root, mut materialize) = (None, false);
+    let mut mode = "lazy".to_string();
     let (mut span, mut escaped, mut chunk_bytes) = (None, false, 64 << 10);
     let mut prefix_bytes = 64 << 10;
     let mut last = 20;
@@ -83,7 +132,7 @@ fn args() -> Result<Args> {
                 "store_probe OP HARNESS ID PATH [--root DIR] [--mode lazy|lazy-extra|facts|bulk|full|complete] \
                  [--materialize] [--sqlite-heap] [--hash-output] [--hash-detail] [--raw-order] [--warm-discover] [--query EXPR] [--resume-from CHECKPOINT] [--span OFFSET:LENGTH --escaped --chunk-bytes N --prefix-bytes N]\n\
                  OP: baseline|discard|count|checkpoint|resume|collect|window|affordances|affordance-read|doctor|token-stats|dataset|dataset-collect|tools|tools-collect|query|query-collect|hash|discover|sessions|events|events-collected|chunks|prefix|resolve|resolved-len|json-len|json-write|json-prefix\n\
-                 HARNESS: claude|codex|gemini|openclaw|continue|lmstudio|cline|kimi|kimi-code|grok|qwen|devin|zed|opensession|chatgpt-export|claude-export; use scratch CLUSTERVISION_HOME"
+                 HARNESS: any (`harness::for_harness_with_root` names each one's ROOT); use scratch CLUSTERVISION_HOME"
             ),
             s if s.starts_with('-') => bail!("unknown option {s}"),
             _ => positional.push(arg),
@@ -95,12 +144,7 @@ fn args() -> Result<Args> {
     let path = std::fs::canonicalize(&positional[3]).context("input path")?;
     let root = root.unwrap_or_else(|| path.parent().unwrap_or(Path::new("/")).to_path_buf());
     let root = std::fs::canonicalize(root).context("adapter root")?;
-    if !matches!(
-        mode.as_str(),
-        "lazy" | "lazy-extra" | "facts" | "bulk" | "full" | "complete"
-    ) {
-        bail!("unknown mode {mode}");
-    }
+    let mode = Mode::parse(&mode).with_context(|| format!("unknown mode {mode}"))?;
     if chunk_bytes == 0 {
         bail!("--chunk-bytes must be positive");
     }
@@ -133,57 +177,9 @@ fn args() -> Result<Args> {
     })
 }
 
-fn options(mode: &str) -> ParseOptions {
-    match mode {
-        "bulk" => ParseOptions::bulk(),
-        "full" => ParseOptions::full(),
-        "complete" => ParseOptions::complete(),
-        "lazy-extra" => ParseOptions::lazy_extra(),
-        "facts" => ParseOptions::facts(),
-        _ => ParseOptions::lazy(),
-    }
-}
-
 fn adapter(a: &Args) -> Result<Box<dyn Adapter>> {
-    Ok(match a.harness {
-        Harness::Claude => Box::new(cv_core::harness::claude::Claude::with_config_dir(&a.root)),
-        Harness::Codex => Box::new(cv_core::harness::codex::Codex::with_home(&a.root)),
-        Harness::Gemini => Box::new(cv_core::harness::gemini::Gemini::with_home(&a.root)),
-        Harness::OpenClaw => Box::new(cv_core::harness::openclaw::OpenClaw::with_state_dir(&a.root)),
-        Harness::Continue => Box::new(cv_core::harness::continuedev::Continue::with_root(&a.root)),
-        Harness::LmStudio => Box::new(cv_core::harness::lmstudio::LmStudio::with_root(&a.root)),
-        Harness::Cline => Box::new(cv_core::harness::cline::Cline::with_home(&a.root)),
-        Harness::Kimi => Box::new(cv_core::harness::kimi::Kimi::with_home(&a.root)),
-        Harness::KimiCode => Box::new(cv_core::harness::kimi_code::KimiCode::with_home(&a.root)),
-        Harness::Grok => Box::new(cv_core::harness::grok::Grok::with_home(&a.root)),
-        Harness::OpenSession => Box::new(cv_core::harness::opensession::OpenSession::with_roots(vec![a
-            .root
-            .clone()])),
-        Harness::ChatGptExport => Box::new(cv_core::harness::export::ChatGptExport::with_roots(vec![a
-            .root
-            .clone()])),
-        Harness::ClaudeExport => Box::new(cv_core::harness::export::ClaudeExport::with_roots(vec![a.root.clone()])),
-        Harness::Qwen => Box::new(cv_core::harness::qwen::Qwen::with_home(&a.root)),
-        #[cfg(feature = "sqlite")]
-        Harness::Cursor => Box::new(if a.id.starts_with("cli:") {
-            cv_core::harness::cursor::Cursor::with_cli_home(&a.root)
-        } else {
-            cv_core::harness::cursor::Cursor::with_user_dir(&a.root)
-        }),
-        #[cfg(feature = "sqlite")]
-        Harness::OpenCode => Box::new(cv_core::harness::opencode::OpenCode::with_data_dir(&a.root)),
-        #[cfg(feature = "sqlite")]
-        Harness::Hermes => Box::new(cv_core::harness::hermes::Hermes::with_home(&a.root)),
-        #[cfg(feature = "sqlite")]
-        Harness::Goose => Box::new(cv_core::harness::goose::Goose::with_sessions_dir(&a.root)),
-        #[cfg(feature = "sqlite")]
-        Harness::Devin => Box::new(cv_core::harness::devin::Devin::with_root(&a.root)),
-        #[cfg(feature = "sqlite")]
-        Harness::Zed => Box::new(cv_core::harness::zed::Zed::with_root(&a.root)),
-        _ => {
-            bail!("unsupported probe harness or disabled feature; use explicit-root constructors when extending it")
-        }
-    })
+    cv_core::harness::for_harness_with_root(a.harness, &a.root)
+        .context("this harness is not built in (enable the sqlite feature)")
 }
 
 // Sort owned maps in place: deterministic JSON without cloning giant payloads into Value trees.
@@ -238,9 +234,26 @@ impl Write for DigestWriter {
     }
 }
 
+/// Counts bytes written without retaining them; the write stays observable to the optimizer.
+struct CountWriter(u64);
+
+impl Write for CountWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        std::hint::black_box(buf);
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct Outcome {
     messages: usize,
+    /// The operation's API does not deliver messages through a callback the probe can count:
+    /// `messages` is then reported as null, not as a zero that was never measured.
+    unobserved: bool,
     detail: Value,
     // Keep actual collection alive until the stage's heap snapshot is taken.
     session: Option<Session>,
@@ -264,7 +277,7 @@ fn affordance_detail(rows: &[cv_core::affordance::Affordance], hash_output: bool
 }
 
 fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
-    let opts = options(&a.mode);
+    let opts = a.mode.demand();
     let mut out = Outcome::default();
     match a.operation.as_str() {
         "baseline" => {}
@@ -272,9 +285,15 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
             let mut refs = if a.operation == "sessions" {
                 cv_core::sessions()
             } else {
-                adapter.discover()?
+                adapter.discover()?.refs
             };
-            out.detail = json!({ "discovered_sessions": refs.len(), "discovered_turns": refs.iter().map(|r| r.message_count).sum::<usize>() });
+            // A store whose count is free (a row count) reports it; one that would have to decode
+            // every body reports "not counted" (`None`) until a full read or `cv index` certifies it.
+            out.detail = json!({
+                "discovered_sessions": refs.len(),
+                "discovered_turns": refs.iter().filter_map(|r| r.message_count).sum::<usize>(),
+                "uncounted_sessions": refs.iter().filter(|r| r.message_count.is_none()).count(),
+            });
             if a.hash_output {
                 refs.sort_by(|a, b| (&a.id, &a.path).cmp(&(&b.id, &b.path)));
                 let mut digest = DigestWriter::default();
@@ -305,12 +324,17 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
                 let mut sink = cv_core::events::EventSink::new(r.cwd.clone());
                 adapter.try_stream(r, &opts, &mut cv_core::TeeSink::new(&mut count, &mut sink))?;
                 let source = source.with_reads(sink.dependencies());
+                // The retained control: every event collected before one ordered publication.
                 let events = sink.into_events()?;
-                cv_core::events::record_from_with_source(r, 0, &events, &source, &Default::default());
+                let mut spool = cv_core::events::EventSpool::default();
+                for event in events.iter().cloned() {
+                    spool.push(event)?;
+                }
+                cv_core::events::record_spooled_with_source(r, 0, spool, &source, &Default::default())?;
                 (events.len(), 0)
             };
-            out.detail = json!({ "events": events, "temporary_bytes_written": temporary_bytes,
-                               "temporary_bytes_read": temporary_bytes });
+            // The spool reads back exactly what it wrote; only the write is measured.
+            out.detail = json!({ "events": events, "temporary_bytes_written": temporary_bytes });
         }
         "checkpoint" | "resume" => {
             // This is a fixture diagnostic, not a replacement for production MarkHead/source
@@ -358,7 +382,7 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
             });
             let s = adapter.try_stream(r, &opts, &mut sink)?;
             if a.operation == "count" {
-                out.detail = serde_json::to_value(counter.finish(&s, &adapter.store_affordances(r)))?;
+                out.detail = serde_json::to_value(counter.finish(&s, &adapter.store_affordances(r)?))?;
             }
         }
         "tools" | "tools-collect" => {
@@ -368,10 +392,11 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
                 // The production path before histogram reduction: includes EventSink's unused
                 // per-record checkpoints, because the forest reader requested them too.
                 let mut sink = cv_core::events::EventSink::new(r.cwd.clone());
-                adapter.try_stream(r, &ParseOptions::lazy(), &mut sink)?;
+                adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
                 cv_core::tools::ToolHistogram::from_events(&sink.into_events()?)
             };
             out.detail = serde_json::to_value(histogram)?;
+            out.unobserved = true;
         }
         "dataset" | "dataset-collect" => {
             let query = a
@@ -382,16 +407,6 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
                 .map_err(anyhow::Error::msg)?;
             let texts = cv_core::query::TextSets::default();
             let mut digest = DigestWriter::default();
-            struct CountWriter(u64);
-            impl Write for CountWriter {
-                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                    self.0 += bytes.len() as u64;
-                    Ok(bytes.len())
-                }
-                fn flush(&mut self) -> io::Result<()> {
-                    Ok(())
-                }
-            }
             let mut count = CountWriter(0);
             let writer: &mut dyn Write = if a.hash_output { &mut digest } else { &mut count };
             let wrote = if a.operation == "dataset" {
@@ -429,7 +444,7 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
                 out.detail["record_sha256"] = json!(digest.digest.finish_hex());
             }
             if a.operation == "dataset" {
-                out.detail["message_callbacks"] = json!("not observed");
+                out.unobserved = true;
             }
         }
         "token-stats" => {
@@ -453,16 +468,17 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
             let matched = if a.operation == "query" {
                 cv_core::query::matches_streamed(&query, adapter, r, &texts)?
             } else {
-                let session = cv_core::stream::collect_with(adapter, r, &ParseOptions::lazy())?;
+                let session = cv_core::stream::collect_with(adapter, r, &Demand::LEAN.with_spans())?;
                 let matched = cv_core::query::matches_full(&query, r, &session, &texts)?;
                 out.session = Some(session);
                 matched
             };
-            out.detail = json!({ "matches": matched, "message_callbacks": "not observed" });
+            out.detail = json!({ "matches": matched });
+            out.unobserved = true;
         }
         "collect" | "affordances" => {
             let opts = if a.operation == "affordances" {
-                ParseOptions::full()
+                Demand::RICH
             } else {
                 opts
             };
@@ -475,7 +491,7 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
             out.messages = s.messages.len();
             if a.operation == "affordances" {
                 out.rows = cv_core::affordance::of_session(&s)?;
-                out.rows.extend(adapter.store_affordances(r));
+                out.rows.extend(adapter.store_affordances(r)?);
                 out.detail = affordance_detail(&out.rows, a.hash_output)?;
             }
             out.session = Some(s);
@@ -503,7 +519,7 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
         "affordance-read" => {
             out.rows = cv_core::affordance::read(adapter, r)?;
             out.detail = affordance_detail(&out.rows, a.hash_output)?;
-            out.detail["message_callbacks"] = json!("not observed");
+            out.unobserved = true;
         }
         "hash" => {
             let resolver = cv_core::Resolver::new(Some(r.path.clone()));
@@ -589,17 +605,6 @@ fn run(a: &Args, adapter: &dyn Adapter, r: &SessionRef) -> Result<Outcome> {
                 out.detail = json!({ "canonical_bytes": digest.bytes,
                                      "canonical_sha256": digest.digest.finish_hex() });
             } else {
-                struct CountWriter(u64);
-                impl Write for CountWriter {
-                    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                        std::hint::black_box(buf);
-                        self.0 += buf.len() as u64;
-                        Ok(buf.len())
-                    }
-                    fn flush(&mut self) -> io::Result<()> {
-                        Ok(())
-                    }
-                }
                 let mut writer = CountWriter(0);
                 value.write_canonical(&mut writer)?;
                 out.detail = json!({ "canonical_bytes": writer.0 });
@@ -734,25 +739,25 @@ fn main() -> Result<()> {
         "{}",
         json!({
             "operation": a.operation, "harness": a.harness.as_str(), "id": a.id,
-            "path": a.path, "root": a.root, "requested_mode": a.mode,
+            "path": a.path, "root": a.root, "requested_mode": a.mode.as_str(),
             "effective_mode": match a.operation.as_str() {
                 "affordances" => "full",
                 "affordance-read" | "token-stats" => "production-defined",
-                "dataset-collect" => &a.mode,
+                "dataset-collect" => a.mode.as_str(),
                 "query" | "query-collect" | "tools" | "tools-collect" | "dataset" => "lazy",
                 "baseline" | "discover" | "sessions" | "chunks" | "prefix" | "resolve" | "resolved-len" | "json-len" | "json-write" | "json-prefix" => "not-applicable",
-                _ => &a.mode,
+                _ => a.mode.as_str(),
             },
             "materialize": if a.operation == "affordance-read" { Value::Null }
                            else { json!(a.materialize || matches!(a.operation.as_str(), "affordances" | "hash" | "resolve")) },
-            "physical_input_bytes": physical_bytes, "traversed_bytes": null,
+            "physical_input_bytes": physical_bytes,
             "build_features": { "mmap": cfg!(feature = "mmap"), "probe_heap": cfg!(feature = "probe-heap") },
             "hash_output": a.hash_output,
             "hash_detail": a.hash_detail,
             "raw_order": a.raw_order,
             "warm_discover": a.warm_discover,
             "setup_discovered_sessions": setup_discovered_sessions,
-            "wall_seconds": seconds, "messages": out.messages,
+            "wall_seconds": seconds, "messages": if out.unobserved { Value::Null } else { json!(out.messages) },
             "requested_rust_heap": requested_rust_heap, "sqlite_native_heap": sqlite_native_heap, "detail": out.detail,
         })
     );
@@ -773,7 +778,8 @@ mod tests {
 
     #[test]
     fn digest_resolves_escaped_spans_and_ignores_json_map_insertion_order() {
-        let path = std::env::temp_dir().join(format!("cv-probe-hash-{}.json", uuid::Uuid::new_v4()));
+        let world = cv_testkit::World::in_process("probe-hash", cv_core::env::Env::enter_isolated);
+        let path = world.base.join("input.json");
         let text = "escaped\n\"quote\"\\☃".repeat(1024);
         let quoted = serde_json::to_string(&text).unwrap();
         let raw_input = r#"{"a":0,"z":{"a":1,"b":2}}"#;

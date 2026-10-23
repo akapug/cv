@@ -6,11 +6,13 @@ pub(super) struct Accumulator {
     target: Harness,
     thinking: ThinkingMode,
     features: Features,
-    // Claude's answered-call policy needs future IDs, but not argument/output bodies.
-    claude: Vec<Message>,
+    // The answered-call rule ([`WriteRules::answered_calls_only`]) needs future IDs, but not
+    // argument/output bodies.
+    answered_only: bool,
+    pending: Vec<Message>,
     answered: std::collections::HashSet<String>,
     resolver: crate::lazy::Resolver,
-    error: Option<anyhow::Error>,
+    latch: crate::stream::Latch,
 }
 impl Accumulator {
     pub(super) fn new(target: Harness, thinking: ThinkingMode, resolver: crate::lazy::Resolver) -> Self {
@@ -18,23 +20,24 @@ impl Accumulator {
             target,
             thinking,
             features: Features::default(),
-            claude: Vec::new(),
+            answered_only: write_rules(target).answered_calls_only,
+            pending: Vec::new(),
             answered: Default::default(),
             resolver,
-            error: None,
+            latch: Default::default(),
         }
     }
     pub(super) fn note(&mut self, message: &Message) -> Result<()> {
         let facts = project(message, &self.resolver, self.target)?;
-        if self.target == Harness::Claude {
+        if self.answered_only {
             for block in &facts.content {
                 if let Block::ToolResult { tool_use_id, .. } = block {
                     self.answered.insert(tool_use_id.clone());
                 }
             }
         }
-        if self.target == Harness::Claude && facts.content.iter().any(|b| matches!(b, Block::ToolUse { .. })) {
-            self.claude.push(facts);
+        if self.answered_only && facts.content.iter().any(|b| matches!(b, Block::ToolUse { .. })) {
+            self.pending.push(facts);
         } else {
             self.features
                 .note(self.target, self.thinking, &facts, false, &|_| false);
@@ -42,8 +45,8 @@ impl Accumulator {
         Ok(())
     }
     pub(super) fn finish(mut self, metadata: &Session) -> Features {
-        if self.target == Harness::Claude {
-            for message in &self.claude {
+        if self.answered_only {
+            for message in &self.pending {
                 self.features.note(
                     self.target,
                     self.thinking,
@@ -62,16 +65,19 @@ impl Accumulator {
 }
 impl MessageSink for Accumulator {
     fn message(&mut self, message: Message) -> Flow {
+        if self.latch.failed() {
+            return Flow::Stop;
+        }
         match self.note(&message) {
             Ok(()) => Flow::Continue,
             Err(error) => {
-                self.error = Some(error);
+                self.latch.fail(error);
                 Flow::Stop
             }
         }
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.error.take()
+        self.latch.take("fidelity projection")
     }
     fn meta(&mut self, session: &Session) {
         self.resolver = session.resolver();
@@ -86,6 +92,8 @@ pub(in crate::emit) fn source_features(target: Harness, thinking: ThinkingMode, 
     Ok(accumulator.finish(session))
 }
 
+/// Preserve the first nonblank character classification consumed by `is_client_command`:
+/// `/` and `?` are commands, `x` is other nonblank text, and empty is blank.
 pub(super) fn marker(text: &crate::lazy::Text, resolver: &crate::lazy::Resolver) -> Result<String> {
     Ok(match crate::emit::thinking::first_character(text, resolver, true)? {
         Some(ch @ ('/' | '?')) => ch.to_string(),
@@ -94,7 +102,16 @@ pub(super) fn marker(text: &crate::lazy::Text, resolver: &crate::lazy::Resolver)
     })
 }
 
+/// `message` reduced to the facts the feature counts read, written in a small presence-marker
+/// language over the IR's own types rather than a type of its own: an optional field present in
+/// the source is `Some("")` (an id, a model, a signature) or `Some(Value::Null)` (details), absent
+/// stays `None`; a text is its [`marker`] (`/`, `?`, `x` or empty, first block only) and every other
+/// body is emptied once validated; a tool id survives only where the target answers calls by id
+/// ([`write_rules`]`.answered_calls_only`); a result's `tool_name` is `x` when nonempty; images and
+/// files keep only their kind.
 fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness) -> Result<Message> {
+    let rules = write_rules(target);
+    let keep_ids = rules.answered_calls_only;
     let mut facts = Message::new(message.role);
     facts.id = message.id.as_ref().map(|_| String::new());
     facts.kind = message.kind;
@@ -102,16 +119,14 @@ fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness)
     facts.timestamp = message.timestamp;
     facts.model = message.model.as_ref().map(|_| String::new());
     facts.usage = message.usage.clone();
-    if is_carrier(message) {
-        facts
-            .extra
-            .insert(crate::harness::claude::CARRIER_KEY.into(), Value::Null);
+    if message.is_carrier() {
+        facts.extra.insert(crate::ir::CARRIER_KEY.into(), Value::Null);
     }
     let mut text_started = false;
     for block in &message.content {
         facts.content.push(match block {
             Block::Text { text } => {
-                let mut value = if reroles_client_commands(target) && message.kind == MessageKind::Prompt {
+                let mut value = if rules.reroles_client_commands && message.kind == MessageKind::Prompt {
                     marker(text, resolver)?
                 } else {
                     validate_text(text, resolver)?;
@@ -140,11 +155,7 @@ fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness)
                 // Preserve the old source-error boundary even though feature counts ignore args.
                 input.with_view(|_| Ok(()))?;
                 Block::ToolUse {
-                    id: if target == Harness::Claude {
-                        id.clone()
-                    } else {
-                        String::new()
-                    },
+                    id: if keep_ids { id.clone() } else { String::new() },
                     name: String::new(),
                     input: Value::Null.into(),
                     namespace: None,
@@ -160,11 +171,7 @@ fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness)
             } => {
                 validate_text(content, resolver)?;
                 Block::ToolResult {
-                    tool_use_id: if target == Harness::Claude {
-                        tool_use_id.clone()
-                    } else {
-                        String::new()
-                    },
+                    tool_use_id: if keep_ids { tool_use_id.clone() } else { String::new() },
                     content: "".into(),
                     tool_name: tool_name
                         .as_ref()
@@ -241,26 +248,36 @@ mod tests {
         let mut carrier = Message::new(Role::System);
         carrier.kind = MessageKind::Carrier;
         session.messages = vec![result, orphan, command, signed, carrier, call];
+        let mut golden = String::new();
         for model in [None, Some("late-default".into())] {
             session.model = model;
-            for target in [
-                Harness::Claude,
-                Harness::Codex,
-                Harness::Grok,
-                Harness::Gemini,
-                Harness::Qwen,
-                Harness::LmStudio,
-                Harness::OpenCode,
-            ] {
+            for target in Harness::ALL {
                 for thinking in [ThinkingMode::Native, ThinkingMode::Text, ThinkingMode::Drop] {
-                    assert_eq!(
-                        source_features(target, thinking, &session)?,
-                        super::super::features(target, thinking, &session),
-                        "{target}/{thinking}"
-                    );
+                    golden.push_str(&format!(
+                        "{:?}/{target}/{thinking} {:?}\n",
+                        session.model,
+                        source_features(target, thinking, &session)?
+                    ));
                 }
             }
         }
+        assert_eq!(
+            golden,
+            include_str!("../../../tests/fixtures/emit-frozen/fidelity-features.txt")
+        );
+        session.model = None;
+        let facts = source_features(Harness::Claude, ThinkingMode::Native, &session)?;
+        assert_eq!(facts.tool_use, 1, "only the answered call survives");
+        assert_eq!(facts.tool_result, 1);
+        assert_eq!(facts.results_with_name, 1);
+        assert_eq!(facts.results_is_error, 1);
+        assert_eq!(facts.results_with_details, 1);
+        assert_eq!(facts.thinking_text, 0, "Unicode whitespace is blank");
+        assert_eq!(facts.model_eff, 1, "the command has an explicit model");
+        session.model = Some("late-default".into());
+        let facts = source_features(Harness::Claude, ThinkingMode::Native, &session)?;
+        assert_eq!(facts.model_eff, facts.role_counts.values().sum::<usize>());
+        assert!(!facts.kind_counts.contains_key("carrier"));
         Ok(())
     }
 }

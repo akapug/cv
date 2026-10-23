@@ -24,10 +24,24 @@
         "web_fetch"
       ],
       "usage_messages": 3,
+      "model_messages": 3,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "web_fetch": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 1
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 1
+      },
       "lineage": {},
       "model": "gemini-3.5-flash",
       "skipped_lines": 0
@@ -47,10 +61,16 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "gemini-3.5-flash",
       "skipped_lines": 0
@@ -76,10 +96,24 @@
         "google_web_search"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "google_web_search": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "gemini-3.5-flash",
       "skipped_lines": 0
@@ -105,11 +139,25 @@
         "activate_skill"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "skill/load": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "activate_skill": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gemini-3.5-flash",
@@ -136,10 +184,24 @@
         "mcp_corpus_add"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "mcp_corpus_add": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "gemini-3.5-flash",
       "skipped_lines": 0
@@ -179,10 +241,45 @@
         "complete_task"
       ],
       "usage_messages": 5,
+      "model_messages": 5,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "complete_task": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "grep_search": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "list_directory": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "read_file": {
+            "calls": 4,
+            "edits": 0,
+            "reads": 4,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 9,
+        "total_errors": 0
+      },
       "lineage": {
         "parent": "964ee802-2410-4c28-8f0e-bf29909626c5"
       },
@@ -206,10 +303,16 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "gemini-3.5-flash",
       "skipped_lines": 0
@@ -235,11 +338,25 @@
         "write_todos"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "plan/write": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "write_todos": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gemini-3.5-flash",
@@ -261,11 +378,17 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "hook/output": 1
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gemini-3.5-flash",
@@ -292,11 +415,25 @@
         "run_shell_command"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "background_job/start": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "run_shell_command": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gemini-3.5-flash",
@@ -332,12 +469,47 @@
         "exit_plan_mode"
       ],
       "usage_messages": 4,
+      "model_messages": 4,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "plan/exit": 1,
         "plan/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "exit_plan_mode": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "read_file": {
+            "calls": 3,
+            "edits": 0,
+            "reads": 3,
+            "commands": 0,
+            "errors": 0
+          },
+          "update_topic": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "write_file": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 6,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gemini-3.5-flash",
@@ -364,12 +536,26 @@
         "invoke_agent"
       ],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
       "subagent_returns": 1,
       "affordances": {
         "subagent_return/return": 1,
         "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "invoke_agent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
       },
       "lineage": {},
       "model": "gemini-3.5-flash",
@@ -391,10 +577,16 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "gemini-3.5-flash",
       "skipped_lines": 0
@@ -434,10 +626,38 @@
         "run_shell_command"
       ],
       "usage_messages": 5,
+      "model_messages": 5,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "read_file": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 2,
+            "commands": 0,
+            "errors": 0
+          },
+          "replace": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "run_shell_command": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 2,
+            "errors": 0
+          }
+        },
+        "total_calls": 5,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "gemini-3.5-flash",
       "skipped_lines": 0
@@ -469,6 +689,7 @@
         "tracker_list_tasks"
       ],
       "usage_messages": 4,
+      "model_messages": 4,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
@@ -476,6 +697,26 @@
         "plan/create": 2,
         "plan/read": 1,
         "plan/state": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "tracker_create_task": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 1
+          },
+          "tracker_list_tasks": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 3,
+        "total_errors": 1
       },
       "lineage": {},
       "model": "gemini-3.5-flash",
@@ -496,11 +737,17 @@
       },
       "tools": [],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
         "checkpoint/state": 1
+      },
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
       },
       "lineage": {},
       "model": null,
@@ -521,10 +768,16 @@
       },
       "tools": [],
       "usage_messages": 0,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": null,
       "skipped_lines": 0
@@ -546,10 +799,16 @@
       },
       "tools": [],
       "usage_messages": 1,
+      "model_messages": 1,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "gemini-2.5-flash-lite",
       "skipped_lines": 0
@@ -573,10 +832,16 @@
       },
       "tools": [],
       "usage_messages": 2,
+      "model_messages": 2,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
       "lineage": {},
       "model": "gemini-3.5-flash",
       "skipped_lines": 0

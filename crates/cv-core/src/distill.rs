@@ -38,7 +38,7 @@ use std::sync::OnceLock;
 /// priced like tool-call JSON. Blocks use the shared [`crate::ir::est_tokens`].
 const PACK_KIND: crate::ir::TokenKind = crate::ir::TokenKind::ToolInput;
 
-/// Knobs for [`distill`].
+/// Knobs for [`prepare_distill`].
 #[derive(Debug, Clone)]
 pub struct DistillOptions {
     /// Keep the last N tool calls (and the turns around them) verbatim as the tail.
@@ -105,7 +105,7 @@ pub struct DistillStats {
     pub elided_outputs: usize,
 }
 
-/// The result of [`distill`].
+/// The result of [`prepare_distill`].
 #[derive(Debug, Clone)]
 pub struct Distilled {
     /// Brief + timeline + facts + ledger (the part that replaces the head of the transcript).
@@ -227,7 +227,9 @@ type Counts = HashMap<String, Mentions>;
 #[derive(Default)]
 struct Facts {
     commits: Vec<(usize, String, String, String)>, // idx, branch, sha, subject
-    branches: Counts,                              // name, mentions and first-seen order
+    /// The shas in `commits`: a capture is checked against a set, not a scan of every commit so far.
+    commit_shas: HashSet<String>,
+    branches: Counts, // name, mentions and first-seen order
     hosts: Counts,
     paths: Counts,
     gates: Vec<(usize, String, String)>,  // idx, label, verdict
@@ -245,86 +247,73 @@ fn bump(counts: &mut Counts, key: &str) {
     }
 }
 
-fn re(cell: &'static OnceLock<Regex>, pat: &str) -> &'static Regex {
-    cell.get_or_init(|| Regex::new(pat).expect("static regex"))
+/// The distiller's patterns, each compiled on first use.
+#[derive(Clone, Copy)]
+enum Re {
+    Commit,
+    OnBranch,
+    NewBranch,
+    Push,
+    Path,
+    RemoteTarget,
+    GateCmd,
+    Verdict,
+    ErrorLine,
+    Tip,
+    GitLog,
+    Cd,
+    Oneline,
+    HeredocTarget,
 }
 
-fn commit_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?m)^\[([^\]\s]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] (.+)$")
-}
-fn on_branch_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?m)^On branch (\S+)")
-}
-fn new_branch_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"git\s+(?:-C\s+\S+\s+)?(?:checkout\s+-[bB]|switch\s+-[cC]|worktree\s+add\s+(?:\S+\s+)*?-b)\s+([\w./-]+)",
-    )
-}
-fn push_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"git\s+(?:-C\s+\S+\s+)?push\s+(?:-\S+\s+)*[\w./:@-]+\s+\+?([\w./-]+(?::[\w./-]+)?)",
-    )
-}
-fn path_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?:^|[\s'`=(:,\x22])(~?/[\w.@+-]+(?:/[\w.@+-]+)+/?)")
-}
-fn remote_target_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?:^|\s)((?:[\w.-]+@)?[\w.-]+):[/~]")
-}
-fn gate_cmd_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"\blake\s+(?:build|env\s+lean|test)\b|\bcargo\s+(?:build|test|nextest|check|clippy)\b|swarm-build|\bmake\b|\bpytest\b|\bnpm\s+(?:run\s+)?test\b|\bgo\s+test\b|clean-build|local-gates|\bctest\b|\bninja\b|\brc=",
-    )
-}
-fn verdict_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"(?i)\berror\b|\bfail|\bpassed\b|\bsuccess|\bcompleted\b|\brc=\d|exit code|✔|✖|\bbuilt\b|test result|declaration uses 'sorry'",
-    )
-}
-fn error_line_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"(?i)\berror\b|\bfatal\b|denied|no such file|not found|cannot|can't|failed|refused|timed out|unknown|invalid|conflict|panicked|traceback",
-    )
-}
-fn tip_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?m)^([0-9a-f]{40})\s+refs/heads/(\S+)$")
-}
-fn git_log_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"git\s+(?:-C\s+(\S+)\s+)?log\b((?:\s+-[^\s|;&)]*)*)(?:\s+([^\s|;&)'-][^\s|;&)']*))?",
-    )
-}
-fn cd_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"\bcd\s+([^\s;&|)']+)")
-}
-fn oneline_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"^([0-9a-f]{7,40})\s+(\S.*)$")
+static RES: [OnceLock<Regex>; 14] = [const { OnceLock::new() }; 14];
+
+fn re(which: Re) -> &'static Regex {
+    let (cell, pat) = match which {
+        Re::Commit => (&RES[0], r"(?m)^\[([^\]\s]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] (.+)$"),
+        Re::OnBranch => (&RES[1], r"(?m)^On branch (\S+)"),
+        Re::NewBranch => (
+            &RES[2],
+            r"git\s+(?:-C\s+\S+\s+)?(?:checkout\s+-[bB]|switch\s+-[cC]|worktree\s+add\s+(?:\S+\s+)*?-b)\s+([\w./-]+)",
+        ),
+        Re::Push => (
+            &RES[3],
+            r"git\s+(?:-C\s+\S+\s+)?push\s+(?:-\S+\s+)*[\w./:@-]+\s+\+?([\w./-]+(?::[\w./-]+)?)",
+        ),
+        Re::Path => (&RES[4], r"(?:^|[\s'`=(:,\x22])(~?/[\w.@+-]+(?:/[\w.@+-]+)+/?)"),
+        Re::RemoteTarget => (&RES[5], r"(?:^|\s)((?:[\w.-]+@)?[\w.-]+):[/~]"),
+        Re::GateCmd => (
+            &RES[6],
+            r"\blake\s+(?:build|env\s+lean|test)\b|\bcargo\s+(?:build|test|nextest|check|clippy)\b|swarm-build|\bmake\b|\bpytest\b|\bnpm\s+(?:run\s+)?test\b|\bgo\s+test\b|clean-build|local-gates|\bctest\b|\bninja\b|\brc=",
+        ),
+        Re::Verdict => (
+            &RES[7],
+            r"(?i)\berror\b|\bfail|\bpassed\b|\bsuccess|\bcompleted\b|\brc=\d|exit code|✔|✖|\bbuilt\b|test result|declaration uses 'sorry'",
+        ),
+        Re::ErrorLine => (
+            &RES[8],
+            r"(?i)\berror\b|\bfatal\b|denied|no such file|not found|cannot|can't|failed|refused|timed out|unknown|invalid|conflict|panicked|traceback",
+        ),
+        Re::Tip => (&RES[9], r"(?m)^([0-9a-f]{40})\s+refs/heads/(\S+)$"),
+        Re::GitLog => (
+            &RES[10],
+            r"git\s+(?:-C\s+(\S+)\s+)?log\b((?:\s+-[^\s|;&)]*)*)(?:\s+([^\s|;&)'-][^\s|;&)']*))?",
+        ),
+        Re::Cd => (&RES[11], r"\bcd\s+([^\s;&|)']+)"),
+        Re::Oneline => (&RES[12], r"^([0-9a-f]{7,40})\s+(\S.*)$"),
+        Re::HeredocTarget => (
+            &RES[13],
+            r#"(?:cat|tee(?:\s+-a)?)\s*>{0,2}\s*['"]?([^\s'"<>|;&]+)['"]?\s*<<-?\s*['"]?\w+"#,
+        ),
+    };
+    cell.get_or_init(|| Regex::new(pat).expect("static regex"))
 }
 
 /// The repository a single `git log` in `cmd` reads, and the HEAD line it printed: `(key, line)`.
 /// The key is `host:dir`, plus `[ref]` when the log names a ref instead of HEAD. Commands with
 /// several `git log`s (loops over many repos) are skipped — their output can't be attributed.
 fn git_log_head(cmd: &str, out: &str) -> Option<(String, String)> {
-    let mut logs = git_log_re().captures_iter(cmd);
+    let mut logs = re(Re::GitLog).captures_iter(cmd);
     let c = logs.next()?;
     if logs.next().is_some() {
         return None;
@@ -333,7 +322,7 @@ fn git_log_head(cmd: &str, out: &str) -> Option<(String, String)> {
     let dir = c
         .get(1)
         .map(|m| m.as_str().to_string())
-        .or_else(|| cd_re().captures_iter(&cmd[..at]).last().map(|d| d[1].to_string()))
+        .or_else(|| re(Re::Cd).captures_iter(&cmd[..at]).last().map(|d| d[1].to_string()))
         .unwrap_or_else(|| ".".into());
     let host = hosts_in(cmd).into_iter().next();
     let mut key = match host {
@@ -344,16 +333,8 @@ fn git_log_head(cmd: &str, out: &str) -> Option<(String, String)> {
         key = format!("{key} [{}]", r.as_str());
     }
     let line = out.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let m = oneline_re().captures(line)?;
+    let m = re(Re::Oneline).captures(line)?;
     Some((key, format!("{} {}", &m[1], truncate(m[2].trim(), 90))))
-}
-
-fn heredoc_target_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r#"(?:cat|tee(?:\s+-a)?)\s*>{0,2}\s*['"]?([^\s'"<>|;&]+)['"]?\s*<<-?\s*['"]?\w+"#,
-    )
 }
 
 /// Prose files an agent writes to record state: notes, statuses, briefs, commit messages.
@@ -402,13 +383,6 @@ fn when(m: &Message) -> String {
     m.timestamp
         .map(|t| t.format("%m-%d %H:%M").to_string())
         .unwrap_or_default()
-}
-
-fn attachment_type(m: &Message) -> Option<&str> {
-    m.extra
-        .get("claude")
-        .and_then(|b| b.get("attachment_type"))
-        .and_then(Value::as_str)
 }
 
 fn est(s: &str) -> u64 {
@@ -549,7 +523,7 @@ fn hosts_in(cmd: &str) -> Vec<String> {
         i += 1;
     }
     if cmd.contains("scp ") || cmd.contains("rsync ") {
-        for c in remote_target_re().captures_iter(cmd) {
+        for c in re(Re::RemoteTarget).captures_iter(cmd) {
             let h = &c[1];
             if !h.contains('/') && !h.starts_with("http") && h.len() > 2 {
                 out.push(h.to_string());
@@ -559,7 +533,7 @@ fn hosts_in(cmd: &str) -> Vec<String> {
     out
 }
 
-fn note_paths(p: &str) -> bool {
+fn plausible_path(p: &str) -> bool {
     p.len() >= 8
         && !p.starts_with("/dev/")
         && !p.starts_with("/proc/")
@@ -569,16 +543,9 @@ fn note_paths(p: &str) -> bool {
         && !p.starts_with("/etc/")
 }
 
-/// Distill `session` (any harness; owned or checked source-backed) into a context pack, a tail cut point and the
-/// elided-output list. Source-backed values are validated before analysis; failures propagate.
-/// Only demanded messages, fields and products become owned.
-pub fn distill(session: &Session, opts: &DistillOptions) -> anyhow::Result<Distilled> {
-    Ok(prepare_distill(session, opts)?.distilled)
-}
-
 /// Prepare only the pack and identical statistics, without retaining the sidecar roster.
-/// `elided` is empty even when `stats.elided_outputs` is nonzero; use [`distill`] or
-/// [`prepare_distill`] when complete sidecar entries or resumable products are needed.
+/// `elided` is empty even when `stats.elided_outputs` is nonzero; use [`prepare_distill`]
+/// when complete sidecar entries or resumable products are needed.
 pub fn distill_pack(session: &Session, opts: &DistillOptions) -> anyhow::Result<Distilled> {
     Ok(analyze(session, opts, Demand::Pack)?.distilled)
 }
@@ -646,7 +613,7 @@ fn validate_analysis_sources(session: &Session) -> anyhow::Result<()> {
                 Block::ToolResult { content, .. } => Some(content),
                 _ => None,
             };
-            if let Some(text) = text.filter(|text| text.is_span()) {
+            if let Some(text) = text.filter(|text| text.is_lazy()) {
                 text.try_for_each_chunk(&resolver, 64 * 1024, |_| Ok(()))?;
             }
         }
@@ -664,22 +631,15 @@ fn validate_analysis_sources(session: &Session) -> anyhow::Result<()> {
 }
 
 fn analysis_label(session: &Session, resolver: &crate::Resolver) -> anyhow::Result<String> {
-    if let Some(description) = session
-        .harness_extra(crate::Harness::Claude)
-        .and_then(|bag| bag.get("agent_description"))
-        .and_then(Value::as_str)
+    // Every adapter is asked: a bag is keyed by the harness that wrote it, not by `session.harness`.
+    if let Some(description) = crate::Harness::ALL
+        .iter()
+        .filter_map(|h| crate::harness::rootless(*h))
+        .find_map(|adapter| adapter.agent_description(session))
     {
         return Ok(description.to_owned());
     }
-    let first_user = session
-        .messages
-        .iter()
-        .find(|message| message.role == Role::User)
-        .map(|message| MessageText::new(message, resolver).text())
-        .transpose()?
-        .flatten()
-        .filter(|text| !text.trim().is_empty());
-    Ok(crate::ir::label_from(session.title.as_deref(), first_user.as_deref()))
+    Ok(crate::ir::label_from(session.title_with(resolver)?.as_deref(), None))
 }
 
 fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::Result<PreparedDistillation> {
@@ -698,12 +658,13 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in msgs.iter().filter(|_| demand != Demand::Findings) {
         let incoming = (m.role == Role::User && m.kind == MessageKind::Prompt)
-            || (m.kind == MessageKind::InjectedContext && matches!(attachment_type(m), Some("queued_command")));
+            || (m.kind == MessageKind::InjectedContext
+                && matches!(crate::harness::attachment_kind(m), Some("queued_command")));
         if !incoming {
             continue;
         }
         let t = MessageText::new(m, &resolver).text()?.unwrap_or_default();
-        for c in path_re().captures_iter(&t) {
+        for c in re(Re::Path).captures_iter(&t) {
             referenced.insert(c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']).to_string());
         }
     }
@@ -809,7 +770,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
             }
             (_, MessageKind::InjectedContext) if !in_tail && demand != Demand::Findings => {
                 // A message delivered mid-run (peer agent, coordinator, queued user input).
-                if matches!(attachment_type(m), Some("queued_command")) {
+                if matches!(crate::harness::attachment_kind(m), Some("queued_command")) {
                     timeline.push(Entry {
                         idx: i,
                         when: when(m),
@@ -934,9 +895,9 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         if m.role == Role::Assistant {
             for (index, b) in m.content.iter().enumerate() {
                 if let Block::Text { .. } = b {
-                    for c in path_re().captures_iter(reader.block(index)?) {
+                    for c in re(Re::Path).captures_iter(reader.block(index)?) {
                         let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`']);
-                        if note_paths(p) {
+                        if plausible_path(p) {
                             bump(&mut facts.paths, p);
                         }
                     }
@@ -1126,7 +1087,7 @@ fn own_words_from_tool(i: usize, m: &Message, name: &str, input: &Value, opts: &
         }),
         _ => {
             let cmd = command_of(input)?;
-            let target = heredoc_target_re().captures(cmd)?.get(1)?.as_str().to_string();
+            let target = re(Re::HeredocTarget).captures(cmd)?.get(1)?.as_str().to_string();
             if !is_note_path(&target) || cmd.starts_with("python") {
                 return None;
             }
@@ -1150,10 +1111,10 @@ fn scan_input_facts(_name: &str, input: &Value, f: &mut Facts) {
         for h in hosts_in(c) {
             bump(&mut f.hosts, &h);
         }
-        for c2 in new_branch_re().captures_iter(c) {
+        for c2 in re(Re::NewBranch).captures_iter(c) {
             bump(&mut f.branches, &c2[1]);
         }
-        for c2 in push_re().captures_iter(c) {
+        for c2 in re(Re::Push).captures_iter(c) {
             let r = &c2[1];
             let b = r.rsplit(':').next().unwrap_or(r);
             bump(&mut f.branches, b);
@@ -1161,15 +1122,15 @@ fn scan_input_facts(_name: &str, input: &Value, f: &mut Facts) {
     }
     for k in ["file_path", "path", "notebook_path"] {
         if let Some(p) = input.get(k).and_then(Value::as_str) {
-            if note_paths(p) {
+            if plausible_path(p) {
                 bump(&mut f.paths, p);
             }
         }
     }
     for t in texts {
-        for c in path_re().captures_iter(t) {
+        for c in re(Re::Path).captures_iter(t) {
             let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']);
-            if note_paths(p) {
+            if plausible_path(p) {
                 bump(&mut f.paths, p);
             }
         }
@@ -1187,18 +1148,18 @@ fn scan_result_facts(
     f: &mut Facts,
 ) -> String {
     let mut commit_outcome: Option<String> = None;
-    for c in commit_re().captures_iter(out) {
+    for c in re(Re::Commit).captures_iter(out) {
         let (b, sha, subj) = (c[1].to_string(), c[2].to_string(), c[3].trim().to_string());
         // `git log --oneline`-style listings never use the bracketed form; a bracketed line is a
         // commit (or cherry-pick/amend) the agent made.
-        if !f.commits.iter().any(|x| x.2 == sha) {
+        if f.commit_shas.insert(sha.clone()) {
             bump(&mut f.branches, &b);
             commit_outcome.get_or_insert_with(|| format!("⊕ [{b} {sha}] {}", truncate(subj.trim(), 90)));
             f.tips.push((i, b.clone(), sha.clone()));
             f.commits.push((i, b, sha, subj));
         }
     }
-    for c in on_branch_re().captures_iter(out) {
+    for c in re(Re::OnBranch).captures_iter(out) {
         bump(&mut f.branches, &c[1]);
     }
     if !is_error {
@@ -1206,7 +1167,7 @@ fn scan_result_facts(
             f.heads.push((i, key, line));
         }
     }
-    for c in tip_re().captures_iter(out) {
+    for c in re(Re::Tip).captures_iter(out) {
         bump(&mut f.branches, &c[2]);
         f.tips.push((i, c[2].to_string(), c[1][..12].to_string()));
     }
@@ -1218,7 +1179,7 @@ fn scan_result_facts(
             .lines()
             .map(str::trim)
             .filter(meaningful)
-            .find(|line| error_line_re().is_match(line))
+            .find(|line| re(Re::ErrorLine).is_match(line))
             .or_else(|| out.lines().rev().map(str::trim).find(meaningful))
             .unwrap_or("");
         let line = truncate(line.trim(), 200);
@@ -1228,13 +1189,13 @@ fn scan_result_facts(
     if let Some(c) = commit_outcome {
         return c;
     }
-    let is_gate = name == "Bash" && command_of(input).is_some_and(|c| gate_cmd_re().is_match(c));
+    let is_gate = name == "Bash" && command_of(input).is_some_and(|c| re(Re::GateCmd).is_match(c));
     if is_gate {
         let verdict = out
             .lines()
             .rev()
             .map(str::trim)
-            .find(|l| verdict_re().is_match(l))
+            .find(|l| re(Re::Verdict).is_match(l))
             .or_else(|| out.lines().rev().map(str::trim).find(|l| !l.is_empty()))
             .unwrap_or("(no output)");
         let verdict = truncate(verdict.trim(), 160);
@@ -1402,14 +1363,14 @@ fn clear_resume_usage(message: &mut Message) {
     // The old complete native record would reintroduce stale usage or unclipped payloads
     // under complete emission. Distillation deliberately replaces that representation.
     message.complete_record = None;
-    message.extra.remove(crate::harness::claude::CARRIER_KEY);
+    message.extra.remove(crate::ir::CARRIER_KEY);
 }
 
 /// The tail as real IR turns for a resumable session: thinking dropped (unless asked), recorded
 /// usage stripped (so a resume gate never reads the source's stale near-limit size), oversized
 /// results clipped with a `cv cat` pointer, queued messages turned into user turns, harness-only
 /// records dropped. A trailing call with no result stays here (the pack shows the lane stopped
-/// mid-call); the Claude emitter drops it from a resumable session (`harness::claude::emit::make_resumable`).
+/// mid-call); the Claude emitter drops it from a resumable session (`harness::claude::emit::emit`).
 fn resumable_tail(
     msgs: &[Message],
     tail_start: usize,
@@ -1463,7 +1424,9 @@ fn resumable_tail(
                 owned.materialize(resolver)?;
                 out.push(owned);
             }
-            (_, MessageKind::InjectedContext) if matches!(attachment_type(m), Some("queued_command")) => {
+            (_, MessageKind::InjectedContext)
+                if matches!(crate::harness::attachment_kind(m), Some("queued_command")) =>
+            {
                 let mut u = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent);
                 u.id = m.id.clone();
                 u.parent_id = m.parent_id.clone();
@@ -1561,7 +1524,7 @@ pub fn resume_preamble(d: &Distilled, keep_last: usize) -> String {
 /// The caller emits it (as a session, or as a sub-agent of a root) with the Claude emitter, which
 /// owns the resumability rules: the first tail turn's parent names a record the tail does not
 /// carry and is re-linked to the opening prompt, a hook attachment's child is re-linked over the
-/// gap, an unanswered trailing call is dropped (`harness::claude::emit::make_resumable`). This is a selector.
+/// gap, an unanswered trailing call is dropped (`harness::claude::emit::emit`). This is a selector.
 pub fn resumable_session(session: &Session, d: &Distilled, opts: &DistillOptions) -> anyhow::Result<Session> {
     let tail = resumable_tail(
         &session.messages,
@@ -1586,9 +1549,6 @@ fn session_with_tail(session: &Session, d: &Distilled, keep_last: usize, mut tai
     let mut messages = vec![first];
     messages.append(&mut tail);
     let output = Session {
-        source_stamp: None,
-        id: session.id.clone(),
-        harness: session.harness,
         cwd: session.cwd.clone(),
         title: Some(format!("distilled: {}", d.label)),
         created_at: session.created_at,
@@ -1596,14 +1556,12 @@ fn session_with_tail(session: &Session, d: &Distilled, keep_last: usize, mut tai
         model: session.model.clone(),
         git: session.git.clone(),
         principal: session.principal.clone(),
-        system_prompt: None,
         lineage: crate::ir::Lineage {
             forked_from: Some(session.id.clone()),
             ..Default::default()
         },
         messages,
-        source_path: None,
-        extra: serde_json::Map::new(),
+        ..Session::new(session.id.clone(), session.harness)
     };
     // The selected tail was already materialized; earlier inputs were never demanded.
     output
@@ -1623,7 +1581,7 @@ pub fn findings(session: &Session, opts: &DistillOptions) -> anyhow::Result<Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::emit::grok_qwen_tests::Frozen;
+    use crate::emit::frozen::Frozen;
     use crate::ir::Harness;
     use serde_json::json;
 
@@ -1793,7 +1751,7 @@ body λ",
                     }
                 }
                 frozen.insert(format!("keep{keep_last}-result{tail_result_max}"), entry);
-                same_products(&distill(&source, &opts)?, &actual);
+                same_products(&prepare_distill(&source, &opts)?.distilled, &actual);
                 assert_eq!(
                     serde_json::to_value(resumable_session(&source, &actual, &opts)?)?,
                     serde_json::to_value(&actual_session)?
@@ -1847,7 +1805,7 @@ body λ",
         ));
         std::fs::write(&path, b"changed")?;
         assert!(prepare_distill(&source, &opts).is_err());
-        assert!(distill(&source, &opts).is_err());
+        assert!(prepare_distill(&source, &opts).is_err());
         assert!(findings(&source, &opts).is_err());
         Ok(())
     }
@@ -1948,7 +1906,7 @@ facts text",
             };
             let prepared = prepare_distill(&source, &opts)?;
             let (actual, actual_session) = prepared.into_resumable_session(&source);
-            same_products(&distill(&source, &opts)?, &actual);
+            same_products(&prepare_distill(&source, &opts)?.distilled, &actual);
             WORK.with(|cell| cell.set(Work::default()));
             let pack = distill_pack(&source, &opts)?;
             let work = WORK.with(|cell| cell.get());
@@ -1998,7 +1956,7 @@ facts text",
     }
 
     #[test]
-    fn full_analysis_preserves_malformed_span_text_but_rejects_failed_sources() -> anyhow::Result<()> {
+    fn full_analysis_reads_span_text_but_rejects_malformed_and_failed_sources() -> anyhow::Result<()> {
         let world = cv_testkit::World::new("distill-legacy-spans");
         let path = world.base.join("span.txt");
         let opts = DistillOptions {
@@ -2007,8 +1965,9 @@ facts text",
         };
         let mut frozen = Frozen::new("distill-span-text");
         for body in [Some(r#"escaped\n\u03bb"#), Some(r#"malformed\q"#), None] {
+            // A span covers a JSON string's body.
             if let Some(body) = body {
-                std::fs::write(&path, body)?;
+                std::fs::write(&path, format!("\"{body}\""))?;
             } else {
                 std::fs::remove_file(&path)?;
             }
@@ -2019,20 +1978,20 @@ facts text",
                 vec![Block::Text {
                     text: crate::Text::Span(crate::Span {
                         source: Some(path.clone()),
-                        offset: 0,
+                        offset: 1,
                         len: body.map_or(20, str::len) as u64,
                         escaped: true,
                     }),
                 }],
             ));
-            if body.is_none() {
-                assert!(distill(&source, &opts).is_err());
+            if body.is_none_or(|body| body.starts_with("malformed")) {
+                assert!(prepare_distill(&source, &opts).is_err());
                 assert!(prepare_distill(&source, &opts).is_err());
                 assert!(distill_pack(&source, &opts).is_err());
                 assert!(findings(&source, &opts).is_err());
                 continue;
             }
-            let expected = distill(&source, &opts)?;
+            let expected = prepare_distill(&source, &opts)?.distilled;
             frozen.insert(body.unwrap(), products(&expected));
             let pack = distill_pack(&source, &opts)?;
             assert_eq!(pack.pack(), expected.pack());
@@ -2105,7 +2064,7 @@ facts text",
                 keep_last: 0,
                 ..Default::default()
             };
-            let expected = distill(&session, &options)?;
+            let expected = prepare_distill(&session, &options)?.distilled;
             frozen.insert(format!("input{i}"), products(&expected));
             let pack = distill_pack(&session, &options)?;
             assert_eq!(pack.pack(), expected.pack());
@@ -2185,14 +2144,14 @@ facts text",
         };
         *input = crate::Json::source(&argument_path, 0, original_arguments.len() as u64)?;
         let span_path = world.base.join("legacy-span.txt");
-        std::fs::write(&span_path, b"legacy span reply")?;
+        std::fs::write(&span_path, b"\"legacy span reply\"")?;
         source.messages.push(msg(
             Role::Assistant,
             MessageKind::Reply,
             vec![Block::Text {
                 text: crate::Text::Span(crate::Span {
                     source: Some(span_path),
-                    offset: 0,
+                    offset: 1,
                     len: 17,
                     escaped: false,
                 }),
@@ -2277,35 +2236,23 @@ facts text",
         ));
         msgs.push(msg(Role::Assistant, MessageKind::Reply, vec![call("z1", "ls", "List")]));
         Session {
-            source_stamp: None,
-            id: "agent-test".into(),
-            harness: Harness::Claude,
-            cwd: None,
-            title: None,
-            created_at: None,
-            updated_at: None,
-            model: None,
-            git: None,
-            principal: None,
-            system_prompt: None,
-            lineage: Default::default(),
             messages: msgs,
-            source_path: None,
-            extra: Default::default(),
+            ..Session::new("agent-test", Harness::Claude)
         }
     }
 
     #[test]
     fn keeps_brief_words_commits_errors_and_collapses_polls() {
         let s = lane();
-        let d = distill(
+        let d = prepare_distill(
             &s,
             &DistillOptions {
                 keep_last: 2,
                 ..Default::default()
             },
         )
-        .unwrap();
+        .unwrap()
+        .distilled;
         let p = d.pack();
         assert!(p.contains("You are lane X. Build the thing on box1."));
         assert!(p.contains("Chose rebase over merge"));
@@ -2322,14 +2269,15 @@ facts text",
     #[test]
     fn tail_opens_on_an_assistant_turn_and_keeps_the_source_threading() {
         let s = lane();
-        let d = distill(
+        let d = prepare_distill(
             &s,
             &DistillOptions {
                 keep_last: 2,
                 ..Default::default()
             },
         )
-        .unwrap();
+        .unwrap()
+        .distilled;
         assert_eq!(s.messages[d.tail_start].role, Role::Assistant);
         let r = resumable_session(
             &s,
@@ -2461,10 +2409,9 @@ facts text",
                 input_tokens: Some(100000),
                 ..Default::default()
             });
-            message.extra.insert(
-                crate::harness::claude::CARRIER_KEY.into(),
-                json!({"usage":{"input_tokens":100000}}),
-            );
+            message
+                .extra
+                .insert(crate::ir::CARRIER_KEY.into(), json!({"usage":{"input_tokens":100000}}));
             crate::ir::CompleteRecord::attach(
                 std::slice::from_mut(message),
                 Harness::Claude,
@@ -2481,8 +2428,10 @@ facts text",
         assert_eq!(prepared.distilled.stats.tail_tool_calls, 3);
         let (_, resumed) = prepared.into_resumable_session(&source);
         assert!(resumed.messages.iter().all(|message| message.usage.is_none()));
-        assert!(resumed.messages.iter().all(|message| message.complete_record.is_none()
-            && !message.extra.contains_key(crate::harness::claude::CARRIER_KEY)));
+        assert!(resumed
+            .messages
+            .iter()
+            .all(|message| message.complete_record.is_none() && !message.extra.contains_key(crate::ir::CARRIER_KEY)));
         assert!(resumed.messages.iter().all(Message::is_model_visible));
         let retained = tool_index(&resumed.messages);
         for message in &resumed.messages {

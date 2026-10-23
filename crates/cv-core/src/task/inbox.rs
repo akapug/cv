@@ -42,7 +42,9 @@ pub struct InboxItem {
     pub repo: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<String>,
-    pub body: String,
+    /// `None` on brief pages, which never carry bodies (and are never serialized).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
     pub blocked: bool,
     pub last_by: String,
     pub last_ts: DateTime<Utc>,
@@ -52,7 +54,9 @@ pub struct InboxItem {
     /// The pinned STATUS text, when one is pinned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    pub notes: Vec<NoteView>,
+    /// `None` on brief pages, which never carry notes (and are never serialized).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<NoteView>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -137,6 +141,7 @@ pub struct InboxCounts {
     pub provisional: usize,
     pub assigned: usize,
     pub claimed: usize,
+    /// Unread open items only; unread rows in closed are not included.
     pub unread: usize,
     pub closed: usize,
 }
@@ -198,7 +203,7 @@ fn item_of(ctx: &PageCtx<'_>, t: &TaskProjection, reason: Option<InboxReason>, s
         tags: t.tags.clone(),
         repo: t.repo.clone(),
         issue: t.issue.clone(),
-        body: if ctx.rich { t.body.clone() } else { String::new() },
+        body: ctx.rich.then(|| t.body.clone()),
         blocked: project::is_blocked(model, t),
         last_by: last_by.to_string(),
         last_ts: t.last_ts,
@@ -224,7 +229,7 @@ fn item_of(ctx: &PageCtx<'_>, t: &TaskProjection, reason: Option<InboxReason>, s
         } else {
             None
         },
-        notes: if ctx.rich {
+        notes: ctx.rich.then(|| {
             t.notes
                 .iter()
                 .map(|n| NoteView {
@@ -235,9 +240,7 @@ fn item_of(ctx: &PageCtx<'_>, t: &TaskProjection, reason: Option<InboxReason>, s
                     split_into: children.get(&n.event_id).cloned(),
                 })
                 .collect()
-        } else {
-            Vec::new()
-        },
+        }),
     }
 }
 
@@ -281,7 +284,12 @@ fn build_page(
         model,
         who,
         plen: project::unique_prefix_len(model.tasks.keys().map(String::as_str), 8),
-        children: decisions_from_notes(model),
+        // Only rich rows carry notes, so only they name a split decision.
+        children: if rich {
+            decisions_from_notes(model)
+        } else {
+            HashMap::new()
+        },
         authors: last_authors(model, &outcome.events),
         now,
         rich,
@@ -410,7 +418,7 @@ mod tests {
             assert_eq!(page.items.len(), 1);
             assert_eq!(page.items[0].last_by, "web:ember");
             assert!(!page.items[0].unread);
-            assert_eq!(page.items[0].notes.len(), 2);
+            assert_eq!(page.items[0].notes.as_ref().unwrap().len(), 2);
             assert!(inbox_page(&outcome, who, None, None, true, ts).items.is_empty());
         }
         outcome.events.push(event(
@@ -454,17 +462,7 @@ mod tests {
             kind,
         };
         let events = vec![
-            ev(
-                1,
-                TaskEventKind::Opened {
-                    title: "pick".into(),
-                    body: String::new(),
-                    repo: None,
-                    issue: None,
-                    channel: None,
-                    assignee: Some("ember".into()),
-                },
-            ),
+            ev(1, crate::task::opened_kind("pick", Some("ember"))),
             ev(
                 2,
                 TaskEventKind::Posed {

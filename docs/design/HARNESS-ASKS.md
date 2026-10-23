@@ -4,6 +4,11 @@ Status: a letter, not a plan. Quotes are from https://code.claude.com/docs/en/ho
 /docs/en/sub-agents as served on 2026-10-11. Each ask is one field. Delete this file when both
 land or are declined. Context: `docs/INTERFACE-V2.md` "The shape" and the manual's hooks section.
 
+Rechecked 2026-10-18 for 0.18 K1: the [official hooks reference](https://code.claude.com/docs/en/hooks#precompact)
+still documents PreCompact veto control, not `compactSummary` replacement. PostCompact's
+`compact_summary` observes the generated summary and cannot change it. No pre-compact summary
+writer can be implemented against this documented contract yet.
+
 ## What the contract says today
 
 PreCompact input (quoted): "In addition to the common input fields, PreCompact hooks receive
