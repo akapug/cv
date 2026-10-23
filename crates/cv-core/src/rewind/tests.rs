@@ -1203,7 +1203,11 @@ fn track(v: &Value, open: &mut HashMap<String, Option<String>>, closed: Option<&
     std::fs::write(&path, v.to_string()).unwrap();
     let source = crate::json::JsonSource::capture(&path).unwrap();
     let facts = source
-        .read_range_value(0, source.len(), |view| Ok(Facts::parse(view)?.0))
+        .read(
+            crate::json::ReadInput::Range(0, source.len()),
+            crate::json::Validation::Value,
+            |view| Ok(Facts::parse(view)?.0),
+        )
         .unwrap();
     track_tool_calls(&facts, open, closed);
 }
