@@ -445,12 +445,10 @@ fn control(view: JsonView<'_>, top: &Fields<'_>, ty: &str, common: &Common, span
 /// A `message` entry → its turn(s). The `compactionSummary` custom role (the pre-`compaction`-entry
 /// form) yields two: the boundary (the entry's id and token counts) and the summary.
 fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message>> {
-    let Some(body) = top
-        .get("message")
-        .map(|m| Fields::parse(m, BODY))
-        .transpose()?
-        .flatten()
-    else {
+    let Some(container) = top.get("message") else {
+        return Ok(Vec::new());
+    };
+    let Some(body) = Fields::parse(container, BODY)? else {
         return Ok(Vec::new());
     };
     let Some(role_str) = body.string("role")? else {
@@ -469,8 +467,9 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
         "compactionSummary" => (Role::System, MessageKind::CompactionSummary, Origin::Harness),
         _ => return Ok(Vec::new()),
     };
-    // A system prompt is also the owned `Session::system_prompt`: its text is always inline.
-    let spans = spans && role_str != "system";
+    // A system prompt is also the owned `Session::system_prompt`: its text is always inline. So
+    // this message's span rule is the entry's, narrowed: named apart from the parameter.
+    let keep_source = spans && role_str != "system";
     let provenance = match body.get("provenance") {
         Some(p) if p.is_object()? => Some(p.resolve()?.into_owned()),
         _ => None,
@@ -491,7 +490,7 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
             // on the block, where every harness puts them.
             m.content.push(Block::ToolResult {
                 tool_use_id: body.string("toolCallId")?.unwrap_or_default(),
-                content: text_parts(content, spans)?,
+                content: text_parts(content, keep_source)?,
                 is_error: body
                     .get("isError")
                     .map(JsonView::as_bool)
@@ -507,7 +506,7 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
                 for item in items {
                     let item = item?;
                     if string(item.get("type")?)?.as_deref() == Some("image") {
-                        if let Some(b) = block(item, spans)? {
+                        if let Some(b) = block(item, keep_source)? {
                             m.content.push(b);
                         }
                     }
@@ -515,14 +514,14 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
             }
         }
         "assistant" => {
-            blocks(&mut m, content, spans)?;
+            blocks(&mut m, content, keep_source)?;
             assistant_meta(&mut m, &body)?;
         }
         "user" | "system" => match content {
             Some(c) if c.is_string()? => m.content.push(Block::Text {
-                text: lazy(Some(c), spans)?,
+                text: lazy(Some(c), keep_source)?,
             }),
-            _ => blocks(&mut m, content, spans)?,
+            _ => blocks(&mut m, content, keep_source)?,
         },
         "bashExecution" => {
             let command = body.get("command").filter(|v| v.is_string().unwrap_or(false));
@@ -539,9 +538,8 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
                     pieces.extend([Piece::Literal("\n"), Piece::String(output)]);
                 }
             }
-            let container = top.get("message").expect("parsed body");
             m.content.push(Block::Text {
-                text: joined(container, spans, &pieces)?,
+                text: joined(container, keep_source, &pieces)?,
             });
             custom_role_bag(
                 &mut m,
@@ -558,7 +556,7 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
         }
         "branchSummary" => {
             m.content.push(Block::Text {
-                text: lazy(body.get("summary"), spans)?,
+                text: lazy(body.get("summary"), keep_source)?,
             });
             let from_id = body.string("fromId")?;
             let bag = custom_role_bag(&mut m, "branchSummary", &body, &[])?;
@@ -568,7 +566,7 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
         }
         "compactionSummary" => {
             m.content.push(Block::Text {
-                text: lazy(body.get("summary"), spans)?,
+                text: lazy(body.get("summary"), keep_source)?,
             });
             custom_role_bag(
                 &mut m,
@@ -578,7 +576,7 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
             )?;
         }
         _ => {
-            let text = text_parts(content, spans)?;
+            let text = text_parts(content, keep_source)?;
             if !text.is_empty() {
                 m.content.push(Block::Text { text });
             }
@@ -604,6 +602,8 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
     }
     // The old single-record form: the record IS the compaction. The boundary keeps the entry's id
     // (what a later `firstKeptEntryId` / label points at) and counts; the summary hangs off it.
+    // The whole bag goes to the boundary — `message_role` and the token counts it already carries —
+    // and the summary gets its own role marker re-inserted below, so the split is deliberate.
     let mut boundary = Message::synthesized(MessageKind::CompactionBoundary, Origin::Harness);
     boundary.id = m.id.take();
     boundary.parent_id = m.parent_id.take();
@@ -613,6 +613,26 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
     m.harness_extra_mut(Harness::OpenClaw)
         .insert("message_role".into(), Value::from(role_str));
     Ok(vec![boundary, m])
+}
+
+/// An assistant reply that is an API failure (`errorMessage`, or `stopReason: "error"`).
+fn failed(body: &Fields<'_>) -> Result<bool> {
+    Ok(string(body.get("errorMessage"))?.is_some_and(|e| !e.is_empty())
+        || string(body.get("stopReason"))?.as_deref() == Some("error"))
+}
+
+/// Whether a `message` entry's body is a turn ([`Message::is_turn`]) as [`message`] kinds it: a
+/// `user` message that [`user_provenance`] leaves a prompt, or an `assistant` reply that is not a
+/// failure. Reads `role`, `provenance`, `errorMessage` and `stopReason`, never content.
+pub(super) fn is_turn(body: &Fields<'_>) -> Result<bool> {
+    Ok(match body.string("role")?.as_deref() {
+        Some("user") => match body.get("provenance") {
+            Some(p) if p.is_object()? => user_provenance(&*p.resolve()?).0 == MessageKind::Prompt,
+            _ => true,
+        },
+        Some("assistant") => !failed(body)?,
+        _ => false,
+    })
 }
 
 /// A user message OpenClaw wrote on someone else's behalf carries `provenance` (`InputProvenance`,
@@ -637,8 +657,7 @@ fn user_provenance(p: &Value) -> (MessageKind, Origin) {
 /// Capture assistant-level metadata (provider/api/model/usage/stop/diagnostics) into the harness
 /// bag, and an API failure into the `Error` kind (`extra["openclaw"]["error"]`).
 fn assistant_meta(m: &mut Message, body: &Fields<'_>) -> Result<()> {
-    let failed = string(body.get("errorMessage"))?.is_some_and(|e| !e.is_empty())
-        || string(body.get("stopReason"))?.as_deref() == Some("error");
+    let failed = failed(body)?;
     let usage = body.value("usage")?;
     if let Some(usage) = &usage {
         m.usage = parse_usage(usage);

@@ -88,18 +88,81 @@ impl Adapter for Roo {
     /// neither): `say: checkpoint_saved` (a shadow-git commit under `checkpoints/`) and the `ask`s
     /// that gate a tool, a command, an MCP call or a browser launch.
     fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
-        ui_affordances(&r.path.join("ui_messages.json"))
+        let path = r.path.join("ui_messages.json");
+        let read = UI.with(|slot| slot.borrow_mut().take());
+        match read {
+            Some((at, state, affordances)) if at == path && crate::source::FileId::at(&path) == state => {
+                Ok(affordances)
+            }
+            _ => ui_affordances(&path),
+        }
     }
 }
 
-fn ui_affordances(path: &Path) -> Result<Vec<crate::affordance::Affordance>> {
-    use crate::affordance::{Affordance, Kind};
+thread_local! {
+    /// The affordances [`ui_times`] read from one `ui_messages.json` at one state, for the
+    /// [`Roo::store_affordances`] that follows its read on this thread: one file, taken once.
+    static UI: std::cell::RefCell<UiRead> = const { std::cell::RefCell::new(None) };
+}
+type UiRead = Option<(
+    PathBuf,
+    Option<crate::source::FileId>,
+    Vec<crate::affordance::Affordance>,
+)>;
+
+/// A task's `ui_messages.json` read once for its timestamp hints and its affordances, which wait
+/// in [`UI`] for the count's [`Roo::store_affordances`]. `None` when the file does not decode or
+/// cannot be read as a whole value: the caller reads it as before, and so does the affordance pass.
+pub(super) fn ui_times(dir: &Path) -> Option<super::cline::UiTimes> {
     use serde_json::Value;
+    let path = dir.join("ui_messages.json");
+    #[cfg(test)]
+    UI_READS.lock().unwrap().push(path.clone());
+    let state = crate::source::FileId::at(&path);
+    let value = crate::affordance::side_json(&path).ok()?;
+    let mut times: super::cline::UiTimes = Default::default();
+    if let Some(Value::Array(events)) = &value {
+        let (mut first, mut last) = (None, None);
+        for e in events {
+            let ts = e
+                .get("ts")
+                .and_then(Value::as_i64)
+                .and_then(chrono::DateTime::from_timestamp_millis);
+            if let Some(dt) = ts {
+                first.get_or_insert(dt);
+                last = Some(dt);
+            }
+        }
+        times = (first, last, first);
+    }
+    let affordances = match &value {
+        Some(Value::Array(events)) => ui_affordances_of(events),
+        _ => Vec::new(),
+    };
+    if crate::source::FileId::at(&path) == state {
+        UI.with(|slot| *slot.borrow_mut() = Some((path, state, affordances)));
+    }
+    Some(times)
+}
+
+#[cfg(test)]
+static UI_READS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn ui_affordances(path: &Path) -> Result<Vec<crate::affordance::Affordance>> {
+    use serde_json::Value;
+    #[cfg(test)]
+    UI_READS.lock().unwrap().push(path.to_path_buf());
     let Some(Value::Array(events)) = crate::affordance::side_json(path)? else {
         return Ok(Vec::new());
     };
+    Ok(ui_affordances_of(&events))
+}
+
+fn ui_affordances_of(events: &[serde_json::Value]) -> Vec<crate::affordance::Affordance> {
+    use crate::affordance::{Affordance, Kind};
+    use serde_json::Value;
     let mut out = Vec::new();
-    for e in &events {
+    for e in events {
         if e.get("partial").and_then(Value::as_bool) == Some(true) {
             continue;
         }
@@ -136,7 +199,7 @@ fn ui_affordances(path: &Path) -> Result<Vec<crate::affordance::Affordance>> {
             _ => {}
         }
     }
-    Ok(out)
+    out
 }
 
 /// Emit `session` into Roo's per-task layout under `out_dir`: the Cline writer, tagged for Roo.
@@ -154,6 +217,50 @@ mod tests {
     fn fixture(name: &str) -> String {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/roo/");
         std::fs::read_to_string(format!("{path}{name}")).unwrap_or_else(|e| panic!("reading fixture {name}: {e}"))
+    }
+
+    /// A count reads a task's `ui_messages.json` once: the stream's timestamp hints and the
+    /// affordance pass share the read, and give what each read alone gave.
+    #[test]
+    fn a_count_reads_ui_messages_once() {
+        let world = crate::test_world("roo-ui-once");
+        let dir = world.base.join("1717111111111");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("api_conversation_history.json"),
+            fixture("api_conversation_history.json"),
+        )
+        .unwrap();
+        let ui = dir.join("ui_messages.json");
+        fs::write(
+            &ui,
+            r#"[{"ts":1717111111000,"type":"say","say":"text","text":"hi"},
+                {"ts":1717111112000,"type":"say","say":"checkpoint_saved","text":"0123456789abcdef"},
+                {"ts":1717111113000,"type":"ask","ask":"command","text":"cargo test"}]"#,
+        )
+        .unwrap();
+        let r = SessionRef::new("1717111111111", Harness::Roo, &dir);
+        let reads = || {
+            let mut all = UI_READS.lock().unwrap();
+            let mine = all.iter().filter(|p| **p == ui).count();
+            all.retain(|p| *p != ui);
+            mine
+        };
+        // A counted read: the stream, then the affordance pass.
+        let s = crate::stream::collect_with(&ROOTLESS, &r, &Demand::RICH).unwrap();
+        assert_eq!(reads(), 1);
+        assert_eq!(s.created_at, chrono::DateTime::from_timestamp_millis(1717111111000));
+        // The same pass by hand gives what a read of the file alone gives.
+        let json = |a: &[crate::affordance::Affordance]| serde_json::to_string(a).unwrap();
+        crate::stream::collect_with(&ROOTLESS, &r, &Demand::RICH).unwrap();
+        reads();
+        let mut sink = crate::stream::CollectSink::default();
+        ROOTLESS.stream(&r, &Demand::RICH, &mut sink).unwrap();
+        let shared = ROOTLESS.store_affordances(&r).unwrap();
+        assert_eq!(reads(), 1);
+        let alone = ui_affordances(&ui).unwrap();
+        assert_eq!(json(&shared), json(&alone));
+        assert_eq!(alone.len(), 2);
     }
 
     #[test]
@@ -176,9 +283,6 @@ mod tests {
     /// message count + roles + tool blocks survive the round-trip.
     #[test]
     fn emit_round_trips_through_parser() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-
         // ── build a small session ──
         let mut user = Message::new(Role::User);
         user.content = vec![Block::Text {
@@ -219,10 +323,8 @@ mod tests {
             ..Session::new("src", Harness::Roo)
         };
 
-        // ── emit to a unique temp dir (no tempfile crate) ──
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let out_dir = std::env::temp_dir().join(format!("cv-roo-emit-{}-{}", std::process::id(), n));
-        let _ = fs::remove_dir_all(&out_dir);
+        // ── emit to a unique temp dir ──
+        let out_dir = cv_testkit::temp_dir("roo-emit");
 
         let result = emit(&session, &out_dir, &crate::emit::EmitOptions::default()).expect("emit roo session");
 

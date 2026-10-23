@@ -160,16 +160,13 @@ mod tests {
     }
 
     #[test]
-    fn source_text_frames_and_labels_match_owned_and_reject_changed_guards() {
+    fn source_text_frames_and_labels_match_owned() {
         let world = crate::test_world("archive-source-text");
         let path = world.home.join("source.json");
-        let sidecar = world.home.join("optional-meta.json");
         let body = "  λ moon\n\"text\" ".repeat(10_000);
         let encoded = serde_json::to_vec(&body).unwrap();
         fs::write(&path, &encoded).unwrap();
-        let mut guard = cv_core::source::ReadSet::default();
-        guard.record(&sidecar);
-        let json = cv_core::Json::source_with_reads(&path, 0, encoded.len() as u64, &guard).unwrap();
+        let json = cv_core::Json::source(&path, 0, encoded.len() as u64).unwrap();
         let text = json.with_view(|v| v.source_text()).unwrap().unwrap();
         assert!(matches!(text, cv_core::Text::Source(_)));
         let mut owned = Session::new("source-label", Harness::Codex);
@@ -184,6 +181,24 @@ mod tests {
         actual.copy_to(&mut right).unwrap();
         assert_eq!(left, right);
         assert_eq!(label.unwrap().head, source_label.unwrap().head);
+    }
+
+    #[test]
+    fn spool_rejects_changed_guards() {
+        let world = crate::test_world("archive-source-guard");
+        let path = world.home.join("source.json");
+        let sidecar = world.home.join("optional-meta.json");
+        let body = "  λ moon\n\"text\" ".repeat(10_000);
+        let encoded = serde_json::to_vec(&body).unwrap();
+        fs::write(&path, &encoded).unwrap();
+        let mut guard = cv_core::source::ReadSet::default();
+        guard.record(&sidecar);
+        let json = cv_core::Json::source_with_reads(&path, 0, encoded.len() as u64, &guard).unwrap();
+        let text = json.with_view(|v| v.source_text()).unwrap().unwrap();
+        let mut owned = Session::new("source-label", Harness::Codex);
+        owned.messages.push(message(&body));
+        let mut lazy = owned.clone();
+        lazy.messages[0].content = vec![Block::Text { text }];
         fs::write(&sidecar, "new metadata").unwrap();
         let mut spool = Spool::new(&path);
         assert_eq!(spool.message(lazy.messages.remove(0)), Flow::Stop);

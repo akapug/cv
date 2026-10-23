@@ -43,6 +43,7 @@
 //! namespace (`rooveterinaryinc.roo-cline` / `rooveterinaryinc.roo-code`) and `~/.roo/`. The real
 //! parsing lives here as `pub` helpers; `roo.rs` reuses them with Roo's paths + `Harness::Roo`.
 
+use crate::json::{ReadInput, Validation};
 mod prompt;
 mod writer;
 
@@ -126,7 +127,7 @@ impl Adapter for Cline {
                 deps.files.push(dir.join(format!("{sid}.json")));
                 if !r.id.contains('/') {
                     if let Some(data) = dir.parent().and_then(Path::parent) {
-                        for name in ["sessions.db", "cron.db", "teams.db"] {
+                        for name in super::cline_sdk::SIDE_DATABASES {
                             let db = data.join("db").join(name);
                             deps.files.extend(sqlite_sidecars(&db));
                             deps.files.push(db);
@@ -160,6 +161,20 @@ impl Adapter for Cline {
             }
             stream_task_dir(&r.path, &r.id, Harness::Cline, opts, sink)
         })
+    }
+
+    /// An SDK lead session reads its own rows of the store's side databases, which every session
+    /// of the store writes: it is certified by them ([`super::cline_sdk::side_rows`]).
+    fn rows_store(&self, r: &SessionRef) -> Option<PathBuf> {
+        super::cline_sdk::side_store(r)
+    }
+
+    fn rows_files(&self, store: &Path) -> Vec<PathBuf> {
+        super::cline_sdk::SIDE_DATABASES.map(|name| store.join(name)).into()
+    }
+
+    fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        super::cline_sdk::side_rows(store)
     }
 
     /// The SDK store's side databases: schedule fires and team runs ([`super::cline_sdk`]).
@@ -256,7 +271,14 @@ pub fn discover_in(roots: &[PathBuf], harness: Harness) -> crate::Discovered {
             let Some(id) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
                 continue;
             };
-            if let Some(found) = crate::Skipped::listed(&history, scan(&dir, &id, harness).map(Some)) {
+            // The scan reads the history, the metadata file's cwd and the three files' mtimes:
+            // cached under those files' identities, rescanned only when one moves.
+            let mut reads = crate::source::ReadSet::default();
+            reads.record(&dir.join("ui_messages.json"));
+            reads.record(&dir.join("task_metadata.json"));
+            let scanned =
+                crate::discover_cache::cached_scan_with_reads(&history, reads, || scan(&dir, &id, harness).map(Some));
+            if let Some(found) = crate::Skipped::listed(&history, scanned) {
                 out.push(found);
             }
         }
@@ -264,22 +286,55 @@ pub fn discover_in(roots: &[PathBuf], harness: Harness) -> crate::Discovered {
     out
 }
 
+/// Whether one history item is a turn ([`Message::is_turn`]) as [`record`] reads it: a user or
+/// assistant item that is not a condense summary (`isSummary`), and for a user item, not one
+/// whose content is only `tool_result` blocks (a Tool turn). Reads block types, never bodies.
+fn is_turn(role: &str, record: &Fields<'_>) -> Result<bool> {
+    if !matches!(role, "user" | "assistant")
+        || record.get("isSummary").map(|v| v.as_bool()).transpose()?.flatten() == Some(true)
+    {
+        return Ok(false);
+    }
+    if role == "assistant" {
+        return Ok(true);
+    }
+    // `reasoning` is Cline's own thinking part; every other part is an Anthropic block.
+    let only_results = anthropic::only_tool_results(record.get("content"), |part| {
+        let reasoning = Fields::parse(part, &["type"])?
+            .map(|f| f.string("type"))
+            .transpose()?
+            .flatten()
+            .as_deref()
+            == Some("reasoning");
+        match reasoning {
+            true => Ok(Some(false)),
+            false => anthropic::block_kind(part, &anthropic::ANTHROPIC),
+        }
+    })?;
+    Ok(!only_results)
+}
+
+#[cfg(test)]
+static SCANNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 /// Cheap metadata-only scan of one task dir into a `SessionRef`.
 fn scan(dir: &Path, id: &str, harness: Harness) -> Result<SessionRef> {
+    #[cfg(test)]
+    SCANNED.lock().unwrap().push(dir.to_path_buf());
     let history = dir.join("api_conversation_history.json");
     let source = JsonSource::capture(&history)?;
-    let (mut cwd, title, message_count) = source.read_document(|view| {
+    let (mut cwd, title, message_count) = source.read(ReadInput::Document, Validation::Value, |view| {
         let messages = view.array()?.context("history array")?;
         let mut cwd = None;
         let mut title = None;
         let mut message_count = 0;
         for view in messages {
             let view = view?;
-            let Some(record) = Fields::parse(view, &["role", "content"])? else {
+            let Some(record) = Fields::parse(view, &["role", "content", "isSummary"])? else {
                 continue;
             };
             let role = record.string("role")?.unwrap_or_default();
-            if matches!(role.as_str(), "user" | "assistant") {
+            if is_turn(&role, &record)? {
                 message_count += 1;
             }
             if role == "user" && (cwd.is_none() || title.is_none()) {
@@ -367,7 +422,15 @@ pub fn stream_task_dir(
     session.created_at = task_id_to_time(id);
     session.updated_at = newest_mtime(dir).or(session.created_at);
     // ui_messages.json gives the most precise created/updated and the first user turn's timestamp.
-    let (ui_created, ui_updated, first_user_ts) = ui_message_times(dir)?;
+    // Roo also takes its store affordances from this file: one read serves both.
+    let roo = match harness {
+        Harness::Roo => super::roo::ui_times(dir),
+        _ => None,
+    };
+    let (ui_created, ui_updated, first_user_ts) = match roo {
+        Some(times) => times,
+        None => ui_message_times(dir)?,
+    };
     if let Some(c) = ui_created {
         session.created_at = Some(c);
     }
@@ -456,7 +519,8 @@ pub fn stream_task_dir(
     let mut stamped_first_user = false;
     // An item that is not one JSON value, and a history that does not decode, are counted.
     let mut unparsed = super::Unparsed::default();
-    let result = source.read_archive(|items| {
+    let result = source.read(ReadInput::Document, Validation::Syntax, |items| {
+        let items = items.accepted_array()?;
         for view in items.into_iter().flatten() {
             let Some(view) = view? else {
                 unparsed.count();
@@ -656,34 +720,34 @@ fn record(view: JsonView<'_>, session: &mut Session, spans: bool) -> Result<(Opt
     let metadata = Value::Object(record.project(&MESSAGE_FIELDS[..MESSAGE_FIELDS.len() - 1])?);
     let boundary = condense_boundary(&metadata, session.harness);
     let content = record.get("content");
-    let summary = if metadata.get("role").and_then(Value::as_str) == Some("user") {
+    let role = metadata.get("role").and_then(Value::as_str);
+    let summary = if role == Some("user") {
         Some(prompt::summarize(|feed| visit_text(content, false, feed))?)
     } else {
         None
     };
-    let system_text =
-        if metadata.get("role").and_then(Value::as_str) == Some("system") && session.system_prompt.is_none() {
-            let mut text = String::new();
-            text_views(content, false, |view| {
-                let mut started = false;
-                if let Some(view) = view {
-                    view.for_each_str_chunk(|chunk| {
-                        if !chunk.is_empty() && !started {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            started = true;
+    let system_text = if role == Some("system") && session.system_prompt.is_none() {
+        let mut text = String::new();
+        text_views(content, false, |view| {
+            let mut started = false;
+            if let Some(view) = view {
+                view.for_each_str_chunk(|chunk| {
+                    if !chunk.is_empty() && !started {
+                        if !text.is_empty() {
+                            text.push('\n');
                         }
-                        text.push_str(chunk);
-                        Ok(())
-                    })?;
-                }
-                Ok(())
-            })?;
-            Some(text)
-        } else {
-            None
-        };
+                        started = true;
+                    }
+                    text.push_str(chunk);
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+        Some(text)
+    } else {
+        None
+    };
     let mut blocks = Vec::new();
     if let Some(content) = content {
         if let Some(text) = content.lazy_text(spans)? {
@@ -718,7 +782,7 @@ fn record(view: JsonView<'_>, session: &mut Session, spans: bool) -> Result<(Opt
                         &anthropic::ANTHROPIC,
                         spans,
                         &mut |v| v.lazy_text(spans),
-                        if spans { 0 } else { u64::MAX },
+                        crate::harness::wire::joined_over(spans),
                     )?
                 };
                 if let Some(block) = block {
@@ -955,7 +1019,7 @@ fn optional_document<T>(path: &Path, visit: impl for<'a> FnOnce(JsonView<'a>) ->
     let Ok(source) = JsonSource::capture(path) else {
         return Ok(None);
     };
-    match source.read_document(visit) {
+    match source.read(ReadInput::Document, Validation::Value, visit) {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.is::<InvalidJson>() => Ok(None),
         Err(error) => Err(error),
@@ -971,7 +1035,7 @@ fn optional_document<T>(path: &Path, visit: impl for<'a> FnOnce(JsonView<'a>) ->
 /// - `first_user_ts`: same first `ts`, which the streaming core stamps onto the first user turn.
 ///
 /// The three timestamp hints extracted from a task's `ui_messages.json`.
-type UiTimes = (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+pub(super) type UiTimes = (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
 /// Reduce timestamps while skipping UI text payloads under the original whole-Value boundary.
 fn ui_message_times(dir: &Path) -> Result<UiTimes> {
@@ -1007,6 +1071,42 @@ mod tests {
     use super::*;
     use crate::harness::Parse;
     use crate::stream::CollectSink;
+
+    /// Discovery rescans a task only when one of the files its scan reads moves.
+    #[test]
+    fn discovery_rescans_only_a_task_whose_files_moved() {
+        let world = crate::test_world("cline-discovery-cache");
+        let context = crate::discover_cache::read::Context::current();
+        let _scope = context.enter();
+        let root = world.base.join("tasks");
+        for id in ["1717000000001", "1717000000002", "1717000000003"] {
+            let dir = root.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("api_conversation_history.json"),
+                r#"[{"role":"user","content":[{"type":"text","text":"<task>hi</task>"}]}]"#,
+            )
+            .unwrap();
+        }
+        let scanned = || {
+            let mut all = SCANNED.lock().unwrap();
+            let mut mine: Vec<PathBuf> = all.iter().filter(|p| p.starts_with(&root)).cloned().collect();
+            all.retain(|p| !p.starts_with(&root));
+            mine.sort();
+            mine
+        };
+        let first = discover_in(std::slice::from_ref(&root), Harness::Cline).refs;
+        assert_eq!(scanned().len(), 3);
+        let again = discover_in(std::slice::from_ref(&root), Harness::Cline).refs;
+        assert!(scanned().is_empty());
+        assert_eq!(format!("{first:?}"), format!("{again:?}"));
+        let moved = root.join("1717000000002");
+        fs::write(moved.join("task_metadata.json"), r#"{"cwd":"/meta"}"#).unwrap();
+        let refs = discover_in(std::slice::from_ref(&root), Harness::Cline).refs;
+        assert_eq!(scanned(), vec![moved.clone()]);
+        let r = refs.iter().find(|r| r.path == moved).unwrap();
+        assert_eq!(r.cwd.as_deref(), Some(Path::new("/meta")));
+    }
 
     #[test]
     fn editor_roots_do_not_repeat_default_xdg_stores() {
@@ -1199,7 +1299,8 @@ mod tests {
         let r = scan(&dir, "1717000000000", Harness::Cline).unwrap();
         assert_eq!(r.title.as_deref(), Some("late selected title"));
         assert_eq!(r.cwd, Some(PathBuf::from("/selected")));
-        assert_eq!(r.message_count, Some(4));
+        // The prompt and the reply: the tool results, the system turn and the summary are not turns.
+        assert_eq!(r.message_count, Some(2));
         fs::write(&history, "[{\"role\":\"user\",\"content\":\"ok\"},]").unwrap();
         assert!(parse_task_dir(&dir, "1717000000000", Harness::Cline)
             .unwrap()

@@ -15,7 +15,7 @@ const COMMIT1_TS: i64 = EDIT_TS + 8 * 60;
 /// A second commit two days later that no session can claim.
 const COMMIT2_TS: i64 = EDIT_TS + 2 * 86_400;
 
-fn git(repo: &Path, args: &[&str], date: Option<i64>) {
+fn git(repo: &Path, args: &[&str], date: Option<i64>) -> String {
     let mut c = Command::new("git");
     c.arg("-C").arg(repo).args(args);
     if let Some(d) = date {
@@ -28,6 +28,7 @@ fn git(repo: &Path, args: &[&str], date: Option<i64>) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
 /// Index of `needle`'s first occurrence, with a labeled panic when missing.
@@ -55,9 +56,9 @@ fn blame_end_to_end() {
     // In-process: the catalog ingest below reads `CLUSTERVISION_HOME` from the process env.
     let w = World::in_process("blame-e2e", cv_core::env::Env::enter_isolated);
     let base = w.base.clone();
-    let home = w.cv_home.clone();
     let repo_raw = base.join("repo");
-    fs::create_dir_all(home.join("sessions")).unwrap();
+    let fixtures = base.join("fixtures");
+    fs::create_dir_all(&fixtures).unwrap();
     fs::create_dir_all(repo_raw.join("src")).unwrap();
     // Canonicalize so /var vs /private/var (macOS temp symlink) agrees with git's toplevel.
     let repo = repo_raw.canonicalize().unwrap();
@@ -75,7 +76,7 @@ fn blame_end_to_end() {
 
     // --- a synthetic claude session that edited the same file in a DIFFERENT checkout ---
     // (cwd /historical/checkout: only the repo-relative suffix can match it — the robust path.)
-    let jsonl = home.join("sessions/blame-e2e.jsonl");
+    let jsonl = fixtures.join("blame-e2e.jsonl");
     let lines = [
         serde_json::json!({
             "type": "user", "uuid": "u0", "sessionId": "blame-e2e",
@@ -102,15 +103,9 @@ fn blame_end_to_end() {
 
     // --- a second session that edited the file hours earlier and then RAN the first commit ---
     // (its tool result prints the sha: exact evidence that must outrank the closer timed match).
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(&repo)
-        .args(["rev-parse", "HEAD~1"])
-        .output()
-        .unwrap();
-    let sha1 = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let sha1 = git(&repo, &["rev-parse", "HEAD~1"], None);
     let short1 = &sha1[..7];
-    let exact_jsonl = home.join("sessions/exact-e2e.jsonl");
+    let exact_jsonl = fixtures.join("exact-e2e.jsonl");
     let lines = [
         serde_json::json!({
             "type": "assistant", "uuid": "x1", "sessionId": "exact-e2e",

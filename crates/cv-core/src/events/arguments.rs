@@ -45,13 +45,42 @@ impl Header {
     }
 }
 
+/// The unified-diff `--- ` marker is one bit — some line begins with it — so unlike the path
+/// headers it probes without a value machine: divergence ignores the rest of the line, the
+/// marker's match latches for the line, and [`Patch::has_old`] keeps the answer across lines.
+#[derive(Default)]
+struct Old {
+    probe: String,
+    ignored: bool,
+    found: bool,
+}
+impl Old {
+    fn push(&mut self, line: &str) {
+        if self.ignored || self.found {
+            return;
+        }
+        for ch in line.chars() {
+            self.probe.push(ch);
+            if self.probe.as_str() == "--- " {
+                self.found = true;
+                return;
+            }
+            if !"--- ".starts_with(&self.probe) {
+                self.ignored = true;
+                self.probe.clear();
+                return;
+            }
+        }
+    }
+}
+
 /// A non-header line is discarded as soon as its prefix differs. Only actual candidate path
 /// lines and the deduplicated output paths are retained; a demanded giant path can still be giant.
 #[derive(Default)]
 pub(super) struct Patch {
     codex: Header,
     unified: Header,
-    old: Header,
+    old: Old,
     primary: HashMap<String, usize>,
     fallback: HashMap<String, usize>,
     has_old: bool,
@@ -62,12 +91,9 @@ impl Patch {
             let line = part.strip_suffix('\n').unwrap_or(part);
             self.codex.push(line, HEADERS, true, true);
             self.unified.push(line, &["+++ "], false, true);
-            self.old.push(line, &["--- "], false, false);
-            self.has_old |= self.old.value.is_some();
-            // The --- marker demands no rest of the line.
-            if self.has_old {
-                self.old.ignored = true;
-                self.old.value = None;
+            if !self.has_old {
+                self.old.push(line);
+                self.has_old = self.old.found;
             }
             if part.ends_with('\n') {
                 self.end_line();
@@ -89,7 +115,7 @@ impl Patch {
         }
         self.codex = Header::default();
         self.unified = Header::default();
-        self.old = Header::default();
+        self.old = Old::default();
     }
     pub(super) fn finish(mut self) -> Vec<String> {
         self.end_line();
@@ -154,7 +180,7 @@ pub(super) fn command_string(view: JsonView<'_>) -> Result<Option<String>> {
     .then_some(text))
 }
 
-/// Small rolling prefix/substring state; the command itself is never assembled for event rows.
+/// Small rolling prefix/substring state that decides whether a command carries a patch.
 #[derive(Default)]
 struct Trigger {
     tail: Vec<u8>,
@@ -202,11 +228,15 @@ impl Trigger {
     }
 }
 
-pub(super) fn command_rows(view: JsonView<'_>, cap: usize) -> Result<Option<(String, Vec<String>)>> {
-    let mut prefix = crate::projection::Head::bounded(cap);
+/// A command call's whole command string (only when `whole`; a caller that keeps no command text
+/// streams the chunks for the patch decision and assembles nothing) and the files its patch edits.
+pub(super) fn command_rows(view: JsonView<'_>, whole: bool) -> Result<Option<(Option<String>, Vec<String>)>> {
+    let mut command = whole.then(String::new);
     let mut trigger = Trigger::default();
     let exists = command_chunks(view, |chunk| {
-        prefix.push(chunk);
+        if let Some(command) = &mut command {
+            command.push_str(chunk);
+        }
         trigger.push(chunk);
         Ok(())
     })?;
@@ -232,7 +262,7 @@ pub(super) fn command_rows(view: JsonView<'_>, cap: usize) -> Result<Option<(Str
     } else {
         Vec::new()
     };
-    Ok(Some((prefix.finish(), files)))
+    Ok(Some((command, files)))
 }
 
 pub(super) fn patch_rows(view: JsonView<'_>) -> Result<Vec<String>> {

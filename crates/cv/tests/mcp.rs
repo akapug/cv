@@ -217,18 +217,17 @@ fn handshake_and_tool_schemas() {
         );
     }
 
-    // `show` advertises its MCP window defaults, and `--json` is never the caller's to set.
+    // `show` says no window is the whole transcript, and `--json` is never the caller's to set.
     let show = tools.iter().find(|t| t["name"] == "show").unwrap();
     let desc = show["description"].as_str().unwrap();
-    assert!(desc.contains("LAST 50") && desc.contains("200000"), "{desc}");
+    assert!(desc.contains("returns the whole transcript"), "{desc}");
     let props = &show["inputSchema"]["properties"];
     assert!(props.get("json").is_none(), "json must not be a property: {props}");
     assert_eq!(props["last"]["type"], "integer", "{props}");
     assert_eq!(show["inputSchema"]["required"], json!(["id"]), "{show}");
 }
 
-/// The generated tools run the real commands: `show` with no window gets the MCP default and
-/// returns the IR as JSON, `cat` (no JSON form) returns text, a non-zero exit is a tool error
+/// The generated tools run the real commands: `show` with no window returns the whole IR as JSON, `cat` (no JSON form) returns text, a non-zero exit is a tool error
 /// carrying stderr, and a protocol mistake is -32602 before anything runs.
 #[test]
 fn generated_tools_run_the_real_commands() {

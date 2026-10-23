@@ -21,7 +21,7 @@
 //! Like [`crate::catalog`], the persistence side is best-effort: SQLite errors degrade to empty
 //! results / no-ops with a named diagnostic, never silently failing the caller.
 
-use crate::ir::{truncate, Block, Message, Session, SessionRef};
+use crate::ir::{Block, Message, Session, SessionRef};
 use crate::json::{Json, JsonView};
 use crate::stream::{Checkpoint, Flow, MessageSink};
 use anyhow::Result;
@@ -39,11 +39,6 @@ pub struct IngestOptions {
     pub force: bool,
     pub subagents: bool,
 }
-
-/// Cap (chars) on a command-string target. File-path targets are never truncated.
-const TARGET_MAX: usize = 300;
-/// Cap (chars) on the `detail` context (e.g. the head of an error result).
-const DETAIL_MAX: usize = 200;
 
 /// Name fragments that mark a file-keyed tool as *writing* its target.
 const WRITE_HINTS: &[&str] = &["edit", "write", "patch", "notebook", "replace", "create", "save"];
@@ -75,7 +70,7 @@ pub struct Event {
     /// The raw tool name as the harness recorded it (`None` for an error result whose tool is unknown).
     pub tool: Option<String>,
     pub target: Option<String>,
-    /// Small context, capped at [`DETAIL_MAX`] chars (e.g. the head of an error result).
+    /// An error result's whole text (trimmed), resolved from the source when it is lazy.
     pub detail: Option<String>,
     /// The first row of its `tool_use` block. One call can yield several rows (a patch sent through
     /// the shell is a `command` row plus a `file_edit` per file); counting calls counts these.
@@ -91,6 +86,9 @@ pub struct EventSink {
     dependencies: crate::source::ReadSet,
     capture_events: bool,
     extractor: EventExtractor,
+    /// Resolves a lazy error result for its `detail`: the session's source, from
+    /// [`with_source`](Self::with_source) or the streamed meta session.
+    resolver: crate::lazy::Resolver,
     latch: crate::stream::Latch,
 }
 
@@ -105,8 +103,16 @@ impl EventSink {
             dependencies: Default::default(),
             capture_events: true,
             extractor: EventExtractor::default(),
+            resolver: crate::lazy::Resolver::new(None),
             latch: Default::default(),
         }
+    }
+
+    /// Resolve lazy error results against `source` (the session's file) until a streamed meta
+    /// session names its own, parse-time stamped, source.
+    pub fn with_source(mut self, source: PathBuf) -> Self {
+        self.resolver = crate::lazy::Resolver::new(Some(source));
+        self
     }
 
     /// Observe a borrowed message when another consumer owns its delivery.
@@ -114,10 +120,14 @@ impl EventSink {
         if self.latch.failed() {
             return Flow::Stop;
         }
-        if let Err(error) = self
-            .extractor
-            .extract(m, self.msg_idx, self.cwd.as_deref(), None, &mut self.events)
-        {
+        if let Err(error) = self.extractor.extract(
+            m,
+            self.msg_idx,
+            self.cwd.as_deref(),
+            None,
+            Some(&self.resolver),
+            &mut self.events,
+        ) {
             self.latch.fail(error);
             return Flow::Stop;
         }
@@ -163,6 +173,7 @@ impl EventSink {
             dependencies: st.dependencies,
             capture_events: true,
             extractor: EventExtractor::resume(st.extractor).ok()?,
+            resolver: crate::lazy::Resolver::new(None),
             latch: Default::default(),
         })
     }
@@ -186,9 +197,20 @@ impl MessageSink for EventSink {
             self.dependencies.record(path);
         }
     }
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if !self.latch.failed() {
+            self.dependencies.record_append_only(path);
+        }
+    }
     fn meta(&mut self, s: &Session) {
-        if !self.latch.failed() && self.cwd.is_none() {
+        if self.latch.failed() {
+            return;
+        }
+        if self.cwd.is_none() {
             self.cwd = s.cwd.clone();
+        }
+        if s.source_path.is_some() {
+            self.resolver = s.resolver();
         }
     }
 
@@ -225,10 +247,15 @@ impl MessageSink for EventSink {
 
 /// Classify one message's tool blocks into events. `msg_idx` is its index in the transcript;
 /// relative file targets resolve against `cwd`. The standalone form of what [`EventSink`] does
-/// per streamed message.
-pub fn extract(m: &Message, msg_idx: usize, cwd: Option<&Path>) -> Result<Vec<Event>> {
+/// per streamed message. `resolver` reads a lazy error result whole for its `detail`.
+pub fn extract(
+    m: &Message,
+    msg_idx: usize,
+    cwd: Option<&Path>,
+    resolver: &crate::lazy::Resolver,
+) -> Result<Vec<Event>> {
     let mut out = Vec::new();
-    extract_into(m, msg_idx, cwd, &mut out)?;
+    EventExtractor::default().extract(m, msg_idx, cwd, None, Some(resolver), &mut out)?;
     Ok(out)
 }
 
@@ -327,15 +354,19 @@ impl EventExtractor {
         Ok(())
     }
 
+    /// Classify `m` into `out`. With `details`, rows carry their text whole: a command's string
+    /// and an error's (resolved) text. Without, a caller that only counts or matches tools and
+    /// files reads and assembles neither.
     pub(crate) fn extract(
         &mut self,
         m: &Message,
         msg_idx: usize,
         cwd: Option<&Path>,
         tool: Option<&str>,
+        details: Option<&crate::lazy::Resolver>,
         out: &mut Vec<Event>,
     ) -> Result<()> {
-        extract_message(m, msg_idx, cwd, tool, out, self)
+        extract_message(m, msg_idx, cwd, tool, details, out, self)
     }
 }
 
@@ -351,15 +382,12 @@ pub struct NativeEdit<'m> {
     pub paths: Vec<&'m str>,
 }
 
-pub(crate) fn extract_into(m: &Message, msg_idx: usize, cwd: Option<&Path>, out: &mut Vec<Event>) -> Result<()> {
-    EventExtractor::default().extract(m, msg_idx, cwd, None, out)
-}
-
 fn extract_message(
     m: &Message,
     msg_idx: usize,
     cwd: Option<&Path>,
     tool: Option<&str>,
+    details: Option<&crate::lazy::Resolver>,
     out: &mut Vec<Event>,
     extractor: &mut EventExtractor,
 ) -> Result<()> {
@@ -391,7 +419,7 @@ fn extract_message(
         match b {
             Block::ToolUse { id, name, input, .. } => {
                 let before = staged.len();
-                extract_call_into(name, input, msg_idx, ts, cwd, &mut staged)?;
+                extract_call_into(name, input, msg_idx, ts, cwd, details.is_some(), &mut staged)?;
                 for event in staged[before..].iter().filter(|event| event.kind == "file_edit") {
                     if let Some(target) = &event.target {
                         extractor.note_target(id, target)?;
@@ -404,13 +432,14 @@ fn extract_message(
                 tool_name,
                 ..
             } => {
-                // Never materialize a lazy span just for a 200-char detail — an unresolved span
-                // (a giant failed-command dump) simply contributes no detail.
-                let detail = content
-                    .inline_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| truncate(s, DETAIL_MAX));
+                // The whole error text: a lazy one is read from the source. A caller that keeps
+                // no text (`cv tools` counts rows) passes no resolver and reads nothing.
+                let detail = match details {
+                    Some(resolver) => Some(content.try_resolve(resolver)?)
+                        .map(|text| text.trim().to_owned())
+                        .filter(|s| !s.is_empty()),
+                    None => None,
+                };
                 staged.push(Event {
                     msg_idx,
                     ts,
@@ -438,18 +467,21 @@ fn extract_message(
     Ok(())
 }
 
-/// Classify a borrowed call without cloning its possibly owned, oversized arguments.
+/// Classify a borrowed call without cloning its possibly owned, oversized arguments. A `command`
+/// row's target is the whole command only when `commands`; otherwise it is `None` and the command
+/// is never assembled.
 pub(crate) fn extract_call_into(
     name: &str,
     input: &crate::Json,
     msg_idx: usize,
     ts: Option<i64>,
     cwd: Option<&Path>,
+    commands: bool,
     out: &mut Vec<Event>,
 ) -> Result<()> {
     out.extend(
         input
-            .with_view(|view| classify_tool_view(name, view, cwd))?
+            .with_view(|view| classify_tool_view(name, view, cwd, commands))?
             .into_iter()
             .enumerate()
             .map(|(i, (kind, target))| Event {
@@ -471,6 +503,7 @@ fn classify_tool_view(
     name: &str,
     input: JsonView<'_>,
     cwd: Option<&Path>,
+    commands: bool,
 ) -> Result<Vec<(&'static str, Option<String>)>> {
     let workdir = arguments::file_key(input, &["workdir", "cwd"])?.map(|path| PathBuf::from(absolutize(&path, cwd)));
     let cwd = workdir.as_deref().or(cwd);
@@ -494,8 +527,8 @@ fn classify_tool_view(
         };
         return Ok(vec![(kind, Some(absolutize(&path, cwd)))]);
     }
-    if let Some((prefix, files)) = arguments::command_rows(input, TARGET_MAX)? {
-        let mut rows = vec![("command", Some(prefix))];
+    if let Some((command, files)) = arguments::command_rows(input, commands)? {
+        let mut rows = vec![("command", command)];
         rows.extend(
             files
                 .into_iter()
@@ -506,8 +539,7 @@ fn classify_tool_view(
     Ok(vec![("tool", None)])
 }
 
-/// Full command projection for consumers whose required output is the complete command.
-/// Event classification uses a bounded prefix and streaming patch reducer instead.
+/// Full command projection: the string a `command` event's target holds.
 pub(crate) fn command_of_json(input: &Json) -> Result<Option<String>> {
     input.with_view(arguments::command_string)
 }
@@ -555,7 +587,7 @@ pub fn read_ref(r: &crate::SessionRef, kind: Option<&str>) -> Result<Vec<EventRo
         if crate::env::frozen() {
             let adapter = crate::harness::for_harness(r.harness)
                 .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
-            let mut sink = EventSink::new(r.cwd.clone());
+            let mut sink = EventSink::new(r.cwd.clone()).with_source(r.path.clone());
             adapter.try_stream(r, &crate::Demand::LEAN.with_spans(), &mut sink)?;
             let mut events = sink.into_events()?;
             // Match catalog order.
@@ -712,6 +744,7 @@ mod db {
 
     impl crate::source::Payload for Attributed {
         const TAG: &'static str = "events";
+        const BY_ROWS: bool = true;
     }
 
     fn authority(r: &SessionRef, prov: &Provenance) -> Attributed {
@@ -936,16 +969,7 @@ mod db {
     /// baseline is captured **before** the streamed pass, so anything appended while we were
     /// reading still shows as stale next time.
     pub fn ingest_ref(r: &SessionRef) -> Result<usize> {
-        let adapter =
-            crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
-        let source = crate::source::Probe::default().snapshot(r);
-        let mut sink = SpoolingSink::new(r.cwd.clone());
-        adapter.try_stream(r, &crate::stream::Demand::LEAN.with_spans(), &mut sink)?;
-        let source = source.with_reads(sink.inner().dependencies());
-        let events = sink.into_spool()?;
-        let len = events.len();
-        record_spooled_with_source(r, 0, events, &source, &Provenance::default())?;
-        Ok(len)
+        ingest_subagent(r, &Provenance::default())
     }
 
     /// (Re)ingest events for one sub-agent transcript, stamping `prov`enance on its catalog row so
@@ -955,7 +979,7 @@ mod db {
         let adapter =
             crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
         let source = crate::source::Probe::default().snapshot(r);
-        let mut sink = SpoolingSink::new(r.cwd.clone());
+        let mut sink = SpoolingSink::new(r.cwd.clone()).with_source(r.path.clone());
         adapter.try_stream(r, &crate::stream::Demand::LEAN.with_spans(), &mut sink)?;
         let source = source.with_reads(sink.inner().dependencies());
         let events = sink.into_spool()?;
@@ -1103,7 +1127,7 @@ mod db {
     /// distinct targets, ~⅓ of the event rows) and joins matches back through `idx_events_target`
     /// instead of scanning every event row.
     pub fn sessions_touching(path: &str, edits_only: bool) -> Result<Vec<TouchedSession>> {
-        let abs = absolutize(path, std::env::current_dir().ok().as_deref());
+        let abs = absolutize(path, crate::env::current_dir().as_deref());
         // Escape LIKE metacharacters in the user's path, then match any target ending in /<path>.
         let escaped = path
             .trim_start_matches("./")
@@ -1423,13 +1447,15 @@ mod tests {
             include_str!("../tests/fixtures/codex/code_mode_patch.jsonl"),
             true,
             None,
-        );
+        )
+        .unwrap();
         let direct = crate::harness::codex::parse_str(
             "direct",
             include_str!("../tests/fixtures/codex/direct_patch.jsonl"),
             true,
             None,
-        );
+        )
+        .unwrap();
         for session in [&nested, &direct] {
             assert_eq!(session.messages.len(), 3);
             let mut before = EventSink::new(None);
@@ -1463,7 +1489,7 @@ mod tests {
     fn native_edits_reconcile_resolved_targets_and_command_workdir() {
         let fixture = include_str!("../tests/fixtures/codex/direct_patch.jsonl");
         for shell_cd in [false, true] {
-            let mut session = crate::harness::codex::parse_str("direct", fixture, true, None);
+            let mut session = crate::harness::codex::parse_str("direct", fixture, true, None).unwrap();
             if shell_cd {
                 let Block::ToolUse { input, .. } = &mut session.messages[0].content[0] else {
                     panic!("fixture must start with the shell call");
@@ -1518,7 +1544,8 @@ mod tests {
             include_str!("../tests/fixtures/codex/direct_patch.jsonl"),
             true,
             None,
-        );
+        )
+        .unwrap();
         let native = &mut session.messages[1];
         native.extra["codex"]["item"]["id"] = json!("pending-0");
         native.extra["codex"]["item"]["changes"] = json!({
@@ -1596,7 +1623,7 @@ mod tests {
                 vec![
                     (
                         "command",
-                        Some("apply_patch *** Begin Patch *** Add File: late *** End Patch".to_string()),
+                        Some("apply_patch *** Begin Patch\n*** Add File: late\n*** End Patch".to_string()),
                     ),
                     ("file_edit", Some("/w/late".to_string())),
                 ],
@@ -1608,12 +1635,12 @@ mod tests {
             let owned: Value = serde_json::from_str(raw).unwrap();
             assert_eq!(
                 source
-                    .with_view(|view| classify_tool_view(name, view, Some(Path::new("/w"))))
+                    .with_view(|view| classify_tool_view(name, view, Some(Path::new("/w")), true))
                     .unwrap(),
                 expected
             );
             assert_eq!(
-                classify_tool_view(name, JsonView::from(&owned), Some(Path::new("/w"))).unwrap(),
+                classify_tool_view(name, JsonView::from(&owned), Some(Path::new("/w")), true).unwrap(),
                 expected
             );
             let mut message = msg(vec![
@@ -1627,7 +1654,9 @@ mod tests {
             ]);
             std::fs::remove_file(&path).unwrap();
             let mut rows = vec![];
-            assert!(extract_into(&message, 0, None, &mut rows).is_err());
+            assert!(EventExtractor::default()
+                .extract(&message, 0, None, None, None, &mut rows)
+                .is_err());
             assert!(rows.is_empty(), "the first valid call must not partially publish");
             let mut sink = EventSink::new(None);
             assert_eq!(sink.message(message.clone()), Flow::Stop);
@@ -1658,9 +1687,11 @@ mod tests {
             let raw = serde_json::to_vec(&value).unwrap();
             std::fs::write(&path, &raw).unwrap();
             let source = Json::source(&path, 0, raw.len() as u64).unwrap();
-            let expected = classify_tool_view(name, JsonView::from(&value), None).unwrap();
+            let expected = classify_tool_view(name, JsonView::from(&value), None, true).unwrap();
             assert_eq!(
-                source.with_view(|view| classify_tool_view(name, view, None)).unwrap(),
+                source
+                    .with_view(|view| classify_tool_view(name, view, None, true))
+                    .unwrap(),
                 expected
             );
             assert!(expected
@@ -1682,7 +1713,7 @@ mod tests {
             tool_use("Bash", json!({"command": "cargo test -p cv-core"})),
             tool_use("Glob", json!({"pattern": "**/*.rs", "path": "crates"})),
         ]);
-        let ev = extract(&m, 7, Some(cwd)).unwrap();
+        let ev = extract(&m, 7, Some(cwd), &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(ev.len(), 4);
         assert_eq!(
             (ev[0].kind, ev[0].target.as_deref()),
@@ -1705,7 +1736,7 @@ mod tests {
     fn codex_style_shell_and_local_shell_become_commands() {
         // codex `shell`: argv array.
         let m = msg(vec![tool_use("shell", json!({"command": ["bash", "-lc", "ls -la"]}))]);
-        let ev = extract(&m, 0, None).unwrap();
+        let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(
             (ev[0].kind, ev[0].target.as_deref()),
             ("command", Some("bash -lc ls -la"))
@@ -1716,7 +1747,7 @@ mod tests {
             "local_shell",
             json!({"action": {"type": "exec", "command": ["echo", "hi"]}, "status": "completed"}),
         )]);
-        let ev = extract(&m, 0, None).unwrap();
+        let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("command", Some("echo hi")));
     }
 
@@ -1730,7 +1761,7 @@ mod tests {
                      *** End Patch";
         // Plain-string input (codex custom_tool_call).
         let m = msg(vec![tool_use("apply_patch", json!(patch))]);
-        let ev = extract(&m, 0, Some(Path::new("/repo"))).unwrap();
+        let ev = extract(&m, 0, Some(Path::new("/repo")), &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(ev.len(), 2);
         assert_eq!(
             (ev[0].kind, ev[0].target.as_deref()),
@@ -1743,7 +1774,7 @@ mod tests {
 
         // The same patch routed through the shell tool: command row + per-file edits.
         let m = msg(vec![tool_use("shell", json!({"command": ["apply_patch", patch]}))]);
-        let ev = extract(&m, 0, Some(Path::new("/repo"))).unwrap();
+        let ev = extract(&m, 0, Some(Path::new("/repo")), &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(ev[0].kind, "command");
         let edits: Vec<_> = ev.iter().filter(|e| e.kind == "file_edit").collect();
         assert_eq!(edits.len(), 2);
@@ -1769,11 +1800,11 @@ mod tests {
     fn ambiguous_file_tool_and_unknown_tool_degrade_gracefully() {
         // File key but a name that hints neither read nor write → 'tool' with the path target.
         let m = msg(vec![tool_use("Mystery", json!({"path": "x.txt"}))]);
-        let ev = extract(&m, 0, Some(Path::new("/w"))).unwrap();
+        let ev = extract(&m, 0, Some(Path::new("/w")), &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("tool", Some("/w/x.txt")));
         // No file key, no command → bare 'tool' row.
         let m = msg(vec![tool_use("web_search", json!({"query": "rust"}))]);
-        let ev = extract(&m, 0, None).unwrap();
+        let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("tool", None));
     }
 
@@ -1788,7 +1819,7 @@ mod tests {
                 json!({"file_path": "/g/edit.txt", "old_string": "a", "new_string": "b"}),
             ),
         ]);
-        let ev = extract(&m, 0, Some(Path::new("/g"))).unwrap();
+        let ev = extract(&m, 0, Some(Path::new("/g")), &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("file_edit", Some("/g/out.txt")));
         assert_eq!((ev[1].kind, ev[1].target.as_deref()), ("file_read", Some("/g/in.txt")));
         assert_eq!((ev[2].kind, ev[2].target.as_deref()), ("command", Some("make build")));
@@ -1799,7 +1830,12 @@ mod tests {
     }
 
     #[test]
-    fn error_results_emit_error_events_without_materializing_spans() {
+    fn error_results_carry_their_whole_text_lazy_or_inline() {
+        // A failed dump past the inline limit, lazy on disk: its detail is read whole.
+        let dump = format!("  {}tail of the failure\n", "boom\n".repeat(20_000));
+        let path = std::env::temp_dir().join(format!("cv-event-detail-{}", uuid::Uuid::new_v4()));
+        let encoded = serde_json::to_string(&dump).unwrap();
+        std::fs::write(&path, &encoded).unwrap();
         let mut m = Message::new(Role::Tool);
         m.content = vec![
             Block::ToolResult {
@@ -1810,14 +1846,13 @@ mod tests {
                 status: None,
                 details: None,
             },
-            // A giant failed dump left lazy on disk: the event still lands, detail is skipped.
             Block::ToolResult {
                 tool_use_id: "t2".into(),
                 content: crate::lazy::Text::Span(crate::lazy::Span {
-                    source: None,
-                    offset: 0,
-                    len: 50_000_000,
-                    escaped: false,
+                    source: Some(path.clone()),
+                    offset: 1,
+                    len: encoded.len() as u64 - 2,
+                    escaped: true,
                 }),
                 is_error: true,
                 tool_name: None,
@@ -1834,21 +1869,24 @@ mod tests {
                 details: None,
             },
         ];
-        let ev = extract(&m, 3, None).unwrap();
+        let ev = extract(&m, 3, None, &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(ev.len(), 2);
         assert_eq!(ev[0].kind, "error");
         assert_eq!(ev[0].detail.as_deref(), Some("command failed: no such file"));
         assert_eq!(ev[0].tool.as_deref(), Some("Bash"));
         assert_eq!(ev[1].kind, "error");
-        assert_eq!(ev[1].detail, None);
+        assert_eq!(ev[1].detail.as_deref(), Some(dump.trim()));
+        // A source that is gone fails the extraction instead of dropping the detail.
+        std::fs::remove_file(&path).unwrap();
+        assert!(extract(&m, 3, None, &crate::lazy::Resolver::new(None)).is_err());
     }
 
     #[test]
-    fn long_commands_and_details_are_capped() {
-        let long_cmd = "x".repeat(1000);
+    fn long_commands_and_details_are_whole() {
+        let long_cmd = format!("cat <<'EOF'\n{}\nEOF", "x".repeat(100_000));
         let m = msg(vec![tool_use("Bash", json!({"command": long_cmd}))]);
-        let ev = extract(&m, 0, None).unwrap();
-        assert!(ev[0].target.as_ref().unwrap().chars().count() <= TARGET_MAX);
+        let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
+        assert_eq!(ev[0].target.as_deref(), Some(long_cmd.as_str()));
 
         let mut m = Message::new(Role::Tool);
         m.content = vec![Block::ToolResult {
@@ -1859,8 +1897,25 @@ mod tests {
             status: None,
             details: None,
         }];
-        let ev = extract(&m, 0, None).unwrap();
-        assert!(ev[0].detail.as_ref().unwrap().chars().count() <= DETAIL_MAX);
+        let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
+        assert_eq!(ev[0].detail, Some("e".repeat(1000)));
+    }
+
+    #[test]
+    fn a_caller_keeping_no_text_assembles_no_command() {
+        // Query facts and `cv tools` pass no resolver: the command row and its patched files
+        // still land, its text does not.
+        let command = format!(
+            "apply_patch *** Begin Patch\n*** Add File: a.rs\n{}*** End Patch",
+            "+x\n".repeat(10_000)
+        );
+        let m = msg(vec![tool_use("Bash", json!({ "command": command }))]);
+        let mut rows = vec![];
+        EventExtractor::default()
+            .extract(&m, 0, Some(Path::new("/w")), None, None, &mut rows)
+            .unwrap();
+        let rows: Vec<_> = rows.iter().map(|e| (e.kind, e.target.as_deref())).collect();
+        assert_eq!(rows, [("command", None), ("file_edit", Some("/w/a.rs"))]);
     }
 
     #[cfg(feature = "sqlite")]
@@ -2073,9 +2128,11 @@ mod tests {
             .unwrap();
         assert!(needs_ingest(&r), "missing captured authority still misses");
         ingest_ref(&r).unwrap();
+        // A real record of the previous writer version — the whole envelope cv wrote, with only
+        // the version rewound — not a hand-cut byte offset.
         conn.execute(
-            "UPDATE source_dependencies SET record=substr(record,1,53)||'{\"version\":2}' WHERE consumer='events'",
-            [],
+            "UPDATE source_dependencies SET record=CAST(json_set(CAST(record AS TEXT),'$.version',?1) AS BLOB) WHERE consumer='events'",
+            [crate::source::VERSION - 1],
         )
         .unwrap();
         assert!(needs_ingest(&r), "old source stamps cannot authorize empty reuse");

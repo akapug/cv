@@ -19,7 +19,7 @@ mod util;
 
 /// A hermetic world whose environment this thread's library calls read (see `cv_core::env`).
 #[cfg(test)]
-fn test_world(tag: &str) -> cv_testkit::InProcess<cv_core::env::Scope> {
+fn test_world(tag: &str) -> cv_testkit::InProcess<cv_core::env::Isolated> {
     cv_testkit::World::in_process(tag, cv_core::env::Env::enter_isolated)
 }
 
@@ -37,6 +37,21 @@ use util::{usage, UsageError, WindowArgs};
 /// Version with the embedded build commit (set by build.rs; "unknown" outside git), so the
 /// binary in your PATH is checkable against source.
 const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CV_BUILD_SHA"), ")");
+
+/// The clap tree is well-formed (debug asserts: conflicting ids, bad defaults, …).
+/// Building the clap tree is deep: `Cli::command()` for every command with its args is a
+/// large stack frame in a debug build, and the default 2 MB test-thread stack overflows on
+/// it (the binary's main thread has 8 MB and is fine). Run the tree-building tests on a
+/// thread sized like main.
+#[cfg(test)]
+pub(crate) fn on_main_sized_stack(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("test thread panicked");
+}
 
 /// The command groups `cv --help` prints and `cv schema --commands` reports. clap renders
 /// subcommands as one flat list (its `next_help_heading` tags *arguments*), so the grouping lives
@@ -141,7 +156,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    // ───────────────────────────── Read ─────────────────────────────
     /// List discovered sessions across all harnesses.
     Ls {
         /// Only this harness (claude, codex, grok, opencode, gemini, cursor, kimi, kimi-code,
@@ -249,6 +263,7 @@ enum Cmd {
         query: String,
         #[arg(long)]
         harness: Option<String>,
+        /// Hits to show. Every match is still counted: the footer says `N of M matches`.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Use semantic (embedding) search instead of full-text. Requires `cv index --semantic`
@@ -266,10 +281,17 @@ enum Cmd {
         /// `all`. Context repeats across sessions, so it is matched only when asked for.
         #[arg(long, value_name = "exchange|context|all", conflicts_with_all = ["semantic", "scan"])]
         kind: Option<String>,
-        /// Emit the hits as one JSON array instead of the table — the same hits in the same
-        /// order (--harness/--limit/--semantic respected): a session row (`id, harness, path, cwd,
-        /// title, created_at, updated_at, message_count, size_bytes`) plus `score`, `snippet`, and
-        /// the sub-agent provenance `agent_id`/`parent_id`/`workflow`. Nothing else goes to stdout.
+        /// The index answers plus a live read of the sessions it has not seen as they are now
+        /// (grown, rewritten, new since `cv index`), from where the index stopped: all of them by
+        /// default; with this, at most BYTES of source, newest sessions first, and the footer
+        /// names what the budget left out. 0 (or global --frozen) answers from the index alone.
+        #[arg(long, value_name = "BYTES", conflicts_with_all = ["semantic", "scan"])]
+        live_bytes: Option<u64>,
+        /// Emit `{"hits": [...], "total": M}` instead of the table — the same hits in the same
+        /// order (--harness/--limit/--semantic respected), each a session row (`id, harness, path,
+        /// cwd, title, created_at, updated_at, message_count, size_bytes`) plus `score`, `snippet`,
+        /// and the sub-agent provenance `agent_id`/`parent_id`/`workflow`; `total` counts every
+        /// session that matched. Nothing else goes to stdout.
         #[arg(long)]
         json: bool,
     },
@@ -292,9 +314,14 @@ enum Cmd {
         /// is visible, not just the orchestrator's own tool calls.
         #[arg(long)]
         subagents: bool,
-        /// Emit the events as one JSON array (snake_case keys) instead of the table.
+        /// Emit the events as one JSON array (snake_case keys) instead of the table. Every
+        /// target and detail is whole: the full command, the full error text.
         #[arg(long)]
         json: bool,
+        /// Print each table cell whole (newlines as spaces). Without it the target column is
+        /// shortened to 90 characters and the detail line to 100, a cut marked with `…`.
+        #[arg(long, conflicts_with = "json")]
+        wide: bool,
     },
     /// Sessions that touched a file — every session with a file_edit/file_read event on its path.
     ///
@@ -493,7 +520,6 @@ enum Cmd {
         json: bool,
     },
 
-    // ───────────────────────────── Reshape ─────────────────────────────
     /// Custom, lossless compaction of a Claude session into a NEW resumable session: snip bulky old
     /// tool payloads (large reads/logs/screenshots) into a sidecar, leaving a small `[PRUNED]` marker
     /// — your prompts and flow stay verbatim, the recent turns stay sharp. Resume with
@@ -791,7 +817,7 @@ enum Cmd {
         #[arg(long = "no-context")]
         no_context: bool,
         /// Fail if the fidelity check finds a loss the target format could have carried. Losses the
-        /// format inherently cannot hold are still only reported under `⚠ lost`.
+        /// format inherently cannot hold are still only reported under `⚠ lossy:`.
         #[arg(long)]
         strict: bool,
         /// Native keeps reasoning where the target holds it; portable demotes plaintext thinking to
@@ -814,7 +840,6 @@ enum Cmd {
         launch: bool,
     },
 
-    // ───────────────────────────── Export ─────────────────────────────
     /// Export a session to markdown or OpenSession JSON (stdout); `cv share` is the HTML artifact.
     Export {
         id: String,
@@ -903,9 +928,18 @@ enum Cmd {
         /// Return the bundle or written artifact as a JSON result.
         #[arg(long)]
         json: bool,
+        /// Bytes of each span's transcript the `CV_PACK_LLM` digest may send. Default: the model's
+        /// context window as its provider reports it, less the digest's output and prompt (a token
+        /// is at least a byte). The bundle states each digest's input and limit.
+        #[arg(long, value_name = "N")]
+        context_bytes: Option<usize>,
+        /// Bytes of one message an excerpt shows; a longer one is cut there, an open code fence
+        /// closed, and marked `…`. The bundle's header states this and every other bound, and
+        /// what each cut.
+        #[arg(long, value_name = "N", default_value_t = pack::EXCERPT_BYTES)]
+        excerpt_bytes: usize,
     },
 
-    // ───────────────────────────── Fleet & live ─────────────────────────────
     /// Fleet task substrate: dispatch, review, and git-observed landing.
     Task {
         #[command(subcommand)]
@@ -1007,7 +1041,6 @@ enum Cmd {
         no_redact: bool,
     },
 
-    // ───────────────────────────── System ─────────────────────────────
     /// Build/refresh the tantivy full-text index that makes `cv search` instant.
     ///
     /// Incremental by default: only changed/new sessions are re-indexed and vanished ones reaped,
@@ -1271,8 +1304,9 @@ fn run() -> Result<()> {
             semantic,
             scan,
             kind,
+            live_bytes,
             json,
-        } => search::cmd_search(&query, harness, limit, semantic, scan, kind, json),
+        } => search::cmd_search(&query, harness, limit, semantic, scan, kind, live_bytes, json),
         Cmd::Show {
             id,
             harness,
@@ -1363,7 +1397,8 @@ fn run() -> Result<()> {
             kind,
             subagents,
             json,
-        } => events::cmd_events(&id, harness, kind, subagents, json),
+            wide,
+        } => events::cmd_events(&id, harness, kind, subagents, json, wide),
         Cmd::Touched {
             path,
             edits_only,
@@ -1386,7 +1421,20 @@ fn run() -> Result<()> {
             force,
             thinking,
             json,
-        } => pack::cmd_pack(pack::PackArgs { task: &task, format: &format, harness, limit, out, force, thinking: util::parse_thinking(&thinking)?, json }),
+            context_bytes,
+            excerpt_bytes,
+        } => pack::cmd_pack(pack::PackArgs {
+            task: &task,
+            format: &format,
+            harness,
+            limit,
+            out,
+            force,
+            thinking: util::parse_thinking(&thinking)?,
+            json,
+            context_bytes,
+            excerpt_bytes,
+        }),
         Cmd::Stats { query, json, tokens } => browse::cmd_stats(query, json, tokens),
         Cmd::Prune {
             id,
@@ -1728,20 +1776,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The clap tree is well-formed (debug asserts: conflicting ids, bad defaults, …).
-    /// Building the clap tree is deep: `Cli::command()` for every command with its args is a
-    /// large stack frame in a debug build, and the default 2 MB test-thread stack overflows on
-    /// it (the binary's main thread has 8 MB and is fine). Run the tree-building tests on a
-    /// thread sized like main.
-    fn on_main_sized_stack(f: impl FnOnce() + Send + 'static) {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(f)
-            .expect("spawn")
-            .join()
-            .expect("test thread panicked");
-    }
-
     #[test]
     fn skills_policy_spelling_parses_to_the_canonical_skills_value() {
         on_main_sized_stack(|| {
@@ -1766,7 +1800,7 @@ mod tests {
 
     #[test]
     fn mcp_reuses_one_parsed_tree_with_exact_schema_and_releases_parser_owners() {
-        on_main_sized_stack(|| {
+        crate::on_main_sized_stack(|| {
             use std::sync::Arc;
             #[derive(Clone)]
             struct Owner(Arc<()>);
@@ -1830,14 +1864,14 @@ mod tests {
 
     #[test]
     fn clap_tree_is_valid() {
-        on_main_sized_stack(|| build_cli().debug_assert());
+        crate::on_main_sized_stack(|| build_cli().debug_assert());
     }
 
     /// Every visible command sits in exactly one group, and every grouped name is a real
     /// command — the table and the enum cannot drift apart.
     #[test]
     fn groups_cover_every_visible_command() {
-        on_main_sized_stack(groups_cover_every_visible_command_body);
+        crate::on_main_sized_stack(groups_cover_every_visible_command_body);
     }
 
     fn groups_cover_every_visible_command_body() {
@@ -1885,7 +1919,7 @@ mod tests {
     /// `cv --help` lists the groups and ends with the recipes pointer.
     #[test]
     fn help_is_grouped_and_ends_with_recipes() {
-        on_main_sized_stack(help_is_grouped_and_ends_with_recipes_body);
+        crate::on_main_sized_stack(help_is_grouped_and_ends_with_recipes_body);
     }
 
     fn help_is_grouped_and_ends_with_recipes_body() {

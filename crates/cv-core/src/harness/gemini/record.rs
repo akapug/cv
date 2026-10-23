@@ -8,6 +8,8 @@ use super::*;
 use crate::harness::store::{document::Fields, text};
 use crate::harness::wire::genai::{self, Dialect, Part};
 use crate::json::{JsonSource, JsonView};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::lazy::{Resolver, Text};
 
 /// Every top-level key any message kind reads, selected in one pass.
@@ -117,11 +119,13 @@ fn message(view: JsonView<'_>, d: Demand<'_>, st: &mut EmitState, out: &mut Out<
             }
             m.usage = rec.get("tokens").map(tokens).transpose()?.flatten();
 
-            // Thoughts → Thinking blocks (subject + description).
-            let mut has_thoughts = false;
+            // Thoughts → Thinking blocks (subject + description). `thoughts_listed` records that a
+            // `thoughts[]` list with entries was present — whether or not any yielded text —
+            // because then `content` carries the same thoughts as parts, which are dropped below.
+            let mut thoughts_listed = false;
             if let Some(thoughts) = rec.get("thoughts").map(JsonView::array).transpose()?.flatten() {
                 for thought in thoughts {
-                    has_thoughts = true;
+                    thoughts_listed = true;
                     if let Some(text) = d.thought(thought?)? {
                         m.content.push(Block::Thinking {
                             text,
@@ -160,7 +164,7 @@ fn message(view: JsonView<'_>, d: Demand<'_>, st: &mut EmitState, out: &mut Out<
                 content_blocks(content, d, &mut parts)?;
             }
             m.content.extend(parts.into_iter().filter(|b| match b {
-                Block::Thinking { .. } => !has_thoughts,
+                Block::Thinking { .. } => !thoughts_listed,
                 Block::ToolUse { id, .. } => !call_ids.contains(id.as_str()),
                 _ => true,
             }));
@@ -815,7 +819,7 @@ mod genai_contracts {
             std::fs::write(&path, &bytes)?;
             let source = JsonSource::capture(&path)?;
             for demand in 0..2 {
-                let (blocks, flag) = source.read_range_value(0, source.len(), |view| {
+                let (blocks, flag) = source.read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
                     let d = Demand {
                         harness: Harness::Gemini,
                         source: if demand == 0 { None } else { Some(&source) },

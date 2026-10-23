@@ -94,9 +94,56 @@ pub fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// Mark `root` and everything under it (symlinks not followed) as last modified a minute ago:
+/// how a test steps past a "recently modified, not yet settled" window (the catalog's watch fudge)
+/// without sleeping through it. A later write stamps the real time, so it still reads as a change.
+pub fn settle(root: &Path) {
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            stack.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+        }
+        if !meta.file_type().is_symlink() {
+            fs::File::open(&path).unwrap().set_modified(then).unwrap();
+        }
+    }
+}
+
 /// Lines as a JSONL body, one per line, newline-terminated.
 pub fn jsonl(lines: &[Value]) -> String {
     lines.iter().map(|l| format!("{l}\n")).collect()
+}
+
+/// An RFC 3339 UTC "now" for seeded events (this crate has no chrono: the civil date is Howard
+/// Hinnant's algorithm, derived from the clock directly).
+pub fn now_rfc3339() -> String {
+    now_rfc3339_at(0)
+}
+
+/// [`now_rfc3339`] shifted by `offset` seconds.
+pub fn now_rfc3339_at(offset: u64) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + offset;
+    let days = secs / 86_400;
+    let (h, m, s) = ((secs % 86_400) / 3600, (secs % 3600) / 60, secs % 60);
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 /// An environment as `(name, value)` pairs.
@@ -334,10 +381,11 @@ fn output_with_stdin(mut cmd: Command, text: &str) -> std::process::Output {
 pub mod claude {
     use serde_json::{json, Value};
 
-    /// A user prompt, with `cwd` (the field `cv ls` reads the project from).
-    pub fn user(uuid: &str, ts: &str, text: &str) -> Value {
+    /// A user prompt, with `cwd` (the field `cv ls` reads the project from) and the session
+    /// the record belongs to (the adapters take the id from the file name; the JSON agrees).
+    pub fn user(sid: &str, uuid: &str, ts: &str, text: &str) -> Value {
         json!({
-            "type": "user", "uuid": uuid, "sessionId": "s", "timestamp": ts, "cwd": "/work/proj",
+            "type": "user", "uuid": uuid, "sessionId": sid, "timestamp": ts, "cwd": "/work/proj",
             "message": {"role": "user", "content": text}
         })
     }
@@ -426,6 +474,77 @@ pub mod claude {
             }
             (b, e) => *b = e,
         }
+    }
+}
+
+/// The standard two-session corpus several suites plant, so `alphasess` and `betasess` mean the
+/// same bytes everywhere.
+pub mod corpus {
+    use super::{claude, World};
+    use serde_json::{json, Value};
+
+    /// The secret `standard` plants in alphasess, for redaction assertions to hunt for.
+    pub const SECRET: &str = "sk-abcDEF1234567890ghijkl";
+
+    /// `alphasess`: created 2026-01-01, updated 2026-06-01, 3 messages (prompt, Edit tool use,
+    /// tool result), title "alpha adventures", carries [`SECRET`] and an Edit on
+    /// /work/proj/src/widget.rs. `betasess`: created 2026-03-01, updated 2026-03-02, 4 messages,
+    /// no title. Orderings disagree on purpose: updated → alpha first; created → beta first;
+    /// messages → beta.
+    pub fn standard(w: &World) {
+        let assistant = |uuid: &str, ts: &str, blocks: Value| {
+            claude::with(
+                claude::assistant(uuid, ts, "claude-test-1", blocks),
+                json!({"cwd": "/work/proj"}),
+            )
+        };
+        w.write_session(
+            "alphasess",
+            &[
+                json!({"type": "ai-title", "aiTitle": "alpha adventures"}),
+                claude::user(
+                    "alphasess",
+                    "u1",
+                    "2026-01-01T10:00:00Z",
+                    "please fix the zebrafish migration",
+                ),
+                assistant(
+                    "a1",
+                    "2026-01-02T10:00:00Z",
+                    json!([
+                        {"type": "text", "text": format!("on it — found a leaked key {SECRET} in the env")},
+                        {"type": "tool_use", "id": "t1", "name": "Edit",
+                         "input": {"file_path": "/work/proj/src/widget.rs", "old_string": "a", "new_string": "b"}}
+                    ]),
+                ),
+                claude::with(
+                    claude::tool_result("u2", "2026-06-01T10:00:00Z", "t1", "edited ok"),
+                    json!({"sessionId": "alphasess", "cwd": "/work/proj"}),
+                ),
+            ],
+        );
+        w.write_session(
+            "betasess",
+            &[
+                claude::user(
+                    "betasess",
+                    "b1",
+                    "2026-03-01T09:00:00Z",
+                    "how many quokkas in the census",
+                ),
+                assistant(
+                    "b2",
+                    "2026-03-01T09:05:00Z",
+                    json!([{"type": "text", "text": "seventeen quokkas"}]),
+                ),
+                claude::user("betasess", "b3", "2026-03-02T09:00:00Z", "thanks"),
+                assistant(
+                    "b4",
+                    "2026-03-02T09:01:00Z",
+                    json!([{"type": "text", "text": "anytime"}]),
+                ),
+            ],
+        );
     }
 }
 

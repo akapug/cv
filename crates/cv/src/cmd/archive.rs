@@ -342,15 +342,39 @@ pub(crate) fn cmd_watch(archive: &Archive, interval: f64, harness: Option<String
 
     // Not `Watcher::run` (which never returns and takes the closure by value): a manual loop keeps
     // ownership of `archive` and reads identically.
+    // What each accepted pass left on disk: the archived session and its resume state. A source
+    // the watcher finds unchanged is offered again only when one of these moved, the same
+    // condition under which `store_ref` would not skip it.
+    let mut outputs: std::collections::HashMap<(Harness, String), [cv_core::source::FileId; 2]> =
+        std::collections::HashMap::new();
     loop {
         let mut fatal = None;
-        watcher.poll_sources(|kind, r, previous| match archive_event(archive, r, kind, previous) {
-            Ok(pass) => pass,
-            Err(error) => {
-                fatal = Some(error);
-                None
-            }
-        });
+        let mut accepted = Vec::new();
+        watcher.offer_sources(
+            |r| {
+                outputs
+                    .get(&(r.harness, r.id.clone()))
+                    .is_some_and(|ids| archive.outputs(r).as_ref() == Some(ids))
+            },
+            |kind, r, previous| match archive_event(archive, r, kind, previous) {
+                Ok(pass) => {
+                    if pass.is_some() {
+                        accepted.push(r.clone());
+                    }
+                    pass
+                }
+                Err(error) => {
+                    fatal = Some(error);
+                    None
+                }
+            },
+        );
+        for r in accepted {
+            match archive.outputs(&r) {
+                Some(ids) => outputs.insert((r.harness, r.id), ids),
+                None => outputs.remove(&(r.harness, r.id)),
+            };
+        }
         if let Some(error) = fatal {
             return Err(error);
         }

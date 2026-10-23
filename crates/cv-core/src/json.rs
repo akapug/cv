@@ -115,6 +115,24 @@ fn file_id(metadata: &Metadata) -> Result<FileId> {
     anyhow::ensure!(metadata.is_file(), "JSON source is not a regular file");
     FileId::of(metadata).context("JSON source has no modification time")
 }
+/// Bytes for one checked JSON read. Decoded buffers retain their original source identity.
+pub(crate) enum ReadInput<'a> {
+    Document,
+    Range(u64, u64),
+    Backing(Arc<crate::harness::store::bytes::ByteSource>, u64, u64),
+    Record(
+        u64,
+        &'a str,
+        Option<(&'a Arc<crate::harness::store::bytes::ByteSource>, u64)>,
+    ),
+    Positioned(
+        &'a RangeSource<'a>,
+        u64,
+        u64,
+        Option<(&'a Arc<crate::harness::store::bytes::ByteSource>, u64)>,
+    ),
+}
+
 impl JsonSource {
     pub(crate) fn decoded_backing(&self) -> Result<Arc<crate::harness::store::bytes::ByteSource>> {
         let mut decoded = self
@@ -240,110 +258,47 @@ impl JsonSource {
             decoded: None,
         })
     }
-    /// One Value-compatible record of an in-memory copy (mapped or read) of this capture. No
-    /// stat: the record reader checks identity once per operation and after each record that
-    /// published a source descriptor, rather than twice per record.
-    pub(crate) fn read_record<T>(
+    /// Read one view under an explicit acceptance policy. The input selects bytes and
+    /// provenance; validation and the callback/error lifecycle are shared by every reader.
+    pub(crate) fn read<T>(
         &self,
-        offset: u64,
-        text: &str,
-        f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>,
-    ) -> Result<T> {
-        self.read_record_with(offset, text, Validation::Value, f)
-    }
-    /// [`Self::read_record`] under a chosen acceptance (grammar only for typed sidecars).
-    pub(crate) fn read_record_with<T>(
-        &self,
-        offset: u64,
-        text: &str,
+        input: ReadInput<'_>,
         validation: Validation,
         f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>,
     ) -> Result<T> {
-        let range = self.range(offset, text.len() as u64)?;
-        let context = RangeSource::text(Some(self.clone()), text, offset, true);
-        range.view_unchecked(&context, validation, f)
-    }
-    /// [`Self::read_record`] over this source's private decoded bytes (`decoded_len` of them), an
-    /// in-memory copy of one record at `offset`. Decoded bytes are immutable: the reader checks
-    /// the original when it decodes and when its pass ends, never per record.
-    pub(crate) fn read_decoded_record<T>(
-        &self,
-        backing: &Arc<crate::harness::store::bytes::ByteSource>,
-        decoded_len: u64,
-        offset: u64,
-        text: &str,
-        f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>,
-    ) -> Result<T> {
-        let range = self.decoded_range(backing.clone(), decoded_len, offset, text.len() as u64)?;
-        let context = RangeSource::text(Some(self.clone()), text, offset, false);
-        range.view_unchecked(&context, Validation::Value, f)
-    }
-    /// [`Self::read_positioned_range_value`] over this source's private decoded bytes, with a
-    /// context made by `RangeSource::decoded` over the same backing.
-    pub(crate) fn read_positioned_decoded_value<T>(
-        &self,
-        context: &RangeSource<'_>,
-        backing: &Arc<crate::harness::store::bytes::ByteSource>,
-        decoded_len: u64,
-        offset: u64,
-        len: u64,
-        f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>,
-    ) -> Result<T> {
-        self.decoded_range(backing.clone(), decoded_len, offset, len)?
-            .with_source(context, Validation::Value, f)
-    }
-    /// One record through an original-source positioned context shared across records.
-    pub(crate) fn read_positioned_range<T>(
-        &self,
-        context: &RangeSource<'_>,
-        offset: u64,
-        len: u64,
-        validation: Validation,
-        f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>,
-    ) -> Result<T> {
-        anyhow::ensure!(
-            context.matches_original(self),
-            "JSON positioned context has different provenance"
-        );
-        self.range(offset, len)?.with_source(context, validation, f)
-    }
-    pub(crate) fn read_range_value<T>(
-        &self,
-        offset: u64,
-        len: u64,
-        f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>,
-    ) -> Result<T> {
-        self.range(offset, len)?.with_validation(Validation::Value, f)
-    }
-    pub(crate) fn read_backing_value<T>(
-        &self,
-        backing: Arc<crate::harness::store::bytes::ByteSource>,
-        offset: u64,
-        len: u64,
-        f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>,
-    ) -> Result<T> {
-        self.backing_range(backing, offset, len)?
-            .with_validation(Validation::Value, f)
-    }
-    pub(crate) fn read_range_syntax<T>(
-        &self,
-        offset: u64,
-        len: u64,
-        f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>,
-    ) -> Result<T> {
-        self.range(offset, len)?.with_validation(Validation::Syntax, f)
-    }
-    /// The producer captures/checks the original opened source before deriving these private bytes.
-    /// Backing ownership and original provenance survive every selected child descriptor.
-    pub(crate) fn read_backing_syntax<T>(
-        &self,
-        backing: Arc<crate::harness::store::bytes::ByteSource>,
-        offset: u64,
-        len: u64,
-        f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>,
-    ) -> Result<T> {
-        self.backing_range(backing, offset, len)?
-            .with_validation(Validation::Syntax, f)
+        match input {
+            ReadInput::Document => {
+                if self.len() == 0 {
+                    return Err(InvalidJson.into());
+                }
+                self.range(0, self.len())?.with_validation(validation, f)
+            }
+            ReadInput::Range(offset, len) => self.range(offset, len)?.with_validation(validation, f),
+            ReadInput::Backing(backing, offset, len) => {
+                self.backing_range(backing, offset, len)?.with_validation(validation, f)
+            }
+            ReadInput::Record(offset, text, decoded) => {
+                let range = match decoded {
+                    Some((backing, len)) => self.decoded_range(backing.clone(), len, offset, text.len() as u64)?,
+                    None => self.range(offset, text.len() as u64)?,
+                };
+                let context = RangeSource::text(Some(self.clone()), text, offset, decoded.is_none());
+                range.view_unchecked(&context, validation, f)
+            }
+            ReadInput::Positioned(context, offset, len, decoded) => {
+                let range = match decoded {
+                    Some((backing, backing_len)) => self.decoded_range(backing.clone(), backing_len, offset, len)?,
+                    None => {
+                        anyhow::ensure!(
+                            context.matches_original(self),
+                            "JSON positioned context has different provenance"
+                        );
+                        self.range(offset, len)?
+                    }
+                };
+                range.with_source(context, validation, f)
+            }
+        }
     }
     /// Only for store::text::Builder's successfully completed quoted JSON-string output.
     /// Its checked string/canonical writers guarantee strict UTF8/escape validity before this
@@ -378,7 +333,7 @@ impl JsonSource {
         len: u64,
     ) -> Result<JsonRange> {
         self.check()?;
-        let backing_len = backing.len()?;
+        let backing_len = backing.byte_len()?;
         self.decoded_range(backing, backing_len, offset, len)
     }
     fn decoded_range(
@@ -409,28 +364,8 @@ impl JsonSource {
             decoded: Some(backing),
         })
     }
-    pub(crate) fn read_document<T>(&self, f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>) -> Result<T> {
-        self.read_range_value(0, self.0.identity.len, f)
-    }
-    /// Validate whole-source JSON grammar and UTF-8 without imposing Value's scalar/depth
-    /// policy on ignored fields. Typed document consumers enforce their known-field schema
-    /// and use accepted_array for records whose Value budget resets independently.
-    pub(crate) fn read_syntax<T>(&self, f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>) -> Result<T> {
-        if self.0.identity.len == 0 {
-            return Err(InvalidJson.into());
-        }
-        self.read_range_syntax(0, self.0.identity.len, f)
-    }
-    /// Archive grammar and UTF-8 are whole-source; each child resets Value's depth budget.
-    /// Invalid children remain None so a consumer can preserve first-record shape semantics.
-    pub(crate) fn read_archive<T>(&self, f: impl for<'a> FnOnce(Option<AcceptedArray<'a>>) -> Result<T>) -> Result<T> {
-        self.read_syntax(|view| f(view.accepted_array()?))
-    }
     pub(crate) fn metadata_bytes(&self) -> usize {
         std::mem::size_of::<CapturedSource>() + 2 * std::mem::size_of::<usize>() + self.0.path.capacity()
-    }
-    pub(crate) fn same_identity(&self, other: &Self) -> bool {
-        self == other
     }
     /// Caller must have syntax AND Value-compatible scalar/depth validation for this complete
     /// range since capture. Quotes/containers are included; surrounding whitespace is excluded.
@@ -442,17 +377,12 @@ impl JsonSource {
 }
 
 impl JsonRange {
-    pub(crate) fn check(&self) -> Result<()> {
-        self.source.check()?;
-        Ok(())
-    }
-
     /// The source still holds its capture and the decoded backing still holds this range. The
     /// backing is the arena, not the source, so one source check covers both.
     pub(crate) fn check_retained_bounds(&self) -> Result<()> {
-        self.check()?;
+        self.source.check()?;
         if let Some(bytes) = &self.decoded {
-            let len = bytes.len()?;
+            let len = bytes.byte_len()?;
             anyhow::ensure!(
                 self.offset.checked_add(self.len).is_some_and(|end| end <= len),
                 "source text backing is truncated"
@@ -519,7 +449,7 @@ impl JsonRange {
         validation: Validation,
         f: impl for<'a> FnOnce(JsonView<'a>) -> Result<T>,
     ) -> Result<T> {
-        self.check()?;
+        self.source.check()?;
         scoped(&self.source, self.decoded.as_deref(), self.extent(), |source| {
             self.with_source(source, validation, f)
         })
@@ -535,7 +465,6 @@ impl JsonRange {
     ) -> Result<T> {
         let result = self.view_unchecked(source, validation, f);
         source.check_identity()?;
-        self.check()?;
         result
     }
     fn view_unchecked<T>(
@@ -891,13 +820,15 @@ impl<'a> JsonView<'a> {
         if blank {
             return Ok(serde_json::json!({}).into());
         }
-        match range.source.read_backing_value(bytes, offset, len, |view| {
-            if view.is_object()? || view.is_array()? {
-                Ok(Some(view.to_json()?))
-            } else {
-                Ok(None)
-            }
-        }) {
+        match range
+            .source
+            .read(ReadInput::Backing(bytes, offset, len), Validation::Value, |view| {
+                if view.is_object()? || view.is_array()? {
+                    Ok(Some(view.to_json()?))
+                } else {
+                    Ok(None)
+                }
+            }) {
             Ok(Some(value)) => Ok(value),
             Ok(None) => Ok(original),
             Err(error) if error.downcast_ref::<InvalidJson>().is_some() => Ok(original),
@@ -931,11 +862,23 @@ impl<'a> JsonView<'a> {
         let View::Source(source) = self.0 else { unreachable!() };
         source.source.kind(source.value)
     }
+    /// Own a selected JSON string; a missing string type remains distinct from a read failure.
+    pub(crate) fn string(self) -> Result<Option<String>> {
+        Ok(self.text(false)?.and_then(|text| match text {
+            crate::Text::Inline(text) => Some(text),
+            _ => None,
+        }))
+    }
     pub fn is_string(self) -> Result<bool> {
         match self.0 {
             View::Owned(value) => Ok(value.is_string()),
             View::Source(_) => Ok(self.kind()? == Some(b'"')),
         }
+    }
+    /// A weaker [`Self::is_string`]: an unreadable source counts as absence, for a type probe of a
+    /// field the codec skips rather than fails on.
+    pub fn may_be_string(self) -> bool {
+        self.is_string().unwrap_or(false)
     }
     pub fn is_object(self) -> Result<bool> {
         match self.0 {
@@ -1112,44 +1055,15 @@ impl<'a> JsonView<'a> {
         replacements: &[(Json, Value)],
         writer: &mut impl Write,
     ) -> Result<()> {
-        if let Some(replacement) = self.replacement(replacements)? {
-            serde_json::to_writer(writer, replacement)?;
-            return Ok(());
+        match self.0 {
+            View::Owned(value) => serde_json::to_writer(writer, value).map_err(Into::into),
+            View::Source(source) => write_source(source, replacements, writer),
         }
-        if self.is_object()? {
-            writer.write_all(b"{")?;
-            let mut first = true;
-            self.for_each_entry(|key, child| {
-                if !first {
-                    writer.write_all(b",")?;
-                }
-                first = false;
-                serde_json::to_writer(&mut *writer, key)?;
-                writer.write_all(b":")?;
-                child.write_canonical_replacing(replacements, writer)
-            })?;
-            writer.write_all(b"}")?;
-        } else if let Some(array) = self.array()? {
-            writer.write_all(b"[")?;
-            for (index, child) in array.enumerate() {
-                if index != 0 {
-                    writer.write_all(b",")?;
-                }
-                child?.write_canonical_replacing(replacements, writer)?;
-            }
-            writer.write_all(b"]")?;
-        } else {
-            self.write_canonical(writer)?;
-        }
-        Ok(())
     }
 
     /// Same partial-output-on-error contract as Json::write_canonical.
     pub fn write_canonical(self, writer: &mut impl Write) -> Result<()> {
-        match self.0 {
-            View::Owned(value) => serde_json::to_writer(writer, value).map_err(Into::into),
-            View::Source(source) => write_source(source, writer),
-        }
+        self.write_canonical_replacing(&[], writer)
     }
 }
 
@@ -1226,8 +1140,12 @@ impl Write for CountWriter {
     }
 }
 /// One container walk; only scalar access touches the bytes.
-fn write_source(view: SourceView<'_>, writer: &mut impl Write) -> Result<()> {
+fn write_source(view: SourceView<'_>, replacements: &[(Json, Value)], writer: &mut impl Write) -> Result<()> {
     let value = JsonView(View::Source(view));
+    if let Some(replacement) = value.replacement(replacements)? {
+        serde_json::to_writer(writer, replacement)?;
+        return Ok(());
+    }
     match view.source.kind(view.value)? {
         Some(b'{') => {
             writer.write_all(b"{")?;
@@ -1239,7 +1157,7 @@ fn write_source(view: SourceView<'_>, writer: &mut impl Write) -> Result<()> {
                 first = false;
                 serde_json::to_writer(&mut *writer, key)?;
                 writer.write_all(b":")?;
-                child.write_canonical(writer)
+                child.write_canonical_replacing(replacements, writer)
             })?;
             writer.write_all(b"}")?;
         }
@@ -1249,7 +1167,7 @@ fn write_source(view: SourceView<'_>, writer: &mut impl Write) -> Result<()> {
                 if i != 0 {
                     writer.write_all(b",")?;
                 }
-                child?.write_canonical(writer)?;
+                child?.write_canonical_replacing(replacements, writer)?;
             }
             writer.write_all(b"]")?;
         }
@@ -1329,23 +1247,33 @@ mod tests {
         let context = RangeSource::from_captured(source.clone()).unwrap();
         assert_eq!(
             source
-                .read_positioned_range(&context, 0, source.len(), Validation::Value, |view| {
-                    Ok(view.get("known")?.unwrap().resolve()?.as_u64())
-                })
+                .read(
+                    ReadInput::Positioned(&context, 0, source.len(), None),
+                    Validation::Value,
+                    |view| { Ok(view.get("known")?.unwrap().resolve()?.as_u64()) }
+                )
                 .unwrap(),
             Some(1)
         );
         assert!(other
-            .read_positioned_range(&context, 0, other.len(), Validation::Value, |_| Ok(()))
+            .read(
+                ReadInput::Positioned(&context, 0, other.len(), None),
+                Validation::Value,
+                |_| Ok(())
+            )
             .is_err());
         let error = source
-            .read_positioned_range(&context, 0, source.len(), Validation::Value, |_| -> Result<()> {
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&first.path)?
-                    .write_all(b" ")?;
-                anyhow::bail!("intentional callback stop")
-            })
+            .read(
+                ReadInput::Positioned(&context, 0, source.len(), None),
+                Validation::Value,
+                |_| -> Result<()> {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&first.path)?
+                        .write_all(b" ")?;
+                    anyhow::bail!("intentional callback stop")
+                },
+            )
             .unwrap_err();
         assert!(error.to_string().contains("source changed"));
     }
@@ -1566,7 +1494,7 @@ mod tests {
         for bytes in cases {
             let fixture = Fixture::new(bytes.as_bytes());
             let source = JsonSource::capture(&fixture.path).unwrap();
-            let actual = source.read_syntax(|view| {
+            let actual = source.read(ReadInput::Document, Validation::Syntax, |view| {
                 let fields =
                     crate::harness::store::document::Fields::parse_struct(view, &["body"])?.context("not a struct")?;
                 if let Some(body) = fields.get("body") {
@@ -1596,7 +1524,7 @@ mod tests {
         let fixture = Fixture::new(bytes.as_bytes());
         let source = JsonSource::capture(&fixture.path).unwrap();
         source
-            .read_document(|view| {
+            .read(ReadInput::Document, Validation::Value, |view| {
                 let fields =
                     crate::harness::store::document::Fields::parse(view, &["id", "id", "body", "input"])?.unwrap();
                 assert_eq!(fields.string("id")?.as_deref(), Some("last"));
@@ -1624,9 +1552,9 @@ mod tests {
             format!("[{{\"bad\":1e400}},{{\"bad\":\"\\ud800\"}},{{\"ok\":{nested}}},{{\"ok\":1}}]").as_bytes(),
         );
         let source = JsonSource::capture(&fixture.path).unwrap();
-        assert!(source.read_document(|_| Ok(())).is_err());
+        assert!(source.read(ReadInput::Document, Validation::Value, |_| Ok(())).is_err());
         let syntax = source
-            .read_syntax(|view| {
+            .read(ReadInput::Document, Validation::Syntax, |view| {
                 view.accepted_array()?
                     .unwrap()
                     .map(|v| v.map(|v| v.is_some()))
@@ -1635,7 +1563,8 @@ mod tests {
             .unwrap();
         assert_eq!(syntax, [false, false, true, true]);
         let accepted = source
-            .read_archive(|array| {
+            .read(ReadInput::Document, Validation::Syntax, |array| {
+                let array = array.accepted_array()?;
                 array
                     .unwrap()
                     .map(|value| value.map(|v| v.is_some()))
@@ -1648,7 +1577,8 @@ mod tests {
             let source = JsonSource::capture(&fixture.path).unwrap();
             let mut published = false;
             let error = source
-                .read_archive(|_| {
+                .read(ReadInput::Document, Validation::Syntax, |view| {
+                    let _ = view.accepted_array()?;
                     published = true;
                     Ok(())
                 })
@@ -1760,7 +1690,9 @@ mod tests {
             if let Ok(text) = std::str::from_utf8(&input) {
                 let source = JsonSource::capture(&fixture.path).unwrap();
                 assert_eq!(
-                    source.read_record(0, text, |_| Ok(())).is_ok(),
+                    source
+                        .read(ReadInput::Record(0, text, None), Validation::Value, |_| Ok(()))
+                        .is_ok(),
                     expected,
                     "in memory {input:?}"
                 );
@@ -2072,17 +2004,21 @@ mod tests {
         let bytes = [b"prefix ".as_slice(), body.as_slice(), b" suffix".as_slice()].concat();
         let backing = Arc::new(crate::harness::store::bytes::ByteSource::read(bytes.as_slice()).unwrap());
         let child = source
-            .read_backing_syntax(backing, 7, body.len() as u64, |view| {
-                view.get("p")?
-                    .unwrap()
-                    .array()?
-                    .unwrap()
-                    .nth(1)
-                    .unwrap()?
-                    .get("n")?
-                    .unwrap()
-                    .to_json()
-            })
+            .read(
+                ReadInput::Backing(backing, 7, body.len() as u64),
+                Validation::Syntax,
+                |view| {
+                    view.get("p")?
+                        .unwrap()
+                        .array()?
+                        .unwrap()
+                        .nth(1)
+                        .unwrap()?
+                        .get("n")?
+                        .unwrap()
+                        .to_json()
+                },
+            )
             .unwrap();
         assert_eq!(canonical(&child), b"42");
         std::fs::remove_file(&fixture.path).unwrap();
@@ -2136,9 +2072,11 @@ mod tests {
                 })
                 .unwrap();
             let value = captured
-                .read_backing_value(backing.clone(), offset, len, |view| {
-                    view.get("arguments")?.unwrap().encoded_argument()
-                })
+                .read(
+                    ReadInput::Backing(backing.clone(), offset, len),
+                    Validation::Value,
+                    |view| view.get("arguments")?.unwrap().encoded_argument(),
+                )
                 .unwrap();
             let expected = crate::harness::wire::openai::parse_arguments(Some(&serde_json::Value::String(argument)));
             assert_eq!(value.resolve().unwrap().as_ref(), &expected);
@@ -2155,12 +2093,18 @@ mod tests {
                 })
                 .unwrap();
             let (copy_offset, copy_len) = captured
-                .read_backing_value(backing.clone(), offset, len, |view| {
-                    backing.append(|mut out| view.write_canonical(&mut out))
-                })
+                .read(
+                    ReadInput::Backing(backing.clone(), offset, len),
+                    Validation::Value,
+                    |view| backing.append(|mut out| view.write_canonical(&mut out)),
+                )
                 .unwrap();
             let copied = captured
-                .read_backing_value(backing.clone(), copy_offset, copy_len, |view| view.to_json())
+                .read(
+                    ReadInput::Backing(backing.clone(), copy_offset, copy_len),
+                    Validation::Value,
+                    |view| view.to_json(),
+                )
                 .unwrap();
             assert_eq!(canonical(&copied), wire);
         }
@@ -2180,9 +2124,11 @@ mod tests {
             })
             .unwrap();
         let value = captured
-            .read_backing_syntax(backing.clone(), offset, len, |view| {
-                view.get("arguments")?.unwrap().encoded_argument()
-            })
+            .read(
+                ReadInput::Backing(backing.clone(), offset, len),
+                Validation::Syntax,
+                |view| view.get("arguments")?.unwrap().encoded_argument(),
+            )
             .unwrap();
         let Json::Source(range) = &value else {
             panic!("decoded source")
@@ -2190,7 +2136,7 @@ mod tests {
         assert!(Arc::ptr_eq(range.decoded.as_ref().unwrap(), &backing));
         assert!(range.offset >= len);
         assert!(canonical(&value) == inner.as_bytes());
-        assert!(backing.len().unwrap() > len);
+        assert!(backing.byte_len().unwrap() > len);
         std::fs::remove_file(&fixture.path).unwrap();
         assert!(value.canonical_len().is_err());
     }

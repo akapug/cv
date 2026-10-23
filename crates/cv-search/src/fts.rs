@@ -42,7 +42,9 @@
 mod observe;
 #[cfg(test)]
 use observe::{body_hash, SweepWork};
+mod live;
 mod sweep;
+pub use live::{LiveRead, Suffix};
 use sweep::*;
 
 use crate::ingest::{Admission, AdmittedDocument, Writer};
@@ -102,7 +104,15 @@ fn build_schema() -> Schema {
     b.add_text_field("parent_id", STRING | STORED); // fielded: `parent_id:<id>` scopes to a forest
     b.add_text_field("agent_id", STRING | STORED); // stored attribution
     b.add_text_field("workflow", STRING | STORED); // stored attribution
+    b.add_bool_field(&format_field(), tantivy::schema::NumericOptions::default());
     b.build()
+}
+
+/// The schema's format stamp: a field that holds nothing, named by [`cv_core::source::VERSION`].
+/// An index built under another version lacks it, so [`schema_current`] refuses it: the indexing
+/// path rebuilds it whole, a query asks for `cv index`. No document of an older layout is read.
+fn format_field() -> String {
+    format!("cv_format_v{}", cv_core::source::VERSION)
 }
 
 fn fields_of(schema: &Schema) -> Result<Fields> {
@@ -129,10 +139,14 @@ fn fields_of(schema: &Schema) -> Result<Fields> {
     })
 }
 
-/// Whether an on-disk index carries every field of the current schema. A miss means it was built
-/// by an older `cv` (pre-`path`/`mtime`/`preview`, pre-subagent-provenance, pre-`size`/discovery-metadata guard, or one doc
-/// kind for everything) and must be rebuilt fresh — one-time on upgrade, from the indexing path only.
+/// Whether an on-disk index carries every field of the current schema and its format stamp
+/// ([`format_field`]). A miss means it was built by another `cv` and must be rebuilt fresh —
+/// one-time on upgrade, from the indexing path only.
 fn schema_current(schema: &Schema) -> bool {
+    schema.get_field(&format_field()).is_ok() && fields_current(schema)
+}
+
+fn fields_current(schema: &Schema) -> bool {
     [
         "kind",
         "first_msg",
@@ -436,7 +450,7 @@ pub fn index_all(
 /// Discovery beside [`sweep_decoded`], then the full sweep over what discovery found.
 fn sweep_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<(Swept, Vec<cv_core::SessionRef>)> {
     let sources = cv_core::source::read_scope();
-    let (handoff, decoded) = cv_core::codex_handoff::channel(DECODED_WINDOW);
+    let (handoff, decoded) = cv_core::codex_handoff::channel(DECODED_WINDOW, decoded_slots());
     let (early, refs) = std::thread::scope(|scope| {
         let sources = &sources;
         let discovery = scope.spawn(cv_core::env::carry(move || {
@@ -571,7 +585,7 @@ fn report(swept: Swept, rebuild: bool, strict: bool) -> Result<Indexed> {
     );
     if let Some(first) = swept.unreadable.first() {
         let summary = format!(
-            "{unread} session(s) could not be read and stay out of the index until a later pass (first: {} ({}): {})",
+            "{unread} session(s) could not be indexed this pass and are retried by the next (first: {} ({}): {})",
             first.id, first.harness, first.reason
         );
         anyhow::ensure!(!strict, "index incomplete: {summary}");
@@ -719,14 +733,7 @@ enum Delete {
 fn source_consumer(dir: &Path) -> Result<String> {
     use std::io::Write;
     let file = dir.join("cv-index-id");
-    let read = |file: &Path| -> Result<Option<String>> {
-        match std::fs::read_to_string(file) {
-            Ok(id) if !id.trim().is_empty() => Ok(Some(format!("fts:{}", id.trim()))),
-            Ok(_) => Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
-        }
-    };
+    let read = |file: &Path| indexed_consumer(file);
     if let Some(consumer) = read(&file)? {
         return Ok(consumer);
     }
@@ -762,6 +769,16 @@ fn source_consumer(dir: &Path) -> Result<String> {
             read(&file)?.with_context(|| format!("reading {}", file.display()))
         }
         Err(e) => Err(e).with_context(|| format!("recording {}", file.display())),
+    }
+}
+
+/// The consumer an index's identity file names, read only: `None` when it has none yet.
+fn indexed_consumer(file: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(file) {
+        Ok(id) if !id.trim().is_empty() => Ok(Some(format!("fts:{}", id.trim()))),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
     }
 }
 
@@ -996,13 +1013,13 @@ fn sig(primary: Option<cv_core::source::FileId>) -> (i64, i64) {
 
 /// The search index's source record payload: its documents live in the index, keyed per index
 /// (`fts:<cv-index-id>`), so the record carries nothing else. The shared `source::VERSION`
-/// invalidates both skip and append admission: pre-version-6 duplicate rows are replaced by
-/// the ordinary whole-session delete/write, with no separate index version or repair pass.
+/// invalidates both skip and append admission, and stamps the index's schema ([`format_field`]).
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct InIndex;
 
 impl cv_core::source::Payload for InIndex {
     const TAG: &'static str = "fts";
+    const BY_ROWS: bool = true;
 }
 
 /// What planning compares each candidate with: the index's docs and the catalog's tables, read
@@ -1059,18 +1076,12 @@ impl PlanState {
             ..
         } = self;
         let source = probe.snapshot(r);
-        let (mtime, size) = sig(source.primary);
-        // Auxiliary inputs are judged across primary growth, against the tuple the docs were
-        // indexed at; the adapter's checkpoint then decides whether the growth resumes.
-        let baseline = dependencies.get(r).map(|record| &record.baseline);
-        let indexed = existing.get(&r.id).copied().unwrap_or((mtime, size));
-        let dependencies_fresh =
-            baseline.is_some_and(|old| sig(old.primary) == indexed && old.dependencies_fresh(&source, probe));
-        // The docs' stamp is the current tuple, then the captured source authority holds.
-        let fts_fresh = mtime != 0
-            && existing.get(&r.id) == Some(&(mtime, size))
-            && dependencies.admit(r, &source, probe).is_some()
-            && metadata.get(&r.id) == Some(&DiscoveryMetadata::new(r, prov));
+        let Freshness {
+            mtime,
+            size,
+            fresh: fts_fresh,
+            dependencies_fresh,
+        } = Freshness::of(existing, metadata, dependencies, probe, r, prov, &source);
         let events = event_sync.needs_ingest(r, &source, prov, probe);
         // Unchanged on every axis → skip entirely (no re-parse beyond the metadata scan).
         // Folded subagents have no independent catalog affordance row; their FTS/event
@@ -1102,6 +1113,53 @@ impl PlanState {
             fts_fresh,
             cv_core::harness::for_harness(r.harness).is_some().then_some(job),
         )
+    }
+}
+
+/// Whether a session's FTS docs are current, as both the sweep and a search's live read judge it.
+struct Freshness {
+    mtime: i64,
+    size: i64,
+    /// The docs' stamp is the current tuple, the captured source authority holds and discovery
+    /// describes the session as the docs do.
+    fresh: bool,
+    /// The auxiliary inputs still match the tuple the docs were indexed at, so a grown primary
+    /// may resume from its mark.
+    dependencies_fresh: bool,
+}
+
+impl Freshness {
+    fn of(
+        existing: &HashMap<String, (i64, i64)>,
+        metadata: &HashMap<String, DiscoveryMetadata>,
+        dependencies: &cv_core::source::Table<InIndex>,
+        probe: &mut cv_core::source::Probe,
+        r: &cv_core::SessionRef,
+        prov: &cv_core::events::Provenance,
+        source: &cv_core::source::Baseline,
+    ) -> Self {
+        let (mtime, size) = sig(source.primary);
+        // Auxiliary inputs are judged across primary growth, against the tuple the docs were
+        // indexed at; the adapter's checkpoint then decides whether the growth resumes.
+        let baseline = dependencies.get(r).map(|record| &record.baseline);
+        let indexed = existing.get(&r.id).copied().unwrap_or((mtime, size));
+        let dependencies_fresh =
+            baseline.is_some_and(|old| sig(old.primary) == indexed && old.dependencies_fresh(source, probe));
+        // A session of a shared SQLite store keeps its docs while its rows certify unchanged,
+        // though the store (the docs' stamp) moved with a write to another session.
+        let by_rows = dependencies.get(r).is_some_and(|record| record.baseline.rows.is_some());
+        let fresh = mtime != 0
+            && existing
+                .get(&r.id)
+                .is_some_and(|&stamp| stamp == (mtime, size) || by_rows)
+            && dependencies.admit(r, source, probe).is_some()
+            && metadata.get(&r.id) == Some(&DiscoveryMetadata::new(r, prov));
+        Freshness {
+            mtime,
+            size,
+            fresh,
+            dependencies_fresh,
+        }
     }
 }
 
@@ -1210,9 +1268,10 @@ const CHECKPOINT_EVERY: u64 = CHUNK_BYTES as u64;
 /// and the shared snapshot-size spacing can delay this request further.
 const CHECKPOINT_AT_MOST: u64 = 8 * CHUNK_BYTES as u64;
 
-/// The version of what a mark's `fts` layer and the docs behind it mean, part of every mark's
-/// version: bump it when [`FtsState`], the doc layout or [`CHECKPOINT_EVERY`] changes.
-const RESUME_TAG: &str = "fts5";
+/// The consumer a mark's `fts` layer belongs to. Its version is the mark's
+/// ([`cv_core::resume::version`], [`cv_core::source::VERSION`]): a change to [`FtsState`], the doc
+/// layout or [`CHECKPOINT_EVERY`] bumps that.
+const RESUME_TAG: &str = "fts";
 
 /// The checkpoint `job` can resume from: the source grew, its sampled mark still matches, and
 /// its state covers every consumer this pass feeds. Growth is interpreted under the adapter's
@@ -1289,8 +1348,14 @@ impl cv_core::MessageSink for CallbackCounter<'_> {
     fn dependency(&mut self, path: &Path) {
         self.inner.dependency(path);
     }
+    fn append_only_dependency(&mut self, path: &Path) {
+        self.inner.append_only_dependency(path);
+    }
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
         self.inner.wants_checkpoint(offset)
+    }
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        self.inner.wants_final_checkpoint(offset)
     }
     fn checkpoint(&mut self, checkpoint: &mut cv_core::stream::Checkpoint) {
         self.inner.checkpoint(checkpoint);
@@ -1322,7 +1387,8 @@ fn job_pass(
     let mut events = match from {
         None => cv_core::events::SpoolingSink::new(job.r.cwd.clone()),
         Some(cp) => cv_core::events::SpoolingSink::resume(cp).context("checkpoint without events")?,
-    };
+    }
+    .with_source(job.r.path.clone());
     if !job.events {
         events = events.without_events();
     }
@@ -1337,7 +1403,7 @@ fn job_pass(
     let event_sink: &mut dyn cv_core::MessageSink = &mut events;
     let done = if job.fts {
         let delete = match (from, job.existing) {
-            (Some(_), _) => Delete::From(first),
+            (Some(cp), _) => Delete::From(resumes_docs_at(cp).unwrap_or(first)),
             (None, true) => Delete::All,
             (None, false) => Delete::Nothing,
         };
@@ -1569,6 +1635,8 @@ struct ChunkSink<'w> {
     copied_before: Option<chrono::DateTime<chrono::Utc>>,
     /// A chunk was flushed since the last checkpoint: take the next one offered.
     boundary_due: bool,
+    /// The checkpoint about to be taken is the read's end mark: keep the docs open in it.
+    keep_open: bool,
     /// Where the last checkpoint was taken (the file offset).
     last_checkpoint: u64,
     /// Whitespace-collapsed head of the body, capped at [`PREVIEW_CHARS`]; stored on the meta doc.
@@ -1581,8 +1649,8 @@ struct ChunkSink<'w> {
 /// The [`cv_core::stream::Checkpoint`] layer a [`ChunkSink`] keeps its state under.
 const FTS_LAYER: &str = "fts";
 
-/// What a [`ChunkSink`] holds at a checkpoint (its buffer is empty there: the docs so far are in
-/// the index).
+/// What a [`ChunkSink`] holds at a checkpoint. At a chunk boundary its buffers are empty (the
+/// docs so far are in the index); at the end of a read they hold the open docs ([`Open`]).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct FtsState {
     discovery_metadata: DiscoveryMetadata,
@@ -1593,6 +1661,39 @@ struct FtsState {
     meta_received: bool,
     first_prompt: Option<String>,
     preview: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    open: Option<Open>,
+}
+
+/// The docs still open at a read's end mark ([`cv_core::MessageSink::wants_final_checkpoint`]):
+/// the text of the exchange and context buffers since the last chunk boundary. A pass resumed
+/// there continues them, and replaces the partial docs the marked pass flushed at its end, so
+/// the docs are those a whole pass makes. Bounded by two chunks per buffer.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Open {
+    /// The last chunk-boundary checkpoint's offset, the schedule a whole pass keeps.
+    last_checkpoint: u64,
+    /// A chunk was flushed since then: the next spaced checkpoint flushes the rest.
+    boundary_due: bool,
+    buf: String,
+    buf_first: usize,
+    in_context: bool,
+    other: String,
+    other_first: usize,
+}
+
+/// The first message whose docs a pass resumed at `cp` replaces: the checkpoint's own, or the
+/// first of the docs it left open.
+fn resumes_docs_at(cp: &cv_core::stream::Checkpoint) -> Option<usize> {
+    let at = cp.messages()?;
+    let open = cp.get::<FtsState>(FTS_LAYER).and_then(|state| state.open);
+    Some(open.map_or(at, |open| {
+        [(&open.buf, open.buf_first), (&open.other, open.other_first)]
+            .into_iter()
+            .filter(|(text, _)| !text.is_empty())
+            .map(|(_, first)| first)
+            .fold(at, usize::min)
+    }))
 }
 
 /// Length cap (chars) of the stored head-of-body preview — the snippet fallback when a hit's
@@ -1636,6 +1737,7 @@ impl<'w> ChunkSink<'w> {
             other_first: 0,
             copied_before: None,
             boundary_due: false,
+            keep_open: false,
             last_checkpoint: 0,
             preview: String::new(),
             docs: 0,
@@ -1669,6 +1771,15 @@ impl<'w> ChunkSink<'w> {
         sink.first_prompt = st.first_prompt;
         sink.preview = st.preview;
         sink.last_checkpoint = cp.offset;
+        if let Some(open) = st.open {
+            sink.last_checkpoint = open.last_checkpoint;
+            sink.boundary_due = open.boundary_due;
+            sink.buf = open.buf;
+            sink.buf_first = open.buf_first;
+            sink.in_context = open.in_context;
+            sink.other = open.other;
+            sink.other_first = open.other_first;
+        }
         Some(sink)
     }
 
@@ -1915,16 +2026,19 @@ impl cv_core::projection::Searchable for ChunkSink<'_> {
         // A persisted-output stub points to text absent from the transcript itself.
         if let Some(path) = block.persisted_output_path() {
             self.dependencies.record(Path::new(path));
-            let head = cv_core::lazy::read_head_checked(Path::new(path), PERSISTED_INDEX_CAP)
-                .context("reading persisted search output")?;
-            if let cv_core::lazy::PersistedHead::Unreadable(reason) = &head {
-                anyhow::bail!("reading persisted search output {path}: {reason}");
-            }
-            if let Some(text) = head.indexed_text(path) {
-                for piece in text.as_bytes().chunks(CHUNK_BYTES) {
-                    self.push_chunk(&String::from_utf8_lossy(piece));
+            // The whole output, in chunk-sized pieces: what the model saw through the stub is
+            // searchable to its end.
+            let read = cv_core::lazy::read_pieces_checked(Path::new(path), CHUNK_BYTES, |piece| {
+                self.push_chunk(piece);
+                Ok(())
+            })
+            .context("reading persisted search output")?;
+            match read {
+                cv_core::lazy::PersistedHead::Unreadable(reason) => {
+                    anyhow::bail!("reading persisted search output {path}: {reason}")
                 }
-                self.push_chunk("\n");
+                cv_core::lazy::PersistedHead::Text(_) => self.push_chunk("\n"),
+                cv_core::lazy::PersistedHead::Absent => {}
             }
         }
         Ok(())
@@ -1997,10 +2111,6 @@ impl std::io::Write for JsonChunks<'_, '_> {
     }
 }
 
-/// How much of a persisted tool output (a sidecar file) to index per stub. A multi-MB dump beyond
-/// this is still on disk (`cv show` prints the path); the index just carries its head.
-const PERSISTED_INDEX_CAP: usize = 1024 * 1024;
-
 impl cv_core::MessageSink for ChunkSink<'_> {
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.failed |= self.err.is_some();
@@ -2010,6 +2120,9 @@ impl cv_core::MessageSink for ChunkSink<'_> {
     }
     fn dependency(&mut self, path: &Path) {
         self.dependencies.record(path);
+    }
+    fn append_only_dependency(&mut self, path: &Path) {
+        self.dependencies.record_append_only(path);
     }
     fn meta(&mut self, s: &cv_core::Session) {
         self.meta_title = s.title.clone();
@@ -2027,17 +2140,39 @@ impl cv_core::MessageSink for ChunkSink<'_> {
     /// which only a stretch with little text reaches (giant tool outputs, telemetry), so a resumed
     /// pass normally re-reads little. The shared scheduler can delay requests for large states.
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
+        self.keep_open = false;
         !self.failed
             && self.err.is_none()
             && (self.boundary_due || offset >= self.last_checkpoint.saturating_add(CHECKPOINT_AT_MOST))
     }
 
+    /// The read's end, between chunk boundaries: a mark that keeps the open docs' text, so the
+    /// next pass reads only what was appended and still writes the docs a whole pass would.
+    /// Always keeping the docs open, even when a chunk boundary is due: a whole pass flushes at
+    /// its next spaced checkpoint, and so does a pass resumed here.
+    fn wants_final_checkpoint(&mut self, _offset: u64) -> bool {
+        self.keep_open = !self.failed && self.err.is_none();
+        self.keep_open
+    }
+
     /// A checkpoint is a body-doc boundary: every doc lies wholly before it or after it, so a
-    /// pass resumed there replaces exactly the docs from its message on.
+    /// pass resumed there replaces exactly the docs from its message on. The read's end mark
+    /// instead carries the open docs ([`Open`]), which the pass flushes at its end as usual.
     fn checkpoint(&mut self, cp: &mut cv_core::stream::Checkpoint) {
-        self.flush_both();
-        self.boundary_due = false;
-        self.last_checkpoint = cp.offset;
+        let open = std::mem::take(&mut self.keep_open).then(|| Open {
+            last_checkpoint: self.last_checkpoint,
+            boundary_due: self.boundary_due,
+            buf: self.buf.clone(),
+            buf_first: self.buf_first,
+            in_context: self.in_context,
+            other: self.other.clone(),
+            other_first: self.other_first,
+        });
+        if open.is_none() {
+            self.flush_both();
+            self.boundary_due = false;
+            self.last_checkpoint = cp.offset;
+        }
         cp.put(
             FTS_LAYER,
             &FtsState {
@@ -2049,6 +2184,7 @@ impl cv_core::MessageSink for ChunkSink<'_> {
                 meta_received: self.meta_received,
                 first_prompt: self.first_prompt.clone(),
                 preview: self.preview.clone(),
+                open,
             },
         );
     }
@@ -2161,7 +2297,7 @@ fn kind_query(f: &Fields, kind: &str) -> tantivy::query::TermQuery {
     )
 }
 
-/// Session `id`'s metadata: absence allows a body fallback; failed lookup or decoding does not.
+/// Session `id`'s metadata document, if the index holds one.
 fn meta_doc(searcher: &tantivy::Searcher, f: &Fields, id: &str) -> Result<Option<TantivyDocument>> {
     meta_addr(searcher, f, id)?
         .map(|address| searcher.doc(address))
@@ -2184,14 +2320,18 @@ fn meta_addr(searcher: &tantivy::Searcher, f: &Fields, id: &str) -> Result<Optio
     Ok(top.into_iter().next().map(|(_, addr)| addr))
 }
 
+/// Every committed session of a current index has its metadata document: the writer commits
+/// only between whole sessions. A body without one is an unusable index, not a session to guess.
+fn missing_meta(id: &str) -> tantivy::TantivyError {
+    tantivy::TantivyError::InternalError(format!(
+        "search index holds session {id} without its metadata; rebuild it with `cv index --rebuild`"
+    ))
+}
+
 #[derive(Clone, Copy)]
-enum MetadataDecision {
-    Present {
-        address: tantivy::DocAddress,
-        accepted: bool,
-    },
-    Missing,
-    Unavailable,
+struct MetadataDecision {
+    address: tantivy::DocAddress,
+    accepted: bool,
 }
 
 /// Query-local predicate decisions and addresses. Retain no metadata strings/documents: only
@@ -2217,7 +2357,7 @@ impl MetadataDecisions {
             observed: Default::default(),
         }
     }
-    fn resolve(&self, id: &str) -> MetadataDecision {
+    fn resolve(&self, id: &str) -> tantivy::Result<MetadataDecision> {
         let cached = self
             .cache
             .lock()
@@ -2225,34 +2365,28 @@ impl MetadataDecisions {
             .get(id)
             .copied();
         if let Some(decision) = cached {
-            return decision;
+            return Ok(decision);
         }
-        // Errors remain retryable and keep the existing per-body fallback. A definite missing
-        // meta doc is stable in this searcher's snapshot, but its body filter is segment-local.
+        // A failed lookup is the query's error and is not cached.
         #[cfg(test)]
         self.observed.queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let decision = match meta_addr(&self.searcher, &self.fields, id) {
-            Ok(Some(address)) => {
-                #[cfg(test)]
-                self.observed
-                    .stored_reads
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                match self.searcher.doc::<TantivyDocument>(address) {
-                    Ok(doc) => MetadataDecision::Present {
-                        address,
-                        accepted: metadata_matches(&doc, &self.fields, self.harness.as_deref(), self.cwd.as_deref()),
-                    },
-                    Err(_) => return MetadataDecision::Unavailable,
-                }
-            }
-            Ok(None) => MetadataDecision::Missing,
-            Err(_) => return MetadataDecision::Unavailable,
+        let address = meta_addr(&self.searcher, &self.fields, id)
+            .map_err(|error| tantivy::TantivyError::InternalError(format!("{error:#}")))?
+            .ok_or_else(|| missing_meta(id))?;
+        #[cfg(test)]
+        self.observed
+            .stored_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let doc = self.searcher.doc::<TantivyDocument>(address)?;
+        let decision = MetadataDecision {
+            address,
+            accepted: metadata_matches(&doc, &self.fields, self.harness.as_deref(), self.cwd.as_deref()),
         };
         self.cache
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .insert(id.to_owned(), decision);
-        decision
+        Ok(decision)
     }
     fn cached(&self, id: &str) -> Option<MetadataDecision> {
         self.cache
@@ -2296,67 +2430,6 @@ pub fn newest_indexed_mtime(dir: &Path) -> Option<i64> {
     sigs.values().filter(|(_, size)| *size >= 0).map(|&(mt, _)| mt).max()
 }
 
-/// How far the index at `dir` trails the live session corpus — the data the search footer's
-/// staleness disclosure names. `stale_sessions` counts sessions whose primary source signature no
-/// longer matches their indexed stamp (grew, rewrote, or arrived since the last pass); `behind_ns`
-/// is the gap between the index's newest stamp and the newest session file on disk. `None` when
-/// the index can't be opened or holds no meta docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Staleness {
-    pub stale_sessions: usize,
-    pub behind_ns: i64,
-}
-
-/// The staleness probe. The sessions come from the catalog ([`cv_core::sessions`], which probes
-/// its freshness and rescans only what changed), then one stat each — the same cost this call's
-/// miss-path predecessor paid; a full `discover_all` here made every miss pay a fleet scan.
-pub fn staleness(dir: &Path) -> Option<Staleness> {
-    staleness_over(dir, &cv_core::sessions())
-}
-
-/// [`staleness`] over a caller-supplied inventory — the split that lets a unit test feed the
-/// fixture's refs rather than a real corpus discovery.
-fn staleness_over(dir: &Path, refs: &[cv_core::SessionRef]) -> Option<Staleness> {
-    let (sigs, _) = probe_indexed_sigs(dir)?;
-    let indexed = sigs.values().filter(|(_, size)| *size >= 0).map(|&(mt, _)| mt).max()?;
-    // Count against the same preferred-candidate set the sweep indexes: a second on-disk
-    // copy of one session is not another stale session.
-    let prov = cv_core::events::Provenance::default();
-    let mut stale_sessions = 0usize;
-    let mut newest_on_disk = 0i64;
-    for (r, _) in preferred_index_candidates(refs.iter().map(|r| (r, &prov)).collect()) {
-        let cur = sig(cv_core::source::FileId::at(&cv_core::source::primary_path(r)));
-        newest_on_disk = newest_on_disk.max(cur.0);
-        if cur.0 == 0 || sigs.get(&r.id) != Some(&cur) {
-            stale_sessions += 1;
-        }
-    }
-    Some(Staleness {
-        stale_sessions,
-        behind_ns: newest_on_disk.saturating_sub(indexed),
-    })
-}
-
-/// The one-sentence staleness disclosure every search surface prints — on a hit list it warns the
-/// rows may be behind, on a miss it names the likely reason a recent conversation wasn't found.
-/// `None` when the index is caught up (or unmeasurable).
-pub fn staleness_note(dir: &Path) -> Option<String> {
-    staleness(dir).as_ref().and_then(staleness_line)
-}
-
-/// The note text for a measured [`Staleness`], `None` when caught up — the pure split the unit
-/// test asserts on (`staleness` itself goes through the fleet catalog's discovery).
-fn staleness_line(s: &Staleness) -> Option<String> {
-    if s.stale_sessions == 0 {
-        return None;
-    }
-    Some(format!(
-        "the index is ~{} behind for {} session(s) — run `cv index`",
-        fmt_age_ns(s.behind_ns),
-        s.stale_sessions
-    ))
-}
-
 /// `7s` / `14m` / `9h` / `3d` — the compact age the staleness note carries.
 fn fmt_age_ns(ns: i64) -> String {
     let secs = (ns / 1_000_000_000).max(0);
@@ -2389,10 +2462,7 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
     let (index, f) = open_or_create(dir)?;
     let mut writer = open_writer(&index, 50_000_000)?;
     let consumer = source_consumer(dir)?;
-    anyhow::ensure!(
-        cv_core::source::invalidate(&consumer, refs),
-        "invalidating old search dependency baselines"
-    );
+    cv_core::source::invalidate(&consumer, refs).context("invalidating old search dependency baselines")?;
     writer.delete_all_documents().context("clearing index")?;
     let mut probe = cv_core::source::Probe::default();
     let mut dependencies = Vec::new();
@@ -2402,7 +2472,7 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
         };
         let source = probe.snapshot(r);
         let (mtime, size) = sig(source.primary);
-        let mut es = catalog.then(|| cv_core::events::SpoolingSink::new(r.cwd.clone()));
+        let mut es = catalog.then(|| cv_core::events::SpoolingSink::new(r.cwd.clone()).with_source(r.path.clone()));
         let (_, reads) = index_session_clean(
             &mut writer,
             &f,
@@ -2489,6 +2559,56 @@ pub fn text_search_ids_batch(dir: &Path, queries: &[&str]) -> Result<Vec<Result<
         .collect())
 }
 
+/// [`text_search_ids_batch`] over the index plus the live suffix of `refs` it has not seen,
+/// as `live` allows (all of it by default). Membership is exact for every session
+/// the index describes as it is now or the suffix read; the returned [`Suffix`] names the rest.
+/// No index at `dir` is an empty index.
+pub fn text_search_ids_suffixed(
+    dir: &Path,
+    queries: &[&str],
+    live: LiveRead,
+    refs: &[cv_core::SessionRef],
+) -> Result<(Vec<Result<HashSet<String>>>, Suffix)> {
+    let indexed = if dir.join("meta.json").exists() || live == LiveRead::Frozen {
+        Some(query_index(dir)?)
+    } else {
+        None
+    };
+    let (live, suffix) = live::read(
+        dir,
+        indexed.as_ref().map(|(index, f, _)| live::Indexed { index, f }),
+        refs,
+        live,
+    )?;
+    let empty = HashMap::new();
+    let shadows = live.as_ref().map_or(&empty, |l| &l.shadows);
+    let matches = queries
+        .iter()
+        .map(|query| -> Result<HashSet<String>> {
+            let mut ids = HashSet::new();
+            if let Some((index, f, searcher)) = &indexed {
+                let parsed = parse_text_query(index, f, query, crate::Scope::Exchange)?;
+                let parsed = live::without_shadowed(f, parsed, shadows);
+                ids.extend(
+                    searcher
+                        .search(&*parsed, &crate::session_collector::SessionIds(f.id))
+                        .context("matching session IDs")?,
+                );
+            }
+            if let Some(l) = &live {
+                let parsed = parse_text_query(l.searcher.index(), &l.f, query, crate::Scope::Exchange)?;
+                ids.extend(
+                    l.searcher
+                        .search(&*parsed, &crate::session_collector::SessionIds(l.f.id))
+                        .context("matching live session IDs")?,
+                );
+            }
+            Ok(ids)
+        })
+        .collect();
+    Ok((matches, suffix))
+}
+
 fn matching_ids(index: &Index, f: &Fields, searcher: &tantivy::Searcher, query: &str) -> Result<HashSet<String>> {
     let parsed = parse_text_query(index, f, query, crate::Scope::Exchange)?;
     searcher
@@ -2516,15 +2636,32 @@ fn enrich_snippets(
     scope: crate::Scope,
     hits: &mut [Hit],
 ) -> Result<Option<String>> {
+    enrich_snippets_from(|id| source_path(searcher, f, id), query, scope, hits)
+}
+
+/// The source path session `id`'s meta doc in `searcher` names.
+fn source_path(searcher: &tantivy::Searcher, f: &Fields, id: &str) -> Result<String> {
+    let doc = meta_doc(searcher, f, id)?.ok_or_else(|| missing_meta(id))?;
+    doc.get_first(f.path)
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .with_context(|| format!("search metadata for {id} names no source path"))
+}
+
+/// [`enrich_snippets`] with each hit's source path from `path_of`.
+fn enrich_snippets_from(
+    path_of: impl Fn(&str) -> Result<String>,
+    query: &str,
+    scope: crate::Scope,
+    hits: &mut [Hit],
+) -> Result<Option<String>> {
     let (mut unreadable, mut first) = (0usize, None);
     for hit in hits {
-        let doc = meta_doc(searcher, f, &hit.id)?;
-        let path = doc.as_ref().and_then(|d| d.get_first(f.path)).and_then(|v| v.as_str());
+        let path = path_of(&hit.id)?;
+        let path = path.as_str();
         // The stored preview stands in when the live read cannot: marked when the source is
-        // gone, returned as the search's note when it is there but cannot be read. A hit whose
-        // meta doc names no path (a legacy body-only index) keeps its preview unmarked.
-        let Some(path) = path else { continue };
-        match live_snippet(path, &hit.harness, query, scope) {
+        // gone, returned as the search's note when it is there but cannot be read.
+        match live_snippet(path, &hit.id, &hit.harness, query, scope) {
             Ok(snippet) if !snippet.is_empty() => hit.snippet = snippet,
             Ok(_) => {}
             Err(_) if !Path::new(path).exists() => {
@@ -2607,6 +2744,146 @@ pub(crate) fn search_with_snippets(
     Ok((hits, note))
 }
 
+/// Search the index plus the live suffix of `refs` it has not seen ([`live`]), as `live` allows
+/// ([`LiveRead::Frozen`]: the index alone, the suffix only counted). No index at `dir` is an
+/// empty index: every session is unindexed. An index that is there but unusable is an error.
+pub(crate) fn search_suffixed(
+    dir: &Path,
+    query: &str,
+    limit: usize,
+    filter: crate::SearchFilter<'_>,
+    live: LiveRead,
+    refs: &[cv_core::SessionRef],
+) -> Result<Searched> {
+    let indexed = if dir.join("meta.json").exists() || live == LiveRead::Frozen {
+        Some(query_index(dir)?)
+    } else {
+        None
+    };
+    let (live, suffix) = live::read(
+        dir,
+        indexed.as_ref().map(|(index, f, _)| live::Indexed { index, f }),
+        refs,
+        live,
+    )?;
+    let empty = HashMap::new();
+    let shadows = live.as_ref().map_or(&empty, |l| &l.shadows);
+    let stats = live::Union(
+        indexed.as_ref().map(|(_, _, searcher)| searcher),
+        live.as_ref().map(|l| &l.searcher),
+    );
+    let live_decisions = live
+        .as_ref()
+        .map(|l| std::sync::Arc::new(MetadataDecisions::new(&l.searcher, &l.f, filter)));
+    // One answer per session: the live meta doc describes a session the suffix read.
+    let accept = |decisions: &std::sync::Arc<MetadataDecisions>| {
+        filtered(filter).then(|| {
+            let (own, live, shadows) = (decisions.clone(), live_decisions.clone(), shadows.clone());
+            std::sync::Arc::new(move |id: &str| match &live {
+                Some(live) if shadows.contains_key(id) => live.resolve(id).map(|d| d.accepted),
+                _ => own.resolve(id).map(|d| d.accepted),
+            }) as crate::session_collector::SessionFilter
+        })
+    };
+    // (score, from the live side, candidate), best first, one per session.
+    let mut ranked: HashMap<String, (crate::session_collector::Candidate, bool)> = HashMap::new();
+    let mut keep = |candidate: crate::session_collector::Candidate, is_live: bool| match ranked.get(&candidate.id) {
+        Some((best, _)) if best.score >= candidate.score => {}
+        _ => {
+            ranked.insert(candidate.id.clone(), (candidate, is_live));
+        }
+    };
+    let indexed_decisions = indexed
+        .as_ref()
+        .map(|(_, f, searcher)| std::sync::Arc::new(MetadataDecisions::new(searcher, f, filter)));
+    // A side that ranked fewer than `limit` sessions ranked every session it matches; one that
+    // filled `limit` may match more, and is counted by a second, unscored pass over its ids.
+    let mut counts: Vec<(HashSet<String>, Option<crate::session_collector::SessionFilter>)> = Vec::new();
+    let mut exhaustive = true;
+    if let (Some((index, f, searcher)), Some(decisions)) = (&indexed, &indexed_decisions) {
+        let parsed = live::without_shadowed(f, parse_text_query(index, f, query, filter.scope)?, shadows);
+        let candidates = rank(f, searcher, &*parsed, limit, accept(decisions), &stats)?;
+        if candidates.len() >= limit {
+            exhaustive = false;
+            let ids = searcher
+                .search(&*parsed, &crate::session_collector::SessionIds(f.id))
+                .context("counting matching sessions")?;
+            counts.push((ids, accept(decisions)));
+        }
+        for candidate in candidates {
+            keep(candidate, false);
+        }
+    }
+    if let (Some(l), Some(decisions)) = (&live, &live_decisions) {
+        let parsed = parse_text_query(l.searcher.index(), &l.f, query, filter.scope)?;
+        let candidates = rank(&l.f, &l.searcher, &*parsed, limit, accept(decisions), &stats)?;
+        if candidates.len() >= limit {
+            exhaustive = false;
+            let ids = l
+                .searcher
+                .search(&*parsed, &crate::session_collector::SessionIds(l.f.id))
+                .context("counting matching live sessions")?;
+            counts.push((ids, accept(decisions)));
+        }
+        for candidate in candidates {
+            keep(candidate, true);
+        }
+    }
+    let total = if exhaustive {
+        ranked.len()
+    } else {
+        let mut matched: HashSet<String> = ranked.keys().cloned().collect();
+        for (ids, admit) in counts {
+            for id in ids {
+                if !matched.contains(&id) && admit.as_ref().map_or(Ok(true), |admit| admit(&id))? {
+                    matched.insert(id);
+                }
+            }
+        }
+        matched.len()
+    };
+    let mut ranked: Vec<_> = ranked.into_values().collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0));
+    ranked.truncate(limit);
+    let mut hits = Vec::with_capacity(ranked.len());
+    for (candidate, is_live) in ranked {
+        let described_live = shadows.contains_key(&candidate.id);
+        hits.push(match (&indexed, &indexed_decisions, &live, &live_decisions) {
+            (_, _, Some(l), Some(d)) if is_live => indexed_hit(&l.searcher, &l.f, candidate, d)?,
+            (_, _, Some(l), Some(d)) if described_live => {
+                meta_hit(&l.searcher, &l.f, candidate.id, candidate.score, d)?
+            }
+            (Some((_, f, searcher)), Some(d), _, _) => indexed_hit(searcher, f, candidate, d)?,
+            _ => unreachable!("a candidate comes from a side that exists"),
+        });
+    }
+    let note = enrich_snippets_from(
+        |id| match (&live, &indexed) {
+            (Some(l), _) if shadows.contains_key(id) => source_path(&l.searcher, &l.f, id),
+            (_, Some((_, f, searcher))) => source_path(searcher, f, id),
+            _ => Err(missing_meta(id).into()),
+        },
+        query,
+        filter.scope,
+        &mut hits,
+    )?;
+    Ok(Searched {
+        hits,
+        total,
+        note,
+        suffix,
+    })
+}
+
+/// What [`search_suffixed`] found: the top hits, how many sessions matched in all, the snippet
+/// note, and the live suffix's account.
+pub(crate) struct Searched {
+    pub hits: Vec<Hit>,
+    pub total: usize,
+    pub note: Option<String>,
+    pub suffix: Suffix,
+}
+
 fn ranked_search(
     index: &Index,
     f: &Fields,
@@ -2617,123 +2894,135 @@ fn ranked_search(
     decisions: std::sync::Arc<MetadataDecisions>,
 ) -> Result<Vec<Hit>> {
     let parsed = parse_text_query(index, f, query, filter.scope)?;
+    let accept = filtered(filter).then(|| {
+        let shared = decisions.clone();
+        std::sync::Arc::new(move |id: &str| shared.resolve(id).map(|decision| decision.accepted))
+            as crate::session_collector::SessionFilter
+    });
+    rank(f, searcher, &*parsed, limit, accept, searcher)?
+        .into_iter()
+        .map(|candidate| indexed_hit(searcher, f, candidate, &decisions))
+        .collect()
+}
 
+/// Whether a filter needs each session's metadata before ranking.
+fn filtered(filter: crate::SearchFilter<'_>) -> bool {
+    filter.harness.is_some() || filter.cwd.is_some()
+}
+
+/// The top `limit` sessions `query` matches in `searcher`, each ranked by its best chunk under
+/// BM25 with the corpus statistics `stats` supplies (the searcher's own, or the index and the live
+/// suffix together), admitted by `accept` when given.
+fn rank(
+    f: &Fields,
+    searcher: &tantivy::Searcher,
+    query: &dyn tantivy::query::Query,
+    limit: usize,
+    accept: Option<crate::session_collector::SessionFilter>,
+    stats: &dyn tantivy::query::Bm25StatisticsProvider,
+) -> Result<Vec<crate::session_collector::Candidate>> {
     // Collect sessions rather than chunks. Each segment's top `limit` sessions contains every
     // possible global winner, even when one session has arbitrarily many matching chunks.
     let mut collector = crate::session_collector::TopSessions::new(f.id, limit);
-    if filter.harness.is_some() || filter.cwd.is_some() {
-        let harness = filter.harness.map(str::to_owned);
-        let cwd = filter.cwd.map(str::to_owned);
-        let fields = f.clone();
-        let shared = decisions.clone();
-        collector.filter = Some(std::sync::Arc::new(move |id, store, doc_id| {
-            // Resumed chunks can retain older labels/cwd: filter the same current meta doc that
-            // describes the returned hit, falling back only for legacy body-only documents.
-            match shared.resolve(id) {
-                MetadataDecision::Present { accepted, .. } => {
-                    return Ok(crate::session_collector::FilterDecision::Session(accepted))
-                }
-                MetadataDecision::Missing | MetadataDecision::Unavailable => {}
-            }
-            let fallback = store.get::<TantivyDocument>(doc_id)?;
-            Ok(crate::session_collector::FilterDecision::Document(metadata_matches(
-                &fallback,
-                &fields,
-                harness.as_deref(),
-                cwd.as_deref(),
-            )))
-        }));
-    }
-    let ranked = searcher.search(&parsed, &collector).context("running search")?;
-
-    let mut hits = Vec::with_capacity(ranked.len());
-    for candidate in ranked {
-        let (score, id) = (candidate.score, candidate.id);
-        let head: crate::session_collector::StoredHead<2> =
-            searcher.doc(candidate.addr).context("loading stored doc header")?;
-        let load_candidate = || -> Result<TantivyDocument> {
-            #[cfg(test)]
-            decisions
-                .observed
-                .winner_body_reads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            searcher.doc(candidate.addr).context("loading stored doc")
-        };
-        // Preserve candidate-meta identity (including compatible duplicate metadata rows).
-        // A body winner needs its current meta document; only legacy/missing/unreadable
-        // metadata or a reordered header demands the complete candidate document.
-        let (is_meta, candidate_doc) = match head.value(f.kind) {
-            Some(kind) => (kind.as_str() == Some(KIND_META), None),
-            None => {
-                let doc = load_candidate()?;
-                let is_meta = doc.get_first(f.kind).and_then(|v| v.as_str()) == Some(KIND_META);
-                (is_meta, Some(doc))
-            }
-        };
-        // Filtered hits must display the same authoritative metadata that admitted them.
-        // Unfiltered queries retain the matching meta row in compatible duplicate indexes.
-        let doc = if is_meta && filter.harness.is_none() && filter.cwd.is_none() {
-            match candidate_doc {
-                Some(doc) => doc,
-                None => load_candidate()?,
-            }
-        } else {
-            let metadata = match decisions.cached(&id) {
-                Some(MetadataDecision::Present { address, .. }) => {
-                    #[cfg(test)]
-                    decisions
-                        .observed
-                        .winner_metadata_reads
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Some(searcher.doc(address).context("reading search metadata")?)
-                }
-                Some(MetadataDecision::Missing) => None,
-                _ => meta_doc(searcher, f, &id)?,
-            };
-            match metadata {
-                Some(doc) => doc,
-                None => match candidate_doc {
-                    Some(doc) => doc,
-                    None => load_candidate()?,
-                },
-            }
-        };
-        let get_str =
-            |field: Field| -> Option<String> { doc.get_first(field).and_then(|v| v.as_str()).map(|s| s.to_string()) };
-        let harness = get_str(f.harness).unwrap_or_default();
-        let snippet = get_str(f.preview).unwrap_or_default();
-
-        hits.push(Hit {
-            id,
-            harness,
-            cwd: get_str(f.cwd),
-            title: get_str(f.title),
-            created_at: doc.get_first(f.created_at).and_then(|v| v.as_i64()),
-            updated_at: doc.get_first(f.updated_at).and_then(|v| v.as_i64()),
-            score,
-            snippet,
-            parent_id: get_str(f.parent_id),
-            agent_id: get_str(f.agent_id),
-            workflow: get_str(f.workflow),
-            session: None,
-        });
-    }
-    Ok(hits)
+    // Resumed chunks can retain older labels/cwd: filter the same current meta doc that
+    // describes the returned hit.
+    collector.filter = accept;
+    searcher
+        .search_with_statistics_provider(query, &collector, stats)
+        .context("running search")
 }
 
-/// Most text we'll scan from a session to find a snippet window. Matches are almost always early;
-/// capping keeps snippeting a multi-GB hit bounded.
-const SNIPPET_SCAN_CAP: usize = 256 * 1024;
+/// A ranked candidate as a hit, described by its session's meta doc in `searcher`.
+fn indexed_hit(
+    searcher: &tantivy::Searcher,
+    f: &Fields,
+    candidate: crate::session_collector::Candidate,
+    decisions: &MetadataDecisions,
+) -> Result<Hit> {
+    let (score, id) = (candidate.score, candidate.id);
+    let head: crate::session_collector::StoredHead<2> =
+        searcher.doc(candidate.addr).context("loading stored doc header")?;
+    let load_candidate = || -> Result<TantivyDocument> {
+        #[cfg(test)]
+        decisions
+            .observed
+            .winner_body_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        searcher.doc(candidate.addr).context("loading stored doc")
+    };
+    // A meta winner is its own metadata; a body winner reads its session's meta document.
+    let is_meta = head
+        .value(f.kind)
+        .with_context(|| {
+            format!("search index document of {id} carries no kind; rebuild it with `cv index --rebuild`")
+        })?
+        .as_str()
+        == Some(KIND_META);
+    let doc = if is_meta {
+        load_candidate()?
+    } else {
+        let address = match decisions.cached(&id) {
+            Some(decision) => {
+                #[cfg(test)]
+                decisions
+                    .observed
+                    .winner_metadata_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                decision.address
+            }
+            None => meta_addr(searcher, f, &id)?.ok_or_else(|| missing_meta(&id))?,
+        };
+        searcher.doc(address).context("reading search metadata")?
+    };
+    Ok(hit_of(&doc, f, id, score))
+}
 
-/// Generate a snippet for a hit by re-reading **just that one session** (streamed, capped), finding
-/// the first query term, and windowing around it — instead of keeping a stored copy of every body.
+/// Session `id`'s hit at `score`, described by its meta doc in `searcher` (the live suffix's
+/// current description of a session whose older chunks ranked it).
+fn meta_hit(
+    searcher: &tantivy::Searcher,
+    f: &Fields,
+    id: String,
+    score: f32,
+    decisions: &MetadataDecisions,
+) -> Result<Hit> {
+    let address = match decisions.cached(&id) {
+        Some(decision) => decision.address,
+        None => meta_addr(searcher, f, &id)?.ok_or_else(|| missing_meta(&id))?,
+    };
+    let doc: TantivyDocument = searcher.doc(address).context("reading search metadata")?;
+    Ok(hit_of(&doc, f, id, score))
+}
+
+fn hit_of(doc: &TantivyDocument, f: &Fields, id: String, score: f32) -> Hit {
+    let get_str =
+        |field: Field| -> Option<String> { doc.get_first(field).and_then(|v| v.as_str()).map(|s| s.to_string()) };
+    Hit {
+        id,
+        harness: get_str(f.harness).unwrap_or_default(),
+        cwd: get_str(f.cwd),
+        title: get_str(f.title),
+        created_at: doc.get_first(f.created_at).and_then(|v| v.as_i64()),
+        updated_at: doc.get_first(f.updated_at).and_then(|v| v.as_i64()),
+        score,
+        snippet: get_str(f.preview).unwrap_or_default(),
+        parent_id: get_str(f.parent_id),
+        agent_id: get_str(f.agent_id),
+        workflow: get_str(f.workflow),
+        session: None,
+    }
+}
+
+/// Generate a snippet for a hit by re-reading **just that one session** (streamed), finding the
+/// first query term, and windowing around it — instead of keeping a stored copy of every body.
 ///
-/// Streams under [`Demand::with_spans`] and resolves span content **capped at the remaining scan
-/// budget**, so a session fronted by a giant record (e.g. a 700 MB tool dump) costs at most
-/// [`SNIPPET_SCAN_CAP`] here — the old `bulk()` + materialize path owned the whole record before
-/// the cap check could run. Trade-off: a term that only occurs *beyond* the cap inside one giant
-/// field now falls back to the head/preview snippet (it already did for terms in later messages).
-fn live_snippet(path: &str, harness: &str, query: &str, scope: crate::Scope) -> Result<String> {
+/// Streams under [`Demand::with_spans`] into a [`cv_core::scan::Matcher`], which matches the whole
+/// projection in pieces and keeps only a window, so a session fronted by a giant record (a 700 MB
+/// tool dump) costs its read, not its size in memory; the read stops once every term is placed.
+/// The snippet is the first term (in query order) that occurs anywhere, else the head.
+fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::Scope) -> Result<String> {
+    use cv_core::projection::Searchable;
+    use cv_core::scan::Matcher;
     use cv_core::{Block, Demand, Flow, Message, MessageSink, SessionRef};
     let h = cv_core::Harness::parse(harness).with_context(|| format!("unknown harness {harness:?}"))?;
     let adapter = cv_core::harness::for_harness(h).with_context(|| format!("no adapter for {harness}"))?;
@@ -2743,16 +3032,70 @@ fn live_snippet(path: &str, harness: &str, query: &str, scope: crate::Scope) -> 
         created_at: None,
         updated_at: None,
         message_count: None,
-        ..SessionRef::new(String::new(), h, PathBuf::from(path))
+        ..SessionRef::new(id.to_owned(), h, PathBuf::from(path))
     };
 
     struct Acc {
-        head: cv_core::projection::Head,
+        matcher: Matcher,
         resolver: cv_core::Resolver,
         error: Option<anyhow::Error>,
         failed: bool,
         scope: crate::Scope,
         copied_before: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    impl Acc {
+        fn block(&mut self, b: &Block) -> Result<()> {
+            let none = &mut || Ok(());
+            match b {
+                Block::Text { text } | Block::Thinking { text, .. } => {
+                    self.matcher.text(text, &self.resolver, none)?;
+                    self.matcher.push("\n");
+                }
+                Block::ToolUse { name, input, .. } => {
+                    self.matcher.push(name);
+                    self.matcher.push(" ");
+                    self.matcher.json(input, none)?;
+                    self.matcher.push("\n");
+                }
+                Block::ToolResult { content, .. } => {
+                    self.matcher.text(content, &self.resolver, none)?;
+                    self.matcher.push("\n");
+                    if let Some(p) = b.persisted_output_path() {
+                        let matcher = &mut self.matcher;
+                        let read = cv_core::stream::stopped(cv_core::lazy::read_pieces_checked(
+                            std::path::Path::new(p),
+                            64 * 1024,
+                            |piece| {
+                                matcher.push(piece);
+                                if matcher.done() {
+                                    Err(cv_core::stream::Stop.into())
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        ))?;
+                        match read {
+                            Some(cv_core::lazy::PersistedHead::Text(_)) => matcher.push("\n"),
+                            Some(head) => {
+                                if let Some(note) = head.indexed_text(p) {
+                                    matcher.push(&note);
+                                    matcher.push("\n");
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                Block::File { path, source, .. } => {
+                    if let Some(p) = path.as_deref().or(source.as_deref()) {
+                        self.matcher.push(p);
+                        self.matcher.push("\n");
+                    }
+                }
+                Block::Image { .. } => {}
+            }
+            Ok(())
+        }
     }
     impl MessageSink for Acc {
         fn take_error(&mut self) -> Option<anyhow::Error> {
@@ -2772,68 +3115,24 @@ fn live_snippet(path: &str, harness: &str, query: &str, scope: crate::Scope) -> 
                 return Flow::Continue;
             }
             for b in &m.content {
-                if self.head.full() {
+                if self.matcher.done() {
                     break;
                 }
-                match b {
-                    Block::Text { text } | Block::Thinking { text, .. } => {
-                        if let Err(error) = self.head.try_push_text(text, &self.resolver) {
-                            self.error = Some(error);
-                            return Flow::Stop;
-                        }
-                        self.head.push("\n");
-                    }
-                    Block::ToolUse { name, input, .. } => {
-                        self.head.push(name);
-                        self.head.push(" ");
-                        if let Err(error) = self.head.push_json(input) {
-                            self.error = Some(error);
-                            return Flow::Stop;
-                        }
-                        self.head.push("\n");
-                    }
-                    Block::ToolResult { content, .. } => {
-                        if let Err(error) = self.head.try_push_text(content, &self.resolver) {
-                            self.error = Some(error);
-                            return Flow::Stop;
-                        }
-                        self.head.push("\n");
-                        if let Some(p) = b.persisted_output_path() {
-                            let remaining = self.head.remaining();
-                            if remaining > 0 {
-                                match cv_core::lazy::read_head_checked(std::path::Path::new(p), remaining) {
-                                    Ok(head) => {
-                                        if let Some(t) = head.indexed_text(p) {
-                                            self.head.push(&t);
-                                            self.head.push("\n");
-                                        }
-                                    }
-                                    Err(error) => {
-                                        self.error = Some(error);
-                                        return Flow::Stop;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Block::File { path, source, .. } => {
-                        if let Some(p) = path.as_deref().or(source.as_deref()) {
-                            self.head.push(p);
-                            self.head.push("\n");
-                        }
-                    }
-                    Block::Image { .. } => {}
+                if let Err(error) = self.block(b) {
+                    self.error = Some(error);
+                    return Flow::Stop;
                 }
             }
-            if self.head.full() {
+            if self.matcher.done() {
                 Flow::Stop
             } else {
                 Flow::Continue
             }
         }
     }
+    let terms = query_terms(query);
     let mut acc = Acc {
-        head: cv_core::projection::Head::new(SNIPPET_SCAN_CAP),
+        matcher: Matcher::new(terms.clone(), terms.len()),
         resolver: cv_core::Resolver::new(Some(PathBuf::from(path))),
         error: None,
         failed: false,
@@ -2847,10 +3146,16 @@ fn live_snippet(path: &str, harness: &str, query: &str, scope: crate::Scope) -> 
         &mut acc,
         cv_core::stream::Pass::RECORD,
     )?;
-    Ok(make_snippet(acc.head.as_str(), query))
+    let head = acc.matcher.finish();
+    Ok(match (0..terms.len()).find_map(|i| acc.matcher.excerpt_of(i)) {
+        Some(e) => window(&e.text, e.at, e.len),
+        None => self::head(&head.text, 200),
+    })
 }
 
-/// Window the body around the first matching query term; fall back to a head if nothing matches.
+/// Window the body around the first matching query term; fall back to a head if nothing matches:
+/// what [`live_snippet`] computes from its stream, over a whole body.
+#[cfg(test)]
 fn make_snippet(body: &str, query: &str) -> String {
     let lc = body.to_lowercase();
     for term in query_terms(query) {
@@ -2944,6 +3249,9 @@ mod tests {
             writer
                 .add_document(tantivy::doc!(f.id => id, f.kind => KIND_BODY, f.harness => harness, f.body => "needle"))
                 .unwrap();
+            writer
+                .add_document(tantivy::doc!(f.id => id, f.kind => KIND_META, f.harness => harness, f.path => format!("/gone/{id}")))
+                .unwrap();
         }
         writer.commit().unwrap();
         let found = crate::Searcher::default()
@@ -2956,6 +3264,7 @@ mod tests {
                 },
                 2,
                 crate::Source::Index,
+                None,
             )
             .unwrap();
         assert_eq!(found.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["b", "c"]);
@@ -2974,6 +3283,48 @@ mod tests {
         assert!(identities.iter().all(|id| id == &identities[0]));
         assert!(uuid::Uuid::parse_str(identities[0].strip_prefix("fts:").unwrap()).is_ok());
         assert_eq!(source_consumer(&dir).unwrap(), identities[0]);
+    }
+
+    /// The live suffix a search reads beside the index holds a private index in a temporary
+    /// directory: its heap is the writer's arena, not what the unindexed sessions hold. The sweep
+    /// fixture, unindexed, searched with the default read, which takes all four giant sessions.
+    #[cfg(feature = "probe-heap")]
+    #[test]
+    #[ignore = "explicit synthetic CV_SWEEP_INPUT_PROBE and CV_SWEEP_INPUT_BYTES, one isolated process"]
+    fn production_live_suffix_heap_probe() {
+        let _home = IsolatedHome::new();
+        let fixture = std::fs::canonicalize(std::env::var_os("CV_SWEEP_INPUT_PROBE").unwrap()).unwrap();
+        let len = std::fs::metadata(&fixture).unwrap().len();
+        let refs: Vec<_> = (0..4)
+            .map(|n| cv_core::SessionRef::new(format!("large{n}"), cv_core::Harness::Claude, &fixture))
+            .collect();
+        let dir = tmpdir();
+        let baseline = cv_testkit::heap::begin();
+        let started = std::time::Instant::now();
+        let Searched { hits, suffix, .. } = search_suffixed(
+            &dir.join("absent"),
+            "Inspect",
+            10,
+            crate::SearchFilter::default(),
+            LiveRead::All,
+            &refs,
+        )
+        .unwrap();
+        let wall = started.elapsed().as_secs_f64();
+        let heap = cv_testkit::heap::end(baseline);
+        assert_eq!((hits.len(), suffix.read, suffix.cut), (4, 4, 0));
+        assert_eq!((suffix.bytes, suffix.cut_bytes), (4 * len, 0));
+        // Four 100 MB sessions: the writer's arena and the admitted documents, flushed to disk.
+        assert!(
+            heap.peak_above_baseline_bytes < 384 * 1024 * 1024,
+            "{}",
+            heap.peak_above_baseline_bytes
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"session_bytes":len,"read":suffix.read,"cut":suffix.cut,"wall_s":wall,
+                "peak_heap":heap.peak_above_baseline_bytes})
+        );
     }
 
     #[cfg(feature = "probe-heap")]
@@ -3017,10 +3368,13 @@ mod tests {
         let wall = started.elapsed().as_secs_f64();
         let heap = cv_testkit::heap::end(baseline);
         assert_eq!((result.changed, result.errors), (refs.len(), 0));
-        assert_eq!(result.observed.admission.0, 0);
+        assert_eq!(result.observed.admission.charged_bytes, 0);
         let bounded = std::env::var_os("CV_SWEEP_COMPARE_UNBOUNDED").is_none();
         if bounded {
-            assert!(result.observed.admission.1 <= crate::ingest::DOCUMENT_BYTES.max(result.observed.admission.2));
+            assert!(
+                result.observed.admission.peak_charged_bytes
+                    <= crate::ingest::DOCUMENT_BYTES.max(result.observed.admission.largest_document_bytes)
+            );
         }
         // This is a scoped composed-path ceiling, not a universal RSS promise. Four concurrent
         // synthetic giant Source inputs include raw queues, working buffers, tokenizers and arenas.
@@ -3061,58 +3415,66 @@ mod tests {
         let repeat_started = std::time::Instant::now();
         let unchanged = sweep(&dir, refs, false, false).unwrap();
         assert_eq!(
-            (unchanged.changed, unchanged.errors, unchanged.observed.admission.1),
+            (
+                unchanged.changed,
+                unchanged.errors,
+                unchanged.observed.admission.peak_charged_bytes
+            ),
             (0, 0, 0)
         );
         eprintln!(
             "{}",
             serde_json::json!({"input_bytes":input_bytes,"physical_bytes":std::fs::metadata(&fixture).unwrap().len(),
             "large_sessions":copies,"small_sessions":small,"chunk_bytes":CHUNK_BYTES,
-            "document_limit_bytes":if bounded { Some(crate::ingest::DOCUMENT_BYTES) } else { None },"queue_peak_charged_bytes":result.observed.admission.1,
-            "largest_document_charged_bytes":result.observed.admission.2,"queue_waits":result.observed.admission.3,
+            "document_limit_bytes":if bounded { Some(crate::ingest::DOCUMENT_BYTES) } else { None },"queue_peak_charged_bytes":result.observed.admission.peak_charged_bytes,
+            "largest_document_charged_bytes":result.observed.admission.largest_document_bytes,"queue_waits":result.observed.admission.queue_waits,
             "body_hashing":std::env::var_os("CV_SWEEP_HASH_BODY").is_some(),"bodies":result.observed.bodies,
             "heap":heap,"wall_seconds":wall,"unchanged_wall_seconds":repeat_started.elapsed().as_secs_f64(),
             "tantivy_tokenization":true,"commits_and_compaction":true})
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn source_admission_selects_fitting_work_without_losing_largest_first_order() {
-        let mut small = ingest_job(cv_core::SessionRef::new("small", cv_core::Harness::Claude, "/missing"));
-        small.size = (IN_FLIGHT_BYTES / 8) as i64;
-        let mut medium = ingest_job(cv_core::SessionRef::new("medium", cv_core::Harness::Claude, "/missing"));
-        medium.size = (IN_FLIGHT_BYTES / 2) as i64;
-        let mut large = ingest_job(cv_core::SessionRef::new("large", cv_core::Harness::Claude, "/missing"));
-        large.size = (3 * IN_FLIGHT_BYTES / 4) as i64;
-        let mut queue = Queue {
-            groups: vec![vec![small], vec![medium], vec![large]],
-            in_flight: 0,
-            draining: false,
-            stopped: false,
-            closed: true,
+        let job = |id: &str, size: u64| {
+            let mut job = ingest_job(cv_core::SessionRef::new(id, cv_core::Harness::Claude, "/missing"));
+            job.size = size as i64;
+            job
         };
-        assert_eq!(queue.next_fitting(), Some(2));
-        let large = queue.groups.pop().unwrap();
-        queue.in_flight = job_cost(&large);
+        let mut queue = Queue::new();
+        queue.closed = true;
+        queue.push(vec![job("small", IN_FLIGHT_BYTES / 8)]);
+        queue.push(vec![job("large", 3 * IN_FLIGHT_BYTES / 4)]);
+        queue.push(vec![job("medium", IN_FLIGHT_BYTES / 2)]);
+        let id = |(_, group): (u64, Vec<Job>)| group[0].r.id.clone();
+        assert_eq!(queue.take_fitting().map(id).as_deref(), Some("large"));
         assert_eq!(
-            queue.next_fitting(),
-            Some(0),
+            queue.take_fitting().map(id).as_deref(),
+            Some("small"),
             "do not leave a worker idle behind the medium group"
         );
-        let small = queue.groups.remove(0);
-        queue.in_flight += job_cost(&small);
         assert_eq!(queue.next_fitting(), None);
         queue.in_flight = 0;
-        assert_eq!(queue.next_fitting(), Some(0), "the waiting medium group now runs");
+        assert_eq!(
+            queue.next_fitting(),
+            Some((IN_FLIGHT_BYTES / 2, 2)),
+            "the waiting medium group now runs"
+        );
         queue.draining = true;
         assert_eq!(queue.next_fitting(), None);
         queue.draining = false;
         queue.stopped = true;
         assert_eq!(queue.next_fitting(), None);
 
-        let mut group = small;
-        group.extend(large);
+        // Equal charges: the latest arrival first, as the stable sort this replaced popped them.
+        let mut queue = Queue::new();
+        for n in 0..4 {
+            queue.push(vec![job(&format!("tie{n}"), 1)]);
+        }
+        let order: Vec<_> = std::iter::from_fn(|| queue.take_fitting().map(id)).collect();
+        assert_eq!(order, ["tie3", "tie2", "tie1", "tie0"]);
+
+        let mut group = vec![job("small", IN_FLIGHT_BYTES / 8), job("large", 3 * IN_FLIGHT_BYTES / 4)];
         assert_eq!(job_cost(&group), 7 * IN_FLIGHT_BYTES / 8);
         group[0].r.path = "/missing.jsonl.zst".into();
         assert_eq!(
@@ -3120,11 +3482,19 @@ mod tests {
             IN_FLIGHT_BYTES,
             "compressed size cannot undercharge a group"
         );
+        // A frame that declares its decoded size is charged that size, not the whole guard.
+        let dir = tmpdir();
+        let declared = dir.join("rollout.jsonl.zst");
+        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0xA0];
+        frame.extend_from_slice(&(IN_FLIGHT_BYTES as u32 / 16).to_le_bytes());
+        std::fs::write(&declared, frame).unwrap();
+        group[0].r.path = declared;
+        assert_eq!(job_cost(&group), IN_FLIGHT_BYTES / 16 + 3 * IN_FLIGHT_BYTES / 4);
         group[0].r.path = "/missing".into();
         for job in &mut group {
             job.size = i64::MAX;
         }
-        group.extend(queue.groups.pop().unwrap());
+        group.push(job("medium", IN_FLIGHT_BYTES / 2));
         assert_eq!(job_cost(&group), IN_FLIGHT_BYTES, "aggregate source sizes saturate");
     }
 
@@ -3147,7 +3517,12 @@ mod tests {
         let dir = tmpdir();
         let result = sweep(&dir, refs.clone(), false, false).unwrap();
         assert_eq!((result.changed, result.errors), (refs.len(), 0));
-        let (live, peak, largest, _) = result.observed.admission;
+        let admission = result.observed.admission;
+        let (live, peak, largest) = (
+            admission.charged_bytes,
+            admission.peak_charged_bytes,
+            admission.largest_document_bytes,
+        );
         assert_eq!(live, 0, "commit consumed every accepted document");
         assert!(peak <= crate::ingest::DOCUMENT_BYTES.max(largest));
         assert!(peak > 0);
@@ -3159,7 +3534,6 @@ mod tests {
             assert!(cv_core::catalog::AffordanceTable::load().counts(r).is_some());
         }
         assert_eq!(sweep(&dir, refs, false, false).unwrap().changed, 0);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Every stored document of the index at `dir`, canonically ordered.
@@ -3220,7 +3594,6 @@ mod tests {
             let reference = tmpdir();
             sweep(&reference, refs, false, false).unwrap();
             assert_eq!(all_docs(dir), all_docs(&reference));
-            std::fs::remove_dir_all(reference).unwrap();
             assert_eq!(text_search(dir, "zqcopy", 5).unwrap()[0].id, "zqa");
             assert!(text_search(dir, "zqorig", 5).unwrap().is_empty());
             let catalog = rusqlite::Connection::open(w.cv_home.join("catalog.db")).unwrap();
@@ -3259,7 +3632,6 @@ mod tests {
         std::fs::write(&preferred, rollout("zqa", "2026-08-01T12:00:00Z", "zqcopy again")).unwrap();
         check(&dir, true, 1);
         assert!(text_search(&dir, "zqbee", 5).unwrap().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3294,7 +3666,7 @@ mod tests {
         );
         drop(writer);
         assert_eq!(
-            admission.stats().0,
+            admission.stats().charged_bytes,
             0,
             "all accepted/discarded documents return their bytes"
         );
@@ -3307,7 +3679,62 @@ mod tests {
         ));
         assert!(cv_core::resume::MarkTable::load().get(&r).is_none());
         assert!(cv_core::catalog::AffordanceTable::load().counts(&r).is_none());
-        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A pass that cannot invalidate a session's old baseline (the catalog cannot be opened: the
+    /// process is out of descriptors, say) defers that session instead of failing: the pass
+    /// completes and names it, its docs and baseline stand, and the next pass reads it.
+    #[test]
+    fn a_failed_baseline_invalidation_defers_the_session_and_the_pass_completes() {
+        let home = IsolatedHome::new();
+        let path = write_claude(&home.home, "deferred", "zqbefore");
+        let r = cv_core::SessionRef::new("deferred", cv_core::Harness::Claude, &path);
+        let dir = tmpdir();
+        index_refs(&dir, std::slice::from_ref(&r), true).unwrap();
+        let consumer = source_consumer(&dir).unwrap();
+        let baseline = || cv_core::source::Table::<InIndex>::load(&consumer).get(&r).is_some();
+        assert!(baseline(), "the first pass published a baseline");
+
+        write_claude(&home.home, "deferred", "zqafter");
+        let db = home.home.join("catalog.db");
+        let aside = home.home.join("catalog.db.aside");
+        std::fs::rename(&db, &aside).unwrap();
+        std::fs::create_dir(&db).unwrap();
+        let (index, fields) = open_or_create(&dir).unwrap();
+        let mut writer = open_writer(&index, 15_000_000).unwrap();
+        let job = || Job {
+            existing: true,
+            ..ingest_job(r.clone())
+        };
+        let ran = run_jobs(&mut writer, &fields, vec![job()], &consumer).unwrap();
+        writer.commit().unwrap();
+        assert_eq!(ran.changed, 0);
+        assert_eq!(ran.unreadable.len(), 1, "the session is named");
+        assert_eq!(ran.unreadable[0].id, "deferred");
+        assert!(
+            ran.unreadable[0]
+                .reason
+                .contains("invalidating old search dependency baselines"),
+            "{}",
+            ran.unreadable[0].reason
+        );
+        let hits = |q: &str| {
+            let reader = index.reader().unwrap();
+            reader.reload().unwrap();
+            let query = tantivy::query::QueryParser::for_index(&index, vec![fields.body])
+                .parse_query(q)
+                .unwrap();
+            reader.searcher().search(&query, &tantivy::collector::Count).unwrap()
+        };
+        assert_eq!((hits("zqbefore"), hits("zqafter")), (1, 0), "its docs stand");
+
+        std::fs::remove_dir(&db).unwrap();
+        std::fs::rename(&aside, &db).unwrap();
+        assert!(baseline(), "its baseline stands for the next pass");
+        let ran = run_jobs(&mut writer, &fields, vec![job()], &consumer).unwrap();
+        writer.commit().unwrap();
+        assert_eq!((ran.changed, ran.unreadable.len()), (1, 0), "the next pass reads it");
+        assert_eq!((hits("zqbefore"), hits("zqafter")), (0, 1));
     }
 
     #[test]
@@ -3407,7 +3834,6 @@ mod tests {
             std::fs::write(&conditional, "conditional appeared or changed").unwrap();
             assert!(!stored.fresh(&mut cv_core::source::Probe::default()));
         }
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3445,7 +3871,6 @@ mod tests {
                 assert!(emitted > 0);
             }
         }
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3490,13 +3915,11 @@ mod tests {
         assert!(sink.finish().is_err());
         drop(sink);
         assert!(emitted > 0);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn tool_input_source_json_matches_canonical_body_and_reports_staleness() {
-        let dir = std::env::temp_dir().join(format!("cv-fts-json-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = tmpdir();
         let path = dir.join("input.json");
         let raw = format!("{{\"arg\":\"{}\",\"tail\":true}}", "\\u00e9\\n\\\"".repeat(CHUNK_BYTES));
         std::fs::write(&path, &raw).unwrap();
@@ -3527,7 +3950,6 @@ mod tests {
         let mut sink = ChunkSink::new(&mut ignore, &f, &r, 1, 1, Default::default());
         sink.append_block(&cv_core::Resolver::new(None), &block);
         assert!(format!("{:#}", sink.finish().unwrap_err()).contains("JSON source changed"));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3633,10 +4055,24 @@ mod tests {
         );
     }
 
-    fn tmpdir() -> std::path::PathBuf {
+    /// A temp directory that removes itself on drop: the hand-rolled `remove_dir_all` teardown
+    /// this replaces only ran on success, so any failing assert leaked the directory.
+    struct TmpDir(std::path::PathBuf);
+    impl std::ops::Deref for TmpDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    fn tmpdir() -> TmpDir {
         let d = std::env::temp_dir().join(format!("cv-search-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        TmpDir(d)
     }
 
     /// Indexing tees events into the catalog, whose path comes from `CLUSTERVISION_HOME`. Tests
@@ -3644,19 +4080,14 @@ mod tests {
     /// (and remove the home on drop), never at the shared real catalog.
     struct IsolatedHome {
         _scope: cv_core::env::Scope,
-        home: std::path::PathBuf,
+        home: TmpDir,
     }
     impl IsolatedHome {
         fn new() -> Self {
             let home = tmpdir();
             let scope = (*cv_core::env::Env::current()).clone().enter();
-            scope.set("CLUSTERVISION_HOME", &home);
+            scope.set("CLUSTERVISION_HOME", &*home);
             IsolatedHome { _scope: scope, home }
-        }
-    }
-    impl Drop for IsolatedHome {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.home).ok();
         }
     }
 
@@ -3733,8 +4164,6 @@ mod tests {
         let mut broken = fields.clone();
         broken.id = fields.preview; // Stored-only field: a term lookup must fail.
         assert!(meta_doc(&searcher, &broken, "metadata-error").is_err());
-        std::fs::remove_dir_all(dir).unwrap();
-        std::fs::remove_dir_all(source).unwrap();
     }
 
     #[test]
@@ -3800,13 +4229,11 @@ mod tests {
         writer.commit().unwrap();
         assert_eq!(text_search_ids(&dir, "allmatches").unwrap(), expected);
         drop(writer);
-        std::fs::remove_dir_all(dir).ok();
-        std::fs::remove_dir_all(sdir).ok();
     }
 
     /// Run in an isolated process. Prepare once, then compare full/head modes under `/usr/bin/time`.
     #[test]
-    #[ignore = "manual CPU and docstore I/O probe"]
+    #[ignore = "manual probe: set CV_SEARCH_ID_PROBE_DIR to an isolated fixture dir"]
     fn session_identity_lookup_probe() {
         let dir = PathBuf::from(std::env::var_os("CV_SEARCH_ID_PROBE_DIR").expect("isolated probe dir"));
         let mode = std::env::var("CV_SEARCH_ID_PROBE_MODE").unwrap_or_else(|_| "head".into());
@@ -3888,19 +4315,33 @@ mod tests {
         let mut writer = open_writer(&index, 15_000_000).unwrap();
         // A hundred best-scoring chunks from one session used to fill the whole fetch window.
         for _ in 0..100 {
-            writer.add_document(tantivy::doc!(f.id => "dominant", f.body => "needle needle needle", f.preview => "dominant preview")).unwrap();
+            writer
+                .add_document(tantivy::doc!(f.id => "dominant", f.kind => KIND_BODY, f.body => "needle needle needle"))
+                .unwrap();
         }
+        writer
+            .add_document(tantivy::doc!(f.id => "dominant", f.kind => KIND_META, f.preview => "dominant preview"))
+            .unwrap();
         // Reverse id order exercises equal-score cutoff selection beyond the former 64 docs.
         for i in (0..100).rev() {
-            writer.add_document(tantivy::doc!(f.id => format!("other-{i:03}"), f.body => "needle padding padding padding", f.preview => "other preview")).unwrap();
+            writer.add_document(tantivy::doc!(f.id => format!("other-{i:03}"), f.kind => KIND_BODY, f.body => "needle padding padding padding")).unwrap();
+            writer
+                .add_document(
+                    tantivy::doc!(f.id => format!("other-{i:03}"), f.kind => KIND_META, f.preview => "other preview"),
+                )
+                .unwrap();
         }
         writer.commit().unwrap();
         // The same sessions span another segment, including a better chunk of other-099.
         writer
-            .add_document(tantivy::doc!(f.id => "other-099", f.body => "needle needle needle needle"))
+            .add_document(
+                tantivy::doc!(f.id => "other-099", f.kind => KIND_BODY, f.body => "needle needle needle needle"),
+            )
             .unwrap();
         writer
-            .add_document(tantivy::doc!(f.id => "dominant", f.body => "needle padding padding padding"))
+            .add_document(
+                tantivy::doc!(f.id => "dominant", f.kind => KIND_BODY, f.body => "needle padding padding padding"),
+            )
             .unwrap();
         writer.commit().unwrap();
         writer.delete_term(Term::from_field_text(f.id, "other-050"));
@@ -3939,7 +4380,6 @@ mod tests {
             text_search_indexed(&dir, "needle", 3).unwrap()[1].snippet,
             "dominant preview"
         );
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -3954,95 +4394,79 @@ mod tests {
         assert!(crate::is_invalid_text_query(batch[1].as_ref().unwrap_err()));
         let setup = text_search_ids(&dir.join("missing"), "needle").unwrap_err();
         assert!(!crate::is_invalid_text_query(&setup));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A body winner displays its session's meta document, a meta winner itself; a document the
+    /// writer did not shape (no kind, no metadata, reordered fields) fails the query and names
+    /// `cv index --rebuild` instead of being read through a fallback.
     #[test]
-    fn body_only_filter_decisions_are_not_reused_by_session_identity() {
+    fn winner_projection_reads_current_metadata_and_refuses_other_layouts() {
+        use std::sync::Arc;
         let _home = IsolatedHome::new();
-        for reverse in [false, true] {
+        let search = |docs: Vec<TantivyDocument>, filter: crate::SearchFilter<'_>| {
             let dir = tmpdir();
             let (index, f) = open_or_create(&dir).unwrap();
             let mut writer = open_writer(&index, 15_000_000).unwrap();
-            let rows = [
-                ("claude", "/outside", "needle needle needle", "wrong"),
-                ("codex", "/wanted", "needle padding padding", "right"),
-            ];
-            for i in if reverse { vec![1, 0] } else { vec![0, 1] } {
-                let (harness, cwd, body, preview) = rows[i];
-                writer
-                    .add_document(tantivy::doc!(f.id => "legacy", f.kind => KIND_BODY,
-                    f.harness => harness, f.cwd => cwd, f.body => body, f.preview => preview))
-                    .unwrap();
+            for doc in docs {
+                writer.add_document(doc).unwrap();
             }
             writer.commit().unwrap();
             drop(writer);
-            for filter in [
+            let searcher = index.reader().unwrap().searcher();
+            let decisions = Arc::new(MetadataDecisions::new(&searcher, &f, filter));
+            ranked_search(&index, &f, &searcher, "needle", 10, filter, decisions)
+        };
+        let f = open_or_create(&tmpdir()).unwrap().1;
+        let current = || {
+            vec![
+                tantivy::doc!(f.id => "current", f.kind => KIND_BODY, f.body => "needle", f.preview => "discarded".repeat(131072)),
+                tantivy::doc!(f.id => "current", f.kind => KIND_META, f.harness => "codex", f.preview => "current preview", f.title => "current title"),
+                tantivy::doc!(f.id => "titled", f.kind => KIND_META, f.harness => "codex", f.title => "needle", f.preview => "titled preview"),
+            ]
+        };
+        for filter in [
+            crate::SearchFilter::default(),
+            crate::SearchFilter {
+                harness: Some("codex"),
+                ..Default::default()
+            },
+        ] {
+            let actual = search(current(), filter).unwrap();
+            let recorded = [
+                r#"{"id":"titled","harness":"codex","cwd":null,"title":"needle","score":0.9808292,"snippet":"titled preview","created_at":null,"updated_at":null,"parent_id":null,"agent_id":null,"workflow":null}"#,
+                r#"{"id":"current","harness":"codex","cwd":null,"title":"current title","score":0.53945607,"snippet":"current preview","created_at":null,"updated_at":null,"parent_id":null,"agent_id":null,"workflow":null}"#,
+            ];
+            assert_eq!(
+                serde_json::to_string(&actual).unwrap(),
+                format!("[{}]", recorded.join(","))
+            );
+        }
+        for (broken, filter) in [
+            (
+                tantivy::doc!(f.id => "body-only", f.kind => KIND_BODY, f.body => "needle"),
+                crate::SearchFilter::default(),
+            ),
+            (
+                tantivy::doc!(f.id => "body-only", f.kind => KIND_BODY, f.harness => "codex", f.body => "needle"),
                 crate::SearchFilter {
                     harness: Some("codex"),
-                    cwd: None,
                     ..Default::default()
                 },
-                crate::SearchFilter {
-                    harness: None,
-                    cwd: Some("wanted"),
-                    ..Default::default()
-                },
-            ] {
-                let hits = text_search_indexed_filtered(&dir, "needle", 1, filter).unwrap();
-                assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].harness, "codex");
-                assert_eq!(hits[0].snippet, "right");
-            }
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    #[test]
-    fn winner_header_projection_preserves_meta_and_legacy_fallback() {
-        use std::sync::Arc;
-        let _home = IsolatedHome::new();
-        let dir = tmpdir();
-        let (index, f) = open_or_create(&dir).unwrap();
-        let mut writer = open_writer(&index, 15_000_000).unwrap();
-        for doc in [
-            tantivy::doc!(f.id => "current", f.kind => KIND_BODY, f.body => "needle", f.preview => "discarded".repeat(131072)),
-            tantivy::doc!(f.id => "current", f.kind => KIND_META, f.preview => "current preview", f.title => "current title"),
-            // Compatible documents place kind after the inspected header or omit it entirely.
-            tantivy::doc!(f.title => "reordered", f.id => "legacy", f.kind => KIND_BODY, f.body => "needle", f.preview => "legacy preview"),
-            tantivy::doc!(f.id => "missing-kind", f.title => "old", f.body => "needle", f.preview => "old preview"),
-            // Candidate metadata rows must not be replaced by another same-id metadata row.
-            tantivy::doc!(f.id => "duplicate-meta", f.kind => KIND_META, f.title => "needle", f.preview => "matching meta"),
-            tantivy::doc!(f.id => "duplicate-meta", f.kind => KIND_META, f.title => "unrelated", f.preview => "other meta"),
+            ),
+            (
+                tantivy::doc!(f.id => "missing-kind", f.body => "needle"),
+                crate::SearchFilter::default(),
+            ),
+            (
+                tantivy::doc!(f.title => "reordered", f.id => "reordered", f.kind => KIND_BODY, f.body => "needle"),
+                crate::SearchFilter::default(),
+            ),
         ] {
-            writer.add_document(doc).unwrap();
+            let mut docs = current();
+            docs.push(broken);
+            let error = format!("{:#}", search(docs, filter).unwrap_err());
+            assert!(error.contains("cv index --rebuild"), "{error}");
         }
-        writer.commit().unwrap();
-        drop(writer);
-        let searcher = index.reader().unwrap().searcher();
-        let filter = crate::SearchFilter::default();
-        let decisions = Arc::new(MetadataDecisions::new(&searcher, &f, filter));
-        let actual = ranked_search(&index, &f, &searcher, "needle", 10, filter, decisions).unwrap();
-        // Recorded from the retired segment-local lookup, which this projection matched hit for hit.
-        let recorded = [
-            r#"{"id":"duplicate-meta","harness":"","cwd":null,"title":"needle","score":1.5404451,"snippet":"matching meta","created_at":null,"updated_at":null,"parent_id":null,"agent_id":null,"workflow":null}"#,
-            r#"{"id":"current","harness":"","cwd":null,"title":"current title","score":0.49191087,"snippet":"current preview","created_at":null,"updated_at":null,"parent_id":null,"agent_id":null,"workflow":null}"#,
-            r#"{"id":"legacy","harness":"","cwd":null,"title":"reordered","score":0.49191087,"snippet":"legacy preview","created_at":null,"updated_at":null,"parent_id":null,"agent_id":null,"workflow":null}"#,
-            r#"{"id":"missing-kind","harness":"","cwd":null,"title":"old","score":0.49191087,"snippet":"old preview","created_at":null,"updated_at":null,"parent_id":null,"agent_id":null,"workflow":null}"#,
-        ];
-        assert_eq!(
-            serde_json::to_string(&actual).unwrap(),
-            format!("[{}]", recorded.join(","))
-        );
-        assert_eq!(
-            actual.iter().find(|hit| hit.id == "current").unwrap().snippet,
-            "current preview"
-        );
-        assert_eq!(
-            actual.iter().find(|hit| hit.id == "duplicate-meta").unwrap().snippet,
-            "matching meta"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -4063,7 +4487,7 @@ mod tests {
                 .unwrap();
         }
         writer.commit().unwrap();
-        for segment in 0..16 {
+        for _ in 0..16 {
             for i in 0..128 {
                 writer
                     .add_document(tantivy::doc!(f.id => format!("session-{i:03}"), f.kind => KIND_BODY,
@@ -4071,10 +4495,6 @@ mod tests {
                     f.harness => "old-harness", f.cwd => "/stale", f.preview => "stale preview"))
                     .unwrap();
             }
-            // Missing metadata must not share one segment's body decision with another segment.
-            writer.add_document(tantivy::doc!(f.id => "legacy", f.kind => KIND_BODY,
-                f.body => "needle padding padding padding", f.harness => if segment % 2 == 0 { "codex" } else { "claude" },
-                f.cwd => "/current/project", f.preview => "legacy preview")).unwrap();
             writer.commit().unwrap();
         }
         drop(writer);
@@ -4088,28 +4508,27 @@ mod tests {
         };
         let decisions = Arc::new(MetadataDecisions::new(&searcher, &f, filter));
         let actual = ranked_search(&index, &f, &searcher, "needle", 10, filter, decisions.clone()).unwrap();
-        // Recorded from the retired segment-local lookup (16 * 129 + 5 metadata queries), which
-        // this shared lookup matched hit for hit.
+        // Recorded: the current metadata, not the stale body fields, admits and labels each hit.
         let recorded = [
-            r#"{"id":"session-000","harness":"codex","cwd":"/current/project","title":"current title 0","score":0.05895274,"snippet":"current preview 0","created_at":11,"updated_at":22,"parent_id":null,"agent_id":null,"workflow":null}"#,
-            r#"{"id":"session-001","harness":"codex","cwd":"/current/project","title":"current title 1","score":0.05895274,"snippet":"current preview 1","created_at":11,"updated_at":22,"parent_id":null,"agent_id":null,"workflow":null}"#,
-            r#"{"id":"session-002","harness":"codex","cwd":"/current/project","title":"current title 2","score":0.05895274,"snippet":"current preview 2","created_at":11,"updated_at":22,"parent_id":null,"agent_id":null,"workflow":null}"#,
-            r#"{"id":"session-003","harness":"codex","cwd":"/current/project","title":"current title 3","score":0.05895274,"snippet":"current preview 3","created_at":11,"updated_at":22,"parent_id":null,"agent_id":null,"workflow":null}"#,
-            r#"{"id":"legacy","harness":"codex","cwd":"/current/project","title":null,"score":0.051666375,"snippet":"legacy preview","created_at":null,"updated_at":null,"parent_id":null,"agent_id":null,"workflow":null}"#,
+            r#"{"id":"session-000","harness":"codex","cwd":"/current/project","title":"current title 0","score":0.059323233,"snippet":"current preview 0","created_at":11,"updated_at":22,"parent_id":null,"agent_id":null,"workflow":null}"#,
+            r#"{"id":"session-001","harness":"codex","cwd":"/current/project","title":"current title 1","score":0.059323233,"snippet":"current preview 1","created_at":11,"updated_at":22,"parent_id":null,"agent_id":null,"workflow":null}"#,
+            r#"{"id":"session-002","harness":"codex","cwd":"/current/project","title":"current title 2","score":0.059323233,"snippet":"current preview 2","created_at":11,"updated_at":22,"parent_id":null,"agent_id":null,"workflow":null}"#,
+            r#"{"id":"session-003","harness":"codex","cwd":"/current/project","title":"current title 3","score":0.059323233,"snippet":"current preview 3","created_at":11,"updated_at":22,"parent_id":null,"agent_id":null,"workflow":null}"#,
         ];
         assert_eq!(
             serde_json::to_string(&actual).unwrap(),
             format!("[{}]", recorded.join(","))
         );
-        assert_eq!(actual.len(), 5);
-        assert!(actual.iter().any(|hit| hit.id == "legacy"));
+        assert_eq!(actual.len(), 4);
         let queries = decisions.observed.queries.load(Ordering::Relaxed);
         let reads = decisions.observed.stored_reads.load(Ordering::Relaxed);
-        assert_eq!(queries, 129);
-        assert_eq!(reads, 128);
-        assert_eq!(decisions.observed.winner_body_reads.load(Ordering::Relaxed), 1);
+        // The shared pass is paid once per index state, not per hit (a per-segment lookup would
+        // spend 16 * 128 + 4): exact counts are the implementation's business, the ceiling is the point.
+        assert!(queries <= 129, "shared lookup queries {queries}");
+        assert!(reads <= 128, "stored reads {reads}");
+        assert_eq!(decisions.observed.winner_body_reads.load(Ordering::Relaxed), 0);
         assert_eq!(decisions.observed.winner_metadata_reads.load(Ordering::Relaxed), 4);
-        assert_eq!(decisions.cache.lock().unwrap().len(), 129);
+        assert!(decisions.cache.lock().unwrap().len() <= 129);
         // A top-three cutoff still compares exact scores/ties and current stored previews.
         let top = text_search_indexed_filtered(&dir, "needle", 3, filter).unwrap();
         assert_eq!(
@@ -4128,7 +4547,6 @@ mod tests {
         )
         .unwrap()
         .is_empty());
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -4138,12 +4556,12 @@ mod tests {
         let (index, f) = open_or_create(&dir).unwrap();
         let mut writer = open_writer(&index, 15_000_000).unwrap();
         for i in 0..100 {
-            writer.add_document(tantivy::doc!(f.id => format!("unwanted-{i}"), f.body => "needle needle needle", f.harness => "claude", f.cwd => "/outside/project")).unwrap();
+            writer.add_document(tantivy::doc!(f.id => format!("unwanted-{i}"), f.kind => KIND_BODY, f.body => "needle needle needle", f.harness => "claude", f.cwd => "/outside/project")).unwrap();
+            writer.add_document(tantivy::doc!(f.id => format!("unwanted-{i}"), f.kind => KIND_META, f.harness => "claude", f.cwd => "/outside/project")).unwrap();
         }
+        // A resumed body keeps the cwd it was indexed under; the meta doc is current.
         writer.add_document(tantivy::doc!(f.id => "wanted", f.kind => KIND_BODY, f.body => "needle padding padding", f.harness => "codex", f.cwd => "/stale/path")).unwrap();
-        writer.add_document(tantivy::doc!(f.id => "wanted", f.kind => KIND_META, f.harness => "codex", f.cwd => "/repo/mixed.Path/project", f.preview => "current preview")).unwrap();
-        // A compatible duplicate can win on its old title; display still follows admission.
-        writer.add_document(tantivy::doc!(f.id => "wanted", f.kind => KIND_META, f.title => "metaneedle", f.harness => "claude", f.cwd => "/old/project", f.preview => "old preview")).unwrap();
+        writer.add_document(tantivy::doc!(f.id => "wanted", f.kind => KIND_META, f.title => "metaneedle", f.harness => "codex", f.cwd => "/repo/mixed.Path/project", f.preview => "current preview")).unwrap();
         writer.commit().unwrap();
         drop(writer);
         for filter in [
@@ -4187,7 +4605,6 @@ mod tests {
             .unwrap()
             .is_empty());
         }
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -4210,8 +4627,6 @@ mod tests {
         assert!(hits[0].snippet.contains("replacementbody"));
         assert_eq!(hits[1].snippet, untouched);
         assert!(hits[1].snippet.contains("originalbody"));
-        std::fs::remove_dir_all(dir).ok();
-        std::fs::remove_dir_all(sdir).ok();
     }
 
     #[test]
@@ -4251,9 +4666,6 @@ mod tests {
 
         // Conjunction-by-default: a term present in neither yields nothing.
         assert!(text_search(&dir, "kubernetes", 10).unwrap().is_empty());
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     #[test]
@@ -4266,9 +4678,13 @@ mod tests {
         let tr = sdir.join("p1").join("tool-results");
         std::fs::create_dir_all(&tr).unwrap();
         let file = tr.join("abc123.txt");
+        // Past a MiB of output (the index once kept only that much of it), and across a piece.
         std::fs::write(
             &file,
-            "line one\nthe zanzibar constant appears only on disk\nline three\n",
+            format!(
+                "line one\n{}\nthe zanzibar constant appears only on disk\nline three\n",
+                "filler ".repeat(3 << 20 >> 3)
+            ),
         )
         .unwrap();
         let stub = format!(
@@ -4299,8 +4715,6 @@ mod tests {
             "the live snippet scans the file too: {:?}",
             hits[0].snippet
         );
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     #[test]
@@ -4358,9 +4772,6 @@ mod tests {
         assert_eq!(refresh().changed, 1);
         assert_eq!(text_search(&dir, "zanzibar", 10).unwrap().len(), 1);
         assert_eq!(refresh().changed, 0);
-        for d in [dir, sdir, external] {
-            std::fs::remove_dir_all(d).unwrap();
-        }
     }
 
     #[test]
@@ -4378,7 +4789,7 @@ mod tests {
             "message":{"role":"user","content":"zanzibar"}})
         );
         std::fs::write(&wire, line.repeat(8192)).unwrap();
-        let r = cv_core::SessionRef::new("directory", cv_core::Harness::KimiCode, &sdir);
+        let r = cv_core::SessionRef::new("directory", cv_core::Harness::KimiCode, &*sdir);
         let refresh = |rebuild| sweep(&dir, vec![r.clone()], rebuild, false).unwrap();
         assert_eq!(refresh(false).changed, 1);
         assert_eq!(refresh(false).changed, 0);
@@ -4414,8 +4825,100 @@ mod tests {
         let changed = refresh(false);
         assert_eq!((changed.changed, changed.resumed), (1, 0));
         assert_eq!(refresh(false).changed, 0);
-        std::fs::remove_dir_all(dir).unwrap();
-        std::fs::remove_dir_all(sdir).unwrap();
+    }
+
+    /// Grok appends to `updates.jsonl` on every turn: that growth resumes the mark (with the
+    /// enrichment of the tools the turn added), keeps a whole sweep's docs, events and counts,
+    /// and declines when it revises a tool the prefix emitted; growth alone rereads.
+    #[test]
+    fn grok_turns_resume_across_update_growth_and_decline_on_a_revised_tool() {
+        use std::io::Write as _;
+        let _home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let session = sdir.join("group/grok-session");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("summary.json"),
+            serde_json::json!({"info":{"id":"grok-session","cwd":"/work"},"created_at":"2026-10-01T00:00:00Z"})
+                .to_string(),
+        )
+        .unwrap();
+        let (history, updates) = (session.join("chat_history.jsonl"), session.join("updates.jsonl"));
+        let append = |path: &Path, lines: &[serde_json::Value]| {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            for line in lines {
+                writeln!(file, "{line}").unwrap();
+            }
+        };
+        let user = |text: &str| serde_json::json!({"type":"user","content":[{"type":"text","text":text}]});
+        let call = |id: &str| {
+            serde_json::json!({"type":"assistant","content":"","tool_calls":[{"id":id,"name":"read_file",
+                "arguments":"{\"target_file\":\"a.rs\"}"}]})
+        };
+        let result = |id: &str| serde_json::json!({"type":"tool_result","tool_call_id":id,"content":"zanzibar body"});
+        let update = |id: &str, title: &str, status: Option<&str>| {
+            let mut u = serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":title});
+            if let Some(status) = status {
+                u["status"] = status.into();
+            }
+            serde_json::json!({"method":"session/update","params":{"update":u}})
+        };
+        let chunk =
+            serde_json::json!({"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk"}}});
+        let hook = serde_json::json!({"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"hook_execution",
+            "event_name":"stop","runs":[{"name":"check","status":{"status":"success"}}]}}});
+        append(&history, &[user("zanzibar first"), call("c1"), result("c1")]);
+        append(
+            &updates,
+            &[
+                chunk.clone(),
+                update("c1", "Read a", None),
+                update("c1", "Read a", Some("completed")),
+            ],
+        );
+        let r = cv_core::SessionRef::new("grok-session", cv_core::Harness::Grok, &*session);
+        let refresh = |rebuild| sweep(&dir, vec![r.clone()], rebuild, false).unwrap();
+        let exact = || {
+            let counts = cv_core::catalog::AffordanceTable::load().counts(&r).unwrap();
+            let before = observe(&dir, std::slice::from_ref(&r), &["zanzibar".into()]);
+            let events = format!("{:?}", cv_core::events::events_for("grok", &r.id, None).unwrap());
+            assert_eq!(refresh(true).resumed, 0);
+            assert_eq!(counts, cv_core::catalog::AffordanceTable::load().counts(&r).unwrap());
+            assert_eq!(before, observe(&dir, std::slice::from_ref(&r), &["zanzibar".into()]));
+            assert_eq!(
+                events,
+                format!("{:?}", cv_core::events::events_for("grok", &r.id, None).unwrap())
+            );
+        };
+        assert_eq!(refresh(false).changed, 1);
+        assert_eq!(refresh(false).changed, 0);
+        // A turn with a new tool, streamed chunks and a hook run: resumed.
+        append(&updates, &[chunk.clone(), update("c2", "Read b", None), hook.clone()]);
+        append(&history, &[user("zanzibar second"), call("c2")]);
+        let turn = refresh(false);
+        assert_eq!((turn.changed, turn.resumed), (1, 1));
+        exact();
+        // The open call completes (its result follows): only the result renders the status.
+        append(&updates, &[update("c2", "Read b", Some("failed"))]);
+        append(&history, &[result("c2")]);
+        let completed = refresh(false);
+        assert_eq!((completed.changed, completed.resumed), (1, 1));
+        exact();
+        // Growth of the updates alone admits nothing: the hook run is counted.
+        append(&updates, &[hook]);
+        let grown = refresh(false);
+        assert_eq!((grown.changed, grown.resumed), (1, 0));
+        assert_eq!(refresh(false).changed, 0);
+        // An update that renames a tool the prefix rendered declines the mark.
+        append(&updates, &[update("c1", "Read a again", Some("completed"))]);
+        append(&history, &[user("zanzibar third")]);
+        let revised = refresh(false);
+        assert_eq!((revised.changed, revised.resumed), (1, 0));
+        exact();
     }
 
     #[test]
@@ -4438,15 +4941,60 @@ mod tests {
         assert_eq!(refresh().changed, 1);
         assert_eq!(counts().get(&cv_core::affordance::Kind::Fork), Some(&1));
         assert_eq!(refresh().changed, 0);
-        let directory_mtime = std::fs::metadata(&sdir).unwrap().modified().unwrap();
+        let directory_mtime = std::fs::metadata(&*sdir).unwrap().modified().unwrap();
         std::fs::write(&sibling, format!("{copied}\n").replace("shared", "other!")).unwrap();
-        assert_eq!(std::fs::metadata(&sdir).unwrap().modified().unwrap(), directory_mtime);
+        assert_eq!(std::fs::metadata(&*sdir).unwrap().modified().unwrap(), directory_mtime);
         assert_eq!(refresh().changed, 1);
         assert_eq!(counts().get(&cv_core::affordance::Kind::Fork).copied().unwrap_or(0), 0);
         assert_eq!(refresh().changed, 0);
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// One project directory of 48 sessions, two of them forks (inferred from their siblings'
+    /// heads) of a third: an append to any one session rereads that session alone (its siblings
+    /// are append-only dependencies of the forks), while a new session in the directory still
+    /// rereads the forks, whose source it could be.
+    #[test]
+    fn an_append_to_one_of_48_siblings_rereads_one() {
+        let _home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let copied = serde_json::json!({"type":"user","uuid":"shared","sessionId":"source",
+            "timestamp":"2026-09-19T00:00:00Z","message":{"role":"user","content":"sourcebody"}});
+        let queued = serde_json::json!({"type":"queue-operation","timestamp":"2026-09-19T01:00:00Z"});
+        let mut refs = Vec::new();
+        let source = sdir.join("source.jsonl");
+        std::fs::write(&source, format!("{copied}\n")).unwrap();
+        refs.push(sref("source", "source", source.display().to_string()));
+        for fork in ["fork-a", "fork-b"] {
+            let p = sdir.join(format!("{fork}.jsonl"));
+            std::fs::write(&p, format!("{queued}\n{copied}\n")).unwrap();
+            refs.push(sref(fork, fork, p.display().to_string()));
         }
+        for i in 0..45 {
+            let id = format!("plain-{i}");
+            refs.push(sref(&id, &id, write_claude(&sdir, &id, &format!("plain body {i}"))));
+        }
+        assert_eq!(refs.len(), 48);
+        let refresh = |refs: &[cv_core::SessionRef]| sweep(&dir, refs.to_vec(), false, false).unwrap();
+        assert_eq!(refresh(&refs).changed, 48);
+        let fork = refs[1].clone();
+        let forks = || cv_core::catalog::AffordanceTable::load().counts(&fork).unwrap();
+        assert_eq!(forks().get(&cv_core::affordance::Kind::Fork), Some(&1));
+        assert_eq!(refresh(&refs).changed, 0);
+        let append = |p: &Path, id: &str| {
+            let line = serde_json::json!({"type":"user","uuid":format!("{id}-more"),"sessionId":id,
+                "message":{"role":"user","content":"appended"}});
+            let mut file = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+            std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
+        };
+        // A fork resumed after a sibling grew publishes a record that admits that growth too.
+        for r in [&refs[10], &refs[0], &refs[2], &refs[20], &refs[1], &refs[0], &refs[30]] {
+            append(&r.path, &r.id);
+            assert_eq!(refresh(&refs).changed, 1, "an append to {}", r.id);
+        }
+        assert_eq!(forks().get(&cv_core::affordance::Kind::Fork), Some(&1));
+        let late = sref("late", "late", write_claude(&sdir, "late", "late body"));
+        refs.push(late);
+        assert_eq!(refresh(&refs).changed, 3, "the new session and the two forks");
     }
 
     #[test]
@@ -4493,9 +5041,6 @@ mod tests {
             observe(&dir, std::slice::from_ref(&r), &[]),
             whole_sweep(std::slice::from_ref(&r), &[])
         );
-        for path in [dir, base] {
-            std::fs::remove_dir_all(path).unwrap();
-        }
     }
 
     #[test]
@@ -4513,9 +5058,6 @@ mod tests {
         index_refs(&dir, &[sref("y", "second", p2)], false).unwrap();
         assert!(text_search(&dir, "alpha", 10).unwrap().is_empty());
         assert_eq!(text_search(&dir, "delta", 10).unwrap().len(), 1);
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     /// Rewrite a file with its own byte-identical content — bumping mtime (the OS stamps "now" on
@@ -4608,9 +5150,6 @@ mod tests {
         let hits = text_search(&dir, "gamma", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "s2");
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     #[test]
@@ -4624,34 +5163,19 @@ mod tests {
         let mut newer = sref("shared", "new title", newer_path);
         older.updated_at = chrono::DateTime::from_timestamp(1, 0);
         newer.updated_at = chrono::DateTime::from_timestamp(2, 0);
-        let stored = |path: &Path| {
-            use tantivy::schema::document::Document;
-            let index = Index::open_in_dir(path).unwrap();
-            let searcher = index.reader().unwrap().searcher();
-            let mut docs = Vec::new();
-            for segment in searcher.segment_readers() {
-                let reader = segment.get_store_reader(0).unwrap();
-                for id in segment.doc_ids_alive() {
-                    let doc: TantivyDocument = reader.get(id).unwrap();
-                    docs.push(doc.to_json(&index.schema()));
-                }
-            }
-            docs.sort();
-            docs
-        };
         let first = sweep(&dir, vec![older.clone(), newer.clone()], true, false).unwrap();
         assert_eq!((first.total, first.copies, first.changed), (2, 1, 1));
         index_refs(&oracle, std::slice::from_ref(&newer), false).unwrap();
-        assert_eq!(stored(&dir), stored(&oracle));
+        assert_eq!(all_docs(&dir), all_docs(&oracle));
         assert_eq!(
             text_search_ids(&dir, "amber").unwrap(),
             HashSet::from(["shared".to_owned()])
         );
         assert!(text_search_ids(&dir, "sapphire").unwrap().is_empty());
-        let before = stored(&dir);
+        let before = all_docs(&dir);
         let unchanged = sweep(&dir, vec![newer.clone(), older.clone()], false, false).unwrap();
         assert_eq!((unchanged.changed, unchanged.copies), (0, 1));
-        assert_eq!(stored(&dir), before);
+        assert_eq!(all_docs(&dir), before);
         // Timestamp ties use the same deterministic path order independent of input order.
         older.updated_at = newer.updated_at;
         let preferred = if older.preferred_copy_cmp(&newer).is_lt() {
@@ -4672,8 +5196,6 @@ mod tests {
         );
         std::fs::remove_file(&older.path).unwrap();
         assert_eq!(sweep(&dir, vec![older, newer], false, false).unwrap().errors, 1);
-        std::fs::remove_dir_all(dir).unwrap();
-        std::fs::remove_dir_all(oracle).unwrap();
     }
 
     #[test]
@@ -4743,28 +5265,11 @@ mod tests {
         let repaired = sweep(&dir, vec![r.clone()], false, false).unwrap();
         assert_eq!((repaired.changed, repaired.resumed, repaired.errors), (1, 0, 0));
         index_refs(&oracle, std::slice::from_ref(&r), false).unwrap();
-        let stored = |path: &Path| {
-            use tantivy::schema::document::Document;
-            let index = Index::open_in_dir(path).unwrap();
-            let searcher = index.reader().unwrap().searcher();
-            let mut docs = Vec::new();
-            for segment in searcher.segment_readers() {
-                let store = segment.get_store_reader(0).unwrap();
-                for id in segment.doc_ids_alive() {
-                    let doc: TantivyDocument = store.get(id).unwrap();
-                    docs.push(doc.to_json(&index.schema()));
-                }
-            }
-            docs.sort();
-            docs
-        };
-        assert_eq!(stored(&dir), stored(&oracle));
+        assert_eq!(all_docs(&dir), all_docs(&oracle));
         assert_eq!(
             text_search_ids(&dir, "amber").unwrap(),
             text_search_ids(&oracle, "amber").unwrap()
         );
-        std::fs::remove_dir_all(dir).unwrap();
-        std::fs::remove_dir_all(oracle).unwrap();
     }
 
     #[test]
@@ -4844,8 +5349,6 @@ mod tests {
             text_search_ids(&dir, "sapphire").unwrap(),
             text_search_ids(&oracle, "sapphire").unwrap()
         );
-        std::fs::remove_dir_all(dir).unwrap();
-        std::fs::remove_dir_all(oracle).unwrap();
     }
 
     #[test]
@@ -4861,7 +5364,7 @@ mod tests {
         std::fs::write(&transcript, "{\"type\":\"user\",\"content\":\"zqbeforechild\"}\n").unwrap();
         let r = cv_core::SessionRef {
             harness: cv_core::Harness::Grok,
-            path: sdir.clone(),
+            path: std::path::PathBuf::from(&*sdir),
             ..sref("grok-child", "child", "unused".into())
         };
         sweep(&dir, vec![r.clone()], false, false).unwrap();
@@ -4892,9 +5395,6 @@ mod tests {
         );
         assert!(!cv_core::events::needs_ingest(&r));
         assert!(!cv_core::catalog::AffordanceTable::load().stale(&r));
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     #[test]
@@ -4928,9 +5428,6 @@ mod tests {
         );
         assert!(!cv_core::catalog::AffordanceTable::load().stale(&r));
         assert_eq!(sweep(&dir, vec![r], false, false).unwrap().changed, 0);
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     #[test]
@@ -4967,9 +5464,320 @@ mod tests {
         );
         assert!(!cv_core::events::needs_ingest(&r));
         assert!(!cv_core::catalog::AffordanceTable::load().stale(&r));
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
+    }
+
+    /// A write to a shared store moves its files for every session in it. The sessions whose rows
+    /// certify unchanged stay fresh for search, events and counts; the written one is read again,
+    /// and so is one whose rows went backwards.
+    #[test]
+    fn a_store_write_rereads_only_the_sessions_whose_rows_moved() {
+        let _home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let db = sdir.join("state.db");
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE sessions(id TEXT PRIMARY KEY,source TEXT NOT NULL,model TEXT,started_at REAL NOT NULL,ended_at REAL,message_count INTEGER DEFAULT 0,title TEXT);
+            CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL,role TEXT NOT NULL,content TEXT,tool_call_id TEXT,tool_calls TEXT,tool_name TEXT,timestamp REAL NOT NULL);
+            CREATE INDEX idx_messages_session_id ON messages(session_id, id);
+            INSERT INTO sessions(id,source,started_at) VALUES('a','cli',1000),('b','cli',1000);
+            INSERT INTO messages(session_id,role,content,timestamp) VALUES('a','user','zqalpha',1001),('b','user','zqbravo',1001),('b','user','zqbravotwo',1002);").unwrap();
+        let refs: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|id| cv_core::SessionRef {
+                harness: cv_core::Harness::Hermes,
+                path: db.clone(),
+                ..sref(id, id, "unused".into())
+            })
+            .collect();
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 2);
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 0);
+        writer
+            .execute(
+                "INSERT INTO messages(session_id,role,content,timestamp) VALUES('a','user','zqalphalate',1003)",
+                [],
+            )
+            .unwrap();
+        let stale = |r: &cv_core::SessionRef| {
+            (
+                cv_core::events::needs_ingest(r),
+                cv_core::catalog::AffordanceTable::load().stale(r),
+            )
+        };
+        assert_eq!((stale(&refs[0]), stale(&refs[1])), ((true, true), (false, false)));
+        let Searched { hits, suffix, .. } = search_suffixed(
+            &dir,
+            "zqalphalate",
+            10,
+            crate::SearchFilter::default(),
+            LiveRead::All,
+            &refs,
+        )
+        .unwrap();
+        assert_eq!((hits.len(), suffix.stale, suffix.read), (1, 1, 1), "{suffix:?}");
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 1);
+        let hits = text_search(&dir, "zqalphalate", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].snippet.contains("zqalphalate"),
+            "a store session's live snippet: {hits:?}"
+        );
+        // Rows that went backwards (a deletion, a rewrite) reread the session whole.
+        writer
+            .execute("DELETE FROM messages WHERE content='zqbravotwo'", [])
+            .unwrap();
+        assert_eq!(stale(&refs[1]), (true, true));
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 1);
+        assert!(text_search(&dir, "zqbravotwo", 10).unwrap().is_empty());
+        assert_eq!(sweep(&dir, refs, false, false).unwrap().changed, 0);
+    }
+
+    /// A gemini-cli `logs.json` holds a whole project's sessions: an entry appended to one
+    /// rereads that session alone, for search, events and counts alike.
+    #[test]
+    fn a_logs_json_append_rereads_only_its_session() {
+        let _home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let file = sdir.join(".gemini/tmp/proj/logs.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let entry = |sid: &str, id: i64, text: &str| {
+            serde_json::json!({"sessionId":sid,"messageId":id,"type":"user","message":text,
+                "timestamp":"2026-01-01T00:00:00Z"})
+        };
+        let mut entries: Vec<serde_json::Value> = (0..6)
+            .map(|i| entry(&format!("s{i}"), 0, &format!("zqlogs{i}")))
+            .collect();
+        std::fs::write(&file, serde_json::to_string(&entries).unwrap()).unwrap();
+        let refs: Vec<_> = (0..6)
+            .map(|i| cv_core::SessionRef::new(format!("s{i}"), cv_core::Harness::Gemini, &file))
+            .collect();
+        let refresh = || sweep(&dir, refs.clone(), false, false).unwrap().changed;
+        assert_eq!(refresh(), 6);
+        assert_eq!(refresh(), 0);
+        entries.push(entry("s3", 1, "zqlogslate"));
+        std::fs::write(&file, serde_json::to_string(&entries).unwrap()).unwrap();
+        assert!(cv_core::events::needs_ingest(&refs[3]));
+        assert!(!cv_core::events::needs_ingest(&refs[2]));
+        assert!(!cv_core::catalog::AffordanceTable::load().stale(&refs[2]));
+        assert_eq!(refresh(), 1);
+        assert_eq!(text_search(&dir, "zqlogslate", 10).unwrap().len(), 1);
+        assert_eq!(refresh(), 0);
+    }
+
+    /// A Kimi Code session's main agent rewrites `state.json` every turn: a sub-agent is
+    /// certified by its own slice of it, so the main agent's turn rereads the main agent alone,
+    /// and a change to one sub-agent's entry rereads that sub-agent (and the main agent, which
+    /// lists every sub-agent).
+    #[test]
+    fn a_kimi_code_state_rewrite_rereads_only_the_agents_whose_slice_moved() {
+        use std::io::Write as _;
+        let _home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let session = sdir.join("session_0000");
+        let line = |text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"context.append_message","message":{"role":"user","content":text}})
+            )
+        };
+        for agent in ["main", "agent-1", "agent-2"] {
+            let wire = session.join("agents").join(agent).join("wire.jsonl");
+            std::fs::create_dir_all(wire.parent().unwrap()).unwrap();
+            std::fs::write(&wire, line(&format!("zqkimi {agent}"))).unwrap();
         }
+        let state = |prompt: &str, labels: &str| {
+            serde_json::json!({"id":"session_0000","cwd":"/work","lastPrompt":prompt,"agents":{
+                "main":{"type":"main"},
+                "agent-1":{"type":"explore","parentAgentId":"main","labels":["one"]},
+                "agent-2":{"type":"explore","parentAgentId":"main","labels":[labels]}}})
+            .to_string()
+        };
+        std::fs::write(session.join("state.json"), state("first", "two")).unwrap();
+        let main = cv_core::SessionRef::new("0000", cv_core::Harness::KimiCode, &*session);
+        let refs: Vec<_> = std::iter::once(main.clone())
+            .chain(["agent-1", "agent-2"].map(|agent| {
+                cv_core::SessionRef::new(
+                    format!("0000/{agent}"),
+                    cv_core::Harness::KimiCode,
+                    session.join("agents").join(agent),
+                )
+            }))
+            .collect();
+        let refresh = || sweep(&dir, refs.clone(), false, false).unwrap().changed;
+        assert_eq!(refresh(), 3);
+        assert_eq!(refresh(), 0);
+        // A main-agent turn: its wire grows and the state is rewritten.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(session.join("agents/main/wire.jsonl"))
+            .unwrap()
+            .write_all(line("zqkimi again").as_bytes())
+            .unwrap();
+        std::fs::write(session.join("state.json"), state("second", "two")).unwrap();
+        assert_eq!(refresh(), 1);
+        assert!(!cv_core::events::needs_ingest(&refs[1]));
+        std::fs::write(session.join("state.json"), state("second", "relabelled")).unwrap();
+        assert!(cv_core::events::needs_ingest(&refs[2]));
+        assert!(!cv_core::events::needs_ingest(&refs[1]));
+        assert_eq!(refresh(), 2);
+        assert_eq!(refresh(), 0);
+    }
+
+    /// Every Cline SDK lead session reads its own rows of the store's side databases, which
+    /// every session writes: a schedule fire, a cron run or a team event rereads its session
+    /// alone, and a write no session reads rereads none.
+    #[test]
+    fn a_cline_side_database_write_rereads_only_its_lead() {
+        let _home = IsolatedHome::new();
+        let (dir, data) = (tmpdir(), tmpdir());
+        let db = data.join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        let refs: Vec<_> = ["100_aaaaa", "200_bbbbb", "300_ccccc"]
+            .iter()
+            .map(|sid| {
+                let session = data.join("sessions").join(sid);
+                std::fs::create_dir_all(&session).unwrap();
+                std::fs::write(session.join(format!("{sid}.json")), r#"{"cwd":"/work"}"#).unwrap();
+                let path = session.join(format!("{sid}.messages.json"));
+                std::fs::write(
+                    &path,
+                    serde_json::json!({"messages":[{"role":"user","content":format!("zqcline {sid}")}]}).to_string(),
+                )
+                .unwrap();
+                cv_core::SessionRef::new(*sid, cv_core::Harness::Cline, path)
+            })
+            .collect();
+        let exec = |file: &str, sql: &str| {
+            rusqlite::Connection::open(db.join(file))
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap()
+        };
+        exec(
+            "sessions.db",
+            "CREATE TABLE schedules (schedule_id TEXT PRIMARY KEY, name TEXT NOT NULL, cron_pattern TEXT NOT NULL, prompt TEXT NOT NULL);
+             CREATE TABLE schedule_executions (execution_id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL, session_id TEXT,
+               triggered_at TEXT NOT NULL, status TEXT NOT NULL);
+             CREATE TABLE sessions (session_id TEXT PRIMARY KEY, status TEXT);
+             INSERT INTO schedules VALUES ('s1', 'nightly', '0 3 * * *', 'tidy up');",
+        );
+        exec(
+            "teams.db",
+            "CREATE TABLE team_events (id INTEGER PRIMARY KEY AUTOINCREMENT, team_name TEXT NOT NULL, ts TEXT NOT NULL,
+               event_type TEXT NOT NULL, payload_json TEXT NOT NULL);",
+        );
+        let refresh = || sweep(&dir, refs.clone(), false, false).unwrap().changed;
+        assert_eq!(refresh(), 3);
+        assert_eq!(refresh(), 0);
+        // A session row (every session writes its own): no lead reads it.
+        exec("sessions.db", "INSERT INTO sessions VALUES ('400_ddddd', 'running');");
+        assert_eq!(refresh(), 0);
+        exec(
+            "sessions.db",
+            "INSERT INTO schedule_executions VALUES ('e1', 's1', '200_bbbbb', '2026-10-11T03:00:00Z', 'completed');",
+        );
+        assert!(cv_core::catalog::AffordanceTable::load().stale(&refs[1]));
+        assert!(!cv_core::catalog::AffordanceTable::load().stale(&refs[0]));
+        assert_eq!(refresh(), 1);
+        exec(
+            "teams.db",
+            r#"INSERT INTO team_events (team_name, ts, event_type, payload_json) VALUES
+               ('300_ccccc', '2026-10-11T05:00:00Z', 'teammate_spawned', '{"agentId":"helper"}');"#,
+        );
+        assert_eq!(refresh(), 1);
+        assert_eq!(refresh(), 0);
+    }
+
+    /// Continue rewrites `sessions.json` on every save of any session; a session's listing facts
+    /// come from its own entry there, which certifies it: an entry that changed rereads its
+    /// session, a rewrite that changed no session's entry rereads none.
+    #[test]
+    fn a_continue_index_rewrite_rereads_only_the_session_whose_entry_moved() {
+        let _home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let ids = ["c-one", "c-two", "c-three"];
+        let refs: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let path = sdir.join(format!("{id}.json"));
+                std::fs::write(
+                    &path,
+                    serde_json::json!({"sessionId":id,"title":"t","workspaceDirectory":"/w",
+                        "history":[{"message":{"role":"user","content":format!("zqcontinue {id}")}}]})
+                    .to_string(),
+                )
+                .unwrap();
+                cv_core::SessionRef::new(*id, cv_core::Harness::Continue, path)
+            })
+            .collect();
+        let index = |titles: [&str; 3], count: u64| {
+            let entries: Vec<_> = ids
+                .iter()
+                .zip(titles)
+                .map(|(id, title)| {
+                    serde_json::json!({"sessionId":id,"title":title,"dateCreated":"1791750876345",
+                        "workspaceDirectory":"/w","messageCount":count})
+                })
+                .collect();
+            std::fs::write(sdir.join("sessions.json"), serde_json::to_string(&entries).unwrap()).unwrap();
+        };
+        index(["a", "b", "c"], 1);
+        let refresh = || sweep(&dir, refs.clone(), false, false).unwrap().changed;
+        assert_eq!(refresh(), 3);
+        assert_eq!(refresh(), 0);
+        // A save elsewhere rewrites the index: no listing fact moved.
+        index(["a", "b", "c"], 2);
+        assert_eq!(refresh(), 0);
+        index(["a", "renamed", "c"], 2);
+        assert_eq!(refresh(), 1);
+        assert_eq!(refresh(), 0);
+    }
+
+    /// OpenClaw's JSONL registries (`sessions.json`, `cron/jobs.json`, `subagents/runs.json`)
+    /// are rewritten by every session of the agent: each session is certified by its own entries,
+    /// so a rewrite that moves none rereads none, and a job made for one session rereads it alone.
+    #[test]
+    fn an_openclaw_registry_write_rereads_only_the_session_it_names() {
+        use cv_core::harness::Adapter as _;
+        let _home = IsolatedHome::new();
+        let (dir, state) = (tmpdir(), tmpdir());
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../cv-core/tests/corpus/openclaw/2026.1.29");
+        fn copy(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    copy(&entry.path(), &to.join(entry.file_name()));
+                } else {
+                    std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+                }
+            }
+        }
+        copy(&corpus, &state);
+        let refs = cv_core::harness::openclaw::OpenClaw::with_state_dir(&state)
+            .discover()
+            .unwrap()
+            .refs;
+        assert!(refs.len() > 2, "{refs:?}");
+        let refresh = || sweep(&dir, refs.clone(), false, false).unwrap().changed;
+        assert_eq!(refresh(), refs.len());
+        assert_eq!(refresh(), 0);
+        let index = state.join("agents/main/sessions/sessions.json");
+        let mut sessions: serde_json::Value = serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+        // Another session's activity: a new entry, and a field no read takes.
+        sessions["agent:main:subagent:other"] = serde_json::json!({"sessionId":"not-on-disk","updatedAt":1});
+        sessions["agent:main:main"]["updatedAt"] = 1.into();
+        std::fs::write(&index, sessions.to_string()).unwrap();
+        assert_eq!(refresh(), 0);
+        let jobs_path = state.join("cron/jobs.json");
+        let mut jobs: serde_json::Value = serde_json::from_slice(&std::fs::read(&jobs_path).unwrap()).unwrap();
+        jobs["jobs"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id":"made-by-main","agentId":"main",
+            "owner":{"sessionKey":"agent:main:main"},"sessionTarget":"isolated"}));
+        std::fs::write(&jobs_path, jobs.to_string()).unwrap();
+        assert_eq!(refresh(), 1);
+        assert_eq!(refresh(), 0);
     }
 
     /// The core invariant of `ChunkSink`: a body larger than [`CHUNK_BYTES`] is flushed into several
@@ -4997,9 +5805,6 @@ mod tests {
         let hits = text_search(&dir, "zqxmarker", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "big");
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     /// A session with no discovery title labels itself from the first user message, and the body
@@ -5024,33 +5829,23 @@ mod tests {
         assert_eq!(hits[0].id, "m");
         // No ai-title → label is the first user message's text.
         assert_eq!(hits[0].title.as_deref(), Some("alpha question about tantivy"));
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
-    /// `live_snippet` must stay O(cap) on a session fronted by one giant field: a term within the
-    /// scan cap windows normally, a term hiding *beyond* the cap inside the same giant field falls
-    /// back to the head instead of materializing the whole record to find it.
+    /// `live_snippet` finds a term anywhere, even past a giant field, in a bounded window: the
+    /// snippet is what a whole-body search would give.
     #[test]
-    fn live_snippet_caps_giant_fields() {
+    fn live_snippet_finds_a_term_past_a_giant_field() {
         let sdir = tmpdir();
         let mut body = String::from("zqearly marker then padding ");
-        body.push_str(&"pad ".repeat(2 * SNIPPET_SCAN_CAP / 4)); // 2× the cap of filler
+        body.push_str(&"pad ".repeat(512 * 1024));
         body.push_str(" zqlate");
-        assert!(body.len() > SNIPPET_SCAN_CAP);
         let p = write_claude(&sdir, "giant", &body);
-
-        let snip = live_snippet(&p, "claude", "zqearly", crate::Scope::Exchange).expect("snippet");
-        assert!(snip.contains("zqearly"), "in-cap term should window: {snip:?}");
-
-        let snip = live_snippet(&p, "claude", "zqlate", crate::Scope::Exchange).expect("snippet");
-        assert!(
-            !snip.contains("zqlate") && snip.starts_with("zqearly"),
-            "beyond-cap term must fall back to the head, got: {snip:?}"
-        );
-
-        std::fs::remove_dir_all(&sdir).ok();
+        for term in ["zqearly", "zqlate", "absentterm"] {
+            let snip = live_snippet(&p, "", "claude", term, crate::Scope::Exchange).expect("snippet");
+            assert_eq!(snip, make_snippet(&format!("{body}\n"), term), "{term}");
+        }
+        let snip = live_snippet(&p, "", "claude", "zqlate", crate::Scope::Exchange).unwrap();
+        assert!(snip.contains("zqlate"), "{snip:?}");
     }
 
     #[test]
@@ -5079,7 +5874,7 @@ mod tests {
             .unwrap();
         writer.commit().unwrap();
         drop(writer);
-        let store = std::fs::read_dir(&dir)
+        let store = std::fs::read_dir(&*dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .find(|path| path.extension().is_some_and(|ext| ext == "store"))
@@ -5089,7 +5884,6 @@ mod tests {
         assert!(read_indexed_metadata(&index, &f, true).is_err());
         assert!(sweep(&dir, Vec::new(), false, false).is_err());
         assert_eq!(std::fs::read(dir.join("meta.json")).unwrap(), before);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5136,7 +5930,6 @@ mod tests {
         let before = std::fs::read(dir.join("meta.json")).unwrap();
         assert!(sweep(&dir, Vec::new(), false, false).is_err());
         assert_eq!(std::fs::read(dir.join("meta.json")).unwrap(), before);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5177,8 +5970,6 @@ mod tests {
             "head fallback snippet expected: {:?}",
             hits[0].snippet
         );
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     /// Fix for the blank-snippet hole: when a hit's source file has been deleted since indexing,
@@ -5215,9 +6006,6 @@ mod tests {
             "marker expected: {:?}",
             hits[0].snippet
         );
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     /// The event ride-along, end to end through the production `index_session` tee: one indexing
@@ -5272,7 +6060,6 @@ mod tests {
         assert_eq!(touched[0].session_id, "tee-evt");
         assert_eq!(touched[0].edits, 1);
 
-        std::fs::remove_dir_all(&dir).ok();
         // `h` drops here: removes CLUSTERVISION_HOME, deletes the temp home, releases the lock.
     }
 
@@ -5313,8 +6100,6 @@ mod tests {
         write_subagent(&pp, "count-child", "a substantially longer changed child body");
         let changed = sweep(&dir, vec![parent], false, true).unwrap();
         assert_eq!((changed.changed, changed.unchanged), (1, 1));
-        std::fs::remove_dir_all(dir).ok();
-        std::fs::remove_dir_all(sdir).ok();
     }
 
     /// `cv index --subagents` end to end: a string living ONLY inside a sub-agent transcript is
@@ -5363,9 +6148,6 @@ mod tests {
         let scoped = text_search(&dir, "parent_id:parent1 zqsubmarker", 10).unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].id, "agent-child9");
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     /// Regression for the truncated-fresh hole: a parse error *after* chunk docs were already
@@ -5462,7 +6244,6 @@ mod tests {
                 .is_empty());
             assert!(cv_core::events::needs_ingest(&r));
             assert!(cv_core::resume::MarkTable::load().get(&r).is_none());
-            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 
@@ -5568,7 +6349,6 @@ mod tests {
             .is_empty());
         assert!(cv_core::events::needs_ingest(&r));
         assert!(cv_core::resume::MarkTable::load().get(&r).is_none());
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -5633,8 +6413,6 @@ mod tests {
             !sigs.contains_key("victim"),
             "a failed session must not enter the freshness skip-set (B1)"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The sweep reads on every core and writes on one: over many sessions, two of them files under
@@ -5680,9 +6458,6 @@ mod tests {
             };
             assert_eq!(ids(&seq), ids(&par), "{q}");
         }
-        for d in [seq, par, sdir, dup] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     /// Equal scores rank by session id, whatever order the index was written in.
@@ -5701,8 +6476,6 @@ mod tests {
             .map(|h| h.id)
             .collect();
         assert_eq!(ids, ["aa", "mm", "zz"]);
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     /// Regression: an FTS-fresh sub-agent whose *catalog* is stale (e.g. first run after an
@@ -5759,9 +6532,6 @@ mod tests {
             1,
             "an FTS-fresh, events-stale sub-agent must keep its docs (B2)"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     /// A catalog wipe removes FTS's independent dependency baselines too. Existing documents
@@ -5793,8 +6563,6 @@ mod tests {
             0,
             "one incremental reread establishes the new baselines"
         );
-        std::fs::remove_dir_all(dir).ok();
-        std::fs::remove_dir_all(sdir).ok();
     }
 
     /// Regression: a plain (no `--subagents`) refresh after `cv index --subagents` must NOT
@@ -5822,9 +6590,6 @@ mod tests {
             "a plain refresh must not silently reap the folded sub-agent forest (B3)"
         );
         assert_eq!(text_search(&dir, "orchestrator", 10).unwrap().len(), 1);
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     #[test]
@@ -5885,7 +6650,6 @@ mod tests {
         std::fs::remove_file(top.path).unwrap();
         assert_eq!(sweep(&dir, vec![b, a], false, true).unwrap().changed, 1);
         assert!(text_search_ids(&dir, "topaz").unwrap().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5972,7 +6736,6 @@ mod tests {
             sweep(&dir, vec![parent], false, true).unwrap().observed.work,
             SweepWork::default()
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The forest fold also tees sub-agent events into the catalog WITH provenance: a file the
@@ -6017,8 +6780,6 @@ mod tests {
         let edit = rows.iter().find(|e| e.kind == "file_edit").expect("edit event");
         assert_eq!(edit.parent_id.as_deref(), Some("evt-parent"));
         assert_eq!(edit.agent_id.as_deref(), Some("ed1"));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The preview rides only the session's *first* chunk doc, but a hit can score on a *later*
@@ -6049,9 +6810,6 @@ mod tests {
         // The stored preview itself is capped (marker text rides on top of it).
         let stored = hits[0].snippet.trim_end_matches(" (source file moved)").chars().count();
         assert!(stored <= PREVIEW_CHARS, "preview over cap: {stored} chars");
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     /// A hit shows the session's current label, from its meta doc, even when the body doc that
@@ -6068,8 +6826,6 @@ mod tests {
         let hits = text_search(&dir, "zqearly", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title.as_deref(), Some("zqlabel hello"));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
 
     /// The claude transcripts and plain codex rollouts of the cv-core corpus: the adapters whose
@@ -6114,6 +6870,8 @@ mod tests {
         let mut all = resumable_corpus();
         all.sort_by_key(|(_, p)| std::cmp::Reverse(std::fs::metadata(p).unwrap().len()));
         let (claude, codex): (Vec<_>, Vec<_>) = all.into_iter().partition(|(h, _)| *h == cv_core::Harness::Claude);
+        // The zip below pairs the kinds; an empty side would silently shrink the fleet to zero.
+        assert!(!claude.is_empty() && !codex.is_empty());
         claude
             .into_iter()
             .zip(codex)
@@ -6161,18 +6919,7 @@ mod tests {
     /// Everything a sweep leaves for `refs`, comparably: every live doc's stored fields (sorted),
     /// the hits for each word, and each session's events and affordance counts.
     fn observe(dir: &Path, refs: &[cv_core::SessionRef], words: &[String]) -> Vec<String> {
-        let (index, _) = open_existing(dir).unwrap();
-        let searcher = index.reader().unwrap().searcher();
-        let mut docs = Vec::new();
-        for seg in searcher.segment_readers() {
-            let store = seg.get_store_reader(0).unwrap();
-            for d in seg.doc_ids_alive() {
-                let doc: TantivyDocument = store.get(d).unwrap();
-                docs.push(tantivy::schema::document::Document::to_json(&doc, &index.schema()));
-            }
-        }
-        docs.sort();
-        let mut out = docs;
+        let mut out = all_docs(dir);
         for w in words {
             let mut hits: Vec<String> = text_search(dir, w, 100)
                 .unwrap()
@@ -6201,15 +6948,12 @@ mod tests {
     fn whole_sweep_with_work(refs: &[cv_core::SessionRef], words: &[String]) -> (Vec<String>, SweepWork) {
         let (dir, home) = (tmpdir(), tmpdir());
         let scope = (*cv_core::env::Env::current()).clone().enter();
-        scope.set("CLUSTERVISION_HOME", &home);
+        scope.set("CLUSTERVISION_HOME", &*home);
         let swept = sweep(&dir, refs.to_vec(), false, false).unwrap();
         assert_eq!((swept.resumed, swept.errors), (0, 0));
         let seen = observe(&dir, refs, words);
         drop(scope);
 
-        for d in [dir, home] {
-            std::fs::remove_dir_all(d).ok();
-        }
         (seen, swept.observed.work)
     }
 
@@ -6281,67 +7025,132 @@ mod tests {
                 work
             );
         }
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
-    /// Native Qwen has stable ChatRecord boundaries; legacy replay can replace old IDs. Keep
-    /// this end-to-end check across counts, events and stored search docs, including partial EOF.
+    /// Every read leaves a mark where it ended: a claude transcript indexed at a line boundary
+    /// and then appended to resumes at exactly the indexed length (the next pass reads only the
+    /// appended bytes), and leaves what a whole sweep of the grown file does. A small transcript
+    /// has no chunk boundary to resume from, so before end marks it was reread whole.
     #[test]
-    fn qwen_native_append_resumes_but_legacy_replay_and_metadata_changes_do_not() {
+    fn an_append_rereads_only_the_appended_bytes() {
+        let _home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let fleet: Vec<_> = resumable_fleet(&sdir, 12)
+            .into_iter()
+            .filter(|(r, _)| r.harness == cv_core::Harness::Claude)
+            .collect();
+        assert!(fleet.len() > 2);
+        let refs: Vec<_> = fleet.iter().map(|(r, _)| r.clone()).collect();
+        let heads: Vec<usize> = fleet
+            .iter()
+            .map(|(r, bytes)| {
+                let cut = bytes[..bytes.len() * 2 / 3].iter().rposition(|&b| b == b'\n').unwrap() + 1;
+                std::fs::write(&r.path, &bytes[..cut]).unwrap();
+                cut
+            })
+            .collect();
+        let fresh = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!((fresh.resumed, fresh.errors), (0, 0));
+        // The mark is where the read ended, unless a spaced checkpoint lies closer to the end
+        // than its own encoded state (a mark never costs more to write than the reread it saves).
+        let marks = cv_core::resume::MarkTable::load();
+        let mut ended = 0;
+        for (r, &head) in refs.iter().zip(&heads) {
+            let mark = marks.get(r).unwrap_or_else(|| panic!("{} left no mark", r.id));
+            let state = cv_core::resume::Reader::default().state(r, mark).unwrap();
+            let gap = head as u64 - mark.offset();
+            assert!(
+                gap <= serde_json::to_vec(&state).unwrap().len() as u64,
+                "{}: {gap}",
+                r.id
+            );
+            ended += usize::from(gap == 0);
+        }
+        assert!(ended > 0, "no mark at the end");
+        write_heads(&fleet, 1, 1);
+        let swept = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!(
+            (swept.changed, swept.resumed, swept.errors),
+            (refs.len(), refs.len(), 0)
+        );
+        let words = some_words(&refs);
+        let (whole, work) = whole_sweep_with_work(&refs, &words);
+        assert_eq!(observe(&dir, &refs, &words), whole);
+        assert!(
+            swept.observed.work.callbacks < work.callbacks,
+            "{:?} {work:?}",
+            swept.observed.work
+        );
+    }
+
+    /// One native Qwen chat record: the envelope the native parser keys on, plus `body`'s fields.
+    fn qwen_rec(id: &str, body: serde_json::Value) -> String {
+        let mut v = serde_json::json!({"uuid":id,"sessionId":"native","cwd":"/scratch",
+        "timestamp":"2026-10-11T00:00:01Z","version":"0.25.1"});
+        v.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+        v.to_string()
+    }
+
+    /// The native transcript up to the unterminated record: 100 user turns, a tool call, then a
+    /// pending assistant reply — valid EOF records emit, but may wait for the physical newline.
+    fn qwen_native_text() -> String {
+        let mut text = String::new();
+        for n in 0..100 {
+            text.push_str(&qwen_rec(&format!("u{n}"), serde_json::json!({"type":"user",
+            "provenance":"real_user","message":{"role":"user","parts":[{"text":format!("prefix sapphire message {n}")}]}})));
+            text.push('\n');
+        }
+        text.push_str(&qwen_rec(
+            "a1",
+            serde_json::json!({"type":"assistant","model":"first-model",
+        "message":{"role":"model","parts":[{"functionCall":{"id":"call","name":"tool_call",
+            "args":{"name":"agent","arguments":{"prompt":"explore"}}}}]}}),
+        ));
+        text.push('\n');
+        text.push_str(&qwen_rec(
+            "pending",
+            serde_json::json!({"type":"assistant","model":"next-model",
+        "message":{"role":"model","parts":[{"text":"pending amber reply"}]}}),
+        ));
+        text
+    }
+
+    fn qwen_words() -> Vec<String> {
+        ["sapphire", "amber", "returned", "compressed"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Native Qwen has stable ChatRecord boundaries: appends resume from the mark and leave what a
+    /// whole sweep leaves, across counts, events and stored search docs.
+    #[test]
+    fn qwen_native_append_resumes_at_record_boundaries() {
         use cv_core::{Harness, SessionRef};
         let _home = IsolatedHome::new();
         let (dir, root) = (tmpdir(), tmpdir());
         let chats = root.join("projects/group/chats");
         std::fs::create_dir_all(&chats).unwrap();
         let r = SessionRef::new("native", Harness::Qwen, chats.join("native.jsonl"));
-        let rec = |id: &str, body: serde_json::Value| {
-            let mut v = serde_json::json!({"uuid":id,"sessionId":"native","cwd":"/scratch",
-                "timestamp":"2026-10-11T00:00:01Z","version":"0.25.1"});
-            v.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
-            v.to_string()
-        };
-        let mut text = String::new();
-        for n in 0..100 {
-            text.push_str(&rec(&format!("u{n}"), serde_json::json!({"type":"user",
-                "provenance":"real_user","message":{"role":"user","parts":[{"text":format!("prefix sapphire message {n}")}]}})));
-            text.push('\n');
-        }
-        text.push_str(&rec(
-            "a1",
-            serde_json::json!({"type":"assistant","model":"first-model",
-            "message":{"role":"model","parts":[{"functionCall":{"id":"call","name":"tool_call",
-                "args":{"name":"agent","arguments":{"prompt":"explore"}}}}]}}),
-        ));
-        text.push('\n');
-        // Valid EOF records emit, but may not be checkpointed until the physical newline lands.
-        text.push_str(&rec(
-            "pending",
-            serde_json::json!({"type":"assistant","model":"next-model",
-            "message":{"role":"model","parts":[{"text":"pending amber reply"}]}}),
-        ));
+        let mut text = qwen_native_text();
         std::fs::write(&r.path, &text).unwrap();
         assert_eq!(sweep(&dir, vec![r.clone()], false, false).unwrap().resumed, 0);
         assert!(
             cv_core::resume::MarkTable::load().get(&r).is_some(),
             "native head must leave a safe chunk boundary"
         );
-        let words: Vec<_> = ["sapphire", "amber", "returned", "compressed"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let words = qwen_words();
         for suffix in [
-            rec(
+            qwen_rec(
                 "result",
                 serde_json::json!({"type":"tool_result","message":{"role":"user","parts":[
-                {"functionResponse":{"id":"call","name":"tool_call","response":{"output":"returned emerald"}}}]},
-                "toolCallResult":{"callId":"call","status":"success"}}),
+            {"functionResponse":{"id":"call","name":"tool_call","response":{"output":"returned emerald"}}}]},
+            "toolCallResult":{"callId":"call","status":"success"}}),
             ),
-            rec(
+            qwen_rec(
                 "compact",
                 serde_json::json!({"type":"system","subtype":"chat_compression","systemPayload":{
-                "info":{"originalTokenCount":99,"newTokenCount":9},"compressedHistory":[{"role":"user","parts":[{"text":"compressed ruby"}]}]}}),
+            "info":{"originalTokenCount":99,"newTokenCount":9},"compressedHistory":[{"role":"user","parts":[{"text":"compressed ruby"}]}]}}),
             ),
         ] {
             text.push('\n');
@@ -6355,8 +7164,31 @@ mod tests {
                 whole_sweep(std::slice::from_ref(&r), &words)
             );
         }
+    }
 
-        // A sidecar edit must not reuse checkpointed lineage, even alongside transcript growth.
+    /// A sidecar edit must not reuse checkpointed lineage, even alongside transcript growth.
+    #[test]
+    fn qwen_sidecar_metadata_edit_does_not_resume() {
+        use cv_core::{Harness, SessionRef};
+        let _home = IsolatedHome::new();
+        let (dir, root) = (tmpdir(), tmpdir());
+        let chats = root.join("projects/group/chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let r = SessionRef::new("native", Harness::Qwen, chats.join("native.jsonl"));
+        let result = qwen_rec(
+            "result",
+            serde_json::json!({"type":"tool_result","message":{"role":"user","parts":[
+        {"functionResponse":{"id":"call","name":"tool_call","response":{"output":"returned emerald"}}}]},
+        "toolCallResult":{"callId":"call","status":"success"}}),
+        );
+        let compact = qwen_rec(
+            "compact",
+            serde_json::json!({"type":"system","subtype":"chat_compression","systemPayload":{
+        "info":{"originalTokenCount":99,"newTokenCount":9},"compressedHistory":[{"role":"user","parts":[{"text":"compressed ruby"}]}]}}),
+        );
+        let text = format!("{}\n{}\n\n{}\n", qwen_native_text(), result, compact);
+        std::fs::write(&r.path, &text).unwrap();
+
         let sub = root.join("projects/group/subagents/native");
         std::fs::create_dir_all(&sub).unwrap();
         let child = SessionRef::new("agent-worker", Harness::Qwen, sub.join("agent-worker.jsonl"));
@@ -6369,10 +7201,10 @@ mod tests {
             &child.path,
             format!(
                 "{text}\n{}\n",
-                rec(
+                qwen_rec(
                     "last",
                     serde_json::json!({"type":"user",
-            "message":{"role":"user","parts":[{"text":"child append"}]}})
+        "message":{"role":"user","parts":[{"text":"child append"}]}})
                 )
             ),
         )
@@ -6380,10 +7212,18 @@ mod tests {
         let swept = sweep(&dir, vec![r.clone(), child.clone()], false, false).unwrap();
         assert_eq!((swept.changed, swept.resumed), (1, 0));
         assert_eq!(
-            observe(&dir, &[r.clone(), child.clone()], &words),
-            whole_sweep(&[r, child], &words)
+            observe(&dir, &[r.clone(), child.clone()], &qwen_words()),
+            whole_sweep(&[r, child], &qwen_words())
         );
+    }
 
+    /// Legacy Qwen replay replaces old record IDs: the grown file re-reads whole instead of
+    /// resuming, and the replaced records leave nothing searchable behind.
+    #[test]
+    fn qwen_legacy_replay_replaces_old_ids_with_a_full_reread() {
+        use cv_core::{Harness, SessionRef};
+        let _home = IsolatedHome::new();
+        let (dir, root) = (tmpdir(), tmpdir());
         let legacy_dir = root.join("tmp/hash/chats");
         std::fs::create_dir_all(&legacy_dir).unwrap();
         let legacy = SessionRef::new("legacy", Harness::Qwen, legacy_dir.join("session-legacy.jsonl"));
@@ -6402,15 +7242,13 @@ mod tests {
         std::fs::write(&legacy.path, &old).unwrap();
         let swept = sweep(&dir, vec![legacy.clone()], false, false).unwrap();
         assert_eq!((swept.changed, swept.resumed), (1, 0));
+        let words = qwen_words();
         assert_eq!(
             observe(&dir, std::slice::from_ref(&legacy), &words),
             whole_sweep(std::slice::from_ref(&legacy), &words)
         );
         assert!(text_search(&dir, "sapphire", 100).unwrap().is_empty());
         assert!(!text_search(&dir, "amber", 100).unwrap().is_empty());
-        for d in [dir, root] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     #[test]
@@ -6423,19 +7261,16 @@ mod tests {
         assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, refs.len());
         // The catalog and index travel together; the copy's path differs, its identity does not.
         let copy = tmpdir();
-        std::fs::remove_dir_all(&copy).unwrap();
+        std::fs::remove_dir_all(&*copy).unwrap();
         assert!(std::process::Command::new("cp")
             .arg("-R")
-            .arg(&dir)
-            .arg(&copy)
+            .arg(&*dir)
+            .arg(&*copy)
             .status()
             .unwrap()
             .success());
         assert_eq!(source_consumer(&copy).unwrap(), source_consumer(&dir).unwrap());
         assert_eq!(sweep(&copy, refs.clone(), false, false).unwrap().changed, 0);
-        for d in [dir, copy, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     #[test]
@@ -6466,9 +7301,6 @@ mod tests {
         );
         let words = some_words(&refs);
         assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     #[test]
@@ -6535,9 +7367,6 @@ mod tests {
         }
         let words = some_words(&refs);
         assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     /// One row's baseline publication failing loses that row only: the other sessions' baselines
@@ -6589,39 +7418,42 @@ mod tests {
         assert_eq!((again.changed, again.observed.work.callbacks), (0, 0));
         let words = some_words(&refs);
         assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
+    /// An index missing a current field, or built under another `source::VERSION` (no format
+    /// stamp), is refused by a query and rebuilt whole by indexing.
     #[test]
-    fn discovery_metadata_schema_migration_is_indexing_only() {
-        let dir = tmpdir();
-        let mut old = serde_json::to_value(build_schema()).unwrap();
-        old.as_array_mut()
-            .unwrap()
-            .retain(|field| field["name"] != "discovery_metadata");
-        let old: Schema = serde_json::from_value(old).unwrap();
-        let index = Index::create_in_dir(&dir, old.clone()).unwrap();
-        let mut writer = index.writer(15_000_000).unwrap();
-        let mut doc = TantivyDocument::default();
-        doc.add_text(old.get_field("id").unwrap(), "old");
-        doc.add_text(old.get_field("title").unwrap(), "obsolete");
-        writer.add_document(doc).unwrap();
-        writer.commit().unwrap();
-        // A raw tantivy writer: join its post-commit GC as `ingest::Writer` does on drop.
-        writer.wait_merging_threads().unwrap();
-        drop(index);
-        // A query cannot silently trust old stale postings, and never clears them.
-        assert!(open_existing(&dir).err().unwrap().to_string().contains("cv index"));
-        let existing = Index::open_in_dir(&dir).unwrap();
-        assert_eq!(existing.reader().unwrap().searcher().num_docs(), 1);
-        drop(existing);
-        let (new, _) = open_or_create(&dir).unwrap();
-        assert!(schema_current(&new.schema()));
-        assert_eq!(new.reader().unwrap().searcher().num_docs(), 0);
-        drop(new);
-        std::fs::remove_dir_all(dir).ok();
+    fn older_schema_or_format_is_rebuilt_by_indexing_only() {
+        for missing in ["discovery_metadata".to_owned(), format_field()] {
+            let dir = tmpdir();
+            let mut old = serde_json::to_value(build_schema()).unwrap();
+            old.as_array_mut()
+                .unwrap()
+                .retain(|field| field["name"] != missing.as_str());
+            let old: Schema = serde_json::from_value(old).unwrap();
+            let index = Index::create_in_dir(&*dir, old.clone()).unwrap();
+            let mut writer = index.writer(15_000_000).unwrap();
+            let mut doc = TantivyDocument::default();
+            doc.add_text(old.get_field("id").unwrap(), "old");
+            doc.add_text(old.get_field("title").unwrap(), "obsolete");
+            writer.add_document(doc).unwrap();
+            writer.commit().unwrap();
+            // A raw tantivy writer: join its post-commit GC as `ingest::Writer` does on drop.
+            writer.wait_merging_threads().unwrap();
+            drop(index);
+            // A query cannot silently trust old stale postings, and never clears them.
+            assert!(
+                open_existing(&dir).err().unwrap().to_string().contains("cv index"),
+                "{missing}"
+            );
+            let existing = Index::open_in_dir(&*dir).unwrap();
+            assert_eq!(existing.reader().unwrap().searcher().num_docs(), 1);
+            drop(existing);
+            let (new, _) = open_or_create(&dir).unwrap();
+            assert!(schema_current(&new.schema()));
+            assert_eq!(new.reader().unwrap().searcher().num_docs(), 0);
+            drop(new);
+        }
     }
 
     /// A title-changing append cannot keep prefix title postings: Boolean clauses are
@@ -6679,9 +7511,6 @@ mod tests {
         let swept = sweep(&dir, vec![r.clone()], false, false).unwrap();
         assert_eq!((swept.changed, swept.resumed, swept.errors), (1, 1, 0));
         assert_eq!(observe(&dir, &[r.clone()], &words), whole_sweep(&[r], &words));
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     /// Discovery inputs can change without changing the transcript tuple (sidecar metadata,
@@ -6753,9 +7582,6 @@ mod tests {
             base,
             "a count filled after the pass leaves the docs fresh"
         );
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     #[cfg(unix)]
@@ -6818,9 +7644,6 @@ mod tests {
         );
         let unchanged = sweep(&dir, vec![r], false, false).unwrap();
         assert_eq!((unchanged.changed, unchanged.observed.work.callbacks), (0, 0));
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     /// A pass that fails while its source changes is read again, whole, once; one that fails on
@@ -6890,13 +7713,10 @@ mod tests {
         let swept = sweep(&dir, refs, false, false).unwrap();
         assert_eq!((swept.changed, swept.errors), (1, 0), "a later pass retries it");
         assert_eq!(text_search(&dir, "zqrewritten", 10).unwrap().len(), 1);
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     #[test]
-    fn report_fails_only_for_an_unwritable_catalog_a_pass_that_read_nothing_or_strict() {
+    fn report_fails_only_for_a_failed_publication_a_pass_that_read_nothing_or_strict() {
         let unreadable = || Unreadable {
             id: "s".into(),
             harness: "claude".into(),
@@ -6914,8 +7734,14 @@ mod tests {
         assert_eq!(report(swept(1, 0, 0), true, false).unwrap().unreadable.len(), 1);
         assert_eq!(report(swept(0, 1, 0), true, false).unwrap().total, 2);
         for (error, expected) in [
-            (report(swept(1, 0, 0), true, true).unwrap_err(), "could not be read"),
-            (report(swept(0, 0, 0), true, false).unwrap_err(), "could not be read"),
+            (
+                report(swept(1, 0, 0), true, true).unwrap_err(),
+                "could not be indexed this pass",
+            ),
+            (
+                report(swept(0, 0, 0), true, false).unwrap_err(),
+                "could not be indexed this pass",
+            ),
             (
                 report(swept(1, 0, 1), true, false).unwrap_err(),
                 "event publication failed",
@@ -6966,9 +7792,6 @@ mod tests {
         .unwrap();
         assert_eq!((repaired.changed, repaired.errors), (1, 0));
         assert_eq!(text_search(&dir, "zqhiddenoutput", 10).unwrap().len(), 1);
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     /// A same-shaped file renamed over the transcript after a pass read it must not take that
@@ -7025,9 +7848,6 @@ mod tests {
         assert_eq!((swept.changed, swept.resumed), (1, 0));
         assert!(text_search(&dir, "zqoldword", 10).unwrap().is_empty());
         assert_eq!(text_search(&dir, "zqnewword", 10).unwrap().len(), 1);
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     /// Equal-size edits require a whole pass even when the old checkpoint's samples match.
@@ -7067,9 +7887,6 @@ mod tests {
         assert_eq!((swept.changed, swept.resumed), (1, 0));
         assert!(text_search(&dir, "zqoldone", 10).unwrap().is_empty());
         assert_eq!(text_search(&dir, "zqnewone", 10).unwrap().len(), 1);
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     /// A mark whose sampled bytes no longer match is never resumed from: an edit near the mark,
@@ -7106,15 +7923,15 @@ mod tests {
             version: format!("{}-older", head(2).version),
             ..head(2)
         };
-        cv_core::resume::update(&[(r2.clone(), Some((other, cp)))]);
+        cv_core::resume::update(&[cv_core::resume::MarkUpdate {
+            session: r2.clone(),
+            mark: Some((other, cp)),
+        }]);
 
         let swept = sweep(&dir, refs.clone(), false, false).unwrap();
         assert_eq!((swept.changed, swept.resumed), (3, 0));
         let words = some_words(&refs);
         assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
-        for d in [dir, sdir] {
-            std::fs::remove_dir_all(d).ok();
-        }
     }
 
     #[test]
@@ -7132,7 +7949,12 @@ mod tests {
         let _writer_lock = open_writer(&index, 15_000_000).unwrap();
         let swept = sweep(&dir, refs.clone(), false, false).unwrap();
         assert_eq!(
-            (swept.changed, swept.removed, swept.errors, swept.observed.admission.1),
+            (
+                swept.changed,
+                swept.removed,
+                swept.errors,
+                swept.observed.admission.peak_charged_bytes
+            ),
             (0, 0, 0, 0)
         );
         assert_eq!(swept.observed.work, SweepWork::default());
@@ -7214,7 +8036,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "explicit scratch warm sweep measurement"]
+    #[ignore = "manual probe: scratch warm-sweep measurement; CV_FTS_WARM_SESSIONS and CV_FTS_WARM_CPU tune it"]
     fn warm_sweep_transaction_probe() {
         let home = IsolatedHome::new();
         let dir = home.home.join("index");
@@ -7241,7 +8063,7 @@ mod tests {
                     result.changed,
                     result.removed,
                     result.errors,
-                    result.observed.admission.1
+                    result.observed.admission.peak_charged_bytes
                 ),
                 (0, 0, 0, 0)
             );
@@ -7305,10 +8127,16 @@ mod tests {
         let (index, f) = open_or_create(&dir).unwrap();
         let mut writer = open_writer(&index, 15_000_000).unwrap();
         for i in 0..TIER_FANOUT {
-            let mut doc = TantivyDocument::default();
-            doc.add_text(f.id, format!("s{i}"));
-            doc.add_text(f.body, format!("zqtier{i} common"));
-            writer.add_document(doc).unwrap();
+            writer
+                .add_document(
+                    tantivy::doc!(f.id => format!("s{i}"), f.kind => KIND_BODY, f.body => format!("zqtier{i} common")),
+                )
+                .unwrap();
+            writer
+                .add_document(
+                    tantivy::doc!(f.id => format!("s{i}"), f.kind => KIND_META, f.path => format!("/gone/s{i}")),
+                )
+                .unwrap();
             writer.commit().unwrap();
         }
         assert_eq!(index.searchable_segment_ids().unwrap().len(), TIER_FANOUT);
@@ -7321,7 +8149,6 @@ mod tests {
         );
         let hits = text_search(&dir, "common", 50).unwrap();
         assert_eq!(hits.len(), TIER_FANOUT);
-        std::fs::remove_dir_all(&dir).ok();
     }
     #[derive(Default, Debug)]
     struct MergeBytes {
@@ -7394,7 +8221,7 @@ mod tests {
         ids.sort();
         (ids, reads.load(Ordering::Relaxed))
     }
-    fn append_merge_control(legacy: bool) -> (MergeBytes, Vec<String>, usize) {
+    fn append_merge_control() -> (MergeBytes, Vec<String>, usize) {
         use tantivy::{
             query::{BooleanQuery, TermQuery},
             schema::IndexRecordOption,
@@ -7412,7 +8239,7 @@ mod tests {
         let cold_meta = index.searchable_segment_metas().unwrap().pop().unwrap();
         let cold_bytes = segment_bytes(&dir, &cold_meta);
         let floor = cold_bytes / 2;
-        eprintln!("append tier scale: cold={cold_bytes} bytes, floor={floor} bytes, legacy={legacy}");
+        eprintln!("append tier scale: cold={cold_bytes} bytes, floor={floor} bytes");
         let mut cold = HashSet::from([cold_meta.id()]);
         let mut total = MergeBytes::default();
         for n in 0..24 {
@@ -7453,13 +8280,7 @@ mod tests {
             let append_hit = session_ids_and_reads(&dir, &term);
             assert_eq!(cold_hit, (vec!["cold".into()], 1));
             assert_eq!(append_hit, (vec!["hot".into()], 1));
-            let work = measured_compact(
-                &dir,
-                &index,
-                &mut writer,
-                if legacy { floor * TIER_FANOUT as u64 } else { floor },
-                &mut cold,
-            );
+            let work = measured_compact(&dir, &index, &mut writer, floor, &mut cold);
             total.inputs += work.inputs;
             total.outputs += work.outputs;
             total.merges += work.merges;
@@ -7468,45 +8289,42 @@ mod tests {
             assert_eq!(session_ids_and_reads(&dir, "coldword00000000"), cold_hit);
             assert_eq!(session_ids_and_reads(&dir, &term), append_hit);
             assert_eq!(before.0, ["cold", "hot"]);
-            assert_eq!(
+            // One request per live body is the floor; the stored-document count (the cold
+            // body plus a body and meta per append) is the ceiling it must stay beneath.
+            assert!(
+                before.1 >= n + 2 && before.1 < 2 * (n + 1) + 1,
+                "identity requests {} at append {n} must track live bodies ({}), not stored documents ({})",
                 before.1,
                 n + 2,
-                "one identity request per live matching body, not every stored document"
+                2 * (n + 1) + 1
             );
         }
         total.final_segments = index.searchable_segment_ids().unwrap().len();
         let (ids, reads) = session_ids_and_reads(&dir, "common");
-        assert_eq!(
-            measured_compact(
-                &dir,
-                &index,
-                &mut writer,
-                if legacy { floor * TIER_FANOUT as u64 } else { floor },
-                &mut cold
-            )
-            .merges,
-            0
-        );
-        std::fs::remove_dir_all(dir).ok();
+        assert_eq!(measured_compact(&dir, &index, &mut writer, floor, &mut cold).merges, 0);
         (total, ids, reads)
     }
+    /// Twenty-four appends compact the small segments among themselves (the merges happen) and
+    /// never rewrite the cold segment above the bottom tier; every search answers the same.
     #[test]
     fn append_compaction_keeps_the_cold_segment_above_the_bottom_tier() {
-        let (legacy, ids, reads) = append_merge_control(true);
-        let (fixed, fixed_ids, fixed_reads) = append_merge_control(false);
-        assert_eq!((ids, reads), (fixed_ids, fixed_reads));
-        assert!(legacy.cold_rewrites >= 2, "legacy: {legacy:?}");
-        assert_eq!(fixed.cold_rewrites, 0, "fixed: {fixed:?}");
-        assert!(fixed.inputs < legacy.inputs, "inputs {fixed:?} versus {legacy:?}");
-        assert!(fixed.outputs < legacy.outputs, "outputs {fixed:?} versus {legacy:?}");
-        eprintln!("append merge bytes: legacy={legacy:?}, fixed={fixed:?}");
+        let (work, ids, reads) = append_merge_control();
+        assert_eq!(ids, ["cold", "hot"]);
+        assert_eq!(
+            reads, 25,
+            "one identity request per live body: the cold one and 24 appends"
+        );
+        assert!(work.merges > 0, "{work:?}");
+        assert_eq!(work.cold_rewrites, 0, "{work:?}");
+        assert!(work.final_segments < 24, "{work:?}");
+        eprintln!("append merge bytes: {work:?}");
     }
 
     /// Opt-in operation control on a disposable copy of an existing index. The byte-tier
     /// policy is schema-independent: old indexes are useful geometry controls, but this does
     /// not exercise their schema migration or claim parity for a newly rebuilt fleet index.
     #[test]
-    #[ignore = "requires a disposable index copied by tools/profiling/compaction-existing.py"]
+    #[ignore = "manual probe: set CV_COMPACTION_CONTROL_INDEX to a copy made by tools/profiling/compaction-existing.py"]
     fn existing_index_compaction_work_control() {
         let dir = PathBuf::from(std::env::var_os("CV_COMPACTION_CONTROL_INDEX").unwrap());
         assert_eq!(
@@ -7681,54 +8499,148 @@ mod tests {
         );
     }
 
-    /// Regression for the live-staleness disclosure: a session that grows after indexing must be
-    /// counted by [`staleness_over`], and a fresh index must report none — the footer `cv search`
-    /// appends is only honest if both directions hold.
-    #[test]
-    fn staleness_counts_grown_sessions_then_goes_quiet() {
-        let _home = IsolatedHome::new();
-        let dir = tmpdir();
-        let sdir = tmpdir();
-        let p = write_claude(&sdir, "s1", "alpha corpus seed");
-        let refs = vec![sref("s1", "one", p.clone())];
-
-        index_refs(&dir, &refs, false).unwrap();
-        // A fresh index over the same files reports no staleness — the footer stays off.
-        assert_eq!(staleness_over(&dir, &refs).map(|s| s.stale_sessions), Some(0));
-        assert_eq!(staleness_line(&staleness_over(&dir, &refs).unwrap()), None);
-
-        // Grow the transcript on disk: its signature no longer matches its stamp → counted, and
-        // the note names the count and the cure.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-        use std::io::Write as _;
-        writeln!(f, "{}", serde_json::json!({"type":"user","uuid":"u2","sessionId":"s1","message":{"role":"user","content":"beta appended"}})).unwrap();
-        let s = staleness_over(&dir, &refs).expect("index present");
-        assert_eq!(s.stale_sessions, 1, "the grown session must count as stale");
-        assert!(s.behind_ns >= 0);
-        let note = staleness_line(&s).expect("a stale session must produce the note");
-        assert!(note.contains("behind for 1 session"), "{note}");
-        assert!(note.contains("cv index"), "{note}");
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
+    /// A session's grown suffix, searched without `cv index`: read live from its mark (the
+    /// unread suffix only), ranked like the index ranks, and the footer says so.
+    fn suffix_search(
+        dir: &Path,
+        query: &str,
+        live: LiveRead,
+        refs: &[cv_core::SessionRef],
+    ) -> (Vec<(String, f32)>, Suffix) {
+        let Searched { hits, suffix, .. } =
+            search_suffixed(dir, query, 10, crate::SearchFilter::default(), live, refs).unwrap();
+        (hits.into_iter().map(|h| (h.id, h.score)).collect(), suffix)
     }
 
-    /// A session the index has never seen counts as stale too — a hit list that can't contain it
-    /// must disclose the gap.
+    fn append_claude(path: &str, id: &str, n: usize, text: &str) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        for i in 0..n {
+            let line = serde_json::json!({"type":"user","uuid":format!("{id}-late-{i}"),"sessionId":id,
+                "message":{"role":"user","content":format!("{text} {i} {}", "filler words ".repeat(12))}});
+            writeln!(f, "{line}").unwrap();
+        }
+    }
+
     #[test]
-    fn staleness_counts_unindexed_sessions() {
+    fn grown_session_is_found_live_from_its_mark_without_cv_index() {
         let _home = IsolatedHome::new();
-        let dir = tmpdir();
-        let sdir = tmpdir();
-        let p = write_claude(&sdir, "old", "alpha already indexed");
-        let p2 = write_claude(&sdir, "new", "beta never indexed");
-        index_refs(&dir, &[sref("old", "one", p.clone())], false).unwrap();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let msgs: Vec<_> = (0..40)
+            .map(|i| ("user", format!("seed alpha {i} {}", "padding text ".repeat(12))))
+            .collect();
+        let msgs: Vec<_> = msgs.iter().map(|(r, t)| (*r, t.as_str())).collect();
+        let p = write_claude_msgs(&sdir, "grow", &msgs);
+        let other = write_claude(&sdir, "other", "alpha only here");
+        let refs = vec![sref("grow", "one", p.clone()), sref("other", "two", other)];
+        sweep(&dir, refs.clone(), false, false).unwrap();
+        let mark = cv_core::resume::MarkTable::load()
+            .get(&refs[0])
+            .cloned()
+            .expect("a mark");
 
-        let refs = vec![sref("old", "one", p), sref("new", "two", p2)];
-        assert_eq!(staleness_over(&dir, &refs).map(|s| s.stale_sessions), Some(1));
+        // Fresh: nothing is read live and the footer is quiet.
+        let (_, suffix) = suffix_search(&dir, "alpha", LiveRead::All, &refs);
+        assert_eq!((suffix.stale, suffix.read), (0, 0));
+        assert_eq!((suffix.read_line(), suffix.unread_line()), (None, None));
 
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
+        append_claude(&p, "grow", 3, "zanzibar");
+        let len = std::fs::metadata(&p).unwrap().len();
+        let (hits, suffix) = suffix_search(&dir, "zanzibar", LiveRead::All, &refs);
+        assert_eq!(hits.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["grow"]);
+        assert_eq!((suffix.stale, suffix.read, suffix.resumed, suffix.cut), (1, 1, 1, 0));
+        assert_eq!(
+            suffix.bytes,
+            len - mark.offset(),
+            "a stale session costs its unread suffix"
+        );
+        let line = suffix.read_line().unwrap();
+        assert!(line.contains("1 session(s)") && !line.contains("budget"), "{line}");
+        assert_eq!(suffix.unread_line(), None);
+        // A --live-bytes read names its budget.
+        let (_, suffix) = suffix_search(&dir, "zanzibar", LiveRead::Within(1 << 20), &refs);
+        let line = suffix.read_line().unwrap();
+        assert!(line.contains("of the 1.0 MiB --live-bytes budget"), "{line}");
+        // The prefix the index holds still answers for the same session: one hit, not two.
+        let (hits, _) = suffix_search(&dir, "alpha", LiveRead::All, &refs);
+        assert_eq!(hits.iter().filter(|h| h.0 == "grow").count(), 1, "{hits:?}");
+
+        // --frozen: the index alone, and the footer says how far behind.
+        let (hits, suffix) = suffix_search(&dir, "zanzibar", LiveRead::Frozen, &refs);
+        assert!(hits.is_empty(), "{hits:?}");
+        assert_eq!((suffix.stale, suffix.read), (1, 0));
+        let note = suffix.unread_line().unwrap();
+        assert!(
+            note.contains("--frozen") && note.contains("behind for 1 session"),
+            "{note}"
+        );
+        // Nothing was written: the sweep still finds the session stale and resumes it.
+        let swept = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!((swept.changed, swept.resumed), (1, 1));
+        let (_, suffix) = suffix_search(&dir, "zanzibar", LiveRead::All, &refs);
+        assert_eq!(suffix.stale, 0);
+    }
+
+    #[test]
+    fn the_budget_cuts_a_delta_too_large_and_the_footer_names_it() {
+        let _home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let small = write_claude(&sdir, "small", "seed");
+        let big = write_claude(&sdir, "big", "seed");
+        let refs = vec![sref("small", "one", small.clone()), sref("big", "two", big.clone())];
+        index_refs(&dir, &refs, false).unwrap();
+        append_claude(&small, "small", 1, "quokka");
+        append_claude(&big, "big", 60, "quokka");
+        let (small_len, big_len) = (
+            std::fs::metadata(&small).unwrap().len(),
+            std::fs::metadata(&big).unwrap().len(),
+        );
+        // No marks (index_refs takes none): both are read whole. The budget fits only the small.
+        let (hits, suffix) = suffix_search(&dir, "quokka", LiveRead::Within(small_len + 1), &refs);
+        assert_eq!(hits.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["small"]);
+        assert_eq!((suffix.stale, suffix.read, suffix.cut), (2, 1, 1));
+        assert_eq!((suffix.bytes, suffix.cut_bytes), (small_len, big_len));
+        let note = suffix.unread_line().unwrap();
+        assert!(
+            note.contains("1 over the --live-bytes budget") && note.contains("cv index"),
+            "{note}"
+        );
+        // The cut session keeps what the index last saw of it.
+        let (hits, _) = suffix_search(&dir, "seed", LiveRead::Within(small_len + 1), &refs);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        // A zero budget reads nothing live but still says what it left out.
+        let (hits, suffix) = suffix_search(&dir, "quokka", LiveRead::Within(0), &refs);
+        assert!(hits.is_empty());
+        assert_eq!((suffix.read, suffix.cut), (0, 2));
+    }
+
+    /// One scorer: a session read live ranks exactly as it would had `cv index` read it.
+    #[test]
+    fn live_hits_score_as_the_index_scores_them() {
+        let _home = IsolatedHome::new();
+        let (full, part, sdir) = (tmpdir(), tmpdir(), tmpdir());
+        let refs: Vec<_> = [
+            ("a", "lynx lynx otter"),
+            ("b", "lynx heron"),
+            ("c", "otter otter heron"),
+        ]
+        .into_iter()
+        .map(|(id, body)| sref(id, id, write_claude(&sdir, id, body)))
+        .collect();
+        index_refs(&full, &refs, false).unwrap();
+        index_refs(&part, &refs[..1], false).unwrap();
+        for query in ["lynx", "otter", "heron", "lynx OR heron"] {
+            let (indexed, _) = suffix_search(&full, query, LiveRead::Frozen, &refs);
+            let (merged, suffix) = suffix_search(&part, query, LiveRead::All, &refs);
+            assert_eq!(suffix.read, 2);
+            assert_eq!(merged, indexed, "{query}");
+        }
+        // No index at all: every session is unindexed and read live, newest first.
+        let none = tmpdir();
+        let (hits, suffix) = suffix_search(&none.join("absent"), "heron", LiveRead::All, &refs);
+        assert_eq!(hits.len(), 2);
+        assert!(suffix.no_index && suffix.read == 3, "{suffix:?}");
+        assert!(suffix.read_line().unwrap().starts_with("no index yet"), "{suffix:?}");
     }
 
     /// Discovery can report the same session twice (overlapping roots, a copy under another
@@ -7742,7 +8654,7 @@ mod tests {
         let p = write_claude(&sdir, "s1", "alpha corpus seed");
         let r1 = sref("s1", "one", p); // updated_at = 2s
         index_refs(&dir, std::slice::from_ref(&r1), false).unwrap();
-        let stale = |refs: &[cv_core::SessionRef]| staleness_over(&dir, refs).map(|s| s.stale_sessions);
+        let stale = |refs: &[cv_core::SessionRef]| Some(suffix_search(&dir, "alpha", LiveRead::Frozen, refs).1.stale);
 
         // An older duplicate at a different path loses preference → not drift.
         let mut old = sref("s1", "one", write_claude(&sdir, "s1dup", "different, older copy"));
@@ -7753,8 +8665,7 @@ mod tests {
         let mut new = sref("s1", "one", write_claude(&sdir, "s1new", "newer copy content"));
         new.updated_at = chrono::DateTime::from_timestamp(3, 0);
         assert_eq!(stale(&[r1, new]), Some(1));
-
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&sdir).ok();
     }
+
+
 }

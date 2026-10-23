@@ -4,8 +4,26 @@ use cv_core::prune::{prune_session, PruneOptions};
 #[cfg(feature = "probe-heap")]
 #[global_allocator]
 static ALLOCATOR: cv_testkit::heap::Allocator = cv_testkit::heap::Allocator;
+
+/// Run `f` with the requested-Rust-heap snapshot when the probe-heap feature is on.
+fn measure<R>(f: impl FnOnce() -> R) -> (R, Option<cv_testkit::heap::Snapshot>) {
+    #[cfg(feature = "probe-heap")]
+    {
+        let baseline = cv_testkit::heap::begin();
+        let out = f();
+        (out, Some(cv_testkit::heap::end(baseline)))
+    }
+    #[cfg(not(feature = "probe-heap"))]
+    {
+        (f(), None)
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        anyhow::bail!("expected: prune_probe SOURCE_PATH [MODE...] (modes: rewind|revive|window|range|drop|thinking|declassify|dry|resources)");
+    }
     if args.iter().skip(2).any(|mode| mode == "rewind") {
         let source = cv_core::SessionRef::from_path(std::path::Path::new(&args[1]), cv_core::Harness::Claude);
         let options = cv_core::rewind::RewindOptions {
@@ -18,15 +36,10 @@ fn main() -> Result<()> {
             generator: "operation-probe".into(),
             skills_policy: Default::default(),
         };
-        #[cfg(feature = "probe-heap")]
-        let baseline = cv_testkit::heap::begin();
         let start = std::time::Instant::now();
-        let result = cv_core::rewind::rewind_session(&source, &options)?;
+        let (result, heap) = measure(|| cv_core::rewind::rewind_session(&source, &options));
+        let result = result?;
         let elapsed = start.elapsed().as_secs_f64();
-        #[cfg(feature = "probe-heap")]
-        let heap = Some(cv_testkit::heap::end(baseline));
-        #[cfg(not(feature = "probe-heap"))]
-        let heap: Option<serde_json::Value> = None;
         println!("{}", serde_json::json!({"result":result,"seconds":elapsed,"heap":heap}));
         return Ok(());
     }
@@ -51,15 +64,10 @@ fn main() -> Result<()> {
             _ => anyhow::bail!("unknown probe mode {mode}"),
         }
     }
-    #[cfg(feature = "probe-heap")]
-    let baseline = cv_testkit::heap::begin();
     let start = std::time::Instant::now();
-    let result = prune_session(cv_core::Harness::Claude, std::path::Path::new(&args[1]), &options)?;
+    let (result, heap) = measure(|| prune_session(cv_core::Harness::Claude, std::path::Path::new(&args[1]), &options));
+    let result = result?;
     let elapsed = start.elapsed().as_secs_f64();
-    #[cfg(feature = "probe-heap")]
-    let heap = Some(cv_testkit::heap::end(baseline));
-    #[cfg(not(feature = "probe-heap"))]
-    let heap: Option<serde_json::Value> = None;
     println!(
         "{}",
         serde_json::json!({"result": result, "usage_rewritten":result.usage_rewritten,"revive_tokens":result.revive_tokens,"revive_old_tokens":result.revive_old_tokens,"seconds":elapsed,"heap":heap})

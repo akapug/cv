@@ -12,6 +12,7 @@ pub(crate) fn cmd_events(
     kind: Option<String>,
     subagents: bool,
     json: bool,
+    wide: bool,
 ) -> Result<()> {
     use cv_core::events;
     let want = parse_harness(&harness)?;
@@ -74,6 +75,7 @@ pub(crate) fn cmd_events(
             e.tool.as_deref(),
             e.target.as_deref(),
             e.detail.as_deref(),
+            wide,
         );
     }
 
@@ -81,7 +83,7 @@ pub(crate) fn cmd_events(
     // aren't in the catalog (there can be thousands), so they're streamed on the spot through an
     // `EventSink` — large tool-result content stays on disk (lazy), only the small rows accumulate.
     if subagents {
-        print_subagent_events(&r, kind.as_deref())?;
+        print_subagent_events(&r, kind.as_deref(), wide)?;
     }
     Ok(())
 }
@@ -101,7 +103,7 @@ fn subagent_events(
     let adapter = cv_core::harness::for_harness(harness).with_context(|| format!("no adapter for {harness}"))?;
     let mut out = Vec::new();
     for s in subs {
-        let mut sink = EventSink::new(s.session.cwd.clone());
+        let mut sink = EventSink::new(s.session.cwd.clone()).with_source(s.session.path.clone());
         adapter
             .try_stream(&s.session, &Demand::LEAN.with_spans(), &mut sink)
             .with_context(|| {
@@ -124,7 +126,7 @@ fn subagent_events(
 }
 
 /// Print each sub-agent's events grouped under the agent (with the agent's type/task as a header).
-fn print_subagent_events(r: &cv_core::SessionRef, kind: Option<&str>) -> Result<()> {
+fn print_subagent_events(r: &cv_core::SessionRef, kind: Option<&str>, wide: bool) -> Result<()> {
     let subs = cv_core::subagent_tree_of(r)?;
     let n_agents = subs.len();
     let per_agent = subagent_events(subs, r.harness, kind)?;
@@ -152,6 +154,7 @@ fn print_subagent_events(r: &cv_core::SessionRef, kind: Option<&str>) -> Result<
                 e.tool.as_deref(),
                 e.target.as_deref(),
                 e.detail.as_deref(),
+                wide,
             );
         }
     }
@@ -161,8 +164,12 @@ fn print_subagent_events(r: &cv_core::SessionRef, kind: Option<&str>) -> Result<
     Ok(())
 }
 
+/// The table's target and detail widths; `--wide` prints the cell whole instead.
+const TARGET_COLUMN: usize = 90;
+const DETAIL_COLUMN: usize = 100;
+
 /// Print one event row in the shared `cv events` layout (index · time · kind · tool · target, then
-/// an optional indented detail line).
+/// an optional indented detail line). A cell past its column ends in `…` unless `wide`.
 fn print_event_row(
     msg_idx: i64,
     ts: Option<i64>,
@@ -170,7 +177,15 @@ fn print_event_row(
     tool: Option<&str>,
     target: Option<&str>,
     detail: Option<&str>,
+    wide: bool,
 ) {
+    let cell = |text: &str, column: usize| {
+        if wide {
+            text.replace('\n', " ")
+        } else {
+            truncate(text, column)
+        }
+    };
     let time = ts
         .and_then(|t| crate::util::fmt_local_ts(t, "%m-%d %H:%M"))
         .unwrap_or_else(|| "-----------".into());
@@ -180,10 +195,10 @@ fn print_event_row(
         time,
         kind,
         tool.unwrap_or("-"),
-        target.map(|t| truncate(t, 90)).unwrap_or_default(),
+        target.map(|t| cell(t, TARGET_COLUMN)).unwrap_or_default(),
     );
     if let Some(d) = detail {
-        println!("       ↳ {}", truncate(d, 100));
+        println!("       ↳ {}", cell(d, DETAIL_COLUMN));
     }
 }
 

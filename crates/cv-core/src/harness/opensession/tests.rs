@@ -359,9 +359,9 @@ fn discovers_documents_in_registered_sources() {
     let doc = json!({
         "open_session": "0.3", "harness": "codex", "id": "disco-1", "title": "found me",
         "messages": [
-            { "role": "user", "kind": "prompt", "content": [{ "type": "text", "text": "hi" }] },
-            { "role": "assistant", "kind": "reply", "content": [{ "type": "text", "text": "yo" }] },
-            { "role": "tool", "kind": "tool_result", "content": [
+            { "role": "user", "kind": "prompt", "origin": "human", "content": [{ "type": "text", "text": "hi" }] },
+            { "role": "assistant", "kind": "reply", "origin": "model", "content": [{ "type": "text", "text": "yo" }] },
+            { "role": "tool", "kind": "tool_result", "origin": "harness", "content": [
                 { "type": "tool_result", "tool_use_id": "c", "content": "out" }] }
         ]
     });
@@ -372,6 +372,23 @@ fn discovers_documents_in_registered_sources() {
     std::fs::write(dir.join("some-session.json"), by_key.to_string()).unwrap();
     std::fs::write(dir.join("settings.json"), json!({ "theme": "dark" }).to_string()).unwrap();
     std::fs::write(dir.join("notes.txt"), "not json").unwrap();
+    // A plain .json naming its version past 64 KiB (the old head-sniff limit) is still found; a
+    // nested version key, a top-level array and broken JSON are not documents.
+    let mut late = doc.as_object().unwrap().clone();
+    let version = late.remove("open_session").unwrap();
+    late.insert("id".into(), json!("disco-3"));
+    late.insert("padding".into(), json!("x".repeat(100 * 1024)));
+    let late = serde_json::to_string(&late).unwrap();
+    let late = format!("{},\"open_session\":{version}}}", &late[..late.len() - 1]);
+    assert!(late.find("open_session").unwrap() > 64 * 1024);
+    std::fs::write(dir.join("late-key.json"), late).unwrap();
+    std::fs::write(
+        dir.join("nested.json"),
+        json!({"inner": {"open_session": "0.3"}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("array.json"), json!([{"open_session": "0.3"}]).to_string()).unwrap();
+    std::fs::write(dir.join("broken.json"), r#"{"theme": dark, "open_session": "0.3"}"#).unwrap();
 
     let env =
         crate::env::Env::from_vars([("XDG_CONFIG_HOME", dir.join("no-config")), ("CV_EXPORTS", dir.clone())]).enter();
@@ -380,7 +397,11 @@ fn discovers_documents_in_registered_sources() {
 
     let mut ids: Vec<&str> = refs.iter().map(|r| r.id.as_str()).collect();
     ids.sort();
-    assert_eq!(ids, ["disco-1", "disco-2"], "by name and by sniff, and nothing else");
+    assert_eq!(
+        ids,
+        ["disco-1", "disco-2", "disco-3"],
+        "by name and by top-level key, and nothing else"
+    );
     let one = refs.iter().find(|r| r.id == "disco-1").unwrap();
     assert_eq!(one.harness, Harness::OpenSession);
     assert_eq!(one.title.as_deref(), Some("found me"));
@@ -784,6 +805,52 @@ mod projection_schema {
         assert_eq!(declared["renamed"], set(["type", "wire", "alias"]));
         assert_eq!(declared["old"], declared["renamed"]);
     }
+
+    // `rename` transcribes serde's rename rules by hand; probe serde itself so transcription
+    // drift (here, or from a serde bump) fails in this gate instead of on the wire.
+    #[test]
+    fn rename_matches_serde_on_every_accepted_rule() {
+        use serde::Serialize;
+        macro_rules! probe {
+            ($rule:literal) => {{
+                #[derive(Serialize)]
+                #[serde(rename_all = $rule)]
+                enum Variant {
+                    SomeVariantName,
+                }
+                #[derive(Serialize)]
+                #[serde(rename_all = $rule)]
+                struct Field {
+                    some_field_name: u8,
+                }
+                (
+                    serde_json::to_value(Variant::SomeVariantName).unwrap(),
+                    serde_json::to_value(Field { some_field_name: 0 }).unwrap(),
+                )
+            }};
+        }
+        for (rule, (variant, field)) in [
+            ("lowercase", probe!("lowercase")),
+            ("UPPERCASE", probe!("UPPERCASE")),
+            ("snake_case", probe!("snake_case")),
+            ("SCREAMING_SNAKE_CASE", probe!("SCREAMING_SNAKE_CASE")),
+            ("kebab-case", probe!("kebab-case")),
+            ("SCREAMING-KEBAB-CASE", probe!("SCREAMING-KEBAB-CASE")),
+            ("PascalCase", probe!("PascalCase")),
+            ("camelCase", probe!("camelCase")),
+        ] {
+            let variant = variant.as_str().unwrap();
+            let field = field.as_object().unwrap().keys().next().unwrap().clone();
+            assert_eq!(
+                rename("SomeVariantName", Some(rule), true),
+                variant,
+                "variant rule {rule}"
+            );
+            assert_eq!(rename("some_field_name", Some(rule), false), field, "field rule {rule}");
+        }
+        assert_eq!(rename("SomeVariantName", None, true), "SomeVariantName");
+        assert_eq!(rename("some_field_name", None, false), "some_field_name");
+    }
 }
 
 #[test]
@@ -794,7 +861,7 @@ fn opaque_principal_round_trips_in_owned_positioned_and_checked_json_paths() -> 
         json!("opaque-owner"),
         json!({"id":"opaque-owner","kind":"human","domain_extension":{"roles":["opaque"],"unknown":null}}),
     ] {
-        let value = json!({"open_session":"0.3","id":"principal-session","harness":"claude","cwd":"/unrelated/project","principal":principal,"future_session_field":{"ignored":true},"messages":[{"role":"user","content":[{"type":"text","text":"hello","future_block_field":42}],"future_message_field":true}]});
+        let value = json!({"open_session":"0.3","id":"principal-session","harness":"claude","cwd":"/unrelated/project","principal":principal,"future_session_field":{"ignored":true},"messages":[{"role":"user","kind":"prompt","origin":"human","content":[{"type":"text","text":"hello","future_block_field":42}],"future_message_field":true}]});
         let text = serde_json::to_string(&value)?;
         let owned = from_str(&text)?;
         let expected: Principal = serde_json::from_value(principal.clone())?;
@@ -883,4 +950,40 @@ fn an_undecodable_document_is_a_reported_skip() {
     skipped.sort();
     assert_eq!(skipped, ["anonymous.opensession.json", "torn.opensession.json"]);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Discovery rescans a document only when its file moves.
+#[test]
+fn discovery_rescans_only_a_document_that_moved() {
+    let world = crate::test_world("opensession-discovery-cache");
+    let context = crate::discover_cache::read::Context::current();
+    let _scope = context.enter();
+    let dir = world.base.join("exports");
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |id: &str, title: &str| {
+        let mut s = Session::new(id, Harness::Claude);
+        s.title = Some(title.into());
+        let path = dir.join(format!("{id}.opensession.json"));
+        std::fs::write(&path, serde_json::to_vec(&document(&s)).unwrap()).unwrap();
+        path
+    };
+    let paths: Vec<PathBuf> = ["one", "two", "three"].iter().map(|id| write(id, "first")).collect();
+    let scanned = || {
+        let mut all = SCANNED.lock().unwrap();
+        let mine: Vec<PathBuf> = all.iter().filter(|p| p.starts_with(&dir)).cloned().collect();
+        all.retain(|p| !p.starts_with(&dir));
+        mine
+    };
+    let adapter = OpenSession::with_roots(vec![dir.clone()]);
+    assert_eq!(adapter.discover().unwrap().refs.len(), 3);
+    assert_eq!(scanned().len(), 3);
+    assert_eq!(adapter.discover().unwrap().refs.len(), 3);
+    assert!(scanned().is_empty());
+    write("two", "second");
+    let refs = adapter.discover().unwrap().refs;
+    assert_eq!(scanned(), vec![paths[1].clone()]);
+    assert_eq!(
+        refs.iter().find(|r| r.id == "two").unwrap().title.as_deref(),
+        Some("second")
+    );
 }

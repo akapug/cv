@@ -2,6 +2,8 @@
 //! all text spans remain spans. No unresolved placeholder can leave this module as a Message.
 use crate::ir::{Block, Message};
 use crate::json::{Json, SourceDescriptor, SourceRegistry};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::spill::Record;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -247,7 +249,11 @@ mod tests {
             })
             .unwrap();
         let text = source
-            .read_backing_value(backing.clone(), offset, len, |view| view.source_text())
+            .read(
+                ReadInput::Backing(backing.clone(), offset, len),
+                Validation::Value,
+                |view| view.source_text(),
+            )
             .unwrap()
             .unwrap()
             .with_skipped_prefix(8)

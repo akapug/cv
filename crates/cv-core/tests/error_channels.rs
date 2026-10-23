@@ -107,7 +107,18 @@ fn string_stream_carries_a_named_consumer_failure() {
             Some(anyhow::anyhow!("injected consumer failure"))
         }
     }
-    let session = cv_core::harness::claude::stream_str("fixture", "{}\n", None, &cv_core::Demand::RICH, &mut Failed);
+    let text = "{broken\n \t\r\n{\"type\":\"future-record\"}\n{truncated";
+    let session = cv_core::harness::claude::stream_str("fixture", text, None, &cv_core::Demand::RICH, &mut Failed);
+    assert_eq!(session.extra["cv"]["skipped_lines"], 2);
+    let world = cv_testkit::World::in_process("claude-skip-errors", cv_core::env::Env::enter_isolated);
+    let path = world.home.join("fixture.jsonl");
+    fs::write(&path, text).unwrap();
+    let reference = SessionRef::new("fixture", Harness::Claude, path);
+    let file = cv_core::harness::rootless(Harness::Claude)
+        .unwrap()
+        .stream(&reference, &cv_core::Demand::RICH, &mut cv_core::CollectSink::default())
+        .unwrap();
+    assert_eq!(file.extra["cv"]["skipped_lines"], session.extra["cv"]["skipped_lines"]);
     assert!(session.extra["cv"]["read_error"]
         .as_str()
         .unwrap()
@@ -121,7 +132,7 @@ fn workflow_launches_report_an_aborted_scan() {
 }
 
 #[test]
-fn codex_string_input_counts_an_invalid_legacy_document() {
-    let session = cv_core::harness::codex::parse_str("fixture", "{broken", false, None);
-    assert_eq!(session.extra["cv"]["skipped_lines"], 1);
+fn codex_string_input_returns_an_invalid_legacy_document_error() {
+    let error = cv_core::harness::codex::parse_str("fixture", "{broken", false, None).unwrap_err();
+    assert!(error.is::<serde_json::Error>());
 }

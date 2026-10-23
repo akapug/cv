@@ -171,12 +171,18 @@ fn install_is_idempotent_show_reports_and_remove_restores_the_file() {
     let (ok, code, _, err) = w.cv(&["hooks", "install", "gemini"]);
     assert!(!ok && code == 1, "unknown harness errors");
     assert!(err.contains("no verified hook contract"), "{err}");
+}
 
-    // doctor says whether the hooks are installed (project scope here) and the policy in force.
+/// `cv doctor` says whether the hooks are installed (project scope here) and the policy in force.
+#[test]
+fn doctor_reports_hook_install_state_and_policy() {
+    let w = World::new("doctor-hooks");
+    let out = cv_ok(&w, &["hooks", "install", "claude", "--scope", "project"]);
+    assert!(out.contains("installed"), "{out}");
     w.write_session(
         "docsess",
         &[
-            user("u0", "2026-10-01T10:00:00Z", "hi"),
+            user("docsess", "u0", "2026-10-01T10:00:00Z", "hi"),
             assistant("a0", "2026-10-01T10:00:05Z", "hello"),
         ],
     );
@@ -195,7 +201,7 @@ fn each_hook_answers_the_docs_payload_for_its_event() {
         "alphasess",
         &[
             serde_json::json!({"type": "ai-title", "aiTitle": "fix the widget gate", "sessionId": "s"}),
-            user("u0", "2026-10-01T10:00:00Z", "fix the widget gate"),
+            user("alphasess", "u0", "2026-10-01T10:00:00Z", "fix the widget gate"),
             assistant_tool(
                 "a0",
                 "2026-10-01T10:00:05Z",
@@ -222,11 +228,11 @@ fn each_hook_answers_the_docs_payload_for_its_event() {
     w.write_session(
         "hooksess",
         &[
-            user("u0", "2026-10-01T11:00:00Z", "start the swarm"),
+            user("hooksess", "u0", "2026-10-01T11:00:00Z", "start the swarm"),
             assistant("a0", "2026-10-01T11:00:05Z", "starting"),
             boundary("b1", "2026-10-01T11:30:00Z"),
             compact_summary("s1", "2026-10-01T11:30:01Z", "SUMMARY: the early context"),
-            user("u1", "2026-10-01T11:31:00Z", "carry on"),
+            user("hooksess", "u1", "2026-10-01T11:31:00Z", "carry on"),
         ],
     );
     write_agent(
@@ -234,7 +240,7 @@ fn each_hook_answers_the_docs_payload_for_its_event() {
         "hooksess",
         "aaa1",
         &[
-            user("x0", "2026-10-01T11:00:10Z", "You are lane A."),
+            user("hooksess", "x0", "2026-10-01T11:00:10Z", "You are lane A."),
             assistant_tool(
                 "x1",
                 "2026-10-01T11:00:20Z",
@@ -309,7 +315,10 @@ fn each_hook_answers_the_docs_payload_for_its_event() {
         !ctx.contains("elsewher"),
         "another directory's session is not listed:\n{ctx}"
     );
-    assert!(ctx.chars().count() <= 4000);
+    assert!(
+        ctx.chars().count() <= 10_000,
+        "the start pack fits the harness's 10,000-char hook context, by the bound on each line:\n{ctx}"
+    );
     // Nothing to say, nothing printed.
     let out = hook(
         &w,
@@ -616,7 +625,7 @@ fn codex_trust_is_read_from_the_store_codex_writes() {
     w.write_session(
         "docsess",
         &[
-            user("u0", "2026-10-01T10:00:00Z", "hi"),
+            user("docsess", "u0", "2026-10-01T10:00:00Z", "hi"),
             assistant("a0", "2026-10-01T10:00:05Z", "hello"),
         ],
     );
@@ -980,4 +989,31 @@ fn removed_hook_harness_variable_exits_two_with_a_pointer() {
         err.contains("CV_HOOK_HARNESS") && err.contains("cv hooks install codex"),
         "{err}"
     );
+}
+
+/// Past the hooks' 8 MiB read budget the compact hook reads the transcript's tail, and its text
+/// says how much of how large a transcript it read, and that the index is left to `cv show`.
+#[test]
+fn the_compact_hook_names_what_its_budget_left_unread() {
+    let w = World::new("compact-budget");
+    let big = "word ".repeat(2 * 1024 * 1024);
+    w.write_session(
+        "bigsess",
+        &[
+            user("bigsess", "u0", "2026-10-01T10:00:00Z", &big),
+            boundary("b0", "2026-10-01T10:01:00Z"),
+        ],
+    );
+    let out = hook(
+        &w,
+        "compact",
+        &with(common(&w, "bigsess", "SessionStart"), json!({"source": "compact"})),
+        &[],
+    );
+    let ctx = context_of(&out);
+    assert!(
+        ctx.contains("context compacted (auto, 180,412 tokens; the hook read the last 8.0 MB of this 10.0 MB transcript, so the index is not given)"),
+        "{ctx}"
+    );
+    assert!(ctx.contains("--kind compaction_boundary,compaction_summary"), "{ctx}");
 }

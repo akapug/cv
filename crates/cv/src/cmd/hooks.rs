@@ -37,20 +37,14 @@ const SKILL: &str = include_str!("../../skill/SKILL.md");
 
 /// A session whose transcript changed within this many minutes is *live* for the edit guard.
 const LIVE_MINUTES: i64 = 30;
-/// The start pack's hard cap (chars) — well under the harness's 10K inline limit.
-const START_PACK_MAX: usize = 4_000;
 /// How many of this directory's sessions the start pack lists.
 const START_SESSIONS: usize = 6;
-/// How far back from the end of a transcript the start pack looks for a `[branch sha]` line.
-const COMMIT_TAIL_BYTES: u64 = 512 * 1024;
-/// Above this size the compact hook reads the boundary from the transcript's tail instead of
-/// streaming the whole file for its message index: the stream costs ~4.5 ms/MB (release, warm;
-/// 16.5 MB measured at 70–90 ms), and the hook's budget is 100 ms cold. Below it the full
-/// compaction detection runs.
-const COMPACT_FULL_SCAN_MAX: u64 = 8 * 1024 * 1024;
-/// The tail read on the large-transcript path: the boundary the harness just wrote sits a few
-/// records from the end.
-const COMPACT_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+/// The hooks' one latency budget, in transcript bytes. A hook answers inside the harness's turn
+/// (100 ms cold), and streaming a transcript costs ~4.5 ms/MB (release, warm; 16.5 MB measured at
+/// 70–90 ms), so a hook reads at most this much and its output names what it left unread. The
+/// compact hook streams a transcript up to it whole, else reads its last this-many bytes; the
+/// start pack splits it across the sessions it lists.
+const HOOK_READ_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Subcommand)]
 pub(crate) enum HooksCmd {
@@ -1038,7 +1032,7 @@ fn context(event: &str, text: String) -> Value {
     json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
 }
 
-/// Read the last [`COMPACT_TAIL_BYTES`] of `path`.
+/// Read the last `bytes` of `path`.
 fn tail_text(path: &Path, bytes: u64) -> Option<String> {
     use std::io::{Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
@@ -1061,10 +1055,10 @@ fn not_recorded_yet(id: &str) -> Value {
 }
 
 /// `SessionStart` (`compact`): the boundary the harness just wrote and the commands that read what
-/// it discarded. A transcript up to [`COMPACT_FULL_SCAN_MAX`] is streamed the way `cv show --kind
-/// compaction_boundary` does it (exact message index and ordinal); a larger one is read from its tail (trigger and
-/// size exact, the index left to that view), so the hook stays inside its budget however
-/// long the session has run.
+/// it discarded. A transcript up to [`HOOK_READ_BYTES`] is streamed the way `cv show --kind
+/// compaction_boundary` does it (exact message index and ordinal); a larger one is read from its
+/// tail (trigger and size exact, the index left to that view, and the text says how much it
+/// read), so the hook stays inside its budget however long the session has run.
 fn hook_compact(ev: &Event) -> Result<Option<Value>> {
     let Some(path) = ev.transcript() else {
         return Ok(None);
@@ -1074,17 +1068,22 @@ fn hook_compact(ev: &Event) -> Result<Option<Value>> {
     // `cv rewind` writes a derived copy: only a harness with derived copies is pointed at it.
     let rewinds = adapter.identity().is_some();
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if size > COMPACT_FULL_SCAN_MAX {
+    if size > HOOK_READ_BYTES {
         // A tail without a boundary (one far back in a long transcript) still gets the pointers.
-        let what = match adapter.last_compact_boundary(path, COMPACT_TAIL_BYTES)? {
+        let read = format!(
+            "the hook read the last {} of this {} transcript",
+            cv_core::ir::human_bytes(HOOK_READ_BYTES),
+            cv_core::ir::human_bytes(size)
+        );
+        let what = match adapter.last_compact_boundary(path, HOOK_READ_BYTES)? {
             Some((trigger, pre_tokens)) => format!(
-                " ({}, {})",
+                " ({}, {}; {read}, so the index is not given)",
                 trigger.as_deref().unwrap_or("compaction"),
                 pre_tokens
                     .map(|t| format!("{} tokens", fmt_int(t)))
                     .unwrap_or_else(|| "size unrecorded".into())
             ),
-            None => String::new(),
+            None => format!(" (no boundary recorded in what {read})"),
         };
         return Ok(Some(context(
             "SessionStart",
@@ -1132,17 +1131,25 @@ fn affordance_pointer(id: &str) -> String {
     format!("`cv show {id} --kind plan,schedule,background_job` lists the plan, schedules and background jobs this session holds.")
 }
 
-/// The last `[branch sha] subject` a transcript's tail recorded (a `git commit` result), reading at
-/// most [`COMMIT_TAIL_BYTES`] from the end — never a parse of the whole file.
-fn last_commit(path: &Path) -> Option<String> {
+/// What the start pack says of a session's last commit: the short sha of the last
+/// `[branch sha] subject` (a `git commit` result) in the last `bytes` of its transcript — never
+/// a parse of the whole file — or, when none is there and the transcript is longer, how far back
+/// it looked.
+fn last_commit(path: &Path, bytes: u64) -> String {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(r#"\[([^\]\s\\"]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] "#).expect("static regex")
     });
-    let text = tail_text(path, COMMIT_TAIL_BYTES)?;
-    re.captures_iter(&text)
-        .last()
-        .map(|c| c[2][..7.min(c[2].len())].to_string())
+    let Some(text) = tail_text(path, bytes) else {
+        return String::new();
+    };
+    match re.captures_iter(&text).last() {
+        Some(c) => format!(" · last commit {}", &c[2][..7.min(c[2].len())]),
+        None if std::fs::metadata(path).is_ok_and(|m| m.len() > bytes) => {
+            format!(" · no commit in its last {}", cv_core::ir::human_bytes(bytes))
+        }
+        None => String::new(),
+    }
 }
 
 fn ago(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
@@ -1155,7 +1162,8 @@ fn ago(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
 /// owes nothing, so it never costs the start pack its sessions.
 fn owed_decisions(hook: HookName) -> Option<(String, usize)> {
     let who = cv_core::task::actor(None, "cv");
-    let outcome = match cv_core::task::replay() {
+    // Every prompt asks: the stored fold and the events appended since, never the whole log.
+    let outcome = match cv_core::task::fold() {
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("cv hook {}: {e:#}", hook.as_str());
@@ -1191,6 +1199,8 @@ fn hook_start(ev: &Event) -> Result<Option<Value>> {
         return Ok(None);
     }
     let mut lines = Vec::new();
+    // The hooks' read budget, split across the transcripts listed.
+    let tail = HOOK_READ_BYTES / rows.len().max(1) as u64;
     if !rows.is_empty() {
         lines.push(format!(
             "cv: {} earlier session(s) in this directory (catalog as of the last `cv ls`; newest first). \
@@ -1205,9 +1215,7 @@ fn hook_start(ev: &Event) -> Result<Option<Value>> {
                 .filter(|t| !t.trim_start().starts_with('<'))
                 .map(|t| cv_core::ir::truncate(&sanitize_line(t), 60))
                 .unwrap_or_else(|| "(untitled)".into());
-            let commit = last_commit(&r.path)
-                .map(|s| format!(" · last commit {s}"))
-                .unwrap_or_default();
+            let commit = last_commit(&r.path, tail);
             let id = selector(r.harness, &r.id);
             lines.push(format!(
                 "- {id} · {} · {} msgs · {title}{commit}",
@@ -1221,12 +1229,9 @@ fn hook_start(ev: &Event) -> Result<Option<Value>> {
             "- {owed} decision(s) owed to {who}: `cv task inbox` lists them."
         ));
     }
-    let mut text = lines.join("\n");
-    while text.chars().count() > START_PACK_MAX && lines.len() > 1 {
-        lines.pop();
-        text = lines.join("\n");
-    }
-    Ok(Some(context("SessionStart", text)))
+    // Every line is bounded (six rows, titles cut at 60 characters), well under the harness's
+    // 10,000-character limit on hook context, so nothing is dropped.
+    Ok(Some(context("SessionStart", lines.join("\n"))))
 }
 
 /// `SubagentStart` / `SubagentStop`: one row in the lane ledger; no output, no model action.
@@ -1503,7 +1508,7 @@ mod tests {
     fn claude_tail(p: &Path) -> Result<Option<(Option<String>, Option<u64>)>> {
         cv_core::harness::rootless(Harness::Claude)
             .unwrap()
-            .last_compact_boundary(p, COMPACT_TAIL_BYTES)
+            .last_compact_boundary(p, HOOK_READ_BYTES)
     }
 
     #[test]
@@ -1540,7 +1545,9 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(last_commit(&p).as_deref(), Some("0abec0f"));
+        assert_eq!(last_commit(&p, HOOK_READ_BYTES), " · last commit 0abec0f");
+        // None in the tail it read of a longer transcript: it says how far back it looked.
+        assert_eq!(last_commit(&p, 64), " · no commit in its last 64 B");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

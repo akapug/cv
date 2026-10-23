@@ -38,6 +38,7 @@
 
 use super::store::document::{Fields, InvalidStruct};
 use crate::json::{InvalidJson, JsonSource, JsonView};
+use crate::json::{ReadInput, Validation};
 mod record;
 use super::wire::openai;
 use super::{ts_from_epoch, Adapter};
@@ -82,6 +83,27 @@ impl Adapter for Continue {
 
     fn roots(&self) -> Vec<PathBuf> {
         self.sessions.clone().into_iter().collect()
+    }
+
+    /// A session's listing title, cwd and creation time come from its `sessions.json` entry,
+    /// which Continue rewrites on every save of any session: it is certified by its own entry
+    /// ([`index_rows`]).
+    fn dependencies(
+        &self,
+        r: &SessionRef,
+        _probe: &mut crate::source::Probe,
+        deps: &mut crate::source::Dependencies,
+    ) -> Option<()> {
+        deps.files.extend(self.rows_store(r));
+        Some(())
+    }
+
+    fn rows_store(&self, r: &SessionRef) -> Option<PathBuf> {
+        Some(r.path.parent()?.join("sessions.json"))
+    }
+
+    fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        Some(index_rows(store))
     }
 
     fn discover(&self) -> Result<crate::Discovered> {
@@ -130,17 +152,25 @@ impl Adapter for Continue {
                 if seen.contains(&id) {
                     continue;
                 }
-                let Some(scan) = out.keep(&p, scan_session(&p)) else {
+                // An unindexed session's listing facts are its own file's: rescanned only when it
+                // moves. Uncounted, as the scan leaves it (no catalog count is filled in here).
+                let scanned = crate::discover_cache::cached_scan_checked(&p, || {
+                    let scan = scan_session(&p)?;
+                    let (title, cwd) = scan.map_or((None, None), |s| (s.title, s.cwd));
+                    let meta = IndexMeta {
+                        session_id: id,
+                        title,
+                        cwd,
+                        created_at: None,
+                    };
+                    Ok(Some(ref_from(&meta, &p)))
+                })
+                .and_then(|r| anyhow::Context::context(r, "a session scan lists its session"));
+                let Some(mut r) = out.keep(&p, scanned) else {
                     continue;
                 };
-                let (title, cwd) = scan.map_or((None, None), |s| (s.title, s.cwd));
-                let meta = IndexMeta {
-                    session_id: id,
-                    title,
-                    cwd,
-                    created_at: None,
-                };
-                out.refs.push(ref_from(&meta, &p));
+                r.message_count = None;
+                out.refs.push(r);
             }
         }
 
@@ -165,16 +195,16 @@ impl Adapter for Continue {
                 return Err(error);
             }
             let source = JsonSource::capture(&r.path)?;
-            let result = source.read_syntax(|root| {
+            let result = source.read(ReadInput::Document, Validation::Syntax, |root| {
                 let Some(doc) = Fields::parse_struct(root, &["title", "workspaceDirectory", "history"])? else {
                     return Err(InvalidStruct("expected Continue session struct").into());
                 };
                 let title = record::title(doc.get("title"), true)?;
                 let workspace = optional_string(doc.get("workspaceDirectory"))?;
-                let history = doc.get("history").map(JsonView::accepted_array).transpose()?;
-                if doc.get("history").is_some() && history.as_ref().is_some_and(Option::is_none) {
-                    return Err(InvalidStruct("expected Continue history array").into());
-                }
+                let history = match doc.get("history").map(JsonView::accepted_array).transpose()? {
+                    Some(None) => return Err(InvalidStruct("expected Continue history array").into()),
+                    array => array.flatten(),
+                };
                 if s.title.is_none() {
                     s.title = title;
                 }
@@ -183,7 +213,7 @@ impl Adapter for Continue {
                 }
                 sink.meta(&s);
                 let mut answered = std::collections::HashSet::<String>::new();
-                for item in history.into_iter().flatten().flatten() {
+                for item in history.into_iter().flatten() {
                     let Some(item) = item? else { continue };
                     let reply_id = record::reply_id(item)?;
                     if reply_id.is_some_and(|id| answered.contains(&id)) {
@@ -386,7 +416,7 @@ fn is_undecodable(error: &anyhow::Error) -> bool {
 /// Read `sessions.json` (array of `{sessionId, title, dateCreated, workspaceDirectory}`); a
 /// non-array document is an empty index, a read or decode failure an error.
 fn read_index(path: &Path) -> Result<Vec<IndexMeta>> {
-    JsonSource::capture(path)?.read_document(|root| {
+    JsonSource::capture(path)?.read(ReadInput::Document, Validation::Value, |root| {
         let mut out = Vec::new();
         if let Some(entries) = root.array()? {
             for entry in entries {
@@ -410,6 +440,43 @@ fn read_index(path: &Path) -> Result<Vec<IndexMeta>> {
         }
         Ok(out)
     })
+}
+
+/// Every session's certificate in the index at `store`: what discovery takes from its first entry
+/// there (`title`, `workspaceDirectory`, `dateCreated`), or that it has none (an unreadable or
+/// undecodable index is no entry, as discovery reads it), for every `<id>.json` beside it.
+fn index_rows(store: &Path) -> std::collections::HashMap<String, crate::source::Rows> {
+    use crate::source::Rows;
+    let index = read_index(store).unwrap_or_default();
+    let unindexed = Rows {
+        count: 0,
+        high: 0,
+        digest: Rows::SEED,
+    };
+    let mut rows: std::collections::HashMap<String, Rows> = std::collections::HashMap::new();
+    if let Some(dir) = store.parent().and_then(|dir| fs::read_dir(dir).ok()) {
+        for name in dir.flatten().filter_map(|e| e.file_name().into_string().ok()) {
+            if name != "sessions.json" && name.ends_with(".json") {
+                rows.insert(name.trim_end_matches(".json").to_string(), unindexed);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for meta in &index {
+        if !seen.insert(meta.session_id.as_str()) {
+            continue;
+        }
+        let entry = serde_json::json!([meta.title, meta.cwd, meta.created_at]);
+        rows.insert(
+            meta.session_id.clone(),
+            Rows {
+                count: 1,
+                high: 0,
+                digest: Rows::fold(Rows::SEED, &serde_json::to_vec(&entry).unwrap_or_default()),
+            },
+        );
+    }
+    rows
 }
 
 /// Build a `SessionRef` from index metadata + the on-disk transcript path.
@@ -437,7 +504,7 @@ struct Scan {
 
 /// `None` for a document that does not decode; an error for one that cannot be read.
 fn scan_session(path: &Path) -> Result<Option<Scan>> {
-    let scanned = JsonSource::capture(path)?.read_document(|root| {
+    let scanned = JsonSource::capture(path)?.read(ReadInput::Document, Validation::Value, |root| {
         let mut scan = Scan::default();
         if let Some(fields) = Fields::parse(root, &["title", "workspaceDirectory"])? {
             scan.title = record::title(fields.get("title"), false)?;
@@ -577,7 +644,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&items).unwrap()).unwrap();
         let source = JsonSource::capture(&path).unwrap();
         source
-            .read_document(|root| {
+            .read(ReadInput::Document, Validation::Value, |root| {
                 let mut expected_model = None;
                 let mut actual_model = None;
                 for (view, owned) in root.array()?.unwrap().zip(items.as_array().unwrap()) {
@@ -755,9 +822,7 @@ mod tests {
 
     #[test]
     fn cn_tool_call_states_become_tool_results_and_usage_is_read() {
-        let dir = std::env::temp_dir().join(format!("cv-continue-cn-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("continue-cn");
         let path = dir.join("s.json");
         fs::write(&path, r#"{"sessionId":"s","history":[
             {"message":{"role":"user","content":"read a"},"contextItems":[]},
@@ -943,9 +1008,7 @@ mod tests {
     fn parses_fixture_session() {
         let dir = fixtures();
         let path = dir.join("11111111-1111-1111-1111-111111111111.json");
-        if !path.exists() {
-            return;
-        }
+        assert!(path.exists(), "missing committed fixture {}", path.display());
         let r = SessionRef::new("11111111-1111-1111-1111-111111111111", Harness::Continue, path.clone());
         let s = Continue { sessions: None }.parse(&r).unwrap();
         crate::harness::assert_no_flat_keys(&s);
@@ -965,11 +1028,7 @@ mod tests {
 
     #[test]
     fn emit_round_trips() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("cv-continue-emit-{}-{}", std::process::id(), n));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = cv_testkit::temp_dir("continue-emit");
 
         // Build a small session: user, assistant w/ a tool call, a tool result.
         let mut session = Session {
@@ -1048,9 +1107,8 @@ mod tests {
     #[test]
     fn discovers_from_index() {
         let dir = fixtures();
-        if !dir.join("sessions.json").exists() {
-            return;
-        }
+        let index = dir.join("sessions.json");
+        assert!(index.exists(), "missing committed fixture {}", index.display());
         let adapter = Continue {
             sessions: Some(dir.clone()),
         };
@@ -1070,13 +1128,7 @@ mod tests {
     #[test]
     fn stream_is_incremental_and_honors_stop() {
         use crate::stream::{Flow, MessageSink};
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("cv-continue-stream-{}-{}", std::process::id(), n));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("continue-stream");
         let path = dir.join("s.json");
         fs::write(
             &path,
@@ -1116,8 +1168,7 @@ mod tests {
     #[test]
     fn discovery_scan_matches_whole_value_metadata() {
         let _world = crate::test_world("continue-scan");
-        let dir = std::env::temp_dir().join(format!("cv-continue-scan-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("continue-scan");
         let path = dir.join("s.json");
         let mut cases = vec![
             r#"{"title":"escaped\n\uD834\uDD1E","workspaceDirectory":"file:///p","history":[null,{},42,{"message":{"role":"tool"}}]}"#.to_owned(),
@@ -1174,8 +1225,7 @@ mod tests {
     #[test]
     fn discovery_scan_preserves_index_precedence_and_unindexed_fallback() {
         let _world = crate::test_world("continue-scan-index");
-        let dir = std::env::temp_dir().join(format!("cv-continue-index-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("continue-index");
         fs::write(
             dir.join("sessions.json"),
             r#"[

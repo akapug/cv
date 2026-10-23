@@ -30,6 +30,7 @@ use super::store::document::Fields;
 use super::{ts_from_value, Adapter};
 use crate::ir::*;
 use crate::json::{JsonSource, JsonView};
+use crate::json::{ReadInput, Validation};
 use crate::stream::{Demand, Flow, MessageSink};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -51,11 +52,6 @@ pub const VERSION: &str = "0.3";
 /// discovered and refused with a pointer, instead of silently not being a document.
 const VERSION_KEY: &str = "open_session";
 const VERSION_KEY_V02: &str = "openSession";
-
-/// How much of a plain `*.json` file's head is read to decide whether it is an OpenSession
-/// document. cv writes the version marker as the FIRST key, so this is generous; a hand-written
-/// document that buries it past 64 KiB is out of scope (name it `*.opensession.json` instead).
-const SNIFF_BYTES: usize = 64 * 1024;
 
 // Projection vocabularies are pinned against the authoritative deserializer in tests. Nested
 // rich Values preserve their source order; ignored typed fields never need materialization.
@@ -191,7 +187,10 @@ fn discover_documents(roots: Vec<PathBuf>) -> crate::Discovered {
     let paths = super::export::files_under(roots, is_document_file, &mut out.skipped);
     let mut seen = std::collections::HashSet::new();
     for path in paths {
-        if let Some(r) = out.keep(&path, doc_ref(&path)) {
+        // A document's ref is its own bytes': rescanned only when the file moves.
+        let scanned = crate::discover_cache::cached_scan_checked(&path, || doc_ref(&path).map(Some))
+            .and_then(|r| r.context("a document scan names its session"));
+        if let Some(r) = out.keep(&path, scanned) {
             if seen.insert(r.id.clone()) {
                 out.refs.push(r);
             }
@@ -202,8 +201,8 @@ fn discover_documents(roots: Vec<PathBuf>) -> crate::Discovered {
 
 // ── Discovery ─────────────────────────────────────────────────────────────────
 
-/// Is this file an OpenSession document? By name (`*.opensession.json`), or by a head sniff of a
-/// plain `*.json` for the version key.
+/// Is this file an OpenSession document? By name (`*.opensession.json`), or for a plain `*.json`
+/// by [`names_version_key`].
 fn is_document_file(p: &Path) -> bool {
     let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -214,17 +213,48 @@ fn is_document_file(p: &Path) -> bool {
     if !name.ends_with(".json") {
         return false;
     }
-    matches!(
-        crate::lazy::read_head_checked(p, SNIFF_BYTES),
-        Ok(crate::lazy::PersistedHead::Text(head)) if head.contains(VERSION_KEY) || head.contains(VERSION_KEY_V02)
-    )
+    std::fs::File::open(p).is_ok_and(|file| names_version_key(std::io::BufReader::new(file)))
+}
+
+/// Does this JSON text's top-level object have the version key (or the 0.2 spelling)? A streaming
+/// pass over the top-level keys, each value skipped unread, with no byte cap: it stops at the key
+/// (cv writes it first), and rejects at the first structure an OpenSession document cannot have
+/// (a top level that is not an object, or broken JSON before the key). Nested keys do not count.
+fn names_version_key(reader: impl std::io::Read) -> bool {
+    use serde::de::{Deserializer, Error, IgnoredAny, MapAccess, Visitor};
+    struct TopLevel<'a>(&'a std::cell::Cell<bool>);
+    impl<'de> Visitor<'de> for TopLevel<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an OpenSession document object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if key == VERSION_KEY || key == VERSION_KEY_V02 {
+                    // Found: stop here rather than read the rest of the document.
+                    self.0.set(true);
+                    return Err(A::Error::custom("version key found"));
+                }
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let found = std::cell::Cell::new(false);
+    let _ = serde_json::Deserializer::from_reader(reader).deserialize_any(TopLevel(&found));
+    found.get()
 }
 
 /// A lightweight [`SessionRef`] for one document: metadata only, counting conversational turns
 /// (user + assistant, the cross-harness contract) straight off the raw records. A document with
 /// no `id` is not a session cv can name: an error, as is one that cannot be read or decoded.
+#[cfg(test)]
+static SCANNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 fn doc_ref(path: &Path) -> Result<SessionRef> {
-    JsonSource::capture(path)?.read_document(|view| {
+    #[cfg(test)]
+    SCANNED.lock().unwrap().push(path.to_path_buf());
+    JsonSource::capture(path)?.read(ReadInput::Document, Validation::Value, |view| {
         let record = Fields::parse(view, &["id", "cwd", "title", "created_at", "updated_at", "messages"])?
             .context("document object")?;
         let o = record.project(&["id", "cwd", "title", "created_at", "updated_at"])?;
@@ -259,18 +289,25 @@ fn doc_ref(path: &Path) -> Result<SessionRef> {
 
 // ── Reading a document ────────────────────────────────────────────────────────
 
-/// Read one OpenSession document into the IR. The inverse of [`document`].
-pub fn read_document(path: &Path) -> Result<Session> {
+/// One whole rich read, collected into a `Session`.
+fn collect(read: impl FnOnce(&mut dyn MessageSink) -> Result<Session>) -> Result<Session> {
     let mut sink = crate::stream::CollectSink::default();
-    let mut session = stream_document(path, &Demand::RICH, &mut sink)?;
+    let mut session = read(&mut sink)?;
     session.messages = sink.messages;
     Ok(session)
+}
+
+/// Read one OpenSession document into the IR. The inverse of [`document`].
+pub fn read_document(path: &Path) -> Result<Session> {
+    collect(|sink| stream_document(path, &Demand::RICH, sink))
 }
 
 /// Traverse the document's IR messages without retaining a complete Session.
 fn stream_document(path: &Path, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
     let source = JsonSource::capture(path)?;
-    source.read_document(|view| read(view, Some((path, &source)), opts, sink))
+    source.read(ReadInput::Document, Validation::Value, |view| {
+        read(view, Some((path, &source)), opts, sink)
+    })
 }
 
 /// The document codec, the only decoder of this format: the session envelope through the IR's own
@@ -284,60 +321,43 @@ fn read(
     opts: &Demand,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
-    let check = || file.map_or(Ok(()), |(_, source)| source.check());
-    {
-        let keys = SESSION_FIELDS
-            .iter()
-            .copied()
-            .chain(["git", "lineage", "messages"])
-            .collect::<Vec<_>>();
-        let record = Fields::parse(view, &keys)?.context("an OpenSession document is a JSON object")?;
-        let mut meta = record.project(SESSION_FIELDS)?;
-        project_object(&record, &mut meta, "git", GIT_FIELDS)?;
-        project_object(&record, &mut meta, "lineage", LINEAGE_FIELDS)?;
-        meta.insert("messages".into(), Value::Array(Vec::new()));
-        let mut session = from_object(meta)?;
-        let messages = record
-            .get("messages")
-            .context("not an OpenSession 0.3 document: messages must be an array")?;
-        anyhow::ensure!(
-            messages.is_array()?,
-            "not an OpenSession 0.3 document: messages must be an array"
-        );
-        session.source_path = file.map(|(path, _)| path.to_path_buf());
-        // Validate and discard one turn at a time before publishing even metadata. Keep payloads
-        // lazy in this pass regardless of delivery demand; only their shape needs validation.
-        for view in messages.array()?.unwrap() {
-            ir_message(view?, true)?;
-        }
-        sink.meta(&session);
-        let mut has_sources = false;
-        for view in messages.array()?.unwrap() {
-            let message = ir_message(view?, opts.spans)?;
-            let sourced = message.content.iter().any(|block| {
-                matches!(
-                    block,
-                    Block::ToolUse {
-                        input: crate::Json::Source(_),
-                        ..
-                    }
-                )
-            });
-            has_sources |= sourced;
-            let started = std::time::Instant::now();
-            let flow = sink.try_message(message)?;
-            if let Some((_, source)) = file.filter(|_| sourced) {
-                source.check_after(started)?;
-            }
-            if flow == Flow::Stop {
-                break;
-            }
-        }
-        if has_sources {
-            check()?;
-        }
-        Ok(session)
+    let keys = SESSION_FIELDS
+        .iter()
+        .copied()
+        .chain(["git", "lineage", "messages"])
+        .collect::<Vec<_>>();
+    let record = Fields::parse(view, &keys)?.context("an OpenSession document is a JSON object")?;
+    let mut meta = record.project(SESSION_FIELDS)?;
+    project_object(&record, &mut meta, "git", GIT_FIELDS)?;
+    project_object(&record, &mut meta, "lineage", LINEAGE_FIELDS)?;
+    meta.insert("messages".into(), Value::Array(Vec::new()));
+    let mut session = from_object(meta)?;
+    let messages = record
+        .get("messages")
+        .context("not an OpenSession 0.3 document: messages must be an array")?;
+    anyhow::ensure!(
+        messages.is_array()?,
+        "not an OpenSession 0.3 document: messages must be an array"
+    );
+    session.source_path = file.map(|(path, _)| path.to_path_buf());
+    // Validate and discard one turn at a time before publishing even metadata. Keep payloads
+    // lazy in this pass regardless of delivery demand; only their shape needs validation.
+    for view in messages.array()?.unwrap() {
+        ir_message(view?, true)?;
     }
+    sink.meta(&session);
+    for view in messages.array()?.unwrap() {
+        let message = ir_message(view?, opts.spans)?;
+        let started = std::time::Instant::now();
+        let flow = sink.try_message(message)?;
+        if let Some((_, source)) = file {
+            source.check_after(started)?;
+        }
+        if flow == Flow::Stop {
+            break;
+        }
+    }
+    Ok(session)
 }
 
 fn ir_message(view: JsonView<'_>, spans: bool) -> Result<Message> {
@@ -436,10 +456,7 @@ fn ir_block(view: JsonView<'_>, spans: bool) -> Result<Block> {
 /// other than [`VERSION`] is an error that names the version and where the renames are documented.
 pub fn from_str(text: &str) -> Result<Session> {
     let v: Value = serde_json::from_str(text).context("not JSON")?;
-    let mut sink = crate::stream::CollectSink::default();
-    let mut session = read((&v).into(), None, &Demand::RICH, &mut sink)?;
-    session.messages = sink.messages;
-    Ok(session)
+    collect(|sink| read((&v).into(), None, &Demand::RICH, sink))
 }
 
 fn from_object(mut o: serde_json::Map<String, Value>) -> Result<Session> {

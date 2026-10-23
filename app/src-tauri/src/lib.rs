@@ -58,7 +58,7 @@ struct ServeChild(Mutex<Option<Child>>);
 fn ingest_zip_bytes(bytes: &[u8]) -> Result<String, String> {
     let files = cv_core::ingest::archive::extract(std::io::Cursor::new(bytes), Default::default())
         .map_err(|error| format!("zip: {error:#}"))?;
-    let sessions = cv_core::ingest::ingest_files(files);
+    let sessions = cv_core::ingest::ingest_files(files).map_err(|error| format!("ingesting zip: {error:#}"))?;
     serde_json::to_string(&sessions).map_err(|e| format!("serializing sessions: {e}"))
 }
 
@@ -565,6 +565,13 @@ mod tests {
     fn ingest_zip_bytes_rejects_non_zip() {
         let err = ingest_zip_bytes(b"not a zip at all").unwrap_err();
         assert!(err.contains("not a readable zip"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_zip_bytes_reports_transcript_errors() {
+        let zip = make_zip(&[("rollout-broken.json", br#"{"session": {}, "messages": ["#)]);
+        let error = ingest_zip_bytes(&zip).unwrap_err();
+        assert!(error.starts_with("ingesting zip:"), "got: {error}");
     }
 
     #[test]

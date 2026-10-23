@@ -32,15 +32,29 @@ pub use inbox::{
     deadline_phrase, decisions_from_notes, inbox_page, inbox_page_brief, DecisionView, InboxCounts, InboxItem,
     InboxPage, NoteView, ResolutionView,
 };
-pub use model::{RetiredEvent, TaskEvent, TaskEventKind, TaskState, RETIRED_TAGS};
+pub use model::{RetiredEvent, TaskEvent, TaskEventKind, TaskState, LIVE_TAGS, RETIRED_TAGS};
 pub use project::{
     age_short, blocks, effective_display, in_scope, inbox, involves, is_blocked, list, parse_deadline, parse_duration,
     parse_since, resolve_id, same_actor, unique_prefix_len, uuid_v7_timestamp, InboxEntry, InboxReason, TaskFilter,
     DECISION_TAG, DISCUSS_TAG, STATE_VOCABULARY,
 };
 pub use reduce::{Decision, Note, PinnedStatus, ReduceError, Resolution, TaskProjection, TaskReadModel, TaskReducer};
-pub use store::{new_event, replay, ReplayOutcome, TaskStore};
+pub use store::{fold, new_event, replay, Folded, ReplayOutcome, TaskStore};
 pub use views::TaskRow;
+
+/// The tests' `Opened` kernel: a titled plain task with no repo, issue, channel and no assignee
+/// unless named.
+#[cfg(test)]
+pub(crate) fn opened_kind(title: &str, assignee: Option<&str>) -> TaskEventKind {
+    TaskEventKind::Opened {
+        title: title.into(),
+        body: String::new(),
+        repo: None,
+        issue: None,
+        channel: None,
+        assignee: assignee.map(str::to_string),
+    }
+}
 
 /// The fleet identity convention (audit G4): the spawner sets `CV_ENDPOINT=agent:<pane>` in each
 /// agent's environment, and cv front-ends derive their default `--from` here — the *bare*
@@ -175,20 +189,7 @@ mod tests {
         use super::*;
         let world = cv_testkit::World::new("task-committed-reports");
         let store = TaskStore::at(world.base.join("tasks"));
-        let open = |title: &str| {
-            new_event(
-                None,
-                "agent:author",
-                TaskEventKind::Opened {
-                    title: title.into(),
-                    body: String::new(),
-                    repo: None,
-                    issue: None,
-                    channel: None,
-                    assignee: None,
-                },
-            )
-        };
+        let open = |title: &str| new_event(None, "agent:author", opened_kind(title, None));
         let first = open("first");
         let second = open("second");
         let claim = new_event(

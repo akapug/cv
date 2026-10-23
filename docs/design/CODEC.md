@@ -35,14 +35,14 @@ prefix counts are demands on the same reader.
 (`Whole`, `Checkpoint`, `Prefix(len)`), read by `jsonl::drive(read, from, codec, sink)`. The
 adapter owns only its `Codec { record, settled, demand, session, state, finish, VERSION }`;
 the driver owns the rest: declining a start past EOF or a checkpoint of another codec version
-or demand (`jsonl::restore`), counting rejected lines, offering a checkpoint after every
+or demand (`jsonl::restore`), counting every rejected nonblank line (no codec opt-out),
+offering a checkpoint after every
 finished line the codec is settled on, the guard, and the final check after held output. Kimi's
 rotated segments keep their own loop (its checkpoint sits at a line's start) but use the same
 guard and stamp. Who checks the backing, and when, has one answer each: `stream::Guard` after a
 callback slower than `SLOW_CALLBACK`, after the session metadata and after a checkpoint; the
-line pass once per 8 MiB window; `Read::check` at EOF. No reader calls `check_backing`.
-The reader rechecks source identity after a record that published a source descriptor and at
-completion; the identity is
+line pass once per 8 MiB window; `Read::check` at EOF and guard completion (including failed callbacks). No reader calls `check_backing`.
+The guard rechecks source identity after slow callbacks and at completion; the identity is
 `source::FileId`, and a `.jsonl` that grew under the read is admitted by content
 (`FileId::admits`: same inode, at least as long, sampled prefix unchanged), with the trailing
 partial line held back. Every lazy text a reader hands out resolves through its checked capture,
@@ -78,7 +78,7 @@ pastes the lines it moved into its message. Results are never committed.
 
 **Byte sources by family.** JSONL (Claude, the OpenAI family, Gemini's jsonl era): `jsonl::Read`.
 JSON documents (Gemini's document era, cline, roo, cline_sdk, lmstudio, opensession, the exports):
-`JsonSource::read_document`/`read_archive`, with an owned view (`(&Value).into()`) for string entry
+`JsonSource::read(ReadInput, Validation, callback)`, with an owned view (`(&Value).into()`) for string entry
 points. SQLite stores (opencode, cursor, devin, goose, zed, openclaw, hermes): `store::sqlite::Cells`,
 each cell copied once into the source's arena, validated once, then viewed. `codex`, `cursor` and
 `goose` `legacy` modules are readers of older formats, not oracles. Test-only legacy emitters are
@@ -108,3 +108,12 @@ HTML and redaction take the caller's resolver. Fidelity has only the streaming a
 checked against frozen feature counts. Arena copies and quoted JSON use one bounded scratch
 writer; exact-string storage works without SQLite. The independent `zstd` feature selects the
 decoder; a compressed read without it fails instead of interpreting compressed bytes as JSONL.
+
+**Distinct contracts are not decoder twins.** JSON framing trims only JSON's four ASCII
+whitespace bytes; user text and labels classify Unicode whitespace. Neither can substitute for
+the other. `spans` changes payload ownership, not which metadata exists: Zed's owned `Value`
+extras therefore remain owned in a span read. Suppressing them requires a metadata tier, not a
+span-dependent grammar. OpenSession validates message shapes before the first callback so a
+malformed later message cannot publish a successful prefix; its publication pass has a different
+purpose from that validation. Emitters preflight before creating output and check once before
+commit; those checks protect different publication boundaries.

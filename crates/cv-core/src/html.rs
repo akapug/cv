@@ -6,6 +6,8 @@
 //! etc. can never inject markup into the page.
 
 use crate::ir::{human_bytes, Block, Harness, Message, Role, Usage};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 
 fn render_usage(u: &Usage, out: &mut String) {
     let mut parts: Vec<String> = Vec::new();
@@ -910,7 +912,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&body)?)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let text = source
-            .read_range_value(0, source.len(), |view| view.source_text())?
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
+                view.source_text()
+            })?
             .unwrap();
         let mut lazy = Message::new(Role::Assistant);
         lazy.content = vec![

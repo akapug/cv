@@ -116,7 +116,7 @@ pub struct Guard {
     adapter: &'static dyn crate::harness::Adapter,
     root: String,
     agent: Option<String>,
-    ledger: Vec<crate::lanes::LaneEvent>,
+    ledger: std::sync::Arc<crate::lanes::LedgerIndex>,
 }
 
 impl Guard {
@@ -125,9 +125,9 @@ impl Guard {
         let adapter = crate::harness::rootless(ev.harness)?;
         let decision = adapter.capabilities().edit_guard?;
         let (root, ledger) = match decision {
-            EditGuard::Ask => (ev.session.id.clone(), Vec::new()),
+            EditGuard::Ask => (ev.session.id.clone(), Default::default()),
             EditGuard::Deny => {
-                let ledger = crate::lanes::read_ledger();
+                let ledger = crate::lanes::ledger_index();
                 (lineage_root(adapter, &ev.session.id, ev.transcript(), &ledger), ledger)
             }
         };
@@ -160,15 +160,12 @@ fn lineage_root(
     adapter: &dyn crate::harness::Adapter,
     id: &str,
     path: Option<&Path>,
-    ledger: &[crate::lanes::LaneEvent],
+    ledger: &crate::lanes::LedgerIndex,
 ) -> String {
     let mut id = id.to_string();
     let mut path = path.map(Path::to_path_buf);
     for _ in 0..16 {
-        let registered = ledger
-            .iter()
-            .rev()
-            .find(|row| row.event == crate::lanes::LaneEventKind::Start && row.agent_id == id);
+        let registered = ledger.latest_start(&id);
         let parent = path
             .as_deref()
             // An unreadable header falls back to the ledger's registration.

@@ -12,7 +12,7 @@ pub(super) struct Accumulator {
     pending: Vec<Message>,
     answered: std::collections::HashSet<String>,
     resolver: crate::lazy::Resolver,
-    error: Option<anyhow::Error>,
+    latch: crate::stream::Latch,
 }
 impl Accumulator {
     pub(super) fn new(target: Harness, thinking: ThinkingMode, resolver: crate::lazy::Resolver) -> Self {
@@ -24,7 +24,7 @@ impl Accumulator {
             pending: Vec::new(),
             answered: Default::default(),
             resolver,
-            error: None,
+            latch: Default::default(),
         }
     }
     pub(super) fn note(&mut self, message: &Message) -> Result<()> {
@@ -65,16 +65,19 @@ impl Accumulator {
 }
 impl MessageSink for Accumulator {
     fn message(&mut self, message: Message) -> Flow {
+        if self.latch.failed() {
+            return Flow::Stop;
+        }
         match self.note(&message) {
             Ok(()) => Flow::Continue,
             Err(error) => {
-                self.error = Some(error);
+                self.latch.fail(error);
                 Flow::Stop
             }
         }
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.error.take()
+        self.latch.take("fidelity projection")
     }
     fn meta(&mut self, session: &Session) {
         self.resolver = session.resolver();
@@ -262,6 +265,19 @@ mod tests {
             golden,
             include_str!("../../../tests/fixtures/emit-frozen/fidelity-features.txt")
         );
+        session.model = None;
+        let facts = source_features(Harness::Claude, ThinkingMode::Native, &session)?;
+        assert_eq!(facts.tool_use, 1, "only the answered call survives");
+        assert_eq!(facts.tool_result, 1);
+        assert_eq!(facts.results_with_name, 1);
+        assert_eq!(facts.results_is_error, 1);
+        assert_eq!(facts.results_with_details, 1);
+        assert_eq!(facts.thinking_text, 0, "Unicode whitespace is blank");
+        assert_eq!(facts.model_eff, 1, "the command has an explicit model");
+        session.model = Some("late-default".into());
+        let facts = source_features(Harness::Claude, ThinkingMode::Native, &session)?;
+        assert_eq!(facts.model_eff, facts.role_counts.values().sum::<usize>());
+        assert!(!facts.kind_counts.contains_key("carrier"));
         Ok(())
     }
 }

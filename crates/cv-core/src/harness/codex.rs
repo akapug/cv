@@ -55,7 +55,6 @@ use chrono::{DateTime, Utc};
 use record::{Demand, Reader};
 use serde_json::{Map, Value};
 use std::fs;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::WalkDir;
@@ -171,8 +170,6 @@ impl Adapter for Codex {
             deferred_wrapper: None,
             // Native spans retain the same full-extra metadata.
             rich_spans: true,
-            // Tiny native transcripts cost less to parse than to validate and replay a ledger.
-            usage_cache_floor: 64 * 1024,
         }
     }
 
@@ -235,9 +232,8 @@ impl Adapter for Codex {
                     continue;
                 }
                 // `.jsonl.zst`: Codex compresses rollouts colder than 7 days in place
-                // (rollout/src/compression.rs); `.tmp` are its staging files. The zstd decoder rides
-                // the `sqlite` feature (`store::zst`), so compressed rollouts are only listed when we can
-                // read them.
+                // (rollout/src/compression.rs); `.tmp` are its staging files. Discovery reports a
+                // missing zstd capability as an unreadable source, never as an empty transcript.
                 if !name.ends_with(".jsonl") && !name.ends_with(".json") && !is_zst_rollout(name) {
                     continue;
                 }
@@ -246,11 +242,15 @@ impl Adapter for Codex {
         }
         // An unreadable dir, and a rollout whose scan fails, are skipped and reported.
         let mut found: crate::Discovered = crate::par_discovery_filter_map(paths, |path| {
+            // A plain rollout grows in place: its scan resumes where the last one ended.
+            if is_plain_rollout(&path) {
+                return crate::Skipped::listed(&path, cached_metadata(&path));
+            }
             let scanned = || match is_zst_path(&path) {
                 // Decoded in full: an index running beside discovery streams these same bytes.
                 true => crate::codex_handoff::decode_and_offer(
                     || super::store::zst::content_size(&path),
-                    || scan_rollout(&path, FULL_SCAN_CAP),
+                    || scan_rollout(&path),
                 ),
                 false => scan(&path),
             };
@@ -294,12 +294,10 @@ impl Adapter for Codex {
                 return Ok(None);
             }
             let restored = match from {
-                Start::Checkpoint(cp) => {
-                    match jsonl::restore::<ResumeState>(cp, <Transcript as jsonl::Codec>::VERSION) {
-                        Some(state) if state.session.source_path.as_deref() == Some(r.path.as_path()) => Some(state),
-                        _ => return Ok(None),
-                    }
-                }
+                Start::Checkpoint(cp) => match jsonl::restore::<ResumeState>(cp) {
+                    Some(state) if state.session.source_path.as_deref() == Some(r.path.as_path()) => Some(state),
+                    _ => return Ok(None),
+                },
                 _ => None,
             };
             let rollout = Rollout::open(&r.path)?;
@@ -350,9 +348,9 @@ impl ResumeState {
 }
 
 /// A `rollout-*.jsonl.zst`: Codex's in-place compression of cold rollouts (readable only with the
-/// `sqlite` feature, which brings the `store::zst` decoder).
+/// `zstd` byte-source capability).
 fn is_zst_rollout(name: &str) -> bool {
-    cfg!(feature = "zstd") && name.ends_with(".jsonl.zst")
+    name.ends_with(".jsonl.zst")
 }
 
 fn is_zst_path(path: &Path) -> bool {
@@ -410,13 +408,23 @@ impl CodexCtx {
 /// Codex hook membership is a native UUID/parent relation, verified against each child's header.
 /// This also makes the registered forest available to tools and query consumers of the one API.
 fn hook_forest(parent: &SessionRef) -> Result<Vec<crate::AgentRef>> {
-    let rows = crate::lanes::read_ledger();
+    let ledger = crate::lanes::ledger_index();
+    let rows = &ledger.rows;
     let mut known = std::collections::HashSet::from([parent.id.clone()]);
     let mut out = Vec::new();
-    loop {
-        let before = known.len();
-        for row in &rows {
-            if !known.contains(&row.session_id) || known.contains(&row.agent_id) {
+    // The rows whose parent is known and that are not yet decided, by ledger position. Each round
+    // takes them in ledger order, and a child found mid-round makes its own rows candidates of
+    // the same round when they lie further on, of the next round otherwise: the passes the fold
+    // made over every row, without scanning a row whose parent is not in the forest. A row is
+    // decided once (its header verifies or never will), so a forest costs its own rows.
+    let mut candidates: std::collections::BTreeSet<usize> = ledger.rows_of(&parent.id).iter().copied().collect();
+    while !candidates.is_empty() {
+        let mut cursor = 0;
+        while let Some(at) = candidates.range(cursor..).next().copied() {
+            candidates.remove(&at);
+            cursor = at + 1;
+            let row = &rows[at];
+            if known.contains(&row.agent_id) {
                 continue;
             }
             let Some(path) = row.agent_transcript_path.as_deref() else {
@@ -434,6 +442,7 @@ fn hook_forest(parent: &SessionRef) -> Result<Vec<crate::AgentRef>> {
                 continue;
             }
             known.insert(head.id.clone());
+            candidates.extend(ledger.rows_of(&head.id).iter().copied());
             let mut session = SessionRef::new(head.id, Harness::Codex, path);
             session.cwd = head.cwd;
             session.created_at = head.created_at.or(Some(row.ts));
@@ -447,9 +456,6 @@ fn hook_forest(parent: &SessionRef) -> Result<Vec<crate::AgentRef>> {
                 result_status: None,
                 result_summary: None,
             });
-        }
-        if known.len() == before {
-            break;
         }
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.session.created_at));
@@ -491,7 +497,7 @@ pub fn hook_header(path: &Path) -> Result<Option<Session>> {
 /// legacy single-JSON layout. `id` is the fallback session id (used when the transcript carries no
 /// `session_meta`/header id); `source_path` records provenance when known. Each record goes
 /// through the same codec as a file read, over an owned value.
-pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathBuf>) -> Session {
+pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathBuf>) -> Result<Session> {
     // Start the id empty so a transcript-provided id (session_meta / bare header / legacy
     // `session.id`) is authoritative; the `id` argument is only the fallback when none is present.
     let mut s = Session {
@@ -503,14 +509,12 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
     let demand = Demand::from(&stream::Demand::LEAN);
     if is_jsonl {
         let mut det = EventDetector::default();
-        let detected = super::store::jsonl::slice(text.as_bytes(), |line| {
-            Ok(line
-                .view
-                .map(nl_flags)
-                .transpose()?
-                .map_or(Flow::Continue, |flags| det.feed(flags)))
-        });
-        super::note_read_error(&mut s, detected);
+        super::store::jsonl::slice(text.as_bytes(), |line| {
+            Ok(match line.view.map(nl_flags).transpose()? {
+                Some(flags) => det.feed(flags),
+                None => Flow::Continue,
+            })
+        })?;
         let mut reader = Reader {
             session: &mut s,
             ctx: &mut ctx,
@@ -520,17 +524,17 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
             source: None,
         };
         let mut skipped = 0;
-        let read = super::store::jsonl::slice(text.as_bytes(), |line| {
+        super::store::jsonl::slice(text.as_bytes(), |line| {
             if let Some(view) = line.view {
                 reader.record(view)?;
             } else {
                 skipped += u64::from(!line.blank);
             }
             Ok(Flow::Continue)
-        });
-        super::note_read_error(&mut s, read);
+        })?;
         super::Unparsed(skipped).note(&mut s);
-    } else if let Ok(root) = serde_json::from_str::<Value>(text) {
+    } else {
+        let root = serde_json::from_str::<Value>(text)?;
         let root = JsonView::from(&root);
         let mut reader = Reader {
             session: &mut s,
@@ -540,16 +544,13 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
             demand,
             source: None,
         };
-        let read = legacy::items(&mut reader, root);
-        super::note_read_error(&mut s, read);
-    } else {
-        super::Unparsed(u64::from(!text.trim().is_empty())).note(&mut s);
+        legacy::items(&mut reader, root)?;
     }
     s.messages = out;
     if s.id.is_empty() {
         s.id = id.to_string();
     }
-    s
+    Ok(s)
 }
 
 /// What [`EventDetector`] reads of a record: whether it carries natural-language text as an
@@ -645,6 +646,13 @@ pub(crate) struct Rollout {
     input: Arc<jsonl::Read>,
 }
 
+impl Rollout {
+    /// The decoded bytes it holds.
+    pub(crate) fn decoded_bytes(&self) -> u64 {
+        self.input.len()
+    }
+}
+
 thread_local! {
     /// A rollout discovery already decoded, standing in for decoding it again (see
     /// [`crate::handoff`]).
@@ -711,17 +719,6 @@ impl Rollout {
     }
 }
 
-/// Whether a message holds a source descriptor (the reader then rechecks the source).
-fn sourced(m: &Message) -> bool {
-    m.content.iter().any(|block| match block {
-        Block::Text { text } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
-            !matches!(text, Text::Inline(_))
-        }
-        Block::ToolUse { input, .. } => matches!(input, crate::json::Json::Source(_)),
-        _ => false,
-    })
-}
-
 /// The Codex record codec over one rollout: each record accumulates into the session and context
 /// (a checkpoint's, or fresh at 0). A trailing assistant message is held until the usage record
 /// that may follow it, so the codec is settled only when nothing is held. A record that published
@@ -735,10 +732,6 @@ struct Transcript<'r> {
 }
 
 impl jsonl::Codec for Transcript<'_> {
-    /// The adapter state ([`ResumeState`], [`CodexCtx`], what a record parses to) is versioned by
-    /// the one stored-format version: bump [`crate::source::VERSION`] when it changes.
-    const VERSION: u32 = crate::source::VERSION;
-
     fn record(&mut self, view: JsonView<'_>, at: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
         let ResumeState {
             session: s,
@@ -763,9 +756,6 @@ impl jsonl::Codec for Transcript<'_> {
             for m in &mut self.held[before..] {
                 m.extra.insert(crate::offsets::OFFSET_KEY.into(), at.into());
             }
-        }
-        if self.held[before..].iter().any(sourced) {
-            self.input.check()?;
         }
         // Hand the session metadata to the sink as soon as the model is known (session_meta /
         // turn_context land in the first records, before any message), so header-rendering sinks
@@ -881,15 +871,6 @@ fn note_settings_change(
     out.push(msg);
 }
 
-/// Field-wise equality of two usage blocks (the IR type derives no `PartialEq`).
-fn usage_eq(a: &Usage, b: &Usage) -> bool {
-    a.input_tokens == b.input_tokens
-        && a.output_tokens == b.output_tokens
-        && a.cache_read_tokens == b.cache_read_tokens
-        && a.cache_creation_tokens == b.cache_creation_tokens
-        && a.reasoning_tokens == b.reasoning_tokens
-}
-
 /// Marker in `extra.usage_source` for usage that came from a `token_usage_record` (authoritative:
 /// keyed by `response_id`/`turn_id`), so the `token_count` twin merges instead of duplicating.
 const USAGE_FROM_RECORD: &str = "token_usage_record";
@@ -922,26 +903,126 @@ fn title_of(v: Option<JsonView<'_>>, only: Option<&str>) -> Result<String> {
     Ok(head.finish())
 }
 
-/// Files up to this size are scanned in full by [`scan`]; larger ones are sampled head+tail.
-const FULL_SCAN_CAP: u64 = 8 << 20; // 8 MiB
+/// A plain `.jsonl` rollout: what Codex appends to while a session runs.
+fn is_plain_rollout(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+}
 
-/// Metadata-only scan for `discover`: bodies are never resolved past a title and counts are
-/// deferred until a full read or index pass. Files up to [`FULL_SCAN_CAP`] (and every `.jsonl.zst`) are scanned
-/// in full; larger plain ones (Codex rollout logs can be hundreds of MB) are sampled head+tail so
-/// discovery never reads gigabytes just to list sessions. Exact content is parsed on actual open.
+/// Metadata-only scan: bodies are never resolved past a title and counts are deferred until a
+/// full read or index pass. Every record is read (0.17 sampled 1 MiB of head and tail past
+/// 8 MiB, and listed a different title or cwd than a full read would). Exact content is parsed
+/// on actual open.
 fn scan(path: &Path) -> Result<SessionRef> {
-    scan_capped(path, FULL_SCAN_CAP)
+    if is_plain_rollout(path) {
+        return Ok(scan_at(path, None)?.0);
+    }
+    scan_rollout(path).map(|(r, _)| r)
 }
 
-/// [`scan`] with an explicit full-scan cap (tests exercise the sampled path on a small file).
-fn scan_capped(path: &Path, full_scan_cap: u64) -> Result<SessionRef> {
-    scan_rollout(path, full_scan_cap).map(|(r, _)| r)
+/// The discovery fold of a plain rollout, through the per-file scan cache with its continuation:
+/// an unchanged rollout costs a stat, a grown one the appended records.
+fn cached_metadata(path: &Path) -> Result<Option<SessionRef>> {
+    crate::discover_cache::cached_scan_continued(path, LISTING, |from| {
+        let (reference, checkpoint) = scan_at(path, from)?;
+        let continuation = checkpoint.and_then(|checkpoint| {
+            let head = crate::resume::MarkHead::of(path, &checkpoint, LISTING)?;
+            Some(crate::discover_cache::ScanContinuation {
+                head,
+                checkpoint,
+                dependencies: Default::default(),
+            })
+        });
+        Ok((Some(reference), continuation))
+    })
 }
 
-/// [`scan_capped`], keeping the rollout when it was decoded.
-fn scan_rollout(path: &Path, full_scan_cap: u64) -> Result<(SessionRef, Option<Rollout>)> {
-    const SAMPLE: u64 = 1 << 20; // 1 MiB head, 1 MiB tail
+/// The checkpoint layer of [`scan_at`]'s fold.
+const LISTING: &str = "codex.discovery.v1";
 
+/// The discovery fold between records: what [`Reader::record`] keeps under the metadata demand.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Listing {
+    session: Session,
+    ctx: CodexCtx,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The `(offset, bytes)` each plain-rollout discovery fold read: the continuation test's record.
+    static FOLDED: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Fold a plain rollout's records from `from`'s offset (or 0) to its end, and the state after
+/// its last finished line: a partial last line is folded now but read again next time.
+fn scan_at(path: &Path, from: Option<&stream::Checkpoint>) -> Result<(SessionRef, Option<stream::Checkpoint>)> {
+    let rollout = Rollout::open(path)?;
+    let len = rollout.input.len();
+    let restored = from.and_then(|cp| {
+        let state = cp.get::<Listing>(LISTING)?;
+        (cp.offset <= len && state.session.source_path.as_deref() == Some(path)).then_some((state, cp.offset))
+    });
+    let (Listing { mut session, mut ctx }, offset) = restored.unwrap_or_else(|| {
+        let session = Session {
+            source_path: Some(path.to_path_buf()),
+            ..Session::new(String::new(), Harness::Codex)
+        };
+        (
+            Listing {
+                session,
+                ctx: CodexCtx::default(),
+            },
+            0,
+        )
+    });
+    #[cfg(test)]
+    FOLDED.with(|folded| folded.borrow_mut().push((offset, len - offset)));
+    let mut out = Vec::new();
+    let mut prefix: Option<stream::Checkpoint> = None;
+    let mut finished = offset;
+    let mut partial = false;
+    {
+        let mut reader = Reader {
+            session: &mut session,
+            ctx: &mut ctx,
+            out: &mut out,
+            has_events: false,
+            demand: (&stream::Demand::DISCOVERY).into(),
+            source: None,
+        };
+        rollout.lines(offset, len, |line| {
+            if !line.complete && !partial {
+                partial = true;
+                prefix = Some(listing_checkpoint(finished, reader.session, reader.ctx));
+            }
+            if let Some(view) = line.view {
+                reader.record(view)?;
+            }
+            if line.complete {
+                finished = line.end;
+            }
+            Ok(Flow::Continue)
+        })?;
+    }
+    if !partial {
+        prefix = Some(listing_checkpoint(finished, &session, &ctx));
+    }
+    Ok((listed(path, session, &ctx), prefix))
+}
+
+fn listing_checkpoint(offset: u64, session: &Session, ctx: &CodexCtx) -> stream::Checkpoint {
+    #[derive(serde::Serialize)]
+    struct ListingRef<'a> {
+        session: &'a Session,
+        ctx: &'a CodexCtx,
+    }
+    let mut checkpoint = stream::Checkpoint::new(offset);
+    checkpoint.put(LISTING, &ListingRef { session, ctx });
+    checkpoint
+}
+
+/// A decoded `.jsonl.zst` or a 2025 single-document rollout, scanned whole, keeping the rollout
+/// when it was decoded.
+fn scan_rollout(path: &Path) -> Result<(SessionRef, Option<Rollout>)> {
     let mut s = Session::new(String::new(), Harness::Codex);
     let mut ctx = CodexCtx::default();
     let mut out = Vec::new();
@@ -958,37 +1039,19 @@ fn scan_rollout(path: &Path, full_scan_cap: u64) -> Result<(SessionRef, Option<R
             source: None,
         };
         let rollout = Rollout::open(path)?;
-        let len = rollout.input.len();
-        if rollout.input.is_decoded() || len <= full_scan_cap {
-            rollout.lines(0, len, |line| {
-                if let Some(view) = line.view {
-                    s.record(view)?;
-                }
-                Ok(Flow::Continue)
-            })?;
-        } else {
-            // Head: id / cwd / title / created_at all live near the top; its partial last line is
-            // not read.
-            rollout.lines(0, SAMPLE.min(len), |line| {
-                if let (Some(view), true) = (line.view, line.complete) {
-                    s.record(view)?;
-                }
-                Ok(Flow::Continue)
-            })?;
-            // Tail: the last record carries the real updated_at. Skip the (likely partial) first line.
-            let mut first = true;
-            rollout.lines(len.saturating_sub(SAMPLE), len, |line| {
-                if let (Some(view), false) = (line.view, std::mem::take(&mut first)) {
-                    s.record(view)?;
-                }
-                Ok(Flow::Continue)
-            })?;
-            // Keep the existing metadata sampling policy; all discovery defers exact counts.
-        }
-        rollout.input.check()?;
+        rollout.lines(0, rollout.input.len(), |line| {
+            if let Some(view) = line.view {
+                s.record(view)?;
+            }
+            Ok(Flow::Continue)
+        })?;
         decoded = rollout.input.is_decoded().then_some(rollout);
     }
+    Ok((listed(path, s, &ctx), decoded))
+}
 
+/// The listing row a scan's session makes, its writer version observed.
+fn listed(path: &Path, mut s: Session, ctx: &CodexCtx) -> SessionRef {
     if s.id.is_empty() {
         // `rollout-<ts>-<uuid>.jsonl[.zst]`: strip both suffixes.
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1008,7 +1071,7 @@ fn scan_rollout(path: &Path, full_scan_cap: u64) -> Result<(SessionRef, Option<R
         ..SessionRef::new(s.id, Harness::Codex, path.to_path_buf())
     };
     crate::discover_cache::read::Context::current().observe_writer(&r, ctx.writer_version.as_deref());
-    Ok((r, decoded))
+    r
 }
 
 #[cfg(test)]
@@ -1052,6 +1115,29 @@ mod tests {
         let ids: std::collections::HashSet<_> = forest.iter().map(|s| s.session.id.as_str()).collect();
         assert_eq!(ids, std::collections::HashSet::from(["child", "grandchild"]));
         assert!(forest.iter().all(|s| s.session.harness == crate::Harness::Codex));
+        // A `--subagents` pass asks once per parent: the ledger is parsed once per file state.
+        let rows = crate::lanes::read_ledger();
+        crate::subagent_tree_of(&parent).unwrap();
+        crate::subagent_tree_of(&SessionRef::new(
+            "other",
+            crate::Harness::Codex,
+            world.base.join("other.jsonl"),
+        ))
+        .unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&rows, &crate::lanes::read_ledger()),
+            "unchanged: not reparsed"
+        );
+        let index = crate::lanes::ledger_index();
+        crate::subagent_tree_of(&parent).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&index, &crate::lanes::ledger_index()),
+            "unchanged: indexed once"
+        );
+        crate::lanes::append_lane_event(&row("late", "root", "root")).unwrap();
+        let after = crate::lanes::read_ledger();
+        assert!(!std::sync::Arc::ptr_eq(&rows, &after), "an append is read");
+        assert_eq!(after.len(), rows.len() + 1);
     }
 
     use crate::harness::Parse;
@@ -1070,11 +1156,7 @@ mod tests {
             &path,
             format!("{start}{{\"type\":\"reasoning\",\"ignored\":[true,]}}]}}"),
         )?;
-        let rejected = legacy::scan(&path)?;
-        assert!(
-            rejected.id.is_empty() && rejected.title.is_none(),
-            "a useful title cannot hide a malformed tail"
-        );
+        assert!(scan(&path).is_err(), "a useful title cannot hide a malformed tail");
         Ok(())
     }
 
@@ -1206,7 +1288,7 @@ mod tests {
     #[test]
     fn shared_classification_preserves_missing_role_and_canonical_meta() -> Result<()> {
         let raw = [
-            r#"{"type":"session_meta","payload":{"id":"child","cwd":"/child","cli_version":"0.163","subagent_history_start_ordinal":5,"agent_path":"child"}}"#,
+            r#"{"type":"session_meta","payload":{"id":"child","cwd":"/child","cli_version":"0.163.0","subagent_history_start_ordinal":5,"agent_path":"child"}}"#,
             r#"{"ordinal":1,"type":"session_meta","payload":{"id":"parent","cwd":"/parent","cli_version":"99","subagent_history_start_ordinal":0}}"#,
             r#"{"ordinal":2,"type":"response_item","payload":{"type":"message","content":"parent prompt"}}"#,
             r#"{"ordinal":6,"type":"response_item","payload":{"type":"message","content":"own prompt"}}"#,
@@ -1231,9 +1313,9 @@ mod tests {
         assert!(out.is_empty(), "the metadata demand builds no message");
         assert_eq!(scan.id, "child");
         assert_eq!(scan.cwd.as_deref(), Some(Path::new("/child")));
-        assert_eq!(ctx.writer_version.as_deref(), Some("0.163"));
+        assert_eq!(ctx.writer_version.as_deref(), Some("0.163.0"));
         assert_eq!(scan.title.as_deref(), Some("own prompt"));
-        let session = parse_str("child", &raw, true, None);
+        let session = parse_str("child", &raw, true, None).unwrap();
         assert_eq!(
             session.messages.iter().filter_map(Message::text).collect::<Vec<_>>(),
             ["own prompt"]
@@ -1689,7 +1771,7 @@ mod tests {
     /// Doing it here means every test below that builds a session enforces it for free.
     fn parse_jsonl(lines: &[impl std::borrow::Borrow<str>]) -> Session {
         let text = lines.join("\n");
-        let s = parse_str("fallback-id", &text, true, None);
+        let s = parse_str("fallback-id", &text, true, None).unwrap();
         crate::harness::assert_no_flat_keys(&s);
         s
     }
@@ -1721,7 +1803,7 @@ mod tests {
     #[test]
     fn bare_header_provides_id() {
         // No session_meta: first line is a bare {id,timestamp} header.
-        let s = parse_str("", &fixture("bare_header_provides_id.jsonl"), true, None);
+        let s = parse_str("", &fixture("bare_header_provides_id.jsonl"), true, None).unwrap();
         assert_eq!(s.id, "hdr-1");
         assert_eq!(s.messages.len(), 1);
     }
@@ -1868,8 +1950,7 @@ mod tests {
             "payload": { "type": "function_call_output", "call_id": "c1", "output": body }
         })
         .to_string();
-        let dir = std::env::temp_dir().join(format!("cv-codex-span-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("codex-span");
         let path = dir.join("rollout-x.jsonl");
         {
             let mut f = std::fs::File::create(&path).unwrap();
@@ -1900,7 +1981,7 @@ mod tests {
         );
 
         // And it matches the inline (bulk) parse of the same record.
-        let inline = parse_str("fallback", &String::from_utf8(data).unwrap(), true, Some(path.clone()));
+        let inline = parse_str("fallback", &String::from_utf8(data).unwrap(), true, Some(path.clone())).unwrap();
         let inline_c = inline
             .messages
             .iter()
@@ -1917,8 +1998,7 @@ mod tests {
 
     #[cfg(feature = "mmap")]
     fn assert_giant_modes_match(text: &str) {
-        let dir = std::env::temp_dir().join(format!("cv-codex-giant-parity-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("codex-giant-parity");
         let path = dir.join("rollout-parity.jsonl");
         std::fs::write(&path, text).unwrap();
         let mut lazy = whole(
@@ -1926,7 +2006,7 @@ mod tests {
             &stream::Demand::LEAN.with_spans(),
         );
         lazy.materialize().unwrap();
-        let full = parse_str("fallback", text, true, Some(path));
+        let full = parse_str("fallback", text, true, Some(path)).unwrap();
         assert_eq!(serde_json::to_value(lazy).unwrap(), serde_json::to_value(full).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2069,7 +2149,7 @@ mod tests {
             tc(100, 100),
             tc(250, 150),
         ];
-        let s = parse_str("s", &lines.join("\n"), true, None);
+        let s = parse_str("s", &lines.join("\n"), true, None).unwrap();
         let usages: Vec<Option<u64>> = s
             .messages
             .iter()
@@ -2094,7 +2174,7 @@ mod tests {
         // Line 7: trailing assistant message with no token_count after it: held, then flushed at EOF.
         let lines = fixture_lines("stream_attaches_usage_like_parse.jsonl");
         let text = lines.join("\n");
-        let parsed = parse_str("s", &text, true, None);
+        let parsed = parse_str("s", &text, true, None).unwrap();
 
         let streamed = stream_text("s", &text, &stream::Demand::RICH);
 
@@ -2203,7 +2283,7 @@ mod tests {
         // Line 2 is truncated mid-write.
         let lines = fixture_lines("corrupt_lines_are_counted_identically_on_both_paths.jsonl");
         let text = lines.join("\n");
-        let parsed = parse_str("s", &text, true, None);
+        let parsed = parse_str("s", &text, true, None).unwrap();
         assert_eq!(parsed.messages.len(), 2);
         assert_eq!(
             parsed
@@ -2303,7 +2383,7 @@ mod tests {
     #[test]
     fn legacy_2025_json_layout() {
         let text = fixture("legacy_2025_json_layout.json");
-        let s = parse_str("fallback", &text, false, None);
+        let s = parse_str("fallback", &text, false, None).unwrap();
         assert_eq!(s.id, "legacy-1");
         // user text, reasoning, tool use, tool result => 4 messages (no event_msg dedup in legacy).
         assert_eq!(s.messages.len(), 4);
@@ -2659,8 +2739,7 @@ mod tests {
         let output = serde_json::json!({"timestamp":"2026-01-01T00:00:01Z","type":"response_item",
             "payload":{"type":"function_call_output","call_id":"c1","output":body}});
         let line = format!("{meta}\n{output}");
-        let dir = std::env::temp_dir().join(format!("cv-codex-err-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("codex-err");
         let path = dir.join("rollout-2026-01-01T00-00-00-err.jsonl");
         std::fs::File::create(&path)
             .unwrap()
@@ -2689,13 +2768,22 @@ mod tests {
     #[test]
     fn zst_without_decoder_is_an_error_not_jsonl() {
         let world = crate::test_world("codex-no-decoder");
-        let path = world.base.join("rollout.jsonl.zst");
+        let path = world.base.join("rollout-no-decoder.jsonl.zst");
         std::fs::write(&path, b"\x28\xb5\x2f\xfd").unwrap();
         let error = match Rollout::open(&path) {
             Ok(_) => panic!("compressed input must require a decoder"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("zstd"));
+        let found = Codex {
+            roots: vec![world.base.clone()],
+        }
+        .discover()
+        .unwrap();
+        assert!(found.refs.is_empty());
+        assert_eq!(found.skipped.len(), 1);
+        assert_eq!(found.skipped[0].path, path);
+        assert!(found.skipped[0].why.contains("zstd"));
     }
 
     #[cfg(feature = "zstd")]
@@ -2705,7 +2793,7 @@ mod tests {
         let lines = fixture_lines("zstd_compressed_rollouts_are_discovered_scanned_and_parsed.jsonl");
         let raw = lines.join("\n") + "\n";
         let zst = zstd::encode_all(raw.as_bytes(), 1).unwrap();
-        let root = std::env::temp_dir().join(format!("cv-codex-zst-{}", uuid::Uuid::new_v4()));
+        let root = cv_testkit::temp_dir("codex-zst");
         let day = root.join("sessions").join("2026").join("08").join("01");
         std::fs::create_dir_all(&day).unwrap();
         let path = day.join("rollout-2026-08-01T10-00-00-cold-1.jsonl.zst");
@@ -2743,7 +2831,7 @@ mod tests {
     fn discovery_hands_decoded_rollouts_to_the_reads_of_the_same_source() {
         let _world = crate::test_world("codex-handoff");
         let raw = fixture_lines("zstd_compressed_rollouts_are_discovered_scanned_and_parsed.jsonl").join("\n") + "\n";
-        let root = std::env::temp_dir().join(format!("cv-codex-handoff-{}", uuid::Uuid::new_v4()));
+        let root = cv_testkit::temp_dir("codex-handoff");
         let day = root.join("sessions").join("2026").join("08").join("01");
         std::fs::create_dir_all(&day).unwrap();
         let cold = day.join("rollout-2026-08-01T10-00-00-cold-1.jsonl.zst");
@@ -2756,7 +2844,7 @@ mod tests {
         let cx = Codex {
             roots: vec![root.join("sessions")],
         };
-        let (handoff, decoded) = crate::codex_handoff::channel(1);
+        let (handoff, decoded) = crate::codex_handoff::channel(1, 1);
         let refs = crate::codex_handoff::within(&Some(handoff), || cx.discover().unwrap());
         assert_eq!(refs.len(), 2);
         let (r, bytes) = decoded.recv().expect("the compressed rollout is handed over");
@@ -2796,8 +2884,7 @@ mod tests {
     #[test]
     fn scan_titles_a_subagent_by_its_own_task_not_the_parents_prompt() {
         let lines = fixture_lines("scan_titles_a_subagent_by_its_own_task_not_the_parents_prompt.jsonl");
-        let dir = std::env::temp_dir().join(format!("cv-codex-scan-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("codex-scan");
         let path = dir.join("rollout-2026-09-19T14-12-43-child-1.jsonl");
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
         let r = scan(&path).unwrap();
@@ -2810,17 +2897,38 @@ mod tests {
         );
         assert_eq!(r.message_count, None, "discovery defers exact turn counts");
 
-        // Over the full-scan cap the middle is never read: the metadata still comes from the head
-        // and tail, and the turn count is 0 ("not counted") rather than an extrapolation
-        // (`SessionRef::message_count` is user + assistant turns, never a proxy).
-        let sampled = scan_capped(&path, 0).unwrap();
-        assert_eq!(sampled.id, "child-1");
-        assert_eq!(sampled.cwd, r.cwd);
-        assert_eq!(sampled.title, r.title);
-        assert_eq!(sampled.updated_at, r.updated_at);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_grown_rollout_folds_only_its_appended_records() {
+        let _world = crate::test_world("codex-listing-continuation");
+        let lines = fixture_lines("scan_titles_a_subagent_by_its_own_task_not_the_parents_prompt.jsonl");
+        let dir = cv_testkit::temp_dir("codex-continuation");
+        let path = dir.join("rollout-2026-09-19T14-12-43-child-1.jsonl");
+        let cut = lines.len() / 2;
+        let head = lines[..cut].join("\n") + "\n";
+        // The first pass ends inside a record: that line is read again, never trusted.
+        let torn = &lines[cut][..lines[cut].len() / 2];
+        std::fs::write(&path, format!("{head}{torn}")).unwrap();
+        let folded = || FOLDED.with(|f| std::mem::take(&mut *f.borrow_mut()));
+        let first = cached_metadata(&path).unwrap().unwrap();
+        assert_eq!(folded(), [(0, (head.len() + torn.len()) as u64)]);
+        assert_eq!(cached_metadata(&path).unwrap(), Some(first), "unchanged: a hit");
+        assert!(folded().is_empty());
+        let whole = lines.join("\n") + "\n";
+        std::fs::write(&path, &whole).unwrap();
+        let grown = cached_metadata(&path).unwrap().unwrap();
         assert_eq!(
-            sampled.message_count, None,
-            "over the cap the count is unknown, not estimated"
+            folded(),
+            [(head.len() as u64, (whole.len() - head.len()) as u64)],
+            "only the records after the last finished line"
+        );
+        let fresh = scan(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&grown).unwrap(),
+            serde_json::to_value(&fresh).unwrap(),
+            "a resumed fold lists what a whole one does"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2858,8 +2966,7 @@ mod tests {
             .expect("a subagent rollout");
         // Snapshot each file first: the newest rollout is usually a LIVE session still being
         // appended to, and parse-vs-stream must see identical bytes.
-        let snap = std::env::temp_dir().join(format!("cv-codex-smoke-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&snap).unwrap();
+        let snap = cv_testkit::temp_dir("codex-smoke");
         for src in [newest, subagent] {
             let path = snap.join(src.file_name().unwrap());
             fs::copy(&src, &path).unwrap();

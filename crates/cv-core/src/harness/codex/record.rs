@@ -859,9 +859,10 @@ impl Reader<'_> {
         // The twin of a `token_usage_record` already applied (same numbers; on real 0.154 files the
         // call's `item_completed` notes and its output sit between the two, so the record's message
         // no longer trails): its usage is a duplicate — keep only the rate-limit/context-window
-        // snapshot.
+        // snapshot. Both sides come from `parse_usage`, which records no cost (Codex stores
+        // none), so `Usage` equality is token equality here.
         let twin_of_record = match (&usage, &self.ctx.pending_record_usage) {
-            (Some(u), Some(r)) => usage_eq(u, r),
+            (Some(u), Some(r)) => u == r,
             _ => false,
         };
         if twin_of_record {

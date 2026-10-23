@@ -1,8 +1,9 @@
 //! Decode once per index, for Codex (its only user; named for it until a second harness hands
 //! off). `cv index` runs discovery beside the search sweep: a compressed Codex
 //! rollout that discovery decoded in full is handed, with its ref, to the sweep, which streams
-//! those decoded bytes instead of decoding the file again. A window bounds the decoded bytes
-//! alive at once (discovery waits for the sweep), so temp disk holds a window, never the fleet.
+//! those decoded bytes instead of decoding the file again. A window bounds the decoded rollouts
+//! alive at once, by bytes and by count (discovery waits for the sweep), so temp disk holds a
+//! window and the process a few descriptors per slot, never the fleet.
 use crate::SessionRef;
 use std::cell::RefCell;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -19,6 +20,17 @@ impl Decoded {
     pub fn run<T>(&self, f: impl FnOnce() -> T) -> T {
         crate::harness::codex::with_decoded(&self.rollout, f)
     }
+
+    /// The decoded bytes held: what reading them in place of the file works over.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.rollout.decoded_bytes()
+    }
+}
+
+/// The decoded size a compressed rollout's first frame header declares, if it declares one: an
+/// unverified hint for sizing admission, never for trusting the data.
+pub fn decoded_size_hint(path: &std::path::Path) -> Option<u64> {
+    crate::harness::store::zst::content_size(path)
 }
 
 /// Discovery's end: makes decoded rollouts available to the consumer while it is alive.
@@ -34,28 +46,49 @@ pub struct Receiver {
     rx: mpsc::Receiver<(SessionRef, Decoded)>,
 }
 
-/// Decoded bytes alive (counted from before each decode), and whether the consumer is gone.
+/// Decoded bytes and rollouts alive (counted from before each decode), and whether the consumer
+/// is gone.
 struct Window {
-    state: Mutex<(u64, bool)>,
+    state: Mutex<WindowState>,
     freed: Condvar,
     limit: u64,
+    /// Rollouts alive at once. Each holds open descriptors (its source and its decoded copy), so
+    /// a byte limit alone let a window of small rollouts exhaust the process's open files.
+    slots: usize,
+}
+
+/// The window's live byte and rollout counts and whether the consumer has gone (dropped its
+/// [`Receiver`]).
+struct WindowState {
+    live: u64,
+    held: usize,
+    consumer_gone: bool,
 }
 
 struct Permit(Arc<Window>, u64);
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.0.state.lock().unwrap().0 -= self.1;
+        let mut state = self.0.state.lock().unwrap();
+        state.live -= self.1;
+        state.held -= 1;
+        drop(state);
         self.0.freed.notify_all();
     }
 }
 
-/// A handoff holding at most `limit` decoded bytes at once, or one larger rollout alone.
-pub fn channel(limit: u64) -> (Handoff, Receiver) {
+/// A handoff holding at most `limit` decoded bytes and `slots` rollouts at once, or one larger
+/// rollout alone.
+pub fn channel(limit: u64, slots: usize) -> (Handoff, Receiver) {
     let window = Arc::new(Window {
-        state: Mutex::new((0, false)),
+        state: Mutex::new(WindowState {
+            live: 0,
+            held: 0,
+            consumer_gone: false,
+        }),
         freed: Condvar::new(),
         limit,
+        slots: slots.max(1),
     });
     let (tx, rx) = mpsc::channel();
     (
@@ -80,25 +113,30 @@ impl Receiver {
 
 impl Drop for Receiver {
     fn drop(&mut self) {
-        self.window.state.lock().unwrap().1 = true;
+        self.window.state.lock().unwrap().consumer_gone = true;
         self.window.freed.notify_all();
     }
 }
 
 impl Handoff {
-    /// Room for `bytes` in the window (all of it when unknown), waiting while it is too full;
+    /// Room for `bytes` and one rollout in the window (all of it when unknown), waiting while it
+    /// is too full;
     /// `None` once the consumer is gone. Discovery waits here on a worker thread; the sweep frees
     /// room without discovery.
     fn reserve(&self, bytes: Option<u64>) -> Option<Permit> {
         let bytes = bytes.unwrap_or(self.window.limit);
         let mut state = self.window.state.lock().unwrap();
-        while state.0 != 0 && state.0.saturating_add(bytes) > self.window.limit && !state.1 {
+        while state.held != 0
+            && (state.live.saturating_add(bytes) > self.window.limit || state.held >= self.window.slots)
+            && !state.consumer_gone
+        {
             state = self.window.freed.wait(state).unwrap();
         }
-        if state.1 {
+        if state.consumer_gone {
             return None;
         }
-        state.0 += bytes;
+        state.live += bytes;
+        state.held += 1;
         Some(Permit(self.window.clone(), bytes))
     }
 }
@@ -155,7 +193,7 @@ mod tests {
     /// rollout larger than the window alone; a gone consumer releases every waiter.
     #[test]
     fn a_full_window_waits_for_freed_room_and_a_closed_one_never_waits() {
-        let (handoff, receiver) = channel(10);
+        let (handoff, receiver) = channel(10, usize::MAX);
         let first = handoff.reserve(Some(6)).expect("an empty window has room");
         let second = handoff.reserve(Some(4)).expect("room for both");
         std::thread::scope(|scope| {
@@ -177,5 +215,24 @@ mod tests {
             handoff.reserve(Some(1)).is_none(),
             "a closed window never waits, even full"
         );
+    }
+
+    /// Small rollouts fill the window's slots before its bytes: each holds descriptors, so the
+    /// count of rollouts alive is bounded whatever their size.
+    #[test]
+    fn a_window_of_small_rollouts_waits_for_a_free_slot() {
+        let (handoff, _receiver) = channel(1 << 30, 2);
+        let first = handoff.reserve(Some(1)).expect("a free slot");
+        let _second = handoff.reserve(Some(1)).expect("a free slot");
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| handoff.reserve(Some(1)).map(|permit| permit.1));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                !waiting.is_finished(),
+                "two slots held: the third waits, bytes to spare"
+            );
+            drop(first);
+            assert_eq!(waiting.join().unwrap(), Some(1), "a freed slot is taken");
+        });
     }
 }

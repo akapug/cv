@@ -136,22 +136,10 @@ pub fn parse_since(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String>
             .checked_sub_signed(d)
             .ok_or_else(|| format!("duration {s:?} is outside the supported date range"));
     }
-    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
-        return Ok(t.with_timezone(&Utc));
+    if let Some(t) = parse_stamp(s) {
+        return Ok(t);
     }
-    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M",
-    ] {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-            if let Some(t) = Local.from_local_datetime(&ndt).single() {
-                return Ok(t.with_timezone(&Utc));
-            }
-        }
-    }
+    use chrono::{Local, NaiveDate, TimeZone};
     if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let ndt = nd.and_hms_opt(0, 0, 0).expect("midnight exists");
         if let Some(t) = Local.from_local_datetime(&ndt).single() {
@@ -167,6 +155,27 @@ pub fn parse_since(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String>
     ))
 }
 
+/// An RFC 3339 timestamp or one of the four local datetime spellings, as UTC.
+fn parse_stamp(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        return Some(t.with_timezone(&Utc));
+    }
+    use chrono::{Local, NaiveDateTime, TimeZone};
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            if let Some(t) = Local.from_local_datetime(&ndt).single() {
+                return Some(t.with_timezone(&Utc));
+            }
+        }
+    }
+    None
+}
+
 /// Parse a `--by` deadline: a duration from `now` (`3d`, `48h`, `1w`), a bare date (`2026-10-03`
 /// = the end of that local day), a local datetime (`2026-10-03T18:00`), or RFC 3339.
 pub fn parse_deadline(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
@@ -176,22 +185,10 @@ pub fn parse_deadline(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, Stri
             .checked_add_signed(d)
             .ok_or_else(|| format!("deadline {s:?} is outside the supported date range"));
     }
-    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
-        return Ok(t.with_timezone(&Utc));
+    if let Some(t) = parse_stamp(s) {
+        return Ok(t);
     }
-    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M",
-    ] {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-            if let Some(t) = Local.from_local_datetime(&ndt).single() {
-                return Ok(t.with_timezone(&Utc));
-            }
-        }
-    }
+    use chrono::{Local, NaiveDate, TimeZone};
     if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let ndt = nd.and_hms_opt(23, 59, 59).expect("end of day exists");
         if let Some(t) = Local.from_local_datetime(&ndt).single() {

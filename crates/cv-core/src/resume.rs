@@ -45,12 +45,18 @@ impl MarkHead {
     /// this way, so a file renamed over the path mid-pass is never paired with this pass's
     /// checkpoint (its next pass sees another inode and reads whole).
     pub fn of_file(file: &std::fs::File, cp: &Checkpoint, version: &str) -> Option<MarkHead> {
-        // Without a stable file identity, prefer a whole read.
-        cfg!(unix).then_some(())?;
-        Some(MarkHead {
+        // Without a stable file identity (off Unix), prefer a whole read.
+        #[cfg(not(unix))]
+        let mark = {
+            let _ = (file, cp, version);
+            None
+        };
+        #[cfg(unix)]
+        let mark = Some(MarkHead {
             prefix: Prefix::of(file, cp.offset)?,
             version: version.to_string(),
-        })
+        });
+        mark
     }
 
     pub fn offset(&self) -> u64 {
@@ -68,14 +74,17 @@ impl MarkHead {
 /// The version a mark records and must match: the one stored-format version
 /// ([`crate::source::VERSION`], which the affordance view shares), the harness and `consumer`
 /// (the caller's own state format). Not the cv release: a release that changes what a mark means
-/// bumps one of those. The adapter's codec version rides in the checkpoint itself
-/// ([`crate::harness::store::jsonl::Codec::VERSION`]), so a mark of another codec is declined.
+/// bumps one of those. A checkpoint's codec state carries no version of its own: what a codec
+/// keeps, and what a record parses to, are versioned by that same `source::VERSION`.
 pub fn version(adapter: &dyn Adapter, consumer: &str) -> String {
     crate::source::consumer_version(format_args!("{}/{consumer}", adapter.harness().as_str()))
 }
 
-/// A session and its new mark (`None`: it has none any more), for [`update`].
-pub type MarkUpdate = (SessionRef, Option<(MarkHead, Checkpoint)>);
+/// A session and its new mark (`mark: None`: it has none any more), for [`update`].
+pub struct MarkUpdate {
+    pub session: SessionRef,
+    pub mark: Option<(MarkHead, Checkpoint)>,
+}
 
 #[cfg(feature = "sqlite")]
 mod imp {
@@ -192,8 +201,8 @@ mod imp {
             let Ok(mut drop) = tx.prepare("DELETE FROM resume_marks WHERE harness=?1 AND id=?2 AND path=?3") else {
                 return;
             };
-            for (r, mark) in marks {
-                let (h, i, p) = key(r);
+            for MarkUpdate { session, mark } in marks {
+                let (h, i, p) = key(session);
                 let _ = match mark {
                     Some((head, cp)) => {
                         let Ok(text) = serde_json::to_string(cp) else { continue };

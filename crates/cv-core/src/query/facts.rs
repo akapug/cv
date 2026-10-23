@@ -84,7 +84,7 @@ impl<'a> SessionFacts<'a> {
             let mut rows = Vec::new();
             let mut extractor = events::EventExtractor::default();
             for (i, message) in self.session.messages.iter().enumerate() {
-                extractor.extract(message, i, self.session.cwd.as_deref(), None, &mut rows)?;
+                extractor.extract(message, i, self.session.cwd.as_deref(), None, None, &mut rows)?;
             }
             let _ = self.events.set(rows);
         }
@@ -422,7 +422,7 @@ impl FactSink {
         self.facts.images |= m.content.iter().any(|b| matches!(b, Block::Image { .. }));
         if self.events {
             let mut rows = std::mem::take(&mut self.rows);
-            self.extractor.extract(m, self.index, None, None, &mut rows)?;
+            self.extractor.extract(m, self.index, None, None, None, &mut rows)?;
             self.index += 1;
             for e in rows.drain(..) {
                 self.facts.errors |= e.kind == "error";

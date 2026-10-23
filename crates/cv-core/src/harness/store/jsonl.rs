@@ -1,5 +1,6 @@
 //! Strict read-only JSONL projection, sharing document source slices and navigation indexes.
 
+use crate::json::{ReadInput, Validation};
 pub(crate) mod ranges;
 
 use super::document;
@@ -144,11 +145,9 @@ impl Read {
         from: u64,
         visit: impl FnMut(Line<'_>) -> anyhow::Result<crate::stream::Flow>,
     ) -> anyhow::Result<()> {
-        if from == 0 {
-            self.prefix(self.len(), visit)
-        } else {
-            self.snapshot(from, self.len(), visit)
-        }
+        // At the captured EOF (`to == len`) the snapshot flag cannot differ — nothing is held
+        // back — so whole and resumed reads share one call.
+        self.snapshot(from, self.len(), visit)
     }
 
     /// At most `limit` source bytes. A cut inside a record is not EOF: that record is withheld,
@@ -202,14 +201,6 @@ impl Read {
 /// One JSONL wire format's record codec, as [`drive`] runs it: a record in, messages to the sink,
 /// state carried between records. Everything around the record is the driver's.
 pub(crate) trait Codec {
-    /// The version of what a checkpoint keeps ([`Self::state`]) and of what a record parses to:
-    /// bump it when either changes. A checkpoint of another version is declined ([`restore`]).
-    const VERSION: u32;
-
-    /// Whether the session records its rejected lines (`cv.skipped_lines`). Claude's reader never
-    /// has, and starting would change its output.
-    const NOTES_SKIPPED: bool = true;
-
     /// One accepted record, starting at byte `at`.
     fn record(
         &mut self,
@@ -239,52 +230,41 @@ pub(crate) trait Codec {
     fn finish(self, stopped: bool, sink: &mut dyn crate::stream::MessageSink) -> anyhow::Result<crate::ir::Session>;
 }
 
-/// What a driven read's checkpoint keeps under [`crate::stream::ADAPTER_LAYER`].
+/// What a driven read's checkpoint keeps under [`crate::stream::ADAPTER_LAYER`]. It carries no
+/// version of its own: a stored checkpoint is admitted only under its mark's version
+/// ([`crate::resume::version`]), which is [`crate::source::VERSION`]; a change to what a codec
+/// keeps or what a record parses to bumps that.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Stamped<S> {
-    version: u32,
     demand: crate::stream::Demand,
     skipped: u64,
     state: S,
 }
 
-/// The codec state `from` holds for a codec of `version`; `None` (decline the resume) for
-/// another version, another state or no state.
-pub(crate) fn restore<S: serde::de::DeserializeOwned>(from: &crate::stream::Checkpoint, version: u32) -> Option<S> {
+/// The codec state `from` holds; `None` (decline the resume) for another state or no state.
+pub(crate) fn restore<S: serde::de::DeserializeOwned>(from: &crate::stream::Checkpoint) -> Option<S> {
     from.get::<Stamped<S>>(crate::stream::ADAPTER_LAYER)
-        .filter(|stamped| stamped.version == version)
         .map(|stamped| stamped.state)
 }
 
 /// [`restore`] at `demand`, with the rejected lines counted before the checkpoint.
 pub(crate) fn restore_at<S: serde::de::DeserializeOwned>(
     from: &crate::stream::Checkpoint,
-    version: u32,
     demand: crate::stream::Demand,
 ) -> Option<(S, u64)> {
     from.get::<Stamped<S>>(crate::stream::ADAPTER_LAYER)
-        .filter(|stamped| stamped.version == version && stamped.demand == demand)
+        .filter(|stamped| stamped.demand == demand)
         .map(|stamped| (stamped.state, stamped.skipped))
 }
 
-/// Put `state` in `cp` as a driven read's checkpoint keeps it: with its codec's `version`, the
-/// `demand` it depends on and the rejected lines before it ([`restore_at`] reads it back).
+/// Put `state` in `cp` as a driven read's checkpoint keeps it: with the `demand` it depends on and the rejected lines before it ([`restore_at`] reads it back).
 pub(crate) fn stamp(
     cp: &mut crate::stream::Checkpoint,
-    version: u32,
     demand: crate::stream::Demand,
     skipped: u64,
     state: &impl serde::Serialize,
 ) {
-    cp.put(
-        crate::stream::ADAPTER_LAYER,
-        &Stamped {
-            version,
-            demand,
-            skipped,
-            state,
-        },
-    );
+    cp.put(crate::stream::ADAPTER_LAYER, &Stamped { demand, skipped, state });
 }
 
 /// A checkpoint at `offset` holding `state` as a driven read of `C` would (tests build marks).
@@ -295,7 +275,7 @@ pub(crate) fn checkpoint<C: Codec>(
     state: &impl serde::Serialize,
 ) -> crate::stream::Checkpoint {
     let mut cp = crate::stream::Checkpoint::new(offset);
-    stamp(&mut cp, C::VERSION, demand, 0, state);
+    stamp(&mut cp, demand, 0, state);
     cp
 }
 
@@ -320,7 +300,7 @@ pub(crate) fn drive<C: Codec>(
         Start::Prefix(to) => (0, to.min(len), 0),
         Start::Checkpoint(_) if read.is_decoded() => return Ok(None),
         Start::Checkpoint(cp) => {
-            let Some((_, skipped)) = restore_at::<serde::de::IgnoredAny>(cp, C::VERSION, codec.demand()) else {
+            let Some((_, skipped)) = restore_at::<serde::de::IgnoredAny>(cp, codec.demand()) else {
                 return Ok(None);
             };
             (cp.offset, len, skipped)
@@ -343,20 +323,20 @@ pub(crate) fn drive<C: Codec>(
             }
             // Only after a line its writer finished (a blank or rejected one too): a partial last
             // line is re-read whole next time.
-            if line.complete && !read.is_decoded() && codec.settled() && guard.wants_checkpoint(line.end) {
+            // The last line of the read is offered as its mark whatever the spacing.
+            let settled = line.complete && !read.is_decoded() && codec.settled();
+            if settled
+                && (guard.wants_checkpoint(line.end) || (line.end >= to && guard.wants_final_checkpoint(line.end)))
+            {
                 let mut cp = crate::stream::Checkpoint::new(line.end);
-                stamp(&mut cp, C::VERSION, codec.demand(), skipped, &codec.state());
+                stamp(&mut cp, codec.demand(), skipped, &codec.state());
                 guard.checkpoint(&mut cp);
             }
             stopped = guard.failed();
             Ok(if stopped { Flow::Stop } else { Flow::Continue })
         })?;
-        if C::NOTES_SKIPPED {
-            super::super::note_skipped_lines(codec.session(), skipped);
-        }
-        let session = codec.finish(stopped, guard)?;
-        read.check()?;
-        Ok(Some(session))
+        super::super::note_skipped_lines(codec.session(), skipped);
+        codec.finish(stopped, guard).map(Some)
     })
 }
 
@@ -485,30 +465,38 @@ fn lines(
                 })
             };
             let read = (!blank).then(|| match decoded {
-                Some((backing, len)) => {
-                    source.read_positioned_decoded_value(&context, backing, len, at, range.len, &mut view)
-                }
-                None => {
-                    source.read_positioned_range(&context, at, range.len, crate::json::Validation::Value, &mut view)
-                }
+                Some((backing, len)) => source.read(
+                    ReadInput::Positioned(&context, at, range.len, Some((backing, len))),
+                    Validation::Value,
+                    &mut view,
+                ),
+                None => source.read(
+                    ReadInput::Positioned(&context, at, range.len, None),
+                    Validation::Value,
+                    &mut view,
+                ),
             });
             match read {
-                Some(Err(error)) if !visited && error.downcast_ref::<crate::json::InvalidJson>().is_some() => None,
-                Some(flow) => Some(flow?),
-                None => None,
-            }
-            .map_or_else(
-                || {
+                Some(Ok(flow)) => flow,
+                // A rejected record delivers the None line; its parse error does not escape.
+                Some(Err(error)) if !visited && error.downcast_ref::<crate::json::InvalidJson>().is_some() => {
                     visit(Line {
                         at,
                         end,
                         complete,
                         view: None,
                         blank,
-                    })
-                },
-                Ok,
-            )?
+                    })?
+                }
+                None => visit(Line {
+                    at,
+                    end,
+                    complete,
+                    view: None,
+                    blank,
+                })?,
+                Some(Err(error)) => return Err(error),
+            }
         };
         if flow == Flow::Stop {
             break;
@@ -523,6 +511,11 @@ fn lines(
 /// 8 MiB in production (64 KiB in tests).
 #[cfg(feature = "mmap")]
 pub(crate) const MAP_WINDOW: u64 = if cfg!(test) { 64 << 10 } else { 8 << 20 };
+
+/// The record size a whole-record read buffers; at most this (and with `mmap`, strictly above it)
+/// the read is served from a buffer, never a range context. (Not [`MAP_WINDOW`], which bounds how
+/// much a line pass keeps mapped.)
+const MAPPED_RECORD: u64 = 64 * 1024;
 
 // Tests: the largest mapping each thread has made, the bound the mapped-bytes test asserts.
 #[cfg(all(test, feature = "mmap"))]
@@ -618,6 +611,7 @@ fn mapped_lines(
 pub(crate) struct Records<'s> {
     source: &'s crate::json::JsonSource,
     file: &'s File,
+    #[cfg(not(feature = "mmap"))]
     context: Option<document::range::RangeSource<'static>>,
     buffer: Vec<u8>,
 }
@@ -627,6 +621,7 @@ impl<'s> Records<'s> {
         Self {
             source,
             file,
+            #[cfg(not(feature = "mmap"))]
             context: None,
             buffer: Vec::new(),
         }
@@ -638,7 +633,7 @@ impl<'s> Records<'s> {
         len: u64,
         f: impl FnOnce(crate::json::JsonView<'_>) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        self.read_with(at, len, crate::json::Validation::Value, f)
+        self.read_with(at, len, Validation::Value, f)
     }
     /// [`Self::read`] under a chosen acceptance.
     pub(crate) fn read_with<T>(
@@ -652,8 +647,16 @@ impl<'s> Records<'s> {
             at.checked_add(len).is_some_and(|end| end <= self.source.len()),
             "record range outside its source"
         );
+        if len <= MAPPED_RECORD {
+            self.buffer.resize(len as usize, 0);
+            ranges::read_exact_at(self.file, &mut self.buffer, at)?;
+            let text = std::str::from_utf8(&self.buffer).map_err(|_| crate::json::InvalidJson)?;
+            return self.source.read(ReadInput::Record(at, text, None), validation, f);
+        }
+        // Only giant reads remain: a mapped build takes them from one mapping, a positioned
+        // build leaves them in place as a positioned view.
         #[cfg(feature = "mmap")]
-        if len > 64 * 1024 {
+        {
             // SAFETY: a read-only mapping of the checked descriptor, dropped with this read.
             let map = unsafe {
                 memmap2::MmapOptions::new()
@@ -664,19 +667,17 @@ impl<'s> Records<'s> {
             #[cfg(test)]
             note_mapped(map.len());
             let text = std::str::from_utf8(&map).map_err(|_| crate::json::InvalidJson)?;
-            return self.source.read_record_with(at, text, validation, f);
+            self.source.read(ReadInput::Record(at, text, None), validation, f)
         }
-        if len <= 64 * 1024 {
-            self.buffer.resize(len as usize, 0);
-            ranges::read_exact_at(self.file, &mut self.buffer, at)?;
-            let text = std::str::from_utf8(&self.buffer).map_err(|_| crate::json::InvalidJson)?;
-            return self.source.read_record_with(at, text, validation, f);
+        #[cfg(not(feature = "mmap"))]
+        {
+            if self.context.is_none() {
+                self.context = Some(document::range::RangeSource::from_captured(self.source.clone())?);
+            }
+            let context = self.context.as_ref().expect("context was just made");
+            self.source
+                .read(ReadInput::Positioned(context, at, len, None), validation, f)
         }
-        if self.context.is_none() {
-            self.context = Some(document::range::RangeSource::from_captured(self.source.clone())?);
-        }
-        let context = self.context.as_ref().expect("context was just made");
-        self.source.read_positioned_range(context, at, len, validation, f)
     }
 }
 
@@ -707,15 +708,19 @@ fn in_memory(
             })
         };
         let read = match (source, decoded) {
-            (Some(source), Some((backing, len))) => source.read_decoded_record(backing, len, at, text, view),
-            (Some(source), None) => source.read_record(at, text, view),
+            (Some(source), Some((backing, len))) => source.read(
+                ReadInput::Record(at, text, Some((backing, len))),
+                Validation::Value,
+                view,
+            ),
+            (Some(source), None) => source.read(ReadInput::Record(at, text, None), Validation::Value, view),
             (None, _) => (|| {
                 let context = document::range::RangeSource::text(None, text, at, false);
                 let range = document::range::Range {
                     offset: at,
                     len: text.len() as u64,
                 };
-                match context.accept(range, crate::json::Validation::Value)? {
+                match context.accept(range, Validation::Value)? {
                     Some(value) => view(crate::json::JsonView::of(&context, value)),
                     None => Err(crate::json::InvalidJson.into()),
                 }
@@ -737,6 +742,7 @@ fn in_memory(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::json::{ReadInput, Validation};
     use crate::stream::Flow;
 
     /// Run the test `name` (its full path) again in a child process with core dumps off, and
@@ -905,10 +911,16 @@ pub(crate) mod tests {
             assert_eq!(lines, [(false, true), (false, false), (false, true)], "framer, {name}");
             let (at, len) = (valid.len() as u64 + 1, bad.len() as u64);
             let invalid = |result: anyhow::Result<()>| result.is_err_and(|e| e.is::<crate::json::InvalidJson>());
-            assert!(invalid(source.read_range_value(at, len, |_| Ok(()))), "value, {name}");
-            assert!(invalid(source.read_range_syntax(at, len, |_| Ok(()))), "syntax, {name}");
+            assert!(
+                invalid(source.read(ReadInput::Range(at, len), Validation::Value, |_| Ok(()))),
+                "value, {name}"
+            );
+            assert!(
+                invalid(source.read(ReadInput::Range(at, len), Validation::Syntax, |_| Ok(()))),
+                "syntax, {name}"
+            );
             let mut records = super::Records::new(&source, &file);
-            let read = records.read_with(at, len, crate::json::Validation::Syntax, |_| Ok(()));
+            let read = records.read_with(at, len, Validation::Syntax, |_| Ok(()));
             assert!(invalid(read), "records, {name}");
             let derived = crate::derive::transcript(
                 &source,
@@ -989,10 +1001,7 @@ pub(crate) mod tests {
                         !blank && error.is::<crate::json::InvalidJson>(),
                         "prune, {name}: {error:#}"
                     );
-                    assert!(
-                        error.to_string().contains("line 2 is not a complete JSON record"),
-                        "prune, {name}: {error:#}"
-                    );
+                    assert!(error.to_string().contains("line 2"), "prune, {name}: {error:#}");
                     assert!(
                         !world.base.join(format!("{name}-pruned.jsonl")).exists(),
                         "prune, {name}"

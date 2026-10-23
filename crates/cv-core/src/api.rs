@@ -169,12 +169,21 @@ fn with_tasks(f: impl FnOnce(&crate::task::ReplayOutcome) -> (u16, Value)) -> (u
     }
 }
 
+/// [`with_tasks`] for a route that reads only the model: the log's stored fold and the events
+/// appended since ([`crate::task::fold`]), with the same warnings.
+fn with_folded(f: impl FnOnce(&crate::task::Folded) -> (u16, Value)) -> (u16, Value) {
+    match crate::task::fold() {
+        Ok(folded) => f(&folded),
+        Err(e) => err(500, &e.to_string()),
+    }
+}
+
 /// `GET /api/tasks?state=&assignee=&repo=&tag=&all=&detail=` — task projections, oldest first;
 /// `detail=1` adds the backlog columns (`opened_by`, `issue`, `body`, `notes`, `decision`, `blocked`).
 fn tasks(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     let detail = params.flag("detail");
-    with_tasks(|outcome| {
+    with_folded(|outcome| {
         let filter = crate::task::TaskFilter {
             state: params.get("state"),
             assignee: params.get("assignee"),
@@ -377,10 +386,6 @@ fn session_head(harness: &str, id: &str) -> (u16, Value) {
         unreachable!("head metadata is an object")
     };
     for (key, value) in head {
-        // Parsed title/cwd replace catalog hints only when present, as before.
-        if matches!(key.as_str(), "title" | "cwd") && value.is_null() {
-            continue;
-        }
         map.insert(key, value);
     }
     ok(row)
@@ -551,11 +556,8 @@ fn subagent(harness: &str, parent: &str, agent: &str) -> (u16, Value) {
         Ok(forest) => forest,
         Err(error) => return err(500, &format!("forest read failed: {error:#}")),
     };
-    let Some(sr) = forest
-        .into_iter()
-        .find(|s| s.session.id == agent || s.agent_id() == agent)
-        .map(|s| s.session)
-    else {
+    // The select closure kept only members whose transcript id names `agent`, so take the first.
+    let Some(sr) = forest.into_iter().next().map(|s| s.session) else {
         return err(404, "subagent not found");
     };
     match complete_session_json(adapter.as_ref(), &sr) {

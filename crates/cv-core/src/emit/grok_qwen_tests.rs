@@ -166,6 +166,23 @@ fn fixture(harness: Harness) -> Session {
     session
 }
 
+/// The producer's wire, before any normalization: compact, key-ordered, newline-terminated JSONL.
+fn assert_compact_qwen_wire(bytes: &[u8]) -> Result<()> {
+    if bytes == b"\n" {
+        return Ok(());
+    }
+    anyhow::ensure!(bytes.ends_with(b"\n"), "JSONL terminator");
+    for line in std::str::from_utf8(bytes)?.lines() {
+        let row: Value = serde_json::from_str(line)?;
+        assert_eq!(
+            serde_json::to_string(&row)?,
+            line,
+            "compact wire/order before normalization"
+        );
+    }
+    Ok(())
+}
+
 fn normalized_qwen(bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes == b"\n" {
         return Ok(bytes.to_vec());
@@ -176,11 +193,6 @@ fn normalized_qwen(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut prior_normalized = None;
     for (index, line) in std::str::from_utf8(bytes)?.lines().enumerate() {
         let mut row: Value = serde_json::from_str(line)?;
-        assert_eq!(
-            serde_json::to_string(&row)?,
-            line,
-            "compact wire/order before normalization"
-        );
         let uuid = row["uuid"].as_str().unwrap().to_owned();
         assert_eq!(Uuid::parse_str(&uuid)?.get_version(), Some(uuid::Version::Random));
         assert_eq!(row["parentUuid"], json!(prior));
@@ -196,7 +208,7 @@ fn normalized_qwen(bytes: &[u8]) -> Result<Vec<u8>> {
 
 /// One emitted session, frozen: each output file's length and SHA-256 (`$HOME` and Qwen UUIDs normalized)
 /// and the SHA-256 of the fidelity report from re-reading it.
-fn entry(target: Harness, result: &EmitResult, owned: &Session, mode: ThinkingMode) -> Result<Value> {
+fn entry(target: Harness, result: &EmitResult, input: &Session, mode: ThinkingMode) -> Result<Value> {
     let mut files = serde_json::Map::new();
     // Grok's summary names the per-test `$HOME`; everything else is fixed by the fixture.
     let home = crate::env::var("HOME")?;
@@ -208,7 +220,9 @@ fn entry(target: Harness, result: &EmitResult, owned: &Session, mode: ThinkingMo
         );
     };
     if target == Harness::Qwen {
-        digest("session.jsonl", normalized_qwen(&fs::read(&result.path)?)?);
+        let bytes = fs::read(&result.path)?;
+        assert_compact_qwen_wire(&bytes)?;
+        digest("session.jsonl", normalized_qwen(&bytes)?);
     } else {
         for name in ["summary.json", "chat_history.jsonl", "updates.jsonl"] {
             let path = result.path.join(name);
@@ -218,7 +232,7 @@ fn entry(target: Harness, result: &EmitResult, owned: &Session, mode: ThinkingMo
         }
     }
     let reread = fidelity::reparse_emitted(target, result, &Demand::RICH)?;
-    let report = serde_json::to_vec(&fidelity::diff_fidelity(target, mode, owned, &reread))?;
+    let report = serde_json::to_vec(&fidelity::diff_fidelity(target, mode, input, &reread))?;
     Ok(json!({ "files": files, "fidelity": crate::digest::sha256_hex(&report) }))
 }
 
@@ -247,22 +261,18 @@ fn capture_bodies(session: &mut Session, base: &Path) -> Result<()> {
         for block in &mut message.content {
             index += 1;
             let path = base.join(format!("{index}.json"));
-            match block {
-                Block::Text { text } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
-                    let raw = serde_json::to_vec(&text.inline_str().unwrap())?;
-                    fs::write(&path, &raw)?;
-                    // For tiny/empty leaves also force a captured Source while retaining strict acceptance.
-                    let json = crate::Json::source(&path, 0, raw.len() as u64)?;
-                    if let crate::Json::Source(source) = json {
-                        *text = crate::lazy::Text::Source(crate::lazy::SourceText::new(source));
-                    }
+            if let Some(text) = block.text_mut() {
+                let raw = serde_json::to_vec(&text.inline_str().unwrap())?;
+                fs::write(&path, &raw)?;
+                // For tiny/empty leaves also force a captured Source while retaining strict acceptance.
+                let json = crate::Json::source(&path, 0, raw.len() as u64)?;
+                if let crate::Json::Source(source) = json {
+                    *text = crate::lazy::Text::Source(crate::lazy::SourceText::new(source));
                 }
-                Block::ToolUse { input, .. } => {
-                    let raw = serde_json::to_vec(input.resolve()?.as_ref())?;
-                    fs::write(&path, &raw)?;
-                    *input = crate::Json::source(&path, 0, raw.len() as u64)?;
-                }
-                _ => {}
+            } else if let Block::ToolUse { input, .. } = block {
+                let raw = serde_json::to_vec(input.resolve()?.as_ref())?;
+                fs::write(&path, &raw)?;
+                *input = crate::Json::source(&path, 0, raw.len() as u64)?;
             }
         }
     }
@@ -419,12 +429,8 @@ fn checked_grok_qwen_source_failure_preserves_every_destination() -> Result<()> 
     Ok(())
 }
 
-#[test]
-fn checked_grok_qwen_complete_selected_producer_matches_owned() -> Result<()> {
-    let world = crate::test_world("grok-qwen-selected-complete");
-    let mut frozen = Frozen::new("grok-qwen-selected");
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
-    for (target, adapter) in [
+fn grok_qwen_adapters(root: &Path) -> Vec<(Harness, Box<dyn Adapter>)> {
+    vec![
         (
             Harness::Grok,
             Box::new(crate::harness::grok::Grok::with_home(&root.join("grok/1.0.50/.grok"))) as Box<dyn Adapter>,
@@ -433,7 +439,16 @@ fn checked_grok_qwen_complete_selected_producer_matches_owned() -> Result<()> {
             Harness::Qwen,
             Box::new(crate::harness::qwen::Qwen::with_home(&root.join("qwen/0.25.1/.qwen"))) as Box<dyn Adapter>,
         ),
-    ] {
+    ]
+}
+
+/// The checked corpus producers re-emit: selection matches the complete read, per mode, frozen.
+#[test]
+fn checked_grok_qwen_corpus_producer_matches_frozen() -> Result<()> {
+    let world = crate::test_world("grok-qwen-selected-corpus");
+    let mut frozen = Frozen::new("grok-qwen-selected-corpus");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    for (target, adapter) in grok_qwen_adapters(&root) {
         for reference in adapter.discover()? {
             let owned = crate::stream::collect_with(adapter.as_ref(), &reference, &Demand::COMPLETE)?;
             let selected = parse_for_emit(adapter.as_ref(), &reference, target)
@@ -455,6 +470,18 @@ fn checked_grok_qwen_complete_selected_producer_matches_owned() -> Result<()> {
                 )?;
             }
         }
+    }
+    frozen.check()
+}
+
+/// The large-source producer: selection matches the complete read across a malformed JSONL tail
+/// and a whitespace-wrapped record, per mode, frozen; a truncated source refuses to re-emit.
+#[test]
+fn checked_grok_qwen_large_source_matches_frozen_and_rejects_truncation() -> Result<()> {
+    let world = crate::test_world("grok-qwen-selected-large");
+    let mut frozen = Frozen::new("grok-qwen-selected-large");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    for (target, adapter) in grok_qwen_adapters(&root) {
         let mut session = fixture(target);
         session.messages[2].content.insert(
             0,

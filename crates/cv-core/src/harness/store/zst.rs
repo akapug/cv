@@ -10,7 +10,8 @@ use std::io::Read;
 #[cfg(all(feature = "zstd", not(target_family = "wasm")))]
 pub(crate) fn decoder<R: Read>(input: R) -> io::Result<impl Read> {
     use std::io::BufRead;
-    let mut decoded = io::BufReader::with_capacity(64 * 1024, zstd::stream::read::Decoder::new(input)?.single_frame());
+    let mut decoded =
+        io::BufReader::with_capacity(super::IO_CHUNK, zstd::stream::read::Decoder::new(input)?.single_frame());
     decoded.fill_buf()?;
     Ok(decoded)
 }

@@ -97,13 +97,10 @@ pub(super) fn write_database(
     tx.execute("INSERT INTO session_v2 (id,project_id,slug,directory,title,version,model,agent,time_created,time_updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![id,project,short_hash(id),cwd,session.title,env!("CARGO_PKG_VERSION"),model,"build",created,updated])?;
     if session.harness == Harness::OpenCode {
-        let columns = {
-            let mut statement = tx.prepare("PRAGMA table_info(session_v2)")?;
-            let columns = statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            columns
-        };
+        let mut statement = tx.prepare("PRAGMA table_info(session_v2)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         if let Some(bag) = bag {
             for (key, value) in bag {
                 if !columns.contains(key)
@@ -123,19 +120,27 @@ pub(super) fn write_database(
                 {
                     continue;
                 }
-                let mut value = value.clone();
-                if key == "model" {
-                    if let Some(object) = value.as_object_mut() {
-                        if let Some(model) = &session.model {
-                            object.insert("id".into(), json!(model));
+                // Only the rewritten keys need a private copy; the rest bind the bag value as-is.
+                let mut rewritten;
+                let value = match key.as_str() {
+                    "model" => {
+                        rewritten = value.clone();
+                        if let Some(object) = rewritten.as_object_mut() {
+                            if let Some(model) = &session.model {
+                                object.insert("id".into(), json!(model));
+                            }
                         }
+                        &rewritten
                     }
-                }
-                if key == "revert" {
-                    remap_references(&mut value, &remap, &session.id, id);
-                }
+                    "revert" => {
+                        rewritten = value.clone();
+                        remap_references(&mut rewritten, &remap, &session.id, id);
+                        &rewritten
+                    }
+                    _ => value,
+                };
                 let sql = format!("UPDATE session_v2 SET \"{}\"=?1 WHERE id=?2", key.replace('"', "\"\""));
-                tx.execute(&sql, params![sql_value(&value), id])?;
+                tx.execute(&sql, params![sql_value(value), id])?;
             }
         }
     }
@@ -191,14 +196,7 @@ pub(super) fn write_database(
                 };
                 if let Some(group) = group {
                     if !msg.extra.contains_key(crate::ir::CARRIER_KEY)
-                        && session.messages[index..index + group]
-                            .iter()
-                            .filter_map(|m| m.id.as_deref())
-                            .all(|id| identities.get(id) == Some(&1))
-                        && msg
-                            .id
-                            .as_deref()
-                            .is_some_and(|id| owners.get(id).copied().unwrap_or(0) == group - 1)
+                        && replayable(msg, index, group, &session.messages, &identities, &owners)
                         && replay_model_matches(
                             &record.value,
                             &session.messages[index..index + group],
@@ -216,20 +214,9 @@ pub(super) fn write_database(
                     }
                 }
             }
-        }
-
-        if session.harness == Harness::OpenCode && msg.id.as_deref().is_some_and(|id| identities.get(id) == Some(&1)) {
             if let Some(raw) = msg.extra.get(crate::ir::CARRIER_KEY) {
                 if let Some((ty, group)) = owned_replay(raw, &session.messages[index..]) {
-                    if session.messages[index..index + group]
-                        .iter()
-                        .filter_map(|m| m.id.as_deref())
-                        .all(|id| identities.get(id) == Some(&1))
-                        && msg
-                            .id
-                            .as_deref()
-                            .is_some_and(|id| owners.get(id).copied().unwrap_or(0) == group - 1)
-                    {
+                    if replayable(msg, index, group, &session.messages, &identities, &owners) {
                         let ts = msg.timestamp.map(|t| t.timestamp_millis()).unwrap_or(created + seq);
                         let mid = &message_ids[index];
                         let mut bytes = Vec::new();
@@ -516,6 +503,26 @@ fn remap_references(value: &mut Value, ids: &HashMap<&str, &str>, source_session
             remap_references(value, ids, source_session, new_session);
         }
     }
+}
+
+/// A replay group is intact at `index`: the primary and every follower still hold a unique
+/// id, and the primary owns exactly `group - 1` follower records.
+fn replayable(
+    msg: &Message,
+    index: usize,
+    group: usize,
+    messages: &[Message],
+    identities: &HashMap<&str, usize>,
+    owners: &HashMap<&str, usize>,
+) -> bool {
+    messages[index..index + group]
+        .iter()
+        .filter_map(|m| m.id.as_deref())
+        .all(|id| identities.get(id) == Some(&1))
+        && msg
+            .id
+            .as_deref()
+            .is_some_and(|id| owners.get(id).copied().unwrap_or(0) == group - 1)
 }
 
 fn owned_replay<'a>(raw: &'a Value, current: &[Message]) -> Option<(&'a str, usize)> {

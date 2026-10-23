@@ -20,6 +20,17 @@ struct State {
     closed: bool,
 }
 
+/// Admission counters at a sweep boundary: bytes currently charged, the peak concurrent
+/// charge, the largest single document charged, and how often a worker waited for room.
+#[cfg(test)]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct AdmissionStats {
+    pub(super) charged_bytes: usize,
+    pub(super) peak_charged_bytes: usize,
+    pub(super) largest_document_bytes: usize,
+    pub(super) queue_waits: usize,
+}
+
 pub(super) struct Admission {
     limit: usize,
     state: Mutex<State>,
@@ -69,9 +80,14 @@ impl Admission {
     }
 
     #[cfg(test)]
-    pub(super) fn stats(&self) -> (usize, usize, usize, usize) {
+    pub(super) fn stats(&self) -> AdmissionStats {
         let state = self.state.lock().unwrap();
-        (state.bytes, state.peak, state.largest, state.waits)
+        AdmissionStats {
+            charged_bytes: state.bytes,
+            peak_charged_bytes: state.peak,
+            largest_document_bytes: state.largest,
+            queue_waits: state.waits,
+        }
     }
 }
 
@@ -232,14 +248,14 @@ mod tests {
             assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
             drop(first);
             let next = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-            assert_eq!(next.admission.stats().0, 64);
+            assert_eq!(next.admission.stats().charged_bytes, 64);
             // Moving a reservation through a queue cannot return its bytes early.
             let (tx, rx) = mpsc::sync_channel(1);
             tx.send(next).unwrap();
-            assert_eq!(admission_stats_from_receiver(&rx).0, 0);
+            assert_eq!(admission_stats_from_receiver(&rx).charged_bytes, 0);
         });
-        assert_eq!(admission.stats().0, 0);
-        assert!(admission.stats().1 <= 128);
+        assert_eq!(admission.stats().charged_bytes, 0);
+        assert!(admission.stats().peak_charged_bytes <= 128);
 
         let oversized = admission.reserve(256).unwrap();
         let (tx, rx) = mpsc::channel();
@@ -251,14 +267,14 @@ mod tests {
             assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
             drop(oversized);
         });
-        assert_eq!(admission.stats().0, 0);
-        assert_eq!(admission.stats().1, 256);
+        assert_eq!(admission.stats().charged_bytes, 0);
+        assert_eq!(admission.stats().peak_charged_bytes, 256);
     }
 
-    fn admission_stats_from_receiver(rx: &mpsc::Receiver<Reservation>) -> (usize, usize, usize, usize) {
+    fn admission_stats_from_receiver(rx: &mpsc::Receiver<Reservation>) -> AdmissionStats {
         let reservation = rx.recv().unwrap();
         let admission = Arc::clone(&reservation.admission);
-        assert_eq!(admission.stats().0, reservation.bytes);
+        assert_eq!(admission.stats().charged_bytes, reservation.bytes);
         drop(reservation);
         admission.stats()
     }
@@ -277,15 +293,16 @@ mod tests {
             writer.add_document(document).unwrap();
         }
         writer.commit().unwrap();
-        assert_eq!(admission.stats().0, 0);
-        assert!(admission.stats().1 <= admission.limit.max(admission.stats().2));
+        assert_eq!(admission.stats().charged_bytes, 0);
+        let stats = admission.stats();
+        assert!(stats.peak_charged_bytes <= admission.limit.max(stats.largest_document_bytes));
         assert_eq!(index.reader().unwrap().searcher().num_docs(), 40);
         writer.fail_after(0);
         let mut document = TantivyDocument::default();
         document.add_text(body, "failed");
         assert!(writer.add_document(document).is_err());
-        assert_eq!(admission.stats().0, 0);
+        assert_eq!(admission.stats().charged_bytes, 0);
         drop(writer);
-        assert_eq!(admission.stats().0, 0);
+        assert_eq!(admission.stats().charged_bytes, 0);
     }
 }

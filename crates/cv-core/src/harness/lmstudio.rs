@@ -40,6 +40,7 @@ use super::Adapter;
 use super::EmitResult;
 use crate::ir::*;
 use crate::json::{JsonSource, JsonView};
+use crate::json::{ReadInput, Validation};
 use crate::stream::{Demand, Flow, MessageSink, Tier};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -124,7 +125,7 @@ impl Adapter for LmStudio {
         crate::stream::checked(sink, |sink| {
             let source = JsonSource::capture(&r.path)?;
             source
-                .read_syntax(|view| {
+                .read(ReadInput::Document, Validation::Syntax, |view| {
                     let doc = Fields::parse_struct(
                         view,
                         &[
@@ -659,7 +660,7 @@ fn is_conversation_file(path: &Path) -> bool {
 /// Build a cheap [`SessionRef`] without parsing every step.
 fn scan(path: &Path) -> Result<SessionRef> {
     let source = JsonSource::capture(path)?;
-    let doc = source.read_document(scan_view)?;
+    let doc = source.read(ReadInput::Document, Validation::Value, scan_view)?;
 
     let id = path
         .file_name()
@@ -838,21 +839,7 @@ mod tests {
         let mut frozen = Frozen::new("lmstudio-turns");
         for (case, text) in cases.into_iter().enumerate() {
             let value: Value = serde_json::from_str(text).unwrap();
-            let fields = Fields::parse(JsonView::from(&value), &["versions", "currentlySelected"]).unwrap();
-            let actual = if let Some(fields) = fields {
-                if let Some(versions) = fields.get("versions") {
-                    projected_selected_version(&fields, versions)
-                        .unwrap()
-                        .and_then(|(_, version, _)| {
-                            projected_version(version, &mut None, &Demand::RICH, At(0, 0)).unwrap()
-                        })
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let selected = serde_json::to_value(actual).unwrap();
+            let selected = serde_json::to_value(selected(&value)).unwrap();
             let mut actual = Vec::new();
             if let Some(fields) = Fields::parse(JsonView::from(&value), &["versions", "currentlySelected"]).unwrap() {
                 if let Some(versions) = fields.get("versions") {
@@ -1005,7 +992,9 @@ mod tests {
                 fs::write(&path, format!("\"{plain}\"")).unwrap();
                 let source = JsonSource::capture(&path).unwrap();
                 assert!(
-                    source.read_document(projected_harmony).unwrap(),
+                    source
+                        .read(ReadInput::Document, Validation::Value, projected_harmony)
+                        .unwrap(),
                     "{marker} at {padding}"
                 );
                 fs::remove_dir_all(dir).unwrap();
@@ -1033,7 +1022,7 @@ mod tests {
                 fs::write(&path, &wire)?;
                 let source = JsonSource::capture(&path)?;
                 assert_eq!(
-                    source.read_document(projected_harmony)?,
+                    source.read(ReadInput::Document, Validation::Value, projected_harmony)?,
                     expected,
                     "{marker} at {padding}"
                 );
@@ -1042,7 +1031,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&"ordinary λ".repeat(1000))?)?;
         let source = JsonSource::capture(&path)?;
         assert!(source
-            .read_document(|view| {
+            .read(ReadInput::Document, Validation::Value, |view| {
                 assert!(!view.string_may_contain_ascii(b'<')?);
                 fs::write(&path, b"\"changed\"")?;
                 Ok(())
@@ -1458,7 +1447,7 @@ mod tests {
         let original = serde_json::to_vec(&serde_json::json!({"name": "text\n".repeat(40_000)})).unwrap();
         std::fs::write(&path, &original).unwrap();
         let source = JsonSource::capture(&path).unwrap();
-        let result = source.read_document(|view| {
+        let result = source.read(ReadInput::Document, Validation::Value, |view| {
             let mut head = crate::projection::Head::trimmed(80);
             read_head(&mut head, view.get("name")?.unwrap())?;
             assert!(head.done());

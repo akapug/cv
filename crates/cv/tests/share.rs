@@ -40,7 +40,8 @@ fn share_corpus(w: &World) {
     w.write_session("sharesess", &lines);
 }
 
-/// No `src=`/`href=` attribute may point at the network. (Fragment anchors and data: are fine.)
+/// No `src=`/`href=` attribute may point at the network: absolute and protocol-relative values,
+/// quoted or not. (Fragment anchors and data: are fine.)
 fn assert_no_external_urls(html: &str) {
     let lower = html.to_lowercase();
     for needle in [
@@ -48,8 +49,16 @@ fn assert_no_external_urls(html: &str) {
         "src='http",
         "href=\"http",
         "href='http",
+        "src=http://",
+        "src=https://",
+        "href=http://",
+        "href=https://",
         "src=\"//",
+        "src='//",
         "href=\"//",
+        "href='//",
+        "src=//",
+        "href=//",
         "@import",
         "url(http",
     ] {

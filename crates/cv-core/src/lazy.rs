@@ -55,6 +55,36 @@ impl PersistedHead {
 /// a change while it is read is an error. Identity is captured for this demand, without a
 /// historical source stamp.
 pub fn read_head_checked(path: &Path, max_bytes: usize) -> anyhow::Result<PersistedHead> {
+    let mut text = String::new();
+    let max = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    Ok(
+        match read_checked(path, max, max_bytes.clamp(1, 1 << 20), &mut |piece| {
+            text.push_str(piece);
+            Ok(())
+        })? {
+            PersistedHead::Text(_) => PersistedHead::Text(text),
+            other => other,
+        },
+    )
+}
+
+/// [`read_head_checked`] over the whole file, handed to `each` in pieces of at most `piece` bytes
+/// cut on character boundaries (invalid UTF-8 replaced), so a reader takes a sidecar of any size
+/// in bounded memory. On success the `Text` is empty: the text went to `each`.
+pub fn read_pieces_checked(
+    path: &Path,
+    piece: usize,
+    mut each: impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<PersistedHead> {
+    read_checked(path, u64::MAX, piece.max(4), &mut each)
+}
+
+fn read_checked(
+    path: &Path,
+    max: u64,
+    piece: usize,
+    each: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<PersistedHead> {
     use std::io::Read;
     let path = std::path::absolute(path)?;
     let unreadable = |error: &dyn std::fmt::Display| PersistedHead::Unreadable(format!("{error:#}"));
@@ -77,13 +107,45 @@ pub fn read_head_checked(path: &Path, max_bytes: usize) -> anyhow::Result<Persis
         Err(error) => return Err(error.into()),
     };
     captured.check_metadata(file.metadata()?)?;
-    let len = usize::try_from(captured.len().min(u64::try_from(max_bytes).unwrap_or(u64::MAX)))?;
-    let mut bytes = vec![0; len];
-    let result = (&file).read_exact(&mut bytes);
+    let mut left = captured.len().min(max);
+    let mut buf: Vec<u8> = Vec::with_capacity(usize::try_from(left.min(piece as u64))?.saturating_add(3));
+    let result = (|| -> anyhow::Result<()> {
+        while left > 0 {
+            let carried = buf.len();
+            let take = usize::try_from(left.min(piece as u64))?;
+            buf.resize(carried + take, 0);
+            (&file).read_exact(&mut buf[carried..])?;
+            left -= take as u64;
+            // A character cut by the piece's end waits for the next piece (the last is lossy).
+            let cut = if left == 0 { buf.len() } else { complete_prefix(&buf) };
+            each(&String::from_utf8_lossy(&buf[..cut]))?;
+            buf.drain(..cut);
+        }
+        Ok(())
+    })();
     captured.check_metadata(file.metadata()?)?;
     captured.check()?;
     result?;
-    Ok(PersistedHead::Text(String::from_utf8_lossy(&bytes).into_owned()))
+    Ok(PersistedHead::Text(String::new()))
+}
+
+/// The length of `bytes` without a trailing UTF-8 sequence its lead byte says is incomplete.
+fn complete_prefix(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let at = bytes.len() - back;
+        let b = bytes[at];
+        if b & 0xC0 == 0x80 {
+            continue;
+        }
+        let need = match b {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        return if need > back { at } else { bytes.len() };
+    }
+    bytes.len()
 }
 
 /// Content at or below this many bytes is stored inline; larger content becomes a lazy [`Span`].
@@ -133,7 +195,7 @@ impl Text {
         self.inline_str().map(|text| text == other)
     }
 
-    /// The span, if this is lazy content.
+    /// The span, when this is one (`Text::Source` is lazy with no span).
     pub fn as_span(&self) -> Option<&Span> {
         match self {
             Text::Span(sp) => Some(sp),

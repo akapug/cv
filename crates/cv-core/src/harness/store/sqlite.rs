@@ -15,13 +15,23 @@
 //! Every path's identity is captured before and checked after each read ([`ReadConnection::read`]),
 //! so a harness write during a read is an error, not a torn result.
 
+use crate::json::{ReadInput, Validation};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashSet;
 use std::path::Path;
 
+mod certify;
+#[cfg(test)]
+pub(crate) use certify::assert_rows_move_alone;
+pub(crate) use certify::{fold_value, Certificates};
+mod derived;
 #[cfg(test)]
 pub(crate) mod export_tests;
+pub(crate) mod listing;
+pub(crate) use derived::derived;
+#[cfg(test)]
+pub(crate) use derived::DERIVE_OPENS;
 mod selection;
 mod snapshots;
 pub(crate) use selection::Selection;
@@ -93,32 +103,16 @@ thread_local! {
     static BOUNDARY: std::cell::RefCell<std::sync::Weak<ReadBoundary>> = const { std::cell::RefCell::new(std::sync::Weak::new()) };
 }
 
+/// One private backing per store this operation copied, kept until the operation's last scope
+/// drops or the store's state moves (then the next open copies it again and the old backing goes
+/// once no reader holds it). Bounded by the number of distinct stores the operation opens, never by
+/// bytes: a store with WAL frames is copied once per state per operation, however large (an
+/// eviction by size copied a 4.2 GB store again each time another database opened). Disk is each
+/// such store's DB/WAL/journal bytes once (a clone on APFS shares its blocks until the store is
+/// written); memory is one small record per store.
 #[derive(Default)]
 struct SnapshotCacheState {
-    idle: std::collections::VecDeque<std::sync::Arc<ColdSnapshot>>,
-    idle_bytes: u64,
-    active: std::collections::HashMap<std::path::PathBuf, std::sync::Weak<ColdSnapshot>>,
-}
-
-const IDLE_BUDGET: u64 = 256 * 1024 * 1024;
-
-impl SnapshotCacheState {
-    fn discard_idle(&mut self, snapshot: &std::sync::Arc<ColdSnapshot>) {
-        if let Some(index) = self.idle.iter().position(|s| std::sync::Arc::ptr_eq(s, snapshot)) {
-            self.idle_bytes -= self.idle.remove(index).unwrap().copied_bytes;
-        }
-    }
-
-    fn retain_idle(&mut self, snapshot: &std::sync::Arc<ColdSnapshot>, budget: u64) {
-        self.discard_idle(snapshot);
-        // Permit one oversized backing alone. Its next session reuses it, while selecting any
-        // other database evicts it rather than allowing unbounded idle bytes.
-        while !self.idle.is_empty() && self.idle_bytes.saturating_add(snapshot.copied_bytes) > budget {
-            self.idle_bytes -= self.idle.pop_front().unwrap().copied_bytes;
-        }
-        self.idle_bytes += snapshot.copied_bytes;
-        self.idle.push_back(std::sync::Arc::clone(snapshot));
-    }
+    retained: std::collections::HashMap<std::path::PathBuf, std::sync::Arc<ColdSnapshot>>,
 }
 
 pub(crate) fn read_scope() -> ReadScope {
@@ -140,12 +134,24 @@ fn operation_boundary(namespace: &snapshots::Namespace) -> std::sync::Arc<ReadBo
 }
 
 fn reader_scope() -> ReadScope {
-    use std::sync::{Arc, Mutex, OnceLock, Weak};
-    static ACTIVE: OnceLock<Mutex<Weak<SnapshotCache>>> = OnceLock::new();
-    let mut active = ACTIVE
-        .get_or_init(|| Mutex::new(Weak::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    use std::sync::{Mutex, Weak};
+    #[cfg(not(test))]
+    static ACTIVE: std::sync::OnceLock<Mutex<Weak<SnapshotCache>>> = std::sync::OnceLock::new();
+    // libtest runs tests concurrently in one process. A reader in another test must not
+    // retain this test's backings after its final scope drops.
+    #[cfg(test)]
+    thread_local! {
+        static ACTIVE: Mutex<Weak<SnapshotCache>> = const { Mutex::new(Weak::new()) };
+    }
+    #[cfg(test)]
+    return ACTIVE.with(scope_from);
+    #[cfg(not(test))]
+    scope_from(ACTIVE.get_or_init(|| Mutex::new(Weak::new())))
+}
+
+fn scope_from(active: &std::sync::Mutex<std::sync::Weak<SnapshotCache>>) -> ReadScope {
+    use std::sync::{Arc, Mutex};
+    let mut active = active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let cache = active.upgrade().unwrap_or_else(|| {
         let cache = Arc::new(SnapshotCache {
             state: Mutex::new(SnapshotCacheState::default()),
@@ -163,7 +169,6 @@ struct ColdSnapshot {
     directory: std::path::PathBuf,
     directory_identity: snapshots::Identity,
     database: std::path::PathBuf,
-    copied_bytes: u64,
     _owner: Option<std::sync::Arc<snapshots::Owner>>,
 }
 
@@ -190,127 +195,11 @@ pub(crate) fn cached_discover(
     discover: impl FnOnce() -> Result<Vec<crate::SessionRef>>,
 ) -> Result<Vec<crate::SessionRef>> {
     let path = std::path::absolute(db)?;
-    crate::discover_cache::cached_scan_many_with_reads(&path, store_reads(&path), discover)
-}
-
-/// The identities a database's contents depend on: the file, its WAL and its rollback journal
-/// (each its inode, size and mtime, or its absence). SHM is coordination state a reader rewrites.
-fn store_reads(path: &Path) -> crate::source::ReadSet {
     let mut reads = crate::source::ReadSet::default();
-    reads.record(path);
-    reads.record(&sidecar(path, "-wal"));
-    reads.record(&sidecar(path, "-journal"));
-    reads
-}
-
-/// A value `derive` computes from one database, kept beside cv's catalog under the database's
-/// [`store_reads`]. While those stat as they did when `derive` ran, the value comes back without
-/// copying or opening the database, in this process or a later one; a changed store, an
-/// unreadable or foreign record, or no writable catalog runs `derive` over [`open_ro`] again.
-/// `derive` must depend only on that database; its errors are returned and never kept.
-pub(crate) fn derived<T>(
-    db: &Path,
-    purpose: &str,
-    derive: impl FnOnce(&Connection, &Path) -> Result<T>,
-) -> Result<std::sync::Arc<T>>
-where
-    T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
-{
-    use std::sync::{Arc, PoisonError};
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct Derived<T> {
-        db: std::path::PathBuf,
-        purpose: String,
-        reads: crate::source::ReadSet,
-        value: T,
-    }
-    let path = std::path::absolute(db)?;
-    let key = (path.clone(), purpose.to_string());
-    let fresh = |reads: &crate::source::ReadSet| reads.fresh(&mut crate::source::Probe::default());
-    let hit = DERIVED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&key)
-        .filter(|(reads, _)| fresh(reads))
-        .and_then(|(_, value)| Arc::clone(value).downcast::<T>().ok());
-    if let Some(value) = hit {
-        return Ok(value);
-    }
-    // FNV-1a names the record stably; the record's own `db` and `purpose` are what admit it.
-    let hash = path
-        .as_os_str()
-        .to_string_lossy()
-        .bytes()
-        .fold(0xcbf29ce484222325u64, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
-        });
-    let record = crate::catalog::db_path().and_then(|catalog| {
-        Some(
-            catalog
-                .parent()?
-                .join("sqlite-derived")
-                .join(format!("{purpose}-{hash:016x}.json")),
-        )
-    });
-    let stored = record
-        .as_deref()
-        .and_then(|file| std::fs::read(file).ok())
-        .and_then(|bytes| serde_json::from_slice::<Derived<T>>(&bytes).ok())
-        .filter(|d| d.db == path && d.purpose == purpose && fresh(&d.reads));
-    let (reads, value) = match stored {
-        Some(d) => (d.reads, Arc::new(d.value)),
-        None => {
-            #[cfg(test)]
-            DERIVE_OPENS.with(|n| n.set(n.get() + 1));
-            let reader = open_ro(&path)?;
-            let value = reader.read(|conn, _| derive(conn, &path))?;
-            let reads = reader.reads.clone();
-            drop(reader);
-            if let Some(file) = record.filter(|_| !crate::env::frozen()) {
-                let derived = Derived {
-                    db: path.clone(),
-                    purpose: purpose.to_string(),
-                    reads,
-                    value,
-                };
-                let written = file
-                    .parent()
-                    .map_or(Ok(()), std::fs::create_dir_all)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|()| Ok(serde_json::to_vec(&derived)?))
-                    .and_then(|bytes| {
-                        crate::publish::publish_reader(
-                            &file,
-                            "derived",
-                            bytes.as_slice(),
-                            crate::publish::Claim::Replace,
-                        )
-                    });
-                if let Err(error) = written {
-                    crate::env::warn_once("the SQLite derived cache", error);
-                }
-                (derived.reads, Arc::new(derived.value))
-            } else {
-                (reads, Arc::new(value))
-            }
-        }
-    };
-    DERIVED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(key, (reads, Arc::clone(&value) as Arc<dyn std::any::Any + Send + Sync>));
-    Ok(value)
-}
-
-/// [`derived`]'s values in this process, each with the read set it was derived under.
-type Kept = (crate::source::ReadSet, std::sync::Arc<dyn std::any::Any + Send + Sync>);
-static DERIVED: std::sync::Mutex<std::collections::BTreeMap<(std::path::PathBuf, String), Kept>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-#[cfg(test)]
-thread_local! {
-    /// How many times [`derived`] opened its database on this thread.
-    pub(crate) static DERIVE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    reads.record(&path);
+    reads.record(&sidecar(&path, "-wal"));
+    reads.record(&sidecar(&path, "-journal"));
+    crate::discover_cache::cached_scan_many_with_reads(&path, reads, discover)
 }
 
 fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
@@ -361,9 +250,8 @@ pub(crate) fn binary_text_columns(conn: &Connection, table: &str, names: &[&str]
 }
 
 /// Open a harness database without writing anything in its directory (see the module docs).
-/// Snapshots of WAL-mode stores with frames live in a private directory; an operation-local LRU
-/// retains at most 256 MiB of copied DB/WAL/journal bytes, or one larger backing alone. Weak
-/// lookup reuses active readers without increasing idle disk retention. `std::fs::copy` clones
+/// Snapshots of WAL-mode stores with frames live in a private directory, one per store and store
+/// state for the operation ([`SnapshotCacheState`]). `std::fs::copy` clones
 /// on APFS (0.01 s for a 267 MB store) and copies elsewhere (0.26 s for the same file here).
 pub(crate) fn open_ro(path: &Path) -> Result<ReadConnection> {
     open_ro_with_copy_check(path, |_| Ok(()))
@@ -371,12 +259,11 @@ pub(crate) fn open_ro(path: &Path) -> Result<ReadConnection> {
 
 fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>) -> Result<ReadConnection> {
     use std::sync::Arc;
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let reads = store_reads(&path);
+    let path = std::path::absolute(path)?;
+    let mut reads = crate::source::ReadSet::default();
+    reads.record(&path);
+    reads.record(&sidecar(&path, "-wal"));
+    reads.record(&sidecar(&path, "-journal"));
     let has_frames = std::fs::metadata(sidecar(&path, "-wal")).is_ok_and(|m| m.len() > 0);
     let has_journal = sidecar(&path, "-journal").exists();
     let immutable = !has_frames && !has_journal;
@@ -387,18 +274,15 @@ fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("SQLite snapshot cache poisoned"))?;
-        cache.active.retain(|_, snapshot| snapshot.strong_count() > 0);
-        let existing = cache.active.get(&path).and_then(std::sync::Weak::upgrade);
-        if let Some(snapshot) = existing
-            .as_ref()
+        if let Some(snapshot) = cache
+            .retained
+            .get(&path)
             .filter(|s| s.reads.fresh(&mut crate::source::Probe::default()))
         {
-            cache.retain_idle(snapshot, IDLE_BUDGET);
             Some(Arc::clone(snapshot))
         } else {
-            if let Some(stale) = existing {
-                cache.discard_idle(&stale);
-            }
+            // A moved store's old backing goes once no reader holds it.
+            cache.retained.remove(&path);
             let owner = {
                 let mut slot = scope
                     .cache
@@ -412,12 +296,11 @@ fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>
             };
             let directory = owner.snapshot_directory()?;
             let directory_identity = snapshots::snapshot_identity(&directory)?;
-            let mut snapshot = ColdSnapshot {
+            let snapshot = ColdSnapshot {
                 reads: reads.clone(),
                 database: directory.join("store.db"),
                 directory,
                 directory_identity,
-                copied_bytes: 0,
                 _owner: Some(owner),
             };
             #[cfg(unix)]
@@ -427,21 +310,17 @@ fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>
             }
             // std::fs::copy uses clonefile on APFS and bounded OS copying elsewhere. Never copy
             // SHM: it contains live coordination state; SQLite rebuilds it only in our directory.
-            snapshot.copied_bytes = std::fs::copy(&path, &snapshot.database)?;
+            std::fs::copy(&path, &snapshot.database)?;
             for suffix in ["-wal", "-journal"] {
                 let original = sidecar(&path, suffix);
                 if original.exists() {
-                    snapshot.copied_bytes = snapshot
-                        .copied_bytes
-                        .checked_add(std::fs::copy(original, sidecar(&snapshot.database, suffix))?)
-                        .context("SQLite snapshot byte size overflow")?;
+                    std::fs::copy(original, sidecar(&snapshot.database, suffix))?;
                 }
             }
             copied(&snapshot.database)?;
             check_reads(&reads)?;
             let snapshot = Arc::new(snapshot);
-            cache.active.insert(path.clone(), Arc::downgrade(&snapshot));
-            cache.retain_idle(&snapshot, IDLE_BUDGET);
+            cache.retained.insert(path.clone(), Arc::clone(&snapshot));
             Some(snapshot)
         }
     } else {
@@ -492,7 +371,7 @@ pub(crate) fn append_cell(
 ) -> Result<(u64, u64)> {
     if let Ok(mut blob) = conn.blob_open(rusqlite::DatabaseName::Main, table, column, rowid, true) {
         return arena.append(|writer| {
-            let mut buffer = [0u8; 64 * 1024];
+            let mut buffer = [0u8; super::IO_CHUNK];
             loop {
                 let read = std::io::Read::read(&mut blob, &mut buffer)?;
                 if read == 0 {
@@ -602,7 +481,7 @@ impl Cells {
             if blob.is_empty() {
                 return Ok(None);
             }
-            let mut blob = std::io::BufReader::with_capacity(64 * 1024, blob);
+            let mut blob = std::io::BufReader::with_capacity(super::IO_CHUNK, blob);
             self.arena.append(|writer| decode(&mut blob, writer))?
         } else {
             let ValueRef::Blob(mut bytes) = row.get_ref(i)? else {
@@ -699,7 +578,11 @@ impl Cells {
         cell: Cell,
         f: impl for<'a> FnOnce(crate::json::JsonView<'a>) -> Result<T>,
     ) -> Result<Option<T>> {
-        match self.source.read_backing_value(self.arena.clone(), cell.0, cell.1, f) {
+        match self.source.read(
+            ReadInput::Backing(self.arena.clone(), cell.0, cell.1),
+            Validation::Value,
+            f,
+        ) {
             Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => Ok(None),
             result => result.map(Some),
         }
@@ -942,7 +825,6 @@ mod tests {
             directory_identity: snapshots::snapshot_identity(&directory).unwrap(),
             directory: directory.clone(),
             database,
-            copied_bytes: 0,
             _owner: None,
         };
         let saved = directory.with_extension("saved");
@@ -1056,6 +938,8 @@ mod tests {
         let second_database = directory.join("other.db");
         let _second_writer = live_store(&second_database, "CREATE TABLE t(x);");
         let scope = read_scope();
+        // Model another libtest thread retaining a scope across this test's cleanup.
+        let unrelated = std::thread::spawn(read_scope).join().unwrap();
         let first = open_ro(&database).unwrap();
         let first_backing = first._snapshot.as_ref().unwrap().directory.clone();
         let second = open_ro(&second_database).unwrap();
@@ -1066,51 +950,38 @@ mod tests {
         drop(again);
         assert!(first_backing.exists());
         drop(second);
-        assert!(second_backing.exists()); // Both small backings fit the byte budget.
+        assert!(second_backing.exists());
         drop(scope);
         assert!(!first_backing.exists());
         assert!(!second_backing.exists());
+        drop(unrelated);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A copied store lives for the operation however many other databases it opens: a WAL
+    /// store is copied once per state, never again because another store was copied after it.
     #[test]
-    fn idle_byte_budget_evicts_lru_and_permits_only_one_oversized_backing() {
-        use std::sync::Arc;
-        fn backing(bytes: u64) -> Arc<ColdSnapshot> {
-            let (directory, database) = fixture();
-            std::fs::File::create(&database).unwrap().set_len(bytes).unwrap();
-            Arc::new(ColdSnapshot {
-                reads: crate::source::ReadSet::default(),
-                directory_identity: snapshots::snapshot_identity(&directory).unwrap(),
-                directory,
-                database,
-                copied_bytes: bytes,
-                _owner: None,
+    fn a_copied_store_outlives_every_other_open_in_its_operation() {
+        let _serial = SNAPSHOT_TEST.lock().unwrap();
+        let (directory, database) = fixture();
+        let _writer = live_store(&database, "CREATE TABLE t(x); INSERT INTO t VALUES(7);");
+        let others: Vec<_> = (0..4)
+            .map(|i| {
+                let other = directory.join(format!("other-{i}.db"));
+                (live_store(&other, "CREATE TABLE t(x);"), other)
             })
+            .collect();
+        let scope = read_scope();
+        let first = open_ro(&database).unwrap()._snapshot.unwrap().directory.clone();
+        for (_, other) in &others {
+            drop(open_ro(other).unwrap());
+            let again = open_ro_with_copy_check(&database, |_| panic!("an unchanged store was copied again")).unwrap();
+            assert_eq!(again._snapshot.as_ref().unwrap().directory, first);
         }
-        let mut cache = SnapshotCacheState::default();
-        let a = backing(100);
-        let b = backing(100);
-        let c = backing(100);
-        cache.retain_idle(&a, 256);
-        cache.retain_idle(&b, 256);
-        cache.retain_idle(&a, 256);
-        cache.retain_idle(&c, 256);
-        assert_eq!(cache.idle_bytes, 200);
-        assert_eq!(Arc::strong_count(&a), 2);
-        assert_eq!(Arc::strong_count(&b), 1); // Active reader survives idle eviction.
-        let b_path = b.directory.clone();
-        drop(b);
-        assert!(!b_path.exists());
-        let oversized = backing(300);
-        cache.retain_idle(&oversized, 256);
-        assert_eq!(cache.idle.len(), 1);
-        assert_eq!(cache.idle_bytes, 300);
-        let tiny = backing(1);
-        cache.retain_idle(&tiny, 256);
-        assert_eq!(cache.idle.len(), 1);
-        assert_eq!(cache.idle_bytes, 1);
-        assert_eq!(Arc::strong_count(&oversized), 1);
+        drop(scope);
+        assert!(!first.exists());
+        drop(others);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1154,50 +1025,6 @@ mod tests {
         ])
         .enter();
         (root, scope)
-    }
-
-    fn sum(conn: &Connection, _: &Path) -> Result<i64> {
-        Ok(conn.query_row("SELECT sum(x) FROM t", [], |row| row.get(0))?)
-    }
-
-    /// A store whose db, WAL and journal stat as they did is answered from cv's own record,
-    /// in this process and a later one, with no copy and no open; a touched WAL derives again.
-    #[test]
-    fn derived_skips_an_unchanged_store_and_rederives_a_touched_wal() {
-        let _serial = SNAPSHOT_TEST.lock().unwrap();
-        let (root, _env) = catalog_home();
-        let (directory, database) = fixture();
-        let writer = live_store(&database, "CREATE TABLE t(x); INSERT INTO t VALUES(7);");
-        let opens = || DERIVE_OPENS.with(std::cell::Cell::get);
-        let before = opens();
-        assert_eq!(*derived(&database, "sum", sum).unwrap(), 7);
-        assert_eq!(opens(), before + 1);
-        let records: Vec<_> = std::fs::read_dir(root.join("catalog/sqlite-derived"))
-            .unwrap()
-            .collect();
-        assert_eq!(records.len(), 1, "one record beside the catalog");
-        assert_eq!(*derived(&database, "sum", sum).unwrap(), 7);
-        // A later process has only the record.
-        DERIVED.lock().unwrap().clear();
-        assert_eq!(
-            *derived(&database, "sum", |_: &Connection, _: &Path| -> Result<i64> {
-                panic!("an unchanged store was opened")
-            })
-            .unwrap(),
-            7
-        );
-        assert_eq!(opens(), before + 1, "unchanged: neither copied nor opened");
-        writer.execute("INSERT INTO t VALUES(8)", []).unwrap();
-        assert_eq!(*derived(&database, "sum", sum).unwrap(), 15);
-        assert_eq!(opens(), before + 2, "a touched WAL derives again");
-        // A record of another store or purpose never answers.
-        assert_eq!(
-            *derived(&database, "other", |_: &Connection, _: &Path| Ok(1i64)).unwrap(),
-            1
-        );
-        drop(writer);
-        std::fs::remove_dir_all(directory).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A cold WAL copy is staged under cv's catalog directory, not the temporary directory,

@@ -201,26 +201,26 @@ fn codex_id(name: &str, text: &str) -> String {
 ///
 /// Each file's bytes are decoded as UTF-8 (lossy) and its harness sniffed by content. Files that
 /// can't be classified are skipped. Works without any filesystem access (wasm-safe).
-pub fn ingest_files(files: Vec<(String, Vec<u8>)>) -> Vec<Session> {
+pub fn ingest_files(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<Vec<Session>> {
     let mut out = Vec::new();
     for (name, bytes) in files {
         let text = String::from_utf8_lossy(&bytes);
         match sniff(&name, &text) {
             Sniff::Codex { is_jsonl } => {
                 let id = codex_id(&name, &text);
-                out.push(codex::parse_str(&id, &text, is_jsonl, None));
+                out.push(codex::parse_str(&id, &text, is_jsonl, None)?);
             }
             Sniff::Claude => {
                 let id = file_stem(&name).to_string();
                 out.push(claude::parse_str(&id, &text, None));
             }
             Sniff::Gemini => {
-                out.extend(gemini::parse_all_str(&text, None));
+                out.extend(gemini::parse_all_str(&text, None)?);
             }
             Sniff::Unknown => {}
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -244,7 +244,7 @@ mod tests {
                 CODEX_SAMPLE.as_bytes().to_vec(),
             ),
         ];
-        let sessions = ingest_files(files);
+        let sessions = ingest_files(files).unwrap();
         assert_eq!(sessions.len(), 2);
 
         let claude = sessions
@@ -276,7 +276,7 @@ mod tests {
         lines.push(CLAUDE_SAMPLE.to_string());
         let text = lines.join("\n");
 
-        let sessions = ingest_files(vec![("abc.jsonl".to_string(), text.into_bytes())]);
+        let sessions = ingest_files(vec![("abc.jsonl".to_string(), text.into_bytes())]).unwrap();
         assert_eq!(sessions.len(), 1, "meta-heavy claude transcript should ingest");
         assert_eq!(sessions[0].harness, Harness::Claude);
         assert_eq!(sessions[0].messages.len(), 2);
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn skips_unclassifiable() {
         let files = vec![("random.txt".to_string(), b"just some text".to_vec())];
-        assert!(ingest_files(files).is_empty());
+        assert!(ingest_files(files).unwrap().is_empty());
     }
 
     // A legacy whole-file ConversationRecord object (sessionId + projectHash + messages).
@@ -307,7 +307,7 @@ mod tests {
             "session-123.json".to_string(),
             GEMINI_LEGACY_RECORDING.as_bytes().to_vec(),
         )];
-        let sessions = ingest_files(files);
+        let sessions = ingest_files(files).unwrap();
         assert!(!sessions.is_empty(), "legacy recording should yield ≥1 session");
         assert!(sessions.iter().all(|s| s.harness == Harness::Gemini));
         assert_eq!(sessions[0].id, "g-legacy-1");
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn ingests_gemini_modern_jsonl() {
         let files = vec![("session-456.jsonl".to_string(), GEMINI_MODERN_JSONL.as_bytes().to_vec())];
-        let sessions = ingest_files(files);
+        let sessions = ingest_files(files).unwrap();
         assert!(!sessions.is_empty(), "modern jsonl recording should yield ≥1 session");
         assert!(sessions.iter().all(|s| s.harness == Harness::Gemini));
         assert_eq!(sessions[0].id, "g-modern-1");
@@ -328,7 +328,7 @@ mod tests {
             "checkpoint-test.json".to_string(),
             GEMINI_CHECKPOINT.as_bytes().to_vec(),
         )];
-        let sessions = ingest_files(files);
+        let sessions = ingest_files(files).unwrap();
         assert!(!sessions.is_empty(), "checkpoint should yield ≥1 session");
         assert!(sessions.iter().all(|s| s.harness == Harness::Gemini));
     }
@@ -343,7 +343,7 @@ mod tests {
                 CODEX_SAMPLE.as_bytes().to_vec(),
             ),
         ];
-        let sessions = ingest_files(files);
+        let sessions = ingest_files(files).unwrap();
         assert!(sessions.iter().any(|s| s.harness == Harness::Claude));
         assert!(sessions.iter().any(|s| s.harness == Harness::Codex));
         assert!(!sessions.iter().any(|s| s.harness == Harness::Gemini));

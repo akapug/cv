@@ -64,7 +64,7 @@ pub mod tools;
 pub(crate) mod utf8;
 pub mod watch;
 
-pub use emit::{emit, EmitOptions};
+pub use emit::{emit, EmitOptions, SidechainOf};
 pub use harness::{Adapter, Discovered, EmitResult, Skipped};
 pub use ir::*;
 pub use json::{Json, JsonRange, JsonView};
@@ -304,9 +304,17 @@ fn refresh_harness(h: Harness, catalog: &mut catalog::Reader) {
     let _ = discover_harness(h, Some(catalog));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Scoped discoveries this thread ran: the agent-lookup test's counter.
+    static HARNESS_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Enumerate one complete harness scope without certifying freshness of the rest of the fleet.
 /// Returns the freshly discovered refs even when the catalog cannot be opened or published.
 fn discover_harness(h: Harness, mut catalog: Option<&mut catalog::Reader>) -> Option<Vec<SessionRef>> {
+    #[cfg(test)]
+    HARNESS_DISCOVERIES.with(|n| n.set(n.get() + 1));
     let a = harness::for_harness(h)?;
     let _sources = source::read_scope();
     let _cache_scope = catalog.as_ref().map(|reader| reader.discovery_scope());
@@ -453,12 +461,12 @@ fn workflow_store(h: Harness) -> Option<&'static dyn harness::Workflows> {
     harness::rootless(h)?.workflows()
 }
 
-/// Every harness whose adapter keeps a run store, with its sessions (each discovered whole).
+/// Every session whose adapter keeps a run store, with that store: the catalog's rows
+/// ([`sessions`], freshness-probed), never a rediscovery of the harness per call.
 fn workflow_sessions() -> Vec<(SessionRef, &'static dyn harness::Workflows)> {
-    Harness::ALL
-        .iter()
-        .filter_map(|h| workflow_store(*h).map(|w| (*h, w)))
-        .flat_map(|(h, w)| sessions_for(Some(h)).into_iter().map(move |r| (r, w)))
+    sessions()
+        .into_iter()
+        .filter_map(|r| workflow_store(r.harness).map(|w| (r, w)))
         .collect()
 }
 
@@ -495,8 +503,8 @@ pub fn find_workflows_by_name(name: &str) -> Vec<(SessionRef, Workflow)> {
 
 /// Find the parent session(s) of a sub-agent by its `agent-…` id (or bare/prefix form) — so an
 /// agent can be opened directly (`cv show <agent-id>`) without first knowing which session
-/// spawned it. A filename scan of each run-store session's agent transcripts
-/// ([`harness::Workflows::has_agent`]), in parallel; nothing is parsed.
+/// spawned it. A filename scan of each cataloged run-store session's agent transcripts
+/// ([`harness::Workflows::has_agent`]), in parallel; nothing is parsed or rediscovered.
 pub fn find_subagent_parents(agent_id: &str) -> Vec<SessionRef> {
     let want = format!("agent-{}", agent_id.strip_prefix("agent-").unwrap_or(agent_id));
     let refs = workflow_sessions();
@@ -745,7 +753,7 @@ fn ambiguous<'a>(id: &str, hits: impl Iterator<Item = &'a SessionRef>) -> anyhow
 
 /// A hermetic world whose environment this thread's library calls read (see [`env`]).
 #[cfg(test)]
-pub(crate) fn test_world(tag: &str) -> cv_testkit::InProcess<env::Scope> {
+pub(crate) fn test_world(tag: &str) -> cv_testkit::InProcess<env::Isolated> {
     cv_testkit::World::in_process(tag, env::Env::enter_isolated)
 }
 
@@ -807,6 +815,35 @@ mod copy_authority_tests {
         assert!(
             cataloged_sessions().is_empty(),
             "vanished qualified roots clear only their rows"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "sqlite")]
+    fn agent_lookups_read_the_catalog_not_a_rediscovery() {
+        let world = crate::test_world("agent-lookup");
+        world.write_session(
+            "parent",
+            &[serde_json::json!({"type":"user","sessionId":"parent","message":{"role":"user","content":"spawn"}})],
+        );
+        world.write_agent(
+            "parent",
+            "a1b2c3",
+            &serde_json::json!({}),
+            &[serde_json::json!({"type":"user","sessionId":"parent","isSidechain":true,"message":{"role":"user","content":"task"}})],
+        );
+        cv_testkit::settle(&world.home);
+        assert_eq!(sessions().len(), 1, "a warm catalog");
+        let before = HARNESS_DISCOVERIES.with(std::cell::Cell::get);
+        for _ in 0..3 {
+            let parents = find_subagent_parents("agent-a1b2");
+            assert_eq!(parents.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["parent"]);
+        }
+        assert!(find_subagent_parents("agent-ffff").is_empty());
+        assert_eq!(
+            HARNESS_DISCOVERIES.with(std::cell::Cell::get),
+            before,
+            "a lookup by agent id rediscovered the harness"
         );
     }
 

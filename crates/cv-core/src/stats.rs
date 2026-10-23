@@ -8,7 +8,7 @@
 //! and said so in the UI.
 
 use crate::ir::{home_rel, Harness, Message, SessionRef, Usage};
-use crate::spill::{ExactStrings, Ordered, Record};
+use crate::spill::{read_string, write_string, ExactStrings, Ordered, Record};
 use crate::stream::{Demand, Flow};
 #[cfg(feature = "sqlite")]
 mod usage_cache;
@@ -31,8 +31,8 @@ pub struct CorpusStats {
     /// Sessions whose turns no listing, full read or index has counted yet.
     pub uncounted: usize,
     pub by_harness: Vec<(&'static str, usize)>,
-    /// Every cwd, home-relative (`~/dev/x`), `(no cwd)` for sessions that record none. The full
-    /// list; [`CorpusStats::to_json`] and the table take the first [`TOP_CWDS`].
+    /// The [`TOP_CWDS`] most common cwds, home-relative (`~/dev/x`), `(no cwd)` for sessions that
+    /// record none — everything [`CorpusStats::to_json`] and the table show.
     pub top_cwds: Vec<(String, usize)>,
     pub earliest_created: Option<DateTime<Utc>>,
     pub latest_updated: Option<DateTime<Utc>>,
@@ -65,6 +65,7 @@ impl CorpusStats {
         stats.by_harness.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         stats.top_cwds = per_cwd.into_iter().collect();
         stats.top_cwds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        stats.top_cwds.truncate(TOP_CWDS);
         stats
     }
 
@@ -143,15 +144,16 @@ impl TokenRow {
     }
 
     fn add(&mut self, u: &Usage) {
-        self.calls += 1;
-        self.input += u.input_tokens.unwrap_or(0);
-        self.cache_read += u.cache_read_tokens.unwrap_or(0);
-        self.cache_write += u.cache_creation_tokens.unwrap_or(0);
-        self.output += u.output_tokens.unwrap_or(0);
-        self.reasoning += u.reasoning_tokens.unwrap_or(0);
-        if let Some(c) = u.cost_usd {
-            self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + c);
-        }
+        self.absorb(&TokenRow {
+            calls: 1,
+            input: u.input_tokens.unwrap_or(0),
+            cache_read: u.cache_read_tokens.unwrap_or(0),
+            cache_write: u.cache_creation_tokens.unwrap_or(0),
+            output: u.output_tokens.unwrap_or(0),
+            reasoning: u.reasoning_tokens.unwrap_or(0),
+            cost_usd: u.cost_usd,
+            ..TokenRow::default()
+        });
     }
 
     fn absorb(&mut self, o: &TokenRow) {
@@ -227,12 +229,6 @@ fn usage_hits(
     let Some(adapter) = crate::harness::for_harness(r.harness) else {
         return Ok(None);
     };
-    #[cfg(feature = "sqlite")]
-    // Below its adapter's floor a transcript costs less to parse than to validate and replay a ledger.
-    let cache = cache.filter(|_| {
-        let floor = adapter.capabilities().usage_cache_floor;
-        floor == 0 || std::fs::metadata(adapter.resume_source(r)).is_ok_and(|metadata| metadata.len() >= floor)
-    });
     #[cfg(feature = "sqlite")]
     let source = cache.map(|_| crate::source::Probe::default().snapshot(r));
     #[cfg(feature = "sqlite")]
@@ -362,35 +358,6 @@ impl Record for UsageHit {
         })
     }
 }
-fn write_string(writer: &mut impl Write, value: Option<&str>) -> Result<()> {
-    writer.write_all(&[u8::from(value.is_some())])?;
-    if let Some(value) = value {
-        writer.write_all(&(value.len() as u64).to_le_bytes())?;
-        writer.write_all(value.as_bytes())?;
-    }
-    Ok(())
-}
-fn read_string(reader: &mut impl BufRead, limit: Option<usize>) -> Result<Option<String>> {
-    let mut flag = [0];
-    reader.read_exact(&mut flag)?;
-    match flag[0] {
-        0 => Ok(None),
-        1 => {
-            let mut bytes = [0; 8];
-            reader.read_exact(&mut bytes)?;
-            let len = usize::try_from(u64::from_le_bytes(bytes)).context("usage spool string too large")?;
-            anyhow::ensure!(
-                limit.is_none_or(|limit| len <= limit),
-                "usage cache string exceeds source budget"
-            );
-            let mut bytes = vec![0; len];
-            reader.read_exact(&mut bytes)?;
-            Ok(Some(String::from_utf8(bytes).context("invalid usage spool UTF-8")?))
-        }
-        _ => anyhow::bail!("invalid usage spool string"),
-    }
-}
-
 /// Token aggregation needs the full forest and its metadata order, without task descriptions or
 /// journaled return bodies ([`crate::SubagentDemand::Sessions`]).
 fn subagent_usage_refs(r: &SessionRef) -> Result<Vec<SessionRef>> {
@@ -448,7 +415,11 @@ impl TokenStats {
     /// Ordinary source parse failures are counted; temporary storage failures are returned.
     pub fn compute(refs: &[SessionRef]) -> Result<TokenStats> {
         let _sources = crate::source::read_scope();
-        let result = Self::compute_pass(refs, true);
+        let result = Self::compute_pass(
+            refs,
+            #[cfg(feature = "sqlite")]
+            true,
+        );
         #[cfg(feature = "sqlite")]
         if result
             .as_ref()
@@ -456,11 +427,15 @@ impl TokenStats {
         {
             // No totals leave a failed pass. Corrupt cached bytes are evicted and a complete
             // source pass recovers the result; the ordered exact-ID fold starts afresh.
-            return Self::compute_pass(refs, false);
+            return Self::compute_pass(
+                refs,
+                #[cfg(feature = "sqlite")]
+                false,
+            );
         }
         result
     }
-    fn compute_pass(refs: &[SessionRef], _reuse: bool) -> Result<TokenStats> {
+    fn compute_pass(refs: &[SessionRef], #[cfg(feature = "sqlite")] reuse: bool) -> Result<TokenStats> {
         #[cfg(feature = "sqlite")]
         let cache = usage_cache::Cache::new();
         let mut stats = TokenStats {
@@ -482,7 +457,7 @@ impl TokenStats {
                 let parsed = parse_chunk(
                     chunk,
                     #[cfg(feature = "sqlite")]
-                    if _reuse { cache.as_ref() } else { None },
+                    if reuse { cache.as_ref() } else { None },
                 );
                 for batch in parsed {
                     match batch? {
@@ -520,7 +495,7 @@ impl TokenStats {
         }
         #[cfg(feature = "sqlite")]
         if let Some(cache) = &cache {
-            cache.finish();
+            cache.finish(refs.len() + subs.len());
         }
         fold.finish(&mut stats);
         Ok(stats)
@@ -957,7 +932,8 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[test]
-    fn tiny_native_sources_parse_without_publishing_usage_cache() -> anyhow::Result<()> {
+    /// A tiny source is cached like any other (no size floor) and replays the same stats.
+    fn tiny_native_sources_are_cached_and_replay_the_same_stats() -> anyhow::Result<()> {
         let world = crate::test_world("token-stats-tiny");
         let path = world.write_session(
             "tiny",
@@ -976,7 +952,7 @@ mod tests {
         assert!(usage_cache::Cache::new()
             .unwrap()
             .load(&r, &crate::source::Probe::default().snapshot(&r))
-            .is_none());
+            .is_some());
         frozen.check()
     }
 

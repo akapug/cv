@@ -126,7 +126,7 @@ impl<'a> RangeSource<'a> {
         std::str::from_utf8(body).map_err(|_| crate::json::InvalidJson.into())
     }
     fn of_bytes(captured: Option<crate::json::JsonSource>, bytes: &'a ByteSource, original: bool) -> Result<Self> {
-        let len = bytes.len()?;
+        let len = bytes.byte_len()?;
         let backing = match bytes.memory_bytes() {
             Some(memory) => Backing::Bytes(memory, 0, false),
             None => Backing::File(bytes.file()?),
@@ -327,6 +327,8 @@ pub(crate) fn scoped<T>(
     }
     #[cfg(not(feature = "mmap"))]
     {
+        // The range needs no pre-scoped source here: a positioned RangeSource addresses the
+        // whole capture by absolute offset, and every view applies its own extent to it.
         let _ = range;
         let source = match decoded {
             Some(bytes) => RangeSource::decoded(captured.clone(), bytes)?,

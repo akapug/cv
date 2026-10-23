@@ -28,7 +28,7 @@ mod native;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     ChatGpt,
     Claude,
 }
@@ -42,71 +42,45 @@ impl Kind {
     }
 }
 
-// ── Adapters (thin wrappers over the shared engine, one per export shape) ──────
+// ── Adapters (one per export shape over the shared engine) ────────────────────
 
-pub struct ChatGptExport;
-pub struct ClaudeExport;
-impl Adapter for ChatGptExport {
-    fn harness(&self) -> Harness {
-        Harness::ChatGptExport
-    }
-    fn roots(&self) -> Vec<PathBuf> {
-        export_dirs()
-    }
-    fn discover(&self) -> Result<crate::Discovered> {
-        Ok(discover_kind(Kind::ChatGpt))
-    }
-    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
-        crate::stream::checked(sink, |sink| native::stream(Kind::ChatGpt, r, opts, sink))
-    }
-}
-
-impl Adapter for ClaudeExport {
-    fn harness(&self) -> Harness {
-        Harness::ClaudeExport
-    }
-    fn roots(&self) -> Vec<PathBuf> {
-        export_dirs()
-    }
-    fn discover(&self) -> Result<crate::Discovered> {
-        Ok(discover_kind(Kind::Claude))
-    }
-    fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
-        crate::stream::checked(sink, |sink| native::stream(Kind::Claude, r, opts, sink))
-    }
-}
-
-impl ChatGptExport {
-    /// Discover only supplied export files/directories, without consulting configuration.
-    pub fn with_roots(roots: Vec<PathBuf>) -> impl Adapter {
-        RootedExport {
-            kind: Kind::ChatGpt,
-            roots,
-        }
-    }
-}
-impl ClaudeExport {
-    /// Discover only supplied export files/directories, without consulting configuration.
-    pub fn with_roots(roots: Vec<PathBuf>) -> impl Adapter {
-        RootedExport {
-            kind: Kind::Claude,
-            roots,
-        }
-    }
-}
-struct RootedExport {
+/// One export adapter: the archive's shape ([`Kind`]) and where its files come from — the
+/// registered sources (`roots: None`, read at discovery time) or an explicit list.
+#[derive(Clone)]
+pub struct ExportAdapter {
     kind: Kind,
-    roots: Vec<PathBuf>,
+    roots: Option<Vec<PathBuf>>,
 }
-impl Adapter for RootedExport {
+
+/// The registered-sources adapter of each shape ([`super::rootless`]).
+pub(crate) static CHATGPT_EXPORT: ExportAdapter = ExportAdapter {
+    kind: Kind::ChatGpt,
+    roots: None,
+};
+pub(crate) static CLAUDE_EXPORT: ExportAdapter = ExportAdapter {
+    kind: Kind::Claude,
+    roots: None,
+};
+
+impl ExportAdapter {
+    /// Discover only supplied export files/directories, without consulting configuration.
+    pub(crate) fn with_roots(kind: Kind, roots: Vec<PathBuf>) -> Self {
+        ExportAdapter {
+            kind,
+            roots: Some(roots),
+        }
+    }
+}
+
+impl Adapter for ExportAdapter {
     fn harness(&self) -> Harness {
         self.kind.harness()
     }
     fn roots(&self) -> Vec<PathBuf> {
-        self.roots.clone()
+        self.roots.clone().unwrap_or_else(export_dirs)
     }
     fn discover(&self) -> Result<crate::Discovered> {
-        Ok(discover_kind_under(self.kind, self.roots.clone()))
+        Ok(discover_kind_under(self.kind, self.roots()))
     }
     fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| native::stream(self.kind, r, opts, sink))
@@ -183,14 +157,6 @@ fn is_conversations_file(p: &Path) -> bool {
         .is_some_and(|n| n == "conversations.json" || (n.starts_with("conversations") && n.ends_with(".json")))
 }
 
-/// Enumerate every conversation of `kind` across all export files as lightweight [`SessionRef`]s.
-/// Reads each file once: parse the array, sniff the kind from its first element, then enumerate.
-/// Dedups by conversation id (keeping the first) — overlapping exports (e.g. a loose
-/// `conversations-000.json` plus an extracted full archive) commonly repeat the same conversation.
-fn discover_kind(kind: Kind) -> crate::Discovered {
-    discover_kind_under(kind, export_dirs())
-}
-
 /// [`discover_kind_in`] over every `conversations*.json` under `roots`; an unreadable dir is
 /// reported beside the archives' own skips.
 fn discover_kind_under(kind: Kind, roots: Vec<PathBuf>) -> crate::Discovered {
@@ -204,17 +170,6 @@ fn discover_kind_under(kind: Kind, roots: Vec<PathBuf>) -> crate::Discovered {
 
 fn discover_kind_in(kind: Kind, paths: Vec<PathBuf>) -> crate::Discovered {
     native::discover(kind, paths)
-}
-
-// ── Parse one conversation ──────────────────────────────────────────────────
-
-fn role_from_str(s: &str) -> Role {
-    match s {
-        "user" | "human" => Role::User,
-        "assistant" => Role::Assistant,
-        "tool" => Role::Tool,
-        _ => Role::System,
-    }
 }
 
 #[cfg(test)]

@@ -126,7 +126,6 @@ fn invalid_queries_point_to_current_schema_command() {
         assert!(error.contains("see `cv schema`"), "{source}: {error}");
         assert!(!error.contains("cv query"), "{source}: {error}");
     }
-    assert!(reference().contains("unquoted | is always OR"));
 }
 
 #[test]
@@ -399,9 +398,15 @@ fn forest_fields_classify_and_resolve() {
 fn errors_teach() {
     // The retired sub-languages name their replacement instead of silently becoming needles.
     let err = SessionQuery::parse("title~^fix").unwrap_err();
-    assert!(err.contains("removed in 0.15.0") && err.contains("`~`"), "{err}");
+    assert!(
+        err.contains("`~`") && err.contains("`:` is substring, `=` exact") && err.contains("see `cv schema`"),
+        "{err}"
+    );
     let err = SessionQuery::parse(r#"thread:"user > assistant""#).unwrap_err();
-    assert!(err.contains("removed in 0.15.0") && err.contains("thread:"), "{err}");
+    assert!(
+        err.contains("thread:") && err.contains("select the session") && err.contains("`cv show`"),
+        "{err}"
+    );
     assert!(SessionQuery::parse("path:x").unwrap_err().contains("thread:"));
     // A bare `~` word is a needle, not an operator.
     assert!(!q("~/dev/cv").needs_parse());
@@ -508,19 +513,7 @@ fn msgs_counts_user_assistant_only_in_matches_session() {
     // SessionRef.message_count is contractually user+assistant turns only (ir.rs) — the ref view
     // matches_session builds must count the same way, or prefilter and full match disagree.
     let mut s = sess(None, &[Some("m1"), Some("m2")]); // two assistant turns
-    let extra = |role: Role| Message {
-        complete_record: None,
-        id: None,
-        parent_id: None,
-        role,
-        timestamp: None,
-        model: None,
-        content: vec![],
-        usage: None,
-        extra: serde_json::Map::new(),
-        kind: crate::ir::MessageKind::for_role(role),
-        origin: crate::ir::Origin::for_role(role),
-    };
+    let extra = |role: Role| bare_message(role, None);
     s.messages.push(extra(Role::User));
     s.messages.push(extra(Role::Tool));
     s.messages.push(extra(Role::System));
@@ -530,25 +523,26 @@ fn msgs_counts_user_assistant_only_in_matches_session() {
 
 // --- helpers ---
 
+fn bare_message(role: Role, model: Option<&str>) -> Message {
+    Message {
+        complete_record: None,
+        id: None,
+        parent_id: None,
+        role,
+        timestamp: None,
+        model: model.map(str::to_string),
+        content: vec![],
+        usage: None,
+        extra: serde_json::Map::new(),
+        kind: crate::ir::MessageKind::for_role(role),
+        origin: crate::ir::Origin::for_role(role),
+    }
+}
+
 fn sess(primary: Option<&str>, turn_models: &[Option<&str>]) -> Session {
     Session {
         model: primary.map(str::to_string),
-        messages: turn_models
-            .iter()
-            .map(|m| Message {
-                complete_record: None,
-                id: None,
-                parent_id: None,
-                role: Role::Assistant,
-                timestamp: None,
-                model: m.map(str::to_string),
-                content: vec![],
-                usage: None,
-                extra: serde_json::Map::new(),
-                kind: crate::ir::MessageKind::for_role(Role::Assistant),
-                origin: crate::ir::Origin::for_role(Role::Assistant),
-            })
-            .collect(),
+        messages: turn_models.iter().map(|m| bare_message(Role::Assistant, *m)).collect(),
         ..Session::new("s", Harness::Claude)
     }
 }
@@ -612,4 +606,28 @@ fn consulted_fact_errors_propagate_through_negation_and_boolean_terms() {
     // Keep existing order-sensitive short circuiting: these leaves are never consulted.
     assert!(q("id:a OR tool:edit").matches(&facts).unwrap());
     assert!(!q("id:absent AND tool:edit").matches(&facts).unwrap());
+}
+
+#[test]
+fn created_is_never_answered_from_the_update_time() {
+    // The listing knows only when the session was last written; it was created in January.
+    let r = refx("a", Harness::Claude, None, None, 1);
+    let mut session = Session::new("a", Harness::Claude);
+    session.created_at = "2026-01-01T00:00:00Z".parse().ok();
+    let listing = Facts::from_ref(&r);
+    let parsed = Facts {
+        r: &r,
+        session: Some(&session),
+        ext: &NoExt,
+    };
+    assert_eq!(q("created>2026-05-01").eval(&listing).unwrap(), Tri::Unknown);
+    assert_eq!(q("created>2026-05-01").eval(&parsed).unwrap(), Tri::False);
+    assert_eq!(q("created<2026-02-01").eval(&parsed).unwrap(), Tri::True);
+    session.created_at = None;
+    let parsed = Facts {
+        r: &r,
+        session: Some(&session),
+        ext: &NoExt,
+    };
+    assert_eq!(q("created>2026-05-01").eval(&parsed).unwrap(), Tri::False);
 }

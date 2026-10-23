@@ -177,6 +177,28 @@ mod tests {
                 "last_ts"
             ],
         );
+        // The detailed row's order is pinned as a literal too, not against TaskRow::KEYS: the
+        // const lives beside the struct, so struct and const could drift together unseen.
+        let detailed = serde_json::to_value(TaskRow::detailed(t, &model)).unwrap();
+        let keys: Vec<&str> = detailed.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "id",
+                "title",
+                "effective_state",
+                "assignee",
+                "repo",
+                "opened_at",
+                "last_ts",
+                "opened_by",
+                "body",
+                "notes",
+                "decision",
+                "blocked"
+            ],
+            "the backlog columns ride the timestamped row, in shipped order (issue/tags/blocked_by ride only when set)"
+        );
     }
 
     /// A detailed row with every optional column set emits exactly `TaskRow::KEYS`, in order.

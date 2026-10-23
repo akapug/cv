@@ -66,10 +66,18 @@ fn borrowed_sidecar_schema_and_staged_file_match_owned_oracle() -> anyhow::Resul
     Ok(())
 }
 #[test]
-fn owned_sidecar_deserialization_shape_and_positional_order_remain_unchanged() -> anyhow::Result<()> {
-    let sequence =
-        serde_json::json!(["id", "content", "Read", {"arg":1}, ["arbitrary original content"], 27, 1, "mixed"]);
-    let entry: SidecarEntry = serde_json::from_value(sequence)?;
+fn owned_sidecar_round_trips_the_written_shape_and_duplicate_ids_reject() -> anyhow::Result<()> {
+    let written = serde_json::to_string(&SidecarEntry {
+        id: "id".to_owned(),
+        slot: "content".into(),
+        name: "Read".into(),
+        input: serde_json::json!({"arg":1}),
+        content: serde_json::json!(["arbitrary original content"]),
+        size: 27,
+        line_count: 1,
+        kind: "mixed".into(),
+    })?;
+    let entry: SidecarEntry = serde_json::from_str(&written)?;
     assert_eq!(entry.id, "id");
     assert_eq!(entry.slot, "content");
     assert_eq!(entry.name, "Read");

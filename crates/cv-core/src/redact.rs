@@ -38,6 +38,8 @@
 //! OWNED BY the redact work.
 
 use crate::ir::{Block, Message, Session};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use regex::{Captures, Regex};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -242,10 +244,10 @@ pub fn redact_message(
     Ok(())
 }
 
-/// Recursively scrub string values inside a JSON value, leaving keys and structure intact. Public
-/// so per-block redacting renderers (dataset export) can scrub a tool input without going through
-/// [`redact_message`] on a cloned message.
-pub fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
+/// Recursively scrub string values inside a JSON value, leaving keys and structure intact.
+/// Crate-visible so per-block redacting renderers (dataset export) can scrub a tool input without
+/// going through [`redact_message`] on a cloned message.
+pub(crate) fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
     match v {
         Value::String(s) => {
             if let Cow::Owned(scrubbed) = scrub_cow(s, opts, stats) {
@@ -284,7 +286,7 @@ fn scrub(s: &str, opts: &RedactOptions, stats: &mut RedactStats) -> String {
 /// Each enabled [`Rule`] keeps its earliest guarded hit at or after the cursor; the leftmost hit
 /// wins, and at a tie the earlier rule (the order of [`rules`]) wins. An existing placeholder is a
 /// rule too (the first), consumed verbatim, which is what makes the transform idempotent.
-pub fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
+pub(crate) fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
     let rules: Vec<&Rule> = rules().iter().filter(|r| r.kind.enabled(opts)).collect();
     let mut next: Vec<Option<Hit>> = rules.iter().map(|r| r.next_hit(s, 0)).collect();
     // The redacted output, allocated lazily on the first match; `copied` is how much of `s` has
@@ -1356,7 +1358,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&value)?)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let text = source
-            .read_range_value(0, source.len(), |view| view.get("text")?.unwrap().source_text())?
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
+                view.get("text")?.unwrap().source_text()
+            })?
             .unwrap();
         let raw = crate::Json::source(&path, 0, source.len())?;
         let mut session = Session::new("redaction", crate::Harness::OpenCode);

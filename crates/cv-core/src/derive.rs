@@ -4,6 +4,7 @@ use crate::harness::store::jsonl::ranges::{self, Range};
 use crate::harness::Identity;
 use crate::ir::Harness;
 use crate::json::{Json, JsonSource};
+use crate::json::{ReadInput, Validation};
 use anyhow::Result;
 use serde_json::Value;
 use std::io::Write;
@@ -63,9 +64,9 @@ impl Select {
         // An empty line is blank like any JSON-whitespace range (a JSON range cannot be empty).
         let projected = (range.len != 0).then(|| {
             if syntax {
-                source.read_range_syntax(range.offset, range.len, read)
+                source.read(ReadInput::Range(range.offset, range.len), Validation::Syntax, read)
             } else {
-                source.read_range_value(range.offset, range.len, read)
+                source.read(ReadInput::Range(range.offset, range.len), Validation::Value, read)
             }
         });
         let (record, ids) = match projected.transpose() {
@@ -234,15 +235,14 @@ pub(crate) fn derive(
                 if normalize || payload_rewrite {
                     write_modified(view, &selection.replacements, rewrite, &mut output)
                 } else {
-                    // A pure reroot keeps the producer's accepted id roster (duplicate known fields reject restamp).
-                    for &(start, end) in &selection.ids {
-                        selection.replacements.push((
-                            source.validated_range(start, end - start)?,
-                            Value::String(rewrite.session_id.into()),
-                        ));
-                    }
-                    view.write_canonical_replacing(&selection.replacements, &mut output)?;
-                    Ok(!selection.ids.is_empty())
+                    write_pure_reroot(
+                        view,
+                        source,
+                        &selection.ids,
+                        rewrite.session_id,
+                        &mut selection.replacements,
+                        &mut output,
+                    )
                 }
             })?;
             counts.stamped += usize::from(stamped);
@@ -265,6 +265,27 @@ pub(crate) fn derive(
     source.check()?;
     counts.bytes = output.bytes;
     Ok(counts)
+}
+
+/// A reroot with no other rewrite: restamp every id span the selector validated and otherwise
+/// emit the record's own fields untouched. [`write_modified`] would restamp only the session
+/// keys and reshape standalone fields, which a pure reroot must not do behind the caller's back.
+fn write_pure_reroot(
+    view: crate::json::JsonView<'_>,
+    source: &JsonSource,
+    ids: &[(u64, u64)],
+    session_id: &str,
+    replacements: &mut Vec<(Json, Value)>,
+    writer: &mut impl Write,
+) -> Result<bool> {
+    for &(start, end) in ids {
+        replacements.push((
+            source.validated_range(start, end - start)?,
+            Value::String(session_id.into()),
+        ));
+    }
+    view.write_canonical_replacing(replacements, writer)?;
+    Ok(!ids.is_empty())
 }
 
 pub(crate) fn write_modified(

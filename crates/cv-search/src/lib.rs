@@ -107,7 +107,7 @@ pub fn row(hit: &Hit, context: &cv_core::rows::SearchRowContext) -> serde_json::
 }
 
 /// Which path answers a search: the index (authoritative; an empty result is "no match"), the
-/// semantic vectors, or a head-capped live scan of every transcript.
+/// semantic vectors, or a live scan of every transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Index,
@@ -128,8 +128,12 @@ impl Source {
 /// Why an answer may be partial. Every door states these in its own words; none is an error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Note {
-    /// How far the index trails the corpus right now ([`fts::staleness_note`]).
+    /// Sessions changed since `cv index` that this search did not read live (over `--live-bytes`,
+    /// unreadable, or `--frozen`): the index answered for them as it last saw them.
     Stale(String),
+    /// What the search read live beside the index ([`fts::Suffix`]): the sessions, their bytes,
+    /// and the `--live-bytes` budget when one was set.
+    Live(String),
     /// Nothing matched, and the index holds no sub-agent transcripts (`cv index --subagents`).
     NoSubagents,
     /// Live snippets could not be generated for the shown hits; the indexed previews stand in.
@@ -139,12 +143,13 @@ pub enum Note {
 }
 
 /// What one search found: the hits in rank order (or discovery order, live), where they came
-/// from, the degradations, and whether a live scan stopped at the limit.
+/// from, the degradations, and how many sessions matched in all.
 pub struct Found {
     pub hits: Vec<Hit>,
     pub source: Source,
     pub notes: Vec<Note>,
-    pub truncated: bool,
+    /// How many sessions matched in all; `hits` are the first `limit` of them.
+    pub total: usize,
 }
 
 /// The one search operation every door renders: `cv search` and `GET /api/search` call this with
@@ -165,9 +170,18 @@ impl From<SemanticSearch> for Searcher {
 
 impl Searcher {
     /// Errors are the path's own (an unusable index, an invalid query, a missing model); the
-    /// caller adds the door's pointer. Filters apply before ranking.
-    pub fn search(&self, query: &str, filter: SearchFilter<'_>, limit: usize, source: Source) -> Result<Found> {
-        self.search_in(&default_tantivy_dir(), query, filter, limit, source)
+    /// caller adds the door's pointer. Filters apply before ranking. A full-text search answers
+    /// from the index plus a live read of what it has not seen: all of it by default, at most
+    /// `live_bytes` of source when given, nothing under `--frozen` ([`LiveRead::of`]).
+    pub fn search(
+        &self,
+        query: &str,
+        filter: SearchFilter<'_>,
+        limit: usize,
+        source: Source,
+        live_bytes: Option<u64>,
+    ) -> Result<Found> {
+        self.search_in(&default_tantivy_dir(), query, filter, limit, source, live_bytes)
     }
 
     /// Search with an explicit full-text index location; live and semantic sources use their
@@ -179,12 +193,13 @@ impl Searcher {
         filter: SearchFilter<'_>,
         limit: usize,
         source: Source,
+        live_bytes: Option<u64>,
     ) -> Result<Found> {
         let mut found = Found {
             hits: Vec::new(),
             source,
             notes: Vec::new(),
-            truncated: false,
+            total: 0,
         };
         let harness = filter.harness.and_then(cv_core::Harness::parse);
         if filter.harness.is_some() && harness.is_none() {
@@ -204,7 +219,7 @@ impl Searcher {
                     })
                 })?;
                 found.hits = live.hits.into_iter().map(Hit::from).collect();
-                found.truncated = live.truncated;
+                found.total = live.total;
                 if let Some(first) = live.unreadable.first() {
                     found.notes.push(Note::Unscanned(format!(
                         "{} source(s) could not be read and were not scanned (first: {}: {})",
@@ -216,25 +231,31 @@ impl Searcher {
                 return Ok(found);
             }
             Source::Index => {
-                let (hits, note) = fts::search_with_snippets(dir, query, limit, filter)?;
+                let _sources = cv_core::source::read_scope();
+                let refs = cv_core::sessions_for(harness);
+                let live = LiveRead::of(live_bytes);
+                let fts::Searched {
+                    hits,
+                    total,
+                    note,
+                    suffix,
+                } = fts::search_suffixed(dir, query, limit, filter, live, &refs)?;
                 found.hits = hits;
+                found.total = total;
                 if let Some(why) = note {
                     found.notes.push(Note::SnippetsUnavailable(why));
                 }
+                found.notes.extend(suffix.read_line().map(Note::Live));
+                // Named on hits and misses: a hit list can be missing rows, not only an empty one.
+                found.notes.extend(suffix.unread_line().map(Note::Stale));
+                if found.hits.is_empty() && !suffix.no_index && !fts::has_subagent_docs(dir) {
+                    found.notes.push(Note::NoSubagents);
+                }
             }
             #[cfg(feature = "semantic")]
-            Source::Semantic => found.hits = self.semantic.search(query, limit, filter)?,
+            Source::Semantic => (found.hits, found.total) = self.semantic.search_counted(query, limit, filter)?,
             #[cfg(not(feature = "semantic"))]
             Source::Semantic => anyhow::bail!("semantic search is not built into this cv"),
-        }
-        if source == Source::Index {
-            // Named on hits and misses: a hit list can be missing rows, not only an empty one.
-            if let Some(stale) = fts::staleness_note(dir) {
-                found.notes.push(Note::Stale(stale));
-            }
-            if found.hits.is_empty() && !fts::has_subagent_docs(dir) {
-                found.notes.push(Note::NoSubagents);
-            }
         }
         Ok(found)
     }
@@ -305,6 +326,18 @@ pub fn text_search_ids_batch(
     fts::text_search_ids_batch(&dir.into().unwrap_or_else(default_tantivy_dir), queries)
 }
 
+/// [`text_search_ids_batch`] plus the live suffix the index has not seen (see
+/// [`fts::text_search_ids_suffixed`]), as `live` allows.
+pub fn text_search_ids_suffixed(
+    dir: impl Into<Option<PathBuf>>,
+    queries: &[&str],
+    live: LiveRead,
+    refs: &[cv_core::SessionRef],
+) -> Result<(Vec<Result<std::collections::HashSet<String>>>, fts::Suffix)> {
+    let _sources = cv_core::source::read_scope();
+    fts::text_search_ids_suffixed(&dir.into().unwrap_or_else(default_tantivy_dir), queries, live, refs)
+}
+
 /// Rank sessions with stored previews; no source transcripts are read.
 pub fn text_search_indexed(dir: impl Into<Option<PathBuf>>, query: &str, limit: usize) -> Result<Vec<Hit>> {
     fts::text_search_indexed(&dir.into().unwrap_or_else(default_tantivy_dir), query, limit)
@@ -358,10 +391,10 @@ pub fn embed_sessions(path: impl Into<Option<PathBuf>>, refs: &[cv_core::Session
     semantic::embed_sessions(&path.into().unwrap_or_else(default_embeddings_path), refs)
 }
 
-pub use fts::{Indexed, Unreadable};
+pub use fts::{Indexed, LiveRead, Suffix, Unreadable};
 /// Explicit lazy semantic state for a long-lived service. One-shot search remains stateless.
 #[cfg(feature = "semantic")]
-pub use semantic::SemanticSearch;
+pub use semantic::{embedded_chars, SemanticSearch};
 
 /// Embed the query and rank stored session vectors by cosine similarity (default store).
 #[cfg(feature = "semantic")]

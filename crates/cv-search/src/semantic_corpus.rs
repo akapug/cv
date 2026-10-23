@@ -5,9 +5,10 @@ use cv_core::Text;
 use cv_core::{Block, Flow, Message, MessageSink, Resolver, Role};
 
 /// Read only the semantic projection demanded for one discovered session.
-pub(crate) fn read_corpus_doc(r: &cv_core::SessionRef) -> Result<(Doc, cv_core::source::ReadSet)> {
+/// `head` bytes of the body are read: what the model embeds ([`crate::semantic`]'s `input_chars`).
+pub(crate) fn read_corpus_doc(r: &cv_core::SessionRef, head: usize) -> Result<(Doc, cv_core::source::ReadSet)> {
     let adapter = cv_core::harness::for_harness(r.harness).with_context(|| format!("no adapter for {}", r.harness))?;
-    let mut sink = DocSink::for_ref(r, &*adapter);
+    let mut sink = DocSink::for_ref(r, &*adapter, head);
     let meta = cv_core::stream::stream_counted(
         &*adapter,
         r,
@@ -35,11 +36,9 @@ pub(crate) struct Doc {
     pub body: String,
 }
 
-const EMBED_HEAD_BYTES: usize = 64 * 1024;
-
 use cv_core::projection::Head;
 
-/// What a session's vector is made of: the head of its own exchange
+/// What a session's vector is made of: the head of its own exchange, as far as the model reads it
 /// ([`cv_core::MessageKind::is_exchange`], minus turns a fork copied from its source), as the
 /// full-text `body` field holds it, and its first [`cv_core::Message::prompt_title`].
 pub(super) struct DocSink {
@@ -53,15 +52,15 @@ pub(super) struct DocSink {
     failed: bool,
 }
 impl DocSink {
-    fn for_ref(r: &cv_core::SessionRef, adapter: &dyn cv_core::Adapter) -> Self {
-        let mut sink = Self::new(Resolver::new(Some(r.path.clone())));
+    fn for_ref(r: &cv_core::SessionRef, adapter: &dyn cv_core::Adapter, head: usize) -> Self {
+        let mut sink = Self::new(Resolver::new(Some(r.path.clone())), head);
         sink.copied_before = adapter.copied_before(r, &mut sink);
         sink
     }
 
-    pub(super) fn new(resolver: Resolver) -> Self {
+    pub(super) fn new(resolver: Resolver, head: usize) -> Self {
         Self {
-            body: Head::new(EMBED_HEAD_BYTES),
+            body: Head::new(head),
             first_prompt: None,
             copied_before: None,
             reads: Default::default(),
@@ -174,6 +173,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A head size for these tests; production derives it from the model (`input_chars`).
+    const TEST_HEAD: usize = 64 * 1024;
+
     fn text(value: impl Into<String>) -> Block {
         Block::Text {
             text: Text::Inline(value.into()),
@@ -193,7 +195,7 @@ mod tests {
         message
     }
     fn sink() -> DocSink {
-        DocSink::new(Resolver::new(None))
+        DocSink::new(Resolver::new(None), TEST_HEAD)
     }
     fn prefix(text: &str, limit: usize) -> &str {
         let mut end = limit.min(text.len());
@@ -230,8 +232,8 @@ mod tests {
                 Flow::Stop
             );
             assert!(projected.take_error().is_none());
-            assert_eq!(projected.body.as_str(), prefix(&decoded, EMBED_HEAD_BYTES));
-            assert!(projected.body.capacity() <= EMBED_HEAD_BYTES);
+            assert_eq!(projected.body.as_str(), prefix(&decoded, TEST_HEAD));
+            assert!(projected.body.capacity() <= TEST_HEAD);
             assert_eq!(projected.first_prompt, Some(cv_core::ir::truncate(&decoded, 80)));
             assert!(projected.reads.fresh(&mut cv_core::source::Probe::default()));
             std::fs::write(dependency, "dependency changed or appeared").unwrap();
@@ -483,8 +485,8 @@ mod tests {
             ] {
                 let mut actual = sink();
                 actual.message(message(Role::User, vec![content]));
-                assert!(actual.body.len() <= EMBED_HEAD_BYTES);
-                assert_eq!(actual.body.capacity(), EMBED_HEAD_BYTES);
+                assert!(actual.body.len() <= TEST_HEAD);
+                assert_eq!(actual.body.capacity(), TEST_HEAD);
                 assert!(actual.first_prompt.is_none_or(|text| text.chars().count() <= 80));
             }
         }
@@ -538,7 +540,7 @@ mod tests {
             )
             .unwrap();
             let r = cv_core::SessionRef::new("head", cv_core::Harness::Claude, &path);
-            let (doc, reads) = read_corpus_doc(&r).unwrap();
+            let (doc, reads) = read_corpus_doc(&r, TEST_HEAD).unwrap();
             assert_eq!(doc.body.len(), 64 * 1024);
             assert!(doc.body.bytes().all(|byte| byte == b'x'));
             assert!(reads.fresh(&mut cv_core::source::Probe::default()));
@@ -562,7 +564,7 @@ mod tests {
             }
             let id = path.file_stem().unwrap().to_str().unwrap().to_owned();
             let r = cv_core::SessionRef::new(&id, cv_core::Harness::Claude, &path);
-            let (doc, _) = crate::read_corpus_doc(&r).unwrap();
+            let (doc, _) = crate::read_corpus_doc(&r, TEST_HEAD).unwrap();
             if doc.body.contains("corpus test repository") {
                 quoted.push(id[..8].to_owned());
             }
@@ -596,7 +598,7 @@ mod tests {
             Flow::Continue
         ));
         let projected = format!("stub\n{output}\n");
-        assert_eq!(actual.body.as_str(), prefix(&projected, EMBED_HEAD_BYTES));
+        assert_eq!(actual.body.as_str(), prefix(&projected, TEST_HEAD));
         assert!(actual.body.full());
         let saved = actual.body.as_str().to_owned();
         assert!(matches!(
@@ -623,17 +625,17 @@ mod tests {
                 len: bytes.len() as u64,
                 escaped,
             };
-            let expected = resolver.try_resolve_prefix(&span, EMBED_HEAD_BYTES as u64).unwrap();
-            let mut actual = DocSink::new(Resolver::new(Some(dir.join("source"))));
+            let expected = resolver.try_resolve_prefix(&span, TEST_HEAD as u64).unwrap();
+            let mut actual = DocSink::new(Resolver::new(Some(dir.join("source"))), TEST_HEAD);
             let prompt = message(Role::User, vec![Block::Text { text: Text::Span(span) }]);
             let expected_label = prompt.prompt_title(&resolver).unwrap();
             actual.message(prompt);
-            let mut projected = prefix(&expected, EMBED_HEAD_BYTES).to_owned();
-            if projected.len() < EMBED_HEAD_BYTES && expected.len() <= EMBED_HEAD_BYTES {
+            let mut projected = prefix(&expected, TEST_HEAD).to_owned();
+            if projected.len() < TEST_HEAD && expected.len() <= TEST_HEAD {
                 projected.push('\n');
             }
             assert_eq!(actual.body.as_str(), projected);
-            assert!(actual.body.len() <= EMBED_HEAD_BYTES);
+            assert!(actual.body.len() <= TEST_HEAD);
             assert_eq!(actual.first_prompt, expected_label);
         }
         std::fs::remove_dir_all(dir).unwrap();

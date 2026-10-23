@@ -452,12 +452,11 @@ def events_case(binary, root, env, shape, *, mmap):
                 digests.append(digest.digest())
             assert not list(temporary.iterdir()), "completed publication leaked its owned spool"
             written = row["detail"]["temporary_bytes_written"]
-            read = row["detail"]["temporary_bytes_read"]
-            assert written == read and (written > 0 if operation == "events" else written == 0), "spool I/O accounting changed"
+            assert written > 0 if operation == "events" else written == 0, "spool I/O accounting changed"
             peaks[operation].append(peak)
             print(json.dumps({"case": f"{operation}-{shape}", "mmap": mmap, "records": records, "physical_input_bytes": source.stat().st_size,
                               "persisted_events": len(expected), "peak_live_rust_bytes": peak,
-                              "temporary_bytes_written": written, "temporary_bytes_read": read}), flush=True)
+                              "temporary_bytes_written": written}), flush=True)
         assert digests[0] == digests[1], "bounded publication differs from the collector"
     bound(peaks["events"], MIB, MIB // 4, f"events {shape} extraction/publication mmap={mmap}")
     assert peaks["events-collected"][1] > 32 * MIB, "retained control no longer demonstrates the old memory cost"

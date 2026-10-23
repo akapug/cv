@@ -37,6 +37,7 @@ use crate::harness::store::{
     bytes::{ByteSource, ByteStage},
     jsonl::ranges::{self, Range},
 };
+use crate::json::{ReadInput, Validation};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -69,7 +70,7 @@ pub struct PruneOptions {
     /// relinked. Lossless (stashed in the sidecar like any other payload). Off by default — it
     /// changes more than tool output.
     pub thinking: bool,
-    /// Explicit new session id; otherwise a fresh UUIDv4.
+    /// Explicit new session id; otherwise a fresh UUIDv7.
     pub new_id: Option<String>,
     /// Also copy the session's `subagents/`/`workflows/` resource dir under the new id. Off by
     /// default — `claude --resume` doesn't need it, and for big sessions it can be hundreds of MB /
@@ -435,7 +436,7 @@ fn prune_session_after_stage(
     after_stage: impl FnOnce() -> Result<()>,
 ) -> Result<PruneResult> {
     if let Some(id) = &opts.new_id {
-        crate::restamp::validate_output_id(id)?;
+        crate::publish::validate_output_id(id)?;
     }
     let reference = crate::ir::SessionRef::from_path(src_path, harness);
     let subagent = crate::rewind::is_subagent(&reference);
@@ -461,7 +462,7 @@ fn prune_session_after_stage(
         line_no += 1;
         // An empty line is blank like any JSON-whitespace row (a JSON range cannot be empty).
         let read = (range.len != 0).then(|| {
-            source.read_range_value(range.offset, range.len, |view| {
+            source.read(ReadInput::Range(range.offset, range.len), Validation::Value, |view| {
                 decide(view, range, opts, &mut tool_names)
             })
         });
@@ -759,7 +760,7 @@ fn prune_session_after_stage(
         output
     };
     let (output, skills) = skills::apply(output, opts.skills_policy, skills::config_dir_of(src_path).as_deref())?;
-    let new_size = output.len()?;
+    let new_size = output.byte_len()?;
     let sidecar = sidecar_stage.into_inner().map_err(|e| e.into_error())?.finish()?;
 
     let sidecar_out = (!opts.drop && sidecar_count > 0).then(|| sidecar_path.clone());
@@ -1137,63 +1138,32 @@ fn source_turn_prune(
                 continue;
             }
             kept_blocks.push(original_block.to_json()?);
-            if opts.declassify {
-                if let Some(value) = projected.as_mut() {
-                    // This pass sees the generated thinking marker, as the owned pass does.
-                    let text = value.get("text").and_then(Value::as_str).unwrap_or("");
-                    let hits = declassify_hits(text, opts);
-                    if hits >= opts.declassify_min_hits {
-                        let size = text.len();
-                        let lines = text.lines().count().max(1);
-                        let id = format!("{key}#declass{index}");
-                        let marker = build_marker(
-                            &id,
-                            "declassified",
-                            &Value::Null,
-                            "text",
-                            size,
-                            lines,
-                            new_id,
-                            opts.drop,
-                        );
-                        saved += str_tokens(text).saturating_sub(str_tokens(&marker));
-                        declassified.push(source_payload(
-                            value.clone().into(),
-                            id,
-                            "content",
-                            "declassified",
-                            size,
-                            lines,
-                        ));
-                        *value = serde_json::json!({"type":"text", "text":marker});
-                    }
-                } else if ty.as_deref() == Some("text") {
-                    let text = block.get("text");
-                    let (stats, hits) = source_declassify_stats(text, opts)?;
-                    if hits >= opts.declassify_min_hits {
-                        let id = format!("{key}#declass{index}");
-                        let marker = build_marker(
-                            &id,
-                            "declassified",
-                            &Value::Null,
-                            "text",
-                            stats.bytes,
-                            stats.lines(),
-                            new_id,
-                            opts.drop,
-                        );
-                        saved += crate::ir::est_tokens_bytes(stats.bytes, TokenKind::Text)
-                            .saturating_sub(str_tokens(&marker));
-                        declassified.push(source_payload(
-                            original_block.to_json()?,
-                            id,
-                            "content",
-                            "declassified",
-                            stats.bytes,
-                            stats.lines(),
-                        ));
-                        projected = Some(serde_json::json!({"type":"text", "text":marker}));
-                    }
+            if opts.declassify && ty.as_deref() == Some("text") {
+                let text = block.get("text");
+                let (stats, hits) = source_declassify_stats(text, opts)?;
+                if hits >= opts.declassify_min_hits {
+                    let id = format!("{key}#declass{index}");
+                    let marker = build_marker(
+                        &id,
+                        "declassified",
+                        &Value::Null,
+                        "text",
+                        stats.bytes,
+                        stats.lines(),
+                        new_id,
+                        opts.drop,
+                    );
+                    saved +=
+                        crate::ir::est_tokens_bytes(stats.bytes, TokenKind::Text).saturating_sub(str_tokens(&marker));
+                    declassified.push(source_payload(
+                        original_block.to_json()?,
+                        id,
+                        "content",
+                        "declassified",
+                        stats.bytes,
+                        stats.lines(),
+                    ));
+                    projected = Some(serde_json::json!({"type":"text", "text":marker}));
                 }
             }
             if let Some(projected) = projected {
@@ -1376,18 +1346,16 @@ fn source_turn_prune(
                 })?;
             }
         }
-        Ok(Some((replacements, payloads, saved, estimate, images)))
-    })?;
-    Ok(
-        planned.map(|(replacements, payloads, saved, estimate, images)| SourcePrune {
-            record,
+        Ok(Some(SourcePrune {
+            record: record.clone(),
             replacements,
             payloads,
             saved,
             estimate,
             images,
-        }),
-    )
+        }))
+    })?;
+    Ok(planned)
 }
 fn source_payload(
     original: crate::Json,
@@ -1593,9 +1561,18 @@ impl<W: Write> Write for MarkerWriter<'_, W> {
             boundary.extend_from_slice(&bytes[..bytes.len().min(marker.len() - 1)]);
             self.found =
                 boundary.windows(marker.len()).any(|p| p == marker) || bytes.windows(marker.len()).any(|p| p == marker);
-            self.tail.extend_from_slice(bytes);
-            let keep = (marker.len() - 1).min(self.tail.len());
-            self.tail.drain(..self.tail.len() - keep);
+            // Keep only a marker's worth of stream bytes: the head of a chunk never joins the
+            // tail wholesale, so the copy stays bounded by `keep`, not by the stream.
+            let keep = marker.len() - 1;
+            if self.tail.len() + bytes.len() <= keep {
+                self.tail.extend_from_slice(bytes);
+            } else if bytes.len() >= keep {
+                self.tail.clear();
+                self.tail.extend_from_slice(&bytes[bytes.len() - keep..]);
+            } else {
+                self.tail.drain(..self.tail.len() + bytes.len() - keep);
+                self.tail.extend_from_slice(bytes);
+            }
         }
         Ok(n)
     }
@@ -1678,9 +1655,11 @@ fn revive_staged(
         }
         if rewrite {
             let start = start.context("usage row has no JSON value")?;
-            source.read_backing_value(output.clone(), start, end - start, |view| {
-                write_source_usage(view, total, honest, &mut stage)
-            })?;
+            source.read(
+                ReadInput::Backing(output.clone(), start, end - start),
+                Validation::Value,
+                |view| write_source_usage(view, total, honest, &mut stage),
+            )?;
             stage.write_all(b"\n")?;
             rewritten += 1;
             stale_max = stale_max.max(total);
@@ -1806,7 +1785,7 @@ fn anchored_window_tokens(parsed: &[Option<Decision>], before: &[Option<Est>], w
         .find_map(|v| v.facts.model.as_deref().filter(|m| *m != "<synthetic>"))
         .unwrap_or("");
     let scale = crate::ir::tokenizer_scale(model);
-    let size = |e: Est| e.tokens + e.signature + e.images * IMAGE_TOKENS;
+    let size = Est::total;
     let signature_credit = if SIGNATURES_COUNTED.contains(&model) {
         SIGNATURE_CREDIT
     } else {
@@ -1977,7 +1956,7 @@ fn pin_usage(u: &mut serde_json::Map<String, Value>, honest: u64) {
 }
 
 mod declassify;
-use declassify::{declassify_hits, source_declassify_stats};
+use declassify::source_declassify_stats;
 /// Snip the eligible payloads on one (old) user line, in place. `line_key` (the line's uuid or a
 /// file-position fallback) keys sidecar ids for blocks that carry no `tool_use_id` of their own.
 mod retrieve;

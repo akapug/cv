@@ -7,18 +7,22 @@ use std::sync::OnceLock;
 #[cfg(feature = "sqlite")]
 type Connection = Arc<std::sync::Mutex<rusqlite::Connection>>;
 type WriterKey = (crate::Harness, String, PathBuf);
+#[cfg(all(test, feature = "sqlite"))]
+#[derive(Default)]
+struct Counters {
+    opens: std::sync::atomic::AtomicUsize,
+    lookups: std::sync::atomic::AtomicUsize,
+    rows: std::sync::atomic::AtomicUsize,
+}
 struct Owner {
     writer_versions: std::sync::Mutex<std::collections::HashMap<WriterKey, Option<String>>>,
-    path: PathBuf,
+    /// The catalog this operation shares with its workers; `None` when there is no catalog home.
+    path: Option<PathBuf>,
     #[cfg(feature = "sqlite")]
     connection: OnceLock<Option<Connection>>,
     cache: std::sync::OnceLock<Arc<super::Cache>>,
     #[cfg(all(test, feature = "sqlite"))]
-    opens: std::sync::atomic::AtomicUsize,
-    #[cfg(all(test, feature = "sqlite"))]
-    lookups: std::sync::atomic::AtomicUsize,
-    #[cfg(all(test, feature = "sqlite"))]
-    rows: std::sync::atomic::AtomicUsize,
+    counters: Counters,
 }
 #[derive(Clone)]
 pub(crate) struct Context(Arc<Owner>);
@@ -46,39 +50,34 @@ impl Context {
             Self(Arc::new(Owner {
                 writer_versions: Default::default(),
                 #[cfg(feature = "sqlite")]
-                path: crate::catalog::db_path()
-                    .map(|path| catalog_key(&path))
-                    .unwrap_or_default(),
+                path: crate::catalog::db_path().map(|path| catalog_key(&path)),
                 #[cfg(not(feature = "sqlite"))]
-                path: PathBuf::new(),
+                path: None,
                 #[cfg(feature = "sqlite")]
                 connection: OnceLock::new(),
                 cache: std::sync::OnceLock::new(),
                 #[cfg(all(test, feature = "sqlite"))]
-                opens: Default::default(),
-                #[cfg(all(test, feature = "sqlite"))]
-                lookups: Default::default(),
-                #[cfg(all(test, feature = "sqlite"))]
-                rows: Default::default(),
+                counters: Default::default(),
             }))
         })
     }
     #[cfg(feature = "sqlite")]
     pub(crate) fn from_connection(connection: Connection) -> Self {
-        let path = catalog_key(std::path::Path::new(connection.lock().unwrap().path().unwrap_or("")));
-        let cell = OnceLock::new();
-        let _ = cell.set(Some(connection));
+        let key = catalog_key(std::path::Path::new(
+            connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .path()
+                .unwrap_or(""),
+        ));
         Self(Arc::new(Owner {
             writer_versions: Default::default(),
-            path,
-            connection: cell,
+            // An unnamed in-memory connection carries no catalog home.
+            path: (!key.as_os_str().is_empty()).then_some(key),
+            connection: OnceLock::from(Some(connection)),
             cache: std::sync::OnceLock::new(),
-            #[cfg(test)]
-            opens: Default::default(),
-            #[cfg(test)]
-            lookups: Default::default(),
-            #[cfg(test)]
-            rows: Default::default(),
+            #[cfg(all(test, feature = "sqlite"))]
+            counters: Default::default(),
         }))
     }
     /// Observation lifetime is this discovery operation, shared with its parallel workers.
@@ -91,14 +90,14 @@ impl Context {
         self.0
             .writer_versions
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|((h, _, _), _)| *h == harness)
             .map(|((_, id, path), version)| (id.clone(), path.to_string_lossy().into_owned(), version.clone()))
             .collect()
     }
-    pub(crate) fn path(&self) -> PathBuf {
-        self.0.path.clone()
+    pub(crate) fn path(&self) -> Option<&std::path::Path> {
+        self.0.path.as_deref()
     }
     pub(crate) fn enter(&self) -> Scope {
         let id = NEXT_SCOPE.with(|next| {
@@ -114,7 +113,24 @@ impl Context {
         f()
     }
     pub(super) fn cache(&self) -> Arc<super::Cache> {
-        self.0.cache.get_or_init(|| super::cache_for(&self.0.path)).clone()
+        let mut built = None;
+        let cache = self
+            .0
+            .cache
+            .get_or_init(|| {
+                let path = self.0.path.as_deref().unwrap_or(std::path::Path::new(""));
+                let cache = super::cache_for(path);
+                // Pin a newly built catalog cache to the environment, so it stays alive while
+                // this home is in use ([`crate::env::Env::retained`]), not just while this
+                // context lives.
+                built = Some(Arc::new((path.to_path_buf(), cache.clone())));
+                cache
+            })
+            .clone();
+        if let Some(pinned) = built {
+            *crate::env::Env::current().retained().lock().unwrap() = Some(pinned);
+        }
+        cache
     }
     #[cfg(feature = "sqlite")]
     pub(super) fn cached(&self) -> Option<Arc<super::Cache>> {
@@ -122,23 +138,26 @@ impl Context {
             .cache
             .get()
             .cloned()
-            .or_else(|| super::existing_cache(&self.0.path))
+            .or_else(|| super::existing_cache(self.0.path.as_deref().unwrap_or(std::path::Path::new(""))))
     }
     #[cfg(all(test, feature = "sqlite"))]
     pub(super) fn note_lookup(&self) {
-        self.0.lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .counters
+            .lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(all(test, feature = "sqlite"))]
     pub(super) fn note_row(&self) {
-        self.0.rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.counters.rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(all(test, feature = "sqlite"))]
     pub(super) fn work(&self) -> (usize, usize, usize) {
         use std::sync::atomic::Ordering::Relaxed;
         (
-            self.0.opens.load(Relaxed),
-            self.0.lookups.load(Relaxed),
-            self.0.rows.load(Relaxed),
+            self.0.counters.opens.load(Relaxed),
+            self.0.counters.lookups.load(Relaxed),
+            self.0.counters.rows.load(Relaxed),
         )
     }
     #[cfg(feature = "sqlite")]
@@ -156,12 +175,10 @@ impl Context {
         self.0
             .connection
             .get_or_init(|| {
-                if self.0.path.as_os_str().is_empty() {
-                    return None;
-                }
+                let path = self.0.path.as_deref()?;
                 #[cfg(test)]
-                self.0.opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                crate::catalog::open_at(&self.0.path).map(|connection| Arc::new(std::sync::Mutex::new(connection)))
+                self.0.counters.opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::catalog::open_at(path).map(|connection| Arc::new(std::sync::Mutex::new(connection)))
             })
             .clone()
     }

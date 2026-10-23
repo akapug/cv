@@ -9,14 +9,6 @@
 use super::{PruneOptions, SourceTextStats};
 use anyhow::Result;
 
-pub(super) fn declassify_hits(text: &str, opts: &PruneOptions) -> usize {
-    let lower = text.to_lowercase();
-    opts.declassify_tokens
-        .iter()
-        .filter(|token| !token.is_empty() && lower.contains(token.as_str()))
-        .count()
-}
-
 /// Match lowercase substrings with token-sized overlap, retaining valid UTF-8 boundaries.
 pub(super) struct DeclassMatcher<'a> {
     tokens: &'a [String],
@@ -259,6 +251,15 @@ pub(super) fn source_declassify_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Independent whole-string Unicode oracle, never a production codec.
+    fn declassify_hits(text: &str, opts: &PruneOptions) -> usize {
+        let lower = text.to_lowercase();
+        opts.declassify_tokens
+            .iter()
+            .filter(|token| !token.is_empty() && lower.contains(token.as_str()))
+            .count()
+    }
 
     #[test]
     fn source_declassify_matches_case_and_line_semantics_across_chunks() -> Result<()> {

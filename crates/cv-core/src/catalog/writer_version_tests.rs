@@ -15,7 +15,7 @@ fn column(r: &SessionRef) -> Option<String> {
         )
         .unwrap()
 }
-fn observe(context: &Context, r: &SessionRef, version: Option<&str>) {
+fn observe_and_sync(context: &Context, r: &SessionRef, version: Option<&str>) {
     context.run(|| {
         context.observe_writer(r, version);
         sync(std::slice::from_ref(r));
@@ -30,11 +30,11 @@ fn observations_are_monotonic_retained_and_do_not_read_sources() {
     sync(&[r.clone(), other.clone()]);
     assert_eq!(column(&r), None);
     let context = Context::current();
-    observe(&context, &r, Some("2.10.0-rc.2"));
-    observe(&context, &r, Some("2.10.0"));
+    observe_and_sync(&context, &r, Some("2.10.0-rc.2"));
+    observe_and_sync(&context, &r, Some("2.10.0"));
     // Independent operation, as with concurrent/older discovery publishing after a newer one.
-    observe(&Context::current(), &r, Some("2.9.0"));
-    observe(&Context::current(), &r, None);
+    observe_and_sync(&Context::current(), &r, Some("2.9.0"));
+    observe_and_sync(&Context::current(), &r, None);
     let mut retitled = r.clone();
     retitled.title = Some("changed".into());
     replace_harness(Harness::Claude, &[retitled, other.clone()], &[], &Default::default());
@@ -55,7 +55,7 @@ fn null_rows_remain_unknown_until_normal_observation() {
     sync(std::slice::from_ref(&r));
     assert_eq!(column(&r), None);
     assert_eq!(writer_versions()[0].unknown, 1);
-    observe(&Context::current(), &r, None);
+    observe_and_sync(&Context::current(), &r, None);
     assert_eq!(column(&r).as_deref(), Some(""));
     assert_eq!(writer_versions()[0].unknown, 1);
     sync(std::slice::from_ref(&r));
@@ -152,7 +152,7 @@ fn read_only_catalog_serves_observations_and_drops_publication() {
     use std::os::unix::fs::PermissionsExt;
     let w = crate::test_world("writer-read-only");
     let r = session(&w.base, "recorded");
-    observe(&Context::current(), &r, Some("2.1.296"));
+    observe_and_sync(&Context::current(), &r, Some("2.1.296"));
     let modes: Vec<_> = std::fs::read_dir(&w.cv_home)
         .unwrap()
         .map(|e| {
@@ -165,7 +165,7 @@ fn read_only_catalog_serves_observations_and_drops_publication() {
     std::fs::set_permissions(&w.cv_home, std::fs::Permissions::from_mode(0o555)).unwrap();
     let result = std::panic::catch_unwind(|| {
         assert_eq!(writer_versions()[0].newest.as_deref(), Some("2.1.296"));
-        observe(&Context::current(), &r, Some("9.0.0"));
+        observe_and_sync(&Context::current(), &r, Some("9.0.0"));
         assert_eq!(writer_versions()[0].newest.as_deref(), Some("2.1.296"));
     });
     std::fs::set_permissions(&w.cv_home, std::fs::Permissions::from_mode(0o755)).unwrap();

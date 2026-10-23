@@ -430,6 +430,33 @@ pub enum Role {
     Tool,
 }
 
+impl Role {
+    /// Every role, in declaration order: a new variant must be listed here (the array length
+    /// forces it) before the schema can publish it.
+    pub const ALL: [Role; 4] = [Role::System, Role::User, Role::Assistant, Role::Tool];
+
+    /// The canonical lowercase name (what `--json` prints); the same spelling serde derives.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        }
+    }
+}
+
+/// Every role as serde spells it, beside the enum: the vocabulary `cv schema --json` publishes.
+pub const ROLE_NAMES: [&str; Role::ALL.len()] = {
+    let mut names = [""; Role::ALL.len()];
+    let mut i = 0;
+    while i < Role::ALL.len() {
+        names[i] = Role::ALL[i].as_str();
+        i += 1;
+    }
+    names
+};
+
 /// What a message IS — every adapter sets it, every emitter reads it (`docs/INTERFACE-V2.md` §4).
 /// `Role` says who speaks; `MessageKind` says what the turn is; `Origin` says where it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -469,6 +496,25 @@ pub enum MessageKind {
 }
 
 impl MessageKind {
+    /// Every kind, in declaration order: a new variant must be listed here (the array length
+    /// forces it) before the schema can publish it.
+    pub const ALL: [MessageKind; 14] = [
+        MessageKind::Prompt,
+        MessageKind::Reply,
+        MessageKind::ToolResult,
+        MessageKind::InjectedContext,
+        MessageKind::SystemPrompt,
+        MessageKind::Notice,
+        MessageKind::CompactionBoundary,
+        MessageKind::CompactionSummary,
+        MessageKind::ModelChange,
+        MessageKind::Error,
+        MessageKind::SubagentSpawn,
+        MessageKind::SubagentReturn,
+        MessageKind::Branch,
+        MessageKind::Carrier,
+    ];
+
     /// The kind a bare role implies when an adapter has not said otherwise: User→Prompt,
     /// Assistant→Reply, Tool→ToolResult, System→Notice. Adapters MUST set the precise kind; this
     /// exists for `Message::new` and for legacy IR JSON that predates `kind`.
@@ -482,7 +528,7 @@ impl MessageKind {
     }
 
     /// The canonical snake_case name (what `--json` prints).
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             MessageKind::Prompt => "prompt",
             MessageKind::Reply => "reply",
@@ -533,6 +579,17 @@ impl MessageKind {
     }
 }
 
+/// Every kind as serde spells it, beside the enum: the vocabulary `cv schema --json` publishes.
+pub const MESSAGE_KIND_NAMES: [&str; MessageKind::ALL.len()] = {
+    let mut names = [""; MessageKind::ALL.len()];
+    let mut i = 0;
+    while i < MessageKind::ALL.len() {
+        names[i] = MessageKind::ALL[i].as_str();
+        i += 1;
+    }
+    names
+};
+
 /// Where a message came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -557,6 +614,33 @@ pub enum Origin {
 }
 
 impl Origin {
+    /// Every origin, in declaration order: a new variant must be listed here (the array length
+    /// forces it) before the schema can publish it.
+    pub const ALL: [Origin; 8] = [
+        Origin::Human,
+        Origin::Model,
+        Origin::Harness,
+        Origin::Hook,
+        Origin::Scheduler,
+        Origin::Subagent,
+        Origin::Import,
+        Origin::Unknown,
+    ];
+
+    /// The canonical snake_case name (what `--json` prints); the same spelling serde derives.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Origin::Human => "human",
+            Origin::Model => "model",
+            Origin::Harness => "harness",
+            Origin::Hook => "hook",
+            Origin::Scheduler => "scheduler",
+            Origin::Subagent => "subagent",
+            Origin::Import => "import",
+            Origin::Unknown => "unknown",
+        }
+    }
+
     /// The origin a bare role implies: User→Human, Assistant→Model, Tool→Harness (the harness ran
     /// the tool), System→Harness. Adapters override when the store says otherwise.
     pub fn for_role(role: Role) -> Self {
@@ -567,6 +651,17 @@ impl Origin {
         }
     }
 }
+
+/// Every origin as serde spells it, beside the enum: the vocabulary `cv schema --json` publishes.
+pub const ORIGIN_NAMES: [&str; Origin::ALL.len()] = {
+    let mut names = [""; Origin::ALL.len()];
+    let mut i = 0;
+    while i < Origin::ALL.len() {
+        names[i] = Origin::ALL[i].as_str();
+        i += 1;
+    }
+    names
+};
 
 /// One message/turn in a conversation.
 #[derive(Debug, Clone)]
@@ -591,8 +686,7 @@ pub struct Message {
     /// `Block::ToolResult::details`). See `docs/INTERFACE-V2.md` §4.
     pub extra: serde_json::Map<String, serde_json::Value>,
     /// Checked complete native backing; serializes through `extra._record`, never as a new field.
-    #[doc(hidden)]
-    pub complete_record: Option<std::sync::Arc<CompleteRecord>>,
+    pub(crate) complete_record: Option<std::sync::Arc<CompleteRecord>>,
 }
 
 /// serde by derive over the fields themselves. The destructuring is exhaustive, so a new field is
@@ -649,8 +743,8 @@ impl Serialize for Message {
     }
 }
 
-/// Deserialize with `kind` / `origin` optional: IR JSON written before they existed (and
-/// hand-written test fixtures) get the role-implied defaults instead of failing.
+/// The wire form [`Message`]'s `Serialize` writes, read back; `kind` and `origin` are required
+/// (every cv since IR v2 writes them, and OpenSession 0.3 requires them).
 impl<'de> Deserialize<'de> for Message {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -660,10 +754,8 @@ impl<'de> Deserialize<'de> for Message {
             #[serde(default)]
             parent_id: Option<String>,
             role: Role,
-            #[serde(default)]
-            kind: Option<MessageKind>,
-            #[serde(default)]
-            origin: Option<Origin>,
+            kind: MessageKind,
+            origin: Origin,
             #[serde(default)]
             timestamp: Option<DateTime<Utc>>,
             #[serde(default)]
@@ -680,8 +772,8 @@ impl<'de> Deserialize<'de> for Message {
             id: w.id,
             parent_id: w.parent_id,
             role: w.role,
-            kind: w.kind.unwrap_or_else(|| MessageKind::for_role(w.role)),
-            origin: w.origin.unwrap_or_else(|| Origin::for_role(w.role)),
+            kind: w.kind,
+            origin: w.origin,
             timestamp: w.timestamp,
             model: w.model,
             content: w.content,
@@ -710,6 +802,10 @@ fn bag_mut<'a>(
     let slot = extra
         .entry(name)
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    debug_assert!(
+        slot.is_object(),
+        "extra[{name}] held {slot}: a non-object bag can only be a bug"
+    );
     if !slot.is_object() {
         *slot = serde_json::Value::Object(serde_json::Map::new());
     }
@@ -934,6 +1030,20 @@ pub enum Block {
 }
 
 impl Block {
+    /// The text carried by this block, including thinking and tool output.
+    pub fn text(&self) -> Option<&crate::lazy::Text> {
+        match self {
+            Self::Text { text } | Self::Thinking { text, .. } | Self::ToolResult { content: text, .. } => Some(text),
+            _ => None,
+        }
+    }
+    pub fn text_mut(&mut self) -> Option<&mut crate::lazy::Text> {
+        match self {
+            Self::Text { text } | Self::Thinking { text, .. } | Self::ToolResult { content: text, .. } => Some(text),
+            _ => None,
+        }
+    }
+
     /// The block's serde `type` tag (`tool_use`, …): the one spelling of the wire word.
     pub fn type_tag(&self) -> &'static str {
         match self {
@@ -1045,11 +1155,14 @@ pub struct SessionRef {
     /// messages, not from a proxy like file count.
     ///
     /// `None` means **not counted yet**: a listing that read only the session's metadata (Zed,
-    /// Hermes, Goose, Kimi, Kimi Code, Codex and Grok defer counting, because for them counting
-    /// means decoding every message) until a full read or `cv index` certifies the number. An
-    /// adapter whose discovery reads every turn record anyway (Claude, Cursor, Cline, Continue,
-    /// Devin, Gemini, Qwen, LM Studio, OpenClaw, OpenCode, OpenSession, the exports) always
-    /// counts, so `Some(0)` is a session with no turns, never a placeholder. Listings print a
+    /// Hermes, Goose, Kimi, Kimi Code, Codex, Grok, OpenCode and a Cursor composer whose bubbles
+    /// live in their own cells defer counting, because for them counting means decoding every
+    /// message, or an OpenCode message's parts) until a full read
+    /// or `cv index` certifies the number; a [`crate::stream::Demand::COMPLETE`] read, which also
+    /// carries rewound and superseded rows, never does. An adapter whose discovery reads every
+    /// turn record anyway (Claude, Cursor, Cline, Continue, Devin, Gemini, Qwen, LM Studio,
+    /// OpenClaw, OpenSession, the exports) always counts, by the rule its parser kinds turns
+    /// with, so `Some(0)` is a session with no turns, never a placeholder. Listings print a
     /// dash and `--json` emits `null` for an uncounted session; sorting by messages puts
     /// uncounted sessions last.
     #[serde(default)]
@@ -1083,14 +1196,15 @@ impl Message {
     }
 
     /// Whether this message is a conversational turn in [`SessionRef::message_count`]'s sense: a
-    /// typed prompt or a model reply. Tool results, injected context, notices, errors and carriers
+    /// typed prompt (one that spawns a sub-agent, an `@agent` mention, included) or a model reply
+    /// (one that spawns, included). Tool results, injected context, notices, errors and carriers
     /// are not. The count a full read certifies in the catalog's counts record.
     pub fn is_turn(&self) -> bool {
         matches!(
             (self.role, self.kind),
-            (Role::User, MessageKind::Prompt)
+            (Role::User | Role::Assistant, MessageKind::SubagentSpawn)
+                | (Role::User, MessageKind::Prompt)
                 | (Role::Assistant, MessageKind::Reply)
-                | (Role::Assistant, MessageKind::SubagentSpawn)
         )
     }
 
@@ -1654,6 +1768,12 @@ mod tests {
         let bare = serde_json::to_value(Message::new(Role::User)).unwrap();
         let keys: Vec<&str> = bare.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys, ["role", "kind", "origin", "content"]);
+        // `kind` and `origin` are part of the wire form: a message without them is not IR.
+        for missing in ["kind", "origin"] {
+            let mut partial = bare.clone();
+            partial.as_object_mut().unwrap().remove(missing);
+            assert!(serde_json::from_value::<Message>(partial).is_err(), "{missing}");
+        }
     }
 
     /// Every `Option` set, so serde emits every field: the key set is exactly `FIELDS`, in order.

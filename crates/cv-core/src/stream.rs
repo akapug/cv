@@ -8,11 +8,10 @@
 //! [`Adapter::stream`](crate::harness::Adapter::stream) instead hands each [`Message`] to a
 //! [`MessageSink`] and drops it before reading the next. Retention depends on the adapter and
 //! consumer: selected payloads may remain checked source ranges, while owned fallbacks still
-//! scale with their largest message. A collecting sink retains the entire history. The
-//! whole-`Session` `parse` is recovered for free as "stream into a [`CollectSink`]" (see
-//! [`collect`]). Adapters override **one** of the two: a native `stream` (memory-savings) *or* the
-//! existing `parse` (and inherit a `stream` that bridges through it). No mutual recursion, so
-//! migration is incremental.
+//! scale with their largest message. A collecting sink retains the entire history. Every adapter
+//! implements `stream` (a store that can only be read whole hands its parsed session to
+//! [`replay`]); the whole-`Session` `parse` is "stream into a [`CollectSink`]" ([`collect`]), a
+//! blanket [`crate::harness::Parse`] impl no adapter overrides.
 //!
 //! **Who owns the source guarantee.** A reader captures its source (identity, length, the
 //! dependencies it consults) before it reads a byte and binds its descriptor to that capture. It
@@ -188,11 +187,29 @@ pub trait MessageSink {
     /// membership). Adapters report before reading; wrappers must forward the notification.
     fn dependency(&mut self, _path: &std::path::Path) {}
 
+    /// [`dependency`](MessageSink::dependency) on an append-only file of which the adapter
+    /// consults the head, never what is appended: its growth leaves the reader's output as it
+    /// was ([`crate::source::ReadSet::record_append_only`]). Wrappers forward it; a recorder
+    /// that does not know it records the path exactly. Default:
+    /// [`dependency`](MessageSink::dependency).
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        self.dependency(path);
+    }
+
     /// The adapter is between records, holding nothing back, `offset` bytes into the file: may it
     /// take a [`Checkpoint`] here? Only a sink that can put everything it holds into one says
     /// yes, so a pass through any other sink never takes one. Default: no.
     fn wants_checkpoint(&mut self, _offset: u64) -> bool {
         false
+    }
+
+    /// [`wants_checkpoint`](MessageSink::wants_checkpoint) at the last settled position of a read
+    /// (its EOF): a sink that spaces its checkpoints takes this one regardless of the spacing, so
+    /// every read leaves its mark where it stopped and the next pass over the grown file reads
+    /// only the appended bytes. Wrappers forward it with their own conditions. Default:
+    /// [`wants_checkpoint`](MessageSink::wants_checkpoint).
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        self.wants_checkpoint(offset)
     }
 
     /// Add this sink's state to `cp` (the adapter's is already in) and pass it on to any sink
@@ -235,6 +252,11 @@ fn guard<'a, T>(
         return Err(error);
     }
     let result = read(&mut guard);
+    // Held output and a fast failing callback may follow the last line-pass check. Completion
+    // belongs here, including errors: a changed backing outranks the consumer error it caused.
+    if let Some(backing) = backing {
+        backing.check()?;
+    }
     let error = guard.take_error();
     // An inner checked boundary may already have returned the original diagnostic while its
     // failed outer sink now reports only a persistent failure marker. Preserve that Result.
@@ -355,12 +377,28 @@ impl MessageSink for Guard<'_> {
             self.after(started, false);
         }
     }
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if !self.latch.failed() {
+            let started = self.start();
+            self.inner.append_only_dependency(path);
+            self.after(started, false);
+        }
+    }
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
         if self.latch.failed() {
             return false;
         }
         let started = self.start();
         let wants = self.inner.wants_checkpoint(offset);
+        self.after(started, false);
+        wants && !self.latch.failed()
+    }
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        if self.latch.failed() {
+            return false;
+        }
+        let started = self.start();
+        let wants = self.inner.wants_final_checkpoint(offset);
         self.after(started, false);
         wants && !self.latch.failed()
     }
@@ -405,8 +443,12 @@ impl Checkpoint {
     /// Store `layer`'s state (serialization of these plain structs cannot fail; if it did, the
     /// layer would be missing and a resume would decline).
     pub fn put(&mut self, layer: &str, state: &impl Serialize) {
-        if let Ok(v) = serde_json::to_value(state) {
-            self.state.insert(layer.to_string(), v);
+        match serde_json::to_value(state) {
+            Ok(v) => {
+                self.state.insert(layer.to_string(), v);
+            }
+            // A release build keeps the documented decline; a debug build refuses to ship it.
+            Err(error) => debug_assert!(false, "checkpoint layer {layer:?} did not serialize: {error}"),
         }
     }
 
@@ -531,6 +573,17 @@ impl MessageSink for TeeSink<'_> {
             self.capture();
         }
     }
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if self.latch.failed() {
+            return;
+        }
+        self.a.append_only_dependency(path);
+        self.capture();
+        if !self.latch.failed() {
+            self.b.append_only_dependency(path);
+            self.capture();
+        }
+    }
     fn meta(&mut self, s: &Session) {
         if self.latch.failed() {
             return;
@@ -547,6 +600,14 @@ impl MessageSink for TeeSink<'_> {
             return false;
         }
         let wants = self.a.wants_checkpoint(offset) && self.b.wants_checkpoint(offset);
+        self.capture();
+        wants && !self.latch.failed()
+    }
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        if self.latch.failed() {
+            return false;
+        }
+        let wants = self.a.wants_final_checkpoint(offset) && self.b.wants_final_checkpoint(offset);
         self.capture();
         wants && !self.latch.failed()
     }
@@ -655,7 +716,7 @@ pub struct Pass<'a> {
     /// larger suffix to reread on the next append.
     pub amortized: bool,
     /// Publish what a whole read counted to the catalog, against a source snapshot taken before
-    /// the read: a "not counted" (`0`) row gets the parse's turn count, so `cv ls` shows the real
+    /// the read (never from a [`Demand::COMPLETE`] read): a "not counted" (`0`) row gets the parse's turn count, so `cv ls` shows the real
     /// number from the first full read on, and the affordance counts that let `has:<kind>` answer
     /// from the catalog are recorded unless still fresh. A sweep that parses on many threads
     /// leaves this off and publishes [`Counted`] itself, on one.
@@ -748,8 +809,9 @@ pub fn stream_counted(
     let session = match pass.from {
         Some(cp) => {
             let state = cp.get::<CounterState>(COUNTER_LAYER).ok_or(Declined)?;
-            counting.restore(state, cp.offset);
-            counting.space_after(cp);
+            if !counting.restore(state, cp.offset) {
+                counting.space_after(cp);
+            }
             adapter
                 .transcript(r, opts, Start::Checkpoint(cp), &mut counting)?
                 .ok_or(Declined)?
@@ -772,7 +834,9 @@ pub fn stream_counted(
             })
         })
         .transpose()?;
-    if let (true, Some(source), Some(counted)) = (pass.record, &source, &counted) {
+    // A complete read also carries what left the conversation (rewound and superseded rows,
+    // carriers) for round-trip: it never certifies what the session counts.
+    if let (true, Some(source), Some(counted)) = (pass.record && opts.tier != Tier::Complete, &source, &counted) {
         counted.record_with_source(r, source);
     }
     Ok(Streamed {
@@ -815,6 +879,17 @@ struct CounterState {
     turns: usize,
     counts: std::collections::BTreeMap<String, u32>,
     dependencies: crate::source::ReadSet,
+    /// At a read's end mark: the last spaced checkpoint before it, so a pass resumed there keeps
+    /// the schedule (and the consumers the doc boundaries) a whole pass has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor: Option<Anchor>,
+}
+
+/// Where the spaced checkpoints stood at an end mark: the last one's offset and encoded size.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct Anchor {
+    offset: u64,
+    state_bytes: u64,
 }
 
 // Count the complete owned snapshot without allocating another JSON buffer. Value serialization
@@ -854,6 +929,10 @@ struct Counting<'a> {
     last_offset: u64,
     amortized: bool,
     spacing: u64,
+    /// The encoded size of the last checkpoint's state, in an amortized pass.
+    state_bytes: u64,
+    /// The checkpoint about to be taken is the read's end mark.
+    ending: bool,
     last: Option<Checkpoint>,
     /// The primary's identity before the adapter opened it: a file replaced at any later point is
     /// not the one this pass's spans point into.
@@ -875,6 +954,8 @@ impl<'a> Counting<'a> {
             last_offset: 0,
             amortized: false,
             spacing: every.unwrap_or(0),
+            state_bytes: 0,
+            ending: false,
             last: None,
             stamp: crate::lazy::SourceStamp::capture(&r.path),
         }
@@ -895,11 +976,14 @@ impl<'a> Counting<'a> {
 
     fn space_after(&mut self, cp: &Checkpoint) {
         if self.amortized {
-            self.spacing = self.every.unwrap_or(0).max(checkpoint_bytes(cp));
+            self.state_bytes = checkpoint_bytes(cp);
+            self.spacing = self.every.unwrap_or(0).max(self.state_bytes);
         }
     }
 
-    fn restore(&mut self, state: CounterState, offset: u64) {
+    /// Restore the counts and the checkpoint schedule; `true` when `state` is an end mark's,
+    /// whose schedule is its anchor's rather than the checkpoint's own.
+    fn restore(&mut self, state: CounterState, offset: u64) -> bool {
         self.messages = state.messages;
         self.turns = state.turns;
         self.dependencies = state.dependencies;
@@ -910,6 +994,13 @@ impl<'a> Counting<'a> {
             .collect();
         self.affordances.restore(counts);
         self.last_offset = offset;
+        let Some(anchor) = state.anchor else { return false };
+        self.last_offset = anchor.offset;
+        self.state_bytes = anchor.state_bytes;
+        if self.amortized {
+            self.spacing = self.every.unwrap_or(0).max(anchor.state_bytes);
+        }
+        true
     }
 }
 
@@ -931,6 +1022,16 @@ impl MessageSink for Counting<'_> {
             guard.reads.record(path);
         }
         self.inner.dependency(path);
+    }
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if self.latch.failed() {
+            return;
+        }
+        self.dependencies.record_append_only(path);
+        if let Some(guard) = &mut self.guard {
+            guard.reads.record_append_only(path);
+        }
+        self.inner.append_only_dependency(path);
     }
     fn meta(&mut self, s: &Session) {
         if self.latch.failed() {
@@ -957,17 +1058,29 @@ impl MessageSink for Counting<'_> {
             return Flow::Stop;
         }
         if let Some(guard) = &mut self.guard {
-            crate::source::record_message_reads(&m, &guard.primary, &mut guard.reads);
+            crate::source::record_message_reads(&m, Some(&guard.primary), &mut guard.reads);
         }
         let flow = self.inner.message(m);
         self.stopped |= flow == Flow::Stop;
         flow
     }
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
+        self.ending = false;
         !self.stopped
             && self.every.is_some()
             && offset >= self.last_offset.saturating_add(self.spacing)
             && self.inner.wants_checkpoint(offset)
+    }
+    /// The spacing aside: any position past the last checkpoint, by at least the size of that
+    /// checkpoint's state in an amortized pass (a mark costs no more to write and restore than
+    /// the reread it saves).
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        self.ending = !self.stopped
+            && self.every.is_some()
+            && offset > self.last_offset
+            && offset - self.last_offset >= self.state_bytes
+            && self.inner.wants_final_checkpoint(offset);
+        self.ending
     }
     fn checkpoint(&mut self, cp: &mut Checkpoint) {
         if self.latch.failed() {
@@ -986,11 +1099,17 @@ impl MessageSink for Counting<'_> {
                 turns: self.turns,
                 counts,
                 dependencies: self.dependencies.clone(),
+                anchor: self.ending.then_some(Anchor {
+                    offset: self.last_offset,
+                    state_bytes: self.state_bytes,
+                }),
             },
         );
         self.inner.checkpoint(cp);
-        self.space_after(cp);
-        self.last_offset = cp.offset;
+        if !std::mem::take(&mut self.ending) {
+            self.space_after(cp);
+            self.last_offset = cp.offset;
+        }
         self.last = Some(cp.clone());
     }
 }

@@ -7,11 +7,15 @@
 use std::io::Cursor;
 use wasm_bindgen::prelude::*;
 
-/// Ingest a complete bounded harness archive, rejecting partial/corrupt uploads explicitly.
+/// Ingest a complete bounded harness archive. Extraction rejects corrupt or oversized uploads
+/// outright, but transcripts whose harness cannot be sniffed are skipped silently: they produce
+/// no session and are not reported back, so a partly-recognised archive returns fewer sessions
+/// than it held files.
 #[wasm_bindgen]
 pub fn ingest_zip(bytes: &[u8]) -> Result<String, JsValue> {
     let files = cv_core::ingest::archive::extract(Cursor::new(bytes), Default::default())
         .map_err(|error| JsValue::from_str(&format!("zip: {error:#}")))?;
-    let sessions = cv_core::ingest::ingest_files(files);
+    let sessions =
+        cv_core::ingest::ingest_files(files).map_err(|error| JsValue::from_str(&format!("transcript: {error:#}")))?;
     serde_json::to_string(&sessions).map_err(|error| JsValue::from_str(&format!("json: {error}")))
 }

@@ -78,13 +78,7 @@ pub(super) fn message(
     let Some(Record { top, kind }) = Record::parse(view)? else {
         return Ok((false, None));
     };
-    let text = |v: JsonView<'_>| {
-        if spans.is_some() {
-            v.source_text()
-        } else {
-            v.text(false)
-        }
-    };
+    let text = |v: JsonView<'_>| leaf_text(v, spans);
 
     // tool_result lines become a distinct Tool-role message so conversions re-encode them correctly.
     if matches!(kind, Kind::ToolResult) {
@@ -217,16 +211,23 @@ pub(super) fn message(
     Ok((false, Some(m)))
 }
 
+/// The demand's leaf rule: under spans a string stays checked source text, else it is owned text
+/// (None for a nonstring). Every string leaf of a record goes through this one match.
+fn leaf_text(v: JsonView<'_>, spans: Option<&JsonSource>) -> Result<Option<Text>> {
+    if spans.is_some() {
+        v.source_text()
+    } else {
+        v.text(false)
+    }
+}
+
 /// A `content` (or reasoning `summary`) field as transcript text: a string itself, or the string
 /// `text` of each part joined by newlines. Under spans, one large string stays in the source and
 /// several parts are joined into the source's private decoded backing, never owned.
 fn join(view: Option<JsonView<'_>>, spans: Option<&JsonSource>) -> Result<Text> {
     use super::super::wire;
     let backing = spans.map_or(wire::Backing::Inline, wire::Backing::Source);
-    wire::joined(view, wire::TEXT, backing, &mut |view| match spans {
-        Some(_) => view.source_text(),
-        None => view.text(false),
-    })
+    wire::joined(view, wire::TEXT, backing, &mut |view| leaf_text(view, spans))
 }
 
 /// kind/origin for a Grok `user` record from its own semantics. A real typed prompt is

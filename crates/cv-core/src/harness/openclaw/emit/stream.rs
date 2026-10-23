@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     harness::wire::write::{self as wire, ObjectWriter},
-    lazy::Resolver,
+    lazy::{Resolver, Text},
 };
 use std::io::Write;
 
@@ -67,6 +67,16 @@ fn summary(writer: &mut dyn Write, msg: &crate::Message, mode: ThinkingMode, res
     wire::joined_text(writer, texts.iter().map(|v| v.as_ref()), resolver)
 }
 
+/// The first [`Block::ToolResult`] of a Tool turn, as the native row reads it.
+#[derive(Clone, Copy)]
+struct NativeResult<'a> {
+    id: &'a str,
+    content: &'a Text,
+    is_error: bool,
+    name: Option<&'a str>,
+    details: Option<&'a Value>,
+}
+
 fn tool_result(writer: &mut dyn Write, blocks: &[Block], timestamp: i64, resolver: &Resolver) -> Result<()> {
     let result = blocks.iter().find_map(|block| {
         if let Block::ToolResult {
@@ -78,21 +88,21 @@ fn tool_result(writer: &mut dyn Write, blocks: &[Block], timestamp: i64, resolve
             ..
         } = block
         {
-            Some((
-                tool_use_id.as_str(),
+            Some(NativeResult {
+                id: tool_use_id.as_str(),
                 content,
-                *is_error,
-                tool_name.as_deref(),
-                details.as_ref(),
-            ))
+                is_error: *is_error,
+                name: tool_name.as_deref(),
+                details: details.as_ref(),
+            })
         } else {
             None
         }
     });
     let mut inner = ObjectWriter::new(writer)?;
     inner.field("role", "toolResult")?;
-    inner.field("toolCallId", result.map(|r| r.0).unwrap_or(""))?;
-    if let Some(name) = result.and_then(|r| r.3) {
+    inner.field("toolCallId", result.map(|r| r.id).unwrap_or(""))?;
+    if let Some(name) = result.and_then(|r| r.name) {
         inner.field("toolName", name)?;
     }
     inner.field_with("content", |w| {
@@ -100,7 +110,7 @@ fn tool_result(writer: &mut dyn Write, blocks: &[Block], timestamp: i64, resolve
         let mut part = ObjectWriter::new(w)?;
         part.field("type", "text")?;
         part.field_with("text", |w| match result {
-            Some((_, text, _, _, _)) => wire::text(w, text, resolver),
+            Some(r) => wire::text(w, r.content, resolver),
             None => serde_json::to_writer(w, "").map_err(Into::into),
         })?;
         part.finish()?;
@@ -111,8 +121,8 @@ fn tool_result(writer: &mut dyn Write, blocks: &[Block], timestamp: i64, resolve
         w.write_all(b"]")?;
         Ok(())
     })?;
-    inner.field("isError", result.is_some_and(|r| r.2))?;
-    if let Some(details) = result.and_then(|r| r.4) {
+    inner.field("isError", result.is_some_and(|r| r.is_error))?;
+    if let Some(details) = result.and_then(|r| r.details) {
         inner.field("details", details)?;
     }
     inner.field("timestamp", timestamp)?;
@@ -139,11 +149,7 @@ pub(super) fn emit_after_stage(
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let agents_root = if out_dir.file_name().is_some_and(|n| n == "agents") {
-        out_dir.to_path_buf()
-    } else {
-        out_dir.join("agents")
-    };
+    let agents_root = crate::emit::out_dir_within(out_dir, "agents");
     let sessions_dir = agents_root.join("main/sessions");
     let file_path = sessions_dir.join(format!("{new_id}.jsonl"));
     let created = session.created_at.or(session.updated_at).unwrap_or_else(Utc::now);

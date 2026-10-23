@@ -9,10 +9,11 @@
 //! 1. **The dependency allowlist.** Every crate named in cv-core's `Cargo.toml` dependency
 //!    sections must appear in the literal allowlist below. Adding a dependency is allowed —
 //!    by editing the allowlist in the same diff, where a reviewer sees it.
-//! 2. **The purity fence.** `src/task/reduce.rs`, `src/task/model.rs`, `src/task/stats.rs`,
-//!    and `src/sanitize.rs` must not touch `std::process`, `std::net`, or `std::fs`. Reduction,
-//!    wire types, the stats projection, and render sanitization are pure; I/O belongs in
-//!    `task/store.rs` and the verifier.
+//! 2. **The purity fence.** `src/task/reduce.rs`, `src/task/model.rs`, `src/task/project.rs`,
+//!    `src/task/views.rs`, and `src/sanitize.rs` must not touch `std::process`, `std::net`, or
+//!    `std::fs`. Reduction, wire types, the projections, and render sanitization are pure; I/O
+//!    belongs in `task/store.rs` and the verifier. The fenced set is [`PURE_MODULES`] below —
+//!    this paragraph restates it and must be edited with it.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -107,6 +108,11 @@ fn pure_modules_touch_no_process_net_or_fs() {
         let path = manifest_dir().join(module);
         let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
         for (idx, line) in source.lines().enumerate() {
+            // The fence reads code, not prose: a comment naming a forbidden path (a "must not
+            // touch std::fs" in the module's own doc) is documentation, not a touch.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
             for needle in FORBIDDEN {
                 if line.contains(needle) {
                     violations.push(format!("{module}:{}: {}", idx + 1, line.trim()));

@@ -91,7 +91,7 @@ impl ToolHistogram {
         tool: Option<&str>,
         extractor: &mut events::EventExtractor,
     ) -> anyhow::Result<()> {
-        extractor.extract(m, idx, cwd, tool, scratch)?;
+        extractor.extract(m, idx, cwd, tool, None, scratch)?;
         for event in scratch.iter() {
             self.note(event);
         }
@@ -121,13 +121,12 @@ impl ToolHistogram {
     }
     fn from_stream_selected(adapter: &dyn crate::Adapter, r: &SessionRef, tool: Option<&str>) -> anyhow::Result<Self> {
         let mut sink = HistogramSink {
-            cwd: r.cwd.clone(),
+            state: SinkState::new(r.cwd.clone()),
             msg_idx: 0,
             histogram: Self::default(),
             extractor: events::EventExtractor::default(),
             tool: tool.map(str::to_owned),
             scratch: Vec::new(),
-            fail: None,
         };
         adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
         Ok(sink.histogram)
@@ -166,39 +165,62 @@ impl ToolHistogram {
     }
 }
 
-struct HistogramSink {
-    extractor: events::EventExtractor,
+/// What the tool sinks share: EventSink's cwd rule (a discovery cwd wins; otherwise the first
+/// pushed cwd wins) and the one-error latch that stops the pass.
+struct SinkState {
     cwd: Option<std::path::PathBuf>,
+    fail: Option<anyhow::Error>,
+}
+
+impl SinkState {
+    fn new(cwd: Option<std::path::PathBuf>) -> Self {
+        SinkState { cwd, fail: None }
+    }
+
+    fn meta(&mut self, session: &crate::Session) {
+        if self.cwd.is_none() {
+            self.cwd = session.cwd.clone();
+        }
+    }
+
+    fn stop(&mut self, error: anyhow::Error) -> Flow {
+        self.fail = Some(error);
+        Flow::Stop
+    }
+
+    fn take_error(&mut self) -> Option<anyhow::Error> {
+        self.fail.take()
+    }
+}
+
+struct HistogramSink {
+    state: SinkState,
+    extractor: events::EventExtractor,
     msg_idx: usize,
     histogram: ToolHistogram,
     tool: Option<String>,
     scratch: Vec<Event>,
-    fail: Option<anyhow::Error>,
 }
 
 impl MessageSink for HistogramSink {
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.fail.take()
+        self.state.take_error()
     }
 
     fn meta(&mut self, session: &crate::Session) {
-        // Match EventSink: a discovery cwd wins; otherwise the first available pushed cwd wins.
-        if self.cwd.is_none() {
-            self.cwd = session.cwd.clone();
-        }
+        self.state.meta(session)
     }
 
     fn message(&mut self, message: Message) -> Flow {
         if let Err(error) = self.histogram.note_message(
             &message,
             self.msg_idx,
-            self.cwd.as_deref(),
+            self.state.cwd.as_deref(),
             &mut self.scratch,
             self.tool.as_deref(),
             &mut self.extractor,
         ) {
-            self.fail = Some(error);
-            return Flow::Stop;
+            return self.state.stop(error);
         }
         self.msg_idx += 1;
         Flow::Continue
@@ -234,20 +256,18 @@ pub struct ToolEvent {
 /// the call it came from. (The rows themselves are [`events::extract`]'s; results are skipped,
 /// since the timeline is calls.)
 struct CallSink {
-    cwd: Option<std::path::PathBuf>,
+    state: SinkState,
     msg_idx: usize,
     rows: Vec<(String, Event)>,
-    fail: Option<anyhow::Error>,
     tool: Option<String>,
 }
 
 impl CallSink {
     fn new(cwd: Option<std::path::PathBuf>) -> Self {
         CallSink {
-            cwd,
+            state: SinkState::new(cwd),
             msg_idx: 0,
             rows: Vec::new(),
-            fail: None,
             tool: None,
         }
     }
@@ -255,13 +275,11 @@ impl CallSink {
 
 impl MessageSink for CallSink {
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.fail.take()
+        self.state.take_error()
     }
 
     fn meta(&mut self, s: &crate::ir::Session) {
-        if self.cwd.is_none() {
-            self.cwd = s.cwd.clone();
-        }
+        self.state.meta(s)
     }
 
     fn message(&mut self, m: Message) -> Flow {
@@ -276,11 +294,11 @@ impl MessageSink for CallSink {
                     input,
                     self.msg_idx,
                     m.timestamp.map(|t| t.timestamp()),
-                    self.cwd.as_deref(),
+                    self.state.cwd.as_deref(),
+                    true,
                     &mut rows,
                 ) {
-                    self.fail = Some(error);
-                    return Flow::Stop;
+                    return self.state.stop(error);
                 }
                 self.rows.extend(rows.into_iter().map(|e| (id.clone(), e)));
             }
@@ -543,22 +561,55 @@ fn selected_tool_agents(
         }
         matches_workflow && matches_agent(agent, id.strip_prefix("agent-").unwrap_or(id))
     })?;
-    anyhow::ensure!(
-        workflow.is_none()
-            || if agent.is_some() {
-                workflow_member.load(std::sync::atomic::Ordering::Relaxed)
-            } else {
-                !selected.is_empty()
-            },
-        "no agents found for workflow {:?} in {}",
-        workflow.unwrap_or_default(),
-        r.id
-    );
+    if let Some(workflow) = workflow {
+        let members = workflow_member.load(std::sync::atomic::Ordering::Relaxed);
+        workflow_selection(&r.id, workflow, agent, members, !selected.is_empty())?;
+    }
     Ok(selected)
+}
+
+/// Refuse a workflow selection that found nothing, naming the selector that failed: a workflow
+/// with no agents, or an agent (other than the orchestrator, which no workflow contains) that is
+/// not one of the workflow's.
+fn workflow_selection(
+    session: &str,
+    workflow: &str,
+    agent: Option<&str>,
+    members: bool,
+    selected: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(members, "no agents found for workflow {workflow:?} in {session}");
+    match agent {
+        Some(agent) if !selected && agent != ORCHESTRATOR => {
+            anyhow::bail!("no agent {agent:?} in workflow {workflow:?} in {session}")
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_workflow_selection_names_the_selector_that_failed() {
+        use super::workflow_selection as check;
+        let message = |r: anyhow::Result<()>| r.unwrap_err().to_string();
+        assert_eq!(
+            message(check("s", "wf", None, false, false)),
+            "no agents found for workflow \"wf\" in s"
+        );
+        assert_eq!(
+            message(check("s", "wf", Some("a"), false, false)),
+            "no agents found for workflow \"wf\" in s"
+        );
+        assert_eq!(
+            message(check("s", "wf", Some("a"), true, false)),
+            "no agent \"a\" in workflow \"wf\" in s"
+        );
+        check("s", "wf", Some("a"), true, true).unwrap();
+        check("s", "wf", Some(super::ORCHESTRATOR), true, false).unwrap();
+        check("s", "wf", None, true, true).unwrap();
+    }
+
     #[test]
     fn selected_tools_preserve_unfiltered_native_edit_attribution() {
         let session = crate::harness::codex::parse_str(
@@ -566,7 +617,8 @@ mod tests {
             include_str!("../tests/fixtures/codex/direct_patch.jsonl"),
             true,
             None,
-        );
+        )
+        .unwrap();
         let mut messages = session.messages.clone();
         let mut visible = crate::Message::new(crate::Role::Assistant);
         visible.content.push(crate::Block::ToolUse {
@@ -622,19 +674,18 @@ mod tests {
     fn histogram_stream_retains_only_distinct_tools_and_keeps_meta_cwd_rules() {
         let mut sink = HistogramSink {
             extractor: events::EventExtractor::default(),
-            cwd: None,
+            state: SinkState::new(None),
             msg_idx: 0,
             histogram: ToolHistogram::default(),
             tool: None,
             scratch: Vec::new(),
-            fail: None,
         };
         let mut shell = crate::Session::new("histogram", crate::Harness::Claude);
         shell.cwd = Some("/first".into());
         sink.meta(&shell);
         shell.cwd = Some("/later".into());
         sink.meta(&shell);
-        assert_eq!(sink.cwd.as_deref(), Some(std::path::Path::new("/first")));
+        assert_eq!(sink.state.cwd.as_deref(), Some(std::path::Path::new("/first")));
         for i in 0..2000 {
             let m = asst(vec![tool_use("Edit", json!({"file_path":format!("unique-{i}.rs")}))]);
             sink.message(m);
@@ -654,15 +705,17 @@ mod tests {
         assert_eq!(sink.scratch.capacity(), 0);
         let mut discovered = HistogramSink {
             extractor: events::EventExtractor::default(),
-            cwd: Some("/discovery".into()),
+            state: SinkState::new(Some("/discovery".into())),
             msg_idx: 0,
             histogram: ToolHistogram::default(),
             tool: None,
             scratch: Vec::new(),
-            fail: None,
         };
         discovered.meta(&shell);
-        assert_eq!(discovered.cwd.as_deref(), Some(std::path::Path::new("/discovery")));
+        assert_eq!(
+            discovered.state.cwd.as_deref(),
+            Some(std::path::Path::new("/discovery"))
+        );
     }
 
     #[test]
@@ -809,12 +862,11 @@ mod tests {
         assert!(all.take_error().is_some());
         let mut histogram = HistogramSink {
             extractor: events::EventExtractor::default(),
-            cwd: None,
+            state: SinkState::new(None),
             msg_idx: 0,
             histogram: ToolHistogram::default(),
             tool: Some("Read".into()),
             scratch: Vec::new(),
-            fail: None,
         };
         // Histograms correlate native completions with every call before selecting rows.
         // Missing excluded arguments cannot silently change canonical edit attribution.
@@ -925,12 +977,11 @@ mod tests {
         assert!(ToolHistogram::from_messages([&message], None).is_err());
         let mut histogram = HistogramSink {
             extractor: events::EventExtractor::default(),
-            cwd: None,
+            state: SinkState::new(None),
             msg_idx: 0,
             histogram: ToolHistogram::default(),
             tool: None,
             scratch: Vec::new(),
-            fail: None,
         };
         assert_eq!(histogram.message(message.clone()), Flow::Stop);
         assert!(histogram.take_error().is_some());

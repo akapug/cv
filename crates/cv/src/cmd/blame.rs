@@ -402,7 +402,7 @@ pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool) -> Result<()> {
     commits.truncate(MAX_COMMITS);
 
     if commits.is_empty() {
-        println!("no commits touch {rel} — is it committed? (event-catalog view: `cv touched {rel}`)");
+        println!("{}", no_commits(&rel, lines));
         return Ok(());
     }
 
@@ -412,20 +412,7 @@ pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool) -> Result<()> {
         eprintln!("(event catalog is empty — run `cv index` first to ingest tool events)");
     }
 
-    match lines {
-        Some(spec) => println!(
-            "✦ blame {rel} -L {spec} — {} commit(s) own those lines\n",
-            commits.len()
-        ),
-        None => {
-            let more = if total > commits.len() {
-                format!(" (of {total}; showing the most recent)")
-            } else {
-                String::new()
-            };
-            println!("✦ blame {rel} — {} commit(s){more}\n", commits.len());
-        }
-    }
+    println!("{}\n", header(&rel, lines, commits.len(), total));
 
     // The exact tier: candidate sessions whose own tool output shows one of these commits made.
     let exact = exact_matches(&commits, &edits)?;
@@ -434,7 +421,12 @@ pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool) -> Result<()> {
     let mut matched_commits = 0usize;
     let mut best_overall: Option<(String, String, i64)> = None; // (harness, session_id, msg_idx)
     for c in &commits {
-        println!("◆ {} {}  {}", c.short, date(c.time), c.summary);
+        let summary = if c.summary.is_empty() {
+            "(no message)"
+        } else {
+            &c.summary
+        };
+        println!("◆ {} {}  {summary}", c.short, date(c.time));
         let ranked = rank_commit(&c.sha, &exact, correlate(c.time, &edits, &root), &edits);
         if ranked.is_empty() {
             println!("  (no agent session found)");
@@ -472,6 +464,30 @@ pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool) -> Result<()> {
     Ok(())
 }
 
+/// The heading over the commit list: how many commits own the file (or the `-L` lines), and, when
+/// [`MAX_COMMITS`] cut the list, of how many.
+fn header(rel: &str, lines: Option<&str>, shown: usize, total: usize) -> String {
+    let more = if total > shown {
+        format!(" (of {total}; showing the most recent)")
+    } else {
+        String::new()
+    };
+    match lines {
+        Some(spec) => format!("✦ blame {rel} -L {spec} — {shown} commit(s) own those lines{more}"),
+        None => format!("✦ blame {rel} — {shown} commit(s){more}"),
+    }
+}
+
+/// What to say when no commit owns the file, or the `-L` lines of a file that may well be.
+fn no_commits(rel: &str, lines: Option<&str>) -> String {
+    match lines {
+        Some(spec) => format!(
+            "no commit owns {rel} -L {spec} — are those lines committed? (event-catalog view: `cv touched {rel}`)"
+        ),
+        None => format!("no commits touch {rel} — is it committed? (event-catalog view: `cv touched {rel}`)"),
+    }
+}
+
 /// One matched-session line under a commit, plus its copy-pasteable `cv show --range` hint.
 fn print_match(e: &EditEvent, m: &SessionMatch) {
     let when = match m.strength {
@@ -495,11 +511,7 @@ fn print_match(e: &EditEvent, m: &SessionMatch) {
         when,
         elsewhere,
     );
-    let (s, end) = range_hint(e.msg_idx);
-    println!(
-        "    ↳ cv show {} --range {s}..{end}",
-        crate::util::short_id(&e.session_id)
-    );
+    println!("{}", show_hint(&e.session_id, e.msg_idx));
 }
 
 /// An exact-evidence line: the session, where the commit output landed, the label — and the
@@ -520,10 +532,15 @@ fn print_exact(x: &ExactMatch, c: &CommitInfo) {
         x.evidence.msg_idx,
         x.evidence.kind.label(),
     );
-    let id = hint_id(&x.session_id);
-    println!("    ↳ cv rewind {id} --at {}", c.short);
-    let (s, end) = range_hint(x.evidence.msg_idx as i64);
-    println!("    ↳ cv show {id} --range {s}..{end}");
+    println!("    ↳ cv rewind {} --at {}", hint_id(&x.session_id), c.short);
+    println!("{}", show_hint(&x.session_id, x.evidence.msg_idx as i64));
+}
+
+/// The copy-pasteable `cv show --range` line under a match: every tier spells the session the
+/// same way ([`hint_id`]).
+fn show_hint(session_id: &str, msg_idx: i64) -> String {
+    let (s, end) = range_hint(msg_idx);
+    format!("    ↳ cv show {} --range {s}..{end}", hint_id(session_id))
 }
 
 /// The id a copy-pasteable hint uses: the short prefix, except for a sub-agent (`agent-…`), whose
@@ -674,11 +691,7 @@ fn blame_event_only(file: &str, abs: &Path) -> Result<()> {
             e.title.as_deref().map(|t| truncate(t, 48)).unwrap_or_default(),
             e.msg_idx,
         );
-        let (s, end) = range_hint(e.msg_idx);
-        println!(
-            "    ↳ cv show {} --range {s}..{end}",
-            crate::util::short_id(&e.session_id)
-        );
+        println!("{}", show_hint(&e.session_id, e.msg_idx));
     }
     Ok(())
 }
@@ -935,6 +948,33 @@ mod tests {
         ];
         let ids: Vec<String> = candidate_ids(&edits).into_iter().map(|(_, id)| id).collect();
         assert_eq!(ids, ["solo", "agent-a7f5", "orchestrator", "agent-b8e6"]);
+    }
+
+    #[test]
+    fn line_blame_reports_truncation_and_its_own_empty_case() {
+        assert_eq!(
+            header("a.rs", Some("3,9"), 20, 31),
+            "✦ blame a.rs -L 3,9 — 20 commit(s) own those lines (of 31; showing the most recent)"
+        );
+        assert_eq!(
+            header("a.rs", Some("3"), 2, 2),
+            "✦ blame a.rs -L 3 — 2 commit(s) own those lines"
+        );
+        assert_eq!(
+            header("a.rs", None, 20, 31),
+            "✦ blame a.rs — 20 commit(s) (of 31; showing the most recent)"
+        );
+        assert!(no_commits("a.rs", Some("3")).starts_with("no commit owns a.rs -L 3 — are those lines committed?"));
+        assert!(no_commits("a.rs", None).starts_with("no commits touch a.rs — is it committed?"));
+    }
+
+    #[test]
+    fn every_show_hint_spells_a_sub_agent_in_full() {
+        assert_eq!(show_hint("blame-e2e-session", 1), "    ↳ cv show blame-e2 --range 0..4");
+        assert_eq!(
+            show_hint("agent-a1b2c3d4e5f6", 142),
+            "    ↳ cv show agent-a1b2c3d4e5f6 --range 139..145"
+        );
     }
 
     #[test]

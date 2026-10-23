@@ -58,6 +58,7 @@ use super::wire::{self, anthropic};
 use super::{parse_ts, ts_from_epoch};
 use crate::ir::*;
 use crate::json::{JsonSource, JsonView};
+use crate::json::{ReadInput, Validation};
 use crate::stream::{Demand, Flow, MessageSink};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -149,8 +150,35 @@ fn mtime(path: &Path) -> Option<DateTime<Utc>> {
     fs::metadata(path).ok()?.modified().ok().map(DateTime::<Utc>::from)
 }
 
+/// Whether a `messages[]` entry is a turn ([`Message::is_turn`]) as [`message_with_blocks`] kinds
+/// it: an assistant reply that is not a display-only error, or a user entry that does not hold
+/// only tool results. Reads `role`, `metadata` and block types, never bodies.
+fn is_turn(entry: &Fields<'_>) -> Result<bool> {
+    Ok(match entry.string("role")?.as_deref() {
+        Some("assistant") => {
+            let meta = entry
+                .get("metadata")
+                .map(|m| Fields::parse(m, &["displayOnly", "displayRole"]))
+                .transpose()?
+                .flatten();
+            let display_only = meta
+                .as_ref()
+                .and_then(|m| m.get("displayOnly"))
+                .map(|v| v.as_bool())
+                .transpose()?
+                .flatten();
+            let display_role = meta.as_ref().map(|m| m.string("displayRole")).transpose()?.flatten();
+            !(display_only == Some(true) && display_role.as_deref() == Some("error"))
+        }
+        Some("user") => !anthropic::only_tool_results(entry.get("content"), |part| {
+            anthropic::block_kind(part, &anthropic::ANTHROPIC)
+        })?,
+        _ => false,
+    })
+}
+
 fn scan(path: &Path, sid: &str) -> Result<SessionRef> {
-    JsonSource::capture(path)?.read_document(|view| {
+    JsonSource::capture(path)?.read(ReadInput::Document, Validation::Value, |view| {
         let record = Fields::parse(view, &["messages", "updated_at"])?.context("SDK document object")?;
         let messages = record.get("messages").context("SDK messages")?;
         let id = ref_id(path, sid).context("SDK id")?;
@@ -180,16 +208,17 @@ fn scan(path: &Path, sid: &str) -> Result<SessionRef> {
         let mut first_user = false;
         let mut count = 0;
         for message in messages.array()?.context("SDK messages array")? {
-            count += 1;
             let message = message?;
-            if let Some(record) = Fields::parse(message, &["ts", "role", "content"])? {
+            // A message entry, not the document-level `record` above.
+            if let Some(entry) = Fields::parse(message, &["ts", "role", "content", "metadata"])? {
+                count += usize::from(is_turn(&entry)?);
                 if first && r.created_at.is_none() {
-                    r.created_at = record.value("ts")?.and_then(|v| v.as_i64()).and_then(ts_from_epoch);
+                    r.created_at = entry.value("ts")?.and_then(|v| v.as_i64()).and_then(ts_from_epoch);
                 }
-                if !first_user && record.string("role")?.as_deref() == Some("user") {
+                if !first_user && entry.string("role")?.as_deref() == Some("user") {
                     first_user = true;
                     if r.title.is_none() {
-                        r.title = super::wire::text_title(record.get("content"))?;
+                        r.title = super::wire::text_title(entry.get("content"))?;
                     }
                 }
             }
@@ -213,7 +242,7 @@ pub fn stream(path: &Path, id: &str, sink: &mut dyn MessageSink) -> Result<Sessi
 
 pub(crate) fn stream_with_options(path: &Path, id: &str, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
     let source = JsonSource::capture(path)?;
-    source.read_document(|view| {
+    source.read(ReadInput::Document, Validation::Value, |view| {
         let keys = [
             "agent",
             "taskType",
@@ -224,14 +253,16 @@ pub(crate) fn stream_with_options(path: &Path, id: &str, opts: &Demand, sink: &m
             "messages",
         ];
         let record = Fields::parse(view, &keys)?;
+        // `messages` streams below; every other parsed key projects into the document value.
+        let [doc_keys @ .., messages_key] = keys;
         let doc = Value::Object(
             record
                 .as_ref()
-                .map(|r| r.project(&keys[..keys.len() - 1]))
+                .map(|r| r.project(&doc_keys))
                 .transpose()?
                 .unwrap_or_default(),
         );
-        let messages = record.as_ref().and_then(|r| r.get("messages"));
+        let messages = record.as_ref().and_then(|r| r.get(messages_key));
         let mut s = Session::new(id.to_string(), Harness::Cline);
         s.source_path = Some(path.to_path_buf());
         let sid = id.split('/').next().unwrap_or(id);
@@ -265,7 +296,7 @@ pub(crate) fn stream_with_options(path: &Path, id: &str, opts: &Demand, sink: &m
             if let Some(o) = origin {
                 bag.insert("origin".into(), o.clone());
             }
-            if let Some(row) = row.as_ref().filter(|_| lead) {
+            if let Some(row) = row.as_ref() {
                 for k in [
                     "source",
                     "status",
@@ -282,17 +313,18 @@ pub(crate) fn stream_with_options(path: &Path, id: &str, opts: &Demand, sink: &m
             }
         }
         if !lead {
-            s.lineage.parent = origin
-                .and_then(|o| o.get("parentThreadId"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| Some(sid.to_string()));
+            s.lineage.parent = Some(
+                origin
+                    .and_then(|o| o.get("parentThreadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(sid)
+                    .to_string(),
+            );
             s.lineage.agent_path = origin
                 .and_then(|o| o.get("subagent"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
-        let row = row.filter(|_| lead);
         s.cwd = row
             .as_ref()
             .and_then(|m| m.get("cwd"))
@@ -380,9 +412,11 @@ fn view_message(view: JsonView<'_>, spans: bool, lead: bool, prompted: &mut bool
     let Some(record) = Fields::parse(view, &keys)? else {
         return Ok(None);
     };
-    let meta = Value::Object(record.project(&keys[..keys.len() - 1])?);
+    // `content` decodes into blocks below; the other parsed keys project into the meta value.
+    let [meta_keys @ .., content_key] = keys;
+    let meta = Value::Object(record.project(&meta_keys)?);
     let mut blocks = Vec::new();
-    if let Some(content) = record.get("content") {
+    if let Some(content) = record.get(content_key) {
         if let Some(text) = content.lazy_text(spans)? {
             blocks.push(Block::Text { text });
         } else if let Some(items) = content.array()? {
@@ -417,7 +451,7 @@ fn view_message(view: JsonView<'_>, spans: bool, lead: bool, prompted: &mut bool
                     &anthropic::ANTHROPIC,
                     spans,
                     &mut |v| v.lazy_text(spans),
-                    if spans { 0 } else { u64::MAX },
+                    crate::harness::wire::joined_over(spans),
                 )? {
                     blocks.push(block);
                 }
@@ -472,25 +506,120 @@ fn message_with_blocks(v: &Value, blocks: Vec<Block>, lead: bool, prompted: &mut
     Some(m)
 }
 
-/// The side-database rows of a lead session (see the module docs): schedule fires from
-/// `sessions.db` / `cron.db`, team runs from `teams.db`. A child file (`<sid>/<stem>`) has none.
-#[cfg(feature = "sqlite")]
-pub fn store_affordances(r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
-    if r.id.contains('/') {
-        return Ok(Vec::new());
+/// The side databases under `<data>/db/` a lead session reads its rows of.
+pub(crate) const SIDE_DATABASES: [&str; 3] = ["sessions.db", "cron.db", "teams.db"];
+
+/// The `<data>/db/` directory of a lead session's side databases; a child file (`<sid>/<stem>`)
+/// reads none.
+pub(crate) fn side_store(r: &SessionRef) -> Option<PathBuf> {
+    if r.id.contains('/') || !is_sdk_path(&r.path) {
+        return None;
     }
-    let Some(db) = r
-        .path
+    r.path
         .parent()
         .and_then(Path::parent)
         .and_then(Path::parent)
         .map(|d| d.join("db"))
-    else {
+}
+
+/// The side-database rows of a lead session (see the module docs): schedule fires from
+/// `sessions.db` / `cron.db`, team runs from `teams.db`. A child file (`<sid>/<stem>`) has none.
+#[cfg(feature = "sqlite")]
+pub fn store_affordances(r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
+    let Some(db) = side_store(r) else {
         return Ok(Vec::new());
     };
     let mut out = schedule_fires(&db, &r.id)?;
     out.extend(team_runs(&db.join("teams.db"), &r.id)?);
     Ok(out)
+}
+
+/// Every lead session's certificate in the side databases at `db` (`<data>/db/`): the rows its
+/// read takes ([`schedule_fires`], [`team_runs`]), each query's result digested per session, from
+/// one grouped query per database. Every session directory beside `db` is certified, rows or not.
+#[cfg(feature = "sqlite")]
+pub(crate) fn side_rows(db: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+    use super::store::sqlite::{open_ro, table_exists};
+    use crate::source::Rows;
+    use rusqlite::types::ValueRef;
+    let sessions = db.parent()?.join("sessions");
+    let mut certificates: std::collections::HashMap<String, Rows> = fs::read_dir(&sessions)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .map(|sid| {
+            (
+                sid,
+                Rows {
+                    count: 0,
+                    high: 0,
+                    digest: Rows::SEED,
+                },
+            )
+        })
+        .collect();
+    // (database, tables the read requires, the read's query grouped by its session column first)
+    const QUERIES: [(&str, [&str; 2], &str); 3] = [
+        (
+            "sessions.db",
+            ["schedule_executions", "schedules"],
+            "SELECT e.session_id, s.name, s.cron_pattern, s.prompt, e.status, e.triggered_at FROM schedule_executions e \
+             JOIN schedules s ON s.schedule_id = e.schedule_id ORDER BY e.session_id, e.triggered_at",
+        ),
+        (
+            "cron.db",
+            ["cron_runs", "cron_specs"],
+            "SELECT r.session_id, p.title, p.schedule_expr, p.prompt, r.status, COALESCE(r.started_at, r.created_at) \
+             FROM cron_runs r JOIN cron_specs p ON p.spec_id = r.spec_id ORDER BY r.session_id, r.created_at",
+        ),
+        (
+            "teams.db",
+            ["team_events", "team_events"],
+            "SELECT team_name, ts, event_type, payload_json FROM team_events ORDER BY team_name, id",
+        ),
+    ];
+    for (index, (file, tables, sql)) in QUERIES.into_iter().enumerate() {
+        let path = db.join(file);
+        if !path.try_exists().ok()? {
+            continue;
+        }
+        open_ro(&path)
+            .ok()?
+            .read(|conn, _| {
+                if !tables.iter().all(|t| table_exists(conn, t)) {
+                    return Ok(());
+                }
+                let mut statement = conn.prepare(sql)?;
+                let columns = statement.column_count();
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    let Ok(sid) = row.get::<_, String>(0) else { continue };
+                    let Some(cert) = certificates.get_mut(&sid) else {
+                        continue;
+                    };
+                    cert.count += 1;
+                    cert.digest = Rows::fold(cert.digest, &[index as u8]);
+                    for column in 1..columns {
+                        let bytes: Vec<u8> = match row.get_ref(column)? {
+                            ValueRef::Null => b"n".to_vec(),
+                            ValueRef::Integer(i) => format!("i{i}").into_bytes(),
+                            ValueRef::Real(f) => format!("r{f}").into_bytes(),
+                            ValueRef::Text(t) => [b"t".as_slice(), &(t.len() as u64).to_le_bytes(), t].concat(),
+                            ValueRef::Blob(b) => [b"b".as_slice(), &(b.len() as u64).to_le_bytes(), b].concat(),
+                        };
+                        cert.digest = Rows::fold(cert.digest, &bytes);
+                    }
+                }
+                Ok(())
+            })
+            .ok()?;
+    }
+    Some(certificates)
+}
+
+#[cfg(not(feature = "sqlite"))]
+pub(crate) fn side_rows(_db: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+    None
 }
 
 #[cfg(not(feature = "sqlite"))]
@@ -731,8 +860,7 @@ mod tests {
 
     #[test]
     fn lead_and_child_sessions_with_tool_results_and_a_display_error() {
-        let root = std::env::temp_dir().join(format!("cv-cline-sdk-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = cv_testkit::temp_dir("cline-sdk");
         let dir = root.join("100_abcde");
         fs::create_dir_all(&dir).unwrap();
         write(
@@ -802,8 +930,7 @@ mod tests {
 
     #[test]
     fn native_raw_messages_preserve_full_codec_and_wrapper_validation() {
-        let dir = std::env::temp_dir().join(format!("cv-sdk-raw-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("sdk-raw");
         let path = dir.join("sdk.messages.json");
         let body = "a\n\"é😀".repeat(8192);
         let doc = json!({"messages":[
@@ -955,8 +1082,7 @@ mod tests {
     #[test]
     fn schedule_fires_and_team_runs_from_the_side_databases() {
         use crate::affordance::Kind;
-        let root = std::env::temp_dir().join(format!("cv-cline-sdk-dbs-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = cv_testkit::temp_dir("cline-sdk-dbs");
         let sid = "200_fghij";
         let dir = root.join("sessions").join(sid);
         fs::create_dir_all(&dir).unwrap();

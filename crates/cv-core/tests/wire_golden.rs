@@ -13,32 +13,13 @@
 use std::fs;
 use std::path::PathBuf;
 
-use cv_core::task::{TaskEvent, TaskReducer, RETIRED_TAGS};
+use cv_core::task::{TaskEvent, TaskReducer, LIVE_TAGS, RETIRED_TAGS};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
 const HEADER_LINE: &str = r#"{"format":"cv-task-log","v":1}"#;
-
-/// Every live wire tag the fixture must contain a specimen of. When you add a `TaskEventKind`
-/// variant, add its tag here and a specimen event to the fixture — this list is the tripwire
-/// that keeps the golden log exhaustive. The retired tags ([`RETIRED_TAGS`]) must all appear too:
-/// the fixture is the proof that a pre-0.15.0 log still replays.
-const LIVE_EVENT_TAGS: &[&str] = &[
-    "opened",
-    "claimed",
-    "released",
-    "noted",
-    "done",
-    "abandoned",
-    "superseded",
-    "tagged",
-    "blocked_by",
-    "posed",
-    "resolved",
-    "status_set",
-];
 
 #[test]
 fn golden_log_replays_identically_forever() {
@@ -74,7 +55,7 @@ fn golden_log_replays_identically_forever() {
     // Exhaustiveness: the fixture must exercise the whole event grammar, or the byte-stability
     // guarantee silently shrinks to the variants it happens to contain.
     let seen: std::collections::BTreeSet<&str> = events.iter().map(|e| e.kind.tag()).collect();
-    for tag in LIVE_EVENT_TAGS {
+    for tag in LIVE_TAGS {
         assert!(
             seen.contains(tag),
             "golden log has no {tag:?} specimen — every TaskEventKind variant must appear"
@@ -88,7 +69,7 @@ fn golden_log_replays_identically_forever() {
     }
     for tag in &seen {
         assert!(
-            LIVE_EVENT_TAGS.contains(tag) || RETIRED_TAGS.contains(tag),
+            LIVE_TAGS.contains(tag) || RETIRED_TAGS.contains(tag),
             "golden log contains {tag:?}, which neither roster lists — update LIVE_EVENT_TAGS"
         );
     }

@@ -270,6 +270,9 @@ fn checked_openclaw_title_policy_matches_frozen_explicit_and_meaningful_prompt()
     let world = crate::test_world("openclaw-title-policy");
     let mut frozen = crate::emit::frozen::Frozen::new("openclaw-title-policy");
     for title in [None, Some(""), Some("   "), Some("explicit λ")] {
+        // Frozen labels keep the raw title; directory names only get a filesystem-safe spelling
+        // of it, so a whitespace-only title does not name a whitespace-led directory.
+        let dir_title = |title: Option<&str>| title.unwrap_or("none").replace([' ', '\t', '\n', '\r'], "_");
         for meaningful in [false, true] {
             let mut session = Session::new("source", Harness::Claude);
             session.created_at = Some("2026-10-12T12:00:00Z".parse()?);
@@ -305,7 +308,11 @@ fn checked_openclaw_title_policy_matches_frozen_explicit_and_meaningful_prompt()
                     ..Default::default()
                 };
                 let suffix = format!("{}-{meaningful}-{mode}", title.unwrap_or("none"));
-                let after = emit(&session, &world.base.join(format!("new-{suffix}")), &options)?;
+                let after = emit(
+                    &session,
+                    &world.base.join(format!("new-{}-{meaningful}-{mode}", dir_title(title))),
+                    &options,
+                )?;
                 frozen.insert(suffix, frozen_entry(&world.base, &after)?["index"].clone());
             }
         }
@@ -591,6 +598,12 @@ fn native_complete_export_preserves_records_branch_links_and_one_compaction_pair
     let reference = crate::SessionRef::new("source", Harness::OpenClaw, &path);
     let source = crate::emit::parse_for_emit(adapter.as_ref(), &reference, Harness::OpenClaw)?;
     assert!(source.messages.iter().any(|m| m.complete_record.is_some()));
+    // Text mode retains native reasoning when this target can hold it — the assumption the
+    // per-mode expected rows below are built on, so it is pinned once, not per iteration.
+    assert_eq!(
+        crate::emit::thinking_fate_with_presence(Harness::OpenClaw, ThinkingMode::Text, true, Some("sig"), None, false),
+        ThinkingFate::Keep
+    );
     for mode in ThinkingMode::ALL {
         let result = emit(
             &source,
@@ -639,18 +652,6 @@ fn native_complete_export_preserves_records_branch_links_and_one_compaction_pair
                 }
                 if mode != ThinkingMode::Native {
                     if let Some(parts) = expected.pointer_mut("/message/content").and_then(Value::as_array_mut) {
-                        // Text mode retains native reasoning when this target can hold it.
-                        assert_eq!(
-                            crate::emit::thinking_fate_with_presence(
-                                Harness::OpenClaw,
-                                ThinkingMode::Text,
-                                true,
-                                Some("sig"),
-                                None,
-                                false
-                            ),
-                            ThinkingFate::Keep
-                        );
                         if mode == ThinkingMode::Drop {
                             parts.retain(|part| part["type"] != "thinking");
                         }

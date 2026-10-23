@@ -10,7 +10,7 @@
 //! (or `CV_PACK_LLM=<model-id>`) to additionally route each span through `llm::digest` for an
 //! abstractive digest; without it, `cv pack` does zero network and loads zero models.
 //!
-//! Streaming discipline: recall works off the index (or a head-capped live scan), excerpts are
+//! Streaming discipline: recall works off the index (or a live scan), excerpts are
 //! pulled with a windowed streaming sink under [`Demand::with_spans`], and events come from
 //! catalog queries — whole sessions are never materialized.
 
@@ -19,22 +19,20 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use cv_core::ir::{Block, Harness, Message, Role, Session};
 use cv_core::lazy::Resolver;
-use cv_core::scan::{ceil_char, floor_char, CapSink};
+use cv_core::scan::{ceil_char, floor_char, Matcher, ScanSink};
 use cv_core::stream::{Demand, Flow, MessageSink};
 use cv_core::EmitOptions;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-/// Per-message resolution budget for lazy spans while hunting the excerpt window — a giant pasted
-/// log contributes its head, never its body.
-const MSG_RESOLVE_BYTES: u64 = 4096;
-/// Soft cap on one excerpt message (chars). An open code fence may run past it…
-const EXCERPT_SOFT_CHARS: usize = 700;
-/// …but never past this.
-const EXCERPT_HARD_CHARS: usize = 1600;
-/// How many distinct commands / files to keep per source section (curation over completeness).
+/// `--excerpt-bytes` default: the bytes of one message an excerpt shows. A pack is a bounded
+/// bundle by design; its header states every bound below and what each one cut.
+pub(crate) const EXCERPT_BYTES: usize = 1600;
+/// How many distinct commands / files to keep per source section (curation over completeness),
+/// and the characters a command shows (its head: a whole pipeline is not memory).
 const MAX_COMMANDS: usize = 6;
+const COMMAND_CHARS: usize = 90;
 const MAX_FILES_PER_SOURCE: usize = 8;
 /// Rows of the cross-source file rollup.
 const MAX_ROLLUP: usize = 12;
@@ -48,6 +46,10 @@ pub(crate) struct PackArgs<'a> {
     pub force: bool,
     pub thinking: cv_core::emit::ThinkingMode,
     pub json: bool,
+    /// `--context-bytes`: the `CV_PACK_LLM` digest's transcript limit (default: the model's window).
+    pub context_bytes: Option<usize>,
+    /// `--excerpt-bytes`: the bytes of one message an excerpt shows.
+    pub excerpt_bytes: usize,
 }
 
 pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
@@ -60,6 +62,8 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         force,
         thinking,
         json,
+        context_bytes,
+        excerpt_bytes,
     } = args;
     if let (Some(path), "md" | "prompt") = (&out, format) {
         crate::util::user_file_claim(path, force)?;
@@ -89,6 +93,9 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     // Optional abstractive pass. The clap surface for pack is frozen, so the switch is an env var:
     // CV_PACK_LLM=1 (provider default model) or CV_PACK_LLM=<model-id>.
     let llm_model = llm_from_env();
+    if llm_model.is_none() && context_bytes.is_some() {
+        return crate::util::usage("--context-bytes bounds the CV_PACK_LLM digest; set CV_PACK_LLM to use it");
+    }
     if llm_model.is_some() {
         match crate::llm::available_provider() {
             Some(p) => eprintln!("✦ CV_PACK_LLM set — distilling each span via {p}…"),
@@ -103,7 +110,13 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     // 2. DISTILL — one structured digest per recalled span.
     let mut sources: Vec<PackSource> = Vec::with_capacity(hits.len());
     for hit in hits {
-        match build_source(&hit, task, llm_model.as_ref().map(|model| model.as_deref())) {
+        match build_source(
+            &hit,
+            task,
+            llm_model.as_ref().map(|model| model.as_deref()),
+            context_bytes,
+            excerpt_bytes,
+        ) {
             Ok(s) => sources.push(s),
             Err(e) => eprintln!("cv pack: skipping {} ({}): {e:#}", short_id(&hit.id), hit.harness),
         }
@@ -111,13 +124,23 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     if sources.is_empty() {
         bail!("recall matched sessions but none could be read back from disk (stale index? run `cv index`)");
     }
-    let rollup = rollup_files(&sources);
+    let (rollup, rollup_dropped) = rollup_files(&sources);
+    let bounds = Bounds {
+        excerpt_bytes,
+        rollup_dropped,
+    };
 
     // 3. EMIT.
     match format {
-        "md" => write_text(&md_bundle(task, &sources, &rollup), out, force, "context pack", json),
+        "md" => write_text(
+            &md_bundle(task, &sources, &rollup, &bounds),
+            out,
+            force,
+            "context pack",
+            json,
+        ),
         "prompt" => write_text(
-            &prompt_bundle(task, &sources, &rollup),
+            &prompt_bundle(task, &sources, &rollup, &bounds),
             out,
             force,
             "context prompt",
@@ -127,10 +150,13 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
             task,
             &sources,
             &rollup,
-            to_h.expect("validated above"),
-            out,
-            thinking,
-            json,
+            &bounds,
+            SessionOut {
+                harness: to_h.expect("validated above"),
+                out,
+                thinking,
+                json,
+            },
         ),
     }
 }
@@ -153,7 +179,7 @@ fn llm_from_env() -> Option<Option<String>> {
 
 /// Find the `limit` most relevant sessions: full-text (tantivy) and semantic (embeddings) when
 /// their stores exist, fused by reciprocal rank and deduped by session. Honest fallbacks: no
-/// index → head-capped live scan with a stderr note; no embeddings → full-text only.
+/// index → live scan with a stderr note; no embeddings → full-text only.
 /// Fusion weights: lexical hits on the task's own terms are higher-precision than static-embedding
 /// cosine, so the full-text list counts double; semantic stays the recall-broadening channel
 /// (a session ranked in BOTH lists still gets both contributions).
@@ -292,8 +318,8 @@ fn fuse(ranked: Vec<(f32, Vec<cv_search::Hit>)>, limit: usize) -> Vec<cv_search:
     picked
 }
 
-/// No-index fallback: discover and stream every session, scoring a head-capped searchable
-/// haystack against the task's words. Peak memory is O(the cap), never O(session).
+/// No-index fallback: discover and stream every session, scoring its whole searchable exchange
+/// against the task's words. Peak memory is the matcher's window, never O(session).
 fn live_scan(task: &str, fetch: usize) -> Result<Vec<cv_search::Hit>> {
     let adapters = cv_core::harness::all();
     live_scan_adapters(task, fetch, adapters.iter().map(|adapter| adapter.as_ref()))
@@ -321,12 +347,15 @@ fn live_scan_adapters<'a>(
             continue;
         }
         for r in adapter.discover()? {
-            let mut sink = CapSink::new(&r.path);
+            // The words place the excerpt; the whole task scores on top.
+            let needles = words.iter().map(|w| w.to_string()).chain([needle.clone()]).collect();
+            let mut sink = ScanSink::new(&r.path, Matcher::new(needles, words.len()));
             let meta = adapter
                 .try_stream(&r, &Demand::LEAN.with_spans(), &mut sink)
                 .with_context(|| format!("scanning {}:{} for pack", r.harness, r.id))?;
-            let low = sink.hay.as_str().to_lowercase();
-            let score = lexical_score(&low, &needle, words.iter().copied());
+            let excerpt = sink.matcher.finish();
+            let score = (0..words.len()).filter(|&i| sink.matcher.found(i)).count() as i64
+                + if sink.matcher.found(words.len()) { 5 } else { 0 };
             if score == 0 {
                 continue;
             }
@@ -336,12 +365,11 @@ fn live_scan_adapters<'a>(
             if scored.len() == fetch && scored.last_key_value().is_some_and(|(worst, _)| rank >= *worst) {
                 continue;
             }
-            // Lowercasing can expand UTF-8 characters; map the match back to source bytes.
-            let folded_pos = words.iter().filter_map(|w| low.find(*w)).min().unwrap_or(0);
-            let pos = cv_core::scan::lowercase_source_range(sink.hay.as_str(), folded_pos..folded_pos).start;
-            let lo = floor_char(sink.hay.as_str(), pos.saturating_sub(40));
-            let hi = ceil_char(sink.hay.as_str(), (pos + 120).min(sink.hay.len()));
-            let snippet = sink.hay.as_str()[lo..hi].replace('\n', " ").trim().to_string();
+            // The excerpt holds the earliest word's match (else the text's start), in source bytes.
+            let (text, pos) = (excerpt.text.as_str(), excerpt.at);
+            let lo = floor_char(text, pos.saturating_sub(40));
+            let hi = ceil_char(text, (pos + 120).min(text.len()));
+            let snippet = text[lo..hi].replace('\n', " ").trim().to_string();
             let title = cv_core::label_from(meta.title.as_deref(), sink.first_prompt.as_deref());
             scored.insert(
                 rank,
@@ -372,8 +400,9 @@ fn live_scan_adapters<'a>(
 // 2. DISTILL
 // ------------------------------------------------------------------------------------------------
 
-/// A ~3-message excerpt window: `(role, trimmed text)` per message.
-type Excerpt = Vec<(Role, String)>;
+/// A ~3-message excerpt window: `(role, text, cut)` per message, `cut` when the text ends at
+/// `--excerpt-bytes` (marked `…`).
+type Excerpt = Vec<(Role, String, bool)>;
 
 /// One recalled session, distilled: identity off the hit, the best-matching excerpt window, and
 /// the catalog's record of what the session actually DID.
@@ -389,19 +418,34 @@ struct PackSource {
     reads: BTreeMap<String, i64>,
     /// Distinct commands run, in first-seen order (capped).
     commands: Vec<String>,
+    /// Distinct commands past [`MAX_COMMANDS`], and kept ones shortened to [`COMMAND_CHARS`].
+    commands_dropped: usize,
+    commands_shortened: usize,
     /// Abstractive digest when `CV_PACK_LLM` routed this span through `llm::digest`.
-    llm_digest: Option<String>,
+    llm_digest: Option<crate::llm::Digest>,
 }
 
-fn build_source(hit: &cv_search::Hit, task: &str, llm_model: Option<Option<&str>>) -> Result<PackSource> {
+fn build_source(
+    hit: &cv_search::Hit,
+    task: &str,
+    llm_model: Option<Option<&str>>,
+    context_bytes: Option<usize>,
+    excerpt_bytes: usize,
+) -> Result<PackSource> {
     let want = Harness::parse(&hit.harness);
     let (r, adapter) =
         cv_core::find(&hit.id, want)?.with_context(|| format!("session {} no longer on disk", short_id(&hit.id)))?;
 
     // Stale events ride the excerpt pass; event failure remains best effort.
-    let (excerpt, excerpt_range) = best_window_and_ingest(adapter.as_ref(), &r, task)?;
+    let (excerpt, excerpt_range) = best_window_and_ingest(adapter.as_ref(), &r, task, excerpt_bytes)?;
     let rows = cv_core::events::events_for(r.harness.as_str(), &r.id, None)?;
-    let EventFacts { edits, reads, commands } = event_facts(&rows);
+    let EventFacts {
+        edits,
+        reads,
+        commands,
+        commands_dropped,
+        commands_shortened,
+    } = event_facts(&rows);
 
     // Optional abstractive pass over just this span (never the whole session).
     let llm_digest = llm_model.and_then(|model| {
@@ -410,7 +454,7 @@ fn build_source(hit: &cv_search::Hit, task: &str, llm_model: Option<Option<&str>
             title: hit.title.clone(),
             ..Session::new(hit.id.clone(), r.harness)
         };
-        for (role, text) in &excerpt {
+        for (role, text, _) in &excerpt {
             let mut m = Message::new(*role);
             m.content.push(Block::Text {
                 text: text.clone().into(),
@@ -420,9 +464,14 @@ fn build_source(hit: &cv_search::Hit, task: &str, llm_model: Option<Option<&str>
         let opts = crate::llm::DigestOptions {
             model: model.map(str::to_owned),
             project: false,
+            context_bytes,
         };
         match crate::llm::digest(&mini, &opts) {
-            Ok(d) => Some(d.trim().to_string()),
+            Ok(mut d) => {
+                eprintln!("cv pack: digest of {}: {}", short_id(&hit.id), digest_input(&d));
+                d.text = d.text.trim().to_string();
+                Some(d)
+            }
             Err(e) => {
                 eprintln!(
                     "cv pack: LLM digest failed for {} ({e:#}); keeping the extractive digest",
@@ -440,6 +489,8 @@ fn build_source(hit: &cv_search::Hit, task: &str, llm_model: Option<Option<&str>
         edits,
         reads,
         commands,
+        commands_dropped,
+        commands_shortened,
         llm_digest,
     })
 }
@@ -449,11 +500,16 @@ struct EventFacts {
     edits: BTreeMap<String, i64>,
     reads: BTreeMap<String, i64>,
     commands: Vec<String>,
+    commands_dropped: usize,
+    commands_shortened: usize,
 }
 fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
     let mut edits: BTreeMap<String, i64> = BTreeMap::new();
     let mut reads: BTreeMap<String, i64> = BTreeMap::new();
     let mut commands: Vec<String> = Vec::new();
+    let mut dropped: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut commands_shortened = 0;
     for e in rows {
         match e.kind.as_str() {
             "file_edit" => {
@@ -468,10 +524,19 @@ fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
             }
             "command" => {
                 if let Some(c) = &e.target {
+                    if !seen.insert(c.as_str()) {
+                        continue;
+                    }
                     // A whole shell pipeline isn't memory; its head is.
-                    let c = cv_core::ir::truncate(c, 90);
-                    if commands.len() < MAX_COMMANDS && !commands.contains(&c) {
-                        commands.push(c);
+                    let head = cv_core::ir::truncate(c, COMMAND_CHARS);
+                    if commands.contains(&head) {
+                        continue;
+                    }
+                    if commands.len() < MAX_COMMANDS {
+                        commands_shortened += usize::from(head != *c);
+                        commands.push(head);
+                    } else {
+                        dropped.insert(c.as_str());
                     }
                 }
             }
@@ -479,7 +544,13 @@ fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
         }
     }
 
-    EventFacts { edits, reads, commands }
+    EventFacts {
+        edits,
+        reads,
+        commands,
+        commands_dropped: dropped.len(),
+        commands_shortened,
+    }
 }
 
 /// Stream the session once (lazy spans, head-capped per message) and return a compact window of
@@ -490,13 +561,14 @@ fn best_window_and_ingest(
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::SessionRef,
     task: &str,
+    limit: usize,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
     if !cv_core::events::needs_ingest(r) {
-        return best_window(adapter, r, task);
+        return best_window(adapter, r, task, limit);
     }
     let source = cv_core::source::Probe::default().snapshot(r);
-    let mut events = cv_core::events::SpoolingSink::new(r.cwd.clone());
-    let result = best_window_observing(adapter, r, task, Some(&mut events))?;
+    let mut events = cv_core::events::SpoolingSink::new(r.cwd.clone()).with_source(r.path.clone());
+    let result = best_window_observing(adapter, r, task, limit, Some(&mut events))?;
     let source = source.with_reads(events.inner().dependencies());
     // The ingest rides the read the pack needed anyway; failing it costs only a later re-ingest.
     if cv_core::source::unchanged(r, &source) {
@@ -514,14 +586,16 @@ fn best_window(
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::ir::SessionRef,
     task: &str,
+    limit: usize,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
-    best_window_observing(adapter, r, task, None)
+    best_window_observing(adapter, r, task, limit, None)
 }
 
 fn best_window_observing(
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::SessionRef,
     task: &str,
+    limit: usize,
     events: Option<&mut cv_core::events::SpoolingSink>,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
     let needle = task.to_lowercase();
@@ -537,7 +611,8 @@ fn best_window_observing(
         words: Vec<String>,
         needle: String,
         resolver: Resolver,
-        window: cv_core::api::MessageWindow<(Role, String)>,
+        limit: usize,
+        window: cv_core::api::MessageWindow<(Role, String, bool)>,
         error: Option<anyhow::Error>,
     }
     impl MessageSink for WindowSink<'_> {
@@ -568,7 +643,7 @@ fn best_window_observing(
                 self.window.skip();
                 return Flow::Continue;
             }
-            let text = match capped_text(&m, &self.resolver) {
+            let (text, cut) = match capped_text(&m, &self.resolver, self.limit) {
                 Ok(text) => text,
                 Err(error) => {
                     self.error = Some(error);
@@ -581,7 +656,7 @@ fn best_window_observing(
             }
             let low = text.to_lowercase();
             let score = lexical_score(&low, &self.needle, self.words.iter().map(String::as_str));
-            self.window.scored((m.role, text), score);
+            self.window.scored((m.role, text, cut), score);
             Flow::Continue
         }
     }
@@ -592,6 +667,7 @@ fn best_window_observing(
         words,
         needle,
         resolver: Resolver::new(Some(r.path.clone())),
+        limit,
         window: cv_core::api::MessageWindow::best(),
         error: None,
     };
@@ -604,71 +680,53 @@ fn best_window_observing(
     Ok((selected.into_iter().map(|(_, value)| value).collect(), range))
 }
 
-/// A message's text blocks, span-aware (head-resolved) and trimmed to excerpt size with code
-/// fences kept intact.
-fn capped_text(m: &Message, resolver: &Resolver) -> Result<String> {
+/// A message's text blocks, span-aware, as an excerpt of at most `limit` bytes: the whole text
+/// when it fits, else its first `limit` bytes with any open code fence closed and `…` appended
+/// (`true`). No more than `limit + 1` bytes are resolved, so a giant pasted log is never read whole.
+fn capped_text(m: &Message, resolver: &Resolver, limit: usize) -> Result<(String, bool)> {
+    let cap = limit.saturating_add(1);
     let mut s = String::new();
+    let mut more = false;
     for b in &m.content {
         if let Block::Text { text } = b {
-            if s.len() >= MSG_RESOLVE_BYTES as usize {
-                break;
-            }
             if !s.is_empty() {
                 s.push('\n');
             }
-            let remaining = MSG_RESOLVE_BYTES as usize - s.len();
+            let remaining = cap.saturating_sub(s.len());
             if remaining == 0 {
+                more = true;
                 break;
             }
             let prefix = text.try_resolve_prefix(resolver, remaining as u64)?;
             s.push_str(&prefix[..floor_char(&prefix, prefix.len().min(remaining))]);
         }
     }
-    Ok(trim_excerpt(&s))
+    Ok(trim_excerpt(&s, limit, more || s.len() > limit))
 }
 
-/// Trim to ~[`EXCERPT_SOFT_CHARS`], but never cut inside a fenced code block: an open fence
-/// extends the budget up to [`EXCERPT_HARD_CHARS`], then is closed explicitly. Line-oriented, so
-/// fences stay at line starts and the result renders as markdown.
-fn trim_excerpt(s: &str) -> String {
+/// Trim to `limit` bytes when `cut` (or longer): the head, cut on a character boundary, an open
+/// code fence closed explicitly so the result renders as markdown, then `…`.
+fn trim_excerpt(s: &str, limit: usize, cut: bool) -> (String, bool) {
     let s = s.trim();
-    if s.len() <= EXCERPT_SOFT_CHARS {
-        return s.to_string();
+    if !cut && s.len() <= limit {
+        return (s.to_string(), false);
     }
-    let mut out = String::new();
-    let mut in_fence = false;
-    for line in s.lines() {
-        let line = if line.len() > EXCERPT_HARD_CHARS {
-            // A single pathological line (minified JSON, …) — head only.
-            &line[..floor_char(line, 400)]
-        } else {
-            line
-        };
-        let remaining = EXCERPT_HARD_CHARS.saturating_sub(out.len());
-        let prefix = &line[..floor_char(line, line.len().min(remaining))];
-        if prefix.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        }
-        out.push_str(prefix);
-        out.push('\n');
-        if prefix.len() < line.len() || out.len() >= EXCERPT_HARD_CHARS {
-            if in_fence {
-                out.push_str("```\n");
-            }
-            out.push('…');
-            return out;
-        }
-        if out.len() >= EXCERPT_SOFT_CHARS && !in_fence {
-            out.push('…');
-            return out;
-        }
+    let mut out = s[..floor_char(s, s.len().min(limit))].trim_end().to_string();
+    if out.is_empty() {
+        // Nothing visible within the limit (a whitespace-padded blob): no excerpt line at all.
+        return (out, true);
     }
-    out.trim_end().to_string()
+    let fences = out.lines().filter(|line| line.trim_start().starts_with("```")).count();
+    if fences % 2 == 1 {
+        out.push_str("\n```");
+    }
+    out.push_str("\n…");
+    (out, true)
 }
 
 /// Cross-source rollup: `(path, sessions touching it, edits, reads)` ranked by how many sources
 /// it appears in, then by edit count — "the files that keep appearing".
-fn rollup_files(sources: &[PackSource]) -> Vec<(String, usize, i64, i64)> {
+fn rollup_files(sources: &[PackSource]) -> (Vec<(String, usize, i64, i64)>, usize) {
     let mut acc: BTreeMap<String, (HashSet<usize>, i64, i64)> = BTreeMap::new();
     for (si, s) in sources.iter().enumerate() {
         for (p, n) in &s.edits {
@@ -685,8 +743,40 @@ fn rollup_files(sources: &[PackSource]) -> Vec<(String, usize, i64, i64)> {
     let mut rows: Vec<(String, usize, i64, i64)> =
         acc.into_iter().map(|(p, (sess, e, r))| (p, sess.len(), e, r)).collect();
     rows.sort_by_key(|r| std::cmp::Reverse((r.1, r.2, r.3)));
+    let dropped = rows.len().saturating_sub(MAX_ROLLUP);
     rows.truncate(MAX_ROLLUP);
-    rows
+    (rows, dropped)
+}
+
+/// The bundle's bounds and what the whole bundle cut under them.
+struct Bounds {
+    excerpt_bytes: usize,
+    rollup_dropped: usize,
+}
+
+/// The header line naming every bound of a pack and what each cut, e.g. `Bounds: excerpt
+/// messages to 1600 bytes (--excerpt-bytes; 2 cut, marked …), …`.
+fn bounds_line(sources: &[PackSource], bounds: &Bounds) -> String {
+    let excerpts_cut: usize = sources
+        .iter()
+        .map(|s| s.excerpt.iter().filter(|(_, _, cut)| *cut).count())
+        .sum();
+    let commands_dropped: usize = sources.iter().map(|s| s.commands_dropped).sum();
+    let commands_shortened: usize = sources.iter().map(|s| s.commands_shortened).sum();
+    let files_dropped: usize = sources.iter().map(files_dropped).sum();
+    format!(
+        "Bounds: each excerpt message to {} bytes (`--excerpt-bytes`; {excerpts_cut} cut, marked …); \
+         {MAX_COMMANDS} distinct commands per source ({commands_dropped} left out), each to \
+         {COMMAND_CHARS} characters ({commands_shortened} shortened); {MAX_FILES_PER_SOURCE} files per \
+         source ({files_dropped} left out); {MAX_ROLLUP} rollup files ({} left out).",
+        bounds.excerpt_bytes, bounds.rollup_dropped
+    )
+}
+
+/// Distinct files a source touched that [`files_line`] leaves out.
+fn files_dropped(s: &PackSource) -> usize {
+    let distinct = s.edits.len() + s.reads.keys().filter(|p| !s.edits.contains_key(*p)).count();
+    distinct.saturating_sub(MAX_FILES_PER_SOURCE)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -729,8 +819,16 @@ fn files_line(s: &PackSource) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
+/// What a digest was made from: `sent of whole transcript bytes; limit N bytes, from <source>`.
+fn digest_input(d: &crate::llm::Digest) -> String {
+    format!(
+        "{} of {} transcript bytes sent; limit {}",
+        d.sent, d.transcript, d.limit
+    )
+}
+
 /// The `md` format: a CLAUDE.md-style bundle you can paste into project memory.
-fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, i64)]) -> String {
+fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, i64)], bounds: &Bounds) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# Context pack: {task}\n");
     let _ = writeln!(
@@ -740,6 +838,7 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
         sources.len(),
         Utc::now().format("%Y-%m-%d")
     );
+    let _ = writeln!(out, "{}\n", bounds_line(sources, bounds));
 
     for s in sources {
         let title = s.hit.title.as_deref().unwrap_or("(untitled)");
@@ -751,11 +850,12 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
             hit_cwd(&s.hit)
         );
         if let Some(d) = &s.llm_digest {
-            let _ = writeln!(out, "{d}\n");
+            let _ = writeln!(out, "{}\n", d.text);
+            let _ = writeln!(out, "_Digest input: {}._\n", digest_input(d));
         }
         if !s.excerpt.is_empty() {
             let _ = writeln!(out, "Key excerpt:\n");
-            for (role, text) in &s.excerpt {
+            for (role, text, _) in &s.excerpt {
                 let _ = writeln!(out, "**{}:**", cv_core::render::role_label(*role));
                 let _ = writeln!(out, "{text}\n");
             }
@@ -791,7 +891,7 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
 }
 
 /// The `prompt` format: the same content shaped as a system prompt (second person).
-fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, i64)]) -> String {
+fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, i64)], bounds: &Bounds) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "You are picking up work on: {task}\n");
     let _ = writeln!(
@@ -800,6 +900,7 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
          is recalled from {} of your past session(s).\n",
         sources.len()
     );
+    let _ = writeln!(out, "{}\n", bounds_line(sources, bounds));
     for (i, s) in sources.iter().enumerate() {
         let title = s.hit.title.as_deref().unwrap_or("(untitled)");
         let _ = writeln!(
@@ -811,11 +912,11 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
             hit_cwd(&s.hit)
         );
         if let Some(d) = &s.llm_digest {
-            for line in d.lines() {
+            for line in d.text.lines() {
                 let _ = writeln!(out, "   {line}");
             }
         }
-        for (role, text) in &s.excerpt {
+        for (role, text, _) in &s.excerpt {
             let _ = writeln!(out, "   {} said:", cv_core::render::role_label(*role));
             for line in text.lines() {
                 let _ = writeln!(out, "   > {line}");
@@ -847,6 +948,14 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
     out
 }
 
+/// Where and how `--format session` writes: the target harness, `--out`, `--thinking`, `--json`.
+struct SessionOut {
+    harness: Harness,
+    out: Option<PathBuf>,
+    thinking: cv_core::emit::ThinkingMode,
+    json: bool,
+}
+
 /// The `session` format: a synthetic resumable session in the target harness — one user message
 /// framing the task with the full bundle, plus a short assistant acknowledgment so the resumed
 /// harness opens on a clean turn boundary. Emitted through the same `cv_core::emit` path
@@ -855,12 +964,16 @@ fn emit_pack_session(
     task: &str,
     sources: &[PackSource],
     rollup: &[(String, usize, i64, i64)],
-    to_h: Harness,
-    out: Option<PathBuf>,
-    thinking: cv_core::emit::ThinkingMode,
-    json: bool,
+    bounds: &Bounds,
+    target: SessionOut,
 ) -> Result<()> {
-    let bundle = md_bundle(task, sources, rollup);
+    let SessionOut {
+        harness: to_h,
+        out,
+        thinking,
+        json,
+    } = target;
+    let bundle = md_bundle(task, sources, rollup, bounds);
     let now = Utc::now();
 
     let mut user = Message::new(Role::User);
@@ -1043,10 +1156,10 @@ mod tests {
             mutate: None,
             dependency: None,
         };
-        let expected = best_window(&adapter, &r, "chosen")?;
+        let expected = best_window(&adapter, &r, "chosen", EXCERPT_BYTES)?;
         // The old independent ingestion traversal, through the same real adapter.
         let source = cv_core::source::Probe::default().snapshot(&r);
-        let mut events = cv_core::events::SpoolingSink::new(r.cwd.clone());
+        let mut events = cv_core::events::SpoolingSink::new(r.cwd.clone()).with_source(r.path.clone());
         adapter.try_stream(&r, &Demand::LEAN.with_spans(), &mut events)?;
         let source = source.with_reads(events.inner().dependencies());
         cv_core::events::record_spooled_with_source(&r, 0, events.into_spool()?, &source, &Default::default())?;
@@ -1058,7 +1171,7 @@ mod tests {
         assert!(!expected_facts.commands.is_empty());
         stale(&path);
         adapter.calls.store(0, Ordering::Relaxed);
-        assert_eq!(best_window_and_ingest(&adapter, &r, "chosen")?, expected);
+        assert_eq!(best_window_and_ingest(&adapter, &r, "chosen", EXCERPT_BYTES)?, expected);
         assert_eq!(adapter.calls.load(Ordering::Relaxed), session.messages.len());
         assert_eq!(format!("{:?}", rows(&r)), expected_rows);
         assert_eq!(event_facts(&rows(&r)), expected_facts);
@@ -1066,7 +1179,7 @@ mod tests {
         let conn = rusqlite::Connection::open(world.cv_home.join("catalog.db"))?;
         conn.execute_batch("CREATE TABLE pack_event_writes(n INTEGER); INSERT INTO pack_event_writes VALUES(0); CREATE TRIGGER count_pack_events AFTER INSERT ON events BEGIN UPDATE pack_event_writes SET n=n+1; END;")?;
         adapter.calls.store(0, Ordering::Relaxed);
-        assert_eq!(best_window_and_ingest(&adapter, &r, "chosen")?, expected);
+        assert_eq!(best_window_and_ingest(&adapter, &r, "chosen", EXCERPT_BYTES)?, expected);
         assert_eq!(adapter.calls.load(Ordering::Relaxed), session.messages.len());
         assert_eq!(event_facts(&rows(&r)), expected_facts);
 
@@ -1084,7 +1197,7 @@ mod tests {
             stale(&path);
             adapter.dependency = Some(dependency.clone());
             adapter.mutate = Some(mutation.clone());
-            assert_eq!(best_window_and_ingest(&adapter, &r, "chosen")?, expected);
+            assert_eq!(best_window_and_ingest(&adapter, &r, "chosen", EXCERPT_BYTES)?, expected);
             assert_eq!(format!("{:?}", rows(&r)), expected_rows);
             assert!(cv_core::events::needs_ingest(&r));
         }
@@ -1094,11 +1207,11 @@ mod tests {
         conn.execute_batch(
             "CREATE TRIGGER reject_pack_events BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'pack failure'); END;",
         )?;
-        assert_eq!(best_window_and_ingest(&adapter, &r, "chosen")?, expected);
+        assert_eq!(best_window_and_ingest(&adapter, &r, "chosen", EXCERPT_BYTES)?, expected);
         assert_eq!(format!("{:?}", rows(&r)), expected_rows);
         assert!(cv_core::events::needs_ingest(&r));
         std::fs::write(&path, b"{broken transcript")?;
-        assert!(best_window_and_ingest(&adapter, &r, "chosen").is_err());
+        assert!(best_window_and_ingest(&adapter, &r, "chosen", EXCERPT_BYTES).is_err());
         assert_eq!(format!("{:?}", rows(&r)), expected_rows);
         Ok(())
     }
@@ -1135,8 +1248,8 @@ mod tests {
             text: "tail after failed events".into(),
         });
         let fixture = ExcerptFixture(vec![good, bad, following]);
-        let expected = best_window(&fixture, &r, "chosen")?;
-        assert_eq!(best_window_and_ingest(&fixture, &r, "chosen")?, expected);
+        let expected = best_window(&fixture, &r, "chosen", EXCERPT_BYTES)?;
+        assert_eq!(best_window_and_ingest(&fixture, &r, "chosen", EXCERPT_BYTES)?, expected);
         assert!(rows(&r).is_empty());
         let mut unreadable = Message::new(Role::Assistant);
         unreadable.content.push(Block::Text {
@@ -1147,7 +1260,7 @@ mod tests {
                 escaped: false,
             }),
         });
-        assert!(best_window_and_ingest(&ExcerptFixture(vec![unreadable]), &r, "chosen").is_err());
+        assert!(best_window_and_ingest(&ExcerptFixture(vec![unreadable]), &r, "chosen", EXCERPT_BYTES).is_err());
         assert!(rows(&r).is_empty());
         assert!(cv_core::events::needs_ingest(&r));
         Ok(())
@@ -1206,20 +1319,25 @@ mod tests {
         let mut source = message.clone();
         source.content = vec![Block::Text { text: source_text }];
         let resolver = Resolver::new(Some(path.clone()));
-        let expected_text = capped_text(&message, &resolver)?;
-        assert!(!expected_text.contains("omitted-tail"));
-        assert!(expected_text.len() < MSG_RESOLVE_BYTES as usize);
-        let expected_window = best_window(&ExcerptFixture(vec![message]), &reference, "chosen")?;
+        let expected_text = capped_text(&message, &resolver, EXCERPT_BYTES)?;
+        assert!(!expected_text.0.contains("omitted-tail"));
+        assert!(expected_text.1 && expected_text.0.len() <= EXCERPT_BYTES + "\n…".len());
+        let expected_window = best_window(&ExcerptFixture(vec![message]), &reference, "chosen", EXCERPT_BYTES)?;
         for selected in [&span, &source] {
-            assert_eq!(capped_text(selected, &resolver)?, expected_text);
+            assert_eq!(capped_text(selected, &resolver, EXCERPT_BYTES)?, expected_text);
             assert_eq!(
-                best_window(&ExcerptFixture(vec![selected.clone()]), &reference, "chosen")?,
+                best_window(
+                    &ExcerptFixture(vec![selected.clone()]),
+                    &reference,
+                    "chosen",
+                    EXCERPT_BYTES
+                )?,
                 expected_window
             );
         }
         std::fs::write(&path, b"changed")?;
-        assert!(capped_text(&source, &resolver).is_err());
-        assert!(best_window(&ExcerptFixture(vec![source]), &reference, "chosen").is_err());
+        assert!(capped_text(&source, &resolver, EXCERPT_BYTES).is_err());
+        assert!(best_window(&ExcerptFixture(vec![source]), &reference, "chosen", EXCERPT_BYTES).is_err());
         Ok(())
     }
 
@@ -1343,20 +1461,21 @@ mod tests {
     #[test]
     fn trim_excerpt_keeps_code_fences_closed() {
         // Short text passes through untouched.
-        assert_eq!(trim_excerpt("hello"), "hello");
+        assert_eq!(trim_excerpt("hello", EXCERPT_BYTES, false), ("hello".into(), false));
 
-        // A fence that opens before the soft cap stays open past it and gets closed at the hard cap.
+        // A fence open at the limit is closed, and the cut is marked.
         let body = format!("intro\n```rust\n{}\n", "let x = 1;\n".repeat(400));
-        let out = trim_excerpt(&body);
-        assert!(out.len() <= EXCERPT_HARD_CHARS + 16, "len {}", out.len());
-        let fences = out.matches("```").count();
-        assert_eq!(fences % 2, 0, "unbalanced fences in:\n{out}");
+        let (out, cut) = trim_excerpt(&body, EXCERPT_BYTES, false);
+        assert!(cut && out.len() <= EXCERPT_BYTES + 8, "len {}", out.len());
+        assert_eq!(out.matches("```").count() % 2, 0, "unbalanced fences in:\n{out}");
         assert!(out.ends_with('…'), "{out}");
 
-        // Plain prose cuts at the soft cap.
-        let prose = "word ".repeat(500);
-        let out = trim_excerpt(&prose);
-        assert!(out.len() < EXCERPT_SOFT_CHARS + 16, "len {}", out.len());
+        // Prose cuts at the limit the caller chose.
+        let (out, cut) = trim_excerpt(&"word ".repeat(500), 700, false);
+        assert!(cut && out.len() <= 700 + 4, "len {}", out.len());
+        // A text exactly at the limit is whole; one the caller knows continues is cut.
+        assert!(!trim_excerpt(&"x".repeat(700), 700, false).1);
+        assert!(trim_excerpt(&"x".repeat(700), 700, true).1);
     }
 
     fn hit(id: &str, snippet: &str) -> cv_search::Hit {
@@ -1435,17 +1554,20 @@ mod tests {
         let mut message = Message::new(Role::Assistant);
         message.content = (0..20)
             .map(|_| Block::Text {
-                text: " ".repeat(MSG_RESOLVE_BYTES as usize).into(),
+                text: " ".repeat(EXCERPT_BYTES).into(),
             })
             .collect();
         message.content.push(Block::Text {
             text: "outside the message budget".into(),
         });
-        assert!(capped_text(&message, &Resolver::new(None))?.is_empty());
+        assert_eq!(
+            capped_text(&message, &Resolver::new(None), EXCERPT_BYTES)?,
+            (String::new(), true)
+        );
         for body in ["x".repeat(1500), "雪".repeat(500)] {
             let source = format!("{}\n```rust\n{body}\nstill inside\n```\n", "intro ".repeat(100));
-            let actual = trim_excerpt(&source);
-            assert!(actual.len() <= EXCERPT_HARD_CHARS + 16, "{}", actual.len());
+            let (actual, cut) = trim_excerpt(&source, EXCERPT_BYTES, false);
+            assert!(cut && actual.len() <= EXCERPT_BYTES + 8, "{}", actual.len());
             assert_eq!(actual.matches("```").count() % 2, 0, "{actual}");
             assert!(actual.ends_with('…'));
         }
@@ -1461,9 +1583,16 @@ mod tests {
             edits: BTreeMap::new(),
             reads: BTreeMap::new(),
             commands: Vec::new(),
+            commands_dropped: 0,
+            commands_shortened: 0,
             llm_digest: None,
         };
-        let bundle = md_bundle("task", &[source], &[]);
+        let bounds = Bounds {
+            excerpt_bytes: EXCERPT_BYTES,
+            rollup_dropped: 0,
+        };
+        let bundle = md_bundle("task", &[source], &[], &bounds);
+        assert!(bundle.contains("Bounds: each excerpt message to 1600 bytes (`--excerpt-bytes`; 0 cut"));
         assert!(bundle.contains("cv show claude:abcdef0123456789 --range 4..9"));
         assert!(!bundle.contains("--range 4-9"));
     }

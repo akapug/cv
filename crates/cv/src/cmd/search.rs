@@ -7,6 +7,7 @@ use cv_core::sanitize::sanitize_line;
 use cv_search::{Found, Note, Source};
 use std::io::Write;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_search(
     query: &str,
     harness: Option<String>,
@@ -14,7 +15,8 @@ pub(crate) fn cmd_search(
     semantic: bool,
     scan: bool,
     kind: Option<String>,
-    json: bool, // emit the hits as one JSON array (session rows + score/snippet/provenance) instead of the table
+    live_bytes: Option<u64>,
+    json: bool, // emit `{hits, total}` (session rows + score/snippet/provenance) instead of the table
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
     let scope = match kind.as_deref() {
@@ -28,7 +30,7 @@ pub(crate) fn cmd_search(
         Source::Semantic
     } else {
         if scan {
-            eprintln!("(--scan: scanning transcripts live, head-capped; `cv index` makes search instant)");
+            eprintln!("(--scan: scanning every transcript live; `cv index` makes search instant)");
             Source::Live
         } else {
             Source::Index
@@ -41,27 +43,28 @@ pub(crate) fn cmd_search(
     };
     // The index answers every full-text search: an empty result means "no match", and an index
     // that is missing or unusable is an error naming the cause and the fix, never a silent scan
-    // of every transcript (minutes on a large corpus, and only each session's head).
-    let found = match cv_search::Searcher::default().search(query, filter, limit, source) {
+    // of every transcript (minutes on a large corpus).
+    let found = match cv_search::Searcher::default().search(query, filter, limit, source, live_bytes) {
         Ok(found) => found,
         Err(e) => {
             return match source {
                 Source::Semantic => Err(e.context("semantic search failed (run `cv index --semantic` first?)")),
                 Source::Index if cv_search::is_invalid_text_query(&e) => crate::util::usage(format!("{e:#}")),
                 Source::Index => Err(e.context(
-                    "full-text search needs the index (or pass --scan for a slow live scan of each session's head)",
+                    "full-text search needs a usable index (or pass --scan for a slow live scan of every session)",
                 )),
                 Source::Live => Err(e),
             }
         }
     };
-    render(found, limit, query, json)
+    render(found, query, json)
 }
 
 /// A note in the CLI's words. The sub-agent miss is prose for the table only.
 fn note_line(note: &Note) -> Option<String> {
     match note {
         Note::Stale(s) => Some(format!("(note: {s})")),
+        Note::Live(s) => Some(format!("(live: {s})")),
         Note::SnippetsUnavailable(e) => Some(format!(
             "(note: live snippets unavailable ({e}); showing indexed previews)"
         )),
@@ -70,16 +73,22 @@ fn note_line(note: &Note) -> Option<String> {
     }
 }
 
-/// Render what the search found: the table with harness/short-id/date/title/snippet and the
-/// notes, or, with `json`, the SAME hits in the same order as one JSON array on stdout — notes
-/// on stderr, an empty result `[]` — so the output pipes cleanly (`cv mcp` relays stderr as its
-/// own content block).
-fn render(found: Found, limit: usize, query: &str, json: bool) -> Result<()> {
+/// The footer: `N of M matches`, and how to see the rest when `--limit` cut them.
+fn matches_line(shown: usize, total: usize) -> String {
+    let more = if shown < total { "; use --limit for more" } else { "" };
+    format!("{shown} of {total} matches{more}")
+}
+
+/// Render what the search found: the table with harness/short-id/date/title/snippet, the
+/// `N of M matches` footer and the notes, or, with `json`, `{"hits": [...], "total": M}` on
+/// stdout with the SAME hits in the same order — notes on stderr, an empty result `"hits": []` —
+/// so the output pipes cleanly (`cv mcp` relays stderr as its own content block).
+fn render(found: Found, query: &str, json: bool) -> Result<()> {
     let Found {
         hits,
         source,
         notes,
-        truncated,
+        total,
     } = found;
     if json {
         for line in notes.iter().filter_map(note_line) {
@@ -88,10 +97,10 @@ fn render(found: Found, limit: usize, query: &str, json: bool) -> Result<()> {
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
         let rows = std::cell::LazyCell::new(cv_core::rows::SearchRowContext::new);
-        write_json_rows(&mut out, &hits, |hit| cv_search::row(hit, &rows))?;
+        write_json_rows(&mut out, &hits, total, |hit| cv_search::row(hit, &rows))?;
         out.flush()?;
-        if truncated {
-            eprintln!("(stopped at {limit} hits; use --limit)");
+        if hits.len() < total {
+            eprintln!("({})", matches_line(hits.len(), total));
         }
         return Ok(());
     }
@@ -150,10 +159,10 @@ fn render(found: Found, limit: usize, query: &str, json: bool) -> Result<()> {
             println!("          … {}", truncate(&sanitize_line(&h.snippet), 120));
         }
     }
-    if truncated {
-        println!("\n(stopped at {limit} hits; use --limit)");
-    } else if hits.is_empty() {
+    if hits.is_empty() {
         println!("no matches for {query:?}");
+    } else {
+        println!("\n{}", matches_line(hits.len(), total));
     }
     // The disclosure on the hit path: a stale index may be missing the rows the query would have
     // caught, and a hit list that doesn't say so reads as complete.
@@ -163,8 +172,13 @@ fn render(found: Found, limit: usize, query: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-// Preserve the shared row contract and exact pretty-array formatting, retaining only one
-// projected row at a time rather than another complete Value array and serialized String.
+// Preserve the shared row contract, retaining only one projected row at a time rather than
+// another complete Value array and serialized String.
+#[derive(serde::Serialize)]
+struct JsonFound<R> {
+    hits: R,
+    total: usize,
+}
 struct JsonRows<'a, T, F> {
     rows: &'a [T],
     row: F,
@@ -179,8 +193,19 @@ impl<T, F: Fn(&T) -> serde_json::Value> serde::Serialize for JsonRows<'_, T, F> 
         sequence.end()
     }
 }
-fn write_json_rows<T>(out: &mut impl Write, rows: &[T], row: impl Fn(&T) -> serde_json::Value) -> Result<()> {
-    serde_json::to_writer_pretty(&mut *out, &JsonRows { rows, row })?;
+fn write_json_rows<T>(
+    out: &mut impl Write,
+    rows: &[T],
+    total: usize,
+    row: impl Fn(&T) -> serde_json::Value,
+) -> Result<()> {
+    serde_json::to_writer_pretty(
+        &mut *out,
+        &JsonFound {
+            hits: JsonRows { rows, row },
+            total,
+        },
+    )?;
     writeln!(out)?;
     Ok(())
 }
@@ -218,6 +243,9 @@ pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool, strict: 
                 "embedded {e} session(s) → {}",
                 cv_search::default_embeddings_path().display()
             );
+            if let Some(chars) = cv_search::embedded_chars()? {
+                println!("(each vector embeds a session's first {chars} characters: what the model reads)");
+            }
         }
         embedded = Some(e);
     }
@@ -255,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_search_json_preserves_exact_pretty_row_array() {
+    fn streamed_search_json_is_the_pretty_hits_object_with_its_total() {
         for rows in [
             Vec::new(),
             vec![
@@ -264,16 +292,17 @@ mod tests {
             ],
         ] {
             let mut output = Vec::new();
-            write_json_rows(&mut output, &rows, Clone::clone).unwrap();
+            write_json_rows(&mut output, &rows, 7, Clone::clone).unwrap();
+            let expected = serde_json::json!({"hits": rows, "total": 7});
             assert_eq!(
                 String::from_utf8(output).unwrap(),
-                format!("{}\n", serde_json::to_string_pretty(&rows).unwrap())
+                format!("{}\n", serde_json::to_string_pretty(&expected).unwrap())
             );
         }
         let rows = vec![1, 2, 3];
         let visits = std::cell::RefCell::new(Vec::new());
         let mut out = Vec::new();
-        write_json_rows(&mut out, &rows, |row| {
+        write_json_rows(&mut out, &rows, 3, |row| {
             visits.borrow_mut().push(*row);
             serde_json::json!(row)
         })

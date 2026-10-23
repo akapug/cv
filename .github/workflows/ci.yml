@@ -164,6 +164,8 @@ jobs:
           mkdir "$probe_root/catalog"
           python3 tools/perf-fixture.py claude "$probe_root/input" --shape sweep-arguments --payload-bytes 100000000
           CV_SWEEP_INPUT_PROBE="$probe_root/input/sweep.jsonl" CV_SWEEP_INPUT_BYTES=100000000 CV_SWEEP_HASH_BODY=1 CLUSTERVISION_HOME="$probe_root/catalog" cargo test -p cv-search --no-default-features --features probe-heap fts::tests::production_sweep_heap_probe -- --ignored --exact --nocapture
+          # The live suffix a search reads beside the index: all four giant sessions, read by default.
+          CV_SWEEP_INPUT_PROBE="$probe_root/input/sweep.jsonl" CV_SWEEP_INPUT_BYTES=100000000 CLUSTERVISION_HOME="$probe_root/catalog" cargo test -p cv-search --no-default-features --features probe-heap fts::tests::production_live_suffix_heap_probe -- --ignored --exact --nocapture
           # Fake vectors isolate actual parsing/projection/save retention without a model download.
           CV_SWEEP_INPUT_PROBE="$probe_root/input/sweep.jsonl" CV_SWEEP_INPUT_BYTES=100000000 CLUSTERVISION_HOME="$probe_root/catalog" cargo test -p cv-search --features probe-heap semantic::tests::production_semantic_heap_probe -- --ignored --exact --nocapture
           CLUSTERVISION_HOME="$probe_root/catalog" cargo test -p cv-search --features probe-heap semantic::tests::semantic_store_decode_heap_probe -- --ignored --exact --test-threads=1 --nocapture

@@ -6,6 +6,7 @@
 use super::*;
 use crate::harness::store::{bytes::ByteSource, document::Fields, text};
 use crate::json::{JsonSource, JsonView};
+use crate::json::{ReadInput, Validation};
 use crate::lazy::Text;
 use crate::stream::Tier;
 use std::sync::Arc;
@@ -34,47 +35,37 @@ pub(super) fn metadata(view: JsonView<'_>, rich: bool) -> Result<Value> {
     if rich {
         return Ok(view.resolve()?.into_owned());
     }
-    let Some(fields) = Fields::parse(
-        view,
-        &["userVisible", "agentVisible", "turnContext", "usage", "inference"],
-    )?
-    else {
+    // Each selection's keys, named once and reused by the emit loops below.
+    const FLAGS: &[&str] = &["userVisible", "agentVisible", "turnContext"];
+    const USAGE_NUMBERS: &[&str] = &[
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "cost",
+    ];
+    const INFERENCE: &[&str] = &["provider", "resolvedModel", "requestedModel"];
+    let top: Vec<&str> = FLAGS.iter().copied().chain(["usage", "inference"]).collect();
+    let Some(fields) = Fields::parse(view, &top)? else {
         return Ok(Value::Null);
     };
     let mut out = serde_json::Map::new();
-    for key in ["userVisible", "agentVisible", "turnContext"] {
+    for key in FLAGS {
         if let Some(flag) = fields.get(key).map(|v| v.as_bool()).transpose()?.flatten() {
-            out.insert(key.into(), Value::Bool(flag));
+            out.insert((*key).into(), Value::Bool(flag));
         }
     }
+    let usage_keys: Vec<&str> = USAGE_NUMBERS.iter().copied().chain(["isCompaction"]).collect();
     if let Some(usage) = fields
         .get("usage")
-        .map(|v| {
-            Fields::parse(
-                v,
-                &[
-                    "inputTokens",
-                    "outputTokens",
-                    "cacheReadTokens",
-                    "cacheWriteTokens",
-                    "cost",
-                    "isCompaction",
-                ],
-            )
-        })
+        .map(|v| Fields::parse(v, &usage_keys))
         .transpose()?
         .flatten()
     {
         let mut out_usage = serde_json::Map::new();
-        for key in [
-            "inputTokens",
-            "outputTokens",
-            "cacheReadTokens",
-            "cacheWriteTokens",
-            "cost",
-        ] {
+        for key in USAGE_NUMBERS {
             if let Some(number) = usage.get(key).map(|v| v.as_number()).transpose()?.flatten() {
-                out_usage.insert(key.into(), Value::Number(number));
+                out_usage.insert((*key).into(), Value::Number(number));
             }
         }
         if let Some(flag) = usage.get("isCompaction").map(|v| v.as_bool()).transpose()?.flatten() {
@@ -84,16 +75,16 @@ pub(super) fn metadata(view: JsonView<'_>, rich: bool) -> Result<Value> {
     }
     if let Some(inference) = fields
         .get("inference")
-        .map(|v| Fields::parse(v, &["provider", "resolvedModel", "requestedModel"]))
+        .map(|v| Fields::parse(v, INFERENCE))
         .transpose()?
         .flatten()
     {
         let mut out_inference = serde_json::Map::new();
-        for key in ["provider", "resolvedModel", "requestedModel"] {
+        for key in INFERENCE {
             // A present non-string resolvedModel still shadows requestedModel.
             if inference.get(key).is_some() {
                 out_inference.insert(
-                    key.into(),
+                    (*key).into(),
                     inference.string(key)?.map(Value::String).unwrap_or(Value::Null),
                 );
             }
@@ -139,7 +130,7 @@ pub(super) fn content(
                 }
             }
             Some(_) => {
-                let joined_over = if spans { 0 } else { u64::MAX };
+                let joined_over = crate::harness::wire::joined_over(spans);
                 let block = anthropic::block_from_view_with(
                     item,
                     &anthropic::GOOSE,
@@ -248,7 +239,9 @@ fn tool(view: JsonView<'_>, tools: &mut HashMap<String, String>, opts: &Demand, 
                         writer.write_all(b"}")?;
                         Ok(())
                     })?;
-                    source.read_backing_value(arena.clone(), offset, len, |v| v.argument(opts.spans))?
+                    source.read(ReadInput::Backing(arena.clone(), offset, len), Validation::Value, |v| {
+                        v.argument(opts.spans)
+                    })?
                 }
                 None => crate::json::Json::default(),
             };

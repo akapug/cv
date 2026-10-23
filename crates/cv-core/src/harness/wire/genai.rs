@@ -115,25 +115,29 @@ pub(crate) fn text_fields(
     }
     Ok(())
 }
-pub(crate) fn media_fields(object: &mut ObjectWriter<'_>, block: &Block) -> Result<()> {
-    match block {
-        Block::Image { media_type, .. } => object.field_with("inlineData", |w| {
-            let mut data = ObjectWriter::new(w)?;
-            if let Some(mime) = media_type {
-                data.field("mimeType", mime)?;
-            }
-            data.finish()
-        }),
-        Block::File { mime, path, source } => object.field_with("fileData", |w| {
-            let mut data = ObjectWriter::new(w)?;
-            if let Some(mime) = mime {
-                data.field("mimeType", mime)?;
-            }
-            if let Some(uri) = source.as_deref().or(path.as_deref()) {
-                data.field("fileUri", uri)?;
-            }
-            data.finish()
-        }),
-        _ => unreachable!("selected GenAI media part"),
-    }
+pub(crate) fn image_fields(object: &mut ObjectWriter<'_>, media_type: Option<&str>) -> Result<()> {
+    object.field_with("inlineData", |w| {
+        let mut data = ObjectWriter::new(w)?;
+        if let Some(mime) = media_type {
+            data.field("mimeType", mime)?;
+        }
+        data.finish()
+    })
+}
+pub(crate) fn file_fields(
+    object: &mut ObjectWriter<'_>,
+    mime: Option<&str>,
+    path: Option<&str>,
+    source: Option<&str>,
+) -> Result<()> {
+    object.field_with("fileData", |w| {
+        let mut data = ObjectWriter::new(w)?;
+        if let Some(mime) = mime {
+            data.field("mimeType", mime)?;
+        }
+        if let Some(uri) = source.or(path) {
+            data.field("fileUri", uri)?;
+        }
+        data.finish()
+    })
 }

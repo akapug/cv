@@ -213,15 +213,41 @@ pub(super) fn contains(text: &Text, resolver: &Resolver, needle: &'static str) -
 }
 
 /// Whether an error result reads as one of `harness`'s denials
-/// ([`crate::harness::Capabilities::denials`]), tried in order.
+/// ([`crate::harness::Capabilities::denials`]), tried in order. Prefix and `also` needle are
+/// decided in one traversal: the head accumulates only the wanted prefix characters while a
+/// [`Contains`] streams the needle search.
 pub(super) fn denied(text: &Text, resolver: &Resolver, harness: Harness) -> Result<bool> {
     let denials = crate::harness::rootless(harness).map_or(&[][..], |adapter| adapter.capabilities().denials);
     for denial in denials {
-        if starts_with(text, resolver, denial.prefix)?
-            && denial
-                .also
-                .map_or(Ok(true), |needle| contains(text, resolver, needle))?
-        {
+        let mut head = String::with_capacity(denial.prefix.len());
+        let mut remaining = denial.prefix.chars().count();
+        let mut started = false;
+        let mut search = denial.also.map(Contains::new);
+        let mut matched = false;
+        until(text, resolver, |mut chunk| {
+            if let Some(search) = search.as_mut() {
+                search.push(chunk);
+            }
+            if remaining > 0 {
+                if !started {
+                    chunk = chunk.trim_start();
+                    started = !chunk.is_empty();
+                }
+                for ch in chunk.chars().take(remaining) {
+                    head.push(ch);
+                    remaining -= 1;
+                }
+                if remaining > 0 {
+                    return false;
+                }
+                matched = head.starts_with(denial.prefix);
+                if !matched {
+                    return true;
+                }
+            }
+            search.as_ref().is_none_or(|search| search.found)
+        })?;
+        if matched && search.as_ref().is_none_or(|search| search.found) {
             return Ok(true);
         }
     }

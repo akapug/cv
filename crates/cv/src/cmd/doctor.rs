@@ -24,10 +24,11 @@ fn bar(frac: f64) -> String {
 pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: usize, json: bool) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
 
-    // Resolve the target session(s).
-    let targets: Vec<SessionRef> = if let Some(id) = &id {
-        let (r, _ad) = crate::util::resolve(id, want)?;
-        vec![r]
+    // Resolve the target session(s). An explicit id arrives with its adapter (resolve found it);
+    // the recent listing carries refs the loop below still has to load.
+    let targets: Vec<(SessionRef, Option<Box<dyn cv_core::Adapter>>)> = if let Some(id) = &id {
+        let (r, adapter) = crate::util::resolve(id, want)?;
+        vec![(r, Some(adapter))]
     } else {
         let cwd = std::env::current_dir().ok();
         let mut refs: Vec<SessionRef> = cv_core::sessions()
@@ -46,14 +47,19 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
                 unreadable.iter().map(|l| format!("\n{l}")).collect::<String>()
             );
         }
-        refs
+        refs.into_iter().map(|r| (r, None)).collect()
     };
+    let n_targets = targets.len();
 
     let mut rep = Report::default();
     let mut label = String::new();
-    for r in &targets {
-        let (rr, adapter) =
-            cv_core::find(&r.id, Some(r.harness))?.with_context(|| format!("could not load session {}", r.id))?;
+    for (r, found) in targets {
+        let (rr, adapter) = match found {
+            Some(adapter) => (r, adapter),
+            None => {
+                cv_core::find(&r.id, Some(r.harness))?.with_context(|| format!("could not load session {}", r.id))?
+            }
+        };
         // Count decoded text in bounded chunks and request only attribution metadata facts.
         let mut pass = rep.session(Some(rr.path.clone()));
         cv_core::stream::stream_counted(
@@ -81,7 +87,7 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    print_report(&rep, &label, targets.len());
+    print_report(&rep, &label, n_targets);
     Ok(())
 }
 

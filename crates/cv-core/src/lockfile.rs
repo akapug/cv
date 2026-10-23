@@ -12,7 +12,7 @@
 //! state, not a transactional task log.
 
 use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 #[cfg(not(target_family = "wasm"))]
@@ -24,12 +24,12 @@ pub(crate) struct FileLock {
 
 impl FileLock {
     /// Acquire the lock, blocking until the current holder (if any) releases it.
-    pub(crate) fn acquire(path: PathBuf) -> Result<FileLock> {
+    pub(crate) fn acquire(path: &Path) -> Result<FileLock> {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)
+            .open(path)
             .with_context(|| format!("creating lockfile {}", path.display()))?;
         // wasm32 has no file locking (and no cross-process concurrency): the open alone suffices.
         #[cfg(not(target_family = "wasm"))]

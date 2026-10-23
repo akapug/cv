@@ -80,28 +80,8 @@ pub fn decode_content(text: &str, call_id: &mut dyn FnMut() -> String) -> Vec<Bl
                     });
                 }
             }
-            Some("commentary") => {
-                if let Some(recipient) = msg.recipient {
-                    // A tool call on the commentary channel.
-                    let name = strip_tool_prefix(recipient);
-                    blocks.push(Block::ToolUse {
-                        id: call_id(),
-                        name: name.to_string(),
-                        input: parse_input(msg.body).into(),
-                        namespace: None,
-                    });
-                } else {
-                    // Plain commentary (preamble) → text, if non-empty.
-                    let body = msg.body.trim();
-                    if !body.is_empty() {
-                        blocks.push(Block::Text {
-                            text: body.to_string().into(),
-                        });
-                    }
-                }
-            }
-            // Unknown / no channel: if there's a recipient it's still a tool call; else treat the
-            // body as plain text so we never silently drop content.
+            // Commentary (preamble/tool calls) and any unknown channel behave alike: a recipient
+            // marks a tool call, else the body is plain text so we never silently drop content.
             _ => {
                 if let Some(recipient) = msg.recipient {
                     blocks.push(Block::ToolUse {

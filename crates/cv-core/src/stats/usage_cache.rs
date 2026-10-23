@@ -19,14 +19,17 @@ struct Projected {
 
 impl crate::source::Payload for Projected {
     const TAG: &'static str = "usage";
+    const BY_ROWS: bool = true;
 }
 
 /// The records' key, kept from 0.17 so the rows it wrote are replaced, not orphaned.
 const CONSUMER: &str = "usage-v1";
 const CHUNK: usize = 64 * 1024;
-const SOURCE_LIMIT: u64 = 16 * 1024 * 1024;
-const TOTAL_LIMIT: i64 = 256 * 1024 * 1024;
-const SOURCE_COUNT_LIMIT: i64 = 65536;
+/// Publications commit in batches of this many projection bytes (or 64 sources): a transaction
+/// size, not a cap on what is cached.
+const COMMIT_BYTES: u64 = 16 * 1024 * 1024;
+/// The fewest rows one pass's sweep examines ([`sweep`]); a pass over `n` sources examines `2n`.
+const SWEEP_MIN: usize = 64;
 type Shared = Arc<Mutex<Connection>>;
 #[derive(Default)]
 struct Pending {
@@ -69,27 +72,11 @@ impl Cache {
              harness TEXT NOT NULL,id TEXT NOT NULL,path TEXT NOT NULL,chunk INTEGER NOT NULL,payload BLOB NOT NULL,digest BLOB,
              PRIMARY KEY(harness,id,path,chunk),
              FOREIGN KEY(harness,id,path) REFERENCES usage_cache(harness,id,path) ON DELETE CASCADE);
-             CREATE TABLE IF NOT EXISTS usage_budget(singleton INTEGER PRIMARY KEY CHECK(singleton=1),bytes INTEGER NOT NULL,sources INTEGER NOT NULL);"
-        )?;
-        if writer
-            .query_row("SELECT singleton FROM usage_budget WHERE singleton=1", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .optional()?
-            .is_none()
-        {
-            writer.execute(
-                "INSERT OR IGNORE INTO usage_budget SELECT 1,COALESCE(SUM(bytes),0),COUNT(*) FROM usage_cache",
-                [],
-            )?;
-        }
-        writer.execute_batch(
-            "CREATE TRIGGER IF NOT EXISTS usage_insert AFTER INSERT ON usage_cache BEGIN
-             UPDATE usage_budget SET bytes=bytes+NEW.bytes,sources=sources+1 WHERE singleton=1; END;
-             CREATE TRIGGER IF NOT EXISTS usage_delete AFTER DELETE ON usage_cache BEGIN
-             UPDATE usage_budget SET bytes=bytes-OLD.bytes,sources=sources-1 WHERE singleton=1; END;
-             CREATE TRIGGER IF NOT EXISTS usage_update AFTER UPDATE OF bytes ON usage_cache BEGIN
-             UPDATE usage_budget SET bytes=bytes+NEW.bytes-OLD.bytes WHERE singleton=1; END;",
+             CREATE TABLE IF NOT EXISTS usage_sweep(singleton INTEGER PRIMARY KEY CHECK(singleton=1),next INTEGER NOT NULL);
+             DROP TRIGGER IF EXISTS usage_insert;
+             DROP TRIGGER IF EXISTS usage_delete;
+             DROP TRIGGER IF EXISTS usage_update;
+             DROP TABLE IF EXISTS usage_budget;",
         )?;
         writer.execute_batch("COMMIT")?;
         configure(&reader)?;
@@ -107,15 +94,8 @@ impl Cache {
         let (fallback, rows, bytes): (Vec<u8>, i64, i64) = conn
             .query_row(
                 "SELECT fallback,rows,bytes FROM usage_cache WHERE harness=?1 AND id=?2 AND path=?3 AND version=?4
-             AND length(fallback)<=?5 AND rows>=0 AND bytes>=length(fallback) AND bytes<=?6",
-                params![
-                    r.harness.as_str(),
-                    r.id,
-                    path,
-                    VERSION,
-                    CHUNK as i64,
-                    SOURCE_LIMIT as i64
-                ],
+             AND length(fallback)<=?5 AND rows>=0 AND bytes>=length(fallback)",
+                params![r.harness.as_str(), r.id, path, VERSION, CHUNK as i64],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -139,6 +119,8 @@ impl Cache {
                     offset: 0,
                 },
                 remaining: rows as u64,
+                // No string in a row is longer than the projection that holds it.
+                limit: usize::try_from(payload_bytes).unwrap_or(usize::MAX),
                 failed: false,
                 eviction: self.writer.clone(),
             }),
@@ -165,11 +147,13 @@ impl Cache {
             }
         }
     }
-    pub(super) fn finish(&self) {
+    /// End a pass over `visited` sources: commit what it published, then sweep ([`sweep`]).
+    pub(super) fn finish(&self, visited: usize) {
         if let Ok(mut writer) = self.writer.lock().inspect_err(note) {
             if !writer.is_autocommit() {
-                commit_and_evict(&mut writer);
+                commit(&mut writer);
             }
+            sweep(&mut writer, visited);
             if let Ok(mut pending) = self.pending.lock().inspect_err(note) {
                 *pending = Pending {
                     checkpoint: true,
@@ -260,6 +244,7 @@ pub(super) struct ReadError;
 pub(super) struct CachedRows {
     reader: ChunkReader,
     remaining: u64,
+    limit: usize,
     failed: bool,
     eviction: Shared,
 }
@@ -276,8 +261,7 @@ impl Iterator for CachedRows {
                 Err(e) => Err(e.into()),
             }
         } else {
-            UsageHit::read(&mut self.reader, &mut Some(SOURCE_LIMIT as usize))
-                .context("reading cached usage projection")
+            UsageHit::read(&mut self.reader, &mut Some(self.limit)).context("reading cached usage projection")
         };
         self.failed = result.is_err();
         if self.failed {
@@ -364,33 +348,58 @@ fn evict(conn: &Connection, harness: &str, id: &str, path: &str) -> rusqlite::Re
     Ok(())
 }
 
-/// Publication is durable before budget maintenance starts. A failed eviction rolls back
-/// only maintenance; a later batch retries it without discarding any published source.
-fn commit_and_evict(conn: &mut Connection) {
+/// Publication is durable before any maintenance starts.
+fn commit(conn: &mut Connection) {
     if let Err(error) = conn.execute_batch("COMMIT") {
         crate::env::warn_once("usage cache commit", error);
         if let Err(error) = conn.execute_batch("ROLLBACK") {
             crate::env::warn_once("usage cache rollback", error);
         }
-        return;
     }
+}
+
+/// The cache holds one row per source key and grows with the store, never past it: a pass
+/// examines `max(SWEEP_MIN, 2 * visited)` rows after a persisted cursor and evicts only rows
+/// that can never be loaded again: another projection version, an unknown harness, no source
+/// record, or a source path that no longer exists. A live row is never evicted, so a warm pass
+/// reloads every source it published, however large the store. A failed sweep rolls back
+/// alone; the cursor stays and the next pass retries it.
+fn sweep(conn: &mut Connection, visited: usize) {
+    let budget = visited.saturating_mul(2).max(SWEEP_MIN);
     let result = (|| -> rusqlite::Result<()> {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        loop {
-            let (bytes, sources): (i64, i64) =
-                tx.query_row("SELECT bytes,sources FROM usage_budget WHERE singleton=1", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })?;
-            if bytes <= TOTAL_LIMIT && sources <= SOURCE_COUNT_LIMIT {
-                break;
-            }
-            let (h, id, path): (String, String, String) = tx.query_row(
-                "SELECT harness,id,path FROM usage_cache ORDER BY updated LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        let next: i64 = tx
+            .query_row("SELECT next FROM usage_sweep WHERE singleton=1", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        let rows: Vec<(i64, String, String, String, bool)> = {
+            let mut stmt = tx.prepare(
+                "SELECT u.rowid,u.harness,u.id,u.path,
+                 u.version=?3 AND EXISTS(SELECT 1 FROM source_dependencies d
+                   WHERE d.consumer=?4 AND d.harness=u.harness AND d.id=u.id AND d.path=u.path)
+                 FROM usage_cache u WHERE u.rowid>=?1 ORDER BY u.rowid LIMIT ?2",
             )?;
-            evict(&tx, &h, &id, &path)?;
+            let rows = stmt.query_map(params![next, budget as i64, VERSION, CONSUMER], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        // A short page reached the end: the next pass starts over from the first row.
+        let next = match rows.last() {
+            Some((rowid, ..)) if rows.len() == budget => rowid + 1,
+            _ => 0,
+        };
+        for (_, harness, id, path, current) in &rows {
+            let gone =
+                || std::fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if !current || crate::ir::Harness::parse(harness).is_none() || gone() {
+                evict(&tx, harness, id, path)?;
+            }
         }
+        tx.execute(
+            "INSERT INTO usage_sweep(singleton,next) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET next=?1",
+            [next],
+        )?;
         tx.commit()
     })();
     if let Err(error) = result {
@@ -418,6 +427,7 @@ impl Publisher {
         }
         if hit.write(self).inspect_err(note).is_err() {
             self.failed = true;
+            return;
         }
         self.rows += 1;
     }
@@ -492,8 +502,8 @@ impl Publisher {
             let mut pending = self.pending.lock().inspect_err(note).ok()?;
             pending.sources += 1;
             pending.bytes += self.bytes + self.fallback_bytes as u64;
-            if pending.sources >= 64 || pending.bytes >= SOURCE_LIMIT {
-                commit_and_evict(&mut conn);
+            if pending.sources >= 64 || pending.bytes >= COMMIT_BYTES {
+                commit(&mut conn);
                 *pending = Pending {
                     checkpoint: true,
                     ..Pending::default()
@@ -524,9 +534,6 @@ impl Write for Publisher {
     fn write(&mut self, mut bytes: &[u8]) -> std::io::Result<usize> {
         let len = bytes.len();
         self.bytes = self.bytes.saturating_add(len as u64);
-        if self.bytes + self.fallback_bytes as u64 > SOURCE_LIMIT {
-            return Err(std::io::Error::other("usage cache source budget"));
-        }
         while !bytes.is_empty() {
             let n = bytes.len().min(CHUNK - self.buffer.len());
             self.buffer.extend_from_slice(&bytes[..n]);
@@ -552,7 +559,7 @@ mod tests {
         crate::catalog::open_db()
     }
 
-    fn fixture(tag: &str) -> (cv_testkit::InProcess<crate::env::Scope>, SessionRef) {
+    fn fixture(tag: &str) -> (cv_testkit::InProcess<crate::env::Isolated>, SessionRef) {
         let world = crate::test_world(tag);
         let path = world.base.join("source.jsonl");
         std::fs::write(&path, "source").unwrap();
@@ -592,7 +599,7 @@ mod tests {
             writer.hit(&hit(i));
         }
         writer.finish();
-        cache.finish();
+        cache.finish(1);
         let batch = load(&r, &crate::source::Probe::default().snapshot(&r)).unwrap();
         assert_eq!(batch.fallback_model, "final-model");
         let mut count = 0;
@@ -619,13 +626,20 @@ mod tests {
         let mut writer = cache.publisher(r.clone(), before.clone(), "first").unwrap();
         writer.hit(&hit(0));
         writer.finish();
-        cache.finish();
+        cache.finish(1);
+        open()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_chunk BEFORE INSERT ON usage_chunks
+                 BEGIN SELECT RAISE(ABORT, 'injected chunk failure'); END;",
+            )
+            .unwrap();
         let mut failed = cache.publisher(r.clone(), before, "partial").unwrap();
-        failed.bytes = SOURCE_LIMIT;
         failed.hit(&hit(1));
         failed.finish();
         assert!(!crate::env::warn_once("the usage cache", "already reported"));
-        cache.finish();
+        cache.finish(1);
+        open().unwrap().execute_batch("DROP TRIGGER fail_chunk").unwrap();
         let batch = load(&r, &crate::source::Probe::default().snapshot(&r)).unwrap();
         assert_eq!(batch.fallback_model, "first");
         assert_eq!(
@@ -646,7 +660,7 @@ mod tests {
             let mut writer = cache.publisher(r.clone(), source(&r, None), "old").unwrap();
             writer.hit(&hit(0));
             writer.finish();
-            cache.finish();
+            cache.finish(1);
             let conn = open().unwrap();
             conn.execute("UPDATE usage_chunks SET digest=zeroblob(64)", []).unwrap();
             if fail_eviction {
@@ -675,7 +689,7 @@ mod tests {
             });
             assert!(!cache.writer.lock().unwrap().is_autocommit());
             writer.finish();
-            cache.finish();
+            cache.finish(1);
             let batch = load(&other, &source(&other, None)).unwrap();
             assert_eq!(batch.fallback_model, "new");
             let mut rows = batch.hits.rows().unwrap();
@@ -685,57 +699,94 @@ mod tests {
             assert_eq!(load(&r, &current).is_some(), fail_eviction);
         }
     }
+    fn publish(cache: &Cache, r: &SessionRef, i: usize) {
+        let mut writer = cache.publisher(r.clone(), source(r, None), "model").unwrap();
+        writer.hit(&hit(i));
+        writer.finish();
+    }
+    fn rows_cached() -> i64 {
+        open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM usage_cache", [], |r| r.get(0))
+            .unwrap()
+    }
     #[test]
-    fn failed_budget_eviction_keeps_committed_publications_and_retries() {
-        for threshold_commit in [false, true] {
-            let (world, r) = fixture("usage-cache-eviction-failure");
-            let cache = Cache::new().unwrap();
-            let mut writer = cache.publisher(r.clone(), source(&r, None), "old").unwrap();
-            writer.hit(&hit(0));
-            writer.finish();
-            cache.finish();
-            let conn = open().unwrap();
-            // Force the budget boundary without allocating 256 MiB. Fail the second
-            // deletion so the test also checks that maintenance rolls back as a unit.
-            conn.execute("UPDATE usage_budget SET bytes=?1", [TOTAL_LIMIT]).unwrap();
-            conn.execute_batch(
-                "CREATE TRIGGER fail_eviction BEFORE DELETE ON source_dependencies
-                 BEGIN SELECT RAISE(ABORT, 'injected eviction failure'); END;",
-            )
-            .unwrap();
-            for i in 1..=2 {
-                let path = world.base.join(format!("new-{i}.jsonl"));
-                std::fs::write(&path, "new source").unwrap();
-                let new = SessionRef::new(format!("new-{i}"), Harness::Claude, path);
-                if threshold_commit {
-                    cache.pending.lock().unwrap().sources = 63;
-                }
-                let mut writer = cache.publisher(new.clone(), source(&new, None), "new").unwrap();
-                writer.hit(&hit(i));
-                writer.finish();
-                if !threshold_commit {
-                    cache.finish();
-                }
-                assert!(cache.writer.lock().unwrap().is_autocommit());
-                // Fresh connections prove publication actually committed, including its
-                // dependency stamps and complete projection, despite the eviction error.
-                let batch = load(&new, &source(&new, None)).unwrap();
-                assert_eq!(batch.fallback_model, "new");
-                let mut rows = batch.hits.rows().unwrap();
-                assert_eq!(rows.next().unwrap().unwrap().key, hit(i).key);
-                assert!(rows.next().is_none());
-                assert!(load(&r, &source(&r, None)).is_some());
-                assert!(!crate::env::warn_once("usage cache eviction", "already reported"));
-            }
-            conn.execute_batch("DROP TRIGGER fail_eviction").unwrap();
-            let writer = cache.publisher(r.clone(), source(&r, None), "recovered").unwrap();
-            writer.finish();
-            cache.finish();
-            let bytes: i64 = conn
-                .query_row("SELECT bytes FROM usage_budget", [], |r| r.get(0))
-                .unwrap();
-            assert!(bytes <= TOTAL_LIMIT);
+    fn sweep_evicts_only_rows_that_can_never_load_and_keeps_every_live_source() {
+        let (world, r) = fixture("usage-cache-sweep");
+        let cache = Cache::new().unwrap();
+        let live: Vec<SessionRef> = (0..3 * SWEEP_MIN)
+            .map(|i| {
+                let path = world.base.join(format!("live-{i}.jsonl"));
+                std::fs::write(&path, "live source").unwrap();
+                SessionRef::new(format!("live-{i}"), Harness::Claude, path)
+            })
+            .collect();
+        publish(&cache, &r, 0);
+        for (i, live) in live.iter().enumerate() {
+            publish(&cache, live, i + 1);
         }
+        let old = SessionRef::new("old-version", Harness::Claude, world.base.join("live-0.jsonl"));
+        publish(&cache, &old, 0);
+        cache.finish(0);
+        // One pass's sweep examines a bounded page after its cursor; a pass over every source
+        // examines the whole table. Only the deleted source and the old version go.
+        std::fs::remove_file(&r.path).unwrap();
+        open()
+            .unwrap()
+            .execute("UPDATE usage_cache SET version=0 WHERE id='old-version'", [])
+            .unwrap();
+        assert_eq!(rows_cached(), live.len() as i64 + 2);
+        let cursor = || -> i64 {
+            open()
+                .unwrap()
+                .query_row("SELECT next FROM usage_sweep", [], |r| r.get(0))
+                .unwrap()
+        };
+        let at = cursor();
+        cache.finish(0);
+        assert_eq!(
+            cursor(),
+            at + SWEEP_MIN as i64,
+            "a pass over nothing examines one bounded page"
+        );
+        // A pass over every source examines (twice) the whole table, wrapping at its end.
+        cache.finish(live.len() + 2);
+        cache.finish(live.len() + 2);
+        assert_eq!(rows_cached(), live.len() as i64);
+        for live in &live {
+            assert!(
+                load(live, &source(live, None)).is_some(),
+                "a live row survives every sweep"
+            );
+        }
+    }
+    #[test]
+    fn failed_sweep_keeps_committed_publications_and_retries() {
+        let (world, r) = fixture("usage-cache-eviction-failure");
+        let cache = Cache::new().unwrap();
+        publish(&cache, &r, 0);
+        cache.finish(1);
+        std::fs::remove_file(&r.path).unwrap();
+        let conn = open().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_eviction BEFORE DELETE ON source_dependencies
+             BEGIN SELECT RAISE(ABORT, 'injected eviction failure'); END;",
+        )
+        .unwrap();
+        let path = world.base.join("new.jsonl");
+        std::fs::write(&path, "new source").unwrap();
+        let new = SessionRef::new("new", Harness::Claude, path);
+        publish(&cache, &new, 1);
+        cache.finish(1);
+        assert!(cache.writer.lock().unwrap().is_autocommit());
+        assert!(!crate::env::warn_once("usage cache eviction", "already reported"));
+        // The publication committed before the failed sweep; the sweep rolled back as a unit.
+        assert!(load(&new, &source(&new, None)).is_some());
+        assert_eq!(rows_cached(), 2);
+        conn.execute_batch("DROP TRIGGER fail_eviction").unwrap();
+        cache.finish(1);
+        assert_eq!(rows_cached(), 1);
+        assert!(load(&new, &source(&new, None)).is_some());
     }
     #[test]
     fn valid_looking_cost_corruption_is_rejected_and_evicted() {
@@ -744,7 +795,7 @@ mod tests {
         let mut writer = cache.publisher(r.clone(), source(&r, None), "final").unwrap();
         writer.hit(&hit(0));
         writer.finish();
-        cache.finish();
+        cache.finish(1);
         open()
             .unwrap()
             .execute(

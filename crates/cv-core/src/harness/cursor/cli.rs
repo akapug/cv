@@ -40,37 +40,51 @@ pub(super) fn discover(home: &Path, out: &mut crate::Discovered) {
                 continue;
             }
             let path = entry.path();
-            let result = open_ro(path).and_then(|conn| {
-                conn.read(|conn, reads| -> Result<SessionRef> {
-                    let mut collector = Count::default();
-                    let r = SessionRef::new("cli:", Harness::Cursor, path);
-                    let session = read_with_reads(
-                        conn,
-                        &r,
-                        &crate::stream::Demand::LEAN.with_spans(),
-                        true,
-                        reads,
-                        &mut collector,
-                    )?;
-                    if let Some(error) = collector.error {
-                        return Err(error);
-                    }
-                    Ok(SessionRef {
-                        id: session.id,
-                        cwd: session.cwd,
-                        title: session.title.or(collector.title),
-                        created_at: session.created_at,
-                        updated_at: session.updated_at,
-                        message_count: Some(collector.count),
-                        ..r
+            let mut reads = crate::source::ReadSet::default();
+            for suffix in ["", "-wal", "-journal"] {
+                let mut dependency = path.as_os_str().to_os_string();
+                dependency.push(suffix);
+                reads.record(&PathBuf::from(dependency));
+            }
+            if let Some(meta) = path.parent().map(|parent| parent.join("meta.json")) {
+                reads.record(&meta);
+            }
+            let result = crate::discover_cache::cached_scan_many_with_reads(path, reads, || {
+                let reference = open_ro(path).and_then(|conn| {
+                    conn.read(|conn, reads| -> Result<SessionRef> {
+                        let mut collector = Count::default();
+                        let r = SessionRef::new("cli:", Harness::Cursor, path);
+                        let session = read_with_reads(
+                            conn,
+                            &r,
+                            &crate::stream::Demand::LEAN.with_spans(),
+                            true,
+                            reads,
+                            &mut collector,
+                        )?;
+                        if let Some(error) = collector.error {
+                            return Err(error);
+                        }
+                        Ok(SessionRef {
+                            id: session.id,
+                            cwd: session.cwd,
+                            title: session.title.or(collector.title),
+                            created_at: session.created_at,
+                            updated_at: session.updated_at,
+                            message_count: Some(collector.count),
+                            ..r
+                        })
                     })
+                })?;
+                // An empty or uninitialized native store is not a conversation.
+                Ok(if reference.message_count.is_some_and(|n| n > 0) {
+                    vec![reference]
+                } else {
+                    Vec::new()
                 })
             });
-            if let Some(reference) = out.keep(path, result) {
-                // An empty or uninitialized native store is not a conversation.
-                if reference.message_count.is_some_and(|n| n > 0) {
-                    out.refs.push(reference);
-                }
+            if let Some(references) = out.keep(path, result) {
+                out.refs.extend(references);
             }
         }
     }
@@ -450,13 +464,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn string(view: Option<JsonView<'_>>) -> Result<Option<String>> {
-    Ok(match view {
-        Some(view) => view.text(false)?.and_then(|text| match text {
-            Text::Inline(s) => Some(s),
-            _ => None,
-        }),
-        None => None,
-    })
+    view.map(|view| view.string()).transpose().map(Option::flatten)
 }
 fn path<'a>(view: Option<JsonView<'a>>, keys: &[&str]) -> Result<Option<JsonView<'a>>> {
     let mut view = view;
@@ -538,10 +546,9 @@ fn message(view: JsonView<'_>, demand: crate::stream::Demand) -> Result<Option<M
             None => None,
         })
     };
-    let nonempty = |text: &Text| !matches!(text, Text::Inline(s) if s.is_empty());
     let content = fields.get("content");
     if let Some(content) = text(content)? {
-        if nonempty(&content) {
+        if !content.is_empty() {
             message.content.push(Block::Text { text: content });
         }
     } else if let Some(parts) = content.map(|v| v.array()).transpose()?.flatten() {
@@ -568,7 +575,7 @@ fn message(view: JsonView<'_>, demand: crate::stream::Demand) -> Result<Option<M
             let kind = fields.string("type")?.unwrap_or_default();
             let taken: &[&str] = match kind.as_str() {
                 "text" => {
-                    if let Some(text) = text(fields.get("text"))?.filter(nonempty) {
+                    if let Some(text) = text(fields.get("text"))?.filter(|text| !text.is_empty()) {
                         message.content.push(Block::Text { text });
                     }
                     &["text"]

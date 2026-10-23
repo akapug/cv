@@ -36,7 +36,7 @@ pub(super) fn body_hash(mut hash: u64, bytes: &[u8]) -> u64 {
 
 #[derive(Default)]
 pub(super) struct Sweep {
-    pub(super) admission: (usize, usize, usize, usize),
+    pub(super) admission: crate::ingest::AdmissionStats,
     pub(super) work: SweepWork,
     pub(super) early: usize,
     #[cfg(feature = "probe-heap")]

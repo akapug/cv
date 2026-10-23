@@ -24,7 +24,7 @@ fn pack_corpus(w: &World) {
         "wombatsess",
         &[
             serde_json::json!({"type": "ai-title", "aiTitle": "wombat cache design"}),
-            user_line("w1", "2026-02-01T10:00:00Z", "let's design the wombat caching layer for the parser"),
+            user_line("wombatsess", "w1", "2026-02-01T10:00:00Z", "let's design the wombat caching layer for the parser"),
             assistant_line(
                 "w2",
                 "2026-02-01T10:01:00Z",
@@ -42,13 +42,18 @@ fn pack_corpus(w: &World) {
                     {"type": "tool_result", "tool_use_id": "wt1", "content": "edited ok", "is_error": false}
                 ]}
             }),
-            user_line("w4", "2026-02-01T10:03:00Z", "great, ship the wombat cache"),
+            user_line("wombatsess", "w4", "2026-02-01T10:03:00Z", "great, ship the wombat cache"),
         ],
     );
     w.write_session(
         "quokkasess",
         &[
-            user_line("q1", "2026-03-01T09:00:00Z", "how many quokkas in the census"),
+            user_line(
+                "quokkasess",
+                "q1",
+                "2026-03-01T09:00:00Z",
+                "how many quokkas in the census",
+            ),
             assistant_line(
                 "q2",
                 "2026-03-01T09:05:00Z",
@@ -60,6 +65,7 @@ fn pack_corpus(w: &World) {
         "gammasess",
         &[
             user_line(
+                "gammasess",
                 "g1",
                 "2026-04-01T09:00:00Z",
                 "the parser chokes on empty caching headers",
@@ -117,6 +123,26 @@ fn pack_md_no_index_fallback_and_content() {
         !out.contains("quokkas"),
         "irrelevant session leaked into the pack:\n{out}"
     );
+}
+
+#[test]
+fn pack_header_states_its_bounds_and_what_they_cut() {
+    let w = World::new("bounds");
+    pack_corpus(&w);
+    let (out, _) = w.cv_ok(&["pack", "wombat caching layer"]);
+    assert!(
+        out.contains("Bounds: each excerpt message to 1600 bytes (`--excerpt-bytes`; 0 cut, marked …)"),
+        "{out}"
+    );
+    let (out, _) = w.cv_ok(&["pack", "wombat caching layer", "--excerpt-bytes", "20"]);
+    assert!(out.contains("to 20 bytes (`--excerpt-bytes`;"), "{out}");
+    assert!(
+        !out.contains("`--excerpt-bytes`; 0 cut"),
+        "a 20-byte budget cuts:\n{out}"
+    );
+    assert!(out.contains("…"), "{out}");
+    let (ok, code, _, err) = w.cv(&["pack", "wombat", "--context-bytes", "100"]);
+    assert!(!ok && code == 2 && err.contains("CV_PACK_LLM"), "{code} {err}");
 }
 
 #[test]

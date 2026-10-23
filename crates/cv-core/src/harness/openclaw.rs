@@ -113,6 +113,7 @@
 //! `Message::model` is each record's own recorded model and `Session::model` the first
 //! non-synthetic one seen.
 
+use crate::json::{ReadInput, Validation};
 mod discovery;
 mod emit;
 mod record;
@@ -221,7 +222,7 @@ impl Adapter for OpenClaw {
         for root in &self.roots {
             // 1. The sqlite store (OpenClaw ≥ 2026-07-11): agents/<agentId>/agent/openclaw-agent*.sqlite
             for db in sqlite_stores(root) {
-                for r in out.keep(&db, discover_sqlite(&db)).into_iter().flatten() {
+                for r in out.keep(&db, discover_store(&db)).into_iter().flatten() {
                     seen.insert(r.id.clone());
                     out.refs.push(r);
                 }
@@ -256,6 +257,46 @@ impl Adapter for OpenClaw {
         Ok(out)
     }
 
+    /// Every window's certificate in an agent's `.sqlite` store ([`sqlite_rows`]); every JSONL
+    /// session's in the registries beside its transcript ([`registry::jsonl_rows`]).
+    #[cfg(feature = "sqlite")]
+    fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        if !is_sqlite_store_path(store) {
+            return registry::jsonl_rows(store);
+        }
+        open_ro(store).ok()?.read(|conn, _| sqlite_rows(conn)).ok()
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        (!is_sqlite_store_path(store))
+            .then(|| registry::jsonl_rows(store))
+            .flatten()
+    }
+
+    /// A JSONL session reads its own entries of `sessions.json`, `cron/jobs.json` and
+    /// `subagents/runs.json`, which every session of the agent (and the gateway) rewrites: it is
+    /// certified by them, its store the directory of its transcript.
+    fn rows_store(&self, r: &SessionRef) -> Option<PathBuf> {
+        if is_sqlite_store_path(&r.path) {
+            return Some(r.path.clone());
+        }
+        let dir = r.path.parent()?;
+        (dir.file_name()? == "sessions" && r.path.ancestors().nth(4).is_some()).then(|| dir.to_path_buf())
+    }
+
+    fn rows_files(&self, store: &Path) -> Vec<PathBuf> {
+        if is_sqlite_store_path(store) {
+            return vec![store.to_path_buf()];
+        }
+        let mut files = vec![store.join("sessions.json")];
+        if let Some(state) = store.ancestors().nth(3) {
+            files.push(state.join("cron/jobs.json"));
+            files.push(state.join("subagents/runs.json"));
+        }
+        files
+    }
+
     /// An agent's `.sqlite` store is written in place; a JSONL transcript is a file like any other.
     fn watch_policy(&self, r: &SessionRef) -> super::WatchPolicy {
         if is_sqlite_store_path(&r.path) {
@@ -274,7 +315,6 @@ impl Adapter for OpenClaw {
             // leaves the wrapper in place.
             deferred_wrapper: Some(DEFERRED_WRAPPER),
             rich_spans: false,
-            usage_cache_floor: 0,
         }
     }
 
@@ -353,7 +393,6 @@ fn stream_lines(
 ) -> Result<Session> {
     use super::store::jsonl::ranges;
     let source = read.source();
-    let len = source.len();
     let mut tree = false;
     read.lines(0, |line| {
         tree = line.view.map(is_leaf_entry).transpose()?.unwrap_or(false);
@@ -361,18 +400,23 @@ fn stream_lines(
     })?;
     let mut fold = Fold::new(r, facts, opts);
     if tree {
-        // A tree is read whole: invalid UTF-8 anywhere, even off the branch, rejects it.
-        if !ranges::valid_utf8(&mut ranges::reader(read, ranges::Range { offset: 0, len })?)? {
-            return Err(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8").into(),
-            );
-        }
         let mut descriptors = Vec::new();
         let mut records = Vec::new();
         read.lines(0, |line| {
             if let Some(view) = line.view {
                 descriptors.push(record::navigation(view)?);
                 records.push(view.source_range()?.context("a transcript line has a source range")?);
+            } else if !line.blank {
+                anyhow::ensure!(
+                    ranges::valid_utf8(&mut ranges::reader(
+                        read,
+                        ranges::Range {
+                            offset: line.at,
+                            len: line.end - line.at,
+                        }
+                    )?)?,
+                    "stream did not contain valid UTF-8"
+                );
             }
             Ok(Flow::Continue)
         })?;
@@ -380,7 +424,9 @@ fn stream_lines(
         drop(descriptors);
         for row in navigation {
             let (offset, len) = records[row.index];
-            let record = source.read_range_value(offset, len, |view| record::record(view, opts))?;
+            let record = source.read(ReadInput::Range(offset, len), Validation::Value, |view| {
+                record::record(view, opts)
+            })?;
             if fold.push(record, row.active, row.parent, sink)? == Flow::Stop {
                 break;
             }
@@ -681,7 +727,7 @@ impl JsonKeys {
         JSON_KEY_READS.with(|count| count.set(count.get() + 1));
         crate::json::JsonSource::capture(path)
             .and_then(|source| {
-                source.read_document(|view| {
+                source.read(ReadInput::Document, Validation::Value, |view| {
                     let mut index = Self::default();
                     view.for_each_entry(|key, entry| {
                         let Some(fields) = Fields::parse(entry, &["sessionId", "spawnedBy"])? else {
@@ -938,6 +984,80 @@ fn sqlite_parent_candidates(
     Ok(candidates)
 }
 
+/// Every window's [`Rows`](crate::source::Rows) certificate: what a read of it consults in its
+/// store besides event bodies. Per `transcript_events` row, in rowid order, its rowid, `seq` (the
+/// read's order) and the byte lengths of `event_json` and `event_zstd` (record headers, no body);
+/// its whole `session_windows` row (key, `spawned_by`); and its spawner lookup
+/// ([`sqlite_key_facts`]): the other windows under its `spawned_by` key, in the order the read
+/// meets them, and, when there are several (the read then searches their events for this
+/// window's key), each one's event certificate. The state database's registries are a separate
+/// file dependency, outside this certificate.
+#[cfg(feature = "sqlite")]
+fn sqlite_rows(conn: &rusqlite::Connection) -> Result<std::collections::HashMap<String, crate::source::Rows>> {
+    let _snapshot = super::store::sqlite::snapshot(conn)?;
+    let mut events = super::store::sqlite::Certificates::default();
+    let zstd = if super::store::sqlite::columns(conn, Events::TABLE).contains("event_zstd") {
+        "octet_length(event_zstd)"
+    } else {
+        "NULL"
+    };
+    events.rows(
+        conn,
+        &format!(
+            "SELECT session_id, rowid, seq, octet_length(event_json), {zstd} FROM transcript_events \
+             ORDER BY session_id, rowid"
+        ),
+    )?;
+    let mut certificates = super::store::sqlite::Certificates(events.0.clone());
+    certificates.digest(conn, "SELECT session_id, * FROM session_windows ORDER BY session_id")?;
+    let cols = super::store::sqlite::columns(conn, "session_windows");
+    if cols.contains("session_key") && cols.contains("spawned_by") {
+        let spawned: Vec<(String, String)> = conn
+            .prepare("SELECT session_id, spawned_by FROM session_windows WHERE spawned_by IS NOT NULL")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Each spawner key's windows, once: a query per child scanned every window (children x
+        // windows). Exact under plain text comparison; other collations keep the query.
+        let grouped =
+            super::store::sqlite::binary_text_columns(conn, "session_windows", &["session_key", "session_id"])?;
+        let mut windows: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        if grouped {
+            let mut stmt = conn.prepare("SELECT session_key, session_id FROM session_windows")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let (Ok(key), Ok(id)) = (row.get_ref(0)?.as_str(), row.get_ref(1)?.as_str()) else {
+                    continue;
+                };
+                windows.entry(key.to_owned()).or_default().push(id.to_owned());
+            }
+        }
+        let mut candidates =
+            conn.prepare("SELECT session_id FROM session_windows WHERE session_key=?1 AND session_id!=?2")?;
+        for (id, by) in spawned {
+            let found: Vec<String> = if grouped {
+                windows
+                    .get(&by)
+                    .into_iter()
+                    .flatten()
+                    .filter(|window| **window != id)
+                    .cloned()
+                    .collect()
+            } else {
+                candidates
+                    .query_map([&by, &id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for candidate in &found {
+                certificates.fold(&id, candidate.as_bytes());
+                if found.len() > 1 {
+                    certificates.fold_from(&id, events.0.get(candidate).copied());
+                }
+            }
+        }
+    }
+    Ok(certificates.0)
+}
+
 /// [`KeyFacts`] from `session_windows`. The spawner is the window under `spawned_by` — when that key
 /// has several windows (resets, rollovers), the one whose transcript records this session's key as `childSessionKey`.
 #[cfg(feature = "sqlite")]
@@ -1041,7 +1161,8 @@ fn is_uuid_like(s: &str) -> bool {
         && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
 }
 
-/// Is `path` an `openclaw-agent*.sqlite` store (a [`SessionRef::path`] discovery assigned)?
+/// Is `path` a sqlite store? The check is the extension only: every `path` this adapter asks
+/// about is one discovery assigned, and its sqlite stores are all `openclaw-agent*.sqlite`.
 fn is_sqlite_store_path(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("sqlite")
 }
@@ -1102,6 +1223,8 @@ struct ScanAcc {
 /// store and selects the rows by id.
 #[cfg(feature = "sqlite")]
 fn discover_sqlite(db: &Path) -> Result<Vec<SessionRef>> {
+    #[cfg(test)]
+    SQLITE_DISCOVERED.lock().unwrap().push(db.to_path_buf());
     let conn = open_ro(db)?;
     conn.read(|conn, reads| {
         let mut windows = conn.prepare(
@@ -1283,6 +1406,22 @@ fn unzstd(input: &mut dyn std::io::BufRead, out: &mut dyn std::io::Write, invali
 fn discover_sqlite(_db: &Path) -> Result<Vec<SessionRef>> {
     Ok(Vec::new())
 }
+
+/// [`discover_sqlite`] under the scan cache, keyed on the store and its WAL and journal, as every
+/// other SQLite adapter's discovery is: uncached, each listing refresh copied a WAL store and
+/// decompressed and decoded every window's `transcript_events`.
+#[cfg(feature = "sqlite")]
+fn discover_store(db: &Path) -> Result<Vec<SessionRef>> {
+    super::store::sqlite::cached_discover(db, || discover_sqlite(db))
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn discover_store(db: &Path) -> Result<Vec<SessionRef>> {
+    discover_sqlite(db)
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+static SQLITE_DISCOVERED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// Replay one window's `transcript_events` rows (`ORDER BY seq`) through the record codec the
 /// JSONL path uses — `event_json` IS the JSONL line. Branch selection reads the navigation fields
@@ -1748,6 +1887,47 @@ mod tests {
     use super::*;
     use crate::harness::Parse;
 
+    /// The 2026.10.1 corpus agent store: an event appended to the window that spawned the
+    /// sub-agent moves its certificate alone (the sub-agent's spawner lookup names one candidate,
+    /// so it consults that window's id, not its events), and every other window reads exactly as
+    /// before.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn corpus_rows_certify_each_session_and_move_only_with_its_rows() {
+        let world = crate::test_world("openclaw-corpus-rows");
+        let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/openclaw/2026.10.1");
+        for entry in WalkDir::new(&corpus) {
+            let entry = entry.unwrap();
+            let to = world.base.join(entry.path().strip_prefix(&corpus).unwrap());
+            if entry.file_type().is_dir() {
+                std::fs::create_dir_all(&to).unwrap();
+            } else {
+                std::fs::copy(entry.path(), &to).unwrap();
+            }
+        }
+        let db = world.base.join("agents/main/agent/openclaw-agent.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let leaf: String = conn
+            .query_row(
+                "SELECT p.session_id FROM session_windows c JOIN session_windows p ON p.session_key = c.spawned_by \
+                 ORDER BY p.session_id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let adapter = OpenClaw::with_state_dir(&world.base);
+        crate::harness::store::sqlite::assert_rows_move_alone(&adapter, &db, &leaf, |c| {
+            c.execute(
+                "INSERT INTO transcript_events (session_id, seq, event_json, created_at) \
+                 SELECT ?1, max(seq) + 1, '{\"type\":\"custom\",\"id\":\"zq\",\"customType\":\"zqcertified\"}', \
+                 4102444800000 FROM transcript_events WHERE session_id = ?1",
+                [&leaf],
+            )
+            .unwrap();
+        });
+    }
+
     fn fixture_ref(name: &str) -> SessionRef {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/openclaw")
@@ -1938,6 +2118,42 @@ mod tests {
         let mut session = OpenClaw { roots: vec![] }.stream(r, opts, &mut sink)?;
         session.messages = sink.messages;
         Ok(session)
+    }
+
+    /// An unchanged store is not decoded again at discovery; a write to it is.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn unchanged_sqlite_store_is_not_rediscovered() {
+        let _world = crate::test_world("openclaw-sqlite-discovery-cache");
+        let context = crate::discover_cache::read::Context::current();
+        let _scope = context.enter();
+        let agents = tmp_agents();
+        let events: Vec<String> = fixture_text("v3-full.jsonl").lines().map(str::to_string).collect();
+        let db = write_store(&agents, "cached", &events);
+        let scans = || {
+            let mut all = SQLITE_DISCOVERED.lock().unwrap();
+            let mine = all.iter().filter(|p| **p == db).count();
+            all.retain(|p| *p != db);
+            mine
+        };
+        let adapter = OpenClaw {
+            roots: vec![agents.clone()],
+        };
+        let first = adapter.discover().unwrap();
+        assert_eq!(scans(), 1);
+        let again = adapter.discover().unwrap();
+        assert_eq!(scans(), 0, "an unchanged store is not decoded again");
+        assert_eq!(
+            serde_json::to_value(&first.refs).unwrap(),
+            serde_json::to_value(&again.refs).unwrap()
+        );
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("UPDATE session_nodes SET updated_at = updated_at + 1", [])
+            .unwrap();
+        adapter.discover().unwrap();
+        assert_eq!(scans(), 1, "a write is read");
+        let _ = fs::remove_dir_all(agents.parent().unwrap());
     }
 
     #[cfg(feature = "sqlite")]
@@ -3240,7 +3456,6 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_large_window_selection_uses_index_and_matches_native_scan() -> Result<()> {
-        use std::time::Instant;
         let conn = rusqlite::Connection::open_in_memory()?;
         conn.execute_batch("CREATE TABLE session_windows(session_key TEXT,session_id TEXT)")?;
         {
@@ -3252,11 +3467,8 @@ mod tests {
                 ])?;
             }
         }
-        let start = Instant::now();
         let (groups, _) = WindowGroups::load(&conn)?;
-        let build = start.elapsed();
         let mut native_steps = 0;
-        let start = Instant::now();
         let mut expected = Vec::new();
         for i in 0..100 {
             let mut stmt =
@@ -3267,12 +3479,9 @@ mod tests {
             );
             native_steps += stmt.get_status(rusqlite::StatementStatus::FullscanStep);
         }
-        let native = start.elapsed();
-        let start = Instant::now();
         for (i, oracle) in expected.iter().enumerate() {
             assert_eq!(&groups.candidates(&format!("key-{i}"), "self")?, oracle);
         }
-        let indexed = start.elapsed();
         let disk_bytes = groups.0.with(|index| {
             let mut stmt =
                 index.prepare("SELECT session_id FROM windows WHERE key=?1 AND session_id!=?2 ORDER BY ordinal")?;
@@ -3294,37 +3503,27 @@ mod tests {
         let reads = crate::source::ReadSet::default();
         let selector = Path::new("/synthetic/openclaw-query-promotion");
         let _scope = crate::source::read_scope();
-        let start = Instant::now();
         assert_eq!(
             &*sqlite_parent_candidates(&conn, "key-0", "self", selector, &reads)?,
             &expected[0]
         );
-        let first_query = start.elapsed();
         // A repeated identical query is memoized and must not construct a private index.
         assert_eq!(
             &*sqlite_parent_candidates(&conn, "key-0", "self", selector, &reads)?,
             &expected[0]
         );
-        let start = Instant::now();
         for (i, oracle) in expected.iter().enumerate().skip(1) {
             assert_eq!(
                 &*sqlite_parent_candidates(&conn, &format!("key-{i}"), "self", selector, &reads)?,
                 oracle
             );
         }
-        let remaining_queries = start.elapsed();
-        eprintln!("adaptive selection: first={first_query:?} remaining99_including_build={remaining_queries:?}");
         let tiny = rusqlite::Connection::open_in_memory()?;
         tiny.execute_batch("CREATE TABLE session_windows(session_key TEXT,session_id TEXT); INSERT INTO session_windows VALUES ('key','a'),('key','b')")?;
-        let start = Instant::now();
         let (small, _) = WindowGroups::load(&tiny)?;
-        let tiny_build = start.elapsed();
-        let start = Instant::now();
         for _ in 0..1000 {
             assert_eq!(small.candidates("key", "self")?, ["a", "b"]);
         }
-        let tiny_indexed = start.elapsed();
-        let start = Instant::now();
         for _ in 0..1000 {
             let mut stmt =
                 tiny.prepare("SELECT session_id FROM session_windows WHERE session_key=?1 AND session_id!=?2")?;
@@ -3334,9 +3533,6 @@ mod tests {
                 ["a", "b"]
             );
         }
-        let tiny_native = start.elapsed();
-        eprintln!("tiny window selection: rows=2 queries=1000 build={tiny_build:?} native={tiny_native:?} indexed={tiny_indexed:?}");
-        eprintln!("window selection: rows=25000 queries=100 build={build:?} native={native:?} indexed={indexed:?} native_fullscan_steps={native_steps} private_bytes={disk_bytes}");
         Ok(())
     }
 

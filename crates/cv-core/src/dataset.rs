@@ -13,6 +13,8 @@
 //! Reasoning is kept in a `<thinking>` wrapper — it's high-signal for distilling into smaller
 //! models, and a downstream filter can strip it if a given run wants answer-only SFT.
 
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 mod deferred;
 
 use crate::ir::{Block, Message, MessageKind, Role, Session};
@@ -268,12 +270,18 @@ fn represents_system_prompt(message: &Message, prompt: &str, resolver: &crate::R
     Ok(equal && offset == prompt.len())
 }
 
-fn record_header(format: Format) -> &'static [u8] {
+const fn record_header(format: Format) -> &'static [u8] {
     match format {
         Format::Chatml => b"{\"messages\":[",
         Format::ShareGpt => b"{\"conversations\":[",
     }
 }
+
+/// `publish` skips a record header without knowing the format, so it reads into a buffer sized
+/// for any of them — checked against the table above.
+const RECORD_HEADER_BUF: usize = 32;
+const _: () = assert!(record_header(Format::Chatml).len() <= RECORD_HEADER_BUF);
+const _: () = assert!(record_header(Format::ShareGpt).len() <= RECORD_HEADER_BUF);
 
 /// Which export shape — the only difference is the array/role/content key names and the role labels.
 #[derive(Clone, Copy)]
@@ -479,7 +487,7 @@ impl StagedRecord {
             self.body.copy_to(writer)?;
         } else {
             let mut body = self.body.reader()?;
-            let mut header = [0; b"{\"conversations\":[".len()];
+            let mut header = [0; RECORD_HEADER_BUF];
             body.read_exact(&mut header[..self.skip_header])?;
             std::io::copy(&mut body, writer)?;
         }
@@ -516,8 +524,7 @@ pub fn stage_record(
         resolver: crate::lazy::Resolver,
         facts: Option<crate::query::QueryReducer<'a>>,
         messages: usize,
-        error: Option<anyhow::Error>,
-        failed: bool,
+        latch: crate::stream::Latch,
     }
     impl Sink<'_> {
         fn render(&mut self, mut message: Message) -> anyhow::Result<()> {
@@ -557,14 +564,13 @@ pub fn stage_record(
             match result {
                 Ok(()) => crate::Flow::Continue,
                 Err(error) => {
-                    self.failed = true;
-                    self.error = Some(error);
+                    self.latch.fail(error);
                     crate::Flow::Stop
                 }
             }
         }
         fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.error.take()
+            self.latch.take("dataset")
         }
     }
     let mut bytes = std::io::BufWriter::with_capacity(64 * 1024, crate::harness::store::bytes::ByteStage::new());
@@ -578,8 +584,7 @@ pub fn stage_record(
         resolver: crate::lazy::Resolver::new(Some(r.path.clone())),
         facts: query.map(crate::query::QueryReducer::new),
         messages: 0,
-        error: None,
-        failed: false,
+        latch: Default::default(),
     };
     let counted_query = query.is_some_and(crate::SessionQuery::needs_counted);
     let read = crate::stream::stream_counted(
@@ -591,7 +596,7 @@ pub fn stage_record(
     );
     let (session, counted) = match read {
         Ok(done) => (done.session, done.counted),
-        Err(error) if sink.failed => return Err(error),
+        Err(error) if sink.latch.failed() => return Err(error),
         Err(error) => return Err(InputError(error).into()),
     };
     let counts = counted.filter(|_| counted_query).map(|c| c.counts);
@@ -1043,7 +1048,11 @@ mod tests {
             })
             .unwrap();
         let text = source
-            .read_backing_value(backing.clone(), offset, len, |view| view.source_text())
+            .read(
+                ReadInput::Backing(backing.clone(), offset, len),
+                Validation::Value,
+                |view| view.source_text(),
+            )
             .unwrap()
             .unwrap();
         let mut first = Message::new(Role::User);

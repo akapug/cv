@@ -202,6 +202,16 @@ struct Array<'a> {
 }
 
 impl Array<'_> {
+    /// Absorb one decoded key fragment while reading a root key, up to the key budget.
+    fn absorb_key(&mut self, part: &str) {
+        if self.reading_key {
+            if self.key.len().saturating_add(part.len()) <= KEY_BYTES {
+                self.key.push_str(part);
+            } else {
+                self.reading_key = false;
+            }
+        }
+    }
     fn record_end(&mut self) {
         if self.framing.stable == Some(self.count) {
             self.prefix = self.start.map(|start| Prefix {
@@ -307,13 +317,7 @@ impl<F: Formatter> Formatter for &mut Shell<'_, '_, F> {
         self.inner.end_object_value(out)
     }
     fn write_string_fragment<W: ?Sized + Write>(&mut self, out: &mut W, part: &str) -> io::Result<()> {
-        if self.array.reading_key {
-            if self.array.key.len().saturating_add(part.len()) <= KEY_BYTES {
-                self.array.key.push_str(part);
-            } else {
-                self.array.reading_key = false;
-            }
-        }
+        self.array.absorb_key(part);
         self.inner.write_string_fragment(out, part)
     }
     fn write_char_escape<W: ?Sized + Write>(&mut self, out: &mut W, escape: CharEscape) -> io::Result<()> {
@@ -331,11 +335,8 @@ impl<F: Formatter> Formatter for &mut Shell<'_, '_, F> {
                 CharEscape::Tab => '\t',
                 CharEscape::AsciiControl(byte) => char::from(*byte),
             };
-            if self.array.key.len() + character.len_utf8() <= KEY_BYTES {
-                self.array.key.push(character);
-            } else {
-                self.array.reading_key = false;
-            }
+            let mut encoded = [0u8; 4];
+            self.array.absorb_key(character.encode_utf8(&mut encoded));
         }
         self.inner.write_char_escape(out, escape)
     }

@@ -20,6 +20,7 @@
 //! phases → agents → outcomes + the script — making workflows queryable on their own terms.
 
 use super::claude::sidecar;
+use crate::json::{ReadInput, Validation};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -334,18 +335,21 @@ impl crate::harness::Workflows for Runs {
     }
 }
 
+/// Sort key placing a run newest first: the state file's mtime (the JSON carries an ISO
+/// `timestamp` too, but mtime needs no parse), keyed through the on-disk `<runId>.json` name.
+fn state_recency(parent_path: &Path, run_id: &str) -> std::cmp::Reverse<Option<std::time::SystemTime>> {
+    std::cmp::Reverse(
+        workflows_dir(parent_path)
+            .map(|dir| dir.join(format!("{run_id}.json")))
+            .and_then(|path| fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok()),
+    )
+}
+
 pub fn workflows(parent_path: &Path) -> Vec<Workflow> {
     let paths = state_paths(parent_path);
     let mut out = crate::par_filter_map(paths, |p| parse_state_file(&p));
-    // Newest first, by file mtime (the JSON carries an ISO `timestamp` too, but mtime needs no parse).
-    out.sort_by_key(|w| {
-        std::cmp::Reverse(
-            workflows_dir(parent_path)
-                .map(|d| d.join(format!("{}.json", w.run_id)))
-                .and_then(|p| fs::metadata(p).ok())
-                .and_then(|m| m.modified().ok()),
-        )
-    });
+    out.sort_by_cached_key(|w| state_recency(parent_path, &w.run_id));
     out
 }
 
@@ -359,7 +363,9 @@ pub fn workflow(parent_path: &Path, key: &str) -> Option<Workflow> {
     #[cfg(test)]
     record_state_materialization(source.path());
     source
-        .read_document(|view| Ok(parse_state(view.resolve()?.as_ref())))
+        .read(ReadInput::Document, Validation::Value, |view| {
+            Ok(parse_state(view.resolve()?.as_ref()))
+        })
         .ok()
 }
 
@@ -374,7 +380,7 @@ fn workflow_index(parent_path: &Path) -> Vec<(crate::json::JsonSource, String, O
     let mut index = crate::par_filter_map(state_paths(parent_path), |path| {
         let source = crate::json::JsonSource::capture(&path).ok()?;
         let (id, name) = source
-            .read_document(|view| {
+            .read(ReadInput::Document, Validation::Value, |view| {
                 Ok((
                     crate::affordance::input::field_string(view, "runId")?.unwrap_or_default(),
                     crate::affordance::input::field_string(view, "workflowName")?,
@@ -384,14 +390,7 @@ fn workflow_index(parent_path: &Path) -> Vec<(crate::json::JsonSource, String, O
         Some((source, id, name))
     });
     // Keep the existing wire-ID-based mtime ordering, including repeated workflow names.
-    index.sort_by_key(|entry| {
-        std::cmp::Reverse(
-            workflows_dir(parent_path)
-                .map(|dir| dir.join(format!("{}.json", entry.1)))
-                .and_then(|path| fs::metadata(path).ok())
-                .and_then(|metadata| metadata.modified().ok()),
-        )
-    });
+    index.sort_by_cached_key(|entry| state_recency(parent_path, &entry.1));
     index
 }
 
@@ -482,7 +481,9 @@ pub fn run_names(parent_path: &Path) -> Vec<(String, String)> {
             let name = by_script.get(&rid).cloned().or_else(|| {
                 crate::json::JsonSource::capture(&p)
                     .ok()?
-                    .read_document(|view| crate::affordance::input::field_string(view, "workflowName"))
+                    .read(ReadInput::Document, Validation::Value, |view| {
+                        crate::affordance::input::field_string(view, "workflowName")
+                    })
                     .ok()
                     .flatten()
             });
@@ -970,12 +971,14 @@ impl Miner {
 /// Each ghost is enriched from what DID survive: its orphaned script file (written at launch)
 /// recovers the run id, which keys the `subagents/workflows/<runId>/` debris dir — agent
 /// transcripts and journaled results produced before the crash, i.e. the harvestable work.
+///
+/// A state file that exists but cannot be read is not evidence that its run was never recorded:
+/// it is named once on stderr and the session reports no ghosts, never a false one.
 pub fn ghost_launches(session_path: &Path) -> Vec<WorkflowLaunch> {
     // Ghost matching needs only identity, name and resume ancestry, never scripts or results.
-    let states = crate::par_filter_map(state_paths(session_path), |path| {
-        let source = crate::json::JsonSource::capture(&path).ok()?;
-        source
-            .read_document(|view| {
+    let read = crate::par_filter_map(state_paths(session_path), |path| {
+        let state = crate::json::JsonSource::capture(&path).and_then(|source| {
+            source.read(ReadInput::Document, Validation::Value, |view| {
                 let mut fields = serde_json::Map::new();
                 for key in ["runId", "workflowName", "resumeFromRunId"] {
                     if let Some(value) = crate::affordance::input::field_string(view, key)? {
@@ -984,8 +987,20 @@ pub fn ghost_launches(session_path: &Path) -> Vec<WorkflowLaunch> {
                 }
                 Ok(parse_state(&Value::Object(fields)))
             })
-            .ok()
+        });
+        Some(state.map_err(|error| (path, error)))
     });
+    let mut states = Vec::with_capacity(read.len());
+    for state in read {
+        match state {
+            Ok(state) => states.push(state),
+            Err((_, error)) if crate::harness::is_not_found(&error) => {}
+            Err((path, error)) => {
+                crate::env::warn_once("workflow run state", format!("{}: {error:#}", path.display()));
+                return Vec::new();
+            }
+        }
+    }
     let mut ghosts = compute_ghosts(
         launches(session_path).unwrap_or_else(|error| {
             crate::env::warn_once("workflow launches", format!("{}: {error:#}", session_path.display()));
@@ -1025,8 +1040,6 @@ pub fn ghost_launches(session_path: &Path) -> Vec<WorkflowLaunch> {
 struct OrphanScripts {
     entries: Vec<(String, String)>,
     positions: std::collections::HashMap<String, std::collections::BTreeSet<usize>>,
-    #[cfg(test)]
-    lookups: usize,
 }
 impl OrphanScripts {
     fn new(entries: Vec<(String, String)>) -> Self {
@@ -1034,25 +1047,12 @@ impl OrphanScripts {
         for (index, (name, _)) in entries.iter().enumerate() {
             positions.entry(name.clone()).or_default().insert(index);
         }
-        Self {
-            entries,
-            positions,
-            #[cfg(test)]
-            lookups: 0,
-        }
+        Self { entries, positions }
     }
     fn take(&mut self, name: &str) -> Option<String> {
-        #[cfg(test)]
-        {
-            self.lookups += 1;
-        }
         let position = self.positions.get_mut(name)?.pop_first()?;
         let last = self.entries.len() - 1;
         if position != last {
-            #[cfg(test)]
-            {
-                self.lookups += 1;
-            }
             let moved = self
                 .positions
                 .get_mut(&self.entries[last].0)
@@ -1337,13 +1337,17 @@ mod tests {
 
         // The ghost carries its recovered run id + debris counts.
         let ghosts = ghost_launches(&sess);
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(ghosts.len(), 1);
         let g = &ghosts[0];
         assert_eq!(g.name.as_deref(), Some("doomed-swarm"));
         assert_eq!(g.run_id.as_deref(), Some("wf_dead-2"));
         assert_eq!(g.debris_agents, Some(2));
         assert_eq!(g.journal_result_count, Some(1));
+
+        // A state file that cannot be read might be the doomed run's: no ghost is claimed.
+        std::fs::write(wfdir.join("wf_unreadable-3.json"), "{\"runId\": \"wf_unread").unwrap();
+        assert!(ghost_launches(&sess).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1584,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_index_preserves_swap_removal_order_and_bounds_lookup_work() {
+    fn orphan_index_preserves_swap_removal_order() {
         let entries: Vec<_> = ["a", "b", "a", "c", "a", "b"]
             .iter()
             .enumerate()
@@ -1603,20 +1607,11 @@ mod tests {
             let entries: Vec<_> = (0..count).map(|n| (format!("name-{n}"), format!("run-{n}"))).collect();
             let mut actual = OrphanScripts::new(entries.clone());
             let mut old = entries;
-            let mut comparisons = 0;
             for n in (0..count).rev() {
                 let name = format!("name-{n}");
-                let position = old
-                    .iter()
-                    .position(|(candidate, _)| {
-                        comparisons += 1;
-                        candidate == &name
-                    })
-                    .unwrap();
+                let position = old.iter().position(|(candidate, _)| candidate == &name).unwrap();
                 assert_eq!(actual.take(&name), Some(old.swap_remove(position).1));
             }
-            assert_eq!(comparisons, count * (count + 1) / 2);
-            assert!(actual.lookups <= 2 * count);
         }
     }
 

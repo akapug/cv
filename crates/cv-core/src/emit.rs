@@ -28,6 +28,15 @@ use fidelity::{diff_features, reparse_features, source_features, target_holds, F
 use fidelity::{diff_fidelity, reparse_emitted};
 pub use fidelity::{Divergence, FidelityReport};
 
+/// The root transcript a Claude sub-agent emission lives beside, and the agent id it is written as.
+#[derive(Debug, Clone)]
+pub struct SidechainOf {
+    /// The root session's id: every emitted record carries its `sessionId`.
+    pub root: String,
+    /// The emitted records' `agentId`, and the file's `agent-<id>.jsonl` name.
+    pub agent: String,
+}
+
 /// Knobs for emitting/porting a session.
 #[derive(Debug, Clone, Default)]
 pub struct EmitOptions {
@@ -42,15 +51,15 @@ pub struct EmitOptions {
     pub strict: bool,
     /// What to do with [`Block::Thinking`] on the way out. See [`ThinkingMode`].
     pub thinking: ThinkingMode,
-    /// Claude only: write the session as a **sub-agent transcript** of `(root session id, agent id)`
-    /// instead of a main-thread session. Every record carries the root's `sessionId`,
-    /// `isSidechain: true` and `agentId`; no `ai-title` is written; the file is
+    /// Claude only: write the session as a **sub-agent transcript** of a root instead of a
+    /// main-thread session. Every record carries the root's `sessionId`, `isSidechain: true` and
+    /// `agentId`; no `ai-title` is written; the file is
     /// `<out_dir>/agent-<agent id>.jsonl` (the caller passes the root's `subagents/` dir as
     /// `out_dir`, since a sub-agent lives beside its root, not under a project dir of its own) and
     /// `EmitResult::new_id` is the agent id, the handle `SendMessage` takes. `new_id` is ignored.
     /// With `None`, the emitter writes a main-thread session: `isSidechain` false where present,
     /// no `agentId` — a span lifted from a sub-agent transcript joins the main thread.
-    pub sidechain_of: Option<(String, String)>,
+    pub sidechain_of: Option<SidechainOf>,
     /// Replace a session file that already holds the emitted name, by atomic rename. Without it a
     /// taken name (a pinned `new_id` emitted twice) is refused with [`crate::publish::Exists`].
     pub force: bool,
@@ -237,10 +246,15 @@ fn emitter_for(target: Harness) -> Result<EmitFn, &'static str> {
 /// Emit `session` into `target`'s native format under `out_dir` (the target harness's storage root,
 /// or any directory for a dry run). Returns where it was written + how to resume it.
 pub fn emit(session: &Session, target: Harness, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    let f = emitter_for(target).map_err(|why| anyhow::anyhow!("emit to {target} {why}"))?;
+    let f = registered_emitter(target)?;
     // Every registered writer consumes guarded fields and projects thinking per block.
     // Keep that contract at the writer boundary so direct and dispatched emission agree.
     f(session, out_dir, opts)
+}
+
+/// The target's registered writer, with the registry's refusal spelling.
+fn registered_emitter(target: Harness) -> Result<EmitFn> {
+    emitter_for(target).map_err(|why| anyhow::anyhow!("emit to {target} {why}"))
 }
 
 /// Rewrite every [`Block::Thinking`] in `session` as [`EmitOptions::thinking`] asks, for `target`.
@@ -385,14 +399,20 @@ pub(crate) fn thinking_placeholder(signature: Option<&str>, encrypted: Option<&s
 
 /// Whether any message content field is still a lazy [`Span`](crate::lazy::Span) (see [`emit`]).
 fn has_unresolved_spans(session: &Session) -> bool {
-    session.messages.iter().any(|m| {
-        m.content.iter().any(|b| match b {
-            Block::Text { text } | Block::Thinking { text, .. } => text.is_lazy(),
-            Block::ToolResult { content, .. } => content.is_lazy(),
-            Block::ToolUse { input, .. } => matches!(input, crate::Json::Source(_)),
-            _ => false,
+    session
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(|block| {
+            block.text().is_some_and(crate::Text::is_lazy)
+                || matches!(
+                    block,
+                    Block::ToolUse {
+                        input: crate::Json::Source(_),
+                        ..
+                    }
+                )
         })
-    })
 }
 
 /// Resolve complete values before a full-output consumer touches them. Ordinary owned sessions
@@ -448,6 +468,8 @@ pub fn emit_report(
     out_dir: &Path,
     opts: &EmitOptions,
 ) -> Result<(EmitResult, FidelityReport)> {
+    // Refuse an unregistered target before projecting the source: the projection materializes.
+    registered_emitter(target)?;
     let before = source_features(target, opts.thinking, session)?;
     // An emitter that owns a check on its output (Claude's three resumability rules) runs it on
     // the staged file, before publishing.
@@ -496,6 +518,18 @@ pub fn supported_targets() -> &'static [Harness] {
 /// Effective cwd after applying any rehome override.
 pub(crate) fn effective_cwd(session: &Session, opts: &EmitOptions) -> Option<PathBuf> {
     opts.new_cwd.clone().or_else(|| session.cwd.clone())
+}
+
+/// The store's own subdirectory of `out_dir` an emitter writes into, without doubling: when
+/// `out_dir` already is that directory (emitting into a discovered root, whose basename is
+/// `name`), it stays itself instead of nesting `<name>/<name>`. LM Studio's `conversations` and
+/// OpenClaw's `agents` share this one rule.
+pub(crate) fn out_dir_within(out_dir: &Path, name: &str) -> PathBuf {
+    if out_dir.file_name().is_some_and(|n| n == name) {
+        out_dir.to_path_buf()
+    } else {
+        out_dir.join(name)
+    }
 }
 
 /// Branch name (if any) for git-flavored metadata fields.
@@ -608,7 +642,6 @@ mod tests {
     use crate::ir::*;
     use anyhow::Context as _;
     use serde_json::json;
-    use uuid::Uuid;
 
     #[test]
     fn native_source_validation_checks_complete_record_without_lazy_blocks() -> Result<()> {
@@ -626,10 +659,18 @@ mod tests {
         Ok(())
     }
 
-    fn temp_dir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("cv-emit-{}", Uuid::new_v4()));
-        fs::create_dir_all(&d).unwrap();
-        d
+    /// A scratch dir removed when the test ends — failed or not — by the same [`World`](cv_testkit::World)
+    /// facility [`crate::test_world`] sits on. The environment stays untouched: these tests read none.
+    struct Scratch(cv_testkit::World);
+    impl std::ops::Deref for Scratch {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0.base
+        }
+    }
+
+    fn temp_dir() -> Scratch {
+        Scratch(cv_testkit::World::new("emit"))
     }
 
     fn sample_session(harness: Harness) -> Session {
@@ -817,7 +858,6 @@ mod tests {
             .is_err());
             assert_eq!(fs::read(path)?, bytes);
         }
-        fs::remove_dir_all(out)?;
         Ok(())
     }
 
@@ -952,7 +992,13 @@ mod tests {
         // Portable is a new wire policy; frozen legacy dispatch has no corresponding oracle.
         let mut frozen = crate::emit::frozen::Frozen::new("claude-checked-writer");
         for mode in [ThinkingMode::Native, ThinkingMode::Text, ThinkingMode::Drop] {
-            for sidechain in [None, Some(("root".to_owned(), "agent".to_owned()))] {
+            for sidechain in [
+                None,
+                Some(SidechainOf {
+                    root: "root".into(),
+                    agent: "agent".into(),
+                }),
+            ] {
                 let opts = EmitOptions {
                     new_id: Some("fixed-id".into()),
                     thinking: mode,
@@ -967,7 +1013,7 @@ mod tests {
                         .join(format!("new-{}-{}", mode.as_str(), opts.sidechain_of.is_some())),
                     &opts,
                 )?;
-                verify_claude_resumable(&new.path, opts.sidechain_of.as_ref().map(|(_, a)| a.as_str()))?;
+                verify_claude_resumable(&new.path, opts.sidechain_of.as_ref().map(|of| of.agent.as_str()))?;
                 let bytes = fs::read(&new.path)?;
                 frozen.insert(
                     format!("{}-{}", mode.as_str(), opts.sidechain_of.is_some()),
@@ -1401,13 +1447,19 @@ mod tests {
             ("distill(lane).unwrap()", &lane_distilled),
         ];
         for (verb, session) in verbs {
-            for sidechain in [None, Some(("rootsess".to_string(), "afedcba9876543210".to_string()))] {
+            for sidechain in [
+                None,
+                Some(SidechainOf {
+                    root: "rootsess".into(),
+                    agent: "afedcba9876543210".into(),
+                }),
+            ] {
                 let out = temp_dir();
                 let opts = EmitOptions {
                     sidechain_of: sidechain.clone(),
                     ..Default::default()
                 };
-                let agent = sidechain.as_ref().map(|(_, a)| a.as_str());
+                let agent = sidechain.as_ref().map(|of| of.agent.as_str());
                 let (res, _) = emit_verified(session, Harness::Claude, &out, &opts)
                     .unwrap_or_else(|e| panic!("{verb} sidechain={agent:?}: {e:#}"));
                 verify_claude_resumable(&res.path, agent).unwrap_or_else(|e| panic!("{verb}: {e:#}"));
@@ -1443,7 +1495,6 @@ mod tests {
                         );
                     }
                 }
-                let _ = fs::remove_dir_all(&out);
             }
         }
 
@@ -1451,9 +1502,7 @@ mod tests {
         let emit_main = |s: &Session| {
             let out = temp_dir();
             let res = emit(s, Harness::Claude, &out, &EmitOptions::default()).unwrap();
-            let text = fs::read_to_string(&res.path).unwrap();
-            let _ = fs::remove_dir_all(&out);
-            text
+            fs::read_to_string(&res.path).unwrap()
         };
         let t = emit_main(&src);
         assert!(!t.contains("\"t3\""), "the unanswered trailing call is dropped: {t}");
@@ -2453,8 +2502,6 @@ mod tests {
                 );
             }
         }
-
-        fs::remove_dir_all(&out).ok();
     }
 
     // --------------------------------------------------------------------------------------------
@@ -2550,7 +2597,8 @@ mod tests {
         );
 
         // The verifier sees no unexpected loss for this OpenCode round-trip.
-        let (_r, report) = emit_report(&s, Harness::OpenCode, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (_r, report) = emit_report(&s, Harness::OpenCode, &scratch, &EmitOptions::default()).unwrap();
         assert!(!report.has_unexpected(), "opencode round-trip: {:?}", report.deltas);
     }
 
@@ -2755,7 +2803,8 @@ mod tests {
                 });
             }
         }
-        let (res, report) = emit_report(&s, Harness::Codex, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (res, report) = emit_report(&s, Harness::Codex, &scratch, &EmitOptions::default()).unwrap();
         assert!(
             !report.deltas.iter().any(|d| d.what == "usage"),
             "usage must survive into Codex, got {:?}",
@@ -2788,7 +2837,8 @@ mod tests {
                 });
             }
         }
-        let (res, report) = emit_report(&s, Harness::OpenClaw, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (res, report) = emit_report(&s, Harness::OpenClaw, &scratch, &EmitOptions::default()).unwrap();
         assert!(
             !report.deltas.iter().any(|d| d.what == "usage"),
             "usage must survive into OpenClaw, got {:?}",
@@ -2819,7 +2869,8 @@ mod tests {
                 *details = Some(serde_json::json!({ "filePath": "/w/a.rs", "structuredPatch": [1] }));
             }
         }
-        let (res, report) = emit_report(&s, Harness::OpenCode, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (res, report) = emit_report(&s, Harness::OpenCode, &scratch, &EmitOptions::default()).unwrap();
         assert!(
             !report.deltas.iter().any(|d| d.what == "details"),
             "details must survive into OpenCode, got {:?}",
@@ -2861,7 +2912,8 @@ mod tests {
         });
         s.messages.insert(3, think);
 
-        let (_res, report) = emit_report(&s, Harness::Codex, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (_res, report) = emit_report(&s, Harness::Codex, &scratch, &EmitOptions::default()).unwrap();
         assert!(
             report.deltas.iter().all(|d| d.expected),
             "no unexpected loss from a turn the target cannot represent, got {:?}",
@@ -2875,7 +2927,8 @@ mod tests {
         assert_eq!((d.a.as_str(), d.b.as_str()), ("1", "0"));
 
         // Into Claude itself the same turn is perfectly representable, so nothing is reported.
-        let (_res, report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (_res, report) = emit_report(&s, Harness::Claude, &scratch, &EmitOptions::default()).unwrap();
         assert!(
             !report.deltas.iter().any(|d| d.what == "unrepresentable_turns"),
             "Claude holds signature-only thinking, got {:?}",
@@ -3029,7 +3082,8 @@ mod tests {
             "both tool turns are there — the paired one and the orphan"
         );
 
-        let (_r, report) = emit_report(&s, Harness::OpenCode, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (_r, report) = emit_report(&s, Harness::OpenCode, &scratch, &EmitOptions::default()).unwrap();
         assert!(
             !report.has_unexpected(),
             "opencode orphan round-trip: {:?}",
@@ -3167,10 +3221,11 @@ mod tests {
             "the `mode` record is carried"
         );
 
+        let scratch = temp_dir();
         let (_res, report) = emit_report(
             &s,
             Harness::Claude,
-            &temp_dir(),
+            &scratch,
             &EmitOptions {
                 new_id: Some(sid.into()),
                 new_cwd: Some(PathBuf::from("/w")),
@@ -3200,7 +3255,8 @@ mod tests {
                 }
             }
         }
-        let (res, report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (res, report) = emit_report(&s, Harness::Claude, &scratch, &EmitOptions::default()).unwrap();
         assert!(
             !report.deltas.iter().any(|d| d.what == "details"),
             "details must survive a port into Claude, got {:?}",
@@ -3242,7 +3298,8 @@ mod tests {
         .join("\n");
 
         let s = crate::harness::claude::parse_str("s1", &text, None);
-        let (res, _report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (res, _report) = emit_report(&s, Harness::Claude, &scratch, &EmitOptions::default()).unwrap();
         let emitted: Vec<Value> = fs::read_to_string(&res.path)
             .unwrap()
             .lines()
@@ -3303,7 +3360,6 @@ mod tests {
                 first.path,
                 "{target}"
             );
-            std::fs::remove_dir_all(&out).ok();
         }
     }
 
@@ -3324,7 +3380,8 @@ mod tests {
             "the sample carries a System turn with text"
         );
         // Sanity: the report flags an unexpected loss of that text.
-        let (_r, report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (_r, report) = emit_report(&s, Harness::Claude, &scratch, &EmitOptions::default()).unwrap();
         assert!(
             report
                 .deltas
@@ -3334,13 +3391,15 @@ mod tests {
             report.deltas
         );
         // Non-strict: succeeds, lists the loss.
-        let (_res, warnings) = emit_verified(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (_res, warnings) = emit_verified(&s, Harness::Claude, &scratch, &EmitOptions::default()).unwrap();
         assert!(warnings.iter().any(|w| w.contains("block:text")));
         // Strict: errors.
+        let scratch = temp_dir();
         let err = emit_verified(
             &s,
             Harness::Claude,
-            &temp_dir(),
+            &scratch,
             &EmitOptions {
                 strict: true,
                 ..Default::default()
@@ -3370,7 +3429,8 @@ mod tests {
                     });
                 }
             }
-            let (res, report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+            let scratch = temp_dir();
+            let (res, report) = emit_report(&s, Harness::Claude, &scratch, &EmitOptions::default()).unwrap();
             assert!(
                 !report.deltas.iter().any(|d| d.what == "usage"),
                 "usage must survive {src} → Claude, got {:?}",
@@ -3419,7 +3479,8 @@ mod tests {
                 }
             }
         }
-        let (_res, report) = emit_report(&s, Harness::Hermes, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (_res, report) = emit_report(&s, Harness::Hermes, &scratch, &EmitOptions::default()).unwrap();
         let d = report
             .deltas
             .iter()
@@ -3427,10 +3488,11 @@ mod tests {
             .expect("the flag is reported as lost");
         assert!(d.expected, "Hermes has no column for it: {d:?}");
         // …so `--strict` does not fail on it.
+        let scratch = temp_dir();
         emit_verified(
             &s,
             Harness::Hermes,
-            &temp_dir(),
+            &scratch,
             &EmitOptions {
                 strict: true,
                 ..Default::default()
@@ -3438,7 +3500,8 @@ mod tests {
         )
         .expect("an expected loss never fails --strict");
         // A target that *does* have a slot still has to fill it.
-        let (_res, report) = emit_report(&s, Harness::Grok, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (_res, report) = emit_report(&s, Harness::Grok, &scratch, &EmitOptions::default()).unwrap();
         assert!(
             !report.deltas.iter().any(|d| d.what == "tool result is_error"),
             "Grok carries it in updates.jsonl, got {:?}",
@@ -3455,7 +3518,8 @@ mod tests {
     fn grok_pins_a_foreign_session_model() {
         let mut s = sample_session(Harness::Claude);
         s.model = Some("claude-fable-5-1".into());
-        let (res, report) = emit_report(&s, Harness::Grok, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (res, report) = emit_report(&s, Harness::Grok, &scratch, &EmitOptions::default()).unwrap();
         let d = report
             .deltas
             .iter()
@@ -3473,7 +3537,8 @@ mod tests {
         for m in &mut g.messages {
             m.model = g.model.clone();
         }
-        let (res, report) = emit_report(&g, Harness::Grok, &temp_dir(), &EmitOptions::default()).unwrap();
+        let scratch = temp_dir();
+        let (res, report) = emit_report(&g, Harness::Grok, &scratch, &EmitOptions::default()).unwrap();
         assert!(
             !report.deltas.iter().any(|d| d.what.starts_with("session model")),
             "a Grok model round-trips, got {:?}",
@@ -3562,7 +3627,8 @@ mod tests {
         };
 
         // --- native: today's behaviour. The signature-only turn is unrepresentable and vanishes.
-        let (res, report) = emit_report(&base, Harness::Codex, &temp_dir(), &opts(ThinkingMode::Native)).unwrap();
+        let scratch = temp_dir();
+        let (res, report) = emit_report(&base, Harness::Codex, &scratch, &opts(ThinkingMode::Native)).unwrap();
         assert!(report.deltas.iter().all(|d| d.expected), "{:?}", report.deltas);
         assert!(
             report.deltas.iter().any(|d| d.what == "unrepresentable_turns"),
@@ -3578,7 +3644,8 @@ mod tests {
         );
 
         // --- text: the turn survives, and the lost signature is still reported.
-        let (res, report) = emit_report(&base, Harness::Codex, &temp_dir(), &opts(ThinkingMode::Text)).unwrap();
+        let scratch = temp_dir();
+        let (res, report) = emit_report(&base, Harness::Codex, &scratch, &opts(ThinkingMode::Text)).unwrap();
         assert!(
             !report.deltas.iter().any(|d| d.what == "unrepresentable_turns"),
             "no turn is lost under --thinking text, got {:?}",
@@ -3616,7 +3683,8 @@ mod tests {
 
         // --- drop: no thinking at all, even into a target that could hold every payload.
         for target in [Harness::Codex, Harness::Claude] {
-            let (res, report) = emit_report(&base, target, &temp_dir(), &opts(ThinkingMode::Drop)).unwrap();
+            let scratch = temp_dir();
+            let (res, report) = emit_report(&base, target, &scratch, &opts(ThinkingMode::Drop)).unwrap();
             let re = reparse_emitted(target, &res, &Demand::RICH).unwrap();
             assert_eq!(thinking_blocks(&re), 0, "--thinking drop emits none into {target}");
             assert!(

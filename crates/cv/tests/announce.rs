@@ -146,7 +146,7 @@ fn world(tag: &str) -> World {
     let w = World::new(tag);
     w.write_session(
         "alphasess",
-        &[claude::user("u1", "2026-01-01T10:00:00Z", "hello there")],
+        &[claude::user("s1", "u1", "2026-01-01T10:00:00Z", "hello there")],
     );
     w
 }
@@ -165,6 +165,10 @@ fn every_command_on_a_pipe_exits_or_is_a_daemon_that_announced() {
             assert!(
                 line.is_some(),
                 "cv {argv:?} is a daemon that said nothing within {ANNOUNCE:?}"
+            );
+            assert!(
+                run.exited(Duration::from_millis(1500)).is_none(),
+                "cv {argv:?} announced, then exited; a daemon keeps running"
             );
             continue;
         }
@@ -187,7 +191,13 @@ fn scry_on_a_pipe_prints_the_current_state_once_unless_told_to_follow() {
         line.contains("current state once") && line.contains("--follow"),
         "{line}"
     );
-    assert_eq!(run.exited(BUDGET).map(|s| s.code()), Some(Some(0)));
+    let status = run.exited(BUDGET);
+    let stderr = run.rest_of_stderr();
+    assert_eq!(
+        status.map(|s| s.code()),
+        Some(Some(0)),
+        "scry on a pipe exits 0; stderr:\n{stderr}"
+    );
     let out = run.stdout();
     assert!(
         out.contains("alphases") && out.contains("msg"),
@@ -197,7 +207,13 @@ fn scry_on_a_pipe_prints_the_current_state_once_unless_told_to_follow() {
     let mut run = Run::spawn(&w, &strings(&["scry", "--for", "1s"]), Stdio::null());
     let line = run.announced(ANNOUNCE).expect("a bounded follow announces itself");
     assert!(line.contains("following live agent activity for 1s"), "{line}");
-    assert_eq!(run.exited(BUDGET).map(|s| s.code()), Some(Some(0)));
+    let status = run.exited(BUDGET);
+    let stderr = run.rest_of_stderr();
+    assert_eq!(
+        status.map(|s| s.code()),
+        Some(Some(0)),
+        "--for 1s exits 0; stderr:\n{stderr}"
+    );
     assert!(
         run.started.elapsed() >= Duration::from_secs(1),
         "--for 1s returned early"
@@ -227,8 +243,14 @@ fn workflow_follow_is_bounded_by_for_and_announces() {
     );
     let line = run.announced(ANNOUNCE).expect("workflow --for announces");
     assert!(line.contains("following run \"wf_none\" for 1s"), "{line}");
-    assert_eq!(run.exited(BUDGET).map(|s| s.code()), Some(Some(0)));
-    assert!(run.rest_of_stderr().contains("never registered"));
+    let status = run.exited(BUDGET);
+    let stderr = run.rest_of_stderr();
+    assert_eq!(
+        status.map(|s| s.code()),
+        Some(Some(0)),
+        "workflow --for 1s exits 0; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("never registered"), "{stderr}");
 
     let mut run = Run::spawn(
         &w,
@@ -269,12 +291,14 @@ fn stdin_readers_on_a_terminal_refuse_or_announce() {
 
     let (stdin, _master) = terminal_stdin();
     let mut run = Run::spawn(&w, &strings(&["hook", "compact"]), stdin);
+    let status = run.exited(BUDGET);
+    let stderr = run.rest_of_stderr();
     assert_eq!(
-        run.exited(BUDGET).map(|s| s.code()),
+        status.map(|s| s.code()),
         Some(Some(2)),
-        "hook on a terminal is usage"
+        "hook on a terminal is usage; stderr:\n{stderr}"
     );
-    assert!(run.rest_of_stderr().contains("stdin is a terminal"));
+    assert!(stderr.contains("stdin is a terminal"), "{stderr}");
 
     let (stdin, _master) = terminal_stdin();
     let mut run = Run::spawn(&w, &strings(&["mcp"]), stdin);
@@ -283,4 +307,18 @@ fn stdin_readers_on_a_terminal_refuse_or_announce() {
         .expect("mcp on a terminal says what it is waiting for");
     assert!(line.contains("terminal") && line.contains("Ctrl-D"), "{line}");
     assert!(run.exited(Duration::from_millis(1500)).is_none(), "mcp keeps serving");
+
+    // `task note <id> -` reads its text from stdin and announces that on a terminal.
+    let (out, _) = w.cv_ok(&["task", "open", "note stdin target"]);
+    let id = out.lines().last().expect("task open prints its id").trim();
+    let (stdin, _master) = terminal_stdin();
+    let mut run = Run::spawn(&w, &strings(&["task", "note", id, "-"]), stdin);
+    let line = run
+        .announced(ANNOUNCE)
+        .expect("task note - on a terminal says what it is waiting for");
+    assert!(line.contains("terminal") && line.contains("Ctrl-D"), "{line}");
+    assert!(
+        run.exited(Duration::from_millis(1500)).is_none(),
+        "task note - keeps reading"
+    );
 }

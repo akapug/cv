@@ -6,6 +6,7 @@ use crate::harness::store::{
 };
 use crate::harness::wire::text_title;
 use crate::json::{JsonSource, JsonView};
+use crate::json::{ReadInput, Validation};
 
 /// A `sessions.json` entry / `session_nodes.entry_json` (same shape).
 #[derive(Default, Debug, PartialEq)]
@@ -31,7 +32,7 @@ impl Indexes {
             // Missing, unreadable and malformed indexes historically fall back to transcript
             // metadata. Capture before the attempt; final dependency checks reject a race.
             JsonSource::capture(&path)
-                .and_then(|source| source.read_document(index))
+                .and_then(|source| source.read(ReadInput::Document, Validation::Value, index))
                 .unwrap_or_default()
         })
     }
@@ -169,11 +170,23 @@ pub(super) fn feed(view: JsonView<'_>, acc: &mut ScanAcc) -> Result<()> {
         Some("message") => {
             let body = fields
                 .get("message")
-                .map(|value| Fields::parse(value, &["role", "timestamp", "content"]))
+                .map(|value| {
+                    Fields::parse(
+                        value,
+                        &[
+                            "role",
+                            "provenance",
+                            "errorMessage",
+                            "stopReason",
+                            "timestamp",
+                            "content",
+                        ],
+                    )
+                })
                 .transpose()?
                 .flatten();
             let role = body.as_ref().map(|f| f.string("role")).transpose()?.flatten();
-            acc.message_count += usize::from(matches!(role.as_deref(), Some("user" | "assistant")));
+            acc.message_count += usize::from(body.as_ref().map(record::is_turn).transpose()? == Some(true));
             let mut entry_timestamp = fields.string("timestamp")?.as_deref().and_then(parse_ts);
             if entry_timestamp.is_none() {
                 entry_timestamp = timestamp(body.as_ref().and_then(|f| f.get("timestamp")))?;

@@ -367,13 +367,15 @@ pub(crate) fn event_json(ev: &TaskEvent, model: &TaskReadModel) -> serde_json::V
                 obj.insert("assignee".into(), serde_json::Value::String(a.clone()));
             }
         }
-        // The same telling detail the text feed prints, so a page need not know every kind.
+        // The telling detail the text feed prints, shaped alike but at this feed's own widths,
+        // so a page need not know every kind.
         obj.insert("detail".into(), serde_json::Value::String(event_detail(ev)));
     }
     v
 }
 
-/// The telling detail of one event (what `event_text` prints after the kind), sanitized.
+/// The telling detail of one event, shaped like the one `event_text` prints after the kind but
+/// at this feed's own widths, sanitized.
 pub(crate) fn event_detail(ev: &TaskEvent) -> String {
     match &ev.kind {
         TaskEventKind::Noted { text, .. } => truncate(&sanitize_line(text), 160),
@@ -634,15 +636,16 @@ pub(crate) fn render_inbox_md(page: &task::InboxPage) -> String {
                 }
                 out.push('\n');
             }
-            if !i.body.trim().is_empty() {
-                for para in i.body.trim().split("\n\n") {
+            if let Some(body) = i.body.as_deref().filter(|body| !body.trim().is_empty()) {
+                for para in body.trim().split("\n\n") {
                     out.push_str(&md_block(para));
                     out.push_str("\n\n");
                 }
             }
-            if !i.notes.is_empty() {
-                out.push_str(&format!("notes ({}):\n\n", i.notes.len()));
-                for note in &i.notes {
+            if i.notes.as_ref().is_some_and(|notes| !notes.is_empty()) {
+                let notes = i.notes.as_ref().unwrap();
+                out.push_str(&format!("notes ({}):\n\n", notes.len()));
+                for note in notes {
                     let mut line = format!(
                         "- _{}, {}{}:_ {}",
                         md_inline(&note.by),
@@ -791,17 +794,16 @@ mod tests {
             assert!(brief
                 .items
                 .iter()
-                .all(|row| row.body.is_empty() && row.notes.is_empty() && row.status.is_none()));
+                .all(|row| row.body.is_none() && row.notes.is_none() && row.status.is_none()));
             assert!(brief
                 .items
                 .iter()
                 .filter_map(|row| row.decision.as_ref())
                 .filter_map(|d| d.resolution.as_ref())
                 .all(|r| r.note.is_none()));
-            assert!(full
-                .items
-                .iter()
-                .any(|row| row.body == body && row.status.as_deref() == Some(body.as_str())));
+            assert!(full.items.iter().any(|row| {
+                row.body.as_deref() == Some(body.as_str()) && row.status.as_deref() == Some(body.as_str())
+            }));
         }
         assert_eq!(outcome.model.tasks[&action_id].body, body);
         assert_eq!(outcome.model.tasks[&action_id].notes[0].text, body);

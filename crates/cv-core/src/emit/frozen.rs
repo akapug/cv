@@ -40,11 +40,51 @@ impl Frozen {
         let expected = anyhow::Context::with_context(fs::read_to_string(&path), || {
             format!("{} (CV_REGEN_CORPUS=1 writes it)", path.display())
         })?;
-        assert!(
-            expected == actual,
-            "{} differs from the frozen emitted output (CV_REGEN_CORPUS=1 rewrites)",
-            self.1
+        if expected == actual {
+            return Ok(());
+        }
+        panic!(
+            "{} differs from the frozen emitted output (CV_REGEN_CORPUS=1 rewrites){}",
+            self.1,
+            Self::diff(&expected, &actual)
         );
-        Ok(())
+    }
+
+    /// Name the entries that moved and show both sides when they are small enough to read.
+    /// A `[len, sha]` entry then at least reports its length; a full entry reads as the field
+    /// diff it is.
+    fn diff(expected: &str, actual: &str) -> String {
+        let parse = |text: &str| {
+            serde_json::from_str::<serde_json::Map<String, Value>>(text)
+                .unwrap_or_else(|e| panic!("frozen golden is not an object: {e}"))
+        };
+        let (expected, actual) = (parse(expected), parse(actual));
+        let mut report = String::new();
+        for label in expected
+            .keys()
+            .chain(actual.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if expected.get(label) == actual.get(label) {
+                continue;
+            }
+            let side = |value: Option<&Value>| match value {
+                Some(value) => {
+                    let line = serde_json::to_string(value).unwrap_or_default();
+                    if line.len() <= 400 {
+                        line
+                    } else {
+                        format!("{}… ({} bytes)", &line[..200], line.len())
+                    }
+                }
+                None => "<absent>".into(),
+            };
+            report.push_str(&format!(
+                "\n  {label}:\n    frozen: {}\n    actual: {}",
+                side(expected.get(label)),
+                side(actual.get(label))
+            ));
+        }
+        report
     }
 }

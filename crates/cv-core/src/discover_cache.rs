@@ -111,13 +111,11 @@ static CACHE: OnceLock<RwLock<HashMap<PathBuf, std::sync::Weak<Cache>>>> = OnceL
 fn cache_for(path: &Path) -> Arc<Cache> {
     let mut active = CACHE.get_or_init(Default::default).write().unwrap();
     active.retain(|_, cache| cache.strong_count() != 0);
-    let cache = active.get(path).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
+    active.get(path).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
         let cache = Arc::new(load());
         active.insert(path.to_path_buf(), Arc::downgrade(&cache));
         cache
-    });
-    *crate::env::Env::current().retained().lock().unwrap() = Some(Arc::new((path.to_path_buf(), cache.clone())));
-    cache
+    })
 }
 #[cfg(all(test, feature = "sqlite"))]
 fn current_cache() -> Arc<Cache> {
@@ -132,6 +130,17 @@ fn existing_cache(path: &Path) -> Option<Arc<Cache>> {
 pub(crate) fn invalidate_interpretation(path: &Path) {
     if let Some(cache) = existing_cache(path) {
         cache.invalidated.store(true, Ordering::Release);
+    }
+}
+
+/// Drop this process's scan-cache entries, as a new process starts: later scans see only the
+/// rows the catalog holds.
+#[cfg(test)]
+pub(crate) fn forget_process_cache() {
+    let context = read::Context::current();
+    if let Some(cache) = context.path().and_then(existing_cache) {
+        cache.entries.write().unwrap().clear();
+        cache.any_dirty.store(false, Ordering::Relaxed);
     }
 }
 
@@ -289,6 +298,55 @@ where
     Ok(refs)
 }
 
+/// The process entry's capture of `path`, when it covers every read in `reads`.
+fn in_process_candidate(
+    cache: &Cache,
+    path: &Path,
+    reads: &crate::source::ReadSet,
+) -> Option<(Vec<SessionRef>, crate::source::ReadSet)> {
+    let entries = cache.entries.read().unwrap();
+    entries
+        .get(path)
+        .and_then(|entry| entry.payload.known())
+        .and_then(|(refs, captured)| captured.includes(reads).then(|| (refs.clone(), captured.clone())))
+}
+
+/// A candidate's refs when its capture is still fresh, else nothing: a stale capture falls
+/// through to a scan.
+fn fresh_candidate(candidate: Option<(Vec<SessionRef>, crate::source::ReadSet)>) -> Option<Vec<SessionRef>> {
+    candidate
+        .filter(|(_, captured)| captured.fresh(&mut crate::source::Probe::default()))
+        .map(|(refs, _)| refs)
+}
+
+/// An exact-demand row loaded from sqlite and admitted into the process cache, when still
+/// fresh: only a path with no process entry is loaded, and a concurrent in-process scan/count
+/// update always wins over the older SQL snapshot.
+#[cfg(feature = "sqlite")]
+fn fresh_loaded(
+    cache: &Cache,
+    context: &read::Context,
+    path: &Path,
+    key: (u64, u64),
+    reads: &crate::source::ReadSet,
+) -> Option<Vec<SessionRef>> {
+    // Do not reload an existing process entry, even when stale or invalid: a fresh scan replaces it.
+    if cache.entries.read().unwrap().contains_key(path) {
+        return None;
+    }
+    #[cfg(test)]
+    context.note_lookup();
+    let loaded = context.with_connection(|conn| load_entry(conn, path, key)).flatten();
+    // A lazy standalone open may migrate interpretation; clear before retaining this scan.
+    clear_invalidated(cache);
+    let mut entry = loaded?;
+    #[cfg(test)]
+    context.note_row();
+    // Decode outside locks, then choose the actual current process entry.
+    entry.payload.parsed();
+    fresh_candidate(admit_loaded(cache, path, entry, reads))
+}
+
 fn cached_scan_captured<E, F>(
     path: &Path,
     version: Option<&str>,
@@ -308,40 +366,17 @@ where
     };
     let cache = context.cache();
     clear_invalidated(&cache);
-    let candidate = {
-        let entries = cache.entries.read().unwrap();
-        entries
-            .get(path)
-            .and_then(|entry| entry.payload.known())
-            .and_then(|(refs, captured)| captured.includes(&reads).then(|| (refs.clone(), captured.clone())))
-    };
-    if let Some((refs, captured)) = candidate {
-        if captured.fresh(&mut crate::source::Probe::default()) {
-            return Ok(refs);
-        }
+    // Exact hit in this process.
+    if let Some(refs) = fresh_candidate(in_process_candidate(&cache, path, &reads)) {
+        return Ok(refs);
     }
-    // Do not reload an existing process entry, even when stale or invalid: a fresh scan replaces it.
+    // Exact demand persisted by an earlier run.
     #[cfg(feature = "sqlite")]
-    if !cache.entries.read().unwrap().contains_key(path) {
-        #[cfg(test)]
-        context.note_lookup();
-        let loaded = context.with_connection(|conn| load_entry(conn, path, key)).flatten();
-        // A lazy standalone open may migrate interpretation; clear before retaining this scan.
-        clear_invalidated(&cache);
-        if let Some(mut entry) = loaded {
-            #[cfg(test)]
-            context.note_row();
-            // Decode outside locks, then choose the actual current process entry. A concurrent
-            // scan/count update must win over the older SQL snapshot, including on return.
-            entry.payload.parsed();
-            let candidate = admit_loaded(&cache, path, entry, &reads);
-            if let Some((refs, captured)) = candidate {
-                if captured.fresh(&mut crate::source::Probe::default()) {
-                    return Ok(refs);
-                }
-            }
-        }
+    if let Some(refs) = fresh_loaded(&cache, context, path, key, &reads) {
+        return Ok(refs);
     }
+    // The continuation a re-opened pass may resume from: the in-process entry's, or — for a
+    // continuation demand with no process entry — sqlite's, which a newer process row overrides.
     #[allow(unused_mut)] // Persistence may replace the in-process candidate with a demanded row.
     let mut previous = version.and_then(|_| {
         let entries = cache.entries.read().unwrap();
@@ -376,6 +411,7 @@ where
     if let Some(prior) = &prior {
         reads.merge(&prior.dependencies);
     }
+    // The scan itself, against a resumed checkpoint when one was admitted.
     let (refs, mut continuation) = scan(prior.as_ref().map(|prior| &prior.checkpoint))?;
     if let Some(state) = &mut continuation {
         if let Some(prior) = &prior {
@@ -395,6 +431,7 @@ where
         .and_then(|state| serde_json::to_string(&state).inspect_err(note).ok());
     // Only cache hits — empty results are cheap to recompute (a failed name/content check that never
     // read the file) and caching them would bloat the table with every non-transcript path.
+    // Publish into this process (and mark for write-back) under one lock held only for the insert.
     if !refs.is_empty() {
         // Keep filesystem probes outside the cache lock. A pass raced by anything but growth of
         // its append-only primary publishes nothing, and one raced by growth never displaces a
@@ -488,7 +525,7 @@ pub(crate) fn persist(prune: bool) {
     if crate::env::frozen() {
         return;
     }
-    if persistence_cache(&read::Context::current().path(), prune).is_some() {
+    if persistence_cache(read::Context::current().path().unwrap_or(Path::new("")), prune).is_some() {
         #[cfg(feature = "sqlite")]
         read::Context::current().with_connection_mut(|conn| persist_in(conn, prune));
     }

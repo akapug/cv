@@ -1,5 +1,6 @@
 use super::*;
 use crate::emit::frozen::Frozen;
+use crate::json::{ReadInput, Validation};
 use crate::stream::{CollectSink, Demand, Tier};
 use serde_json::{json, Value};
 
@@ -233,7 +234,7 @@ fn real_downloads_exports_parse() {
     let env = crate::env::Env::from_process().enter();
     env.set("CV_EXPORTS", dirs::home_dir().unwrap().join("Downloads"));
     for kind in [Kind::ChatGpt, Kind::Claude] {
-        let refs = discover_kind(kind);
+        let refs = discover_kind_under(kind, export_dirs());
         eprintln!("{:?}: {} conversation(s)", kind, refs.len());
         if let Some(r) = refs.iter().find(|r| r.message_count.is_some_and(|n| n > 0)) {
             let mut sink = CollectSink::default();
@@ -649,7 +650,7 @@ fn wide_chatgpt_parts_preserve_filtered_join_and_source_guard() -> Result<()> {
     std::fs::write(&path, serde_json::to_vec(&json!({"parts":parts}))?)?;
     let source = crate::json::JsonSource::capture(&path)?;
     let resolver = crate::lazy::Resolver::new(None);
-    let text = source.read_range_value(0, source.len(), |view| {
+    let text = source.read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
         let fields = crate::harness::store::document::Fields::parse(view, &["parts"])?;
         native::chatgpt_text(fields.as_ref(), true, &source, &resolver)
     })?;

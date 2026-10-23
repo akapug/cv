@@ -1,11 +1,13 @@
 //! Checked per-block projection: retained text stays borrowed, discarded text is never copied.
 use super::{thinking_fate_with_presence, thinking_placeholder, ThinkingFate, ThinkingMode};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::{lazy::Resolver, Block, Harness, Text};
 use anyhow::Result;
 use std::borrow::Cow;
 
-/// Source strings have strict acceptance at capture; spans retain their full preflight and
-/// established lossy fallback. Checked callbacks revalidate provenance even at an early stop.
+/// Source strings and wire-form spans both require strict JSON string acceptance.
+/// Checked callbacks revalidate provenance even at an early stop.
 pub(crate) fn first_character(text: &Text, resolver: &Resolver, skip_whitespace: bool) -> Result<Option<char>> {
     let select = |chunk: &str| chunk.chars().find(|ch| !skip_whitespace || !ch.is_whitespace());
     if let Some(inline) = text.inline_str() {
@@ -113,7 +115,11 @@ mod tests {
         ] {
             std::fs::write(&path, serde_json::to_vec(&body)?)?;
             let source = JsonSource::capture(&path)?;
-            let text = source.read_range_value(0, source.len(), |v| v.source_text())?.unwrap();
+            let text = source
+                .read(ReadInput::Range(0, source.len()), Validation::Value, |v| {
+                    v.source_text()
+                })?
+                .unwrap();
             let resolver = Resolver::new(None);
             for skip_whitespace in [false, true] {
                 assert_eq!(
@@ -131,7 +137,10 @@ mod tests {
         let bytes = format!("\"x{}\\ud800\"", "a".repeat(70_000));
         std::fs::write(&path, &bytes)?;
         let source = JsonSource::capture(&path)?;
-        assert!(source.read_range_value(0, source.len(), |v| v.source_text()).is_err());
+        assert!(source
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |v| v
+                .source_text())
+            .is_err());
         // A wire-form span over the same malformed string is refused like source text.
         let resolver = Resolver::new(Some(path.clone()));
         let span = Text::Span(crate::lazy::Span {

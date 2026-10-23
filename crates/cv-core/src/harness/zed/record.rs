@@ -2,7 +2,7 @@
 //! Messages are sniffed per message, not per thread, so a hand-migrated or mixed blob still
 //! parses. The span demand decides what is resolved, never which codec runs.
 use super::*;
-use crate::harness::store::document::{text_head, Fields};
+use crate::harness::store::document::{text_is_blank, Fields};
 use crate::json::{JsonSource, JsonView};
 use crate::lazy::{Resolver, Text};
 
@@ -88,8 +88,22 @@ fn text(fields: &Fields<'_>, key: &str, spans: bool) -> Result<Option<Text>> {
         .transpose()
         .map(Option::flatten)
 }
-fn nonempty(text: Option<Text>) -> Option<Text> {
-    text.filter(|text| !text.is_empty())
+/// One emptiness rule per type: `Text`'s inherent `is_empty` (span-safe `len`), `String`'s own.
+trait NonEmpty {
+    fn is_nonempty(&self) -> bool;
+}
+impl NonEmpty for Text {
+    fn is_nonempty(&self) -> bool {
+        !self.is_empty()
+    }
+}
+impl NonEmpty for String {
+    fn is_nonempty(&self) -> bool {
+        !self.is_empty()
+    }
+}
+fn nonempty<T: NonEmpty>(text: Option<T>) -> Option<T> {
+    text.filter(|text| text.is_nonempty())
 }
 fn nonnull(fields: &Fields<'_>, key: &str) -> Result<Option<Value>> {
     let Some(value) = fields.get(key) else { return Ok(None) };
@@ -346,7 +360,7 @@ fn modern(fields: &Fields<'_>, source: &JsonSource, spans: bool, f: &mut dyn FnM
         // CompactionInfo::Summary(text) — the context-compaction summary that replaced history.
         if let Some(compaction) = Fields::parse(compaction, &["Summary"])? {
             if let Some(text) = text(&compaction, "Summary", spans)? {
-                if !text_head(&text, &Resolver::new(None), 1, true)?.0.is_empty() {
+                if !text_is_blank(&text, &Resolver::new(None))? {
                     let mut msg = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
                     msg.content.push(Block::Text { text });
                     return Ok(f(msg));
@@ -413,12 +427,7 @@ fn agent_block(view: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
                 .transpose()?
                 .flatten()
                 .unwrap_or_default(),
-            signature: fields
-                .as_ref()
-                .map(|v| v.string("signature"))
-                .transpose()?
-                .flatten()
-                .filter(|s| !s.is_empty()),
+            signature: nonempty(fields.as_ref().map(|v| v.string("signature")).transpose()?.flatten()),
             encrypted: None,
             redacted: false,
         }));

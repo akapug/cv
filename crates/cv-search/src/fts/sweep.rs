@@ -9,30 +9,71 @@ pub(super) const IN_FLIGHT_BYTES: u64 = 2 << 30;
 /// Decoded bytes discovery may hand to [`sweep_decoded`] ahead of it (a larger rollout alone).
 pub(super) const DECODED_WINDOW: u64 = 2 << 30;
 
+/// Decoded rollouts discovery may hand ahead at once: one being read by each sweep worker and
+/// one waiting for each. A handed rollout keeps two descriptors open (its source and its decoded
+/// copy) until its job is done, so the early sweep holds a few per worker, never one per session.
+pub(super) fn decoded_slots() -> usize {
+    2 * available_workers()
+}
+
 /// The worker queue admits logical-session groups, largest first. Planning chooses one
 /// preferred copy per ID; group reservations bound concurrent source bytes.
 pub(super) struct Queue {
-    pub(super) groups: Vec<Vec<Job>>,
+    /// Waiting groups keyed by (charge, arrival): the largest charge that fits is one ordered
+    /// lookup, and among equal charges the latest arrival goes first. A sorted `Vec` re-sorted on
+    /// every push made a backlog of Z groups fed one batch at a time O(Z²).
+    groups: std::collections::BTreeMap<(u64, u64), Vec<Job>>,
+    arrived: u64,
     pub(super) in_flight: u64,
     pub(super) draining: bool,
     pub(super) stopped: bool,
     /// No more groups will arrive.
     pub(super) closed: bool,
+    /// Sessions [`Feed::push`] could not queue: their old baselines could not be invalidated, so
+    /// their docs, baselines and marks stay as they were and a later pass reads them.
+    deferred: Vec<Unreadable>,
 }
 
-/// Return the largest waiting group that fits. The workload is finite, so a large waiting
-/// group cannot starve: after fitting work completes it is admitted alone when the guard empties.
+/// The largest waiting group that fits. The workload is finite, so a large waiting group cannot
+/// starve: after fitting work completes it is admitted alone when the guard empties.
 impl Queue {
-    pub(super) fn next_fitting(&self) -> Option<usize> {
+    pub(super) fn new() -> Self {
+        Queue {
+            groups: Default::default(),
+            arrived: 0,
+            in_flight: 0,
+            draining: false,
+            stopped: false,
+            closed: false,
+            deferred: Vec::new(),
+        }
+    }
+    /// Queue one group under its charge ([`job_cost`], taken once here).
+    pub(super) fn push(&mut self, group: Vec<Job>) {
+        self.groups.insert((job_cost(&group), self.arrived), group);
+        self.arrived += 1;
+    }
+    pub(super) fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+    fn clear(&mut self) {
+        self.groups.clear();
+    }
+    /// The key of the group [`Self::take_fitting`] would take.
+    pub(super) fn next_fitting(&self) -> Option<(u64, u64)> {
         if self.stopped || self.draining {
             return None;
         }
-        if self.in_flight == 0 {
-            return self.groups.len().checked_sub(1);
-        }
-        self.groups
-            .iter()
-            .rposition(|group| job_cost(group) <= IN_FLIGHT_BYTES.saturating_sub(self.in_flight))
+        let room = IN_FLIGHT_BYTES.saturating_sub(self.in_flight);
+        let fits = if self.in_flight == 0 { u64::MAX } else { room };
+        self.groups.range(..=(fits, u64::MAX)).next_back().map(|(key, _)| *key)
+    }
+    /// Take the largest waiting group that fits, charging its reservation to `in_flight`.
+    pub(super) fn take_fitting(&mut self) -> Option<(u64, Vec<Job>)> {
+        let key = self.next_fitting()?;
+        let group = self.groups.remove(&key)?;
+        self.in_flight += key.0;
+        Some((key.0, group))
     }
 }
 
@@ -62,7 +103,7 @@ impl Shutdown<'_> {
         let mut q = self.queue.lock().unwrap();
         q.stopped = true;
         // Waiting jobs may hold decoded sources discovery is waiting to see freed.
-        q.groups.clear();
+        q.clear();
         drop(q);
         self.admission.close();
         self.wake.notify_all();
@@ -79,14 +120,16 @@ impl Drop for Shutdown<'_> {
 pub(super) fn job_cost(group: &[Job]) -> u64 {
     group
         .iter()
-        // Compressed extents do not bound decoded working sets. Until the adapter
-        // exposes that length, admit a compressed source alone.
-        .map(|j| {
-            if j.r.path.extension().is_some_and(|ext| ext == "zst") {
-                IN_FLIGHT_BYTES
-            } else {
-                j.size.max(0) as u64
+        // A compressed extent does not bound the decoded working set: charge the bytes discovery
+        // already decoded, else the size the frame header declares, else the whole guard (the
+        // source runs alone). Charging every compressed source the whole guard ran a cold index
+        // of compressed rollouts one at a time.
+        .map(|j| match &j.decoded {
+            Some(decoded) => decoded.decoded_bytes(),
+            None if j.r.path.extension().is_some_and(|ext| ext == "zst") => {
+                cv_core::codex_handoff::decoded_size_hint(&j.r.path).unwrap_or(IN_FLIGHT_BYTES)
             }
+            None => j.size.max(0) as u64,
         })
         .fold(0u64, u64::saturating_add)
         .min(IN_FLIGHT_BYTES)
@@ -145,13 +188,25 @@ pub(super) struct Feed<'a> {
 
 impl Feed<'_> {
     /// Queue `jobs`, invalidating the old dependency baselines of those that rewrite docs first.
-    /// Fails once the sweep stopped.
-    pub(super) fn push(&self, jobs: Vec<Job>) -> Result<()> {
+    /// When that fails (the catalog cannot be opened or written: out of descriptors, say), the
+    /// jobs that rewrite docs are not run: each is named unreadable for this pass, its docs and
+    /// baseline left for the next. Fails once the sweep stopped.
+    pub(super) fn push(&self, mut jobs: Vec<Job>) -> Result<()> {
         let changing: Vec<_> = jobs.iter().filter(|j| j.fts).map(|j| j.r.clone()).collect();
-        anyhow::ensure!(
-            cv_core::source::invalidate(self.consumer, &changing),
-            "invalidating old search dependency baselines"
-        );
+        if let Err(err) = cv_core::source::invalidate(self.consumer, &changing) {
+            let reason = cv_core::ir::truncate(&format!("invalidating old search dependency baselines: {err:#}"), 512);
+            let (deferred, rest): (Vec<Job>, Vec<Job>) = jobs.into_iter().partition(|j| j.fts);
+            jobs = rest;
+            let mut q = self.queue.lock().unwrap();
+            for job in deferred {
+                eprintln!("cv: index deferred for {} ({}): {reason}", job.r.id, job.r.harness);
+                q.deferred.push(Unreadable {
+                    id: job.r.id,
+                    harness: job.r.harness.to_string(),
+                    reason: reason.clone(),
+                });
+            }
+        }
         let mut by_id: HashMap<String, usize> = HashMap::new();
         let mut groups: Vec<Vec<Job>> = Vec::new();
         for j in jobs {
@@ -165,9 +220,9 @@ impl Feed<'_> {
         }
         let mut q = self.queue.lock().unwrap();
         anyhow::ensure!(!q.stopped, "index sweep stopped");
-        q.groups.extend(groups);
-        // Smallest last, since workers pop from the end: the largest sessions start first.
-        q.groups.sort_by_key(|g| job_cost(g));
+        for group in groups {
+            q.push(group);
+        }
         drop(q);
         self.wake.notify_all();
         Ok(())
@@ -184,13 +239,7 @@ pub(super) fn run_fed(
     feed: impl FnOnce(&Feed) -> Result<()> + Send,
 ) -> Result<Ran> {
     use std::sync::{mpsc, Condvar, Mutex};
-    let queue = Mutex::new(Queue {
-        groups: Vec::new(),
-        in_flight: 0,
-        draining: false,
-        stopped: false,
-        closed: false,
-    });
+    let queue = Mutex::new(Queue::new());
     let wake = Condvar::new();
     let (tx, rx) = mpsc::sync_channel::<Out>(2 * workers);
     let admission = std::sync::Arc::clone(&writer.admission);
@@ -217,23 +266,17 @@ pub(super) fn run_fed(
                     let group = {
                         let mut q = queue.lock().unwrap();
                         loop {
-                            if q.stopped || (q.closed && q.groups.is_empty()) {
+                            if q.stopped || (q.closed && q.is_empty()) {
                                 break None;
                             }
-                            if let Some(at) = q.next_fitting() {
-                                let group = q.groups.remove(at);
-                                q.in_flight += job_cost(&group);
-                                break Some(group);
+                            if let Some(taken) = q.take_fitting() {
+                                break Some(taken);
                             }
                             q = wake.wait(q).unwrap();
                         }
                     };
-                    let Some(group) = group else { return };
-                    let _reservation = GroupReservation {
-                        queue,
-                        wake,
-                        bytes: job_cost(&group),
-                    };
+                    let Some((bytes, group)) = group else { return };
+                    let _reservation = GroupReservation { queue, wake, bytes };
                     for job in group {
                         if !run_job(job, f, &tx, admission, &marks) {
                             return; // the writer is gone
@@ -342,8 +385,10 @@ pub(super) fn run_fed(
                         // A mark must describe persisted event rows as well as FTS docs. If the
                         // SQL transaction failed, retry the entire event pass rather than resume
                         // past a missing suffix and incorrectly stamp it fresh.
-                        ran.marks
-                            .push((job.r.clone(), if events_published { mark } else { None }));
+                        ran.marks.push(cv_core::resume::MarkUpdate {
+                            session: job.r.clone(),
+                            mark: if events_published { mark } else { None },
+                        });
                     }
                     ran.resumed += usize::from(resumed);
                     if job.fts {
@@ -366,7 +411,10 @@ pub(super) fn run_fed(
                         open.remove(&job.r.id);
                     }
                     if job.mark.is_some() {
-                        ran.marks.push((job.r.clone(), None));
+                        ran.marks.push(cv_core::resume::MarkUpdate {
+                            session: job.r.clone(),
+                            mark: None,
+                        });
                     }
                     eprintln!("cv: parse failed for {} ({}): {err:#}", job.r.id, job.r.harness);
                 }
@@ -387,6 +435,7 @@ pub(super) fn run_fed(
             }
         }
         let fed = fed.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        ran.unreadable.append(&mut queue.lock().unwrap().deferred);
         match failure.map_or(fed, Err) {
             Err(e) => Err(e),
             Ok(()) => {

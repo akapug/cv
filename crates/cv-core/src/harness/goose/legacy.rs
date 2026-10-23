@@ -2,6 +2,7 @@
 use super::*;
 use crate::harness::store::{document::Fields, jsonl::ranges};
 use crate::json::{InvalidJson, JsonSource, JsonView};
+use crate::json::{ReadInput, Validation};
 use crate::stream::Tier;
 
 /// The first physical record is always the header, including when it is malformed or empty.
@@ -34,7 +35,7 @@ pub(super) fn stream(name: &str, path: &Path, opts: &Demand, sink: &mut dyn Mess
         } else {
             let visit = |view: JsonView<'_>| {
                 if header {
-                    read_header(view, &mut session)?;
+                    read_header(view, &mut session, None)?;
                     Ok(None)
                 } else {
                     read_message(view, &mut tools, opts, &source, &arena)
@@ -68,11 +69,19 @@ pub(super) fn stream(name: &str, path: &Path, opts: &Demand, sink: &mut dyn Mess
     Ok(session)
 }
 
-fn read_header(view: JsonView<'_>, session: &mut Session) -> Result<()> {
+fn read_header(view: JsonView<'_>, session: &mut Session, limit: Option<usize>) -> Result<()> {
     let Some(fields) = Fields::parse(view, &["description", "working_dir", "created_at", "updated_at"])? else {
         return Ok(());
     };
-    session.title = fields.string("description")?.filter(|s| !s.trim().is_empty());
+    session.title = if let Some(limit) = limit {
+        let mut head = crate::projection::Head::bounded(limit);
+        if let Some(description) = fields.get("description") {
+            description.for_each_char(|ch| !head.push_char(ch))?;
+        }
+        (!head.is_blank()).then(|| head.finish())
+    } else {
+        fields.string("description")?.filter(|s| !s.trim().is_empty())
+    };
     session.cwd = fields
         .string("working_dir")?
         .filter(|s| !s.is_empty())
@@ -122,7 +131,12 @@ fn read_message(
     Ok(Some(message))
 }
 
+#[cfg(test)]
+pub(super) static SCANNED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 pub(super) fn discover(name: &str, path: &Path) -> Result<SessionRef> {
+    #[cfg(test)]
+    SCANNED.lock().unwrap().push(path.to_path_buf());
     let source = JsonSource::capture(path)?;
     let file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
@@ -151,7 +165,9 @@ pub(super) fn discover(name: &str, path: &Path) -> Result<SessionRef> {
                 Ok(())
             }
         } else if header {
-            source.read_range_value(range.offset, range.len, |view| note_header(view, &mut session))
+            source.read(ReadInput::Range(range.offset, range.len), Validation::Value, |view| {
+                note_header(view, &mut session)
+            })
         } else {
             // Legacy discovery has always rejected invalid UTF-8 anywhere in the file. Keep
             // that inclusion contract without decoding undemanded message JSON or bodies.
@@ -178,40 +194,13 @@ pub(super) fn discover(name: &str, path: &Path) -> Result<SessionRef> {
     source.check()?;
     Ok(session)
 }
-fn note_header(view: JsonView<'_>, session: &mut SessionRef) -> Result<()> {
-    let Some(fields) = Fields::parse(view, &["description", "working_dir", "created_at", "updated_at"])? else {
-        return Ok(());
-    };
-    if let Some(description) = fields.get("description") {
-        if description.is_string()? {
-            let mut prefix = String::new();
-            let mut chars = 0;
-            let mut nonwhite = false;
-            description.for_each_str_chunk(|part| {
-                nonwhite |= part.chars().any(|c| !c.is_whitespace());
-                for c in part.chars().take(81 - chars) {
-                    prefix.push(c);
-                    chars += 1;
-                }
-                Ok(())
-            })?;
-            session.title = nonwhite.then(|| crate::ir::truncate(&prefix, crate::projection::Head::TITLE));
-        }
-    }
-    session.cwd = fields
-        .string("working_dir")?
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-    for (key, output) in [
-        ("created_at", &mut session.created_at),
-        ("updated_at", &mut session.updated_at),
-    ] {
-        if let Some(value) = fields.get(key) {
-            if value.is_string()? || value.as_number()?.is_some() {
-                *output = parse_ts_value(value.resolve()?.as_ref());
-            }
-        }
-    }
+fn note_header(view: JsonView<'_>, reference: &mut SessionRef) -> Result<()> {
+    let mut session = Session::new(&reference.id, Harness::Goose);
+    read_header(view, &mut session, Some(crate::projection::Head::TITLE))?;
+    reference.title = session.title;
+    reference.cwd = session.cwd;
+    reference.created_at = session.created_at;
+    reference.updated_at = session.updated_at;
     Ok(())
 }
 

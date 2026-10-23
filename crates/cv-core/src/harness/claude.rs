@@ -7,6 +7,7 @@
 //! threaded via `uuid`/`parentUuid`.
 
 use super::{parse_ts, Adapter};
+use crate::json::{ReadInput, Validation};
 use crate::source::{Dependencies, Probe};
 
 /// `cv adopt`: move a sub-agent stranded by a dead session into a live one — Claude-only byte
@@ -16,6 +17,7 @@ pub(crate) mod emit;
 mod fork;
 mod hook;
 mod metadata;
+mod notification;
 pub(crate) mod record;
 pub(crate) mod replay;
 /// The sidecar tree beside a transcript (`subagents/`, `workflows/`, `journal.jsonl`): every path
@@ -26,7 +28,7 @@ use super::store::jsonl;
 use super::wire::anthropic;
 use crate::ir::*;
 use crate::ir::{MessageKind, Origin};
-use crate::json::{Json, JsonSource};
+use crate::json::JsonSource;
 use crate::lanes::{ApiErrorNotice, SubagentEnd, TaskNotice};
 use crate::lazy::Text;
 use crate::stream::{Checkpoint, CollectSink, Demand, Flow, MessageSink, Start, Tier};
@@ -111,6 +113,40 @@ const CONFIG_MARKERS: [&str; 5] = [
     "CLAUDE.md",
 ];
 
+/// The roots `claude-roots` lists, read once per file state: `detect` runs once per session in
+/// per-session loops (a source's primary path, a search's staleness), and read the file each time.
+fn configured_roots(path: &Path) -> Option<std::sync::Arc<[PathBuf]>> {
+    use crate::source::FileId;
+    use std::sync::{Arc, Mutex, PoisonError};
+    type Memo = std::collections::HashMap<PathBuf, (FileId, Arc<[PathBuf]>)>;
+    static MEMO: Mutex<Option<Memo>> = Mutex::new(None);
+    let before = FileId::at(path)?;
+    if let Some((_, roots)) = MEMO
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|memo| memo.get(path))
+        .filter(|(seen, _)| *seen == before)
+    {
+        return Some(Arc::clone(roots));
+    }
+    let text = fs::read_to_string(path).ok()?;
+    let roots: Arc<[PathBuf]> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(PathBuf::from)
+        .collect();
+    // A write during the read stores nothing: the next call reads the file as it then stands.
+    if FileId::at(path) == Some(before) {
+        MEMO.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(Default::default)
+            .insert(path.to_path_buf(), (before, Arc::clone(&roots)));
+    }
+    Some(roots)
+}
+
 impl Claude {
     /// Collect the root entries, in priority order:
     /// 1. `$CLAUDE_CONFIG_DIR/projects` — Claude Code's own variable for moving its config dir, so
@@ -140,13 +176,8 @@ impl Claude {
         let cv_home = crate::env::var_os("CLUSTERVISION_HOME")
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|h| h.join(".clustervision")));
-        if let Some(text) = cv_home.and_then(|d| fs::read_to_string(d.join("claude-roots")).ok()) {
-            entries.extend(
-                text.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                    .map(PathBuf::from),
-            );
+        if let Some(listed) = cv_home.and_then(|d| configured_roots(&d.join("claude-roots"))) {
+            entries.extend(listed.iter().cloned());
         }
         let entries = entries
             .into_iter()
@@ -304,8 +335,6 @@ impl Adapter for Claude {
             deferred_wrapper: None,
             // Native spans retain the same full-extra metadata.
             rich_spans: true,
-            // Tiny native transcripts cost less to parse than to validate and replay a ledger.
-            usage_cache_floor: 64 * 1024,
         }
     }
 
@@ -443,18 +472,14 @@ impl Adapter for Claude {
     ) -> Result<Option<Session>> {
         crate::stream::checked(sink, |sink| {
             let session = match from {
-                Start::Checkpoint(cp) => match jsonl::restore(cp, <Transcript as jsonl::Codec>::VERSION) {
+                Start::Checkpoint(cp) => match jsonl::restore(cp) {
                     Some(session) => session,
                     None => return Ok(None),
                 },
                 _ => new_session_for(&r.id, Some(r.path.clone()), opts),
             };
             let read = jsonl::Read::open(&r.path)?;
-            let codec = Transcript {
-                session,
-                opts,
-                source: read.source(),
-            };
+            let codec = Transcript { session, opts };
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
             let Some(s) = jsonl::drive(&read, from, codec, &mut spawns)? else {
                 return Ok(None);
@@ -481,7 +506,7 @@ impl Adapter for Claude {
 /// after every stream, whole or resumed, since it reads other files.
 fn with_fork_source(mut s: Session, path: &Path, sink: &mut dyn MessageSink) -> Session {
     if s.lineage.parent.is_none() && s.lineage.forked_from.is_none() {
-        s.lineage.forked_from = fork::source_tracked(path, sink);
+        s.lineage.forked_from = fork::source_tracked(path, sink).map(|(id, _)| id);
     }
     s
 }
@@ -511,10 +536,15 @@ pub fn stream_str(
     let mut session = new_session_for(id, source_path, opts);
     let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
     // Pure-string path (parse_str, tests): no file offsets, so all content stays inline.
+    let mut skipped = super::Unparsed::default();
     let result = jsonl::slice(text.as_bytes(), |line| match line.view {
-        Some(view) => record::ingest(&mut session, view, None, opts, &mut spawns, &mut false),
-        None => Ok(Flow::Continue),
+        Some(view) => record::record(&mut session, view, None, opts, &mut spawns),
+        None => {
+            skipped.0 += u64::from(!line.blank);
+            Ok(Flow::Continue)
+        }
     });
+    skipped.note(&mut session);
     super::note_read_error(&mut session, result);
     if let Some(error) = spawns.take_error() {
         super::note_read_error(&mut session, Err(error));
@@ -523,25 +553,15 @@ pub fn stream_str(
 }
 
 /// The Claude record codec over one captured transcript: each record accumulates into the session
-/// (a checkpoint's, or a fresh shell at 0). A message holding a source descriptor makes the
-/// reader recheck the source's identity before going on.
+/// (a checkpoint's, or a fresh shell at 0). The shared driver owns source identity checks.
 struct Transcript<'r> {
     session: Session,
     opts: &'r Demand,
-    source: &'r JsonSource,
 }
 
 impl jsonl::Codec for Transcript<'_> {
-    const VERSION: u32 = 1;
-    const NOTES_SKIPPED: bool = false;
-
     fn record(&mut self, view: crate::json::JsonView<'_>, at: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
-        let mut sourced = false;
-        let flow = record::ingest(&mut self.session, view, Some(at), self.opts, sink, &mut sourced)?;
-        if sourced {
-            self.source.check()?;
-        }
-        Ok(flow)
+        record::record(&mut self.session, view, Some(at), self.opts, sink)
     }
 
     fn demand(&self) -> Demand {
@@ -688,14 +708,7 @@ fn user_kind_from_head(origin: Origin, head: &str) -> (MessageKind, Origin) {
     }
     if head.starts_with("<task-notification>") {
         let summary = tag_inner(head, "summary").unwrap_or("").trim_start();
-        if summary.starts_with("Agent ")
-            || memchr::memchr2_iter(b'w', b'W', summary.as_bytes()).any(|at| {
-                summary
-                    .as_bytes()
-                    .get(at..at + 8)
-                    .is_some_and(|word| word.eq_ignore_ascii_case(b"workflow"))
-            })
-        {
+        if summary.starts_with("Agent ") || notification::contains_ascii_insensitive(summary.as_bytes(), b"workflow") {
             return (MessageKind::SubagentReturn, Origin::Subagent);
         }
     }
@@ -744,6 +757,20 @@ pub(crate) fn subagent_tree_filtered(
 }
 
 fn subagent_tree_inner(
+    parent_path: &Path,
+    demand: crate::SubagentDemand,
+    workflow: Option<&str>,
+    select: &(impl Fn(&str, Option<&str>) -> bool + Sync),
+) -> Result<Vec<AgentRef>> {
+    let forest = subagent_forest(parent_path, demand, workflow, select);
+    // The agents this read scanned are saved by the read itself, as discovery saves its own:
+    // `show --tree`, lanes and `events --subagents` in a later process reuse them instead of
+    // rescanning every transcript. A save that fails is said once and retried next time.
+    crate::discover_cache::persist(false);
+    forest
+}
+
+fn subagent_forest(
     parent_path: &Path,
     demand: crate::SubagentDemand,
     workflow: Option<&str>,
@@ -838,15 +865,14 @@ fn agents_in_dir(
         Some((|| -> Result<Option<AgentRef>> {
             #[cfg(test)]
             record_forest_read("transcript", &p);
-            let session = if rich {
-                scan(&p)?
-            } else {
-                // Retain the old open-failure exclusion even on a metadata cache hit.
-                fs::File::open(&p)?;
-                match cached_metadata(&p)? {
-                    Some(session) => session,
-                    None => return Ok(None),
-                }
+            // Every demand reads the agent's metadata through the per-file scan cache: a Rich
+            // forest (`show --tree`, `--subagents`, the sessions API, lanes) rescanned every
+            // agent transcript on every call. An unopenable transcript fails the forest even on a
+            // cache hit.
+            fs::File::open(&p)?;
+            let session = match cached_metadata(&p)? {
+                Some(session) => session,
+                None => return Ok(None),
             };
             let meta = match demand {
                 crate::SubagentDemand::Rich => read_meta(&p.with_extension("meta.json"))?,
@@ -883,7 +909,9 @@ fn read_agent_type(path: &Path) -> Result<Option<String>> {
         Err(error) if super::is_not_found(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    source.read_document(|view| crate::affordance::input::field_string(view, "agentType"))
+    source.read(ReadInput::Document, Validation::Value, |view| {
+        crate::affordance::input::field_string(view, "agentType")
+    })
 }
 
 /// Missing metadata is optional; corrupt or unreadable metadata is an error.
@@ -1123,6 +1151,7 @@ fn cached_metadata(path: &Path) -> Result<Option<SessionRef>> {
     })
 }
 
+#[cfg(test)]
 fn scan(path: &Path) -> Result<SessionRef> {
     Ok(scan_at(path, None)?.0)
 }
@@ -1134,9 +1163,13 @@ fn scan_at(path: &Path, from: Option<&Checkpoint>) -> Result<(SessionRef, Option
     anyhow::ensure!(offset <= source.len(), "discovery checkpoint outside source");
     #[cfg(test)]
     metadata::FRAMED.with(|frames| frames.borrow_mut().push((offset, source.len() - offset)));
+    #[cfg(test)]
+    record_forest_read("scan", path);
     scan.read(&read, offset)?;
     let checkpoint = scan.checkpoint();
-    Ok((scan.finish(), checkpoint))
+    let (session, writer_version) = scan.finish();
+    crate::discover_cache::read::Context::current().observe_writer(&session, writer_version.as_deref());
+    Ok((session, checkpoint))
 }
 
 /// The classification shared by owned and borrowed records. Content storage never chooses kind.
@@ -1351,7 +1384,24 @@ fn task_list(transcript: &Path, id: &str) -> Result<Option<crate::affordance::Af
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `claude-roots` is read once per file state, however many sessions ask for an adapter.
+    #[test]
+    fn claude_roots_are_read_once_per_file_state() {
+        let world = crate::test_world("claude-roots-memo");
+        let path = world.base.join("claude-roots");
+        std::fs::write(&path, "/one\n# note\n/two\n").unwrap();
+        let first = configured_roots(&path).unwrap();
+        assert_eq!(&*first, [PathBuf::from("/one"), PathBuf::from("/two")]);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &configured_roots(&path).unwrap()),
+            "unchanged: not reread"
+        );
+        std::fs::write(&path, "/three\n").unwrap();
+        assert_eq!(&*configured_roots(&path).unwrap(), [PathBuf::from("/three")]);
+    }
     use crate::lazy::INLINE_MAX;
+    use crate::Json;
     use std::sync::LazyLock;
 
     static NO_BAG: LazyLock<Map<String, Value>> = LazyLock::new(Map::new);
@@ -1764,32 +1814,15 @@ mod tests {
         assert!(details.is_none());
     }
 
-    /// Every record field the Claude adapter keeps that the IR does not first-class, with the
-    /// spelling Claude itself uses. Nesting them under `extra["claude"]` (IR v2) is what keeps the
-    /// top level of `extra` free for cv's own bookkeeping.
-    const FORMER_FLAT_KEYS: &[&str] = &[
-        "logicalParentUuid",
-        "isSidechain",
-        "isMeta",
-        "isCompactSummary",
-        "isApiErrorMessage",
-        "agentId",
-        "slug",
-        "version",
-        "requestId",
-        "parentToolUseID",
-        "toolUseID",
-        "sourceToolAssistantUUID",
-        "attributionAgent",
-        "attributionMcpServer",
-        "attributionMcpTool",
-        "attributionSkill",
-        "userType",
-        "message.id",
-        "message.stop_reason",
-        "message.stop_sequence",
-        "message.stop_details",
-    ];
+    /// Every bag key `collect_extra` produces for the kitchen-sink meta record, derived from the
+    /// capture lists themselves (plus the `sourceToolUseID` special case) so this test cannot
+    /// drift from the codec's lists.
+    fn expected_bag_keys() -> Vec<String> {
+        let mut keys: Vec<String> = CLAUDE_EXTRA_TOP.iter().map(|k| k.to_string()).collect();
+        keys.push("sourceToolUseID".into());
+        keys.extend(CLAUDE_EXTRA_MSG.iter().map(|k| format!("{MESSAGE_EXTRA_PREFIX}{k}")));
+        keys
+    }
 
     /// Two records covering everything `collect_extra` captures: one carrying every non-first-class
     /// field, one carrying a `toolUseResult` sidecar.
@@ -1801,7 +1834,8 @@ mod tests {
             "isCompactSummary": true, "isApiErrorMessage": false,
             "agentId": "a4a55af", "slug": "magical-wondering-rabbit", "version": "2.1.278",
             "requestId": "req_123", "parentToolUseID": "toolu_parent", "toolUseID": "toolu_self",
-            "sourceToolAssistantUUID": "u-src", "attributionAgent": "general-purpose",
+            "sourceToolAssistantUUID": "u-src", "sourceToolUseID": "toolu_self",
+            "attributionAgent": "general-purpose",
             "attributionMcpServer": "scry", "attributionMcpTool": "sql",
             "attributionSkill": "code-review", "userType": "internal",
             "message": {"role": "user", "content": "hi", "id": "msg_abc", "stop_reason": "tool_use",
@@ -1833,8 +1867,8 @@ mod tests {
 
         // 2. Every remaining Claude fact is in the bag, with Claude's own spelling.
         let meta = &s.messages[0];
-        for k in FORMER_FLAT_KEYS {
-            assert!(cl(meta).contains_key(*k), "`{k}` must live in extra[\"claude\"]");
+        for k in expected_bag_keys() {
+            assert!(cl(meta).contains_key(&k), "`{k}` must live in extra[\"claude\"]");
         }
         assert_eq!(cl(meta)["agentId"], "a4a55af");
         assert_eq!(cl(meta)["message.stop_reason"], "tool_use");
@@ -2330,6 +2364,55 @@ mod tests {
         FOREST_READS.lock().unwrap().0 = Some(root.clone());
         let tree = subagent_tree(&parent).unwrap();
         assert_eq!(tree.len(), 3, "two tiers: 1 direct + 2 workflow");
+        // A Rich forest over unchanged transcripts scans none of them again; a change rescans
+        // exactly the changed one.
+        let scans = |before: usize| -> Vec<PathBuf> {
+            FOREST_READS.lock().unwrap().1[before..]
+                .iter()
+                .filter(|(kind, _)| *kind == "scan")
+                .map(|(_, path)| path.clone())
+                .collect()
+        };
+        let before = FOREST_READS.lock().unwrap().1.len();
+        let again = subagent_tree(&parent).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&tree).unwrap()
+        );
+        assert_eq!(
+            scans(before),
+            Vec::<PathBuf>::new(),
+            "an unchanged forest was rescanned"
+        );
+        let unchanged = std::fs::read(&a1).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&a1)
+            .unwrap()
+            .write_all(b"{\"type\":\"user\",\"uuid\":\"z\",\"parentUuid\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"later\"}}\n")
+            .unwrap();
+        let before = FOREST_READS.lock().unwrap().1.len();
+        subagent_tree(&parent).unwrap();
+        assert_eq!(scans(before), std::slice::from_ref(&a1), "one change, one rescan");
+        std::fs::write(&a1, &unchanged).unwrap();
+        // A second process starts with no scan cache of its own: it reads the rows the first
+        // one saved, and one change is still one rescan.
+        subagent_tree(&parent).unwrap();
+        crate::discover_cache::forget_process_cache();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&a1)
+            .unwrap()
+            .write_all(b"{\"type\":\"user\",\"uuid\":\"z2\",\"parentUuid\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"later\"}}\n")
+            .unwrap();
+        let before = FOREST_READS.lock().unwrap().1.len();
+        subagent_tree(&parent).unwrap();
+        assert_eq!(
+            scans(before),
+            std::slice::from_ref(&a1),
+            "a new process: one change, one rescan"
+        );
+        std::fs::write(&a1, unchanged).unwrap();
 
         let before = FOREST_READS.lock().unwrap().1.len();
         let candidates = std::sync::atomic::AtomicUsize::new(0);
@@ -2354,7 +2437,7 @@ mod tests {
         assert!(tools[0].description.is_none() && tools[0].result_summary.is_none());
         let reads: Vec<_> = FOREST_READS.lock().unwrap().1[before..]
             .iter()
-            .filter(|(_, path)| path.starts_with(&root))
+            .filter(|(kind, path)| *kind != "scan" && path.starts_with(&root))
             .cloned()
             .collect();
         assert_eq!(
@@ -2374,7 +2457,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         let reads: Vec<_> = FOREST_READS.lock().unwrap().1[before..]
             .iter()
-            .filter(|(_, path)| path.starts_with(&root))
+            .filter(|(kind, path)| *kind != "scan" && path.starts_with(&root))
             .cloned()
             .collect();
         assert_eq!(reads, [("transcript", a1.clone())]);
@@ -2608,7 +2691,7 @@ mod tests {
         assert!(range.offset() >= first.len() as u64);
         assert_eq!(Json::Source(range.clone()).resolve().unwrap()["id"], "second");
         // Deleting the path keeps an existing Unix mmap readable but invalidates its captured
-        // identity. The operation must stop before another callback and return the source error.
+        // identity. A slow callback must stop the operation before another callback.
         struct Deleting {
             path: PathBuf,
             calls: usize,
@@ -2622,6 +2705,7 @@ mod tests {
                     self.captured = Some(input.clone());
                 }
                 fs::remove_file(&self.path).unwrap();
+                std::thread::sleep(jsonl::Read::SLOW_CALLBACK * 10);
                 Flow::Continue
             }
             fn wants_checkpoint(&mut self, _offset: u64) -> bool {

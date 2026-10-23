@@ -95,6 +95,7 @@ use super::Adapter;
 use crate::ir::CARRIER_KEY;
 use crate::ir::*;
 use crate::json::{JsonSource, JsonView};
+use crate::json::{ReadInput, Validation};
 use crate::lazy::Text;
 use crate::source::{Dependencies, Probe};
 use crate::stream::{Demand, Flow, MessageSink, Start, Tier};
@@ -211,6 +212,22 @@ impl Adapter for KimiCode {
         Some(())
     }
 
+    /// A sub-agent reads its own slice of the session's `state.json`, which the main agent
+    /// rewrites every turn: it is certified by that slice ([`state_rows`]).
+    fn rows_store(&self, r: &SessionRef) -> Option<PathBuf> {
+        let (session, agent) = split_agent_path(&r.path);
+        (agent != "main").then(|| session.join("state.json"))
+    }
+
+    fn rows(&self, store: &Path) -> Option<HashMap<String, crate::source::Rows>> {
+        state_rows(store)
+    }
+
+    /// A sub-agent's certificate is keyed by its agent id.
+    fn rows_key<'a>(&self, r: &'a SessionRef) -> &'a str {
+        split_agent_path(&r.path).1
+    }
+
     fn roots(&self) -> Vec<PathBuf> {
         self.root.clone().into_iter().collect()
     }
@@ -219,9 +236,6 @@ impl Adapter for KimiCode {
         let Some(root) = &self.root else {
             return Ok(Default::default());
         };
-        let mut shared_reads = crate::source::ReadSet::default();
-        shared_reads.record(&root.join("session_index.jsonl"));
-        shared_reads.record(&root.join("workspaces.json"));
         // An unreadable index, dir or wire log is skipped and reported; a torn index keeps the
         // tombstones read before the tear.
         let mut out = crate::Discovered::default();
@@ -271,13 +285,20 @@ impl Adapter for KimiCode {
                 dirs.push((sdir, id.to_string(), fallback_cwd));
             }
         }
+        // The index and `workspaces.json` supply only the cwd fallback, applied after the cache:
+        // in the key, the index's one new line per new session rescanned every session.
         let scanned = crate::par_discovery_filter_map(dirs, |(sdir, id, fallback_cwd)| {
-            let mut reads = shared_reads.clone();
+            let mut reads = crate::source::ReadSet::default();
             reads.record(&sdir.join("state.json"));
             let key = main_wire(&sdir);
             reads.record(&key);
             let key = if key.exists() { key } else { sdir.join("state.json") };
-            let r = crate::discover_cache::cached_scan_with_reads(&key, reads, || scan(&sdir, &id, fallback_cwd));
+            let r = crate::discover_cache::cached_scan_with_reads(&key, reads, || scan(&sdir, &id, None)).map(|r| {
+                r.map(|mut r| {
+                    r.cwd = r.cwd.or(fallback_cwd);
+                    r
+                })
+            });
             crate::Skipped::listed(&key, r)
         });
         scanned.into_iter().for_each(|found| out.push(found));
@@ -307,7 +328,7 @@ impl Adapter for KimiCode {
     ) -> Result<Option<Session>> {
         crate::stream::checked(sink, |sink| {
             let ctx = match from {
-                Start::Checkpoint(cp) => match jsonl::restore::<ResumeState>(cp, <Wire as jsonl::Codec>::VERSION) {
+                Start::Checkpoint(cp) => match jsonl::restore::<ResumeState>(cp) {
                     Some(state) if state.wire == self.resume_source(r) => state.ctx.restore(opts),
                     _ => return Ok(None),
                 },
@@ -522,8 +543,6 @@ struct Wire<'r> {
 }
 
 impl jsonl::Codec for Wire<'_> {
-    const VERSION: u32 = 2;
-
     fn record(&mut self, view: JsonView<'_>, _: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
         self.ctx.record(view, Some(self.input), sink)
     }
@@ -636,6 +655,46 @@ pub fn subagent_refs(main: &SessionRef) -> Result<Vec<SessionRef>> {
     Ok(out.into_iter().map(|(_, r)| r).collect())
 }
 
+/// Each sub-agent's certificate in the session `state.json` at `store`, by agent id: the slice a
+/// sub-agent's read takes from it ([`session_header`]), the session's `cwd` (its fallback) and
+/// its own `agents.<id>` entry (`parentAgentId`, `labels`), digested as JSON. Every `agent-N` the
+/// session holds is certified, listed in the state or not.
+fn state_rows(store: &Path) -> Option<HashMap<String, crate::source::Rows>> {
+    use crate::source::Rows;
+    let session_dir = store.parent()?;
+    let state = read_state(session_dir);
+    let mut agents: std::collections::BTreeSet<String> = state
+        .get("agents")
+        .and_then(Value::as_object)
+        .map(|agents| agents.keys().filter(|k| k.starts_with("agent-")).cloned().collect())
+        .unwrap_or_default();
+    if let Ok(entries) = fs::read_dir(session_dir.join("agents")) {
+        agents.extend(
+            entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|name| name.starts_with("agent-")),
+        );
+    }
+    let slice = |agent: &str| serde_json::json!([state.get("cwd"), state.pointer(&format!("/agents/{agent}"))]);
+    Some(
+        agents
+            .into_iter()
+            .map(|agent| {
+                let digest = Rows::fold(Rows::SEED, &serde_json::to_vec(&slice(&agent)).unwrap_or_default());
+                (
+                    agent,
+                    Rows {
+                        count: 1,
+                        high: 0,
+                        digest,
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
 fn read_state(session_dir: &Path) -> Value {
     fs::read_to_string(session_dir.join("state.json"))
         .ok()
@@ -647,7 +706,7 @@ fn read_state(session_dir: &Path) -> Value {
 fn read_discovery_state(session_dir: &Path) -> Value {
     let read = || -> Result<Value> {
         let source = crate::json::JsonSource::capture(&session_dir.join("state.json"))?;
-        source.read_range_value(0, source.len(), |view| {
+        source.read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
             let fields = super::store::document::Fields::parse(view, &["cwd", "title", "createdAt", "updatedAt"])?;
             let Some(fields) = fields else { return Ok(Value::Null) };
             let mut state = serde_json::Map::new();
@@ -717,7 +776,12 @@ fn read_workspaces(path: &Path) -> HashMap<String, PathBuf> {
 
 /// Native state metadata wins; read wire only for missing titles/timestamps. Exact turn counts
 /// are deferred to complete reads or indexing.
+#[cfg(test)]
+static SCANNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 fn scan(session_dir: &Path, id: &str, fallback_cwd: Option<PathBuf>) -> Result<Option<SessionRef>> {
+    #[cfg(test)]
+    SCANNED.lock().unwrap().push(session_dir.to_path_buf());
     let state = read_discovery_state(session_dir);
     let wire = main_wire(session_dir);
     if !wire.exists() && state.is_null() {
@@ -1298,7 +1362,9 @@ impl<'a> Ctx<'a> {
                         out.field("time", time)?;
                         out.finish()
                     })?;
-                    let raw = source.read_backing_syntax(arena, offset, len, |view| view.to_json())?;
+                    let raw = source.read(ReadInput::Backing(arena, offset, len), Validation::Syntax, |view| {
+                        view.to_json()
+                    })?;
                     CompleteRecord::attach(std::slice::from_mut(&mut message), Harness::KimiCode, raw, Map::new());
                 }
                 None => {
@@ -1523,12 +1589,7 @@ impl<'a> Ctx<'a> {
         let Some(prompt) = v.get("systemPrompt").and_then(Value::as_str).filter(|p| !p.is_empty()) else {
             return self.carry(v, ts, sink);
         };
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            prompt.hash(&mut h);
-            h.finish()
-        };
+        let hash = crate::source::digest(prompt.as_bytes());
         if !self.seen_prompts.insert(hash) {
             return self.carry(v, ts, sink);
         }
@@ -1820,7 +1881,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn leftovers_todo_updates_keep_latest_state_and_facts_presence() -> Result<()> {
+    fn todo_updates_keep_latest_state_and_facts_presence() -> Result<()> {
         use crate::affordance::{self, Kind};
         for opts in [
             Demand::RICH,
@@ -1861,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn leftovers_legacy_agent_calls_infer_spawn_and_completed_returns() -> Result<()> {
+    fn legacy_agent_calls_infer_spawn_and_completed_returns() -> Result<()> {
         for status in ["completed", "failed", "running"] {
             let opts = Demand::RICH;
             let mut ctx = Ctx::new(&opts);
@@ -2098,6 +2159,51 @@ mod tests {
         fs::write(dir.join("state.json"), "{\"cwd\":\"/state\"}")?;
         assert_eq!(adapter.discover()?[0].cwd.as_deref(), Some(Path::new("/state")));
         assert_eq!(fs::read_to_string(wire)?, body);
+        Ok(())
+    }
+
+    /// The index grows by one line per new session; that rescans the new session alone, and
+    /// every other session keeps its index cwd.
+    #[test]
+    fn a_new_session_rescans_only_itself() -> Result<()> {
+        let world = crate::test_world("kimi_code_new_sibling");
+        let context = crate::discover_cache::read::Context::current();
+        let _scope = context.enter();
+        let home = world.home.join(".kimi-code");
+        let index = home.join("session_index.jsonl");
+        let add = |name: &str| -> Result<()> {
+            let wire = main_wire(&home.join("sessions/wd_test").join(name));
+            fs::create_dir_all(wire.parent().unwrap())?;
+            fs::write(
+                &wire,
+                "{\"type\":\"context.append_message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+            )?;
+            let mut f = fs::OpenOptions::new().create(true).append(true).open(&index)?;
+            std::io::Write::write_all(
+                &mut f,
+                format!("{{\"sessionId\":\"{name}\",\"workDir\":\"/cwd-{name}\"}}\n").as_bytes(),
+            )?;
+            Ok(())
+        };
+        let scanned = || {
+            let mut all = SCANNED.lock().unwrap();
+            let mine: Vec<PathBuf> = all.iter().filter(|p| p.starts_with(&home)).cloned().collect();
+            all.retain(|p| !p.starts_with(&home));
+            mine
+        };
+        for i in 0..5 {
+            add(&format!("session_{i}"))?;
+        }
+        let adapter = KimiCode::with_home(&home);
+        assert_eq!(adapter.discover()?.len(), 5);
+        assert_eq!(scanned().len(), 5);
+        add("session_new")?;
+        let refs = adapter.discover()?;
+        assert_eq!(scanned(), vec![home.join("sessions/wd_test/session_new")]);
+        for r in &refs {
+            let name = r.path.file_name().unwrap().to_string_lossy();
+            assert_eq!(r.cwd.as_deref(), Some(Path::new(&format!("/cwd-{name}"))));
+        }
         Ok(())
     }
 
@@ -2390,14 +2496,7 @@ mod tests {
                 serde_json::to_value(expected.messages)?
             );
             let last = full.checkpoints.last().unwrap();
-            assert_eq!(
-                jsonl::restore::<ResumeState>(&last.1, <Wire as jsonl::Codec>::VERSION)
-                    .unwrap()
-                    .ctx
-                    .call_names
-                    .len(),
-                96
-            );
+            assert_eq!(jsonl::restore::<ResumeState>(&last.1).unwrap().ctx.call_names.len(), 96);
             assert!(serde_json::to_vec(&last.1)?.len() > 64 * 1024);
             let result_names = full
                 .messages
@@ -2755,8 +2854,10 @@ mod tests {
 
     /// A store mirroring a real `~/.kimi-code` (protocol 1.5): one session with a main agent + one
     /// sub-agent, a workspaces map, and an index with a tombstone for a second (deleted) session.
-    fn fixture_root() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("cv-kimi-code-{}", uuid::Uuid::new_v4()));
+    /// Returns the world (keep it scoped; dropping it removes the dir) and the home root.
+    fn fixture_root() -> (cv_testkit::World, PathBuf) {
+        let world = cv_testkit::World::new("kimi-code-fixture");
+        let root = world.home.join(".kimi-code");
         let sdir = root
             .join("sessions")
             .join("wd_proj_fd4cb822f4b3")
@@ -2837,7 +2938,7 @@ mod tests {
             sub_lines.join("\n") + "\n",
         )
         .unwrap();
-        root
+        (world, root)
     }
 
     #[test]
@@ -2937,7 +3038,7 @@ mod tests {
 
     #[test]
     fn sub_agent_wire_parses_as_its_own_session_with_lineage() {
-        let root = fixture_root();
+        let (_world, root) = fixture_root();
         let a = KimiCode::with_home(&root);
         let main = a.discover().unwrap().remove(0);
         let subs = subagent_refs(&main).unwrap();
@@ -2980,12 +3081,11 @@ mod tests {
         // the main session knows nothing of the child's lineage
         let m = a.parse(&main).unwrap();
         assert!(m.lineage.is_empty());
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn discovers_sessions_from_the_walk_and_honours_tombstones() {
-        let root = fixture_root();
+        let (_world, root) = fixture_root();
         let refs = KimiCode::with_home(&root).discover().unwrap();
         assert_eq!(refs.len(), 1, "the tombstoned session_dead dir is skipped: {refs:?}");
         let r = &refs[0];
@@ -2996,12 +3096,11 @@ mod tests {
         assert_eq!(r.message_count, None, "discovery defers the exact user + step count");
         assert_eq!(r.created_at.map(|t| t.timestamp_millis()), Some(1787509645914));
         assert_eq!(r.updated_at.map(|t| t.timestamp_millis()), Some(1787509891612));
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn parses_steps_into_assistant_and_tool_turns() {
-        let root = fixture_root();
+        let (_world, root) = fixture_root();
         let a = KimiCode::with_home(&root);
         let r = a.discover().unwrap().remove(0);
         let s = a.parse(&r).unwrap();
@@ -3137,12 +3236,11 @@ mod tests {
             assert!(m.extra.keys().all(|k| k == "kimi-code"), "{:?}", m.extra);
         }
         assert!(s.lineage.is_empty(), "a top-level session has no lineage");
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn complete_mode_carries_bookkeeping_records() {
-        let root = fixture_root();
+        let (_world, root) = fixture_root();
         let a = KimiCode::with_home(&root);
         let r = a.discover().unwrap().remove(0);
         let s = crate::stream::collect_with(&a, &r, &Demand::COMPLETE).unwrap();
@@ -3182,14 +3280,14 @@ mod tests {
             "{:?}",
             s.messages.iter().map(|m| m.role).collect::<Vec<_>>()
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     /// `/undo` (`context.undo{count}`) is a branch: the undone turns stay in the log but leave the
     /// context. A `kimi fork` (2.x) names its source in `state.json.forkedFrom`.
     #[test]
     fn undo_is_a_branch_and_fork_names_its_source() {
-        let root = std::env::temp_dir().join(format!("cv-kimi-code-{}", uuid::Uuid::new_v4()));
+        let world = cv_testkit::World::new("kimi-code-undo-fork");
+        let root = world.home.join(".kimi-code");
         let sdir = root
             .join("sessions")
             .join("wd_p_000000000000")
@@ -3219,14 +3317,14 @@ mod tests {
             s.lineage.forked_from.as_deref(),
             Some("0e0e0e0e-0000-0000-0000-000000000000")
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     /// 2.x writes `subagent.spawned` / `subagent.completed` on the parent's wire inside the
     /// spawning step: they follow the step's reply, and the child's usage is not the parent's.
     #[test]
     fn subagent_records_are_spawn_and_return_after_the_step() {
-        let root = std::env::temp_dir().join(format!("cv-kimi-code-{}", uuid::Uuid::new_v4()));
+        let world = cv_testkit::World::new("kimi-code-subagent-records");
+        let root = world.home.join(".kimi-code");
         let main = root
             .join("sessions")
             .join("wd_p_000000000000")
@@ -3264,7 +3362,6 @@ mod tests {
                 .and_then(|x| x.get("parentToolCallId")),
             Some(&Value::String("t1".into()))
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

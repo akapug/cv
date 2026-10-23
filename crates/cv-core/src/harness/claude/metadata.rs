@@ -1,9 +1,8 @@
-//! Discovery reads titles, cwd, timestamps and the turn count (user/assistant records, minus
-//! synthetic assistants): the
-//! record codec's metadata demand, over the same byte source as every other Claude read.
+//! Discovery reads titles, cwd, timestamps and the turn count (the records the codec makes typed
+//! prompts and replies, [`record::counts_as_turn`]): the record codec's metadata demand, over the
+//! same byte source as every other Claude read.
 
 use super::*;
-use crate::harness::store::document::Fields;
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -134,36 +133,16 @@ impl Scan {
             self.session.updated_at = Some(self.session.updated_at.map_or(ts, |old| old.max(ts)));
         }
         // Discovery already reads every record's head, so the turn count is free here: the
-        // codec's one turn rule (user and assistant records, minus synthetic assistants). Only an
-        // assistant's error flag and model are read.
-        let (mut api_error, mut model) = (false, None);
-        if ty == "assistant" {
-            api_error = fields
-                .get("isApiErrorMessage")
-                .map(|v| v.as_bool())
-                .transpose()?
-                .flatten()
-                == Some(true);
-            if !api_error {
-                if let Some(message) = fields
-                    .get("message")
-                    .map(|m| Fields::parse(m, &["model"]))
-                    .transpose()?
-                    .flatten()
-                {
-                    model = message.string("model")?;
-                }
-            }
-        }
-        if record::is_turn(&ty, api_error, model.as_deref()) {
+        // codec's one turn rule, decided from the head without building the message.
+        if record::counts_as_turn(&fields, &ty)? {
             self.session.message_count = self.session.message_count.map(|n| n + 1);
         }
         Ok(())
     }
 
-    pub(super) fn finish(self) -> SessionRef {
-        crate::discover_cache::read::Context::current().observe_writer(&self.session, self.writer_version.as_deref());
-        self.session
+    /// The discovered reference and the writer version it read, for the caller to observe.
+    pub(super) fn finish(self) -> (SessionRef, Option<String>) {
+        (self.session, self.writer_version)
     }
 }
 
@@ -173,9 +152,35 @@ mod tests {
 
     /// What the retired owned discovery reducer produced for `bytes`, frozen before it was
     /// deleted (`tests/fixtures/claude-discovery-frozen.jsonl`, keyed by the bytes' sha256): the
-    /// `SessionRef` without its path. Its count deliberately did not parse content, and its
-    /// cwd/timestamps include metadata-only records, unlike the conversational parser.
+    /// `SessionRef` without its path. Its cwd/timestamps include metadata-only records, unlike the
+    /// conversational parser. Its count counted every `user` record, tool results and injected
+    /// context included; the count is now the count contract instead: the turns
+    /// ([`Message::is_turn`]) a read of the same bytes yields.
     fn frozen(bytes: &[u8]) -> Value {
+        let mut session = frozen_reading(bytes);
+        session["message_count"] = turns(bytes).into();
+        session
+    }
+
+    /// The turns a whole read of `bytes` (as a transcript file) yields.
+    fn turns(bytes: &[u8]) -> usize {
+        let dir = cv_testkit::temp_dir("claude-discovery-turns");
+        let path = dir.join("s.jsonl");
+        fs::write(&path, bytes).unwrap();
+        let mut sink = crate::stream::CollectSink::default();
+        crate::stream::stream_counted(
+            &Claude::with_config_dir(&dir),
+            &SessionRef::new("s", Harness::Claude, &path),
+            &Demand::LEAN.with_spans(),
+            &mut sink,
+            Default::default(),
+        )
+        .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        sink.messages.iter().filter(|m| m.is_turn()).count()
+    }
+
+    fn frozen_reading(bytes: &[u8]) -> Value {
         static FROZEN: std::sync::OnceLock<std::collections::HashMap<String, Value>> = std::sync::OnceLock::new();
         let frozen = FROZEN.get_or_init(|| {
             include_str!("../../../tests/fixtures/claude-discovery-frozen.jsonl")
@@ -393,7 +398,7 @@ mod tests {
         text.push_str(append);
         assert_eq!(
             cached_metadata(&path).unwrap().unwrap().message_count,
-            Some(1),
+            Some(turns(text.as_bytes())),
             "growth recounts"
         );
         for mutation in 0..8 {
@@ -470,12 +475,13 @@ mod tests {
             FRAMED.with(|frames| frames.borrow().clone()),
             vec![(0, text.len() as u64)]
         );
-        fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
+        let replaced = "{\"type\":\"user\",\"message\":{\"content\":\"prompt\"}}\n";
+        fs::write(&path, replaced).unwrap();
         FRAMED.with(|frames| frames.borrow_mut().clear());
         assert_eq!(cached_metadata(&path).unwrap().unwrap().message_count, Some(1));
         assert_eq!(
             FRAMED.with(|frames| frames.borrow().clone()),
-            vec![(0, append.len() as u64)]
+            vec![(0, replaced.len() as u64)]
         );
     }
 

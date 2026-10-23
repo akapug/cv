@@ -145,11 +145,18 @@ fn session_tailed(dir: &Path) -> PathBuf {
     path
 }
 
-/// The synthetic case from the measured evidence (task7336 `critical-tail`): two messages, an
+/// The synthetic case from the measured evidence (task7336 `critical-tail`): two messages and an
 /// `invoked_skills` attachment record whose `rendered` is a string (so the codec surfaces no
-/// message for it), then — with `malformed` — a record with a `type` claiming a turn and no
-/// `message` body. `cv show` counts 2 messages and stops at the prompt.
-fn session_attachment_and_bad_tail(dir: &Path, malformed: bool) -> PathBuf {
+/// message for it). `cv show` counts 2 messages and stops at the prompt.
+fn session_attachment_tail(dir: &Path) -> PathBuf {
+    session_tailed_attachment_with(dir, false)
+}
+/// [`session_attachment_tail`] plus a trailing record with a `type` claiming a turn and no
+/// `message` body.
+fn session_attachment_and_bad_tail(dir: &Path) -> PathBuf {
+    session_tailed_attachment_with(dir, true)
+}
+fn session_tailed_attachment_with(dir: &Path, bad_tail: bool) -> PathBuf {
     let mut lines = vec![
         rec("user", "u0", None, text("user", "go")),
         rec("assistant", "a0", Some("u0"), text("assistant", "done")),
@@ -159,7 +166,7 @@ fn session_attachment_and_bad_tail(dir: &Path, malformed: bool) -> PathBuf {
                    {"name": "fresh", "path": "userSettings:fresh", "content": "the amber key"}]},
                "rendered": "padding"}),
     ];
-    if malformed {
+    if bad_tail {
         lines.push(json!({"type": "user", "sessionId": SID, "uuid": "bad1"}));
     }
     let path = dir.join(format!("{SID}.jsonl"));
@@ -389,7 +396,7 @@ fn a_native_copy_carries_a_bodyless_turn_record_verbatim() {
     // keeps it and the attachment after it rides along to EOF.
     let world = crate::test_world("rewind");
     let dir = world.proj.clone();
-    let src = session_attachment_and_bad_tail(&dir, true);
+    let src = session_attachment_and_bad_tail(&dir);
     let out = dir.join("out");
     let res = rewind_session(&sref(&src, SID), &opts(CutAt::End, &out)).unwrap();
     let copied = std::fs::read_to_string(out.join(format!("{}.jsonl", res.new_id))).unwrap();
@@ -403,7 +410,7 @@ fn a_portable_copy_refuses_a_bodyless_turn_record_instead_of_dropping_it() {
     // bodyless turn: refuse before publishing rather than mint a session missing a record.
     let world = crate::test_world("rewind");
     let dir = world.proj.clone();
-    let src = session_attachment_and_bad_tail(&dir, true);
+    let src = session_attachment_and_bad_tail(&dir);
     let before = std::fs::read(&src).unwrap();
     let out = dir.join("out");
     let mut o = opts(CutAt::End, &out);
@@ -429,7 +436,7 @@ fn a_portable_copy_refuses_a_bodyless_turn_record_instead_of_dropping_it() {
 fn without_the_unreadable_record_the_attachment_rides_along() {
     let world = crate::test_world("rewind");
     let dir = world.proj.clone();
-    let src = session_attachment_and_bad_tail(&dir, false);
+    let src = session_attachment_tail(&dir);
     let res = rewind_session(&sref(&src, SID), &opts(CutAt::End, &dir.join("out"))).unwrap();
 
     let got = read_lines(&res.new_path);
@@ -615,7 +622,7 @@ fn valid_empty_content_and_unknown_tail_survive_all_copy_paths() {
     for thinking in [crate::emit::ThinkingMode::Native, crate::emit::ThinkingMode::Portable] {
         let world = crate::test_world("rewind");
         let dir = world.proj.clone();
-        let src = session_attachment_and_bad_tail(&dir, false);
+        let src = session_attachment_tail(&dir);
         let extra = [
             rec("user", "empty", Some("a0"), json!({"role":"user", "content":[]})),
             json!({"type":"future-state", "sessionId":SID, "payload":{"untouched":true}}),

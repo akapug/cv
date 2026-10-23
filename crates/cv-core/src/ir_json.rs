@@ -3,6 +3,8 @@
 //! The serde derives visit message and block fields. This visitor replaces only their lazy
 //! leaves; ordinary fields still use serde_json. Output may be partial on any error, so callers
 //! publishing files must stage them first.
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::{
     ir::{Block, Message, Session},
     json::Json,
@@ -96,7 +98,7 @@ impl Message {
 
     fn write_json_format(&self, writer: &mut impl Write, resolver: &Resolver, pretty: bool) -> anyhow::Result<()> {
         let mut reads = crate::source::ReadSet::default();
-        crate::source::record_message_reads(self, std::path::Path::new(""), &mut reads);
+        crate::source::record_message_reads(self, None, &mut reads);
         let result = self.serialize(Fields {
             writer,
             resolver,
@@ -556,7 +558,7 @@ mod tests {
             {"type":"file","mime":"text/plain","path":"/file","source":"reference"}
         ]);
         let mut message: Message = serde_json::from_value(json!({
-            "id":"msg","parent_id":"parent","role":"assistant","timestamp":"2026-10-12T00:00:00Z","model":"model",
+            "id":"msg","parent_id":"parent","role":"assistant","kind":"reply","origin":"model","timestamp":"2026-10-12T00:00:00Z","model":"model",
             "content":blocks,
             "usage":{"input_tokens":1,"output_tokens":2,"cache_read_tokens":3,"cache_creation_tokens":4,"reasoning_tokens":5},
             "extra":{"claude":{"field":[1,{"a":true}]},"_record":{"type":"record"}}
@@ -744,7 +746,9 @@ mod output_freshness_tests {
         let raw = serde_json::to_vec(&"source body ".repeat(10000))?;
         std::fs::write(&path, &raw)?;
         let text = crate::json::JsonSource::capture(&path)?
-            .read_range_value(0, raw.len() as u64, |view| view.source_text())?
+            .read(ReadInput::Range(0, raw.len() as u64), Validation::Value, |view| {
+                view.source_text()
+            })?
             .unwrap();
         let mut message = Message::new(crate::Role::User);
         message.content.push(Block::Text { text });
@@ -778,7 +782,9 @@ mod output_freshness_tests {
                 // Refresh capture after each deliberate source replacement.
                 message.content[0] = Block::Text {
                     text: crate::json::JsonSource::capture(&path)?
-                        .read_range_value(0, raw.len() as u64, |v| v.source_text())?
+                        .read(ReadInput::Range(0, raw.len() as u64), Validation::Value, |v| {
+                            v.source_text()
+                        })?
                         .unwrap(),
                 };
                 let mut writer = Mutate {

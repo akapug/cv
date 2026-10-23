@@ -53,9 +53,9 @@ whose purpose is writing stores or sessions (`index`, hook installation/removal,
   `Demand { tier, spans, offsets }` selects extras/carriers, lazy text and offsets.
 - Claude/Codex have lazy source spans and resumable stream state. Codex has a useful direct path
   for giant tool outputs; most unchanged index jobs are skipped.
-- FTS already combines text, event and affordance extraction in one pass, uses one writer,
-  streams body documents through a bounded channel, and publishes resume marks after commit.
-  Its scheduler already admits at most 2 GiB of estimated **source file bytes**.
+- FTS combines text, event and affordance extraction in one pass and one writer, streams body
+  docs through a bounded channel, publishes resume marks (chunk boundaries; each read's end, with
+  its open docs) after commit, and admits at most 2 GiB of estimated **source file bytes**.
 - OpenCode, Goose and Hermes use per-session row iteration and the stores' existing indexes.
   Fixture query plans also support Devin's chain lookups and OpenClaw's event sequence query.
   Do not replace these with speculative PRAGMA tuning.
@@ -74,7 +74,7 @@ JSON-whitespace trim rule, and one SQLite cell reader (`store::sqlite::Cells`).
 | Store / format | Current traversal and retained state | Remaining costs / limits |
 |---|---|---|
 | Claude JSONL | One record codec (`claude/record.rs`, see [`CODEC.md`](CODEC.md)) over the shared JSONL reader in both builds; lazy text/arguments, facts, usage, discovery and fork heads are demands on it; checkpoints | Complete-mode carriers and metadata, rich `toolUseResult` sidecars and array tool results under 64 KiB remain owned |
-| Codex JSONL | one record codec over `jsonl::drive` (mapped or positioned); bounded authority prepass; demand picks spans/inline/heads, never the decoder | Full/unknown metadata remains owned, and discovery retains its small-file full-scan / sampled head-tail policy |
+| Codex JSONL | one record codec over `jsonl::drive` (mapped or positioned); bounded authority prepass; demand picks spans/inline/heads, never the decoder | Full/unknown metadata remains owned; discovery folds every record once, then resumes from its checkpoint |
 | Codex legacy JSON / zstd | Legacy documents feed the same codec item by item; compressed modern JSONL decodes once per read into one arena read by the same line source; `cv index` reads discovery's arena, within a 2 GiB decoded window | Demanded rich fallback fields; decoded/staged disk extent; no general compressed incremental marks |
 | Gemini legacy JSON | Checked selected string/canonical/composite results and formatted thoughts; native mmap or portable range projections | Full/complete modes and rich display extras still own required payloads |
 | Gemini JSONL | Native mmap and portable checked-range replay retain compact order/keys; selected composite bodies use one session arena | Must scan complete history for replacements/rewinds; required metadata and rich display extras remain owned |
@@ -106,14 +106,14 @@ Compressed, encoded, scanned, decoded and emitted bytes must be labeled separate
 | Operation | Actual work | Optimization boundary |
 |---|---|---|
 | Warm ls/stats | Catalog probe, metadata rows, sort/filter; query presence shares its source Probe, JSON rendering rechecks metadata in bounded batches | Preserve freshness between phases; measure discovery separately |
-| Full discovery | Metadata projection, certified count reuse and cache/catalog publication; Codex, Grok, Kimi, Kimi Code, Hermes, Goose and Zed defer cold counts, Claude counts from its record heads | Remaining count-only adapter scans must go; exact fallback metadata and validation may still require EOF |
+| Full discovery | Metadata projection, certified count reuse and cache/catalog publication; Codex, Grok, Kimi, Kimi Code, Hermes, Goose, Zed and OpenCode defer cold counts, Claude counts from its record heads | Remaining count-only adapter scans must go; exact fallback metadata and validation may still require EOF |
 | Text windows / last N | Lazy range or deque, selected messages materialized | Already useful bounds; giant selected output is still output-sized |
 | JSON show / MCP show | CLI show/export stages resolved frames and envelopes in bounded spill storage; EOF metadata retained. MCP stages selected windows | CLI Last retains lazy tail descriptors; owned adapter extras and redaction trees remain; MCP client payload size and subprocess startup |
 | Affordance view | Facts projection into classified rows; checked bounded text summaries | Unprojected adapters retain rich extras; side stores and result rows; escaped validation still traverses the whole field |
 | Doctor | Facts projection; checked text lengths and JSON writer counts | Attribution state, unsupported adapter rich/fallback parsing and demanded structured arguments |
 | Query text predicate | Exact index-only matching IDs; cheap tri-state evaluation before parse | Mixed predicates still parse when cheap facts cannot decide |
 | Other rich predicates | Predicate-sized streamed tool/model facts and shared source probes | Distinct unresolved relative paths retained until final cwd; compaction uses its existing separate boundary |
-| FTS | Chunked text, bounded event spool and byte-capacity permits held through Tantivy document consumption; counts/checkpoints and one catalog connection per sweep | Writer arenas coexist with admitted documents |
+| FTS | Chunked text, bounded event spool and byte-capacity permits held through Tantivy document consumption; counts/checkpoints and one catalog connection per sweep. A query adds the stale suffix, read live from each mark into a temporary on-disk index | Writer arenas coexist with admitted documents; the live suffix's index is on disk, its heap one writer arena |
 | Semantic indexing | Shares discovery inventory; source/model identity enables unchanged-vector reuse and deferred model load; atomic streamed save | Requested vector-store storage grows with session count; ranking candidate retention is now limited by requested result count |
 | API pagination / HTTP windows | Verified page checkpoints and head metadata cache; selected HTTP JSON stages bounded frames through shared window selection | Window JSON parsing, demanded metadata and individual visible-message payloads remain; complete downloads use staged native writers |
 | Watch | Verified checkpoints and bounded EOF metadata reused across tail polls | Strict source identity and dependencies; replay-only formats retain fallback parsing |
@@ -133,16 +133,19 @@ Key sources: `cv/src/cmd/view.rs`, `cv-core/src/{api,affordance,watch,lazy,strea
 
 A listing reports what the metadata read already produced and nothing it would have to read more
 for. A JSONL adapter whose discovery walks every record head anyway (Claude, and the adapters that
-read every turn: Cursor, Cline, Devin, Gemini, LM Studio, OpenClaw, OpenCode's database,
-OpenSession, the exports) counts for free and reports `Some(n)`, so `Some(0)` is a session with no
-turns. An adapter for which counting means decoding message bodies, opening a second store or
-reading files the listing does not need (Codex, Grok, Kimi, Kimi Code, Qwen, Zed, Hermes, Goose,
-Continue, OpenCode's JSON tree) reports `None`, "not counted", until a full
-read or `cv index` certifies the number; the catalog keeps a certified count across metadata
-refreshes that leave the source unchanged and drops it when the source changes. `--json` emits
-`null`, the table a dash, `--sort-by messages` ranks uncounted sessions last, `cv stats` reports
-"N not counted yet". The contract is the doc comment on `SessionRef::message_count`
-(`cv-core/src/ir.rs`); a count is never a proxy such as file count or an extrapolation.
+read every turn: Cursor, Cline, Devin, Gemini, LM Studio, OpenClaw, OpenSession, the exports)
+counts for free and reports `Some(n)`, so `Some(0)` is a session with no turns. It counts by its
+parser's own turn rule ([`Message::is_turn`]: a typed prompt or a reply), read from the same head:
+a user record carrying only tool results, injected context or a sub-agent's return is no turn. An
+adapter for which counting means decoding message bodies, opening a second store or reading files
+the listing does not need (Codex, Grok, Kimi, Kimi Code, Qwen, Zed, Hermes, Goose, Continue,
+OpenCode, whose turn kinds rest on parts, a Cursor composer with external bubble cells) reports `None`, "not counted", until a full read or `cv
+index` certifies the number; a complete (round-trip) read, which carries rewound and superseded
+rows, never certifies. The catalog keeps a certified count across metadata refreshes that leave
+the source unchanged and drops it when the source changes. `--json` emits `null`, the table a
+dash, `--sort-by messages` ranks uncounted sessions last, `cv stats` reports "N not counted yet".
+The contract is the doc comment on `SessionRef::message_count`, held over every corpus session by
+`every_listed_count_is_the_full_read_turn_count`; a count is never a proxy or an extrapolation.
 
 ## Correctness boundaries before reuse
 
@@ -226,17 +229,18 @@ Audited against `git log v0.17.0..HEAD` on 2026-10-21; a closure below names its
   Cursor CLI counts to exclude empty stores. Removing these reads needs to preserve inclusion and exact metadata.
   Shared selections landed for OpenClaw/Hermes/Qwen tasks/Goose/exports (`62f0ccda`, `0a6a3b22`,
   `7475e978`, `20980e64`, `646b8fb6`); native allocations and validation still cost work.
+- **Search freshness, closed.** Index plus a live read of its stale suffix from FTS marks, one
+  BM25, all of it unless `--live-bytes` bounds it (`fts/live.rs`); a SQLite write rereads only moved `source::Rows`.
 - **Archive inventory.** `archive sync` uses `index_all`'s references; `cv/src/cmd/archive` owns
   its checked artifact projection. An unavailable index falls back to discovery with a diagnostic.
 - **Three message windowings, closed.** JSON, text rendering and pack relevance excerpts share
   `api::MessageWindow`; renderers retain their own byte accounting and metadata timing.
   CLI and HTTP search share `cv_search::Searcher::search`, including notes and snippets.
-- **Format-dependent costs, open.** Grok sibling lineage retains per-query metadata guards;
-  Kimi wire enrichment and Kimi Code's auxiliary index reread changed prefixes; Claude fork
-  inference can inspect sibling bodies. These dependencies can change independently of the main
-  transcript. External SQLite schemas remain read-only; OpenClaw custom queries and giant native
-  cells still allocate in SQLite. Zed discovery grows Serde scratch; Hermes reasoning/provider
-  extras and row/FTS allocation remain owned. Rust heap gates do not bound those native costs.
+- **Format-dependent costs, open.** Grok sibling lineage keeps per-query metadata guards; Kimi wire
+  enrichment and Kimi Code's index reread changed prefixes; Claude fork inference reads sibling
+  heads (append-only dependencies). External SQLite schemas stay read-only; OpenClaw queries and
+  giant native cells allocate in SQLite; Zed discovery grows Serde scratch; Hermes extras and
+  row/FTS allocation stay owned. Rust heap gates do not bound those native costs.
 - **Resume-mark sampling, a known limit.** Boundary 3 cannot detect every prefix rewrite plus
   growth, or every same-length edit during captured-read admission. No trusted change signal is
   available; whole-prefix hashing was measured and rejected (see `PERF.md`, Resume marks).

@@ -5,6 +5,7 @@ this being hella fast." Stream, never materialize a session or store you do not 
 re-read bytes already seen; use all cores; keep heap bounded by work in flight, not file size;
 every index or mark over a file verifies itself on use. The datapath design and open gaps are in
 [`DATAPATHS.md`](DATAPATHS.md); the dated logs and per-change evidence files are in git history.
+Per-path costs and the no-mode-switch rule for thresholds: [`COMPLEXITY.md`](COMPLEXITY.md).
 
 ## Regression checks
 
@@ -20,6 +21,11 @@ regression detectors; their bounds do not describe native SQLite allocation or w
 This document records measurements rather than latency, throughput, or fleet-size targets.
 First-run discovery, unchanged indexing, appends and full recounts need separate measurements:
 they do different work, and a result on one fleet is not a promise for another.
+
+An API window publication validates one baseline with the captured read set attached; it does
+not separately revalidate that same set. Cache admission and publication remain separate
+checks because a source can change between them. The number of file identity checks therefore
+scales with distinct dependencies and publication boundaries, not message count.
 
 ## How to measure without lying
 

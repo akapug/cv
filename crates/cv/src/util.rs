@@ -410,18 +410,7 @@ pub(crate) fn dim_cwd(p: Option<&Path>) -> String {
     p.map(home_rel).unwrap_or_else(|| "(no cwd)".into())
 }
 
-/// One word for a POSIX shell command line: bare when every byte is inert in a word (letters,
-/// digits, `/ . _ - + : @`), single-quoted otherwise. `~` is not inert: a bare leading `~` expands.
-pub(crate) fn shell_quote(s: &str) -> String {
-    if !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+' | b':' | b'@'))
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
-    }
-}
+pub(crate) use cv_core::harness::shell_quote;
 
 pub(crate) fn dirs_home() -> Option<std::path::PathBuf> {
     cv_core::env::var_os("HOME").map(std::path::PathBuf::from)
@@ -442,7 +431,8 @@ pub(crate) fn report(json: bool, human: &str, value: &serde_json::Value) -> Resu
 
 /// Dry-run honesty for a `--json` report: nothing was written, so every `paths` key is null, and
 /// the `minted` keys (the new id and what derives from it) are null too unless `--to` pinned the
-/// id — the core mints a throwaway id a real run would NOT reuse. `note` says which.
+/// id — the core mints a throwaway id a real run would NOT reuse. `note` says which; it is part of
+/// every report's shape (the `cv recipes` key list names it), null on a real run.
 pub(crate) fn dry_run_nulls(v: &mut serde_json::Value, pinned: bool, paths: &[&str], minted: &[&str]) {
     v["note"] = serde_json::Value::Null;
     if v["dry_run"] != true {

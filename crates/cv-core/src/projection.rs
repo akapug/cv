@@ -355,6 +355,10 @@ pub fn searchable_text_checked(
     Ok(String::from_utf8(bytes)?)
 }
 
+/// Bytes kept past `limit` as [`searchable_prefix_checked`]'s truncation witness: room for one
+/// more UTF8 scalar, so an exact fit stays within `limit` and reads as untruncated.
+const WITNESS_BYTES: usize = 4;
+
 /// Exact decoded byte prefix of the searchable message projection, with a truncation witness.
 /// Demanded text uses checked chunks; JSON uses the canonical bounded writer. No later block
 /// is demanded after the prefix is established.
@@ -373,10 +377,10 @@ pub fn searchable_prefix_checked(
     limit: usize,
     mut check: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<(String, bool)> {
-    // Four witness bytes distinguish an exact fit from the next UTF8 scalar not fitting.
+    // The witness bytes distinguish an exact fit from the next UTF8 scalar not fitting.
     let mut head = Head {
-        text: String::with_capacity(limit.saturating_add(4).min(64 * 1024)),
-        limit: limit.saturating_add(4),
+        text: String::with_capacity(limit.saturating_add(WITNESS_BYTES).min(64 * 1024)),
+        limit: limit.saturating_add(WITNESS_BYTES),
         stopped: false,
         title: None,
     };

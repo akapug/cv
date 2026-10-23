@@ -31,7 +31,7 @@ A bird's-eye view of every session across all harnesses and all of time. Up top 
 
 ### 🔍 Compare — side-by-side, aligned
 
-Pick **two** sessions and view them side by side with message-level alignment. The app walks both message lists in parallel: while they match (same role + same flattened content) the rows are marked **shared** (a calm amethyst tint, ✓ in the gutter); from the first divergence onward everything is flagged **diverged** (warm tint, ≠ or •). The summary tells you the shape at a glance — *"37 shared messages, then diverges"*. This is exactly what you want for [Loom](#-loom--the-splice-composer) branches that share a common prefix and then split. Use the **⇄** button to swap A and B. (Picks aren't auto-aligned — aligning two huge arbitrary sessions on every visit was useless and slow, so *you* choose the pair.)
+Pick **two** sessions and view them side by side with message-level alignment. The app walks both message lists in parallel: while they match (same role + same flattened content) the rows are marked **shared** (a calm amethyst tint, ✓ in the gutter); from the first divergence onward everything is flagged **diverged** (warm tint, ≠ or •). The summary tells you the shape at a glance — *"37 shared messages, then diverges"*. This is exactly what you want for [Splice](#-splice--the-composer) branches that share a common prefix and then split. Use the **⇄** button to swap A and B. (Picks aren't auto-aligned — aligning two huge arbitrary sessions on every visit was useless and slow, so *you* choose the pair.)
 
 ### 📊 Stats — the dashboard
 

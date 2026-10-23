@@ -2,43 +2,35 @@
 
 ### The app shows the sample data, not my real sessions
 
-The desktop app reads your local sessions through a native `api` command and runs a `cv serve` for the Fleet dashboard. If you see
-the bundled sample, the app couldn't reach them — make sure you're running the **desktop app** (not
-the plain browser build, which is zip-drop only), and that nothing else is occupying its port.
+Run the **desktop app** (the browser build only takes zip drops) and check nothing else holds
+its port.
 
 ### "Showing 0 sessions" / nothing found
 
-clustervision only sees harnesses installed in their standard locations (see
-[Harnesses](harnesses.md)). Run `cv ls` in a terminal — if that's empty too, no supported harness
-data was found under `$HOME`.
+cv reads harnesses at their standard locations ([Harnesses](harnesses.md)). An empty `cv ls`
+means none were found under `$HOME`.
 
 ### First `cv ls` is slow, then fast
 
-Discovery parallelizes across harnesses and caches metadata by file identity (length, mtime,
-device, inode, ctime), so the first run does the real work (158–186 s for 5,421 sessions and 78 GB,
-measured 2026-10-14) and later runs take under 0.1 s. A huge plain Codex rollout is
-sampled head+tail during discovery and reports 0 turns until counted; compressed rollouts are decoded in full. See [Architecture](architecture.md).
+The first run reads everything (about 3 minutes for 78 GB); later runs take under 0.1 s. Codex,
+Grok, Kimi, Qwen, Hermes, Goose, Zed, Continue and OpenCode counts show a dash until a full read
+or `cv index`.
+See [Architecture](architecture.md).
 
 ### `cv port` warns about lost content
 
-`cv port` re-parses its own output and diffs it against the source, message by message, then
-reports anything that didn't survive. Each loss is classified: **expected** when the target format
-genuinely cannot hold it (LM Studio has no tool structures on disk, so tool calls become readable
-text), **unexpected** when it could have and didn't. Only the unexpected ones fail `cv port
---strict`. A `⚠ lost` line about an expected loss is a format limitation, not a bug. See
-[Cross-harness conversion](conversion.md).
+An **expected** loss is one the target format cannot hold (LM Studio stores no tool calls, so
+they become text); only an **unexpected** one fails `cv port --strict`. See [Cross-harness conversion](conversion.md).
 
 ### Sub-agents
 
-Claude Code's Task tool spawns sub-agents whose transcripts are normally invisible. clustervision
-finds them and nests them under the parent session in the app's transcript view (lazy-loaded,
-labeled by task prompt). There can be thousands, so they're never dumped into the main list. See
+Claude Code sub-agents nest under their parent in the app's transcript view, labeled by task
+prompt, never in the main list. See
 [The app](viewing-and-sharing.md).
 
 ### The MCP server isn't responding
 
-`cv mcp` speaks JSON-RPC over **stdio**, and **stdout is the protocol channel** — all diagnostics go
-to stderr. Register it with `claude mcp add clustervision -- /abs/path/to/cv mcp`. See [MCP](mcp.md).
+`cv mcp` speaks JSON-RPC on stdout, diagnostics on stderr. Register it with `claude mcp add clustervision -- /abs/path/to/cv mcp`. See [MCP](mcp.md).
 
 ### Still stuck?
 

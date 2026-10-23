@@ -1,5 +1,7 @@
 //! Retained JSON-string backing with original source provenance and bounded decoded demands.
 use crate::json::{Json, JsonRange};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -67,7 +69,7 @@ impl SourceText {
                 scratch.clear();
                 scratch.push_str(&part[..end]);
                 let result = f(&scratch);
-                self.range.check()?;
+                self.range.captured_source().check()?;
                 result?;
                 part = &part[end..];
             }
@@ -195,7 +197,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
         let source = JsonSource::capture(&path).unwrap();
         let text = source
-            .read_range_value(0, source.len(), |v| v.source_text())
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |v| {
+                v.source_text()
+            })
             .unwrap()
             .unwrap();
         let resolver = Resolver::new(None);
@@ -225,7 +229,11 @@ mod tests {
             })
             .unwrap();
         let text = source
-            .read_backing_value(backing.clone(), offset, len, |view| view.source_text())
+            .read(
+                ReadInput::Backing(backing.clone(), offset, len),
+                Validation::Value,
+                |view| view.source_text(),
+            )
             .unwrap()
             .unwrap();
         assert!(matches!(text, crate::lazy::Text::Source(_)));

@@ -88,6 +88,11 @@ impl Adapter for Qwen {
 
     fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
         deps.files.push(r.path.with_extension("meta.json"));
+        if !is_session_jsonl(&r.path) {
+            // A gemini-cli shape takes its cwd from the registry beside it.
+            deps.files
+                .extend(crate::harness::gemini::registry_files(&r.path).into_iter().flatten());
+        }
         if let Some(chats) = r.path.parent().filter(|p| p.file_name().is_some_and(|n| n == "chats")) {
             if let (Some(root), Some(cwd)) = (
                 chats.parent().and_then(Path::parent).and_then(Path::parent),
@@ -105,6 +110,18 @@ impl Adapter for Qwen {
 
     fn roots(&self) -> Vec<PathBuf> {
         self.projects.iter().chain(self.root.iter()).cloned().collect()
+    }
+
+    /// A gemini-cli `logs.json` holds a whole project's sessions: each is certified by its own
+    /// entries ([`crate::harness::gemini::logs`]).
+    fn rows_store(&self, r: &SessionRef) -> Option<PathBuf> {
+        crate::harness::gemini::is_logs(&r.path).then(|| r.path.clone())
+    }
+
+    fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        crate::harness::gemini::is_logs(store)
+            .then(|| Some(crate::harness::gemini::logs(store).ok()?.rows.clone()))
+            .flatten()
     }
 
     fn discover(&self) -> Result<crate::Discovered> {
@@ -178,12 +195,10 @@ impl Adapter for Qwen {
                 };
             }
             let (s, st) = match from {
-                stream::Start::Checkpoint(cp) => {
-                    match jsonl::restore::<ReplayCheckpoint>(cp, <Replay as jsonl::Codec>::VERSION) {
-                        Some(state) => (state.session, state.replay),
-                        None => return Ok(None),
-                    }
-                }
+                stream::Start::Checkpoint(cp) => match jsonl::restore::<ReplayCheckpoint>(cp) {
+                    Some(state) => (state.session, state.replay),
+                    None => return Ok(None),
+                },
                 _ => (session_shell(&r.path, sink), ReplayState::default()),
             };
             let read = jsonl::Read::open(&r.path)?;
@@ -558,8 +573,6 @@ struct Replay<'r> {
 }
 
 impl jsonl::Codec for Replay<'_> {
-    const VERSION: u32 = 1;
-
     fn record(&mut self, view: crate::json::JsonView<'_>, _: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
         if matches!(self.demand, Demand::Discovery) {
             let seen = &mut self.seen;
@@ -567,11 +580,11 @@ impl jsonl::Codec for Replay<'_> {
                 *seen = true;
                 sink.message(m)
             };
-            let flow = record::ingest(view, &mut self.s, &mut self.st, self.demand, false, &mut noted)?;
+            let flow = record::record(view, &mut self.s, &mut self.st, self.demand, false, &mut noted)?;
             self.st.listed = self.seen && self.st.first_prompt.is_some();
             return Ok(flow);
         }
-        if record::ingest(view, &mut self.s, &mut self.st, self.demand, self.stopped, sink)? == Flow::Stop {
+        if record::record(view, &mut self.s, &mut self.st, self.demand, self.stopped, sink)? == Flow::Stop {
             self.stopped = true;
         }
         Ok(Flow::Continue)
@@ -1058,8 +1071,7 @@ mod tests {
     /// when it was created; sub-agent transcripts take none.
     #[test]
     fn scheduled_tasks_go_to_their_owner_or_the_live_session() {
-        let home = std::env::temp_dir().join(format!("cv-qwen-cron-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&home);
+        let home = cv_testkit::temp_dir("qwen-cron");
         let tmp = home.join("tmp").join(crate::digest::sha256_hex(b"/p"));
         fs::create_dir_all(&tmp).unwrap();
         fs::write(
@@ -1088,7 +1100,7 @@ mod tests {
     /// resulting session as [`Harness::Qwen`] — the pure-text mirror of what the adapter's on-disk
     /// paths do, used here to cross-check them.
     fn parse_qwen_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
-        let mut sessions = crate::harness::gemini::parse_all_str_for(Harness::Qwen, text, source_path);
+        let mut sessions = crate::harness::gemini::parse_all_str_for(Harness::Qwen, text, source_path).unwrap();
         for s in &mut sessions {
             s.harness = Harness::Qwen;
         }
@@ -1205,7 +1217,7 @@ mod tests {
         // The native streaming path (shared Gemini machinery) must re-tag the session as Qwen and
         // emit the same messages the pure parser materializes.
         let text = fixture("session_modern.jsonl");
-        let dir = std::env::temp_dir().join(format!("cv-qwen-stream-{}", std::process::id()));
+        let dir = cv_testkit::temp_dir("qwen-stream");
         // `chats/` in the path is how the shared machinery recognizes a chat recording.
         let chats = dir.join("chats");
         fs::create_dir_all(&chats).unwrap();
@@ -1237,8 +1249,7 @@ mod tests {
         // which gave every checkpoint the generic id "checkpoint" — colliding across files and
         // disagreeing with the streaming path's "checkpoint-<tag>".)
         let text = fixture("checkpoint.json");
-        let dir = std::env::temp_dir().join(format!("cv-qwen-ckpt-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("qwen-ckpt");
         let p1 = dir.join("checkpoint-alpha.json");
         let p2 = dir.join("checkpoint-beta%20tag.json");
         fs::write(&p1, &text).unwrap();
@@ -1281,7 +1292,7 @@ mod tests {
     /// through `tool_call`, its sub-agent transcript, a compression, a goal, telemetry, a fork.
     #[test]
     fn reads_session_jsonl_and_subagent_transcripts() {
-        let home = std::env::temp_dir().join(format!("cv-qwen-modern-{}", uuid::Uuid::new_v4()));
+        let home = cv_testkit::temp_dir("qwen-modern");
         let proj = home.join("projects").join("-home-corpus-project");
         fs::create_dir_all(proj.join("chats")).unwrap();
         fs::create_dir_all(proj.join("subagents").join("s1")).unwrap();

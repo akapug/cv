@@ -227,7 +227,9 @@ type Counts = HashMap<String, Mentions>;
 #[derive(Default)]
 struct Facts {
     commits: Vec<(usize, String, String, String)>, // idx, branch, sha, subject
-    branches: Counts,                              // name, mentions and first-seen order
+    /// The shas in `commits`: a capture is checked against a set, not a scan of every commit so far.
+    commit_shas: HashSet<String>,
+    branches: Counts, // name, mentions and first-seen order
     hosts: Counts,
     paths: Counts,
     gates: Vec<(usize, String, String)>,  // idx, label, verdict
@@ -245,86 +247,73 @@ fn bump(counts: &mut Counts, key: &str) {
     }
 }
 
-fn re(cell: &'static OnceLock<Regex>, pat: &str) -> &'static Regex {
-    cell.get_or_init(|| Regex::new(pat).expect("static regex"))
+/// The distiller's patterns, each compiled on first use.
+#[derive(Clone, Copy)]
+enum Re {
+    Commit,
+    OnBranch,
+    NewBranch,
+    Push,
+    Path,
+    RemoteTarget,
+    GateCmd,
+    Verdict,
+    ErrorLine,
+    Tip,
+    GitLog,
+    Cd,
+    Oneline,
+    HeredocTarget,
 }
 
-fn commit_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?m)^\[([^\]\s]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] (.+)$")
-}
-fn on_branch_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?m)^On branch (\S+)")
-}
-fn new_branch_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"git\s+(?:-C\s+\S+\s+)?(?:checkout\s+-[bB]|switch\s+-[cC]|worktree\s+add\s+(?:\S+\s+)*?-b)\s+([\w./-]+)",
-    )
-}
-fn push_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"git\s+(?:-C\s+\S+\s+)?push\s+(?:-\S+\s+)*[\w./:@-]+\s+\+?([\w./-]+(?::[\w./-]+)?)",
-    )
-}
-fn path_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?:^|[\s'`=(:,\x22])(~?/[\w.@+-]+(?:/[\w.@+-]+)+/?)")
-}
-fn remote_target_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?:^|\s)((?:[\w.-]+@)?[\w.-]+):[/~]")
-}
-fn gate_cmd_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"\blake\s+(?:build|env\s+lean|test)\b|\bcargo\s+(?:build|test|nextest|check|clippy)\b|swarm-build|\bmake\b|\bpytest\b|\bnpm\s+(?:run\s+)?test\b|\bgo\s+test\b|clean-build|local-gates|\bctest\b|\bninja\b|\brc=",
-    )
-}
-fn verdict_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"(?i)\berror\b|\bfail|\bpassed\b|\bsuccess|\bcompleted\b|\brc=\d|exit code|✔|✖|\bbuilt\b|test result|declaration uses 'sorry'",
-    )
-}
-fn error_line_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"(?i)\berror\b|\bfatal\b|denied|no such file|not found|cannot|can't|failed|refused|timed out|unknown|invalid|conflict|panicked|traceback",
-    )
-}
-fn tip_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"(?m)^([0-9a-f]{40})\s+refs/heads/(\S+)$")
-}
-fn git_log_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r"git\s+(?:-C\s+(\S+)\s+)?log\b((?:\s+-[^\s|;&)]*)*)(?:\s+([^\s|;&)'-][^\s|;&)']*))?",
-    )
-}
-fn cd_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"\bcd\s+([^\s;&|)']+)")
-}
-fn oneline_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(&R, r"^([0-9a-f]{7,40})\s+(\S.*)$")
+static RES: [OnceLock<Regex>; 14] = [const { OnceLock::new() }; 14];
+
+fn re(which: Re) -> &'static Regex {
+    let (cell, pat) = match which {
+        Re::Commit => (&RES[0], r"(?m)^\[([^\]\s]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] (.+)$"),
+        Re::OnBranch => (&RES[1], r"(?m)^On branch (\S+)"),
+        Re::NewBranch => (
+            &RES[2],
+            r"git\s+(?:-C\s+\S+\s+)?(?:checkout\s+-[bB]|switch\s+-[cC]|worktree\s+add\s+(?:\S+\s+)*?-b)\s+([\w./-]+)",
+        ),
+        Re::Push => (
+            &RES[3],
+            r"git\s+(?:-C\s+\S+\s+)?push\s+(?:-\S+\s+)*[\w./:@-]+\s+\+?([\w./-]+(?::[\w./-]+)?)",
+        ),
+        Re::Path => (&RES[4], r"(?:^|[\s'`=(:,\x22])(~?/[\w.@+-]+(?:/[\w.@+-]+)+/?)"),
+        Re::RemoteTarget => (&RES[5], r"(?:^|\s)((?:[\w.-]+@)?[\w.-]+):[/~]"),
+        Re::GateCmd => (
+            &RES[6],
+            r"\blake\s+(?:build|env\s+lean|test)\b|\bcargo\s+(?:build|test|nextest|check|clippy)\b|swarm-build|\bmake\b|\bpytest\b|\bnpm\s+(?:run\s+)?test\b|\bgo\s+test\b|clean-build|local-gates|\bctest\b|\bninja\b|\brc=",
+        ),
+        Re::Verdict => (
+            &RES[7],
+            r"(?i)\berror\b|\bfail|\bpassed\b|\bsuccess|\bcompleted\b|\brc=\d|exit code|✔|✖|\bbuilt\b|test result|declaration uses 'sorry'",
+        ),
+        Re::ErrorLine => (
+            &RES[8],
+            r"(?i)\berror\b|\bfatal\b|denied|no such file|not found|cannot|can't|failed|refused|timed out|unknown|invalid|conflict|panicked|traceback",
+        ),
+        Re::Tip => (&RES[9], r"(?m)^([0-9a-f]{40})\s+refs/heads/(\S+)$"),
+        Re::GitLog => (
+            &RES[10],
+            r"git\s+(?:-C\s+(\S+)\s+)?log\b((?:\s+-[^\s|;&)]*)*)(?:\s+([^\s|;&)'-][^\s|;&)']*))?",
+        ),
+        Re::Cd => (&RES[11], r"\bcd\s+([^\s;&|)']+)"),
+        Re::Oneline => (&RES[12], r"^([0-9a-f]{7,40})\s+(\S.*)$"),
+        Re::HeredocTarget => (
+            &RES[13],
+            r#"(?:cat|tee(?:\s+-a)?)\s*>{0,2}\s*['"]?([^\s'"<>|;&]+)['"]?\s*<<-?\s*['"]?\w+"#,
+        ),
+    };
+    cell.get_or_init(|| Regex::new(pat).expect("static regex"))
 }
 
 /// The repository a single `git log` in `cmd` reads, and the HEAD line it printed: `(key, line)`.
 /// The key is `host:dir`, plus `[ref]` when the log names a ref instead of HEAD. Commands with
 /// several `git log`s (loops over many repos) are skipped — their output can't be attributed.
 fn git_log_head(cmd: &str, out: &str) -> Option<(String, String)> {
-    let mut logs = git_log_re().captures_iter(cmd);
+    let mut logs = re(Re::GitLog).captures_iter(cmd);
     let c = logs.next()?;
     if logs.next().is_some() {
         return None;
@@ -333,7 +322,7 @@ fn git_log_head(cmd: &str, out: &str) -> Option<(String, String)> {
     let dir = c
         .get(1)
         .map(|m| m.as_str().to_string())
-        .or_else(|| cd_re().captures_iter(&cmd[..at]).last().map(|d| d[1].to_string()))
+        .or_else(|| re(Re::Cd).captures_iter(&cmd[..at]).last().map(|d| d[1].to_string()))
         .unwrap_or_else(|| ".".into());
     let host = hosts_in(cmd).into_iter().next();
     let mut key = match host {
@@ -344,16 +333,8 @@ fn git_log_head(cmd: &str, out: &str) -> Option<(String, String)> {
         key = format!("{key} [{}]", r.as_str());
     }
     let line = out.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let m = oneline_re().captures(line)?;
+    let m = re(Re::Oneline).captures(line)?;
     Some((key, format!("{} {}", &m[1], truncate(m[2].trim(), 90))))
-}
-
-fn heredoc_target_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    re(
-        &R,
-        r#"(?:cat|tee(?:\s+-a)?)\s*>{0,2}\s*['"]?([^\s'"<>|;&]+)['"]?\s*<<-?\s*['"]?\w+"#,
-    )
 }
 
 /// Prose files an agent writes to record state: notes, statuses, briefs, commit messages.
@@ -542,7 +523,7 @@ fn hosts_in(cmd: &str) -> Vec<String> {
         i += 1;
     }
     if cmd.contains("scp ") || cmd.contains("rsync ") {
-        for c in remote_target_re().captures_iter(cmd) {
+        for c in re(Re::RemoteTarget).captures_iter(cmd) {
             let h = &c[1];
             if !h.contains('/') && !h.starts_with("http") && h.len() > 2 {
                 out.push(h.to_string());
@@ -683,7 +664,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
             continue;
         }
         let t = MessageText::new(m, &resolver).text()?.unwrap_or_default();
-        for c in path_re().captures_iter(&t) {
+        for c in re(Re::Path).captures_iter(&t) {
             referenced.insert(c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']).to_string());
         }
     }
@@ -914,7 +895,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         if m.role == Role::Assistant {
             for (index, b) in m.content.iter().enumerate() {
                 if let Block::Text { .. } = b {
-                    for c in path_re().captures_iter(reader.block(index)?) {
+                    for c in re(Re::Path).captures_iter(reader.block(index)?) {
                         let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`']);
                         if plausible_path(p) {
                             bump(&mut facts.paths, p);
@@ -1106,7 +1087,7 @@ fn own_words_from_tool(i: usize, m: &Message, name: &str, input: &Value, opts: &
         }),
         _ => {
             let cmd = command_of(input)?;
-            let target = heredoc_target_re().captures(cmd)?.get(1)?.as_str().to_string();
+            let target = re(Re::HeredocTarget).captures(cmd)?.get(1)?.as_str().to_string();
             if !is_note_path(&target) || cmd.starts_with("python") {
                 return None;
             }
@@ -1130,10 +1111,10 @@ fn scan_input_facts(_name: &str, input: &Value, f: &mut Facts) {
         for h in hosts_in(c) {
             bump(&mut f.hosts, &h);
         }
-        for c2 in new_branch_re().captures_iter(c) {
+        for c2 in re(Re::NewBranch).captures_iter(c) {
             bump(&mut f.branches, &c2[1]);
         }
-        for c2 in push_re().captures_iter(c) {
+        for c2 in re(Re::Push).captures_iter(c) {
             let r = &c2[1];
             let b = r.rsplit(':').next().unwrap_or(r);
             bump(&mut f.branches, b);
@@ -1147,7 +1128,7 @@ fn scan_input_facts(_name: &str, input: &Value, f: &mut Facts) {
         }
     }
     for t in texts {
-        for c in path_re().captures_iter(t) {
+        for c in re(Re::Path).captures_iter(t) {
             let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']);
             if plausible_path(p) {
                 bump(&mut f.paths, p);
@@ -1167,18 +1148,18 @@ fn scan_result_facts(
     f: &mut Facts,
 ) -> String {
     let mut commit_outcome: Option<String> = None;
-    for c in commit_re().captures_iter(out) {
+    for c in re(Re::Commit).captures_iter(out) {
         let (b, sha, subj) = (c[1].to_string(), c[2].to_string(), c[3].trim().to_string());
         // `git log --oneline`-style listings never use the bracketed form; a bracketed line is a
         // commit (or cherry-pick/amend) the agent made.
-        if !f.commits.iter().any(|x| x.2 == sha) {
+        if f.commit_shas.insert(sha.clone()) {
             bump(&mut f.branches, &b);
             commit_outcome.get_or_insert_with(|| format!("⊕ [{b} {sha}] {}", truncate(subj.trim(), 90)));
             f.tips.push((i, b.clone(), sha.clone()));
             f.commits.push((i, b, sha, subj));
         }
     }
-    for c in on_branch_re().captures_iter(out) {
+    for c in re(Re::OnBranch).captures_iter(out) {
         bump(&mut f.branches, &c[1]);
     }
     if !is_error {
@@ -1186,7 +1167,7 @@ fn scan_result_facts(
             f.heads.push((i, key, line));
         }
     }
-    for c in tip_re().captures_iter(out) {
+    for c in re(Re::Tip).captures_iter(out) {
         bump(&mut f.branches, &c[2]);
         f.tips.push((i, c[2].to_string(), c[1][..12].to_string()));
     }
@@ -1198,7 +1179,7 @@ fn scan_result_facts(
             .lines()
             .map(str::trim)
             .filter(meaningful)
-            .find(|line| error_line_re().is_match(line))
+            .find(|line| re(Re::ErrorLine).is_match(line))
             .or_else(|| out.lines().rev().map(str::trim).find(meaningful))
             .unwrap_or("");
         let line = truncate(line.trim(), 200);
@@ -1208,13 +1189,13 @@ fn scan_result_facts(
     if let Some(c) = commit_outcome {
         return c;
     }
-    let is_gate = name == "Bash" && command_of(input).is_some_and(|c| gate_cmd_re().is_match(c));
+    let is_gate = name == "Bash" && command_of(input).is_some_and(|c| re(Re::GateCmd).is_match(c));
     if is_gate {
         let verdict = out
             .lines()
             .rev()
             .map(str::trim)
-            .find(|l| verdict_re().is_match(l))
+            .find(|l| re(Re::Verdict).is_match(l))
             .or_else(|| out.lines().rev().map(str::trim).find(|l| !l.is_empty()))
             .unwrap_or("(no output)");
         let verdict = truncate(verdict.trim(), 160);

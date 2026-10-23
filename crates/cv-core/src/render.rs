@@ -1,6 +1,8 @@
 //! Rendering an IR [`Session`] to human/LLM-friendly text. Shared by the `cv` CLI and `cv mcp`.
 
 use crate::ir::*;
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::path::Path;
@@ -231,7 +233,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&"lazy title".repeat(2000))?)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let text = source
-            .read_range_value(0, source.len(), |view| view.source_text())?
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
+                view.source_text()
+            })?
             .unwrap();
         session.messages[1].content = vec![Block::Text { text }];
         std::fs::write(&path, b"changed title source")?;

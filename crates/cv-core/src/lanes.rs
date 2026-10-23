@@ -174,22 +174,112 @@ pub fn append_lane_event(ev: &LaneEvent) -> std::io::Result<()> {
 
 /// Every row of the ledger, file order. Unparseable lines (a torn append) are skipped. Empty
 /// when there is no ledger.
-pub fn read_ledger() -> Vec<LaneEvent> {
-    let Ok(text) = std::fs::read_to_string(ledger_path()) else {
-        return Vec::new();
+///
+/// Kept while the ledger stats as it did when it was parsed: a `--subagents` pass asks once per
+/// Codex parent (`hook_forest`), and parsing the whole ledger each time made the fold
+/// O(parents × ledger rows).
+pub fn read_ledger() -> std::sync::Arc<[LaneEvent]> {
+    use crate::source::FileId;
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    type Memo = HashMap<PathBuf, (FileId, Arc<[LaneEvent]>)>;
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
+    let path = ledger_path();
+    let Some(before) = FileId::at(&path) else {
+        return Arc::from([]);
     };
-    text.lines()
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some((_, rows)) = memo
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&path)
+        .filter(|(seen, _)| *seen == before)
+    {
+        return Arc::clone(rows);
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Arc::from([]);
+    };
+    let rows: Arc<[LaneEvent]> = text
+        .lines()
         .filter_map(|l| serde_json::from_str::<LaneEvent>(l).ok())
-        .collect()
+        .collect();
+    // An append during the read leaves no entry: the next ask parses the ledger as it then stands.
+    if FileId::at(&path) == Some(before) {
+        memo.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path, (before, Arc::clone(&rows)));
+    }
+    rows
 }
 
-/// The latest `stop` per bare agent id — what [`status_of`] consults.
-fn ledger_stops(rows: &[LaneEvent], session_id: &str) -> HashMap<String, DateTime<Utc>> {
+/// The ledger's rows indexed for lineage walks: each parent session's rows, and the latest
+/// `start` per agent. Built once per ledger state ([`ledger_index`]).
+#[derive(Default)]
+pub struct LedgerIndex {
+    pub rows: std::sync::Arc<[LaneEvent]>,
+    by_session: HashMap<String, Vec<usize>>,
+    started: HashMap<String, usize>,
+    stopped: HashMap<String, DateTime<Utc>>,
+}
+
+impl LedgerIndex {
+    fn of(rows: std::sync::Arc<[LaneEvent]>) -> Self {
+        let mut index = LedgerIndex {
+            rows,
+            ..Default::default()
+        };
+        for (at, row) in index.rows.iter().enumerate() {
+            index.by_session.entry(row.session_id.clone()).or_default().push(at);
+            match row.event {
+                LaneEventKind::Start => {
+                    index.started.insert(row.agent_id.clone(), at);
+                }
+                LaneEventKind::Stop => {
+                    let ts = index.stopped.entry(row.agent_id.clone()).or_insert(row.ts);
+                    *ts = (*ts).max(row.ts);
+                }
+            }
+        }
+        index
+    }
+    /// The positions of the rows naming `session` as their parent, in file order.
+    pub fn rows_of(&self, session: &str) -> &[usize] {
+        self.by_session.get(session).map_or(&[], Vec::as_slice)
+    }
+    /// The latest `stop` of `agent`, any parent's.
+    pub fn latest_stop(&self, agent: &str) -> Option<DateTime<Utc>> {
+        self.stopped.get(agent).copied()
+    }
+    /// The last `start` row registering `agent`.
+    pub fn latest_start(&self, agent: &str) -> Option<&LaneEvent> {
+        self.started.get(agent).map(|&at| &self.rows[at])
+    }
+}
+
+/// [`read_ledger`] indexed, kept while the ledger's parse is: a lineage walk per parent (Codex
+/// `hook_forest`) or per touching session (the edit guard) is then a lookup, not a scan of
+/// every row.
+pub fn ledger_index() -> std::sync::Arc<LedgerIndex> {
+    use std::sync::{Arc, Mutex, PoisonError};
+    static MEMO: Mutex<Option<Arc<LedgerIndex>>> = Mutex::new(None);
+    let rows = read_ledger();
+    let mut memo = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(index) = memo.as_ref().filter(|index| Arc::ptr_eq(&index.rows, &rows)) {
+        return Arc::clone(index);
+    }
+    let index = Arc::new(LedgerIndex::of(rows));
+    *memo = Some(Arc::clone(&index));
+    index
+}
+
+/// The latest `stop` per bare agent id among the rows `keep` admits — what [`status_of`]
+/// consults. The parent scope keeps one parent's rows; the forest scope keeps the lanes' own.
+fn ledger_stops<'a>(
+    rows: impl IntoIterator<Item = &'a LaneEvent>,
+    mut keep: impl FnMut(&LaneEvent) -> bool,
+) -> HashMap<String, DateTime<Utc>> {
     let mut m: HashMap<String, DateTime<Utc>> = HashMap::new();
-    for r in rows
-        .iter()
-        .filter(|r| r.event == LaneEventKind::Stop && r.session_id == session_id)
-    {
+    for r in rows.into_iter().filter(|r| r.event == LaneEventKind::Stop && keep(r)) {
         let e = m.entry(r.agent_id.clone()).or_insert(r.ts);
         *e = (*e).max(r.ts);
     }
@@ -455,7 +545,7 @@ impl Lane {
 /// against the tail of the last assistant text. They are the shapes that stranded four lanes on
 /// one day (`Waiting on notifications`, `I'll continue when the monitor fires`, `waiting for the
 /// … verdict`), generalized just enough to catch their siblings and no further.
-pub const STRAND_PATTERNS: &[&str] = &[
+const STRAND_PATTERNS: &[&str] = &[
     r"waiting (on|for) ([\w'’-]+ ){0,5}(notification|notifications|monitor|verdict|verdicts|build|builds|result|results|lane|lanes|run|job|report|reply|answer)\b",
     r"continue (when|once|after) (the |that |this |it )?\w*( \w+){0,2} ?(fires|lands|arrives|finishes|completes|returns|comes back|is ready|reports)\b",
     r"\b(i.?ll|i will|will) (continue|resume|pick (this|it|that) (back )?up|check back|follow up|report back|proceed) (when|once|after|as soon as)\b",
@@ -850,22 +940,17 @@ pub fn lanes_of(parent: &SessionRef) -> Result<Vec<Lane>> {
         .map(|adapter| adapter.task_notices(parent))
         .transpose()?
         .unwrap_or_default();
-    let rows = read_ledger();
+    // From the ledger's index: a parent's rows, or each lane's latest stop, never a scan of the
+    // whole ledger per parent (`cv lanes` asks once per session).
+    let index = ledger_index();
     let ledger = match crate::harness::rootless(parent.harness).and_then(|adapter| adapter.capabilities().lane_stops) {
-        Some(StopScope::Parent) => ledger_stops(&rows, &parent.id),
+        Some(StopScope::Parent) => ledger_stops(index.rows_of(&parent.id).iter().map(|&at| &index.rows[at]), |_| true),
         Some(StopScope::Forest) => {
             let agents: std::collections::HashSet<_> = subs.iter().map(|sub| sub.agent_id()).collect();
-            let mut stops = HashMap::new();
-            for row in rows
-                .iter()
-                .filter(|row| row.event == LaneEventKind::Stop && agents.contains(row.agent_id.as_str()))
-            {
-                stops
-                    .entry(row.agent_id.clone())
-                    .and_modify(|at: &mut DateTime<Utc>| *at = (*at).max(row.ts))
-                    .or_insert(row.ts);
-            }
-            stops
+            agents
+                .into_iter()
+                .filter_map(|agent| index.latest_stop(agent).map(|ts| (agent.to_owned(), ts)))
+                .collect()
         }
         None => HashMap::new(),
     };
@@ -1248,10 +1333,13 @@ mod tests {
                 row(5, LaneEventKind::Stop),
                 unrelated,
             ],
-            "s",
+            |r| r.session_id == "s",
         );
         assert_eq!(stops.get("a1").copied(), DateTime::from_timestamp(30, 0));
-        assert!(ledger_stops(&[row(300, LaneEventKind::Stop)], "another-parent").is_empty());
+        assert!(
+            ledger_stops(&[row(300, LaneEventKind::Stop)], |r| r.session_id == "another-parent").is_empty(),
+            "another parent's rows are not this parent's stops"
+        );
     }
 
     #[test]

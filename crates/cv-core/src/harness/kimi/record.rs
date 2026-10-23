@@ -140,17 +140,16 @@ pub(super) const COMPACTION_SUMMARY_TAG: &str = "<system>Previous context has be
 
 /// Refine a `user` record's kind/origin from kimi-cli's own text markers (module doc). A typed
 /// prompt never starts with these tags; the harness's `system()` / `system_reminder()` helpers and
-/// `build_notification_message` always do. Only the first non-whitespace characters are read.
+/// `build_notification_message` always do. Only the first non-whitespace characters are read, up
+/// to the longest marker below.
 fn classify(message: &mut Message) -> Result<()> {
+    const MARKERS: [&str; 4] = [COMPACTION_SUMMARY_TAG, "<notification", "<system>", "<system-reminder>"];
     let Some(Block::Text { text }) = message.content.first() else {
         return Ok(());
     };
-    let (head, _) = crate::harness::store::document::text_head(
-        text,
-        &crate::lazy::Resolver::new(None),
-        COMPACTION_SUMMARY_TAG.chars().count(),
-        true,
-    )?;
+    let head_chars = MARKERS.iter().map(|marker| marker.chars().count()).max().unwrap_or(0);
+    let (head, _) =
+        crate::harness::store::document::text_head(text, &crate::lazy::Resolver::new(None), head_chars, true)?;
     let (kind, origin) = if head.starts_with(COMPACTION_SUMMARY_TAG) {
         (MessageKind::CompactionSummary, Origin::Harness)
     } else if head.starts_with("<notification") {

@@ -8,6 +8,10 @@
 //! consumer owns its records: refreshing counts cannot make an older search index fresh, and a
 //! missing or older record rereads once.
 //!
+//! A session in a shared SQLite store adds its [`Rows`] certificate: a write to the store moves
+//! the database's identity for all its sessions, and a session whose certificate holds is admitted
+//! without rereading ([`Record::admit_for`]).
+//!
 //! These are metadata guards, not content verification. Append-safe comparisons deliberately
 //! exclude the primary identity: immutable-prefix contracts and sampled resume marks govern reuse
 //! during growth. The before-pass inventory covers adapter-declared paths; consumers additionally
@@ -184,6 +188,28 @@ struct Entry {
     state: Option<FileId>,
     #[serde(skip)]
     prefix: Option<Prefix>,
+    /// An append-only file whose head the reader consulted ([`ReadSet::record_append_only`]):
+    /// its growth keeps the entry fresh while this sample still holds ([`FileId::admits`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grows: Option<Prefix>,
+    /// A declared [`Dependencies::resumable`] file: its growth (this sample still holding)
+    /// leaves a mark resumable ([`Baseline::dependencies_fresh`]) but never admits a record as it
+    /// stands ([`Baseline::fresh`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resumes: Option<Prefix>,
+}
+
+impl Entry {
+    /// Still as recorded, or (an append-only entry) only grown.
+    fn holds(&self, probe: &mut Probe) -> bool {
+        let now = probe.entry(&self.path);
+        now.as_ref() == Some(self)
+            || self
+                .grows
+                .zip(self.state)
+                .zip(now.and_then(|now| now.state))
+                .is_some_and(|((sample, then), now)| then.admits(&sample, &now, &self.path))
+    }
 }
 
 impl PartialEq for Entry {
@@ -200,11 +226,16 @@ impl std::hash::Hash for Entry {
 }
 
 /// The one version of everything cv stores about a session: the [`Record`] envelope, the
-/// catalog's discovery interpretation, the affordance view, the usage projection rows and the
-/// semantic store's header. A change to what any of them means bumps it, and every consumer
-/// rereads each session once (0.18 is 6; 0.17 wrote 4). Layout versions of cv's own logs and
-/// cursors (`events` schema, task log, watch cursor) version a byte layout, not an interpretation.
-pub const VERSION: u32 = 6;
+/// catalog (its schema stamp and discovery interpretation), the affordance view, the usage
+/// projection rows, the semantic store's header, the full-text index, and every resume mark with
+/// the codec checkpoint inside it. A change to what any of them means, or to a rebuildable
+/// table's shape, bumps it, and every consumer rereads each session once (0.18 is 9: rc.3 wrote
+/// 8, whose full-text index held only the first MiB of a persisted tool output; rc.2 wrote 7,
+/// whose Cursor listings counted dropped bubbles; rc.1 wrote 6, whose discovery counted tool
+/// results as turns; 0.17 wrote 4). Two byte layouts are versioned apart because they are not
+/// rebuilt from transcripts: the task log (durable user data) and a watch cursor (a follower's
+/// position).
+pub const VERSION: u32 = 9;
 
 /// Version identity for non-Record read state; keep the same interpretation authority.
 pub(crate) fn consumer_version(consumer: impl std::fmt::Display) -> String {
@@ -256,13 +287,59 @@ impl Stamp {
         }
     }
 
+    /// The same inventory: equal as text, or (one side sampling a resumable file the other did
+    /// not, as an inventory taken before it was declared resumable) as paths and identities.
+    fn same_entries(&self, current: &Stamp) -> bool {
+        self.entries.get() == current.entries.get()
+            || self
+                .entries()
+                .zip(current.entries())
+                .is_some_and(|(old, now)| old == now)
+    }
+
+    /// [`Self::matches`], except that a declared [`Dependencies::resumable`] file may have grown
+    /// since this inventory sampled it: a resumed read decides from its mark what the growth
+    /// revises.
+    fn matches_grown(&self, current: &Stamp, probe: &mut Probe) -> bool {
+        if self.entries.get() != current.entries.get() {
+            let (Some(old), Some(now)) = (self.entries(), current.entries()) else {
+                return false;
+            };
+            let grown = |old: &Entry, now: &Entry| {
+                old.path == now.path
+                    && (old == now
+                        || old
+                            .resumes
+                            .zip(old.state)
+                            .zip(now.state)
+                            .is_some_and(|((sample, then), now)| then.admits(&sample, &now, &old.path)))
+            };
+            if old.len() != now.len() || !old.iter().zip(&now).all(|(old, now)| grown(old, now)) {
+                return false;
+            }
+        }
+        matches!(self.reads(), Some(Some(reads)) if reads.iter().all(|entry| entry.holds(probe)))
+    }
+
+    /// [`Self::matches`] with the files in `store` left out of both sides: a shared database's
+    /// own files, which every write to any of its sessions moves.
+    fn matches_except(&self, current: &Stamp, probe: &mut Probe, store: &[PathBuf]) -> bool {
+        let kept =
+            |entries: Vec<Entry>| -> Vec<Entry> { entries.into_iter().filter(|e| !store.contains(&e.path)).collect() };
+        let (Some(old), Some(now)) = (self.entries(), current.entries()) else {
+            return false;
+        };
+        let Some(Some(reads)) = self.reads() else {
+            return false;
+        };
+        kept(old) == kept(now) && kept(reads).iter().all(|entry| entry.holds(probe))
+    }
+
     /// The same inventory, and every recorded read still as recorded: the stamp of a pass whose
     /// read set is unrecorded never matches.
     fn matches(&self, current: &Stamp, probe: &mut Probe) -> bool {
-        self.entries.get() == current.entries.get()
-            && matches!(self.reads(), Some(Some(reads)) if reads
-                .iter()
-                .all(|entry| probe.entry(&entry.path).as_ref() == Some(entry)))
+        self.same_entries(current)
+            && matches!(self.reads(), Some(Some(reads)) if reads.iter().all(|entry| entry.holds(probe)))
     }
 }
 
@@ -354,6 +431,29 @@ impl ReadSet {
         }
     }
 
+    /// [`Self::record`] of an append-only file whose head (and length so far) the reader
+    /// consulted, not its growth: an append keeps it fresh, a rewrite of its sampled bytes
+    /// ([`Prefix`]) does not.
+    pub fn record_append_only(&mut self, path: &Path) {
+        let Some(path) = absolute(path) else {
+            self.known = false;
+            return;
+        };
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.entries.entry(path) {
+            match Probe::default().entry(slot.key()) {
+                Some(mut entry) => {
+                    if let Some(state) = entry.state {
+                        entry.grows = std::fs::File::open(&entry.path)
+                            .ok()
+                            .and_then(|file| Prefix::of(&file, state.len));
+                    }
+                    slot.insert(entry);
+                }
+                None => self.known = false,
+            }
+        }
+    }
+
     /// The `(mtime_ns, len)` recorded for an existing `path`, the key persisted caches index by.
     pub(crate) fn signature(&self, path: &Path) -> Option<(u64, u64)> {
         let state = self.entries.get(&absolute(path)?)?.state.as_ref()?;
@@ -386,11 +486,7 @@ impl ReadSet {
 
     /// Revalidate exactly the paths captured by this consumer, including absence and identity.
     pub fn fresh(&self, probe: &mut Probe) -> bool {
-        self.known
-            && self
-                .entries
-                .values()
-                .all(|entry| probe.entry(&entry.path).as_ref() == Some(entry))
+        self.known && self.entries.values().all(|entry| entry.holds(probe))
     }
 
     /// [`Self::fresh`], except that a primary recorded as appendable may also
@@ -399,12 +495,11 @@ impl ReadSet {
     pub(crate) fn fresh_or_grown(&self, probe: &mut Probe) -> bool {
         self.known
             && self.entries.values().all(|entry| {
-                let now = probe.entry(&entry.path);
-                now.as_ref() == Some(entry)
+                entry.holds(probe)
                     || entry
                         .state
                         .zip(entry.prefix)
-                        .zip(now.and_then(|now| now.state))
+                        .zip(probe.entry(&entry.path).and_then(|now| now.state))
                         .is_some_and(|((then, prefix), now)| then.admits(&prefix, &now, &entry.path))
             })
     }
@@ -413,8 +508,8 @@ impl ReadSet {
 /// Record the original and auxiliary sources retained by one message before a consumer demands it.
 pub(crate) fn session_reads(session: &crate::Session) -> ReadSet {
     let mut reads = ReadSet::default();
-    let primary = session.source_path.as_deref().unwrap_or_else(|| Path::new(""));
-    if session.source_path.is_some() {
+    let primary = session.source_path.as_deref();
+    if let Some(primary) = primary {
         reads.record(primary);
     }
     for message in &session.messages {
@@ -424,15 +519,24 @@ pub(crate) fn session_reads(session: &crate::Session) -> ReadSet {
 }
 
 /// Record the original and auxiliary sources retained by one message before a consumer demands it.
-pub(crate) fn record_message_reads(message: &crate::Message, primary: &std::path::Path, reads: &mut ReadSet) {
+pub(crate) fn record_message_reads(message: &crate::Message, primary: Option<&std::path::Path>, reads: &mut ReadSet) {
+    /// A captured source records its path (unless it *is* the primary) plus its dependencies.
+    fn captured(
+        path: &std::path::Path,
+        deps: Option<&ReadSet>,
+        primary: Option<&std::path::Path>,
+        reads: &mut ReadSet,
+    ) {
+        if primary != Some(path) {
+            reads.record(path);
+        }
+        if let Some(deps) = deps {
+            reads.merge(deps);
+        }
+    }
     if let Some(record) = &message.complete_record {
         if let crate::Json::Source(range) = &record.value {
-            if range.path() != primary {
-                reads.record(range.path());
-            }
-            if let Some(guard) = range.dependencies() {
-                reads.merge(guard);
-            }
+            captured(range.path(), range.dependencies(), primary, reads);
         }
     }
     for block in &message.content {
@@ -441,12 +545,7 @@ pub(crate) fn record_message_reads(message: &crate::Message, primary: &std::path
             ..
         } = block
         {
-            if range.path() != primary {
-                reads.record(range.path());
-            }
-            if let Some(guard) = range.dependencies() {
-                reads.merge(guard);
-            }
+            captured(range.path(), range.dependencies(), primary, reads);
         }
         let text = match block {
             crate::Block::Text { text } | crate::Block::Thinking { text, .. } => Some(text),
@@ -455,18 +554,11 @@ pub(crate) fn record_message_reads(message: &crate::Message, primary: &std::path
         };
         match text {
             Some(crate::Text::Span(span)) => {
-                if let Some(path) = span.source.as_ref().filter(|path| path.as_path() != primary) {
+                if let Some(path) = span.source.as_ref().filter(|path| Some(path.as_path()) != primary) {
                     reads.record(path);
                 }
             }
-            Some(crate::Text::Source(source)) => {
-                if source.path() != primary {
-                    reads.record(source.path());
-                }
-                if let Some(guard) = source.dependencies() {
-                    reads.merge(guard);
-                }
-            }
+            Some(crate::Text::Source(source)) => captured(source.path(), source.dependencies(), primary, reads),
             _ => {}
         }
     }
@@ -479,6 +571,33 @@ pub(crate) fn record_message_reads(message: &crate::Message, primary: &std::path
 pub struct Baseline {
     pub primary: Option<FileId>,
     pub stamp: Option<Stamp>,
+    /// A session in a shared SQLite store: its own rows as the adapter certified them when this
+    /// baseline was published ([`Rows`]). Absent for every other source, and then never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Rows>,
+}
+
+/// The certificate of one session's rows in a database shared by many sessions
+/// ([`crate::harness::Adapter::rows`]): how many rows its read consults, the highest rowid among
+/// them (the high-water mark), and a digest of the small rows and flags beside them (session
+/// metadata, lineage, visibility). A write to the store moves the database's identity for every
+/// session in it; a session whose certificate is unchanged is admitted without rereading. Like a
+/// resume mark's samples, it is not a content digest: an in-place edit of a message body that
+/// changes no count, rowid, flag or session row escapes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Rows {
+    pub count: u64,
+    pub high: i64,
+    pub digest: u64,
+}
+
+impl Rows {
+    /// Fold `bytes` into a certificate digest (FNV-1a), for adapters building one.
+    pub fn fold(digest: u64, bytes: &[u8]) -> u64 {
+        fnv1a(digest, bytes)
+    }
+    /// The digest a certificate starts from.
+    pub const SEED: u64 = 0xcbf2_9ce4_8422_2325;
 }
 
 impl Baseline {
@@ -506,17 +625,55 @@ impl Baseline {
         })
     }
 
-    /// Auxiliary inventories and all recorded reads still match, independently of primary growth.
+    /// Auxiliary inventories and all recorded reads still match, independently of primary growth;
+    /// a [`Dependencies::resumable`] file may have grown, which only a resumed read may admit.
     pub fn dependencies_fresh(&self, current: &Self, probe: &mut Probe) -> bool {
         self.stamp
             .as_ref()
             .zip(current.stamp.as_ref())
-            .is_some_and(|(old, now)| old.matches(now, probe))
+            .is_some_and(|(old, now)| old.matches_grown(now, probe))
     }
 
-    /// Strict: the primary was captured and is unchanged, and the dependencies are fresh.
+    /// Strict: the primary was captured and is unchanged, and every dependency is as recorded.
     pub fn fresh(&self, current: &Self, probe: &mut Probe) -> bool {
-        self.primary.is_some() && self.primary == current.primary && self.dependencies_fresh(current, probe)
+        self.primary.is_some()
+            && self.primary == current.primary
+            && self
+                .stamp
+                .as_ref()
+                .zip(current.stamp.as_ref())
+                .is_some_and(|(old, now)| old.matches(now, probe))
+    }
+
+    /// A session in a store shared by many whose files moved (another session was written): the
+    /// store's own files aside, every dependency is as recorded, and `r`'s rows certify as they
+    /// did ([`Rows`]). The store is `r`'s primary (a SQLite database, a `logs.json`) or a shared
+    /// side file of it ([`crate::harness::Adapter::rows_store`]), when its primary must be as it
+    /// was.
+    pub fn rows_fresh(&self, r: &SessionRef, current: &Self, probe: &mut Probe) -> bool {
+        let (Some(rows), Some(_), Some(old), Some(now)) =
+            (self.rows, current.primary, self.stamp.as_ref(), current.stamp.as_ref())
+        else {
+            return false;
+        };
+        let Some(shared) = probe.rows_store(r) else {
+            return false;
+        };
+        // A store that is not the session's primary certifies its slice of a shared side file;
+        // the primary itself must be as it was. (A primary store's replacement is in its
+        // certificate: [`store_birth`].)
+        let primary = probe.primary_path(r);
+        if absolute(&shared) != absolute(&primary) && self.primary != current.primary {
+            return false;
+        }
+        let store = match probe.adapters.get(&r.harness) {
+            Some(Some(adapter)) => store_files(adapter.as_ref(), &shared),
+            _ => return false,
+        };
+        let Some(store) = store.iter().map(|p| absolute(p)).collect::<Option<Vec<_>>>() else {
+            return false;
+        };
+        old.matches_except(now, probe, &store) && probe.rows(r) == Some(rows)
     }
 
     /// Attach the read set captured by this consumer's complete pass, never another consumer's.
@@ -533,6 +690,7 @@ impl Baseline {
         Self {
             primary: self.primary,
             stamp,
+            rows: self.rows,
         }
     }
 }
@@ -548,6 +706,10 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
 pub trait Payload: Serialize + serde::de::DeserializeOwned {
     /// The consumer's name: written into every record and checked when one loads.
     const TAG: &'static str;
+    /// Whether the payload is derived from the session's own rows alone, so a SQLite session's
+    /// [`Rows`] certificate may admit it across writes to other sessions of its store. A
+    /// database-wide projection is not.
+    const BY_ROWS: bool = false;
 }
 
 /// The one envelope of everything cv stores about a session: the [`VERSION`] it was written
@@ -617,6 +779,14 @@ impl<T: Payload> Record<T> {
     pub fn admit(&self, now: &Baseline, probe: &mut Probe) -> Option<&T> {
         (self.version == VERSION && self.baseline.fresh(now, probe)).then_some(&self.payload)
     }
+
+    /// [`Self::admit`], or, for a payload of `r`'s own rows ([`Payload::BY_ROWS`]) in a shared
+    /// SQLite store, its unchanged [`Rows`] certificate ([`Baseline::rows_fresh`]).
+    pub fn admit_for(&self, r: &SessionRef, now: &Baseline, probe: &mut Probe) -> Option<&T> {
+        self.admit(now, probe).or_else(|| {
+            (T::BY_ROWS && self.version == VERSION && self.baseline.rows_fresh(r, now, probe)).then_some(&self.payload)
+        })
+    }
 }
 
 /// What an adapter declares a session reads besides its primary
@@ -627,7 +797,42 @@ impl<T: Payload> Record<T> {
 pub struct Dependencies {
     pub files: Vec<PathBuf>,
     pub directories: Vec<PathBuf>,
+    /// Append-only files the read consults whole, whose growth can revise what it emitted before:
+    /// recorded like `files`, with a [`Prefix`] sample, so their growth keeps a resume mark usable
+    /// (the adapter's resumed read declines when the growth revises its prefix) but never admits a
+    /// record as it stands.
+    pub resumable: Vec<PathBuf>,
 }
+
+/// The store file's identity, folded into each of its sessions' certificates: device, inode and
+/// birth time. Writes to a store keep its file; a store replaced by another file (a copy, a
+/// restore) is another store whose rows nothing here has read, even when the copy holds the same
+/// bytes (so no SQLite header field tells them apart) and the filesystem reuses the freed inode
+/// (ext4 does; the birth time then differs). Where the filesystem keeps no birth time, device and
+/// inode alone.
+fn store_birth(path: &Path) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return out;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        out[..8].copy_from_slice(&metadata.dev().to_le_bytes());
+        out[8..16].copy_from_slice(&metadata.ino().to_le_bytes());
+    }
+    let born = metadata
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    out[16..].copy_from_slice(&born.to_le_bytes());
+    out
+}
+
+/// A shared SQLite store, and the certificates of its sessions ([`Probe::rows`]).
+type Store = (Harness, PathBuf);
+type Certified = Option<std::sync::Arc<HashMap<String, Rows>>>;
 
 /// File and immediate-directory probes shared within one operation. It never descends recursively.
 #[derive(Default)]
@@ -636,6 +841,8 @@ pub struct Probe {
     directories: HashMap<PathBuf, Option<std::sync::Arc<Vec<PathBuf>>>>,
     // Adapters resolved once per operation: detection stats roots, so not once per session.
     adapters: HashMap<Harness, Option<Box<dyn crate::harness::Adapter>>>,
+    // Shared stores certified once per operation ([`Probe::rows`]).
+    rows: HashMap<Store, Certified>,
 }
 
 enum Observation {
@@ -675,6 +882,8 @@ impl Probe {
             path,
             state,
             prefix: None,
+            grows: None,
+            resumes: None,
         })
     }
 
@@ -753,7 +962,11 @@ impl Probe {
             .map_or(Some(()), |adapter| adapter.dependencies(r, self, &mut deps));
         self.adapters.insert(r.harness, adapter);
         declared?;
-        let Dependencies { files, directories } = deps;
+        let Dependencies {
+            files,
+            directories,
+            resumable,
+        } = deps;
         let mut entries = BTreeMap::new();
         for dir in directories {
             entries.insert(dir.clone(), self.entry(&dir)?.state);
@@ -775,14 +988,27 @@ impl Probe {
             let state = self.entry(&file)?.state;
             entries.insert(file, state);
         }
+        let mut samples = HashMap::new();
+        for file in resumable {
+            let state = self.entry(&file)?.state;
+            let file = absolute(&file)?;
+            if let Some(state) = state {
+                // A file that moved between the stat and the sample is recorded exact.
+                let sample = std::fs::File::open(&file).ok().and_then(|f| Prefix::of(&f, state.len));
+                samples.insert(file.clone(), sample);
+            }
+            entries.insert(file, state);
+        }
         entries
             .into_iter()
             .map(|(path, state)| {
                 let path = if path.is_absolute() { path } else { absolute(&path)? };
                 Some(Entry {
+                    resumes: samples.remove(&path).flatten(),
                     path,
                     state,
                     prefix: None,
+                    grows: None,
                 })
             })
             .collect()
@@ -799,8 +1025,87 @@ impl Probe {
         Baseline {
             primary: self.entry(primary).and_then(|entry| entry.state),
             stamp: self.dependencies_from(r, primary),
+            rows: None,
         }
     }
+
+    /// The store whose certificate covers `r` ([`crate::harness::Adapter::rows_store`]).
+    pub fn rows_store(&mut self, r: &SessionRef) -> Option<PathBuf> {
+        self.adapters
+            .entry(r.harness)
+            .or_insert_with(|| crate::harness::for_harness(r.harness))
+            .as_ref()?
+            .rows_store(r)
+    }
+
+    /// `r`'s [`Rows`] certificate, when its adapter keeps it in a store shared by many sessions
+    /// ([`crate::harness::Adapter::rows_store`]: a SQLite database, a gemini-cli `logs.json`, a
+    /// Kimi Code `state.json`): every session of that store is certified at once, from one
+    /// consistent read, once per store state in this process (the state is the store's, WAL's and
+    /// journal's identities, the ones a write moves) and once per probe.
+    pub fn rows(&mut self, r: &SessionRef) -> Option<Rows> {
+        type State = Vec<Option<FileId>>;
+        type Stores = std::sync::Mutex<HashMap<Store, (State, Certified)>>;
+        static STORES: std::sync::LazyLock<Stores> = std::sync::LazyLock::new(Default::default);
+        let shared = self.rows_store(r)?;
+        let store = (r.harness, absolute(&shared)?);
+        if !self.rows.contains_key(&store) {
+            let adapter = self.adapters.get(&r.harness).and_then(Option::as_ref);
+            let certified = adapter.and_then(|adapter| {
+                let files = store_files(adapter.as_ref(), &shared);
+                let state = || -> State { files.iter().map(|f| FileId::at(f)).collect() };
+                let before = state();
+                let cached = STORES
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&store)
+                    .filter(|(at, _)| *at == before)
+                    .map(|(_, certified)| certified.clone());
+                cached.unwrap_or_else(|| {
+                    // A session's own store carries its birth; a shared side file's slice is
+                    // certified by content, whatever file holds it (side files are commonly
+                    // replaced by an atomic rename on every write).
+                    let born = (shared == r.path).then(|| store_birth(&store.1));
+                    let certified = adapter.rows(&shared).map(|mut rows| {
+                        if let Some(born) = born {
+                            for certificate in rows.values_mut() {
+                                certificate.digest = Rows::fold(certificate.digest, &born);
+                            }
+                        }
+                        std::sync::Arc::new(rows)
+                    });
+                    // Kept only when no write landed while certifying.
+                    if state() == before {
+                        STORES
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(store.clone(), (before, certified.clone()));
+                    }
+                    certified
+                })
+            });
+            self.rows.insert(store.clone(), certified);
+        }
+        let key = match self.adapters.get(&r.harness) {
+            Some(Some(adapter)) => adapter.rows_key(r),
+            _ => &r.id,
+        };
+        self.rows.get(&store)?.as_ref()?.get(key).copied()
+    }
+}
+
+/// The files whose identities are a shared store's state ([`Probe::rows`]): each of its
+/// [`crate::harness::Adapter::rows_files`] with its SQLite sidecars.
+fn store_files(adapter: &dyn crate::harness::Adapter, store: &Path) -> Vec<PathBuf> {
+    adapter
+        .rows_files(store)
+        .into_iter()
+        .flat_map(|file| {
+            let mut files: Vec<PathBuf> = sqlite_sidecars(&file).into();
+            files.push(file);
+            files
+        })
+        .collect()
 }
 
 /// The built-in adapter's actual append file, which may differ from a directory session key.
@@ -839,11 +1144,9 @@ pub(crate) fn unchanged_with(r: &SessionRef, primary: &Path, baseline: &Baseline
     let same = entries == now;
     drop(entries);
     drop(now);
-    same && reads.as_ref().is_none_or(|reads| {
-        reads
-            .iter()
-            .all(|entry| probe.entry(&entry.path).as_ref() == Some(entry))
-    })
+    same && reads
+        .as_ref()
+        .is_none_or(|reads| reads.iter().all(|entry| entry.holds(probe)))
 }
 
 pub type Update = (SessionRef, Baseline);
@@ -876,9 +1179,9 @@ impl<T: Payload> Table<T> {
         self.rows.get(&key(r))
     }
 
-    /// [`Record::admit`] of `r`'s record.
+    /// [`Record::admit_for`] of `r`'s record.
     pub fn admit(&self, r: &SessionRef, now: &Baseline, probe: &mut Probe) -> Option<&T> {
-        self.get(r)?.admit(now, probe)
+        self.get(r)?.admit_for(r, now, probe)
     }
 
     /// The records of `consumer` (`T::TAG`, or a tagged instance such as one index's `fts:<id>`).
@@ -946,11 +1249,10 @@ pub(crate) fn fresh_in<T: Payload + PartialEq>(
     payload: &T,
 ) -> bool {
     record_in::<T>(conn, consumer, r)
-        .is_some_and(|record| record.payload == *payload && record.admit(now, &mut Probe::default()).is_some())
+        .is_some_and(|record| record.payload == *payload && record.admit_for(r, now, &mut Probe::default()).is_some())
 }
 
 /// A 64-bit digest of `bytes`, for a payload that binds output the consumer keeps elsewhere.
-#[cfg(feature = "sqlite")]
 pub(crate) fn digest(bytes: &[u8]) -> u64 {
     fnv1a(0xcbf2_9ce4_8422_2325, bytes)
 }
@@ -980,10 +1282,17 @@ pub(crate) fn publish_in<T: Payload>(
         .stamp
         .as_ref()
         .is_some_and(|stamp| matches!(stamp.reads(), Some(Some(_))));
+    // A shared store's certificate is taken before the identity check: the store unchanged since
+    // the capture means the certificate describes the rows this pass read.
+    let rows = if T::BY_ROWS { probe.rows(r) } else { None };
     if complete && unchanged_with(r, &probe.primary_path(r), baseline, probe) {
+        let baseline = Baseline {
+            rows,
+            ..baseline.clone()
+        };
         conn.execute(
             "INSERT INTO source_dependencies(consumer,harness,id,path,record) VALUES(?1,?2,?3,?4,?5)",
-            rusqlite::params![consumer, h, id, path, encode(VERSION, baseline, payload)],
+            rusqlite::params![consumer, h, id, path, encode(VERSION, &baseline, payload)],
         )?;
     }
     Ok(())
@@ -992,32 +1301,27 @@ pub(crate) fn publish_in<T: Payload>(
 /// Invalidate old baselines before changing consumer output. Failure must prevent that output
 /// write: otherwise an older stamp could certify newer output after dependencies revert.
 #[cfg(feature = "sqlite")]
-pub fn invalidate(consumer: &str, refs: &[SessionRef]) -> bool {
-    if crate::env::frozen() {
-        return false;
-    }
+pub fn invalidate(consumer: &str, refs: &[SessionRef]) -> anyhow::Result<()> {
+    anyhow::ensure!(!crate::env::frozen(), "the catalog is frozen");
     if refs.is_empty() {
-        return true;
+        return Ok(());
     }
-    let clear = || -> Option<()> {
-        let mut conn = open()?;
-        let tx = conn.transaction().ok()?;
-        for r in refs {
-            let (h, id, path) = key(r);
-            tx.execute(
-                "DELETE FROM source_dependencies WHERE consumer=?1 AND harness=?2 AND id=?3 AND path=?4",
-                rusqlite::params![consumer, h, id, path],
-            )
-            .ok()?;
-        }
-        tx.commit().ok()
-    };
-    clear().is_some()
+    let mut conn = open().ok_or_else(|| anyhow::anyhow!("the catalog cannot be opened"))?;
+    let tx = conn.transaction()?;
+    for r in refs {
+        let (h, id, path) = key(r);
+        tx.execute(
+            "DELETE FROM source_dependencies WHERE consumer=?1 AND harness=?2 AND id=?3 AND path=?4",
+            rusqlite::params![consumer, h, id, path],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(not(feature = "sqlite"))]
-pub fn invalidate(_consumer: &str, _refs: &[SessionRef]) -> bool {
-    true
+pub fn invalidate(_consumer: &str, _refs: &[SessionRef]) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Publish after a consumer whose output lives outside the catalog commits it (its payload is
@@ -1727,6 +2031,16 @@ mod tests {
             after.stamp,
             Probe::default().snapshot(&r).with_reads(&ReadSet::default()).stamp,
             "part membership"
+        );
+        // The stream uses the part root for an absent message ID too. Dependency caching must
+        // retain that default, even when the message filename could suggest a different ID.
+        std::fs::write(storage.join("message/sid/noncanonical.json"), r#"{"role":"user"}"#).unwrap();
+        let before = Probe::default().snapshot(&r).with_reads(&ReadSet::default());
+        std::fs::write(storage.join("part/default.json"), "new").unwrap();
+        assert_ne!(
+            before.stamp,
+            Probe::default().snapshot(&r).with_reads(&ReadSet::default()).stamp,
+            "missing IDs still track their default part directory"
         );
     }
 

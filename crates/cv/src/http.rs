@@ -584,6 +584,17 @@ impl<'a> Response<'a> {
                     "response body ended early",
                 ));
             }
+            // A body longer than its declared length lies as much as a short one; its tail must
+            // not vanish behind a response that looks complete. Every body is a staged file or a
+            // buffer, so this is one read that answers EOF when the length is right.
+            let mut surplus = [0u8; 1];
+            if self.body.read(&mut surplus)? != 0 {
+                out.flush()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "response body exceeds its Content-Length",
+                ));
+            }
         }
         out.flush()
     }
@@ -612,6 +623,20 @@ fn reason(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_body_longer_than_its_length_is_an_error_after_the_declared_bytes() {
+        let mut out = Vec::new();
+        let error = super::Response::stream(200, Box::new(std::io::Cursor::new(b"abcdef".to_vec())), 4)
+            .write_to(&mut out, true, false)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(out.ends_with(b"\r\n\r\nabcd"), "{}", String::from_utf8_lossy(&out));
+        let mut out = Vec::new();
+        super::Response::stream(200, Box::new(std::io::Cursor::new(b"abcd".to_vec())), 4)
+            .write_to(&mut out, true, false)
+            .unwrap();
+    }
+
     use super::*;
 
     #[test]

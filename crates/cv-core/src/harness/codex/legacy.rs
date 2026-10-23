@@ -2,11 +2,13 @@
 //! through the same record codec as modern rollouts: the session object is a `session_meta`
 //! payload, each item a `response_item` payload. Only one item's demanded fields are owned at once.
 use super::*;
-use crate::harness::store::{document::Fields, jsonl::ranges};
+use crate::harness::store::document::Fields;
 use crate::json::InvalidJson;
+use crate::json::{ReadInput, Validation};
 
-/// Value acceptance is whole-document, including ignored descendants. Invalid JSON remains an
-/// empty session; read errors (including invalid UTF-8) remain fatal, as with read_to_string.
+/// Value acceptance is whole-document, including ignored descendants. A zero-byte file is an
+/// empty session (nothing recorded yet); any other document that does not decode is a named read
+/// failure, never an empty session: the source is reported, as every unopenable source is.
 fn read<T>(path: &Path, f: impl for<'a> FnOnce(&JsonSource, JsonView<'a>) -> Result<T>) -> Result<Option<T>> {
     let source = JsonSource::capture(path)?;
     let file = fs::File::open(path)?;
@@ -18,16 +20,17 @@ fn read<T>(path: &Path, f: impl for<'a> FnOnce(&JsonSource, JsonView<'a>) -> Res
         return Ok(None);
     }
     let mut entered = false;
-    match source.read_document(|view| {
+    match source.read(ReadInput::Document, Validation::Value, |view| {
         entered = true;
         f(&source, view)
     }) {
         Ok(value) => Ok(Some(value)),
         Err(error) if !entered && error.is::<InvalidJson>() => {
-            let valid = ranges::valid_utf8(&mut BufReader::new(file))?;
             source.check()?;
-            anyhow::ensure!(valid, "reading {}: stream did not contain valid UTF-8", path.display());
-            Ok(None)
+            Err(error.context(format!(
+                "reading {}: not one legacy Codex JSON document",
+                path.display()
+            )))
         }
         Err(error) => Err(error),
     }
@@ -159,17 +162,8 @@ mod tests {
         let path = world.base.join("rollout-legacy.json");
         let valid_prefix = r#"{"items":[{"type":"message","content":"visible"}],"ignored":"#;
         let deep = format!("{valid_prefix}{}0{} }}", "[".repeat(130), "]".repeat(130));
-        for raw in [
-            "",
-            " ",
-            "false",
-            "{}",
-            r#"{"items":[{"type":"message","content":"visible"}],"ignored":"\ud800"}"#,
-            &deep,
-            r#"{"items":[{"type":"message","content":"visible"}],"ignored":1e9999}"#,
-            r#"{"items":[{"type":"message","content":"visible"}]"#,
-        ] {
-            // Not exactly a serde Value (or no items): an empty session, an empty listing.
+        for raw in ["", "false", "{}"] {
+            // A zero-byte file, or a document with no items: an empty session, an empty listing.
             fs::write(&path, raw).unwrap();
             let actual = collected(&path, &stream::Demand::LEAN.with_spans());
             assert!(actual.messages.is_empty(), "{raw}");
@@ -179,6 +173,28 @@ mod tests {
                 listing.id.is_empty() && listing.title.is_none() && listing.created_at.is_none(),
                 "{raw}"
             );
+        }
+        for raw in [
+            " ",
+            r#"{"items":[{"type":"message","content":"visible"}],"ignored":"\ud800"}"#,
+            &deep,
+            r#"{"items":[{"type":"message","content":"visible"}],"ignored":1e9999}"#,
+            r#"{"items":[{"type":"message","content":"visible"}]"#,
+            r#"{"session":{"id":"legacy-broken"},"items":["#,
+        ] {
+            // Not exactly a serde Value: a named read failure, never an empty session.
+            fs::write(&path, raw).unwrap();
+            let r = SessionRef::new("fallback", Harness::Codex, &path);
+            let mut sink = crate::stream::CollectSink::default();
+            let error = Codex { roots: Vec::new() }
+                .stream(&r, &stream::Demand::LEAN.with_spans(), &mut sink)
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("not one legacy Codex JSON document"),
+                "{raw}: {error:#}"
+            );
+            assert!(sink.messages.is_empty(), "{raw}");
+            assert!(scan(&path).is_err(), "{raw}");
         }
         let mut bad_utf8 = valid_prefix.as_bytes().to_vec();
         bad_utf8.extend_from_slice(b"\"\xff\"}");

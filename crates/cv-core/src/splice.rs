@@ -11,13 +11,26 @@
 //! parents that still resolve are kept, the cut points are re-linked, a span lifted from a sub-agent
 //! joins the main thread. `cv splice` calls this.
 
-use crate::ir::{Harness, Message, Session};
+use crate::ir::{GitInfo, Harness, Message, Principal, Session};
+use std::path::PathBuf;
+
+/// The first window's source facts: its harness (which may differ from its discovery reference —
+/// OpenSession documents preserve their named underlying harness) and the session metadata that
+/// carries to the composition.
+struct Owner {
+    harness: Harness,
+    principal: Option<Principal>,
+    cwd: Option<PathBuf>,
+    title: Option<String>,
+    model: Option<String>,
+    git: Option<GitInfo>,
+}
 
 /// Incremental composition of prepared windows. Each source owner is consumed immediately;
 /// selected messages move into the composition without cloning their bodies.
 #[derive(Default)]
 pub struct Composition {
-    first: Option<Session>,
+    owner: Option<Owner>,
     messages: Vec<Message>,
     provenance: Vec<serde_json::Value>,
 }
@@ -29,27 +42,30 @@ impl Composition {
             "source_id": source.id, "harness": source.harness.as_str(), "start": start, "end": end,
         }));
         self.messages.append(&mut source.messages);
-        if let Some(first) = &mut self.first {
-            if first.principal != source.principal {
-                first.principal = None;
+        match &mut self.owner {
+            Some(owner) => {
+                if owner.principal != source.principal {
+                    owner.principal = None;
+                }
             }
-        } else {
-            let mut defaults = Session::new(&source.id, source.harness);
-            defaults.principal = source.principal.take();
-            defaults.cwd = source.cwd.take();
-            defaults.title = source.title.take();
-            defaults.model = source.model.take();
-            defaults.git = source.git.take();
-            self.first = Some(defaults);
+            None => {
+                self.owner = Some(Owner {
+                    harness: source.harness,
+                    principal: source.principal.take(),
+                    cwd: source.cwd.take(),
+                    title: source.title.take(),
+                    model: source.model.take(),
+                    git: source.git.take(),
+                });
+            }
         }
     }
     /// The first prepared session's harness, which may differ from its discovery reference
     /// (OpenSession documents preserve their named underlying harness).
     pub fn first_harness(&self) -> Option<Harness> {
-        self.first.as_ref().map(|source| source.harness)
+        self.owner.as_ref().map(|owner| owner.harness)
     }
     pub fn finish(self, new_id: Option<String>, harness: Harness) -> Session {
-        let first = self.first.unwrap_or_else(|| Session::new("", harness));
         let messages = self.messages;
         // Provenance is cv's own fact about a session cv synthesized, not something read out of a
         // harness store, so it lives in the `cv` namespace — `Session::extra` has no flat keys
@@ -59,17 +75,27 @@ impl Composition {
             crate::ir::CV_NAMESPACE.into(),
             serde_json::json!({ "loom": serde_json::Value::Array(self.provenance) }),
         );
+        let (principal, cwd, title, model, git) = match self.owner {
+            Some(mut owner) => (
+                owner.principal.take(),
+                owner.cwd.take(),
+                owner.title.take(),
+                owner.model.take(),
+                owner.git.take(),
+            ),
+            None => (None, None, None, None, None),
+        };
         Session {
             // created_at = min, updated_at = max of the included messages' timestamps.
             created_at: messages.iter().filter_map(|m| m.timestamp).min(),
             updated_at: messages.iter().filter_map(|m| m.timestamp).max(),
             messages,
             extra,
-            cwd: first.cwd,
-            title: first.title,
-            model: first.model,
-            git: first.git,
-            principal: first.principal,
+            cwd,
+            title,
+            model,
+            git,
+            principal,
             ..Session::new(new_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()), harness)
         }
     }

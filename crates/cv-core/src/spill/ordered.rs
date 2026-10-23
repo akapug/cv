@@ -14,6 +14,8 @@ pub(crate) trait Record: Sized {
     fn heap_bytes(&self) -> usize;
     fn write(&self, writer: &mut impl Write) -> Result<()>;
     /// Read exactly one record. Codecs must preserve their consumer's exact wire/value contract.
+    /// `state` is per-reader carry state — a scratch buffer or a read budget; `Default` arms
+    /// nothing, the contract under which the ordered spool re-reads its own staged bytes.
     fn read(reader: &mut impl BufRead, state: &mut Self::ReadState) -> Result<Self>;
 }
 
@@ -34,6 +36,38 @@ impl Record for String {
         let mut bytes = vec![0; len];
         reader.read_exact(&mut bytes)?;
         Ok(String::from_utf8(bytes)?)
+    }
+}
+
+/// An `Option<string>` wire field: a flag byte, then the length and bytes when present.
+pub(crate) fn write_string(writer: &mut impl Write, value: Option<&str>) -> Result<()> {
+    writer.write_all(&[u8::from(value.is_some())])?;
+    if let Some(value) = value {
+        writer.write_all(&(value.len() as u64).to_le_bytes())?;
+        writer.write_all(value.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// [`write_string`]'s reader; `limit` bounds one string's length.
+pub(crate) fn read_string(reader: &mut impl BufRead, limit: Option<usize>) -> Result<Option<String>> {
+    let mut flag = [0];
+    reader.read_exact(&mut flag)?;
+    match flag[0] {
+        0 => Ok(None),
+        1 => {
+            let mut bytes = [0; 8];
+            reader.read_exact(&mut bytes)?;
+            let len = usize::try_from(u64::from_le_bytes(bytes)).context("usage spool string too large")?;
+            anyhow::ensure!(
+                limit.is_none_or(|limit| len <= limit),
+                "usage cache string exceeds source budget"
+            );
+            let mut bytes = vec![0; len];
+            reader.read_exact(&mut bytes)?;
+            Ok(Some(String::from_utf8(bytes).context("invalid usage spool UTF-8")?))
+        }
+        _ => anyhow::bail!("invalid usage spool string"),
     }
 }
 
@@ -58,9 +92,11 @@ struct Spill {
     _owner: Owner,
 }
 impl<T: Record> Ordered<T> {
+    #[cfg(any(test, feature = "sqlite"))]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
+    #[cfg(any(test, feature = "sqlite"))]
     pub(crate) fn spilled_bytes(&self) -> Result<u64> {
         match &self.spill {
             None => Ok(0),

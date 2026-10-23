@@ -68,14 +68,7 @@ impl<'a> Fields<'a> {
         self.get(key).map(|view| Ok(view.resolve()?.into_owned())).transpose()
     }
     pub fn string(&self, key: &str) -> Result<Option<String>> {
-        let Some(view) = self.get(key) else { return Ok(None) };
-        if !view.is_string()? {
-            return Ok(None);
-        }
-        match view.resolve()?.into_owned() {
-            Value::String(s) => Ok(Some(s)),
-            _ => anyhow::bail!("selected JSON string changed type"),
-        }
+        self.get(key).map(|view| view.string()).transpose().map(Option::flatten)
     }
     pub fn project(&self, keys: &[&str]) -> Result<serde_json::Map<String, Value>> {
         keys.iter()
@@ -158,6 +151,12 @@ pub(crate) fn text_summary<T: std::borrow::Borrow<crate::lazy::Text>>(
         }
     }
     (present && (!require_nonwhite || !head.is_blank())).then(|| head.finish())
+}
+
+/// Unicode whitespace classification without materializing a retained payload.
+#[cfg(feature = "sqlite")]
+pub(crate) fn text_is_blank(text: &crate::Text, resolver: &crate::Resolver) -> Result<bool> {
+    Ok(text_head(text, resolver, 1, true)?.0.is_empty())
 }
 
 #[cfg(test)]

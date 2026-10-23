@@ -332,6 +332,45 @@ fn artifact_root(paths: &[PathBuf; 3]) -> Result<PathBuf> {
     Ok(parent.to_path_buf())
 }
 
+/// The tokens a vector embeds: model2vec's `encode` limit. Before tokenizing it cuts the text to
+/// this many times the tokenizer's median token length in characters (`truncate_str`), so a
+/// session's vector depends on that many characters of its body and no more.
+const INPUT_TOKENS: usize = 512;
+
+/// The characters of a body the model reads ([`INPUT_TOKENS`] × the median byte length of the
+/// tokenizer's vocabulary, as model2vec computes it), from the model's `tokenizer.json`.
+fn input_chars(model: &Path) -> Result<usize> {
+    let path = model.join("tokenizer.json");
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    #[derive(serde::Deserialize)]
+    struct Tokenizer {
+        model: Model,
+    }
+    #[derive(serde::Deserialize)]
+    struct Model {
+        vocab: Vocab,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Vocab {
+        Map(std::collections::HashMap<String, serde::de::IgnoredAny>),
+        Pieces(Vec<(String, serde::de::IgnoredAny)>),
+    }
+    let tokenizer: Tokenizer =
+        serde_json::from_slice(&bytes).with_context(|| format!("reading the vocabulary of {}", path.display()))?;
+    let mut lens: Vec<usize> = match tokenizer.model.vocab {
+        Vocab::Map(map) => map.keys().map(String::len).collect(),
+        Vocab::Pieces(pieces) => pieces.iter().map(|(piece, _)| piece.len()).collect(),
+    };
+    lens.sort_unstable();
+    Ok(INPUT_TOKENS * lens.get(lens.len() / 2).copied().unwrap_or(1))
+}
+
+/// The characters of each session's body the cached model embeds; `None` without a cached model.
+pub fn embedded_chars() -> Result<Option<usize>> {
+    resolve_model(false)?.map(|spec| input_chars(&spec.path)).transpose()
+}
+
 fn load_model(spec: &ModelSpec) -> Result<StaticModel> {
     anyhow::ensure!(
         spec.reads.fresh(&mut Probe::default()),
@@ -359,10 +398,12 @@ pub fn embed_sessions(path: &Path, refs: &[cv_core::SessionRef]) -> Result<usize
     embed_with(path, refs, crate::read_corpus_doc, load_model, save_store)
 }
 
+/// Read each changed session's body as far as the model reads it: [`input_chars`] characters,
+/// at most four bytes each, so the vector is the one the whole body would give.
 fn embed_with(
     path: &Path,
     refs: &[cv_core::SessionRef],
-    read: impl FnMut(&cv_core::SessionRef) -> Result<(crate::Doc, ReadSet)>,
+    mut read: impl FnMut(&cv_core::SessionRef, usize) -> Result<(crate::Doc, ReadSet)>,
     mut load: impl FnMut(&ModelSpec) -> Result<StaticModel>,
     save: impl FnMut(&Path, &Store) -> Result<()>,
 ) -> Result<usize> {
@@ -373,7 +414,7 @@ fn embed_with(
             refs,
             &model_id(),
             ReadSet::default(),
-            read,
+            |r| read(r, 0),
             |_| anyhow::bail!("empty semantic inventory unexpectedly demanded a model"),
             save,
         );
@@ -383,17 +424,27 @@ fn embed_with(
     let key = spec.as_ref().map_or_else(model_id, |s| s.key.clone());
     let reads = spec.as_ref().map_or_else(ReadSet::default, |s| s.reads.clone());
     let mut model = None;
+    let mut head = None;
     refresh(
         path,
         refs,
         &key,
         reads,
-        read,
+        |r| {
+            let bytes = match head {
+                Some(bytes) => bytes,
+                None => *head.insert(4 * input_chars(&spec.as_ref().context("embedding model is not cached")?.path)?),
+            };
+            read(r, bytes)
+        },
         |bodies| {
             if model.is_none() {
                 model = Some(load(spec.as_ref().context("embedding model is not cached")?)?);
             }
-            Ok(model.as_ref().unwrap().encode(bodies))
+            Ok(model
+                .as_ref()
+                .unwrap()
+                .encode_with_args(bodies, Some(INPUT_TOKENS), 1024))
         },
         save,
     )
@@ -498,13 +549,20 @@ fn refresh(
         let snapshot = before.snapshot(r);
         let reusable = lookup.get(&(r.harness.as_str(), r.id.as_str())).copied().filter(|&i| {
             let m = &old.meta[i];
-            compatible && m.session == *r && m.source.as_ref().is_some_and(|old| old.fresh(&snapshot, &mut before))
+            // A session of a shared store whose own rows certify unchanged keeps its row.
+            compatible
+                && m.session == *r
+                && m.source
+                    .as_ref()
+                    .is_some_and(|old| old.fresh(&snapshot, &mut before) || old.rows_fresh(r, &snapshot, &mut before))
         });
         if let Some(i) = reusable {
             keep[i] = true;
         }
         if reusable.is_none() {
-            changed.push((r, snapshot));
+            // A shared store's certificate as of this snapshot, before the read.
+            let rows = before.rows(r);
+            changed.push((r, cv_core::source::Baseline { rows, ..snapshot }));
         }
     }
     drop(lookup);
@@ -565,9 +623,10 @@ fn refresh(
             .get(&(r.harness.as_str(), r.id.as_str()))
             .context("semantic session missing after refresh")?;
         anyhow::ensure!(
-            row.source
-                .as_ref()
-                .is_some_and(|s| s.fresh(&after.snapshot(r), &mut after)),
+            row.source.as_ref().is_some_and(|s| {
+                let now = after.snapshot(r);
+                s.fresh(&now, &mut after) || s.rows_fresh(r, &now, &mut after)
+            }),
             "semantic source changed during refresh: {}",
             r.id
         );
@@ -647,6 +706,12 @@ impl SemanticSearch {
         }
     }
     pub fn search(&self, query: &str, k: usize, filter: crate::SearchFilter<'_>) -> Result<Vec<Hit>> {
+        Ok(self.search_counted(query, k, filter)?.0)
+    }
+
+    /// [`search`](Self::search), and how many stored sessions the filter admits: every one of
+    /// them is ranked, so that is the number of matches the top `k` are drawn from.
+    pub fn search_counted(&self, query: &str, k: usize, filter: crate::SearchFilter<'_>) -> Result<(Vec<Hit>, usize)> {
         self.inner.search(
             query,
             k,
@@ -697,7 +762,7 @@ impl<M> ResidentState<M> {
         resolve: impl FnOnce() -> Result<Option<ModelSpec>>,
         load: impl FnOnce(&ModelSpec) -> Result<M>,
         encode: impl FnOnce(&M, &str) -> Vec<f32>,
-    ) -> Result<Vec<Hit>> {
+    ) -> Result<(Vec<Hit>, usize)> {
         let path = &self.path;
         let mut before = Probe::default();
         if self
@@ -733,7 +798,7 @@ impl<M> ResidentState<M> {
                 "embedding store changed during search: {}",
                 path.display()
             );
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         // Resolution checks paths/revisions and artifact metadata, never model bodies.
         let spec = resolve()?.context("embedding model is not cached — run cv index --semantic")?;
@@ -764,6 +829,7 @@ impl<M> ResidentState<M> {
             cached.store.dim
         );
         let hits = rank_filtered(&cached.store, &q, k, filter);
+        let admitted = cached.store.meta.iter().filter(|meta| admits(filter, meta)).count();
         let mut after = Probe::default();
         anyhow::ensure!(
             cached.reads.fresh(&mut after),
@@ -774,7 +840,7 @@ impl<M> ResidentState<M> {
             spec.reads.fresh(&mut after),
             "embedding model artifacts changed during search"
         );
-        Ok(hits)
+        Ok((hits, admitted))
     }
 }
 struct ResidentSearch<M> {
@@ -801,7 +867,7 @@ impl<M> ResidentSearch<M> {
         resolve: impl FnOnce() -> Result<Option<ModelSpec>>,
         load: impl FnOnce(&ModelSpec) -> Result<M>,
         encode: impl FnOnce(&M, &str) -> Vec<f32>,
-    ) -> Result<Vec<Hit>> {
+    ) -> Result<(Vec<Hit>, usize)> {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -886,14 +952,7 @@ fn ranked_rows<'a>(store: &'a Store, q: &[f32], k: usize, filter: crate::SearchF
     let query = CosineQuery::new(q);
     let mut winners = std::collections::BinaryHeap::new();
     for (index, meta) in store.meta.iter().enumerate() {
-        if !filter.harness.is_none_or(|h| meta.session.harness.as_str() == h)
-            || !filter.cwd.is_none_or(|needle| {
-                meta.session
-                    .cwd
-                    .as_ref()
-                    .is_some_and(|cwd| cwd.to_string_lossy().contains(needle))
-            })
-        {
+        if !admits(filter, meta) {
             continue;
         }
         let candidate = RankedRow {
@@ -913,6 +972,17 @@ fn ranked_rows<'a>(store: &'a Store, q: &[f32], k: usize, filter: crate::SearchF
     // Refreshing one source moves its vector row. Resolve ties by stable session identity,
     // so incremental and clean stores return the same ranking and top-k boundary.
     winners.into_sorted_vec()
+}
+
+/// Whether `filter` admits a stored session: its harness, and its cwd containing the needle.
+fn admits(filter: crate::SearchFilter<'_>, meta: &RecordMeta) -> bool {
+    filter.harness.is_none_or(|h| meta.session.harness.as_str() == h)
+        && filter.cwd.is_none_or(|needle| {
+            meta.session
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| cwd.to_string_lossy().contains(needle))
+        })
 }
 
 fn rank_filtered(store: &Store, q: &[f32], k: usize, filter: crate::SearchFilter<'_>) -> Vec<Hit> {
@@ -1076,7 +1146,7 @@ mod tests {
                 ReadSet::default(),
                 |r| {
                     let text = text.expect("fresh carrier guard must avoid reading").clone();
-                    let mut sink = crate::semantic_corpus::DocSink::new(cv_core::Resolver::new(None));
+                    let mut sink = crate::semantic_corpus::DocSink::new(cv_core::Resolver::new(None), 64 * 1024);
                     let mut message = cv_core::Message::new(cv_core::Role::User);
                     message.content.push(cv_core::Block::Text { text });
                     sink.message(message);
@@ -1218,7 +1288,7 @@ mod tests {
             &refs,
             "fake",
             ReadSet::default(),
-            crate::read_corpus_doc,
+            |r| crate::read_corpus_doc(r, 64 * 1024),
             |bodies| {
                 count.set(count.get() + bodies.len());
                 assert_eq!(bodies[0].len(), 64 * 1024);
@@ -1288,7 +1358,7 @@ mod tests {
                 &refs,
                 "fake",
                 ReadSet::default(),
-                crate::read_corpus_doc,
+                |r| crate::read_corpus_doc(r, 64 * 1024),
                 |bodies| {
                     calls += 1;
                     assert_eq!(bodies.len(), 1);
@@ -1935,6 +2005,25 @@ mod tests {
         s
     }
 
+    /// The head a vector reads is the model's: 512 tokens × the vocabulary's median byte length
+    /// (model2vec's `truncate_str`), read from either vocabulary layout of `tokenizer.json`.
+    #[test]
+    fn input_chars_is_the_models_input_limit() {
+        let dir = cv_testkit::temp_dir("semantic-input-chars");
+        for (vocab, median) in [
+            (
+                serde_json::json!({"a": 0, "bb": 1, "cccc": 2, "dddddd": 3, "eeeeeeeee": 4}),
+                4,
+            ),
+            (serde_json::json!([["a", 0.0], ["bbb", -1.0], ["cc", -2.0]]), 2),
+        ] {
+            let tokenizer = serde_json::json!({"model": {"type": "WordPiece", "vocab": vocab}});
+            std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+            assert_eq!(input_chars(&dir).unwrap(), INPUT_TOKENS * median);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn resident_spec(artifact: &Path) -> ModelSpec {
         let mut reads = ReadSet::default();
         reads.record(artifact);
@@ -1956,6 +2045,7 @@ mod tests {
         store.meta[0].source = Some(Baseline {
             primary: None,
             stamp: None,
+            rows: None,
         });
         store.meta[0].session.title = Some("unused refresh title".repeat(4096));
         store.meta[0].session.message_count = Some(17);
@@ -1998,7 +2088,11 @@ mod tests {
                 vec![1.0, 0.0]
             }
         };
-        let ask = |query, filter| search.search(query, 1, filter, || Ok(Some(resident_spec(&artifact))), load, encode);
+        let ask = |query, filter| {
+            search
+                .search(query, 1, filter, || Ok(Some(resident_spec(&artifact))), load, encode)
+                .map(|(hits, _)| hits)
+        };
         VECTOR_DECODES.with(|count| count.set(0));
         assert_eq!(ask("horizontal", crate::SearchFilter::default()).unwrap()[0].id, "a");
         assert_eq!(ask("vertical", crate::SearchFilter::default()).unwrap()[0].id, "b");
@@ -2165,7 +2259,8 @@ mod tests {
                             },
                             |_, _| vec![1.0, 0.0],
                         )
-                        .unwrap();
+                        .unwrap()
+                        .0;
                     assert_eq!(hits[0].id, "a");
                     decodes.fetch_add(VECTOR_DECODES.with(|count| count.get()), Ordering::Relaxed);
                 });
@@ -2196,7 +2291,8 @@ mod tests {
                 },
                 |_, _| vec![0.0, 1.0],
             )
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(hits[0].id, "b");
         assert_eq!(loads.load(Ordering::Relaxed), 2);
         assert_eq!(drops.load(Ordering::Relaxed), 1);

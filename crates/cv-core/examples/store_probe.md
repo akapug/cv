@@ -126,8 +126,8 @@ Use `/usr/bin/time -l` (macOS) or `/usr/bin/time -v` (Linux) around each clean p
 wall/user/system CPU, RSS and faults. JSON `wall_seconds` measures the stage only; process RSS
 includes startup and setup. For macOS file-backed versus private residency also inspect
 `vmmap --summary`/`footprint` on a long enough run. A directory/whole DB size is not selected
-session bytes; this tool labels metadata size `physical_input_bytes` and reports traversed bytes
-as unknown. It never primes input with a whole-file read. Record explicitly warmed versus
+session bytes; this tool labels metadata size `physical_input_bytes` and does not report traversed
+bytes (it cannot measure them). It never primes input with a whole-file read. Record explicitly warmed versus
 unprimed input and catalog state, and do not claim a cold OS cache without controlling it.
 
 Generate fresh representative fixtures outside the measured process:
@@ -206,7 +206,7 @@ uses the independent lazy collector followed by `matches_full`. Both require a s
 report the same boolean result, and force lazy parsing. The collected session stays alive through
 the heap snapshot. Use rich tool arguments and repeated events to measure retained history;
 large text spans alone do not exercise that distinction. Callback counts are not observed by
-these composed APIs. Compaction predicates have a separate validation pass and should be
+these composed APIs (`messages` is null). Compaction predicates have a separate validation pass and should be
 measured separately from ordinary tool/model/path queries.
 
 `perf-fixture.py claude|codex NEW_DIR --shape tool-arguments --records N --payload-bytes B`
@@ -225,7 +225,7 @@ this gate promises bounded history retention, not lazy argument materialization.
 `tools-collect` uses the previous EventSink collection followed by `from_events`. Both force
 lazy parsing and report the complete small histogram as `detail`, so exact output parity needs
 no additional digest or transcript materialization. Neither updates the catalog. Callback counts
-are not observed by the composed histogram API. Use fixed-size tool calls with distinct targets
+are not observed by the composed histogram API (`messages` is null). Use fixed-size tool calls with distinct targets
 and one tool name to distinguish retained event history from demanded histogram output. The old
 path includes EventSink's per-record checkpoint requests; the histogram consumer never resumes
 from or stores them.
@@ -323,7 +323,7 @@ counters work with a successful 4,096-byte allocation before setup. A failed/dis
 error, rather than a reported zero. After optional discovery setup, stage counters reset and report
 baseline/end/peak live bytes, peak above baseline, live/peak allocation counts, and largest single
 allocation request. Counts are simultaneous outstanding allocations; cumulative allocation requests
-and requested bytes are unavailable from SQLite's built-in status API and reported as null.
+and requested bytes are unavailable from SQLite's built-in status API and not reported.
 
 These counters include SQLite-managed page caches and SQLite's allocator bookkeeping, exclude
 underlying system allocator overhead, and do not measure mapped pages or filesystem residency.

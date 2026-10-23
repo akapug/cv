@@ -285,6 +285,17 @@ pub struct TaskReadModel {
 pub struct TaskReducer {
     model: TaskReadModel,
     applied: HashMap<String, TaskEvent>,
+    /// Events folded before the checkpoint this reducer resumed from, by id: each one's
+    /// [`event_digest`], all a later event with the same id is compared against.
+    folded: HashMap<String, String>,
+}
+
+/// The digest of an event's JSON: equal events have equal digests, so a resumed reducer still
+/// tells an idempotent re-append from an id collision.
+pub(super) fn event_digest(event: &TaskEvent) -> String {
+    let mut digest = crate::digest::Sha256::new();
+    digest.update(&serde_json::to_vec(event).expect("a task event serializes"));
+    digest.finish_hex()
 }
 
 impl TaskReducer {
@@ -303,6 +314,26 @@ impl TaskReducer {
 
     pub fn model(&self) -> &TaskReadModel {
         &self.model
+    }
+
+    /// The state a checkpoint keeps: the model and every applied event's digest.
+    pub(super) fn checkpoint(&self) -> (TaskReadModel, std::collections::BTreeMap<String, String>) {
+        let mut applied: std::collections::BTreeMap<String, String> = self
+            .folded
+            .iter()
+            .map(|(id, digest)| (id.clone(), digest.clone()))
+            .collect();
+        applied.extend(self.applied.iter().map(|(id, event)| (id.clone(), event_digest(event))));
+        (self.model.clone(), applied)
+    }
+
+    /// A reducer standing where [`Self::checkpoint`] was taken.
+    pub(super) fn resume(model: TaskReadModel, applied: std::collections::BTreeMap<String, String>) -> Self {
+        Self {
+            model,
+            applied: HashMap::new(),
+            folded: applied.into_iter().collect(),
+        }
     }
 
     pub fn into_model(self) -> TaskReadModel {
@@ -355,6 +386,13 @@ impl TaskReducer {
         if let Some(previous) = self.applied.get(&event.id) {
             return if previous == event {
                 Ok(()) // idempotent re-append
+            } else {
+                Err(ReduceError::EventIdCollision { id: event.id.clone() })
+            };
+        }
+        if let Some(previous) = self.folded.get(&event.id) {
+            return if *previous == event_digest(event) {
+                Ok(())
             } else {
                 Err(ReduceError::EventIdCollision { id: event.id.clone() })
             };
@@ -843,14 +881,7 @@ mod tests {
             task_id: "00000000-0000-7000-8000-000000000def".into(),
             ts: "2026-07-16T12:00:00Z".parse().unwrap(),
             by: AUTHOR.into(),
-            kind: TaskEventKind::Opened {
-                title: "t".into(),
-                body: String::new(),
-                repo: None,
-                issue: None,
-                channel: None,
-                assignee: None,
-            },
+            kind: crate::task::opened_kind("t", None),
         };
         assert!(matches!(
             TaskReducer::reduce(&[ev]).unwrap_err(),
@@ -1198,14 +1229,7 @@ mod tests {
                 task_id: id.clone(),
                 ts: "2026-07-16T12:00:00Z".parse().unwrap(),
                 by: AUTHOR.into(),
-                kind: TaskEventKind::Opened {
-                    title: "a decision".into(),
-                    body: String::new(),
-                    repo: None,
-                    issue: None,
-                    channel: None,
-                    assignee: Some(DECIDER.into()),
-                },
+                kind: crate::task::opened_kind("a decision", Some(DECIDER)),
             });
             log.push(&id, AUTHOR, posed(&["keep", "delete"], "keep"));
             (log, id)

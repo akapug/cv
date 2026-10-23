@@ -37,6 +37,9 @@ fn sanitize_cwd(cwd: &str) -> String {
 }
 
 /// `<home>/projects`, from the projects root, its `tmp/` sibling, or the home itself.
+///
+/// `--out` naming convention (same as lmstudio's `conversations`): the flag may name the CLI's
+/// store root or the store dir inside it; accept either and write where the CLI reads.
 fn projects_dir(out_dir: &Path) -> PathBuf {
     match out_dir.file_name().and_then(|n| n.to_str()) {
         Some("projects") => out_dir.to_path_buf(),
@@ -95,7 +98,10 @@ fn write_parts(writer: &mut dyn Write, parts: &[Part<'_>], resolver: &Resolver) 
             Part::Thinking { text, signature } => {
                 genai::text_fields(&mut row, text, true, signature.as_deref(), resolver)?
             }
-            Part::Other(block @ (Block::Image { .. } | Block::File { .. })) => genai::media_fields(&mut row, block)?,
+            Part::Other(Block::Image { media_type, .. }) => genai::image_fields(&mut row, media_type.as_deref())?,
+            Part::Other(Block::File { mime, path, source }) => {
+                genai::file_fields(&mut row, mime.as_deref(), path.as_deref(), source.as_deref())?
+            }
             Part::Other(Block::ToolUse {
                 id,
                 name,
@@ -454,7 +460,29 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                     })?;
                 }
             }
-            _ => {
+            // What remains arrives as model-facing injected input. Naming each kind keeps a
+            // future MessageKind from silently degrading to this record shape.
+            (
+                Role::System,
+                MessageKind::Prompt
+                | MessageKind::Reply
+                | MessageKind::ToolResult
+                | MessageKind::InjectedContext
+                | MessageKind::CompactionSummary
+                | MessageKind::SubagentSpawn
+                | MessageKind::SubagentReturn
+                | MessageKind::Carrier,
+            )
+            | (
+                Role::User,
+                MessageKind::Reply
+                | MessageKind::ToolResult
+                | MessageKind::InjectedContext
+                | MessageKind::CompactionSummary
+                | MessageKind::SubagentSpawn
+                | MessageKind::SubagentReturn
+                | MessageKind::Carrier,
+            ) => {
                 let parts = parts(&m.content, opts.thinking, &resolver)?;
                 if !parts.is_empty() {
                     let subtype = injected_subtype(m);
@@ -481,7 +509,10 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     Ok(EmitResult {
         path,
         new_id: new_id.clone(),
-        resume_hint: Some(format!("qwen --resume {new_id}  (run from {cwd_str})")),
+        resume_hint: Some(crate::harness::resume_in(
+            cwd.as_deref(),
+            format!("qwen --resume {}", crate::harness::shell_quote(&new_id)),
+        )),
     })
 }
 

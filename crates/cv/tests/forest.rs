@@ -14,7 +14,10 @@ fn write_workflow(w: &World, sid: &str, run: &str, state: &serde_json::Value, sc
     let sdir = wdir.join("scripts");
     fs::create_dir_all(&sdir).unwrap();
     fs::write(wdir.join(format!("{run}.json")), serde_json::to_string(state).unwrap()).unwrap();
-    fs::write(sdir.join(format!("script-{run}.js")), script).unwrap();
+    // The launcher's convention: `scripts/<workflowName>-wf_<run>.js` — the basename's name half
+    // is the workflow's name (what ghost recovery matches an orphan against).
+    let name = state["workflowName"].as_str().unwrap_or("workflow");
+    fs::write(sdir.join(format!("{name}-wf_{run}.js")), script).unwrap();
 }
 
 /// A workflow *agent* transcript + its meta under `<sid>/subagents/workflows/<run>/`.
@@ -44,8 +47,8 @@ fn assistant_tools(uuid: &str, ts: &str, blocks: serde_json::Value) -> serde_jso
     })
 }
 
-fn tool_use(name: &str, input: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"type": "tool_use", "id": "t", "name": name, "input": input})
+fn tool_use(id: &str, name: &str, input: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
 }
 
 fn boundary(uuid: &str, parent: &str, trigger: &str, pre: u64) -> serde_json::Value {
@@ -80,8 +83,8 @@ fn build_world(tag: &str) -> World {
                 "a0",
                 "2026-06-07T12:00:01Z",
                 serde_json::json!([
-                    tool_use("Bash", serde_json::json!({"command": "cargo build"})),
-                    tool_use("Workflow", serde_json::json!({"script": "wf"})),
+                    tool_use("t1", "Bash", serde_json::json!({"command": "cargo build"})),
+                    tool_use("t2", "Workflow", serde_json::json!({"script": "wf"})),
                 ]),
             ),
             user("u1", Some("a0"), "more"),
@@ -93,6 +96,7 @@ fn build_world(tag: &str) -> World {
                 "a1",
                 "2026-06-07T12:05:00Z",
                 serde_json::json!([tool_use(
+                    "t3",
                     "Edit",
                     serde_json::json!({"file_path": "x.rs", "old_string": "a", "new_string": "b"})
                 )]),
@@ -120,7 +124,7 @@ fn build_world(tag: &str) -> World {
             "totalTokens": 12345,
             "totalToolCalls": 7,
             "durationMs": 600000,
-            "scriptPath": "/work/proj/fsess/workflows/scripts/script-wf_test-0001.js",
+            "scriptPath": "/work/proj/fsess/workflows/scripts/demo-workflow-wf_test-0001.js",
             "script": "export const meta = { name: 'demo-workflow' }\n// the driving script body",
             "phases": [
                 {"title": "Phase-A", "detail": "build the thing"},
@@ -154,9 +158,10 @@ fn build_world(tag: &str) -> World {
                 "wa0",
                 "2026-06-07T12:01:00Z",
                 serde_json::json!([
-                    tool_use("Bash", serde_json::json!({"command": "make"})),
-                    tool_use("Read", serde_json::json!({"file_path": "src/lib.rs"})),
+                    tool_use("b1", "Bash", serde_json::json!({"command": "make"})),
+                    tool_use("b2", "Read", serde_json::json!({"file_path": "src/lib.rs"})),
                     tool_use(
+                        "b3",
                         "Edit",
                         serde_json::json!({"file_path": "src/lib.rs", "old_string": "x", "new_string": "y"})
                     ),
@@ -174,7 +179,7 @@ fn build_world(tag: &str) -> World {
             assistant_tools(
                 "va0",
                 "2026-06-07T12:02:00Z",
-                serde_json::json!([tool_use("Bash", serde_json::json!({"command": "cargo test"}))]),
+                serde_json::json!([tool_use("v1", "Bash", serde_json::json!({"command": "cargo test"}))]),
             ),
         ],
     );

@@ -7,7 +7,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
+/// What one namespace may retain in one operation. Per namespace, so a projection kept per small
+/// file (OpenCode's message ids) cannot crowd out a shared inventory other sessions reuse (Qwen's
+/// scheduled tasks, OpenClaw's registries), which would then reload once per session.
 const RETAINED_BYTES: usize = 16 * 1024 * 1024;
+/// Per-entry hash-map and path overhead counted alongside retained bytes, so many small
+/// entries cannot bypass admission.
+const ENTRY_BYTES: usize = 256;
 #[derive(Hash, PartialEq, Eq)]
 struct Key(TypeId, &'static str, PathBuf);
 struct Cached {
@@ -19,7 +25,19 @@ type Slot = Arc<Mutex<Option<Cached>>>;
 #[derive(Default)]
 struct State {
     entries: HashMap<Key, Slot>,
-    bytes: usize,
+    /// Retained bytes per namespace.
+    bytes: HashMap<&'static str, usize>,
+}
+
+/// Say once per namespace that its inventories stopped being retained: each later use reloads.
+fn over_budget(namespace: &'static str) {
+    crate::env::warn_once(
+        namespace,
+        format_args!(
+            "its retention passed {} MiB in this operation; each further use reloads it",
+            RETAINED_BYTES >> 20
+        ),
+    );
 }
 #[derive(Clone, Default)]
 pub(crate) struct Context(Arc<Mutex<State>>);
@@ -76,12 +94,14 @@ pub(crate) fn inventory<T: Send + Sync + 'static>(
             return Some(slot.clone());
         }
         // Count key/map/slot overhead too, so many empty inventories cannot bypass admission.
-        let bytes = 256usize.saturating_add(key.2.as_os_str().len());
-        if bytes > RETAINED_BYTES.saturating_sub(state.bytes) {
+        let bytes = ENTRY_BYTES.saturating_add(key.2.as_os_str().len());
+        let held = state.bytes.entry(namespace).or_default();
+        if bytes > RETAINED_BYTES.saturating_sub(*held) {
+            over_budget(namespace);
             return None;
         }
         let slot = Arc::new(Mutex::new(None));
-        state.bytes += bytes;
+        *held += bytes;
         state.entries.insert(key, slot.clone());
         Some(slot)
     });
@@ -111,20 +131,23 @@ pub(crate) fn inventory<T: Send + Sync + 'static>(
     let value = Arc::new(value);
     if let (Some(context), Some(retained)) = (context.as_ref(), retained.as_deref_mut()) {
         let guard_bytes = reads.entries.keys().fold(0usize, |bytes, path| {
-            bytes.saturating_add(256usize.saturating_add(path.as_os_str().len()))
+            bytes.saturating_add(ENTRY_BYTES.saturating_add(path.as_os_str().len()))
         });
         let bytes = estimate.saturating_add(guard_bytes);
         let mut state = context.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = state.bytes.entry(namespace).or_default();
         if let Some(old) = retained.take() {
-            state.bytes = state.bytes.saturating_sub(old.bytes);
+            *held = held.saturating_sub(old.bytes);
         }
-        if bytes <= RETAINED_BYTES.saturating_sub(state.bytes) {
-            state.bytes += bytes;
+        if bytes <= RETAINED_BYTES.saturating_sub(*held) {
+            *held += bytes;
             *retained = Some(Cached {
                 value: value.clone(),
                 reads: reads.clone(),
                 bytes,
             });
+        } else {
+            over_budget(namespace);
         }
     }
     Ok((value, reads))
@@ -188,6 +211,38 @@ mod tests {
             calls.load(Ordering::SeqCst),
             5,
             "another operation retained old inventory"
+        );
+    }
+
+    /// One namespace at its budget leaves another's retention alone: a shared inventory is still
+    /// loaded once however many per-file projections came before it.
+    #[test]
+    fn a_full_namespace_does_not_evict_another() {
+        let world = crate::test_world("source-inventory-namespaces");
+        let (big, shared) = (world.base.join("big"), world.base.join("shared"));
+        std::fs::write(&big, "big").unwrap();
+        std::fs::write(&shared, "shared").unwrap();
+        let _scope = super::super::read_scope();
+        let reads = baseline(&big);
+        // Exactly the whole budget: the entry's slot, its guard path and its estimate.
+        let overhead = ENTRY_BYTES + super::super::absolute(&big).unwrap().as_os_str().len();
+        inventory("test-per-file", &big, &reads, || {
+            Ok((0usize, reads.clone(), RETAINED_BYTES - 2 * overhead))
+        })
+        .unwrap();
+        let calls = AtomicUsize::new(0);
+        let shared_reads = baseline(&shared);
+        for _ in 0..3 {
+            inventory("test-shared", &shared, &shared_reads, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok((1usize, shared_reads.clone(), 64))
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the shared inventory was reloaded per use"
         );
     }
 

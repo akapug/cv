@@ -50,7 +50,10 @@ fn parts(writer: &mut dyn Write, message: &Message, fates: &[ThinkingFate], reso
                     genai::text_fields(&mut object, text, projection == ThinkingFate::Keep, None, resolver)?;
                 }
             }
-            block @ (Block::Image { .. } | Block::File { .. }) => genai::media_fields(&mut object, block)?,
+            Block::Image { media_type, .. } => genai::image_fields(&mut object, media_type.as_deref())?,
+            Block::File { mime, path, source } => {
+                genai::file_fields(&mut object, mime.as_deref(), path.as_deref(), source.as_deref())?
+            }
             Block::ToolUse { .. } | Block::ToolResult { .. } => unreachable!(),
         }
         object.finish()?;
@@ -182,7 +185,12 @@ fn messages(
             message
                 .content
                 .iter()
-                .map(|block| crate::emit::thinking::fate(block, Harness::Gemini, mode, resolver))
+                .map(|block| match block {
+                    // `parts` skips tool blocks before reading their projection and the thoughts
+                    // loop before its Thinking match, so their fate is never read.
+                    Block::ToolUse { .. } | Block::ToolResult { .. } => Ok(ThinkingFate::Keep),
+                    block => crate::emit::thinking::fate(block, Harness::Gemini, mode, resolver),
+                })
                 .collect::<Result<_>>()?
         };
         if !first {
@@ -315,9 +323,9 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Res
     Ok(EmitResult {
         path,
         new_id: new_id.clone(),
-        resume_hint: Some(match cwd {
-            Some(cwd) => format!("gemini --resume {new_id}  (run from {})", cwd.display()),
-            None => format!("gemini --resume {new_id}"),
-        }),
+        resume_hint: Some(crate::harness::resume_in(
+            cwd.as_deref(),
+            format!("gemini --resume {}", crate::harness::shell_quote(&new_id)),
+        )),
     })
 }

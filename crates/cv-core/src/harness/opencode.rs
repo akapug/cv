@@ -55,6 +55,7 @@
 //! (`Usage::cost_usd`, `Usage::reasoning_tokens`); `session.parent_id` is `Lineage::parent`; the
 //! remaining `session` columns land in `Session::extra["opencode"]`.
 
+use crate::json::{ReadInput, Validation};
 mod emit;
 mod record;
 #[cfg(any(feature = "sqlite", test))]
@@ -257,7 +258,6 @@ impl Adapter for OpenCode {
             lane_stops: None,
             deferred_wrapper: None,
             rich_spans: false,
-            usage_cache_floor: 0,
         }
     }
 
@@ -342,25 +342,32 @@ impl Adapter for OpenCode {
             .find(|p| p.file_name().is_some_and(|n| n == "session"))
             .and_then(Path::parent)?;
         let messages = storage.join("message").join(&r.id);
-        // Parts are keyed by the parsed message ID. Read only the ID (other fields are ignored),
-        // and enumerate only this session's own message/part directories.
+        // IDs are data, not filenames: old/imported stores can disagree. Cache that small
+        // projection under its captured identity for every probe in this operation; no body
+        // is materialized and unchanged messages are not decoded again on publication.
         for message in probe.list(&messages)?.iter() {
-            #[derive(serde::Deserialize)]
-            struct MessageId {
-                #[serde(default)]
-                id: String,
+            let mut reads = crate::source::ReadSet::default();
+            reads.record(message);
+            let (id, _) = crate::source::inventory("opencode-message-id", message, &reads, || {
+                let id = document(message, |view, _| {
+                    super::store::document::Fields::parse(view, &["id"])?
+                        .map(|fields| fields.string("id").map(Option::unwrap_or_default))
+                        .transpose()
+                })?
+                .flatten();
+                let bytes = id.as_ref().map_or(0, String::capacity) + std::mem::size_of_val(&id);
+                Ok((id, reads.clone(), bytes))
+            })
+            .inspect_err(|error| {
+                crate::env::warn_once(
+                    "OpenCode dependencies",
+                    format_args!("{}: {error:#}", message.display()),
+                );
+            })
+            .ok()?;
+            if let Some(id) = id.as_ref() {
+                deps.directories.push(storage.join("part").join(id));
             }
-            // A file that cannot be opened is undetermined; one that does not decode names no part
-            // dir (the stream skips it too), and the message dir's own entry covers its repair.
-            let file = fs::File::open(message)
-                .inspect_err(|error| {
-                    crate::env::warn_once("OpenCode dependencies", format_args!("{}: {error}", message.display()));
-                })
-                .ok()?;
-            let Ok(id) = serde_json::from_reader::<_, MessageId>(std::io::BufReader::new(file)) else {
-                continue;
-            };
-            deps.directories.push(storage.join("part").join(id.id));
         }
         deps.directories.push(messages);
         Some(())
@@ -503,6 +510,9 @@ impl Adapter for OpenCode {
                     continue;
                 };
                 if let Some(dir) = self.part_dir(record.id().unwrap_or("")) {
+                    // `dependencies` already inventories this directory and all its parts
+                    // before the read. Re-reporting them retains a duplicate per-part read set
+                    // through counted publication, even when the consumer discards every turn.
                     // Parts in file-name order, one file at a time.
                     let mut paths = listing(&dir)?;
                     paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
@@ -527,6 +537,12 @@ impl Adapter for OpenCode {
             unparsed.note(&mut s);
             Ok(s)
         })
+    }
+
+    /// Every database session's certificate ([`db::rows`]); a JSON-file session is its own files.
+    #[cfg(feature = "sqlite")]
+    fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        db::rows(store).ok()
     }
 
     /// The todo list `todowrite` keeps in `opencode.db`'s `todo` table (1.x; 2.x has none).
@@ -575,7 +591,7 @@ fn document<T>(
     f: impl for<'a> FnOnce(crate::json::JsonView<'a>, &crate::json::JsonSource) -> Result<T>,
 ) -> Result<Option<T>> {
     let source = crate::json::JsonSource::capture(path)?;
-    match source.read_syntax(|view| {
+    match source.read(ReadInput::Document, Validation::Syntax, |view| {
         if view.accepts_value()? {
             f(view, &source).map(Some)
         } else {
@@ -598,15 +614,6 @@ mod db {
     use super::super::ts_from_epoch;
     use super::*;
     use rusqlite::types::ValueRef;
-    use std::collections::HashMap;
-
-    /// A message record whose `role` is `user` or `assistant`.
-    fn is_turn(view: crate::json::JsonView<'_>) -> Result<bool> {
-        Ok(matches!(
-            record::string(view.get("role")?)?.as_deref(),
-            Some("user" | "assistant")
-        ))
-    }
 
     /// Session columns the IR first-classes (`parent_id` is `Lineage::parent`; everything else lands
     /// in `Session::extra["opencode"]` verbatim).
@@ -654,11 +661,80 @@ mod db {
         })
     }
 
+    /// Every session's [`Rows`](crate::source::Rows) certificate: what a read of it consults
+    /// besides message bodies. Its `session` and `session_v2` rows whole (which table the read
+    /// takes is the presence of the latter); per 1.x `message` row its rowid, id, `time_created`
+    /// (the read's order), `time_updated` and the byte length of `data`; per `part` row, through
+    /// its message, the same with `message_id`; per 2.x `session_message` row its rowid, id, type,
+    /// `seq` (the read's order), `time_updated` and `data`'s length; and its `todo` rows. OpenCode
+    /// UPDATEs a streaming part (and a 2.x message) in place, so count and max rowid alone are
+    /// not enough: every UPDATE stamps `time_updated` (drizzle `$onUpdate`) and nearly every one
+    /// changes the length; a same-length rewrite within the same millisecond escapes. Lengths come
+    /// from record headers, so no body's overflow pages are read.
+    pub(super) fn rows(db: &Path) -> Result<std::collections::HashMap<String, crate::source::Rows>> {
+        open_ro(db)?.read(|conn, _| {
+            let _snapshot = crate::harness::store::sqlite::snapshot(conn)?;
+            let mut certificates = crate::harness::store::sqlite::Certificates::default();
+            for table in ["session", "session_v2"] {
+                if has_table(conn, table) {
+                    certificates.digest(conn, &format!("SELECT id, '{table}', * FROM {table} ORDER BY id"))?;
+                }
+            }
+            let column = |table: &str, name: &str, expr: &str| {
+                if crate::harness::store::sqlite::columns(conn, table).contains(name) {
+                    expr.to_owned()
+                } else {
+                    "NULL".to_owned()
+                }
+            };
+            if has_table(conn, "message") {
+                let (created, updated) = (
+                    column("message", "time_created", "time_created"),
+                    column("message", "time_updated", "time_updated"),
+                );
+                certificates.rows(
+                    conn,
+                    &format!(
+                        "SELECT session_id, rowid, id, {created}, {updated}, octet_length(data) FROM message \
+                         ORDER BY session_id, rowid"
+                    ),
+                )?;
+            }
+            if has_table(conn, "message") && has_table(conn, "part") {
+                let updated = column("part", "time_updated", "p.time_updated");
+                certificates.rows(
+                    conn,
+                    &format!(
+                        "SELECT m.session_id, p.rowid, p.message_id, p.id, {updated}, octet_length(p.data) \
+                         FROM part p JOIN message m ON m.id = p.message_id ORDER BY m.session_id, p.rowid"
+                    ),
+                )?;
+            }
+            if has_table(conn, "session_message") {
+                let updated = column("session_message", "time_updated", "time_updated");
+                certificates.rows(
+                    conn,
+                    &format!(
+                        "SELECT session_id, rowid, id, type, seq, {updated}, octet_length(data) FROM session_message \
+                         ORDER BY session_id, rowid"
+                    ),
+                )?;
+            }
+            if has_table(conn, "todo") {
+                certificates.digest(
+                    conn,
+                    "SELECT session_id, position, content, status FROM todo ORDER BY session_id, position",
+                )?;
+            }
+            Ok(certificates.0)
+        })
+    }
+
     pub(super) fn is_db_ref(r: &SessionRef) -> bool {
         r.path.extension().and_then(|e| e.to_str()) == Some("db")
     }
 
-    fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
+    pub(super) fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
         conn.query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
             rusqlite::params![name],
@@ -674,15 +750,13 @@ mod db {
     pub(super) fn discover(db: &Path) -> Result<Vec<SessionRef>> {
         crate::harness::store::sqlite::cached_discover(db, || {
             let conn = open_ro(db)?;
-            conn.read(|reader, reads| discover_snapshot(db, reads, reader))
+            conn.read(|reader, _| discover_snapshot(db, reader))
         })
     }
 
-    fn discover_snapshot(
-        db: &Path,
-        reads: &crate::source::ReadSet,
-        conn: &rusqlite::Connection,
-    ) -> Result<Vec<SessionRef>> {
+    /// Counts stay unknown: a turn's kind can rest on its parts (`compaction`, an `@agent`
+    /// mention) or its `error`, so complete reads and indexing count and certify them.
+    fn discover_snapshot(db: &Path, conn: &rusqlite::Connection) -> Result<Vec<SessionRef>> {
         let _snapshot = crate::harness::store::sqlite::snapshot(conn)?;
         let mut refs = if has_table(conn, "session_v2") && has_table(conn, "session_message") {
             discover_v2(conn, db)?
@@ -691,33 +765,17 @@ mod db {
         };
         if has_table(conn, "session") && has_table(conn, "message") {
             let seen: HashSet<String> = refs.iter().map(|r| r.id.clone()).collect();
-            refs.extend(discover_v1(conn, db, reads, &seen)?);
+            refs.extend(discover_v1(conn, db, &seen)?);
         }
         Ok(refs)
     }
 
     fn discover_v2(conn: &rusqlite::Connection, db: &Path) -> Result<Vec<SessionRef>> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        {
-            let mut stmt = conn.prepare(
-                "SELECT session_id, COUNT(*) FROM session_message WHERE type IN ('user', 'assistant') GROUP BY session_id",
-            )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-            for row in rows {
-                let (sid, n) = row?;
-                counts.insert(sid, n.max(0) as usize);
-            }
-        }
         let mut stmt = conn.prepare(
             "SELECT id, directory, title, time_created, time_updated FROM session_v2 ORDER BY time_updated DESC",
         )?;
         let refs = stmt
             .query_map([], |r| session_ref(db, r))?
-            .map(|row| {
-                let mut r = row?;
-                r.message_count = Some(counts.get(&r.id).copied().unwrap_or(0));
-                Ok(r)
-            })
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(refs)
     }
@@ -739,47 +797,16 @@ mod db {
         })
     }
 
-    /// Count the turns the stream reads: `message` cells whose final `role` is user or assistant.
-    fn discover_v1(
-        conn: &rusqlite::Connection,
-        db: &Path,
-        reads: &crate::source::ReadSet,
-        seen: &HashSet<String>,
-    ) -> Result<Vec<SessionRef>> {
-        // Migrated stores retain old message bodies. Select only surviving legacy sessions
-        // before touching those bodies; a fully migrated store needs no legacy message scan.
-        let mut refs: Vec<SessionRef> = conn
+    /// The 1.x sessions 2.x does not already cover.
+    fn discover_v1(conn: &rusqlite::Connection, db: &Path, seen: &HashSet<String>) -> Result<Vec<SessionRef>> {
+        Ok(conn
             .prepare("SELECT id, directory, title, time_created, time_updated FROM session ORDER BY time_updated DESC")?
             .query_map([], |r| session_ref(db, r))?
             .filter_map(|row| match row {
                 Ok(reference) if seen.contains(&reference.id) => None,
                 other => Some(other),
             })
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if refs.is_empty() {
-            return Ok(refs);
-        }
-        let wanted: HashSet<&str> = refs.iter().map(|reference| reference.id.as_str()).collect();
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        let cells = Cells::new(conn, db, reads, "message")?;
-        let mut stmt = conn.prepare(&format!("SELECT session_id, {} FROM message", cells.select("data")))?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let sid = row.get::<_, String>(0)?;
-            if !wanted.contains(sid.as_str()) {
-                continue;
-            }
-            let Some(cell) = cells.cell(conn, "message", "data", row, 1)? else {
-                continue;
-            };
-            if cells.read(cell, |view| Ok(view.is_object()? && is_turn(view)?))? == Some(true) {
-                *counts.entry(sid).or_default() += 1;
-            }
-        }
-        for reference in &mut refs {
-            reference.message_count = Some(counts.get(&reference.id).copied().unwrap_or(0));
-        }
-        Ok(refs)
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// One row as a JSON object keyed by column name (`NULL`s dropped, JSON columns decoded).
@@ -1071,31 +1098,27 @@ mod db {
                         std::ptr::null_mut(),
                     );
                 }
-                let refs = discover_snapshot(&path, &Default::default(), &conn)?;
+                let refs = discover_snapshot(&path, &conn)?;
                 assert_eq!(refs.len(), 1);
                 assert_eq!(refs[0].title.as_deref(), Some("current title"));
-                assert_eq!(
-                    refs[0].message_count,
-                    Some(0),
-                    "a migrated session with no turns is counted"
-                );
+                assert_eq!(refs[0].message_count, None, "discovery defers the count");
             }
             Ok(())
         }
 
         #[test]
-        fn mixed_store_keeps_unmigrated_counts_and_order() -> Result<()> {
+        fn mixed_store_keeps_unmigrated_sessions_in_order() -> Result<()> {
             let world = cv_testkit::World::new("opencode-mixed-discovery");
             let path = world.base.join("provenance");
             fs::write(&path, b"unchanged")?;
             let conn = rusqlite::Connection::open_in_memory()?;
             conn.execute_batch(r#"CREATE TABLE session(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,data TEXT); CREATE TABLE session_v2(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT); INSERT INTO session VALUES('covered','/old','old',1,3),('older','/old','older',1,1),('newer','/old','newer',1,2); INSERT INTO session_v2 VALUES('covered','/new','current',2,2); INSERT INTO message VALUES('hidden','covered','{broken'),('orphan','missing','{broken'),('old','older','{"role":"user"}'),('new','newer','{"role":"system","role":"assistant"}');"#)?;
-            let refs = discover_snapshot(&path, &Default::default(), &conn)?;
+            let refs = discover_snapshot(&path, &conn)?;
             assert_eq!(
                 refs.iter()
                     .map(|r| (r.id.as_str(), r.message_count))
                     .collect::<Vec<_>>(),
-                vec![("covered", Some(0)), ("newer", Some(1)), ("older", Some(1))]
+                vec![("covered", None), ("newer", None), ("older", None)]
             );
             Ok(())
         }
@@ -1106,6 +1129,53 @@ mod db {
 mod tests {
     use super::*;
     use crate::harness::Parse;
+
+    #[test]
+    fn json_tree_guard_rejects_part_changes_after_streaming() -> Result<()> {
+        for change in ["rewrite", "create", "delete", "retarget"] {
+            let world = crate::test_world("opencode-tree-guard");
+            let root = world.base.join("storage");
+            for dir in ["session/project", "message/ses_guard", "part/actual-id"] {
+                fs::create_dir_all(root.join(dir))?;
+            }
+            let path = root.join("session/project/ses_guard.json");
+            fs::write(&path, "{}")?;
+            let header = root.join("message/ses_guard/noncanonical.json");
+            fs::write(&header, r#"{"id":"actual-id","role":"user"}"#)?;
+            let part = root.join("part/actual-id/part.json");
+            fs::write(&part, r#"{"type":"text","text":"before"}"#)?;
+            let adapter = OpenCode::with_root(root.clone());
+            let reference = SessionRef::new("ses_guard", Harness::OpenCode, path);
+            let mut messages = 0;
+            let mut sink = crate::stream::TryFnSink::new(|_: Message| {
+                messages += 1;
+                Ok(Flow::Continue)
+            });
+            let done = crate::stream::stream_counted(
+                &adapter,
+                &reference,
+                &Demand::LEAN.with_spans(),
+                &mut sink,
+                crate::stream::Pass {
+                    record: false,
+                    guard: true,
+                    ..crate::stream::Pass::RECORD
+                },
+            )?;
+            assert_eq!(messages, 1);
+            let guard = done.guard.unwrap();
+            guard.verify(&reference)?;
+            match change {
+                "rewrite" => fs::write(&part, r#"{"type":"text","text":"after!"}"#)?,
+                "create" => fs::write(root.join("part/actual-id/new.json"), "{}")?,
+                "delete" => fs::remove_file(&part)?,
+                "retarget" => fs::write(&header, r#"{"id":"different","role":"user"}"#)?,
+                _ => unreachable!(),
+            }
+            assert!(guard.verify(&reference).is_err(), "{change} escaped the read guard");
+        }
+        Ok(())
+    }
 
     fn parts(json_strs: &[&str]) -> Vec<Value> {
         json_strs.iter().map(|s| serde_json::from_str(s).unwrap()).collect()
@@ -1131,9 +1201,15 @@ mod tests {
     ) -> (Vec<Message>, Vec<Message>) {
         let source = crate::json::JsonSource::capture(path).unwrap();
         let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
-        let owned = source.read_document(|view| decode(view, record::Ctx::Owned)).unwrap();
+        let owned = source
+            .read(ReadInput::Document, Validation::Value, |view| {
+                decode(view, record::Ctx::Owned)
+            })
+            .unwrap();
         let mut spans = source
-            .read_document(|view| decode(view, record::Ctx::new(true, &source, &arena)))
+            .read(ReadInput::Document, Validation::Value, |view| {
+                decode(view, record::Ctx::new(true, &source, &arena))
+            })
             .unwrap();
         for message in &mut spans {
             message.materialize(&crate::lazy::Resolver::new(None)).unwrap();
@@ -1405,7 +1481,7 @@ mod tests {
         let source = crate::json::JsonSource::capture(&path).unwrap();
         let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
         let mut messages = source
-            .read_document(|view| {
+            .read(ReadInput::Document, Validation::Value, |view| {
                 Ok(
                     record::Record::header(view, None, record::Ctx::new(true, &source, &arena))?
                         .unwrap()
@@ -1528,7 +1604,7 @@ mod tests {
         let source = crate::json::JsonSource::capture(&path).unwrap();
         let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
         let messages = source
-            .read_document(|view| {
+            .read(ReadInput::Document, Validation::Value, |view| {
                 Ok(v2::build(
                     "message",
                     "shell",
@@ -1700,7 +1776,7 @@ mod tests {
         let source = crate::json::JsonSource::capture(&path).unwrap();
         let arena = std::sync::Arc::new(crate::harness::store::bytes::ByteSource::arena().unwrap());
         let messages = source
-            .read_document(|view| {
+            .read(ReadInput::Document, Validation::Value, |view| {
                 Ok(v2::build(
                     "message",
                     "assistant",
@@ -2024,8 +2100,8 @@ mod tests {
     #[test]
     fn reading_a_live_wal_store_writes_nothing_in_it() {
         use crate::harness::store::sqlite::{live_store, store_state};
-        let dir = std::env::temp_dir().join(format!("cv-opencode-live-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&dir).unwrap();
+        let world = cv_testkit::World::new("opencode-live-wal");
+        let dir = world.base.clone();
         let db = dir.join("opencode.db");
         drop(make_db(&db, true));
         let writer = live_store(&db, "SELECT 1");
@@ -2050,7 +2126,6 @@ mod tests {
             assert_eq!(store_state(&dir), before, "checkpointed: {checkpointed}");
         }
         drop(writer);
-        fs::remove_dir_all(dir).ok();
     }
 
     /// A `session_message` cell that is not TEXT, empty, not UTF-8 or not exactly one JSON value
@@ -2089,11 +2164,10 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
-    #[cfg(feature = "sqlite")]
     #[test]
-    fn sqlite_v1_discovery_counts_follow_readable_final_roles() {
-        let dir = std::env::temp_dir().join(format!("cv-opencode-role-count-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
+    fn sqlite_v1_turns_follow_readable_final_roles() {
+        let world = cv_testkit::World::new("opencode-role-count");
+        let dir = world.base.clone();
         let path = dir.join("opencode.db");
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY,directory TEXT,title TEXT,time_created INTEGER,time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,message_id TEXT,data TEXT);").unwrap();
@@ -2138,7 +2212,7 @@ mod tests {
                 .into_iter()
                 .find(|reference| reference.id == id)
                 .unwrap();
-            assert_eq!(reference.message_count, Some(*new));
+            assert_eq!(reference.message_count, None, "discovery defers the count");
             let session = adapter.parse(&reference).unwrap();
             assert_eq!(
                 session
@@ -2148,16 +2222,16 @@ mod tests {
                     .count(),
                 *new
             );
+            assert_eq!(session.messages.iter().filter(|m| m.is_turn()).count(), *new);
         }
         drop(connection);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn cold_wal_selected_text_keeps_original_guard_without_creating_sidecars() {
-        let dir = std::env::temp_dir().join(format!("cv-opencode-cold-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&dir).unwrap();
+        let world = cv_testkit::World::new("opencode-cold-wal");
+        let dir = world.base.clone();
         let db = dir.join("opencode.db");
         let writer = make_db(&db, false);
         writer
@@ -2175,7 +2249,7 @@ mod tests {
         fs::remove_file(&shm).unwrap();
         let adapter = OpenCode::with_db(db);
         let reference = adapter.discover().unwrap().remove(0);
-        assert_eq!(reference.message_count, Some(2));
+        assert_eq!(reference.message_count, None);
         let mut messages = Vec::new();
         let mut sink = crate::stream::TryFnSink::new(|message| {
             messages.push(message);
@@ -2202,14 +2276,13 @@ mod tests {
             "copied payload must validate original WAL"
         );
         drop(writer);
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_snapshot_rejects_wal_mutation_even_after_sink_failure() {
-        let dir = std::env::temp_dir().join(format!("cv-opencode-wal-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&dir).unwrap();
+        let world = cv_testkit::World::new("opencode-wal-guard");
+        let dir = world.base.clone();
         let db = dir.join("opencode.db");
         let writer = make_db(&db, false);
         writer.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
@@ -2228,7 +2301,74 @@ mod tests {
         assert!(format!("{error:#}").contains("changed"), "{error:#}");
         assert!(!format!("{error:#}").contains("consumer cap"));
         drop(writer);
-        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Every corpus version: a part written into one session's last message (1.x) or a message
+    /// appended to it (2.x) moves that session's certificate alone, and every other session
+    /// reads exactly as before.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn corpus_rows_certify_each_session_and_move_only_with_its_rows() {
+        let corpus = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/opencode");
+        let mut versions: Vec<_> = std::fs::read_dir(&corpus).unwrap().map(|e| e.unwrap().path()).collect();
+        versions.sort();
+        assert!(!versions.is_empty());
+        for version in versions {
+            let world = crate::test_world("opencode-corpus-rows");
+            let db = world.base.join("opencode.db");
+            std::fs::copy(version.join(".local/share/opencode/opencode.db"), &db).unwrap();
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let v2 = db::has_table(&conn, "session_v2");
+            let leaf: String = conn
+                .query_row(
+                    if v2 {
+                        "SELECT session_id FROM session_message ORDER BY session_id LIMIT 1"
+                    } else {
+                        "SELECT session_id FROM message ORDER BY session_id LIMIT 1"
+                    },
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(conn);
+            let adapter = OpenCode::with_db(db.clone());
+            crate::harness::store::sqlite::assert_rows_move_alone(&adapter, &db, &leaf, |c| {
+                let sql = if v2 {
+                    "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) \
+                     SELECT 'zq', ?1, 'user', max(seq) + 1, 4102444800000, 4102444800000, \
+                     '{\"text\":\"zqcertified\"}' FROM session_message WHERE session_id = ?1"
+                } else {
+                    "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+                     SELECT 'prt_zq', id, ?1, 4102444800000, 4102444800000, \
+                     '{\"type\":\"text\",\"text\":\"zqcertified\"}' FROM message WHERE session_id = ?1 \
+                     ORDER BY time_created DESC LIMIT 1"
+                };
+                assert_eq!(c.execute(sql, [&leaf]).unwrap(), 1);
+            });
+            // A streaming part (a 2.x message) is UPDATEd in place: same rowid, same count.
+            let before = adapter.rows(&db).unwrap();
+            let table = if v2 { "session_message" } else { "part" };
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET data = json_set(data, '$.text', 'zqcertified, streamed'), \
+                         time_updated = time_updated + 1 WHERE id = (SELECT id FROM {table} WHERE id LIKE '%zq')"
+                    ),
+                    [],
+                )
+                .unwrap();
+            let after = adapter.rows(&db).unwrap();
+            assert_ne!(
+                after[&leaf], before[&leaf],
+                "{version:?}: an in-place update moves its session"
+            );
+            assert_eq!(
+                (after[&leaf].count, after[&leaf].high),
+                (before[&leaf].count, before[&leaf].high)
+            );
+            assert!(after.iter().all(|(id, rows)| id == &leaf || before[id] == *rows));
+        }
     }
 
     #[cfg(feature = "sqlite")]
@@ -2246,8 +2386,8 @@ mod tests {
     #[test]
     fn db_store_discover_and_parse() {
         for with_metadata in [false, true] {
-            let dir = std::env::temp_dir().join(format!("cv-opencode-db-{}", uuid::Uuid::new_v4()));
-            fs::create_dir_all(&dir).unwrap();
+            let world = cv_testkit::World::new("opencode-db-store");
+            let dir = world.base.clone();
             let db = dir.join("opencode.db");
             let conn = make_db(&db, with_metadata);
             seed_session(&conn, "ses_DB01", with_metadata);
@@ -2261,11 +2401,7 @@ mod tests {
             assert_eq!(r.path, db, "a db-backed ref points at the database");
             assert_eq!(r.cwd.as_deref(), Some(std::path::Path::new("/home/dev/proj")));
             assert_eq!(r.title.as_deref(), Some("Removing debug comments"));
-            assert_eq!(
-                r.message_count,
-                Some(2),
-                "user + assistant turns, from the role inside `data`"
-            );
+            assert_eq!(r.message_count, None, "discovery defers the count to a full read");
             assert!(r.created_at.is_some() && r.updated_at >= r.created_at);
 
             let s = oc.parse(r).unwrap();
@@ -2325,7 +2461,6 @@ mod tests {
                 matches!(&s.messages[2].content[0], Block::ToolResult { content, .. } if content.matches_str("a\nb") == Some(true))
             );
             assert_eq!(s.messages[1].usage.as_ref().unwrap().cache_read_tokens, Some(20627));
-            fs::remove_dir_all(&dir).ok();
         }
     }
 
@@ -2335,8 +2470,8 @@ mod tests {
         // The JSON fixture holds ses_FIX01; a database holding the same id (the import left both)
         // must yield ONE ref, the db-backed one — while a JSON-only session is still discovered.
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opencode/parts_gen");
-        let dir = std::env::temp_dir().join(format!("cv-opencode-dedupe-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+        let world = cv_testkit::World::new("opencode-dedupe");
+        let dir = world.base.clone();
         let db = dir.join("opencode.db");
         let conn = make_db(&db, false);
         seed_session(&conn, "ses_FIX01", false);
@@ -2356,7 +2491,6 @@ mod tests {
             skipped: Vec::new(),
         };
         assert_eq!(oc_json_only.discover().unwrap().len(), 1);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A `reasoning` part whose text is empty but which carries a provider signature is the WHOLE

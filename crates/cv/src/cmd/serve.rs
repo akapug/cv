@@ -524,7 +524,7 @@ fn stats(params: &Query) -> (u16, Value) {
 /// through the other door.
 ///
 /// **The index answers, or says why not.** A missing or unusable index is a 503 naming the cause
-/// and the fix, as `cv search` errors; `scan=1` asks for the head-capped live scan instead
+/// and the fix, as `cv search` errors; `scan=1` asks for the live scan instead
 /// ([`cv_core::scan::live_search_filtered`]). Which path answered rides on `X-Cv-Search-Source` (`index` |
 /// `semantic` | `live`), with a human sentence in `X-Cv-Search-Note` whenever the answer may be
 /// partial (a stale index, a live scan, a truncation). Both headers are CORS-exposed. The body
@@ -585,7 +585,11 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
         cwd: cwd.as_deref(),
         scope,
     };
-    let found = match searcher.search(&q, filter, limit, source) {
+    let live_bytes = match params.unsigned("live_bytes") {
+        Ok(bytes) => bytes.map(|b| b as u64),
+        Err(error) => return bad(400, &error),
+    };
+    let found = match searcher.search(&q, filter, limit, source, live_bytes) {
         Ok(found) => found,
         // A live scan cannot stand in for semantic ranking, so this is an error, exactly as
         // `cv search --semantic` exits non-zero rather than quietly changing mode.
@@ -602,7 +606,7 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
         Err(e) => {
             return bad(
                 503,
-                &format!("{e:#} (or add scan=1 for a slow live scan of each session's head)"),
+                &format!("{e:#} (or add scan=1 for a slow live scan of every session)"),
             )
         }
     };
@@ -611,16 +615,18 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
 
     // The note, in this door's words: the scan, its truncation, then whatever the search itself
     // could not promise, joined with `; `.
-    let mut note = scan.then(|| "scan=1: scanned transcripts live, head-capped".to_string());
-    if found.truncated {
-        note = Some(format!(
-            "{} (stopped at {limit} hits; raise limit for more)",
-            note.unwrap_or_default()
-        ));
+    let mut note = scan.then(|| "scan=1: scanned every transcript live".to_string());
+    if found.hits.len() < found.total {
+        let cut = format!("{} of {} matches; raise limit for more", found.hits.len(), found.total);
+        note = Some(match note {
+            Some(n) => format!("{n}; {cut}"),
+            None => cut,
+        });
     }
     for n in &found.notes {
         let s = match n {
             Note::Stale(s) => s.clone(),
+            Note::Live(s) => s.clone(),
             Note::SnippetsUnavailable(e) => format!("live snippets unavailable ({e}); showing indexed previews"),
             Note::Unscanned(s) => s.clone(),
             Note::NoSubagents => "sub-agent transcripts aren't searched yet — rebuild with `cv index --subagents` to \
@@ -633,7 +639,10 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
         });
     }
 
-    let mut headers = vec![("X-Cv-Search-Source", found.source.as_str().to_string())];
+    let mut headers = vec![
+        ("X-Cv-Search-Source", found.source.as_str().to_string()),
+        ("X-Cv-Search-Total", found.total.to_string()),
+    ];
     if let Some(n) = note {
         headers.push(("X-Cv-Search-Note", header_safe(&n)));
     }

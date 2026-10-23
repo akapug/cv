@@ -2,6 +2,7 @@
 //! no retained transcript payloads.
 use super::*;
 use crate::harness::claude::record;
+use crate::json::{ReadInput, Validation};
 use crate::{harness::store::jsonl::ranges, json::JsonSource};
 use std::collections::{HashMap, HashSet};
 /// What the rules read of one record.
@@ -76,7 +77,9 @@ fn scan(source: &JsonSource, file: &fs::File, label: &Path, agent: Option<&str>,
             continue;
         }
         let n = facts.len();
-        let fact = match source.read_range_value(raw.offset, raw.len, |view| Ok(record::Facts::parse(view)?.0)) {
+        let fact = match source.read(ReadInput::Range(raw.offset, raw.len), Validation::Value, |view| {
+            Ok(record::Facts::parse(view)?.0)
+        }) {
             Ok(fact) => fact,
             Err(error) if skip_invalid && error.is::<crate::json::InvalidJson>() => continue,
             Err(error) => return Err(error.context(format!("{}: not a JSON record", label.display()))),

@@ -40,42 +40,10 @@ pub(crate) fn cmd_schema(cli: &clap::Command, json: bool, commands: bool) -> Res
     Ok(())
 }
 
-/// Every `MessageKind` as serde spells it. Kept in step with `cv_core::ir::MessageKind` by
-/// `kinds_and_origins_round_trip` (each name must deserialize).
-pub(crate) const MESSAGE_KINDS: &[&str] = &[
-    "prompt",
-    "reply",
-    "tool_result",
-    "injected_context",
-    "system_prompt",
-    "notice",
-    "compaction_boundary",
-    "compaction_summary",
-    "model_change",
-    "error",
-    "subagent_spawn",
-    "subagent_return",
-    "branch",
-    "carrier",
-];
-
-/// Every `Origin` as serde spells it.
-pub(crate) const ORIGINS: &[&str] = &[
-    "human",
-    "model",
-    "harness",
-    "hook",
-    "scheduler",
-    "subagent",
-    "import",
-    "unknown",
-];
-
-pub(crate) const ROLES: &[&str] = &["system", "user", "assistant", "tool"];
-
 /// The data shapes: what `--json` outputs are made of. Field lists mirror `cv_core::ir`; the
 /// block `type` tag and the message `kind`/`origin` vocabularies are enumerated so a consumer can
-/// branch without reading Rust.
+/// branch without reading Rust. The vocabularies are the IR's own lists (`*_NAMES`, beside the
+/// enums), so a renamed/removed variant fails to compile and a new one is published automatically.
 pub(crate) fn data_schema_json() -> Value {
     json!({
         "session_row": {
@@ -103,9 +71,9 @@ pub(crate) fn data_schema_json() -> Value {
         },
         "message": {
             "fields": ["id", "parent_id", "role", "kind", "origin", "timestamp", "model", "content", "usage", "extra"],
-            "role": ROLES,
-            "kind": MESSAGE_KINDS,
-            "origin": ORIGINS,
+            "role": &cv_core::ir::ROLE_NAMES[..],
+            "kind": &cv_core::ir::MESSAGE_KIND_NAMES[..],
+            "origin": &cv_core::ir::ORIGIN_NAMES[..],
             "usage": ["input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
                       "reasoning_tokens", "cost_usd"],
         },
@@ -310,18 +278,25 @@ mod tests {
     use super::*;
     use cv_core::ir::{MessageKind, Origin, Role};
 
-    /// The enumerated vocabularies match the IR's serde spelling (a renamed/removed variant
-    /// fails here; a new one must be added to the list to be published).
+    /// The published vocabularies ARE the enums, both ways: every published name deserializes
+    /// (so `as_str` cannot drift from serde's spelling) and every variant serializes to a
+    /// published name (the lists derive from `ALL`, so a new variant cannot dodge the schema).
     #[test]
     fn kinds_and_origins_round_trip() {
-        for k in MESSAGE_KINDS {
-            serde_json::from_value::<MessageKind>(json!(k)).unwrap_or_else(|e| panic!("kind {k}: {e}"));
+        for k in MessageKind::ALL {
+            let name = k.as_str();
+            assert_eq!(serde_json::to_value(k).unwrap(), json!(name), "kind {name}");
+            serde_json::from_value::<MessageKind>(json!(name)).unwrap_or_else(|e| panic!("kind {name}: {e}"));
         }
-        for o in ORIGINS {
-            serde_json::from_value::<Origin>(json!(o)).unwrap_or_else(|e| panic!("origin {o}: {e}"));
+        for o in Origin::ALL {
+            let name = o.as_str();
+            assert_eq!(serde_json::to_value(o).unwrap(), json!(name), "origin {name}");
+            serde_json::from_value::<Origin>(json!(name)).unwrap_or_else(|e| panic!("origin {name}: {e}"));
         }
-        for r in ROLES {
-            serde_json::from_value::<Role>(json!(r)).unwrap_or_else(|e| panic!("role {r}: {e}"));
+        for r in Role::ALL {
+            let name = r.as_str();
+            assert_eq!(serde_json::to_value(r).unwrap(), json!(name), "role {name}");
+            serde_json::from_value::<Role>(json!(name)).unwrap_or_else(|e| panic!("role {name}: {e}"));
         }
         // The default-by-role table the contract fixes.
         assert_eq!(MessageKind::for_role(Role::User), MessageKind::Prompt);

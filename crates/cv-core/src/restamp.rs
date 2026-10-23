@@ -8,6 +8,8 @@
 //! output quoting a transcript) is content and is not touched. The property, pinned below:
 //! `restamp(restamp(x, a), b) == x` when `b` is the id `x` carried.
 
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -17,20 +19,6 @@ struct TopIds<'a> {
     session_id: Option<&'a RawValue>,
     #[serde(borrow, rename = "session_id")]
     session_id_snake: Option<&'a RawValue>,
-}
-
-/// Raw transform output ids also become filenames/resource directory names. Keep them within the
-/// selected output directory; this does not restrict ids stored in arbitrary IR or restamped text.
-pub(crate) fn validate_output_id(id: &str) -> anyhow::Result<()> {
-    let mut components = std::path::Path::new(id).components();
-    anyhow::ensure!(
-        !id.is_empty()
-            && !id.contains(['/', '\\', '\0'])
-            && matches!(components.next(), Some(std::path::Component::Normal(_)))
-            && components.next().is_none(),
-        "new session id must be a nonempty filename component, not a path: {id:?}"
-    );
-    Ok(())
 }
 
 /// Restamp one transcript line: replace the top-level `sessionId` / `session_id` string values with
@@ -191,7 +179,9 @@ mod tests {
             Vec::new()
         } else {
             let keys = crate::harness::claude::IDENTITY.session_keys;
-            match source.read_range_syntax(offset, len, |view| source_id_spans(view, keys)) {
+            match source.read(ReadInput::Range(offset, len), Validation::Syntax, |view| {
+                source_id_spans(view, keys)
+            }) {
                 Ok(spans) => spans,
                 Err(e) if e.is::<crate::json::InvalidJson>() || e.is::<InvalidStruct>() => Vec::new(),
                 Err(e) => return Err(e),

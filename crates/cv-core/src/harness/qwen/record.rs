@@ -6,6 +6,8 @@ use super::*;
 use crate::harness::store::document::{text_head, text_summary, Fields};
 use crate::harness::wire::genai::{self, Dialect, Part};
 use crate::json::{JsonSource, JsonView};
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::lazy::{Resolver, Text};
 use crate::stream::Tier;
 
@@ -59,7 +61,7 @@ const TOP: &[&str] = &[
 
 /// One record: fold its session facts, then (unless the sink already stopped) hand its messages
 /// to `sink`. Returns false once the sink has stopped.
-pub(super) fn ingest(
+pub(super) fn record(
     view: JsonView<'_>,
     s: &mut Session,
     st: &mut ReplayState,
@@ -88,19 +90,18 @@ fn string(view: Option<JsonView<'_>>, key: &str) -> Result<Option<String>> {
         .and_then(|v| v.as_str().map(str::to_owned)))
 }
 
+type DateTime = chrono::DateTime<chrono::Utc>;
+
 fn timestamp(r: &Fields<'_>) -> Result<Option<DateTime>> {
     Ok(r.string("timestamp")?.as_deref().and_then(parse_ts))
 }
-type DateTime = chrono::DateTime<chrono::Utc>;
 
 /// Session-level facts every record carries: id, cwd, branch, version, time span, fork origin,
 /// approval mode.
 fn session_facts(s: &mut Session, r: &Fields<'_>) -> Result<()> {
     if s.lineage.parent.is_none() {
         if let Some(id) = r.string("sessionId")? {
-            if s.id != id {
-                s.id = id;
-            }
+            s.id = id;
         }
     }
     if s.cwd.is_none() {
@@ -716,7 +717,9 @@ mod tests {
         ]}});
         std::fs::write(&path, serde_json::to_vec(&record)?)?;
         let source = JsonSource::capture(&path)?;
-        let blocks = source.read_document(|view| content_blocks(view.get("message")?, Demand::Discovery))?;
+        let blocks = source.read(ReadInput::Document, Validation::Value, |view| {
+            content_blocks(view.get("message")?, Demand::Discovery)
+        })?;
         assert!(serde_json::to_vec(&blocks)?.len() < 2000);
         assert!(
             matches!(&blocks[3], Block::ToolUse { id, name, namespace: Some(namespace), input }
@@ -750,7 +753,7 @@ mod genai_contracts {
             std::fs::write(&path, &bytes)?;
             let source = JsonSource::capture(&path)?;
             for demand in 0..3 {
-                let (blocks, flag) = source.read_range_value(0, source.len(), |view| {
+                let (blocks, flag) = source.read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
                     let d = match demand {
                         0 => Demand::Owned,
                         1 => Demand::Spans(&source),

@@ -138,6 +138,11 @@ impl Adapter for Zed {
         Ok(found)
     }
 
+    /// Every thread's certificate ([`rows_conn`]).
+    fn rows(&self, store: &Path) -> Option<HashMap<String, crate::source::Rows>> {
+        open_ro(store).ok()?.read(|conn, _| rows_conn(conn)).ok()
+    }
+
     /// Zed writes `threads.db` in place.
     fn watch_policy(&self, _r: &SessionRef) -> super::WatchPolicy {
         super::WatchPolicy::Database
@@ -163,7 +168,10 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
     // Sorting only metadata keeps every complete blob out of SQLite's temporary sorter; each
     // thread's cell is then read by key.
     let sql = format!("SELECT {} FROM threads ORDER BY updated_at DESC", select.list());
-    let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "threads")?;
+    // A thread whose row certifies as it did when its listing was last decoded keeps that
+    // listing: a save decodes the saved thread, not every thread ([`Listings`]).
+    let certificates = rows_conn(conn)?;
+    let mut pass = super::store::sqlite::listing::Pass::<ThreadCwd>::begin(Harness::Zed, db);
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
@@ -177,11 +185,17 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
         let folders = row.get::<_, Option<String>>(4)?;
         let order = row.get::<_, Option<String>>(5)?;
         let data_type = row.get::<_, Option<String>>(6)?;
-        let thread = thread_cell(conn, &cells, &id, data_type.as_deref())?
-            .map(|cell| cells.read(cell, listing))
-            .transpose()?
-            .flatten();
-        let cwd = thread.flatten();
+        let ThreadCwd(cwd) = pass.list(&id, certificates.get(&id).copied(), || -> Result<ThreadCwd> {
+            // Each thread's cells are its own: the decoded blob is released before the next.
+            let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "threads")?;
+            Ok(ThreadCwd(
+                thread_cell(conn, &cells, &id, data_type.as_deref())?
+                    .map(|cell| cells.read(cell, listing))
+                    .transpose()?
+                    .flatten()
+                    .flatten(),
+            ))
+        })?;
         out.push(SessionRef {
             cwd: cwd.or_else(|| first_folder_path(folders.as_deref(), order.as_deref())),
             title: summary
@@ -193,7 +207,46 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
             ..SessionRef::new(id, Harness::Zed, db.to_path_buf())
         });
     }
+    drop(rows);
+    drop(stmt);
+    pass.keep();
     Ok(out)
+}
+
+/// A thread's listing cwd: its decoded blob's snapshot cwd ([`listing`]).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ThreadCwd(Option<PathBuf>);
+
+impl super::store::sqlite::listing::Listing for ThreadCwd {
+    const TAG: &'static str = "zed-listing";
+}
+
+/// Every thread's [`Rows`](crate::source::Rows) certificate: its one `threads` row, by rowid (Zed
+/// saves a thread by `INSERT OR REPLACE`, a new rowid; a `WITHOUT ROWID` table has none), every
+/// column but `data` (`updated_at` moves on every save), and the byte length of the `data` blob
+/// from its record header. The thread document is one compressed blob, so this is the whole read
+/// short of decoding it.
+fn rows_conn(conn: &Connection) -> Result<HashMap<String, crate::source::Rows>> {
+    let _snapshot = super::store::sqlite::snapshot(conn)?;
+    let rowid = if conn.prepare("SELECT rowid FROM threads LIMIT 0").is_ok() {
+        "rowid"
+    } else {
+        "NULL"
+    };
+    let mut columns: Vec<String> = super::store::sqlite::columns(conn, "threads")
+        .into_iter()
+        .filter(|c| c != "data")
+        .collect();
+    columns.sort();
+    let mut certificates = super::store::sqlite::Certificates::default();
+    certificates.rows(
+        conn,
+        &format!(
+            "SELECT id, {rowid}, {}, octet_length(data) FROM threads ORDER BY id",
+            columns.join(", ")
+        ),
+    )?;
+    Ok(certificates.0)
 }
 
 /// Listing needs the snapshot cwd, not a replay of the thread's message bodies.
@@ -487,6 +540,11 @@ mod tests {
             data BLOB NOT NULL
         );
     ";
+
+    /// The current schema with the table as WITHOUT ROWID — the shape production must also read.
+    fn without_rowid_schema() -> String {
+        SCHEMA.replace("        );", "        ) WITHOUT ROWID;")
+    }
 
     /// A file-backed store (a cell's byte source is a file) that lives as long as the value.
     struct Db {
@@ -921,10 +979,7 @@ mod tests {
 
     #[test]
     fn metadata_sort_preserves_ties_and_without_rowid_fallback() {
-        for schema in [
-            SCHEMA.to_string(),
-            SCHEMA.replace("        );", "        ) WITHOUT ROWID;"),
-        ] {
+        for schema in [SCHEMA.to_string(), without_rowid_schema()] {
             let c = mk(&schema);
             let data = zstd_blob(&legacy_thread());
             for id in ["z", "a", "m"] {
@@ -1293,8 +1348,7 @@ mod tests {
         let _world = crate::test_world("zed-stream-parse");
         // The corpus-wide invariant, asserted here on a fixture so it runs without real data:
         // parse() and collect(stream()) are the same bytes.
-        let dir = std::env::temp_dir().join(format!("cv-zed-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = cv_testkit::temp_dir("zed-parity");
         let db = dir.join("threads.db");
         {
             let c = Connection::open(&db).unwrap();
@@ -1325,13 +1379,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A save of one thread rediscovers the store decoding that thread alone: every other
+    /// thread keeps the listing its unchanged row certifies, in this process or (its memo gone,
+    /// as in the next `cv` process) from the catalog.
+    #[test]
+    fn a_save_decodes_only_the_saved_thread_at_discovery() {
+        let world = crate::test_world("zed-listing");
+        let context = crate::discover_cache::read::Context::current();
+        let _scope = context.enter();
+        let db = world.base.join("threads.db");
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch(SCHEMA).unwrap();
+        for id in ["t1", "t2", "t3"] {
+            insert(&c, id, id, "zstd", &zstd_blob(&legacy_thread()));
+        }
+        let zed = Zed::with_root(&world.base);
+        let decoded = || super::super::store::sqlite::listing::DECODED.with(|n| n.replace(0));
+        let listing = || {
+            let mut refs = zed.discover().unwrap().refs;
+            refs.sort_by(|a, b| a.id.cmp(&b.id));
+            serde_json::to_string(&refs).unwrap()
+        };
+        let first = listing();
+        assert_eq!(decoded(), 3);
+        let save = |id: &str, at: &str| {
+            c.execute(
+                "INSERT OR REPLACE INTO threads (id, summary, updated_at, data_type, data, folder_paths, \
+                 folder_paths_order, created_at) SELECT id, summary, ?2, data_type, data, folder_paths, \
+                 folder_paths_order, created_at FROM threads WHERE id = ?1",
+                rusqlite::params![id, at],
+            )
+            .unwrap();
+        };
+        save("t2", "2030-01-01T00:00:00+00:00");
+        let saved = listing();
+        assert_eq!(decoded(), 1);
+        assert_ne!(saved, first);
+        super::super::store::sqlite::listing::forget();
+        save("t3", "2030-01-02T00:00:00+00:00");
+        listing();
+        assert_eq!(decoded(), 1);
+    }
+
+    /// A save of one thread (its row replaced, as Zed writes it) moves its certificate alone, with
+    /// and without rowids, and every other thread reads exactly as before.
+    #[test]
+    fn rows_certify_each_thread_and_move_only_with_its_row() {
+        for without_rowid in [false, true] {
+            let world = crate::test_world("zed-rows");
+            let db = world.base.join("threads.db");
+            {
+                let c = Connection::open(&db).unwrap();
+                c.execute_batch(&if without_rowid {
+                    without_rowid_schema()
+                } else {
+                    SCHEMA.to_string()
+                })
+                .unwrap();
+                insert(&c, "t1", "Fix the flaky test", "zstd", &zstd_blob(&legacy_thread()));
+                insert(&c, "t2", "", "zstd", &zstd_blob(&modern_thread()));
+                insert(&c, "t3", "Third", "json", modern_thread().to_string().as_bytes());
+            }
+            let zed = Zed::with_root(&world.base);
+            super::super::store::sqlite::assert_rows_move_alone(&zed, &db, "t2", |c| {
+                let mut thread = modern_thread();
+                thread["title"] = "zqcertified".into();
+                c.execute(
+                    "INSERT OR REPLACE INTO threads (id, summary, updated_at, data_type, data, folder_paths, \
+                     folder_paths_order, created_at) SELECT id, summary, '2030-01-01T00:00:00+00:00', data_type, ?2, \
+                     folder_paths, folder_paths_order, created_at FROM threads WHERE id = ?1",
+                    rusqlite::params!["t2", zstd_blob(&thread)],
+                )
+                .unwrap();
+            });
+        }
+    }
+
     #[test]
     fn every_demand_resolves_the_same_thread_with_and_without_rowid() {
         let world = cv_testkit::World::new("zed-checked-stream");
         let path = world.base.join("threads.db");
         for without_rowid in [false, true] {
             let schema = if without_rowid {
-                SCHEMA.replace("        );", "        ) WITHOUT ROWID;")
+                without_rowid_schema()
             } else {
                 SCHEMA.to_string()
             };

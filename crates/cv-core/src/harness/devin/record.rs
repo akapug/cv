@@ -7,11 +7,7 @@ use super::*;
 use crate::json::JsonView;
 
 pub(super) fn string(view: Option<JsonView<'_>>) -> Result<Option<String>> {
-    let Some(view) = view else { return Ok(None) };
-    if !view.is_string()? {
-        return Ok(None);
-    }
-    Ok(view.resolve()?.as_str().map(str::to_string))
+    view.map(|view| view.string()).transpose().map(Option::flatten)
 }
 fn boolean(view: Option<JsonView<'_>>) -> Result<Option<bool>> {
     view.map(JsonView::as_bool).transpose().map(Option::flatten)

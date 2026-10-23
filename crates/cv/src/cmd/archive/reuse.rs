@@ -6,8 +6,6 @@ use cv_core::projection::{Counted, Prefix};
 use spool::{FirstUser, Spool, Spooled};
 use std::io::{BufWriter, Read};
 
-const STATE_BYTES: u64 = 1024 * 1024;
-
 /// A published archive file: its identity, plus off Unix (where `FileId` has no inode or
 /// ctime) a content digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,7 +141,8 @@ fn equal_artifact(path: &Path, len: u64, digest: &str) -> bool {
     compare().unwrap_or(false)
 }
 
-/// The catalog row of an archived session: `turns` of its `written` messages are turns.
+/// The catalog row of an archived session: `message_count` becomes its turns, `messages_written`
+/// the raw count of messages the pass wrote.
 fn entry(session: &Session, title: Option<String>, turns: usize, written: usize) -> CatalogEntry {
     CatalogEntry {
         session: SessionRef {
@@ -164,6 +163,17 @@ fn entry(session: &Session, title: Option<String>, turns: usize, written: usize)
 }
 
 impl Archive {
+    /// The identities of what an archive pass left for `r` (its session file and resume state),
+    /// when both exist and the platform's file identity is exact enough to stand for their
+    /// content (Unix: inode and ctime). Elsewhere `None`: every pass validates in full.
+    pub(super) fn outputs(&self, r: &SessionRef) -> Option<[cv_core::source::FileId; 2]> {
+        if !cfg!(unix) {
+            return None;
+        }
+        let id = |path: PathBuf| cv_core::source::FileId::of(&fs::metadata(path).ok()?);
+        Some([id(self.session_path(r.harness, &r.id))?, id(self.source_path(r))?])
+    }
+
     fn source_path(&self, r: &SessionRef) -> PathBuf {
         self.home
             .join("archive-source")
@@ -172,8 +182,7 @@ impl Archive {
     }
 
     /// The resume state a previous archive pass left for `r`, when it still applies. A miss
-    /// re-reads the source: no state yet (`NotFound`), one over the cap, one another cv version
-    /// wrote (it does not decode, or names another version) or for another artifact. A state that
+    /// re-reads the source: no state yet (`NotFound`), one another cv version wrote (it does not decode, or names another version) or for another artifact. A state that
     /// is there but cannot be read degrades once per process, like every accelerator.
     fn stored(&self, r: &SessionRef) -> Option<Stored> {
         let path = self.source_path(r);
@@ -185,16 +194,12 @@ impl Archive {
                 return None;
             }
         };
-        let (metadata, file) = file;
-        if metadata.len() > STATE_BYTES {
-            return None;
-        }
-        let mut bytes = Vec::new();
-        if let Err(error) = file.take(STATE_BYTES + 1).read_to_end(&mut bytes) {
+        // No size cap: the state is this session's own certificate, so declining a large one
+        // would re-read and re-archive the session on every pass.
+        let (metadata, mut file) = file;
+        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        if let Err(error) = file.read_to_end(&mut bytes) {
             cv_core::env::warn_once("the archive's resume state", format!("{}: {error}", path.display()));
-            return None;
-        }
-        if bytes.len() as u64 > STATE_BYTES {
             return None;
         }
         let record = cv_core::source::Record::<Stored<cv_core::watch::Held>>::decode(&bytes)?;
@@ -347,7 +352,7 @@ impl Archive {
             .as_ref()
             .map_or(0, |prefix| old_turns + turns.before(prefix.messages - pass.prefix));
         // Freshness is checked once, under the catalog lock, right before the state publishes.
-        if read.fits_cache(STATE_BYTES as usize - 1024) {
+        {
             let (baseline, held) = read.clone().split();
             let stored = Stored {
                 total,
@@ -455,6 +460,26 @@ mod tests {
             "artifact_bytes":fs::metadata(a.session_path(r.harness,&r.id)).ok().map(|m|m.len()),
             "elapsed_seconds":started.elapsed().as_secs_f64(),"heap":heap});
         eprintln!("archive_probe={report}");
+    }
+
+    #[test]
+    fn a_resume_state_past_one_mib_is_kept_and_an_unchanged_source_is_skipped() {
+        let (root, a, r, mut body) = setup(Harness::Claude);
+        // The session's cwd rides in every checkpoint, so the state encodes above 1 MiB.
+        let cwd = format!("/{}", "w".repeat(1024 * 1024));
+        let wide = serde_json::json!({"type":"user","uuid":"wide","sessionId":"read","cwd":cwd,
+            "message":{"role":"user","content":"wide"}});
+        body.insert_str(0, &format!("{wide}\n"));
+        fs::write(&r.path, &body).unwrap();
+        let adapter = cv_core::harness::for_harness(r.harness).unwrap();
+        let first = a.store_ref(adapter.as_ref(), &r).unwrap();
+        assert!(matches!(first.outcome, StoreOutcome::Archived));
+        assert!(fs::metadata(a.source_path(&r)).unwrap().len() > 1024 * 1024);
+        let again = a.store_ref(adapter.as_ref(), &r).unwrap();
+        assert!(matches!(again.outcome, StoreOutcome::Skipped));
+        assert_eq!(again.parsed_messages, 0, "an unchanged source is not re-read");
+        exact(&a, adapter.as_ref(), &r);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

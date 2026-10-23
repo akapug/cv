@@ -10,7 +10,7 @@ use crate::stream::{Checkpoint, Flow, MessageSink, Tier};
 use crate::{Message, Resolver, Session};
 use anyhow::{Context as _, Result};
 use serde_json::Value;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 pub struct WindowSink {
@@ -144,16 +144,25 @@ impl WindowSink {
         self.kept.take().unwrap_or_default()
     }
 
-    /// The staged frames as values (the unstaged `/messages` reply).
+    /// The staged frames as values (the unstaged `/messages` reply). One frame decodes at a
+    /// time, straight off the staged source: the reply never duplicates the staged bytes.
     pub(super) fn values(&mut self) -> Result<Vec<Value>> {
         let frames = self.finish()?;
-        let mut bytes = Vec::new();
-        frames.copy_to(&mut bytes)?;
-        bytes
-            .split(|byte| *byte == 0x1e)
-            .filter(|frame| !frame.is_empty())
-            .map(|frame| serde_json::from_slice(frame).map_err(Into::into))
-            .collect()
+        let mut reader = std::io::BufReader::new(frames.reader()?);
+        let mut values = Vec::new();
+        let mut frame = Vec::new();
+        loop {
+            frame.clear();
+            if reader.read_until(0x1e, &mut frame)? == 0 {
+                return Ok(values);
+            }
+            if frame.last() == Some(&0x1e) {
+                frame.pop();
+            }
+            if !frame.is_empty() {
+                values.push(serde_json::from_slice(&frame)?);
+            }
+        }
     }
 
     fn in_window(&self, index: usize) -> bool {
@@ -177,9 +186,7 @@ impl MessageSink for WindowSink {
     }
     fn checkpoint(&mut self, checkpoint: &mut Checkpoint) {
         self.capture = false;
-        if super::read::bounded_size(&(&*checkpoint, &self.meta)).is_some() {
-            self.checkpoint = Some((self.idx, checkpoint.clone(), self.meta.clone()));
-        }
+        self.checkpoint = Some((self.idx, checkpoint.clone(), self.meta.clone()));
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.fail.take()
@@ -193,7 +200,7 @@ impl MessageSink for WindowSink {
         }
     }
     fn message(&mut self, m: Message) -> Flow {
-        crate::source::record_message_reads(&m, &self.primary, &mut self.reads);
+        crate::source::record_message_reads(&m, Some(&self.primary), &mut self.reads);
         let index = self.idx;
         if self.fail.is_some() {
             return Flow::Stop;

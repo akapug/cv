@@ -1,6 +1,8 @@
 //! Prompt metadata without retaining the prompt. Marker positions use decoded UTF-8 bytes;
 //! a second bounded traversal selects the same first prose/task line as the owned codec.
 
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -250,8 +252,9 @@ mod tests {
                 ] {
                     std::fs::write(&path, wire)?;
                     let source = crate::json::JsonSource::capture(&path)?;
-                    let summary =
-                        source.read_document(|view| summarize(|feed| view.for_each_str_chunk(feed).map(|_| ())))?;
+                    let summary = source.read(ReadInput::Document, Validation::Value, |view| {
+                        summarize(|feed| view.for_each_str_chunk(feed).map(|_| ()))
+                    })?;
                     let title = match chars {
                         ..=80 => "é".repeat(chars),
                         _ => "é".repeat(79) + "…",
@@ -265,7 +268,7 @@ mod tests {
         std::fs::write(&path, wire)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let mut passes = 0;
-        let result = source.read_document(|view| {
+        let result = source.read(ReadInput::Document, Validation::Value, |view| {
             summarize(|feed| {
                 passes += 1;
                 let result = view.for_each_str_chunk(feed).map(|_| ());

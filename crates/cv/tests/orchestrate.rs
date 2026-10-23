@@ -72,20 +72,20 @@ fn build_world(tag: &str) -> World {
     w.write_session(
         SID,
         &[
-            user("u0", "2026-10-01T10:00:00Z", "start the swarm please"),
+            user(SID, "u0", "2026-10-01T10:00:00Z", "start the swarm please"),
             assistant_tool("a0", "2026-10-01T10:00:05Z", "AskUserQuestion", serde_json::json!({"questions": [{"question": "Where?"}]})),
             tool_result("r0", "2026-10-01T10:01:00Z", "toolu_a0", "The user answered: \"Where?\"=\"persvati\""),
             assistant("a1", "2026-10-01T10:02:00Z", "Noted. The ResourceTargetAdmission externalKind exhaustiveness check is queued for the standing integrator right after FINAL-1 lands."),
-            user("u1", "2026-10-01T10:03:00Z", "/compact"),
-            user("u2", "2026-10-01T10:03:00Z", "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>"),
-            user("u3", "2026-10-01T10:03:30Z", "<local-command-stdout>Compacted</local-command-stdout>"),
+            user(SID, "u1", "2026-10-01T10:03:00Z", "/compact"),
+            user(SID, "u2", "2026-10-01T10:03:00Z", "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>"),
+            user(SID, "u3", "2026-10-01T10:03:30Z", "<local-command-stdout>Compacted</local-command-stdout>"),
             boundary("b1", "2026-10-01T10:03:31Z"),
             compact_summary("s1", "2026-10-01T10:03:32Z", "SUMMARY: the early context"),
-            user("u4", "2026-10-01T10:04:00Z", "hi :) we /compacted. carry on"),
+            user(SID, "u4", "2026-10-01T10:04:00Z", "hi :) we /compacted. carry on"),
             notification("2026-10-01T10:05:00Z", "aaa1", "completed"),
             notification("2026-10-01T10:06:00Z", "bbb2", "completed"),
             assistant("a2", "2026-10-01T10:07:00Z", "The hermes tariff reconciliation is an inconsistency to settle in one later lane, not tonight."),
-            user("u5", "2026-10-01T10:08:00Z", "ok"),
+            user(SID, "u5", "2026-10-01T10:08:00Z", "ok"),
         ],
     );
     // aaa1: finished cleanly.
@@ -95,7 +95,7 @@ fn build_world(tag: &str) -> World {
         "aaa1",
         "LANE-A: the first lane",
         &[
-            user("x0", "2026-10-01T10:00:10Z", "You are lane A."),
+            user(SID, "x0", "2026-10-01T10:00:10Z", "You are lane A."),
             assistant_tool(
                 "x1",
                 "2026-10-01T10:00:20Z",
@@ -118,7 +118,7 @@ fn build_world(tag: &str) -> World {
         "bbb2",
         "LANE-B: waits on a build",
         &[
-            user("y0", "2026-10-01T10:00:30Z", "You are lane B."),
+            user(SID, "y0", "2026-10-01T10:00:30Z", "You are lane B."),
             assistant_tool(
                 "y1",
                 "2026-10-01T10:00:40Z",
@@ -141,7 +141,7 @@ fn build_world(tag: &str) -> World {
         "ccc3",
         "LANE-C: still at it",
         &[
-            user("z0", "2026-10-01T10:01:00Z", "You are lane C."),
+            user(SID, "z0", "2026-10-01T10:01:00Z", "You are lane C."),
             assistant("z1", "2026-10-01T10:01:10Z", "Reading first."),
             assistant_tool(
                 "z2",
@@ -159,7 +159,7 @@ fn build_world(tag: &str) -> World {
         "ddd4",
         "LANE-D: lost notification",
         &[
-            user("q0", "2026-10-01T10:01:30Z", "You are lane D."),
+            user(SID, "q0", "2026-10-01T10:01:30Z", "You are lane D."),
             assistant_tool(
                 "q1",
                 "2026-10-01T10:01:40Z",
@@ -522,7 +522,7 @@ fn lanes_failure_cause_from_the_transcript() {
     w.write_session(
         SID,
         &[
-            user("u0", "2026-10-01T19:00:00Z", "go"),
+            user(SID, "u0", "2026-10-01T19:00:00Z", "go"),
             notification("2026-10-01T20:10:30Z", "eee5", "failed"),
             notification("2026-10-01T19:30:30Z", "fff6", "failed"),
             notification("2026-10-01T20:10:31Z", "ggg7", "failed"),
@@ -533,7 +533,7 @@ fn lanes_failure_cause_from_the_transcript() {
     );
     let run = |id: &str, desc: &str, tail: Vec<serde_json::Value>| {
         let mut lines = vec![
-            user(&format!("{id}0"), "2026-10-01T19:00:10Z", "You are a lane."),
+            user(SID, &format!("{id}0"), "2026-10-01T19:00:10Z", "You are a lane."),
             assistant_tool(
                 &format!("{id}1"),
                 "2026-10-01T19:00:20Z",
@@ -581,7 +581,12 @@ fn lanes_failure_cause_from_the_transcript() {
                 Some(429),
                 Some(1_790_902_800),
             ),
-            user("g4", "2026-10-01T21:10:00Z", "The coordinator sent a message: resume."),
+            user(
+                SID,
+                "g4",
+                "2026-10-01T21:10:00Z",
+                "The coordinator sent a message: resume.",
+            ),
             assistant("g5", "2026-10-01T21:29:00Z", "Resumed and finished; report written."),
         ],
     );
@@ -638,7 +643,7 @@ fn lanes_endpoint_comes_from_the_lanes_own_shell_exports_only() {
     w.write_session(
         SID,
         &[
-            user("u0", "2026-10-01T10:00:00Z", "go"),
+            user(SID, "u0", "2026-10-01T10:00:00Z", "go"),
             notification("2026-10-01T10:30:00Z", "ppp1", "completed"),
             notification("2026-10-01T10:30:01Z", "qqq2", "completed"),
             assistant("a0", "2026-10-01T10:31:00Z", "ok"),
@@ -651,7 +656,7 @@ fn lanes_endpoint_comes_from_the_lanes_own_shell_exports_only() {
         "ppp1",
         "PARENT: briefs a child, then works",
         &[
-            user("p0", "2026-10-01T10:00:10Z", "You are the parent lane."),
+            user(SID, "p0", "2026-10-01T10:00:10Z", "You are the parent lane."),
             assistant_tool(
                 "p1",
                 "2026-10-01T10:00:20Z",
@@ -682,7 +687,7 @@ fn lanes_endpoint_comes_from_the_lanes_own_shell_exports_only() {
         "qqq2",
         "ONLYBRIEF: spawns and stops",
         &[
-            user("q0", "2026-10-01T10:00:10Z", "You spawn one child."),
+            user(SID, "q0", "2026-10-01T10:00:10Z", "You spawn one child."),
             assistant_tool(
                 "q1",
                 "2026-10-01T10:00:20Z",

@@ -4,6 +4,8 @@
 //! [`Quirks`] constant names the dialect.
 
 use crate::ir::Block;
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::lazy::Text;
 use serde_json::Value;
 
@@ -338,7 +340,7 @@ mod tests {
         let source = JsonSource::capture(&path).unwrap();
         for q in [&KIMI, &KIMI_CODE, &HERMES, &CODEX] {
             let selected = source
-                .read_range_value(0, bytes.len() as u64, |view| {
+                .read(ReadInput::Range(0, bytes.len() as u64), Validation::Value, |view| {
                     blocks_from_view(Some(view), q, &mut |v| v.source_text())
                 })
                 .unwrap();
@@ -364,7 +366,9 @@ mod tests {
             std::fs::write(&path, &bytes).unwrap();
             let source = JsonSource::capture(&path).unwrap();
             let selected = source
-                .read_range_value(0, bytes.len() as u64, |v| tool_call_from_view(v, true))
+                .read(ReadInput::Range(0, bytes.len() as u64), Validation::Value, |v| {
+                    tool_call_from_view(v, true)
+                })
                 .unwrap();
             assert_eq!(
                 serde_json::to_value(&selected).unwrap(),

@@ -211,6 +211,8 @@ pub enum FindingKind {
     IgnoreLiteralUnused,
     /// The manifest names a source file that does not exist.
     SourceFileMissing,
+    /// The manifest itself does not parse (or names another harness).
+    ManifestInvalid,
 }
 
 impl FindingKind {
@@ -220,6 +222,7 @@ impl FindingKind {
             FindingKind::HandledRestatesArm => "handled_restates_arm",
             FindingKind::IgnoreLiteralUnused => "ignore_literal_unused",
             FindingKind::SourceFileMissing => "source_file_missing",
+            FindingKind::ManifestInvalid => "manifest_invalid",
         }
     }
 }
@@ -247,17 +250,22 @@ fn non_test_source(source: &str) -> &str {
 /// manifests are written against, so a new arm in an adapter fails the check until the manifest
 /// names it.
 pub fn type_literals(source: &str) -> BTreeSet<String> {
+    static PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        let lit = r#""([A-Za-z][A-Za-z0-9_.\-]*)""#;
+        [
+            format!(r"{lit}\s*(?:=>|\|)"),
+            format!(r"\|\s*{lit}"),
+            format!(r"Some\({lit}\)"),
+            format!(r"Some\(\w+ @ \({lit}"),
+        ]
+        .iter()
+        .map(|p| regex::Regex::new(p).expect("static regex"))
+        .collect()
+    });
     let body = non_test_source(source);
-    let lit = r#""([A-Za-z][A-Za-z0-9_.\-]*)""#;
-    let patterns = [
-        format!(r"{lit}\s*(?:=>|\|)"),
-        format!(r"\|\s*{lit}"),
-        format!(r"Some\({lit}\)"),
-        format!(r"Some\(\w+ @ \({lit}"),
-    ];
     let mut out = BTreeSet::new();
-    for p in patterns {
-        let re = regex::Regex::new(&p).expect("static regex");
+    for re in patterns {
         for c in re.captures_iter(body) {
             if let Some(m) = c.get(1) {
                 out.insert(m.as_str().to_string());
@@ -426,31 +434,35 @@ pub fn handled(m: &Manifest, sources: &[(String, String)]) -> BTreeSet<String> {
     out
 }
 
-/// [`check`] for every harness whose manifest parses, reading sources under `src_root`.
+/// [`check`] for every harness whose manifest parses, reading sources under `src_root`; a
+/// manifest that does not parse is itself a finding.
 pub fn check_all(src_root: &Path) -> Vec<Divergence> {
-    let mut out = Vec::new();
-    for (h, m) in manifests() {
-        match m {
-            Ok(m) => {
-                let (sources, mut missing) = read_sources(&m, src_root);
-                let readable = !sources.is_empty();
-                out.append(&mut missing);
-                // With NONE of a harness's sources readable there is nothing to compare against,
-                // and running the check anyway reported every `handled` type as "missing in
-                // source" — hundreds of findings that read like real drift but only mean "I could
-                // not open the file". That is exactly what a RELEASED binary does: it has no
-                // checkout, and `src_root` defaults to the one it was built in. Say why once.
-                if readable {
-                    out.append(&mut check(&m, &sources));
-                }
-            }
-            Err(e) => out.push(finding(
+    manifests()
+        .into_iter()
+        .flat_map(|(h, m)| check_harness(h, m, src_root))
+        .collect()
+}
+
+fn check_harness(h: Harness, m: Result<Manifest>, src_root: &Path) -> Vec<Divergence> {
+    let m = match m {
+        Ok(m) => m,
+        Err(e) => {
+            return vec![finding(
                 h.as_str(),
-                FindingKind::SourceFileMissing,
+                FindingKind::ManifestInvalid,
                 format!("formats/{}.toml", h.as_str()),
                 format!("{e:#}"),
-            )),
+            )];
         }
+    };
+    let (sources, mut out) = read_sources(&m, src_root);
+    // With NONE of a harness's sources readable there is nothing to compare against,
+    // and running the check anyway reported every `handled` type as "missing in
+    // source" — hundreds of findings that read like real drift but only mean "I could
+    // not open the file". That is exactly what a RELEASED binary does: it has no
+    // checkout, and `src_root` defaults to the one it was built in. Say why once.
+    if !sources.is_empty() {
+        out.append(&mut check(&m, &sources));
     }
     out
 }
@@ -865,6 +877,14 @@ mod tests {
         assert!(sample.records["novel"].new);
         assert!(census_session(&Fixture { fail: true }, &reference, Harness::Gemini, None).is_err());
         assert!(recent_refs(None, 0).is_empty());
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_parse_is_its_own_finding() {
+        let findings = check_harness(Harness::Gemini, Err(anyhow::anyhow!("bad toml")), Path::new("."));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].a, FindingKind::ManifestInvalid.as_str());
+        assert_eq!(findings[0].what, "formats/gemini.toml");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! checkpoints, branches, forks and model switches (`docs/design/AFFORDANCES.md`).
 //!
 //! This is a **derived view**, not IR: [`of_session`] reads it off what the IR already says (tool
-//! names through the one [`classify_tool`] table, message kinds and origins, lineage, a short
+//! names through the one [`classify_tool_view`] table, message kinds and origins, lineage, a short
 //! record table), and [`Adapter::store_affordances`](crate::harness::Adapter::store_affordances)
 //! adds what lives only in a side store (Claude `tasks/`, Grok `plan.json`, …). The one IR-side
 //! piece is [`AffordanceSink`], which adapters wrap around their sink: it unwraps deferred-tool
@@ -11,6 +11,8 @@
 //! tool a [`MessageKind::SubagentSpawn`] and a synchronous spawn's result a
 //! [`MessageKind::SubagentReturn`].
 
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 pub(crate) mod input;
 mod text;
 
@@ -311,9 +313,9 @@ fn action_verb(input: JsonView<'_>) -> Result<&'static str> {
 /// The one table: `(harness, tool name, input)` → `(kind, action)`, or `None` for a tool that is not
 /// an affordance. Scoped by harness only where a name means different things in different
 /// harnesses (`task` is a sub-agent in OpenCode; `Bash` is a background job only when told to be).
-/// Compatibility for already-owned side-store data and callers of the public Value API.
-/// Owned views cannot encounter source failures.
-pub fn classify_tool(h: Harness, name: &str, value: &Value) -> Option<(Kind, &'static str)> {
+/// Test shim over the view table with owned JSON: owned views cannot encounter source failures.
+#[cfg(test)]
+fn classify_tool(h: Harness, name: &str, value: &Value) -> Option<(Kind, &'static str)> {
     classify_tool_view(h, name, JsonView::from(value)).expect("owned JSON classification")
 }
 
@@ -589,6 +591,11 @@ impl MessageSink for AffordanceSink<'_> {
             self.inner.dependency(path);
         }
     }
+    fn append_only_dependency(&mut self, path: &std::path::Path) {
+        if !self.latch.failed() {
+            self.inner.append_only_dependency(path);
+        }
+    }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.latch.take_or(self.inner, "affordance consumer")
     }
@@ -626,6 +633,10 @@ impl MessageSink for AffordanceSink<'_> {
     /// checkpoint carries.
     fn wants_checkpoint(&mut self, offset: u64) -> bool {
         !self.latch.failed() && self.open.is_empty() && self.inner.wants_checkpoint(offset)
+    }
+
+    fn wants_final_checkpoint(&mut self, offset: u64) -> bool {
+        !self.latch.failed() && self.open.is_empty() && self.inner.wants_final_checkpoint(offset)
     }
 
     fn checkpoint(&mut self, cp: &mut crate::stream::Checkpoint) {
@@ -691,7 +702,10 @@ fn refine_spawn(h: Harness, m: &mut Message, open: &mut std::collections::HashMa
         }
         _ if !open.is_empty() && !m.content.is_empty() => {
             let all_results = m.content.iter().all(|b| matches!(b, Block::ToolResult { .. }));
-            if !all_results && !open.values().any(|r| matches!(r, Returns::ResultInPrompt(_))) {
+            // This message can settle an open spawn when it is wholly results, or when a spawn
+            // expects its return inside the next prompt beside the user's own text (Roo).
+            let settles = all_results || open.values().any(|r| matches!(r, Returns::ResultInPrompt(_)));
+            if !settles {
                 return Ok(());
             }
             let mut returned = false;
@@ -737,7 +751,7 @@ fn refine_spawn(h: Harness, m: &mut Message, open: &mut std::collections::HashMa
 /// the first array under `todos`/`plan`/`items`/`tasks`/`checklist`, each element's text under
 /// the first of `content`/`step`/`description`/`title`/`subject`/`text`/`task`/`name`; or a
 /// markdown checklist / numbered list in a string under one of those keys.
-pub fn items_of(v: &Value) -> Vec<Item> {
+pub(crate) fn items_of(v: &Value) -> Vec<Item> {
     items_of_view(JsonView::from(v)).expect("owned JSON items")
 }
 
@@ -783,25 +797,28 @@ pub fn items_of_view(view: JsonView<'_>) -> Result<Vec<Item>> {
     Ok(item_of_view(view)?.into_iter().collect())
 }
 
-pub fn item_of(v: &Value) -> Option<Item> {
+pub(crate) fn item_of(v: &Value) -> Option<Item> {
     item_of_view(JsonView::from(v)).expect("owned JSON item")
 }
+
+/// The keys an item's text hides under, tried in order, wherever plan items are spelled.
+const ITEM_TEXT_KEYS: &[&str] = &[
+    "content",
+    "subject",
+    "title",
+    "step",
+    "description",
+    "text",
+    "task",
+    "name",
+    "goal",
+];
 
 fn item_text(view: JsonView<'_>) -> Result<Option<JsonView<'_>>> {
     if view.is_string()? {
         return Ok(Some(view));
     }
-    for key in [
-        "content",
-        "subject",
-        "title",
-        "step",
-        "description",
-        "text",
-        "task",
-        "name",
-        "goal",
-    ] {
+    for key in ITEM_TEXT_KEYS {
         if let Some(text) = view.get(key)? {
             if text.is_string()? {
                 return Ok(Some(text));
@@ -891,17 +908,7 @@ fn item_summary(view: JsonView<'_>) -> Result<Option<String>> {
     if view.is_string()? {
         return Ok(input::trimmed_prefix(view, 120)?.filter(|text| !text.is_empty()));
     }
-    for key in [
-        "content",
-        "subject",
-        "title",
-        "step",
-        "description",
-        "text",
-        "task",
-        "name",
-        "goal",
-    ] {
+    for key in ITEM_TEXT_KEYS {
         if let Some(value) = view.get(key)? {
             if value.is_string()? {
                 return input::nonblank_prefix(value, 120);
@@ -1748,7 +1755,9 @@ mod tests {
                 })
                 .unwrap();
             let text = capture
-                .read_backing_value(backing, offset, len, |view| view.source_text())
+                .read(ReadInput::Backing(backing, offset, len), Validation::Value, |view| {
+                    view.source_text()
+                })
                 .unwrap()
                 .unwrap();
             let make = |text| {
@@ -2205,7 +2214,10 @@ mod tests {
             payload.push_str(&"é\n".repeat(50000));
             std::fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
             let source = crate::json::JsonSource::capture(&path).unwrap();
-            let backed = source.read_syntax(|view| view.source_text()).unwrap().unwrap();
+            let backed = source
+                .read(ReadInput::Document, Validation::Syntax, |view| view.source_text())
+                .unwrap()
+                .unwrap();
             let run = |text: crate::lazy::Text| {
                 let mut messages = Vec::new();
                 let mut target = |m| {
@@ -2238,7 +2250,10 @@ mod tests {
         }
         // Stale retained backing is an error, rather than silently classifying the result.
         let source = crate::json::JsonSource::capture(&path).unwrap();
-        let backed = source.read_syntax(|view| view.source_text()).unwrap().unwrap();
+        let backed = source
+            .read(ReadInput::Document, Validation::Syntax, |view| view.source_text())
+            .unwrap()
+            .unwrap();
         std::fs::write(&path, b"\"changed\"").unwrap();
         let crate::lazy::Text::Source(backed) = backed else {
             panic!("large receipt backing")

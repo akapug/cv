@@ -17,6 +17,11 @@ pub(crate) mod text;
 pub mod sqlite;
 pub(crate) mod zst;
 
+/// The store's standard buffered-I/O chunk: stage chunks, read/write buffers, copy buffers.
+const IO_CHUNK: usize = 64 * 1024;
+/// The buffer for streaming one stored artifact into another — a copy, not a parse.
+const COPY_CHUNK: usize = 256 * 1024;
+
 /// `$XDG_DATA_HOME` when set to an absolute path (the spec says a relative value is ignored), else
 /// `~/.local/share`. The base of every XDG-shaped store (opencode, devin, goose, zed); `None` only
 /// when there is no home directory at all.

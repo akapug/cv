@@ -325,6 +325,28 @@ impl<'a> IntoIterator for &'a Discovered {
     }
 }
 
+/// One word for a POSIX shell command line: bare when every byte is inert in a word (letters,
+/// digits, `/ . _ - + : @`), single-quoted otherwise. `~` is not inert: a bare leading `~` expands.
+pub fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+' | b':' | b'@'))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// The resume hint for a harness that resumes relative to its working directory: one runnable
+/// command line, `cd <dir> && <command>` when the directory is known.
+pub fn resume_in(cwd: Option<&Path>, command: String) -> String {
+    match cwd {
+        Some(dir) => format!("cd {} && {command}", shell_quote(&dir.display().to_string())),
+        None => command,
+    }
+}
+
 /// Result of emitting an IR session into a harness's native on-disk format.
 #[derive(Debug, Clone)]
 pub struct EmitResult {
@@ -371,10 +393,6 @@ pub struct Capabilities {
     /// Whether a [`Demand::RICH`] stream with spans keeps the same full-extra metadata as an
     /// inline one, so a tail can leave large payloads in the source; `false`: read inline.
     pub rich_spans: bool,
-    /// cv's own tuning, not a harness fact: the primary size below which parsing a transcript costs
-    /// less than validating and replaying its usage-cache ledger, so the cache is skipped; 0: always
-    /// use it.
-    pub usage_cache_floor: u64,
 }
 
 impl Capabilities {
@@ -385,7 +403,6 @@ impl Capabilities {
         lane_stops: None,
         deferred_wrapper: None,
         rich_spans: false,
-        usage_cache_floor: 0,
     };
 }
 
@@ -578,6 +595,37 @@ pub trait Adapter: Send + Sync {
     /// for the shared writer in `derive`. Default: none; the harness has no derived copies.
     fn identity(&self) -> Option<Identity> {
         None
+    }
+
+    /// The [`Rows`](crate::source::Rows) certificate of every session the shared SQLite store
+    /// at `store` holds, by session id, from one consistent read that copies no message body:
+    /// what each session's own read consults (its rows' count and highest rowid, the flags and
+    /// small rows beside them). A consumer's record of a session whose certificate is unchanged
+    /// stays fresh across writes to the store's other sessions. `None`: the adapter certifies
+    /// none, and any write to the store rereads every session in it. Default: none.
+    fn rows(&self, _store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        None
+    }
+
+    /// The store shared by many sessions whose [`Self::rows`] certify `r`: its primary when that
+    /// is shared (a SQLite database, a gemini-cli `logs.json`), or a side file every session of a
+    /// group reads its own slice of (a Kimi Code sub-agent's `state.json`). `None`: `r` is
+    /// certified by its files alone. Default: `r`'s path when it is a SQLite store
+    /// ([`Self::sqlite_source`]).
+    fn rows_store(&self, r: &SessionRef) -> Option<PathBuf> {
+        (self.sqlite_source(r) == Some(true)).then(|| r.path.clone())
+    }
+
+    /// The files a [`Self::rows_store`] is made of, whose identities (with their SQLite sidecars)
+    /// are its state: a write to any moves every certificate's cache. Default: the store itself.
+    fn rows_files(&self, store: &Path) -> Vec<PathBuf> {
+        vec![store.to_path_buf()]
+    }
+
+    /// The key of `r`'s certificate in [`Self::rows`]: its id, unless its read is wholly another
+    /// session's rows (a sub-agent chain stored in its parent session's forest). Default: its id.
+    fn rows_key<'a>(&self, r: &'a SessionRef) -> &'a str {
+        &r.id
     }
 
     /// Whether `r`'s source is a SQLite database, whose `-wal`/`-journal` sidecars then guard it;
@@ -774,6 +822,12 @@ const ORDER: [Harness; Harness::COUNT] = [
     Harness::Devin,
 ];
 
+/// `h`'s place in registration order: where its rows sit in the catalog's listing.
+#[cfg(feature = "sqlite")]
+pub(crate) fn rank(h: Harness) -> usize {
+    ORDER.iter().position(|o| *o == h).expect("ORDER names every harness")
+}
+
 /// All registered adapters.
 pub fn all() -> Vec<Box<dyn Adapter>> {
     ORDER.into_iter().filter_map(for_harness).collect()
@@ -814,8 +868,8 @@ pub fn rootless(h: Harness) -> Option<&'static dyn Adapter> {
         Harness::Cline => &cline::ROOTLESS,
         Harness::Roo => &roo::ROOTLESS,
         Harness::Continue => &continuedev::ROOTLESS,
-        Harness::ChatGptExport => &export::ChatGptExport,
-        Harness::ClaudeExport => &export::ClaudeExport,
+        Harness::ChatGptExport => &export::CHATGPT_EXPORT,
+        Harness::ClaudeExport => &export::CLAUDE_EXPORT,
         Harness::OpenSession => &opensession::OpenSession,
         #[cfg(feature = "sqlite")]
         Harness::Hermes => &hermes::ROOTLESS,
@@ -870,8 +924,8 @@ pub fn for_harness(h: Harness) -> Option<Box<dyn Adapter>> {
         Harness::Cline => Box::new(cline::Cline::detect()),
         Harness::Roo => Box::new(roo::Roo::detect()),
         Harness::Continue => Box::new(continuedev::Continue::detect()),
-        Harness::ChatGptExport => Box::new(export::ChatGptExport),
-        Harness::ClaudeExport => Box::new(export::ClaudeExport),
+        Harness::ChatGptExport => Box::new(export::CHATGPT_EXPORT.clone()),
+        Harness::ClaudeExport => Box::new(export::CLAUDE_EXPORT.clone()),
         Harness::OpenSession => Box::new(opensession::OpenSession),
         #[cfg(feature = "sqlite")]
         Harness::Hermes => Box::new(hermes::Hermes::detect()),
@@ -910,8 +964,14 @@ pub fn for_harness_with_root(h: Harness, root: &Path) -> Option<Box<dyn Adapter>
         Harness::Roo => Box::new(roo::Roo::with_home(root)),
         Harness::Continue => Box::new(continuedev::Continue::with_root(root)),
         Harness::OpenCode => Box::new(opencode::OpenCode::with_data_dir(root)),
-        Harness::ChatGptExport => Box::new(export::ChatGptExport::with_roots(vec![root.to_path_buf()])),
-        Harness::ClaudeExport => Box::new(export::ClaudeExport::with_roots(vec![root.to_path_buf()])),
+        Harness::ChatGptExport => Box::new(export::ExportAdapter::with_roots(
+            export::Kind::ChatGpt,
+            vec![root.to_path_buf()],
+        )),
+        Harness::ClaudeExport => Box::new(export::ExportAdapter::with_roots(
+            export::Kind::Claude,
+            vec![root.to_path_buf()],
+        )),
         Harness::OpenSession => Box::new(opensession::OpenSession::with_roots(vec![root.to_path_buf()])),
         #[cfg(feature = "sqlite")]
         Harness::Hermes => Box::new(hermes::Hermes::with_home(root)),
@@ -1032,6 +1092,16 @@ pub(crate) fn side_entries(path: &std::path::Path) -> Result<Vec<std::fs::DirEnt
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_resume_hint_is_one_runnable_command_line() {
+        assert_eq!(resume_in(None, "qwen --resume x".into()), "qwen --resume x");
+        assert_eq!(
+            resume_in(Some(Path::new("/work/my proj")), "claude --resume x".into()),
+            "cd '/work/my proj' && claude --resume x"
+        );
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
     use super::*;
 
     #[test]

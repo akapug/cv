@@ -27,6 +27,8 @@
 
 use crate::ir::{Harness, SessionRef};
 
+#[cfg(feature = "sqlite")]
+mod order;
 mod reader;
 pub(crate) use reader::Reader;
 mod writer;
@@ -57,8 +59,19 @@ pub(crate) fn capture_primary_reads_from(a: &dyn crate::Adapter, refs: &[Session
     out
 }
 
+/// One watched path as discovery recorded it: its identity, an optional file's stable absence
+/// (fresh until it appears), or unknown (unreadable, or modified too recently: never fresh).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+pub(crate) enum Watched {
+    Unknown,
+    Absent,
+    Is(crate::source::FileId),
+}
+
 #[cfg(feature = "sqlite")]
 mod imp {
+    use super::order;
     use super::*;
     use crate::source::FileId;
     use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -204,11 +217,11 @@ mod imp {
         (stored == version && schema == SCHEMA).then_some(conn)
     }
 
-    /// The catalog's schema, stamped in `PRAGMA user_version`. Every table here is derived from
-    /// the transcripts, so a catalog of any other schema is dropped whole and rebuilt: there are
-    /// no migrations. Change any table's shape and bump this. 4: above every stamp an older cv
-    /// wrote (its event tables used 0-3).
-    const SCHEMA: i64 = 4;
+    /// The catalog's schema, stamped in `PRAGMA user_version`: the one stored-format version
+    /// ([`crate::source::VERSION`]). Every table here is derived from the transcripts, so a
+    /// catalog of any other stamp is dropped whole and rebuilt: there are no migrations. Change
+    /// any table's shape and bump that version (8 is above every stamp an older cv wrote).
+    const SCHEMA: i64 = crate::source::VERSION as i64;
 
     fn open_writable(path: &Path) -> rusqlite::Result<Connection> {
         let mut conn = Connection::open(path)?;
@@ -366,8 +379,10 @@ mod imp {
         }
     }
 
-    /// The SELECT column list [`row_to_ref`] decodes — keep the two in lockstep.
-    const REF_COLUMNS: &str = "harness,id,path,cwd,title,created_at,updated_at,message_count,created_ns,updated_ns";
+    /// The sessions column list, in order: [`row_to_ref`] decodes it and `insert_refs` names it —
+    /// keep all three in lockstep.
+    pub(super) const REF_COLUMNS: &str =
+        "harness,id,path,cwd,title,created_at,updated_at,message_count,created_ns,updated_ns";
 
     /// A timestamp from the nanosecond column at `ns_idx`, falling back to the second-precision
     /// column at `s_idx` (rows written before the `_ns` migration, or dates outside the i64-ns
@@ -383,7 +398,7 @@ mod imp {
 
     /// One row (in [`REF_COLUMNS`] order) → one `SessionRef`. `Ok(None)` for rows whose harness
     /// this binary doesn't know (a newer binary's rows — skipped, never deleted by us).
-    fn row_to_ref(row: &Row) -> rusqlite::Result<Option<SessionRef>> {
+    pub(super) fn row_to_ref(row: &Row) -> rusqlite::Result<Option<SessionRef>> {
         row_to_ref_projected(row, [false, false])
     }
 
@@ -419,41 +434,10 @@ mod imp {
         }))
     }
 
-    /// Insert (or replace) every ref through `stmt` — shared by [`sync`] and [`Reader::replace_harness`].
-    /// A replaced row keeps its `writer_version`: discovery does not know it, and omitting the
-    /// column would erase it.
-    fn insert_refs(
-        tx: &rusqlite::Transaction,
-        refs: &[SessionRef],
-        retained: &std::collections::HashMap<(String, String), String>,
-    ) -> rusqlite::Result<()> {
-        let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO sessions
-             (harness,id,path,cwd,title,created_at,updated_at,message_count,created_ns,updated_ns,writer_version)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,
-                 COALESCE(?11,(SELECT writer_version FROM sessions WHERE harness=?1 AND id=?2 AND path=?3)))",
-        )?;
-        for r in refs {
-            stmt.execute(params![
-                r.harness.as_str(),
-                r.id,
-                r.path.to_string_lossy(),
-                r.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                r.title,
-                r.created_at.map(|t| t.timestamp()),
-                r.updated_at.map(|t| t.timestamp()),
-                r.message_count.map(|n| n as i64),
-                r.created_at.and_then(|t| t.timestamp_nanos_opt()),
-                r.updated_at.and_then(|t| t.timestamp_nanos_opt()),
-                retained.get(&(r.id.clone(), r.path.to_string_lossy().into_owned())),
-            ])?;
-        }
-        Ok(())
-    }
-
     /// Upsert every ref in one transaction, deleting nothing — the *additive* sync for callers
-    /// that know about one session (event ingest, tests). Full discovery uses [`Reader::replace_harness`]
-    /// instead so vanished sessions actually disappear.
+    /// that know about one session (event ingest, tests). A known row is rewritten in place and a
+    /// new one follows its harness's rows ([`order::upsert`]). Full discovery uses
+    /// [`Reader::replace_harness`] instead so vanished sessions actually disappear.
     pub fn sync(refs: &[SessionRef]) {
         if crate::env::frozen() {
             return;
@@ -462,7 +446,9 @@ mod imp {
         let Ok(tx) = conn.transaction().inspect_err(note_sql) else {
             return;
         };
-        if insert_refs(&tx, refs, &Default::default())
+        if refs
+            .iter()
+            .try_for_each(|r| order::upsert(&tx, r))
             .inspect_err(note_sql)
             .is_ok()
             && refs
@@ -521,8 +507,8 @@ mod imp {
     }
 
     /// Replace one harness's catalog rows *and* its watch entries in a single transaction — the
-    /// post-discovery sync. Deleting first is what makes vanished sessions vanish from
-    /// [`all_sessions`]; the transaction keeps concurrent readers from seeing the gap.
+    /// post-discovery sync. Vanished sessions' rows are deleted and only changed rows are
+    /// written ([`order::publish`]); the transaction keeps concurrent readers from seeing a gap.
     #[cfg(test)]
     pub(crate) fn replace_harness(
         h: Harness,
@@ -564,7 +550,7 @@ mod imp {
         else {
             return;
         };
-        if publish_harness_in(&tx, h, refs, watches, sources, true)
+        if publish_harness_in(&tx, h, refs, watches, sources)
             .inspect_err(note_sql)
             .is_ok()
         {
@@ -574,6 +560,7 @@ mod imp {
         }
     }
 
+    #[cfg(test)]
     fn matches_sessions_in<'a>(
         conn: &Connection,
         refs: impl Iterator<Item = &'a SessionRef>,
@@ -584,15 +571,7 @@ mod imp {
         for row in rows {
             let Some(a) = row? else { return Ok(false) };
             let Some(b) = refs.next() else { return Ok(false) };
-            if a.harness != b.harness
-                || a.id != b.id
-                || a.path != b.path
-                || a.cwd != b.cwd
-                || a.title != b.title
-                || a.created_at != b.created_at
-                || a.updated_at != b.updated_at
-                || a.message_count != b.message_count
-            {
+            if !order::same_row(&a, b) {
                 return Ok(false);
             }
         }
@@ -626,13 +605,8 @@ mod imp {
         else {
             return;
         };
-        let Ok(equal) =
-            matches_sessions_in(&tx, rows.iter().flat_map(|(_, refs, _, _)| refs.iter())).inspect_err(note_sql)
-        else {
-            return;
-        };
         for ((h, refs, watches, _), sources) in rows.iter().zip(sources) {
-            if publish_harness_in(&tx, *h, refs, watches, sources, !equal)
+            if publish_harness_in(&tx, *h, refs, watches, sources)
                 .inspect_err(note_sql)
                 .is_err()
             {
@@ -708,13 +682,8 @@ mod imp {
         refs: &[SessionRef],
         watches: &[(PathBuf, Watched)],
         source_rows: &SourceRows,
-        rewrite_sessions: bool,
     ) -> rusqlite::Result<()> {
-        if rewrite_sessions {
-            let versions = recorded_writer_versions(tx, h)?;
-            tx.execute("DELETE FROM sessions WHERE harness=?1", params![h.as_str()])?;
-            insert_refs(tx, refs, &versions)?;
-        }
+        order::publish(tx, h, refs)?;
         publish_writer_versions(tx, h)?;
         let watch_rows = watches
             .iter()
@@ -890,11 +859,10 @@ mod imp {
         Some(stale)
     }
 
-    /// Every catalog row, in insertion (= discovery) order. Full publication preserves rowids
-    /// only when its complete ordered refs match; otherwise it reinserts successful harnesses
-    /// in discovery order. Thus after a full sync `rowid`
-    /// order reproduces [`crate::discover_all`]'s output order exactly — which keeps `cv ls`'s
-    /// stable sorts byte-identical even across rows whose timestamps tie. `None` on any sqlite
+    /// Every catalog row, in discovery order: each harness's rows sit in its own rowid span in
+    /// the order its last publication listed them ([`order`]), so `rowid` order reproduces
+    /// [`crate::discover_all`]'s output order exactly, after a full or a scoped publication —
+    /// which keeps `cv ls`'s stable sorts byte-identical even across rows whose timestamps tie. `None` on any sqlite
     /// error — callers fall back to a full discovery. Note `Some(vec![])` is a valid answer (a
     /// machine with no sessions); cold-vs-empty is [`Reader::last_full_sync`]'s job.
     pub(crate) fn all_sessions() -> Option<Vec<SessionRef>> {
@@ -961,6 +929,7 @@ mod imp {
 
     impl crate::source::Payload for Counted {
         const TAG: &'static str = "counts";
+        const BY_ROWS: bool = true;
     }
     use crate::source::Payload as _;
 
@@ -1025,7 +994,7 @@ mod imp {
             .and_then(crate::source::Record::<Counted>::decode)
             .is_some_and(|old| {
                 turns.is_none_or(|turns| old.payload.turns == Some(turns))
-                    && old.admit(source, &mut crate::source::Probe::default()).is_some()
+                    && old.admit_for(r, source, &mut crate::source::Probe::default()).is_some()
             });
         if keep && turns.is_none() {
             return;
@@ -1088,18 +1057,6 @@ mod imp {
         )
         .inspect_err(note_sql)
         .ok()
-    }
-
-    /// `(id, path, writer_version)` for every row of `h` that has one, for rows a rewrite
-    /// deletes and reinserts.
-    fn recorded_writer_versions(
-        tx: &rusqlite::Transaction,
-        h: Harness,
-    ) -> rusqlite::Result<std::collections::HashMap<(String, String), String>> {
-        let mut stmt =
-            tx.prepare("SELECT id,path,writer_version FROM sessions WHERE harness=?1 AND writer_version IS NOT NULL")?;
-        let rows = stmt.query_map([h.as_str()], |row| Ok(((row.get(0)?, row.get(1)?), row.get(2)?)))?;
-        rows.collect()
     }
 
     /// Apply observations collected by existing discovery reads, under the publication's writer lock.
@@ -2031,12 +1988,13 @@ mod imp {
             assert!(matches_sessions([&a, &b].into_iter()));
             sync(std::slice::from_ref(&failed));
             publish(std::slice::from_ref(&b));
-            assert!(matches_sessions([&failed, &a, &b].into_iter()));
+            // A harness whose discovery failed keeps its rows, in its registration place.
+            assert!(matches_sessions([&a, &b, &failed].into_iter()));
             let mut new = b.clone();
             new.id = "new".into();
             publish(&[b.clone(), new]);
             publish(std::slice::from_ref(&b));
-            assert!(matches_sessions([&failed, &a, &b].into_iter()));
+            assert!(matches_sessions([&a, &b, &failed].into_iter()));
             let conn = open().unwrap();
             conn.execute(
                 "INSERT INTO sessions(harness,id,path,message_count) VALUES('future-harness','future','future',0)",
@@ -2052,6 +2010,68 @@ mod imp {
                 )
                 .unwrap(),
                 1
+            );
+        }
+
+        #[test]
+        fn one_changed_session_writes_one_row() {
+            let w = crate::test_world("publication-one-change");
+            let session = |i: usize| {
+                let mut r = db_ref(Harness::Hermes, w.base.join("state.db"));
+                r.id = format!("s{i:04}");
+                r
+            };
+            let mut refs: Vec<SessionRef> = (0..200).map(session).collect();
+            let before = PrimaryReads::default();
+            let publish = |refs: &[SessionRef]| {
+                order::WRITES.with(|n| n.set(0));
+                replace_harness(Harness::Hermes, refs, &[], &before);
+                assert!(matches_sessions(refs.iter()), "rowid order is the listing's");
+                order::WRITES.with(std::cell::Cell::get)
+            };
+            assert_eq!(publish(&refs), 200);
+            assert_eq!(publish(&refs), 0, "an unchanged harness writes nothing");
+            refs[100].message_count = Some(7);
+            assert_eq!(publish(&refs), 1, "one session's metadata");
+            refs.insert(0, session(1000));
+            assert_eq!(
+                publish(&refs),
+                1,
+                "a new session listed first (Hermes lists newest first)"
+            );
+            refs.push(session(1001));
+            assert_eq!(publish(&refs), 1, "a new session listed last");
+            refs.insert(77, session(1002));
+            assert_eq!(publish(&refs), 1, "a new session listed in the middle");
+            refs.remove(150);
+            assert_eq!(publish(&refs), 1, "a vanished session");
+            // Sessions landing in one gap, over and over: the gap widens instead of the harness
+            // being rewritten, so the total stays far below one rewrite per insert.
+            let mut total = 0;
+            for i in 0..64 {
+                refs.insert(50, session(2000 + i));
+                total += publish(&refs);
+            }
+            assert!(total < 64 * 8, "{total} writes for 64 inserts into one gap");
+        }
+
+        #[test]
+        fn a_scoped_publication_keeps_its_harness_in_registration_order() {
+            let w = crate::test_world("publication-scoped-order");
+            let mut a = db_ref(Harness::Claude, w.base.join("a"));
+            a.id = "a".into();
+            let mut b = db_ref(Harness::Gemini, w.base.join("b"));
+            b.id = "b".into();
+            let before = PrimaryReads::default();
+            publish_all(&[
+                (Harness::Claude, std::slice::from_ref(&a), Vec::new(), &before),
+                (Harness::Gemini, std::slice::from_ref(&b), Vec::new(), &before),
+            ]);
+            a.message_count = Some(3);
+            replace_harness(Harness::Claude, std::slice::from_ref(&a), &[], &before);
+            assert!(
+                matches_sessions([&a, &b].into_iter()),
+                "a refreshed harness keeps its place"
             );
         }
 
@@ -2087,7 +2107,8 @@ mod imp {
             let mut newer = crate::source::ReadSet::default();
             newer.record(&path);
             before.insert(path.clone(), newer);
-            conn.execute_batch("CREATE TRIGGER reject_publication BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT,'publication'); END;").unwrap();
+            // A changed row is rewritten in place, so the publication aborts on its update.
+            conn.execute_batch("CREATE TRIGGER reject_publication BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT,'publication'); END;").unwrap();
             publish_all(&[(
                 Harness::Claude,
                 std::slice::from_ref(&changed),
@@ -2260,6 +2281,7 @@ mod imp {
                 Baseline {
                     primary: None,
                     stamp: None,
+                    rows: None,
                 },
                 Counted { counts, turns: Some(3) },
             );
@@ -2292,15 +2314,6 @@ mod imp {
 
 #[cfg(feature = "sqlite")]
 pub(crate) use imp::{all_sessions, db_path, open_at, open_db, watches_for};
-/// One watched path as discovery recorded it: its identity, an optional file's stable absence
-/// (fresh until it appears), or unknown (unreadable, or modified too recently: never fresh).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
-pub(crate) enum Watched {
-    Unknown,
-    Absent,
-    Is(crate::source::FileId),
-}
 
 #[cfg(feature = "sqlite")]
 pub use imp::{lookup, note_affordances_with_source, skipped_sources, sync, writer_versions, AffordanceTable};

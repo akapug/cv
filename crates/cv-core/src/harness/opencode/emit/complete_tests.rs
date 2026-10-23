@@ -7,8 +7,7 @@ use crate::{
 use rusqlite::Connection;
 use serde_json::Value;
 
-fn rows(db: &Path, id: &str) -> Result<Vec<(String, Value)>> {
-    let conn = Connection::open(db)?;
+fn rows(conn: &Connection, id: &str) -> Result<Vec<(String, Value)>> {
     let mut stmt = conn.prepare("SELECT type,data FROM session_message WHERE session_id=?1 ORDER BY seq")?;
     let rows = stmt
         .query_map([id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
@@ -17,8 +16,8 @@ fn rows(db: &Path, id: &str) -> Result<Vec<(String, Value)>> {
         .map(|(ty, raw)| Ok((ty, serde_json::from_str(&raw)?)))
         .collect()
 }
-fn logical_rows(db: &Path, id: &str) -> Result<Value> {
-    Ok(serde_json::to_value(rows(db, id)?)?)
+fn logical_rows(conn: &Connection, id: &str) -> Result<Value> {
+    Ok(serde_json::to_value(rows(conn, id)?)?)
 }
 #[test]
 fn complete_v2_replay_matches_native_rows_owned_and_public_ir() -> Result<()> {
@@ -31,6 +30,7 @@ fn complete_v2_replay_matches_native_rows_owned_and_public_ir() -> Result<()> {
     )?;
     let adapter = OpenCode::with_db(source.clone());
     let references = adapter.discover()?;
+    let source_conn = Connection::open(&source)?;
     for reference in &references {
         let checked = crate::emit::parse_for_emit(&adapter, reference, Harness::OpenCode)?;
         assert!(
@@ -72,9 +72,9 @@ fn complete_v2_replay_matches_native_rows_owned_and_public_ir() -> Result<()> {
             ] {
                 let output = root.join(format!("{}-{mode}-{kind}", reference.id));
                 let result = emit(session, &output, &options)?;
-                let actual = logical_rows(&result.path, &result.new_id)?;
+                let actual = logical_rows(&Connection::open(&result.path)?, &result.new_id)?;
                 if mode == ThinkingMode::Native {
-                    let expected = logical_rows(&source, &reference.id)?;
+                    let expected = logical_rows(&source_conn, &reference.id)?;
                     assert_eq!(
                         actual.as_array().unwrap().len(),
                         expected.as_array().unwrap().len(),
@@ -118,7 +118,7 @@ fn embedded_v2_attachments_keep_bytes_external_references_report_loss() -> Resul
     });
     session.messages.push(user);
     let (result, report) = crate::emit::emit_report(&session, Harness::OpenCode, &root, &EmitOptions::default())?;
-    let rows = rows(&result.path, &result.new_id)?;
+    let rows = rows(&Connection::open(&result.path)?, &result.new_id)?;
     assert_eq!(rows[0].1["files"][0]["data"], "aGk=");
     assert_eq!(rows[0].1["files"][0]["source"]["type"], "inline");
     assert_eq!(rows[0].1["files"].as_array().unwrap().len(), 1);
@@ -144,6 +144,7 @@ fn complete_v2_edits_groups_models_and_raw_only_sources_are_guarded() -> Result<
     )?;
     let adapter = OpenCode::with_db(source.clone());
     let references = adapter.discover()?;
+    let source_conn = Connection::open(&source)?;
     for title in ["tools", "compact", "image"] {
         let reference = references.iter().find(|r| r.title.as_deref() == Some(title)).unwrap();
         let baseline = crate::emit::parse_for_emit(&adapter, reference, Harness::OpenCode)?;
@@ -249,17 +250,17 @@ fn complete_v2_edits_groups_models_and_raw_only_sources_are_guarded() -> Result<
                 let a = emit(&edited, &root.join(format!("{title}-{case}-{mode}-checked")), &options)?;
                 let b = emit(&owned, &root.join(format!("{title}-{case}-{mode}-owned")), &options)?;
                 assert_eq!(
-                    logical_rows(&a.path, &a.new_id)?,
-                    logical_rows(&b.path, &b.new_id)?,
+                    logical_rows(&Connection::open(&a.path)?, &a.new_id)?,
+                    logical_rows(&Connection::open(&b.path)?, &b.new_id)?,
                     "{title}/{case}/{mode}"
                 );
                 if case == "text" && title == "image" {
-                    let original = rows(&source, &reference.id)?
+                    let original = rows(&source_conn, &reference.id)?
                         .into_iter()
                         .find(|(ty, _)| ty == "user")
                         .unwrap()
                         .1;
-                    let changed = rows(&a.path, &a.new_id)?
+                    let changed = rows(&Connection::open(&a.path)?, &a.new_id)?
                         .into_iter()
                         .find(|(ty, _)| ty == "user")
                         .unwrap()
@@ -271,7 +272,7 @@ fn complete_v2_edits_groups_models_and_raw_only_sources_are_guarded() -> Result<
                     );
                 }
                 if case == "tool" {
-                    let output = logical_rows(&a.path, &a.new_id)?.to_string();
+                    let output = logical_rows(&Connection::open(&a.path)?, &a.new_id)?.to_string();
                     if baseline
                         .messages
                         .iter()
@@ -282,7 +283,7 @@ fn complete_v2_edits_groups_models_and_raw_only_sources_are_guarded() -> Result<
                     }
                 }
                 if case == "model" {
-                    for (ty, data) in rows(&a.path, &a.new_id)? {
+                    for (ty, data) in rows(&Connection::open(&a.path)?, &a.new_id)? {
                         if ty == "assistant" {
                             assert_eq!(data["model"]["id"], "changed-model");
                         }
@@ -290,7 +291,9 @@ fn complete_v2_edits_groups_models_and_raw_only_sources_are_guarded() -> Result<
                 }
                 if case == "idle-time" {
                     assert!(
-                        !rows(&a.path, &a.new_id)?.iter().any(|(ty, _)| ty == "idle"),
+                        !rows(&Connection::open(&a.path)?, &a.new_id)?
+                            .iter()
+                            .any(|(ty, _)| ty == "idle"),
                         "changed owned/source carriers cannot bypass witness"
                     );
                 }
@@ -378,8 +381,8 @@ fn complete_legacy_producers_match_owned_preparation() -> Result<()> {
                     &options,
                 )?;
                 assert_eq!(
-                    logical_rows(&a.path, &a.new_id)?,
-                    logical_rows(&b.path, &b.new_id)?,
+                    logical_rows(&Connection::open(&a.path)?, &a.new_id)?,
+                    logical_rows(&Connection::open(&b.path)?, &b.new_id)?,
                     "legacy native output {kind}/{}",
                     reference.id
                 );

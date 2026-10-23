@@ -66,6 +66,7 @@
 use crate::harness::claude::record::Facts;
 use crate::harness::claude::skills::{self, SkillsPolicy, SkillsReport};
 use crate::ir::{Block, Message, MessageKind, SessionRef};
+use crate::json::{ReadInput, Validation};
 use crate::lazy::Resolver;
 use crate::offsets::OFFSET_KEY;
 use crate::prune::new_uuid;
@@ -585,7 +586,7 @@ fn rewind_session_after_scan(
         "rewind --thinking supports native or portable"
     );
     if let Some(id) = &opts.new_id {
-        crate::restamp::validate_output_id(id)?;
+        crate::publish::validate_output_id(id)?;
     }
     // Only an adapter that declares derived copies (Claude's) says what a rewound copy rewrites.
     let identity = crate::derive::identity(r.harness).map_err(|_| {
@@ -705,7 +706,7 @@ fn rewind_session_after_scan(
             source = stage.finish()?;
         }
         (source, skills) = skills::apply(source, opts.skills_policy, skills::config_dir_of(&r.path).as_deref())?;
-        bytes_written = source.len()?;
+        bytes_written = source.byte_len()?;
         if let Some(w) = writer.as_mut() {
             source.copy_to(w)?;
         }
@@ -1189,7 +1190,7 @@ fn first_cwd(path: &Path) -> Option<String> {
     .ok()?;
     for row in rows.take(500) {
         let (range, _) = row.ok()?;
-        let value = source.read_range_value(range.offset, range.len, |view| {
+        let value = source.read(ReadInput::Range(range.offset, range.len), Validation::Value, |view| {
             view.get("cwd")?
                 .map(|v| Ok(v.resolve()?.as_str().map(str::to_owned)))
                 .transpose()
@@ -1217,7 +1218,9 @@ fn read_line_at(source: &crate::json::JsonSource, file: &std::fs::File, off: u64
         return Ok(None);
     };
     let (range, _) = row?;
-    match source.read_range_value(range.offset, range.len, |view| Ok(Facts::parse(view)?.0)) {
+    match source.read(ReadInput::Range(range.offset, range.len), Validation::Value, |view| {
+        Ok(Facts::parse(view)?.0)
+    }) {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.is::<crate::json::InvalidJson>() => Ok(None),
         Err(error) => Err(error),

@@ -29,16 +29,17 @@
 //! (it must replay them from old logs); the store seam is where "never written again" is
 //! mechanical.
 //!
-//! # Growth & retention (the compaction plan)
+//! # Growth & retention
 //!
-//! The log is append-only and currently **unbounded**: every read replays every event ever
-//! appended, so read cost grows linearly with history. Fine at fleet-task volumes for a long
-//! time; not forever. The planned compaction is **snapshot + tail**: periodically fold the
-//! log's stable prefix into a snapshot of the read model, keep the live tail as raw events,
-//! and retire the prefix to an archive file — **preserving the audit prefix** (retired events
-//! stay on disk and re-verifiable; they just stop being replayed on every read). This
-//! is not implemented yet; whoever picks this up should keep the CAS append's invariant intact —
-//! a snapshot the appender validates against must be exactly the fold of the retired prefix.
+//! The log is append-only and unbounded. A command that needs only the read model (the prompt
+//! hook, a mutation's target lookup and its CAS append, `cv task list`, `GET /api/tasks`)
+//! resumes from a [`Fold`]: the reducer's state at the last newline-terminated line, kept in the
+//! catalog and admitted only while the log's prefix still samples as it did. It reads the events
+//! after that mark alone, so E appends cost O(E) parses in all rather than O(E²); loading the
+//! fold costs the state's size (the model and one digest per event id). A reader that lists
+//! events (`events`, `show`, the inbox's authors) still replays the whole log: that is its answer.
+//! The append validates against the fold only when it carries no warning; otherwise it replays
+//! whole, so its refusal names the line as before.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -62,6 +63,32 @@ const HEADER_LINE: &str = r#"{"format":"cv-task-log","v":1}"#;
 /// Events paired with their 1-based line number in the log file — the raw material of a replay,
 /// where the line number keys quarantine warnings back to the physical file.
 type NumberedEvents = Vec<(usize, TaskEvent)>;
+
+/// What one pass over the log file yields: the parseable events with their line numbers, loud
+/// warnings about interior garbage, and the physical EOF framing.
+struct RawRead {
+    events: NumberedEvents,
+    warnings: Vec<String>,
+    tail: LogTail,
+    /// Where the last newline-terminated line ends, how many lines precede it, and how many of
+    /// `events` and `warnings` it covers: the boundary a [`Fold`] may be taken at.
+    committed: Committed0,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Non-blank log lines parsed: the fold test's counter.
+    static PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// See [`RawRead::committed`].
+#[derive(Clone, Copy, Default)]
+struct Committed0 {
+    offset: u64,
+    lines: usize,
+    events: usize,
+    warnings: usize,
+}
 
 /// Physical EOF framing, separate from events admitted by replay. Readers do not modify it.
 #[derive(Clone, Copy)]
@@ -134,28 +161,80 @@ impl TaskStore {
     /// reason) and counted, so one poisoned interior line degrades the model instead of bricking
     /// the CLI, `cv serve`, and every append at once.
     pub fn replay(&self) -> Result<ReplayOutcome> {
-        let (raw, mut warnings, _) = self.read_events()?;
+        let mut read = self.read_events()?;
         let path = self.events_path();
         let mut reducer = TaskReducer::new();
-        let mut events = Vec::with_capacity(raw.len());
+        let mut events = Vec::with_capacity(read.events.len());
         let mut quarantined = 0usize;
-        for (line_no, ev) in raw {
+        for (line_no, ev) in read.events {
             match reducer.apply(&ev) {
                 Ok(()) => events.push(ev),
                 Err(e) => {
                     quarantined += 1;
-                    warnings.push(format!(
-                        "task log {}: line {line_no} quarantined — the reducer refused it ({e}); \
-                         event skipped, model is best-effort",
-                        path.display()
-                    ));
+                    read.warnings.push(quarantine_warning(&path, line_no, &e));
                 }
             }
         }
         Ok(ReplayOutcome {
             model: reducer.into_model(),
             events,
-            warnings,
+            warnings: read.warnings,
+            quarantined,
+        })
+    }
+
+    /// The read model without the event list: [`Self::replay`]'s `model`, `warnings` and
+    /// `quarantined`, resumed from the log's stored [`Fold`] so only the events appended since
+    /// are read and reduced. What the prompt hook and every mutation's target lookup ask.
+    pub fn fold(&self) -> Result<Folded> {
+        let path = self.events_path();
+        let start = Fold::stored(&path);
+        let from = start.as_ref().map(Fold::boundary).unwrap_or_default();
+        let (mut reducer, mut garbage, mut refused) = match start {
+            Some(fold) => (
+                TaskReducer::resume(fold.model, fold.applied),
+                fold.garbage,
+                fold.refused,
+            ),
+            None => (TaskReducer::new(), Vec::new(), Vec::new()),
+        };
+        let read = self.read_events_from(from)?;
+        let committed = read.committed;
+        let mut snapshot = None;
+        let take = |reducer: &TaskReducer, refused: &[String], garbage: &[String]| {
+            (committed.offset > from.offset).then(|| (reducer.checkpoint(), refused.to_vec(), garbage.to_vec()))
+        };
+        let mut new_garbage = read.warnings.into_iter();
+        garbage.extend(new_garbage.by_ref().take(committed.warnings));
+        for (i, (line_no, ev)) in read.events.into_iter().enumerate() {
+            if i == committed.events {
+                snapshot = take(&reducer, &refused, &garbage);
+            }
+            if let Err(e) = reducer.apply(&ev) {
+                refused.push(quarantine_warning(&path, line_no, &e));
+            }
+        }
+        if snapshot.is_none() {
+            snapshot = take(&reducer, &refused, &garbage);
+        }
+        if let Some(((model, applied), refused, garbage)) = snapshot {
+            Fold {
+                version: crate::source::VERSION,
+                offset: committed.offset,
+                lines: committed.lines,
+                model,
+                applied,
+                garbage,
+                refused,
+            }
+            .store(&path);
+        }
+        garbage.extend(new_garbage);
+        let quarantined = refused.len();
+        garbage.extend(refused);
+        Ok(Folded {
+            model: reducer.into_model(),
+            warnings: garbage,
             quarantined,
         })
     }
@@ -193,11 +272,13 @@ impl TaskStore {
         anyhow::ensure!(!crate::env::frozen(), "--frozen forbids writing tasks");
         debug_assert!(!events.is_empty());
         fs::create_dir_all(&self.dir).with_context(|| format!("creating tasks dir {}", self.dir.display()))?;
-        let _lock = FileLock::acquire(self.lock_path())?;
+        let _lock = FileLock::acquire(&self.lock_path())?;
 
         // Replay under the lock: the candidate is validated against the exact state it will
-        // land after.
-        let (raw, warnings, tail) = self.read_events()?;
+        // land after. A clean stored fold stands for the log's prefix; only what follows is read.
+        let start = Fold::stored(&self.events_path()).filter(|fold| fold.garbage.is_empty() && fold.refused.is_empty());
+        let read = self.read_events_from(start.as_ref().map(Fold::boundary).unwrap_or_default())?;
+        let tail = read.tail;
         if let LogTail::Unrecognized { line_no } = tail {
             bail!(
                 "refusing to append: task log {} line {line_no} is an unrecognized final record \
@@ -205,16 +286,19 @@ impl TaskStore {
                 self.events_path().display()
             );
         }
-        if let Some(first) = warnings.first() {
+        if let Some(first) = read.warnings.first() {
             bail!(
                 "refusing to append: task log {} is degraded ({} warning(s); first: {first}) — \
                  repair the log or upgrade cv before writing",
                 self.events_path().display(),
-                warnings.len()
+                read.warnings.len()
             );
         }
-        let mut reducer = TaskReducer::new();
-        for (line_no, ev) in raw {
+        let mut reducer = match start {
+            Some(fold) => TaskReducer::resume(fold.model, fold.applied),
+            None => TaskReducer::new(),
+        };
+        for (line_no, ev) in read.events {
             reducer.apply(&ev).map_err(|e| {
                 anyhow::anyhow!(
                     "refusing to append: task log {} line {line_no} fails replay ({e}) — an \
@@ -268,28 +352,47 @@ impl TaskStore {
         })
     }
 
-    /// Read raw events as `(1-based line number, event)` pairs. Interior unparseable lines are
-    /// collected as warnings, including complete malformed rows without a final newline.
+    /// Read raw events as [`RawRead`]. Interior unparseable lines are collected as warnings,
+    /// including complete malformed rows without a final newline.
     /// A syntactically incomplete EOF prefix is tolerated silently. Syntax-incomplete tails carry a byte boundary for locked recovery;
     /// other unrecognized final rows refuse append. Valid unterminated records need a newline.
     /// A format header is skipped when current, and refused loudly for a newer format version.
-    fn read_events(&self) -> Result<(NumberedEvents, Vec<String>, LogTail)> {
+    fn read_events(&self) -> Result<RawRead> {
+        self.read_events_from(Committed0::default())
+    }
+
+    /// [`Self::read_events`] of the lines after `from` (a [`Fold`]'s boundary), numbered on.
+    fn read_events_from(&self, from: Committed0) -> Result<RawRead> {
+        use std::io::{Seek, SeekFrom};
         let path = self.events_path();
-        let file = match File::open(&path) {
+        let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), Vec::new(), LogTail::Terminated))
+                return Ok(RawRead {
+                    events: Vec::new(),
+                    warnings: Vec::new(),
+                    tail: LogTail::Terminated,
+                    committed: Committed0::default(),
+                })
             }
             Err(e) => return Err(e).with_context(|| format!("opening task log {}", path.display())),
         };
+        file.seek(SeekFrom::Start(from.offset))
+            .with_context(|| format!("reading task log {}", path.display()))?;
 
         let mut events: Vec<(usize, TaskEvent)> = Vec::new();
         let mut bad: Vec<(usize, String)> = Vec::new(); // (1-based line no, snippet)
         let mut reader = BufReader::new(file);
         let mut raw = Vec::new();
-        let mut line_no = 0usize;
-        let mut offset = 0u64;
+        let mut line_no = from.lines;
+        let mut offset = from.offset;
         let mut tail = LogTail::Terminated;
+        let mut committed = Committed0 {
+            offset: from.offset,
+            lines: from.lines,
+            events: 0,
+            warnings: 0,
+        };
         loop {
             raw.clear();
             let n = reader
@@ -321,8 +424,18 @@ impl TaskStore {
             };
             let line = text.trim();
             if line.is_empty() {
+                if terminated {
+                    committed = Committed0 {
+                        offset,
+                        lines: line_no,
+                        events: events.len(),
+                        warnings: bad.len(),
+                    };
+                }
                 continue;
             }
+            #[cfg(test)]
+            PARSED.with(|n| n.set(n.get() + 1));
             match serde_json::from_str::<TaskEvent>(line) {
                 Ok(ev) => events.push((line_no, ev)),
                 Err(_) => {
@@ -334,7 +447,16 @@ impl TaskStore {
                                 path.display()
                             );
                         }
-                        continue; // current (or ancient) header: skip
+                        // current (or ancient) header: skip
+                        if terminated {
+                            committed = Committed0 {
+                                offset,
+                                lines: line_no,
+                                events: events.len(),
+                                warnings: bad.len(),
+                            };
+                        }
+                        continue;
                     }
                     if !terminated {
                         // A complete unknown event could come from a newer binary. Recover only
@@ -353,6 +475,14 @@ impl TaskStore {
                     bad.push((line_no, snippet));
                 }
             }
+            if terminated {
+                committed = Committed0 {
+                    offset,
+                    lines: line_no,
+                    events: events.len(),
+                    warnings: bad.len(),
+                };
+            }
         }
 
         let warnings = bad
@@ -366,8 +496,118 @@ impl TaskStore {
                 )
             })
             .collect();
-        Ok((events, warnings, tail))
+        Ok(RawRead {
+            events,
+            warnings,
+            tail,
+            committed,
+        })
     }
+}
+
+/// The warning a replay gives for an event the reducer refused.
+fn quarantine_warning(path: &Path, line_no: usize, e: &super::reduce::ReduceError) -> String {
+    format!(
+        "task log {}: line {line_no} quarantined — the reducer refused it ({e}); \
+         event skipped, model is best-effort",
+        path.display()
+    )
+}
+
+/// [`TaskStore::fold`]'s answer: a replay's model and warnings, without its events.
+#[derive(Debug)]
+pub struct Folded {
+    pub model: TaskReadModel,
+    pub warnings: Vec<String>,
+    pub quarantined: usize,
+}
+
+/// The log's first `offset` bytes, folded: the reducer's state (the model and each applied
+/// event's digest) and the warnings so far, unparseable lines apart from refused events because
+/// a replay lists every unparseable line first. Kept in the catalog under [`crate::source::VERSION`]
+/// as a `task-fold` record keyed by the log's path, and admitted only while the log is the same
+/// file, at least `offset` long, its prefix sampling as it did ([`crate::source::Prefix`]: an
+/// edit outside the samples is not seen, the limit every resume mark has).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Fold {
+    version: u32,
+    offset: u64,
+    lines: usize,
+    model: TaskReadModel,
+    applied: std::collections::BTreeMap<String, String>,
+    garbage: Vec<String>,
+    refused: Vec<String>,
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Stored {
+    prefix: crate::source::Prefix,
+    fold: Fold,
+}
+
+#[cfg(feature = "sqlite")]
+const FOLD_CONSUMER: &str = "task-fold";
+
+impl Fold {
+    fn boundary(&self) -> Committed0 {
+        Committed0 {
+            offset: self.offset,
+            lines: self.lines,
+            events: 0,
+            warnings: 0,
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn stored(path: &Path) -> Option<Fold> {
+        let conn = crate::catalog::open_db()?;
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT record FROM source_dependencies WHERE consumer=?1 AND harness='' AND id='' AND path=?2",
+                rusqlite::params![FOLD_CONSUMER, path.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let Stored { prefix, fold } = serde_json::from_slice(&bytes).ok()?;
+        (fold.version == crate::source::VERSION && prefix.len == fold.offset && prefix.holds(path)).then_some(fold)
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    fn stored(_path: &Path) -> Option<Fold> {
+        None
+    }
+
+    /// Best effort: a fold that cannot be kept is taken again by the next command.
+    #[cfg(feature = "sqlite")]
+    fn store(self, path: &Path) {
+        if crate::env::frozen() {
+            return;
+        }
+        let Some(prefix) = File::open(path)
+            .ok()
+            .and_then(|file| crate::source::Prefix::of(&file, self.offset))
+        else {
+            return;
+        };
+        let stored = Stored { prefix, fold: self };
+        let Ok(bytes) = serde_json::to_vec(&stored) else { return };
+        // A state that does not come back equal from its own bytes is never kept.
+        let same = serde_json::from_slice::<Stored>(&bytes)
+            .is_ok_and(|back| back.fold.model == stored.fold.model && back.fold.applied == stored.fold.applied);
+        let Some(conn) = crate::catalog::open_db().filter(|_| same) else {
+            return;
+        };
+        if let Err(error) = conn.execute(
+            "INSERT OR REPLACE INTO source_dependencies(consumer,harness,id,path,record) VALUES(?1,'','',?2,?3)",
+            rusqlite::params![FOLD_CONSUMER, path.to_string_lossy(), bytes],
+        ) {
+            crate::env::warn_once("the task log's fold", error);
+        }
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    fn store(self, _path: &Path) {}
 }
 
 /// If `line` is a log-format header record, its declared version (`v` missing reads as 0, which
@@ -390,14 +630,14 @@ pub fn new_event(task_id: Option<&str>, by: &str, kind: TaskEventKind) -> TaskEv
     }
 }
 
-/// Convenience: agent-facing append to the default store.
-pub fn append_agent_event(task_id: Option<&str>, by: &str, kind: TaskEventKind) -> Result<TaskEvent> {
-    TaskStore::default_store().append_agent_event(new_event(task_id, by, kind))
-}
-
 /// Convenience: replay the default store.
 pub fn replay() -> Result<ReplayOutcome> {
     TaskStore::default_store().replay()
+}
+
+/// Convenience: [`TaskStore::fold`] of the default store.
+pub fn fold() -> Result<Folded> {
+    TaskStore::default_store().fold()
 }
 
 #[cfg(test)]
@@ -413,14 +653,7 @@ mod tests {
     }
 
     fn open_kind() -> TaskEventKind {
-        TaskEventKind::Opened {
-            title: "demo".into(),
-            body: String::new(),
-            repo: None,
-            issue: None,
-            channel: None,
-            assignee: None,
-        }
+        crate::task::opened_kind("demo", None)
     }
 
     fn open_task(store: &TaskStore) -> String {
@@ -893,6 +1126,77 @@ mod tests {
         assert!(replay.warnings.is_empty());
         assert_eq!(replay.events.len(), 2);
         assert_eq!(replay.model.tasks[&task].state, TaskState::Claimed);
+    }
+
+    #[test]
+    fn a_fold_reads_only_the_events_after_its_mark_and_equals_a_replay() {
+        let _world = crate::test_world("task-fold");
+        let dir = tmp_tasks();
+        let store = TaskStore::at(&dir);
+        let parsed = || PARSED.with(|n| n.replace(0));
+        let same = |store: &TaskStore| {
+            let (folded, replayed) = (store.fold().unwrap(), store.replay().unwrap());
+            assert_eq!(folded.model, replayed.model);
+            assert_eq!(folded.warnings, replayed.warnings);
+            assert_eq!(folded.quarantined, replayed.quarantined);
+        };
+        let task = open_task(&store);
+        let note = |text: &str| {
+            new_event(
+                Some(&task),
+                "agent:a",
+                TaskEventKind::Noted {
+                    text: text.into(),
+                    session_ref: None,
+                },
+            )
+        };
+        for i in 0..40 {
+            store.append_agent_event(note(&format!("note {i}"))).unwrap();
+        }
+        store.fold().unwrap();
+        parsed();
+        // One more event: the append reads nothing (the fold stands for the whole log), and the
+        // next fold reads that one event.
+        let late = store.append_agent_event(note("late")).unwrap();
+        assert_eq!(parsed(), 0, "the append read only what followed the fold");
+        store.fold().unwrap();
+        assert_eq!(parsed(), 1, "the fold read only the appended event");
+        assert_eq!(store.fold().unwrap().model.tasks[&task].notes.len(), 41);
+        assert_eq!(parsed(), 0, "an unchanged log reads nothing");
+        same(&store);
+        // An idempotent re-append of an event before the mark is still recognized, and a
+        // different event under its id still refuses.
+        store.append_agent_event(late.clone()).unwrap();
+        let mut forged = late.clone();
+        forged.by = "agent:forger".into();
+        assert!(store.append_agent_event(forged).is_err());
+        // Garbage, a refused event and an unterminated valid event ride the fold as a replay
+        // reports them, in a replay's order.
+        let refused = new_event(
+            Some("00000000-0000-7000-8000-00000000dead"),
+            "agent:evil",
+            TaskEventKind::Claimed {
+                assignee: "agent:evil".into(),
+            },
+        );
+        let mut f = OpenOptions::new().append(true).open(store.events_path()).unwrap();
+        writeln!(f, "not an event").unwrap();
+        writeln!(f, "{}", serde_json::to_string(&refused).unwrap()).unwrap();
+        same(&store);
+        writeln!(f, "also not an event").unwrap();
+        write!(f, "{}", serde_json::to_string(&note("unterminated")).unwrap()).unwrap();
+        drop(f);
+        same(&store);
+        same(&store);
+        // Another file at the path (a repaired log) is not the folded one.
+        let body = std::fs::read_to_string(store.events_path()).unwrap();
+        let first_lines: String = body.lines().take(3).map(|l| format!("{l}\n")).collect();
+        std::fs::remove_file(store.events_path()).unwrap();
+        std::fs::write(store.events_path(), first_lines).unwrap();
+        same(&store);
+        assert_eq!(store.fold().unwrap().model.tasks[&task].notes.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

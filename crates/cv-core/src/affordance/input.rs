@@ -34,9 +34,20 @@ pub(crate) fn scalar_prefix(view: JsonView<'_>, cap: usize) -> Result<Option<Str
 }
 
 /// Reject all-whitespace strings even when `trim` is false; otherwise preserve whitespace unless
-/// trimming was requested. Scan before allocating. Trimming uses decoded
-/// byte bounds; a huge ignored whitespace tail does not become a transient String allocation.
+/// trimming was requested. The untrimmed case builds while it scans, so the source decodes once.
+/// Trimming scans before allocating and uses decoded byte bounds; a huge ignored whitespace tail
+/// does not become a transient String allocation.
 pub(crate) fn item_string(view: JsonView<'_>, trim: bool) -> Result<Option<String>> {
+    if !trim {
+        let mut out = String::new();
+        let mut nonblank = false;
+        let is_string = view.for_each_str_chunk(|chunk| {
+            nonblank |= chunk.chars().any(|ch| !ch.is_whitespace());
+            out.push_str(chunk);
+            Ok(())
+        })?;
+        return Ok((is_string && nonblank).then_some(out));
+    }
     let mut offset = 0;
     let mut start = None;
     let mut end = 0;
@@ -55,9 +66,6 @@ pub(crate) fn item_string(view: JsonView<'_>, trim: bool) -> Result<Option<Strin
     let Some(start) = start else {
         return Ok(None);
     };
-    if !trim {
-        return string(view);
-    }
     let mut out = String::new();
     offset = 0;
     view.for_each_str_chunk(|chunk| {

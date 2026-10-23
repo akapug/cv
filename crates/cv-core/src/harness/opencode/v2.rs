@@ -25,6 +25,7 @@
 //! Anything else is kept verbatim as a `Carrier` under `complete`, and is counted in
 //! `extra["opencode"]["unknown_message_types"]` on the session otherwise — never silently dropped.
 
+use crate::json::{ReadInput, Validation};
 /// cv preserves tool-result details in OpenCode's free-form metadata under this key.
 /// The reader restores the original IR value; it is not an OpenCode-native status field.
 pub(super) const DETAILS_KEY: &str = "clustervision.details";
@@ -493,7 +494,11 @@ fn decoded_input(view: JsonView<'_>, ctx: Ctx<'_>) -> Result<crate::json::Json> 
         Ok(())
     })?;
     if len != 0 {
-        match source.read_backing_value(arena.clone(), offset, len, |decoded| decoded.argument(true)) {
+        match source.read(
+            ReadInput::Backing(arena.clone(), offset, len),
+            Validation::Value,
+            |decoded| decoded.argument(true),
+        ) {
             Ok(decoded) => return Ok(decoded),
             Err(error) if error.is::<crate::json::InvalidJson>() => {}
             Err(error) => return Err(error),

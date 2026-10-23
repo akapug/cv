@@ -1,6 +1,7 @@
 //! Accept one source snapshot before retaining its lazy file bodies for native emission.
 use super::*;
 use crate::json::JsonSource;
+use crate::json::{ReadInput, Validation};
 use crate::source::{Probe, ReadSet};
 use crate::stream::{Flow, MessageSink};
 use anyhow::Context;
@@ -15,7 +16,7 @@ struct Collect {
     implicit: PathBuf,
     reads: ReadSet,
     sources: HashMap<PathBuf, JsonSource>,
-    error: Option<anyhow::Error>,
+    latch: crate::stream::Latch,
 }
 impl Collect {
     fn capture(&mut self, path: &Path) -> Result<()> {
@@ -27,14 +28,14 @@ impl Collect {
         Ok(())
     }
     fn note(&mut self, message: crate::Message) -> Result<()> {
-        crate::source::record_message_reads(&message, &self.primary, &mut self.reads);
+        crate::source::record_message_reads(&message, Some(&self.primary), &mut self.reads);
         let index = self.index;
         self.index += 1;
         if index < self.start || self.end.is_some_and(|end| index >= end) {
             return Ok(());
         }
         for block in &message.content {
-            if let Some(crate::Text::Span(span)) = text(block) {
+            if let Some(crate::Text::Span(span)) = block.text() {
                 let path = span.source.clone().unwrap_or_else(|| self.implicit.clone());
                 self.capture(&path)?;
             }
@@ -46,14 +47,14 @@ impl Collect {
 impl MessageSink for Collect {
     fn message(&mut self, message: crate::Message) -> Flow {
         if let Err(error) = self.note(message) {
-            self.error = Some(error);
+            self.latch.fail(error);
             Flow::Stop
         } else {
             Flow::Continue
         }
     }
     fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.error.take()
+        self.latch.take("emit preparation")
     }
     fn meta(&mut self, metadata: &Session) {
         if let Some(path) = &metadata.source_path {
@@ -65,25 +66,46 @@ impl MessageSink for Collect {
         // Absence/directory membership are read-set guards, not retained body files.
         if fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
             if let Err(error) = self.capture(path) {
-                self.error = Some(error);
+                self.latch.fail(error);
             }
         }
     }
 }
-fn text(block: &crate::Block) -> Option<&crate::Text> {
-    match block {
-        crate::Block::Text { text } | crate::Block::Thinking { text, .. } => Some(text),
-        crate::Block::ToolResult { content, .. } => Some(content),
-        _ => None,
-    }
+/// Bind one retained block text: a wire-form span is replaced by the checked JSON string it
+/// covers (quotes included) from the captured source, non-span text passes through.
+fn bind_span(
+    sources: &HashMap<PathBuf, JsonSource>,
+    primary: &Path,
+    session: &Session,
+    value: &mut crate::Text,
+) -> Result<()> {
+    let crate::Text::Span(span) = &*value else {
+        return Ok(());
+    };
+    let owned = span.source.as_ref().or(session.source_path.as_ref());
+    let path = std::path::absolute(owned.map(|path| path.as_path()).unwrap_or(primary))?;
+    let source = sources
+        .get(&path)
+        .ok_or_else(|| anyhow::anyhow!("uncaptured retained span source: {}", path.display()))?;
+    source.check()?;
+    // A wire-form span covers a JSON string's body: bind that string, quotes included, in the
+    // capture just checked rather than a fresh stat of the live path.
+    let (offset, len) = span
+        .offset
+        .checked_sub(1)
+        .zip(span.len.checked_add(2))
+        .filter(|(offset, len)| offset.checked_add(*len).is_some_and(|end| end <= source.len()))
+        .with_context(|| format!("retained span is outside its source {}", path.display()))?;
+    let bound = source
+        .read(ReadInput::Range(offset, len), Validation::Value, |view| {
+            view.source_text()
+        })?
+        .with_context(|| format!("retained span is not a JSON string in {}", path.display()))?;
+    source.check()?;
+    *value = bound;
+    Ok(())
 }
-fn text_mut(block: &mut crate::Block) -> Option<&mut crate::Text> {
-    match block {
-        crate::Block::Text { text } | crate::Block::Thinking { text, .. } => Some(text),
-        crate::Block::ToolResult { content, .. } => Some(content),
-        _ => None,
-    }
-}
+
 pub(super) fn parse(
     adapter: &dyn crate::harness::Adapter,
     reference: &SessionRef,
@@ -114,7 +136,7 @@ pub(super) fn selected(
         implicit: reference.path.clone(),
         reads,
         sources: HashMap::new(),
-        error: None,
+        latch: Default::default(),
     };
     if fs::metadata(&primary).is_ok_and(|metadata| metadata.is_file()) {
         sink.capture(&primary)?;
@@ -131,33 +153,8 @@ pub(super) fn selected(
     );
     for message in &mut sink.messages {
         for block in &mut message.content {
-            let Some(value) = text_mut(block) else { continue };
-            let crate::Text::Span(span) = value else { continue };
-            let span = span.clone();
-            let path = std::path::absolute(
-                span.source
-                    .as_ref()
-                    .or(session.source_path.as_ref())
-                    .unwrap_or(&primary),
-            )?;
-            let source = sink
-                .sources
-                .get(&path)
-                .ok_or_else(|| anyhow::anyhow!("uncaptured retained span source: {}", path.display()))?;
-            source.check()?;
-            // A wire-form span covers a JSON string's body: bind that string, quotes included,
-            // in the capture just checked rather than a fresh stat of the live path.
-            let (offset, len) = span
-                .offset
-                .checked_sub(1)
-                .zip(span.len.checked_add(2))
-                .filter(|(offset, len)| offset.checked_add(*len).is_some_and(|end| end <= source.len()))
-                .with_context(|| format!("retained span is outside its source {}", path.display()))?;
-            let bound = source
-                .read_range_value(offset, len, |view| view.source_text())?
-                .with_context(|| format!("retained span is not a JSON string in {}", path.display()))?;
-            source.check()?;
-            *value = bound;
+            let Some(value) = block.text_mut() else { continue };
+            bind_span(&sink.sources, &primary, &session, value)?;
         }
     }
 
@@ -221,7 +218,7 @@ mod tests {
                 .messages
                 .iter()
                 .flat_map(|m| &m.content)
-                .all(|block| text(block).is_none_or(|t| t.inline_str().is_some())));
+                .all(|block| block.text().is_none_or(|t| t.inline_str().is_some())));
             let checked_options = Demand {
                 spans: true,
                 ..owned_options
@@ -252,7 +249,7 @@ mod tests {
                 .messages
                 .iter()
                 .flat_map(|m| &m.content)
-                .any(|block| matches!(text(block), Some(Text::Source(_)))));
+                .any(|block| matches!(block.text(), Some(Text::Source(_)))));
             let mut materialized = actual.clone();
             materialized.materialize()?;
             assert_serialized_equal(&materialized, &expected)?;
@@ -321,7 +318,7 @@ mod tests {
             .messages
             .iter()
             .flat_map(|m| &m.content)
-            .any(|block| matches!(text(block), Some(Text::Source(_)))));
+            .any(|block| matches!(block.text(), Some(Text::Source(_)))));
         let mut materialized = actual.clone();
         materialized.materialize()?;
         assert_serialized_equal(&materialized, &expected)?;
@@ -390,13 +387,13 @@ mod tests {
                 .messages
                 .iter()
                 .flat_map(|m| &m.content)
-                .all(|b| !matches!(text(b), Some(Text::Span(_) | Text::Source(_)))));
+                .all(|b| !matches!(b.text(), Some(Text::Span(_) | Text::Source(_)))));
             let actual = super::super::parse_for_emit(&adapter, &reference, Harness::Gemini)?;
             assert!(actual
                 .messages
                 .iter()
                 .flat_map(|m| &m.content)
-                .any(|b| matches!(text(b), Some(Text::Source(_)))));
+                .any(|b| matches!(b.text(), Some(Text::Source(_)))));
             let mut materialized = actual.clone();
             materialized.materialize()?;
             assert_serialized_equal(&materialized, &expected)?;

@@ -38,9 +38,8 @@ pub(super) fn discover(conn: &Connection, db: &Path, cwd: Option<&Path>, out: &m
                 continue;
             };
             let mut count = 0;
-            for bubble in bubbles.into_iter().flatten() {
-                bubble?;
-                count += 1;
+            for view in bubbles.into_iter().flatten() {
+                count += usize::from(bubble(view?, true)?.is_some_and(|message| message.is_turn()));
             }
             if count == 0 {
                 continue;
@@ -135,11 +134,11 @@ mod tests {
         for (index, (text, expected)) in [
             (
                 r#"{"tabs":[{"tabId":"a","chatTitle":"A","bubbles":[{"type":"user","text":"1"},2]},{"tabId":"a","bubbles":[3]}]}"#,
-                Some(vec![("a", Some("A"), Some(2)), ("a", None, Some(1))]),
+                Some(vec![("a", Some("A"), Some(1))]),
             ),
             (
                 r#"{"tabs":[{"tabId":"obsolete","bubbles":[1]}],"tabs":[{"tabId":"a","bubbles":[2],"bubbles":[3,4]}]}"#,
-                Some(vec![("a", None, Some(2))]),
+                Some(vec![]),
             ),
             (r#"{"tabs":[{"tabId":"a","bubbles":[1],"bubbles":false}]}"#, Some(vec![])),
             (r#"{"tabs":[null,1,[],{"tabId":"a","bubbles":[]}]}"#, Some(vec![])),

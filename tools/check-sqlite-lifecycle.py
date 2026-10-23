@@ -11,9 +11,11 @@ import os
 from pathlib import Path
 import signal
 import sqlite3
+import sys
 import subprocess
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from perf_fixture_sqlite import generate_sqlite
 
 
@@ -24,6 +26,23 @@ def digest(path):
 def identity(path):
     stat = path.stat()
     return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+
+
+def cold_wal(source):
+    """Freeze committed WAL frames without changing any logical row or leaving live SHM."""
+    source = Path(source)
+    connection = sqlite3.connect(source)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        connection.execute(f"PRAGMA user_version={version}")
+        database = source.read_bytes()
+        wal = Path(str(source) + "-wal").read_bytes()
+        assert len(wal) > 32, "fixture needs committed WAL frames, not just a WAL header"
+    finally:
+        connection.close()
+    source.write_bytes(database)
+    Path(str(source) + "-wal").write_bytes(wal)
 
 
 def children(pid):
@@ -50,11 +69,7 @@ def main():
             parser.error("--baseline is required when creating new scratch state")
         root.mkdir(parents=True, exist_ok=False)
         fixture = generate_sqlite("goose", root / "goose/data/sessions", 8_000_000, 8192, True, "history")
-        connection = sqlite3.connect(fixture["path"])
-        try:
-            connection.execute("PRAGMA journal_mode=WAL")
-        finally:
-            connection.close()  # Cold WAL header, with no original WAL or SHM.
+        cold_wal(fixture["path"])
         (root / "fixture.json").write_text(json.dumps(fixture, indent=2) + "\n")
         for directory in ("home", "catalog", "temporary", "home/.local/share", "home/.config", "home/.cache"):
             (root / directory).mkdir(parents=True, exist_ok=True)
@@ -67,12 +82,24 @@ def main():
                GOOSE_PATH_ROOT=str(root / "goose"), XDG_DATA_HOME=str(root / "home/.local/share"),
                XDG_CONFIG_HOME=str(root / "home/.config"), XDG_CACHE_HOME=str(root / "home/.cache"),
                RAYON_NUM_THREADS="1")
-    original, original_identity = digest(source), identity(source)
+    originals = {
+        suffix: (digest(path), identity(path)) if path.exists() else None
+        for suffix in ("", "-wal", "-shm", "-journal")
+        for path in [Path(str(source) + suffix)]
+    }
+    original, original_identity = originals[""]
+    assert originals["-wal"] is not None, "lifecycle fixture must contain WAL frames"
     command = ["doctor", "goose:" + fixture["id"], "--json"]
 
     def guards():
-        assert digest(source) == original and identity(source) == original_identity
-        assert not any(Path(str(source) + suffix).exists() for suffix in ("-wal", "-shm", "-journal"))
+        for suffix, before in originals.items():
+            path = Path(str(source) + suffix)
+            after = (digest(path), identity(path)) if path.exists() else None
+            assert after == before, f"source changed: {path}"
+
+    def own(pid):
+        with (root / "owned-pids.txt").open("a") as pids:
+            pids.write(f"{pid}\n")
 
     def payloads():
         return [{"path": str(path.relative_to(root)), "bytes": path.stat().st_size}
@@ -100,7 +127,10 @@ def main():
         return hashlib.sha256(process.stdout).hexdigest()
 
     if not args.reuse_state:
-        process = subprocess.run([str(args.baseline.resolve(strict=True)), *command], env=env, cwd=root,
+        baseline_temporary = root / "baseline-temporary"
+        baseline_temporary.mkdir()
+        process = subprocess.run([str(args.baseline.resolve(strict=True)), *command],
+                                 env={**env, "TMPDIR": str(baseline_temporary)}, cwd=root,
                                  capture_output=True, check=True, timeout=30)
         (root / "normal.json").write_bytes(process.stdout)
         guards()
@@ -109,6 +139,7 @@ def main():
     for sig in (signal.SIGINT, signal.SIGKILL):
         process = subprocess.Popen([str(binary), *command], env=env, cwd=root,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        own(process.pid)
         try:
             witness = wait_copy(process)
             process.send_signal(sig)
@@ -128,6 +159,7 @@ def main():
 
     process = subprocess.Popen([str(binary), "mcp"], env=env, cwd=root, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    own(process.pid)
     def send(value):
         process.stdin.write((json.dumps(value) + "\n").encode())
         process.stdin.flush()
@@ -142,6 +174,7 @@ def main():
         # It cannot naturally finish after this witness. Disconnect must kill and reap it.
         started_identities = {pid: process_identity(pid) for pid in started}
         assert all(started_identities.values()), "generated child disappeared before stop"
+        own(started[0])
         os.kill(started[0], signal.SIGSTOP)
         process.stdout.close()
         process.stdout = None
@@ -170,6 +203,7 @@ def main():
             owned.update(pid for pid, stamp in started_identities.items()
                          if stamp is not None and process_identity(pid) == stamp)
             for child in owned:
+                own(child)
                 try:
                     os.kill(child, signal.SIGKILL)
                 except ProcessLookupError:
@@ -203,7 +237,7 @@ def main():
     report["limits"] = ["standalone abrupt exit reclamation is eventual at a later operation boundary",
         "MCP closed-output cancellation kills and reaps a stopped generated child before request cleanup",
         "logical named payload extents only, not physical APFS blocks or timing/RSS",
-        "owned fixture/home/catalog/TMPDIR only (copies stage in the catalog); source hash/identity/auxiliary absence and exact output preserved",
+        "owned fixture/home/catalog/TMPDIR only (copies stage in the catalog); source and WAL hashes/identities, auxiliary absence and exact output preserved",
         "fixed recognized gate metadata may remain; no abandoned store.db payloads"]
     (root / "candidate-lifecycle.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))

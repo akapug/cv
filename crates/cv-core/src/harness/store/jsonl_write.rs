@@ -9,14 +9,16 @@ use std::path::Path;
 pub(crate) struct JsonlStage {
     output: BufWriter<ByteStage>,
     records: usize,
-    failed: bool,
+    /// Some once a push failed (or was interrupted): the stage is poisoned, and this names the
+    /// record and cause for every later call.
+    failed: Option<String>,
 }
 impl JsonlStage {
     pub(crate) fn new() -> Self {
         Self {
-            output: BufWriter::with_capacity(64 * 1024, ByteStage::new()),
+            output: BufWriter::with_capacity(super::IO_CHUNK, ByteStage::new()),
             records: 0,
-            failed: false,
+            failed: None,
         }
     }
     pub(crate) fn record_count(&self) -> usize {
@@ -29,16 +31,32 @@ impl JsonlStage {
         self.push_with(|writer| serde_json::to_writer(writer, &value).map_err(Into::into))
     }
     pub(crate) fn push_with(&mut self, produce: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<()> {
-        anyhow::ensure!(!self.failed, "JSONL stage already failed");
-        self.failed = true;
-        produce(&mut self.output)?;
-        self.output.write_all(b"\n")?;
-        self.records += 1;
-        self.failed = false;
-        Ok(())
+        if let Some(failure) = &self.failed {
+            anyhow::bail!("JSONL stage already failed at {failure}");
+        }
+        // Poisoned until the record is whole, so a push that never returns leaves it failed.
+        self.failed = Some(format!("record {} (interrupted)", self.records));
+        let pushed = produce(&mut self.output).and_then(|()| Ok(self.output.write_all(b"\n")?));
+        match pushed {
+            Ok(()) => {
+                self.records += 1;
+                self.failed = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.failed = Some(format!("record {}: {error:#}", self.records));
+                Err(error)
+            }
+        }
+    }
+    fn refuse_if_failed(&self, what: &str) -> Result<()> {
+        match &self.failed {
+            Some(failure) => anyhow::bail!("cannot {what} a failed JSONL stage (failed at {failure})"),
+            None => Ok(()),
+        }
     }
     pub(crate) fn into_source(self) -> Result<super::bytes::ByteSource> {
-        anyhow::ensure!(!self.failed, "cannot consume a failed JSONL stage");
+        self.refuse_if_failed("consume")?;
         Ok(self.output.into_inner().map_err(|e| e.into_error())?.finish()?)
     }
     pub(crate) fn publish(self, path: &Path, claim: Claim) -> Result<()> {
@@ -58,7 +76,7 @@ impl JsonlStage {
         stage_into(set, self.into_stage()?, path, claim)
     }
     fn into_stage(self) -> Result<ByteStage> {
-        anyhow::ensure!(!self.failed, "cannot publish a failed JSONL stage");
+        self.refuse_if_failed("publish")?;
         Ok(self.output.into_inner().map_err(|e| e.into_error())?)
     }
 }
@@ -79,7 +97,7 @@ pub(crate) fn publish_stage_checked(
     check: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
     let source = stage.finish()?;
-    let reader = BufReader::with_capacity(256 * 1024, source.reader()?);
+    let reader = BufReader::with_capacity(super::COPY_CHUNK, source.reader()?);
     let staged = crate::publish::stage_reader(path, "stage", reader, claim)?;
     check(staged.path())?;
     staged.publish(path, claim)?;
@@ -89,7 +107,7 @@ pub(crate) fn publish_stage_checked(
 /// [`publish_stage`] as one member of `set`.
 pub(crate) fn stage_into(set: &mut Set, stage: ByteStage, path: &Path, claim: Claim) -> Result<()> {
     let source = stage.finish()?;
-    let reader = BufReader::with_capacity(256 * 1024, source.reader()?);
+    let reader = BufReader::with_capacity(super::COPY_CHUNK, source.reader()?);
     set.stage(path, "stage", reader, claim)
 }
 
@@ -119,7 +137,14 @@ mod tests {
         let mut stage = JsonlStage::new();
         stage.push(serde_json::json!({"valid": true}))?;
         assert!(stage.push(Failure).is_err());
-        assert!(stage.publish(&path, Claim::Replace).is_err());
+        // Every later refusal names the record that failed and why.
+        let again = stage.push(serde_json::Value::Null).unwrap_err().to_string();
+        assert_eq!(again, "JSONL stage already failed at record 1: synthetic failure");
+        let refused = stage.publish(&path, Claim::Replace).unwrap_err().to_string();
+        assert_eq!(
+            refused,
+            "cannot publish a failed JSONL stage (failed at record 1: synthetic failure)"
+        );
         assert_eq!(std::fs::read(&path)?, before);
         let mut stage = JsonlStage::new();
         assert!(stage

@@ -123,17 +123,26 @@ fn surviving<'a>(removed: &'a HashMap<String, Option<String>>, mut id: &'a str) 
     None
 }
 
+/// Which of the two rewrites [`rewrite`] serves: [`normalize`], the portable replay, or
+/// [`drop_empty_records`], the transform pass that also removes records emptied of content and
+/// keeps malformed lines verbatim.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Normalize,
+    DropEmpties,
+}
+
 /// Two passes reserve all valid IDs (and find records left empty) before allocation. Metadata
 /// scales with IDs, removed records and each record's selected spans. Unknown fields and tool
 /// payloads copy unchanged with bounded positioned reads.
 pub(crate) fn normalize(bytes: ByteSource, mode: crate::emit::ThinkingMode) -> Result<(ByteStage, Changes)> {
-    rewrite(bytes, mode, false)
+    rewrite(bytes, mode, Mode::Normalize)
 }
 
 /// Remove records whose `message.content` is an empty array (a transform emptied them), relinking
 /// their children exactly as [`normalize`] does. Nothing else changes.
 pub(crate) fn drop_empty_records(bytes: ByteSource) -> Result<(ByteStage, Changes)> {
-    rewrite(bytes, crate::emit::ThinkingMode::Native, true)
+    rewrite(bytes, crate::emit::ThinkingMode::Native, Mode::DropEmpties)
 }
 
 fn empty_content(source: &RangeSource, row: Range) -> Result<bool> {
@@ -149,7 +158,7 @@ fn empty_content(source: &RangeSource, row: Range) -> Result<bool> {
     })
 }
 
-fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) -> Result<(ByteStage, Changes)> {
+fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, pass: Mode) -> Result<(ByteStage, Changes)> {
     let bytes = Arc::new(bytes);
     let source = RangeSource::private(&bytes)?;
     let mut reserved = HashSet::new();
@@ -168,7 +177,10 @@ fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) ->
         }
         if source.accept(row, Validation::Value)?.is_none() {
             // A transform's pass-through keeps malformed lines verbatim; replay refuses them.
-            anyhow::ensure!(empties, "portable Claude replay encountered invalid JSON");
+            anyhow::ensure!(
+                pass == Mode::DropEmpties,
+                "portable Claude replay encountered invalid JSON"
+            );
             return Ok(());
         }
         let (mut total, mut drops) = (0usize, 0usize);
@@ -179,7 +191,7 @@ fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) ->
                 drops += 1;
             }
             let key = match ty.as_deref() {
-                _ if empties => return Ok(()),
+                _ if pass == Mode::DropEmpties => return Ok(()),
                 Some("tool_use") => "id",
                 Some("tool_result") => "tool_use_id",
                 _ => return Ok(()),
@@ -193,7 +205,7 @@ fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) ->
             }
             Ok(())
         })?;
-        if (total > 0 && drops == total) || (empties && total == 0 && empty_content(&source, row)?) {
+        if (total > 0 && drops == total) || (pass == Mode::DropEmpties && total == 0 && empty_content(&source, row)?) {
             removed_rows.insert(row.offset);
             if let Some(uuid) = string(&source, source.get(row, "uuid")?)? {
                 removed.insert(uuid, string(&source, source.get(row, "parentUuid")?)?);
@@ -221,7 +233,7 @@ fn rewrite(bytes: ByteSource, mode: crate::emit::ThinkingMode, empties: bool) ->
     rows(&bytes, |row| {
         // Malformed rows are copied verbatim, including their unparsed links; only accepted
         // records can have parent links patched after removals.
-        if empties
+        if pass == Mode::DropEmpties
             && !removed_rows.contains(&row.offset)
             && (removed.is_empty() || source.accept(row, Validation::Value)?.is_none())
         {

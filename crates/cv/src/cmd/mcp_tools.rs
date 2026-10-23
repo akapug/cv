@@ -29,14 +29,6 @@ use super::mcp::InvalidParams;
 /// subcommands do (see [`select_tool_commands`]).
 const TOOL_GROUPS: [&str; 4] = ["Read", "Reshape", "Export", "System"];
 
-/// `show`'s MCP-only window defaults: applied when the caller names no selector at all.
-pub(crate) const SHOW_DEFAULT_LAST: u64 = 50;
-pub(crate) const SHOW_DEFAULT_MAX_BYTES: u64 = 200_000;
-
-/// The window selectors from INTERFACE-V2 §2, plus `pre_compaction` (which sets the window
-/// itself, so injecting a default on top of it would conflict).
-const WINDOW_SELECTORS: [&str; 6] = ["first", "last", "range", "around", "max_bytes", "pre_compaction"];
-
 /// One argument of one command, as `cv schema --commands --json` describes it.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ArgSpec {
@@ -320,6 +312,7 @@ fn run_command_cancelled(
 /// ever print clap's usage) and `hook`, which reads Claude Code's hook JSON on stdin that an MCP
 /// call cannot supply (it did nothing; `cv hooks install claude` wires it). A `--follow` flag is
 /// dropped too: a tool call has no Ctrl-C, so following is offered only bounded, through `for`.
+/// So is `--wide`: it shapes the table, and a tool call always reads the whole `--json`.
 fn select_tool_commands(all: Vec<CommandSpec>) -> Vec<CommandSpec> {
     let names: Vec<String> = all.iter().map(|c| c.name.clone()).collect();
     all.into_iter()
@@ -329,7 +322,8 @@ fn select_tool_commands(all: Vec<CommandSpec>) -> Vec<CommandSpec> {
             !(has_children && c.args.iter().all(|a| a.global))
         })
         .map(|mut c| {
-            c.args.retain(|a| !(a.name == "follow" && a.kind == ArgKind::Flag));
+            c.args
+                .retain(|a| !(matches!(a.name.as_str(), "follow" | "wide") && a.kind == ArgKind::Flag));
             c
         })
         .collect()
@@ -376,12 +370,10 @@ fn tool_description(cmd: &CommandSpec) -> String {
     let json = if cmd.has_json() { " --json" } else { "" };
     let mut out = format!("{about} (runs `cv {}{json}`).", cmd.name);
     if cmd.tool_name() == "show" {
-        out.push_str(&format!(
-            " Over MCP this windows by default: with none of first/last/range/around/max_bytes \
-             (nor `kind`) given it reads the LAST {SHOW_DEFAULT_LAST} messages capped at \
-             {SHOW_DEFAULT_MAX_BYTES} bytes, so a whole transcript is never pulled in by accident. \
-             Ask for a window explicitly to override."
-        ));
+        out.push_str(
+            " With no first/last/range/around/max_bytes it returns the whole transcript; \
+             a window or byte budget bounds it, and a cut ends with where to continue.",
+        );
     }
     out
 }
@@ -394,9 +386,10 @@ fn property_schema(cmd: &CommandSpec, a: &ArgSpec) -> Value {
     if !a.possible_values.is_empty() {
         p.insert("enum".into(), json!(a.possible_values));
     }
-    if let Some(d) = &a.default {
-        // Typed to match the property, so a client that pre-fills defaults sends a valid value.
-        p.insert("default".into(), default_value(a, d));
+    // Typed to match the property, so a client that pre-fills defaults sends a valid value; a
+    // default that does not parse as the advertised type is left out rather than advertised wrong.
+    if let Some(d) = a.default.as_deref().and_then(|d| default_value(a, d)) {
+        p.insert("default".into(), d);
     }
     if a.multiple {
         // Advertised as a typed array (hosts reject untyped properties); a bare value is
@@ -423,12 +416,13 @@ fn json_type(a: &ArgSpec) -> &'static str {
     }
 }
 
-fn default_value(a: &ArgSpec, raw: &str) -> Value {
+/// `raw` as a value of the property's JSON type, or `None` when it is not one.
+fn default_value(a: &ArgSpec, raw: &str) -> Option<Value> {
     match json_type(a) {
-        "integer" => raw.parse::<i64>().map(Value::from).unwrap_or_else(|_| json!(raw)),
-        "number" => raw.parse::<f64>().map(Value::from).unwrap_or_else(|_| json!(raw)),
-        "boolean" => raw.parse::<bool>().map(Value::from).unwrap_or_else(|_| json!(raw)),
-        _ => json!(raw),
+        "integer" => raw.parse::<i64>().ok().map(Value::from),
+        "number" => raw.parse::<f64>().ok().map(Value::from),
+        "boolean" => raw.parse::<bool>().ok().map(Value::from),
+        _ => Some(json!(raw)),
     }
 }
 
@@ -470,6 +464,7 @@ pub(crate) fn build_argv(cmd: &CommandSpec, args: &Value) -> Result<Vec<String>>
             ("prune", "range") => Some("keep"),
             ("prune", "retrieve") => Some("cat tool with session and tool_use_id"),
             ("rewind", "from_compaction") => Some("full (omit it to start at the last compaction)"),
+            (_, "follow") if cmd.arg("for").is_some() => Some("for"),
             _ => None,
         };
         if let Some(replacement) = replacement {
@@ -550,34 +545,10 @@ pub(crate) fn build_argv(cmd: &CommandSpec, args: &Value) -> Result<Vec<String>>
         }
     }
 
-    apply_mcp_defaults(cmd, obj, &mut argv);
-
     if cmd.has_json() {
         argv.push("--json".into());
     }
     Ok(argv)
-}
-
-/// `show` without a window selector reads the tail, not the whole transcript (§6). A `kind` view
-/// (what the person said, the compaction seams) is rows, not a transcript: it gets no default.
-fn apply_mcp_defaults(cmd: &CommandSpec, obj: &Map<String, Value>, argv: &mut Vec<String>) {
-    if cmd.tool_name() != "show" {
-        return;
-    }
-    let windowed = WINDOW_SELECTORS
-        .iter()
-        .any(|k| cmd.arg(k).is_some() && present(obj, k).is_some());
-    if windowed || present(obj, "kind").is_some() {
-        return;
-    }
-    if cmd.arg("last").is_some() {
-        argv.push("--last".into());
-        argv.push(SHOW_DEFAULT_LAST.to_string());
-    }
-    if cmd.arg("max_bytes").is_some() {
-        argv.push("--max-bytes".into());
-        argv.push(SHOW_DEFAULT_MAX_BYTES.to_string());
-    }
 }
 
 /// An argument the caller actually supplied (JSON `null` counts as absent).
@@ -612,48 +583,53 @@ fn invalid(msg: String) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::on_main_sized_stack;
+
+    /// Every default in the tree is a value of the type its schema advertises, so none is left
+    /// out; one that is not would be omitted, never advertised as a string of the wrong type.
+    #[test]
+    fn every_advertised_default_has_its_property_type() {
+        on_main_sized_stack(|| {
+            let tools = CliTools::from_tree(&crate::build_cli()).unwrap();
+            for command in tools.commands() {
+                for arg in &command.args {
+                    if let Some(raw) = &arg.default {
+                        assert!(
+                            default_value(arg, raw).is_some(),
+                            "{} --{}: default {raw:?} is not a {}",
+                            command.name,
+                            arg.name,
+                            json_type(arg)
+                        );
+                    }
+                }
+            }
+            let mut arg = tools.commands()[0].args[0].clone();
+            arg.kind = ArgKind::Option;
+            arg.value_type = "integer".into();
+            assert_eq!(default_value(&arg, "12"), Some(json!(12)));
+            assert_eq!(default_value(&arg, "twelve"), None);
+        });
+    }
 
     #[test]
     fn skills_policy_uses_the_same_name_in_mcp_and_cli() {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let tree = crate::build_cli();
-                let tools = CliTools::from_tree(&tree).unwrap();
-                for name in ["prune", "rewind", "port"] {
-                    let command = tools.find(name).unwrap();
-                    let descriptor = tool_descriptor(command);
-                    let properties = &descriptor["inputSchema"]["properties"];
-                    assert!(properties.get("skills_policy").is_none());
-                    assert_eq!(properties["skills"]["enum"], json!(["keep", "drop", "drop-stale"]));
-                    let argv = build_argv(command, &json!({"id":"source", "skills":"drop-stale"})).unwrap();
-                    assert!(argv.windows(2).any(|args| args == ["--skills", "drop-stale"]));
-                    tree.clone()
-                        .try_get_matches_from(std::iter::once("cv".to_owned()).chain(argv))
-                        .unwrap();
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    /// `WINDOW_SELECTORS` is `WindowArgs`' own flags plus `pre_compaction`: a window flag added to
-    /// the shared struct must reach the MCP default-window rule, never a hand copy of the list.
-    #[test]
-    fn window_selectors_are_the_window_args_table() {
-        use clap::Args;
-        let cmd = crate::util::WindowArgs::augment_args(clap::Command::new("window"));
-        let mut table: Vec<&str> = cmd
-            .get_arguments()
-            .map(|a| a.get_id().as_str())
-            .filter(|id| *id != "context")
-            .collect();
-        table.push("pre_compaction");
-        table.sort_unstable();
-        let mut have = WINDOW_SELECTORS.to_vec();
-        have.sort_unstable();
-        assert_eq!(have, table);
+        on_main_sized_stack(|| {
+            let tree = crate::build_cli();
+            let tools = CliTools::from_tree(&tree).unwrap();
+            for name in ["prune", "rewind", "port"] {
+                let command = tools.find(name).unwrap();
+                let descriptor = tool_descriptor(command);
+                let properties = &descriptor["inputSchema"]["properties"];
+                assert!(properties.get("skills_policy").is_none());
+                assert_eq!(properties["skills"]["enum"], json!(["keep", "drop", "drop-stale"]));
+                let argv = build_argv(command, &json!({"id":"source", "skills":"drop-stale"})).unwrap();
+                assert!(argv.windows(2).any(|args| args == ["--skills", "drop-stale"]));
+                tree.clone()
+                    .try_get_matches_from(std::iter::once("cv".to_owned()).chain(argv))
+                    .unwrap();
+            }
+        });
     }
 
     fn spec(json_src: &str) -> CommandSpec {
@@ -741,16 +717,11 @@ mod tests {
 
     #[test]
     fn hook_is_no_tool_but_its_installer_is() {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024) // a debug clap tree overflows the 2 MB test stack
-            .spawn(|| {
-                let tools = CliTools::from_tree(&crate::build_cli()).unwrap();
-                assert!(tools.find("hook").is_none());
-                assert!(tools.find("hooks_install").is_some());
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        on_main_sized_stack(|| {
+            let tools = CliTools::from_tree(&crate::build_cli()).unwrap();
+            assert!(tools.find("hook").is_none());
+            assert!(tools.find("hooks_install").is_some());
+        });
     }
 
     #[test]
@@ -787,97 +758,72 @@ mod tests {
 
     #[test]
     fn generated_task_flags_and_repeatable_arguments_round_trip_through_clap() {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let tree = crate::build_cli();
-                let tools = CliTools::from_tree(&tree).unwrap();
-                for (name, args, expected) in [
-                    (
-                        "task_block",
-                        json!({"id":"a", "by_task":"b"}),
-                        vec!["task", "block", "a", "--by", "b"],
-                    ),
-                    (
-                        "task_supersede",
-                        json!({"id":"a", "by_task":"b"}),
-                        vec!["task", "supersede", "a", "--by", "b"],
-                    ),
-                    (
-                        "task_decide",
-                        json!({"title":"question", "for_who":"ember", "default":"a", "options":["b", "c"]}),
-                        vec![
-                            "task",
-                            "decide",
-                            "question",
-                            "--for",
-                            "ember",
-                            "--default",
-                            "a",
-                            "--option",
-                            "b",
-                            "--option",
-                            "c",
-                        ],
-                    ),
-                    (
-                        "splice",
-                        json!({"specs":["a:..2", "b:2.."]}),
-                        vec!["splice", "a:..2", "b:2..", "--json"],
-                    ),
-                ] {
-                    let cmd = tools.find(name).unwrap();
-                    let argv = build_argv(cmd, &args).unwrap();
-                    assert_eq!(argv, expected);
-                    tree.clone()
-                        .try_get_matches_from(std::iter::once("cv".to_owned()).chain(argv))
-                        .unwrap();
-                }
-                for (tool, arg) in [
-                    ("task_decide", "options"),
-                    ("task_open", "blocked_by"),
-                    ("splice", "specs"),
-                    ("adopt", "agents"),
-                    ("distill", "with"),
-                ] {
-                    let descriptor = tool_descriptor(tools.find(tool).unwrap());
-                    let property = &descriptor["inputSchema"]["properties"][arg];
-                    assert_eq!(property["type"], "array");
-                    assert_eq!(property["items"]["type"], "string");
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        on_main_sized_stack(|| {
+            let tree = crate::build_cli();
+            let tools = CliTools::from_tree(&tree).unwrap();
+            for (name, args, expected) in [
+                (
+                    "task_block",
+                    json!({"id":"a", "by_task":"b"}),
+                    vec!["task", "block", "a", "--by", "b"],
+                ),
+                (
+                    "task_supersede",
+                    json!({"id":"a", "by_task":"b"}),
+                    vec!["task", "supersede", "a", "--by", "b"],
+                ),
+                (
+                    "task_decide",
+                    json!({"title":"question", "for_who":"ember", "default":"a", "options":["b", "c"]}),
+                    vec![
+                        "task",
+                        "decide",
+                        "question",
+                        "--for",
+                        "ember",
+                        "--default",
+                        "a",
+                        "--option",
+                        "b",
+                        "--option",
+                        "c",
+                    ],
+                ),
+                (
+                    "splice",
+                    json!({"specs":["a:..2", "b:2.."]}),
+                    vec!["splice", "a:..2", "b:2..", "--json"],
+                ),
+            ] {
+                let cmd = tools.find(name).unwrap();
+                let argv = build_argv(cmd, &args).unwrap();
+                assert_eq!(argv, expected);
+                tree.clone()
+                    .try_get_matches_from(std::iter::once("cv".to_owned()).chain(argv))
+                    .unwrap();
+            }
+            for (tool, arg) in [
+                ("task_decide", "options"),
+                ("task_open", "blocked_by"),
+                ("splice", "specs"),
+                ("adopt", "agents"),
+                ("distill", "with"),
+            ] {
+                let descriptor = tool_descriptor(tools.find(tool).unwrap());
+                let property = &descriptor["inputSchema"]["properties"][arg];
+                assert_eq!(property["type"], "array");
+                assert_eq!(property["items"]["type"], "string");
+            }
+        });
     }
 
+    /// `show` passes exactly what the caller asked for: no window is the whole transcript.
     #[test]
-    fn show_without_a_selector_gets_the_mcp_window_defaults() {
+    fn show_gets_no_window_the_caller_did_not_ask_for() {
         let argv = build_argv(&show(), &json!({"id": "abc"})).unwrap();
-        assert_eq!(
-            argv,
-            vec!["show", "abc", "--last", "50", "--max-bytes", "200000", "--json"]
-        );
-    }
-
-    #[test]
-    fn an_explicit_selector_suppresses_the_defaults() {
-        for sel in [
-            json!({"id": "abc", "first": 10}),
-            json!({"id": "abc", "range": "10..20"}),
-            json!({"id": "abc", "around": 7, "context": 2}),
-            json!({"id": "abc", "max_bytes": 4096}),
-            json!({"id": "abc", "pre_compaction": 1}),
-        ] {
-            let argv = build_argv(&show(), &sel).unwrap();
-            assert!(!argv.contains(&"--last".to_string()), "{sel} → {argv:?}");
-        }
+        assert_eq!(argv, vec!["show", "abc", "--json"]);
         let argv = build_argv(&show(), &json!({"id": "abc", "last": 3})).unwrap();
         assert_eq!(argv, vec!["show", "abc", "--last", "3", "--json"]);
-    }
-
-    #[test]
-    fn a_kind_view_gets_no_window_default() {
         let argv = build_argv(&show(), &json!({"id": "abc", "kind": "prompt,answer"})).unwrap();
         assert_eq!(argv, vec!["show", "abc", "--kind", "prompt,answer", "--json"]);
     }
@@ -943,23 +889,19 @@ mod tests {
 
     #[test]
     fn removed_properties_name_the_replacement() {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                for (name, old, replacement) in [
-                    ("pack", "to", "harness"),
-                    ("dataset", "out", "file"),
-                    ("deferrals", "since", "at"),
-                ] {
-                    let commands = CliTools::from_tree(&crate::build_cli()).unwrap();
-                    let command = commands.commands().iter().find(|cmd| cmd.name == name).unwrap();
-                    let error = build_argv(command, &json!({old: "value"})).unwrap_err().to_string();
-                    assert!(error.contains(&format!("use `{replacement}`")), "{error}");
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        on_main_sized_stack(|| {
+            for (name, old, replacement) in [
+                ("pack", "to", "harness"),
+                ("dataset", "out", "file"),
+                ("deferrals", "since", "at"),
+                ("workflow", "follow", "for"),
+            ] {
+                let commands = CliTools::from_tree(&crate::build_cli()).unwrap();
+                let command = commands.commands().iter().find(|cmd| cmd.name == name).unwrap();
+                let error = build_argv(command, &json!({old: "value"})).unwrap_err().to_string();
+                assert!(error.contains(&format!("use `{replacement}`")), "{error}");
+            }
+        });
     }
 
     #[test]

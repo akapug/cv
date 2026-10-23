@@ -4,9 +4,12 @@
 //! (`crate::stream::Demand` plus the sink's projection) chooses which fields are resolved, never which code
 //! runs; a field nobody asked for is skipped by the view, not decoded and dropped.
 
+use super::notification::NotificationSummary;
 use super::*;
 use crate::harness::store::document::Fields;
 use crate::json::JsonView;
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use crate::stream::Tier;
 
 /// Every top-level key any record kind reads. One selection pass per record; a field is
@@ -123,6 +126,7 @@ const SYSTEM_EXTRA: &[&str] = &[
     "direction",
 ];
 
+#[derive(Clone, Copy)]
 pub(crate) enum Demand {
     Message,
     Metadata,
@@ -160,6 +164,7 @@ impl<'a> Head<'a> {
             Demand::Facts => FACT_KEYS,
             Demand::Compact => &["type", "subtype", "compactMetadata"],
             Demand::Tools => &["type", "timestamp", "message"],
+            // The listing keys, then the rest of what [`counts_as_turn`] decides on.
             Demand::Metadata => &[
                 "type",
                 "version",
@@ -167,8 +172,14 @@ impl<'a> Head<'a> {
                 "timestamp",
                 "customTitle",
                 "aiTitle",
-                "isApiErrorMessage",
                 "message",
+                "isApiErrorMessage",
+                "isCompactSummary",
+                "isMeta",
+                "scheduledTaskId",
+                "scheduledFireId",
+                "turnOrigin",
+                "origin",
             ],
         };
         let Some(top) = Fields::parse(view, keys)? else {
@@ -407,6 +418,77 @@ impl Facts {
     }
 }
 
+/// Who wrote a `user` record: the scheduler, the harness (`isMeta`, or an `origin.kind` other
+/// than `human`), or the person.
+fn user_origin(top: &Fields<'_>) -> Result<Origin> {
+    let scheduled = top.get("scheduledTaskId").is_some()
+        || top.get("scheduledFireId").is_some()
+        || top.string("turnOrigin")?.as_deref() == Some("scheduled");
+    let origin_kind = match top.get("origin") {
+        Some(origin) => origin
+            .get("kind")?
+            .filter(|v| v.may_be_string())
+            .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
+            .transpose()?,
+        None => None,
+    };
+    let is_meta = top.get("isMeta").map(|v| v.as_bool()).transpose()?.flatten() == Some(true);
+    Ok(user_origin_from(scheduled, is_meta, origin_kind.as_deref()))
+}
+
+/// Whether a record is a conversational turn ([`Message::is_turn`]), decided from its head
+/// without building the message: what [`Record::conversation`] classifies a typed prompt or a
+/// model reply. A `user` record carrying only tool results is a Tool turn, an injected one
+/// (`isMeta`, a harness origin, an interrupt marker), a compaction summary or a slash command
+/// is not; neither is a record without a `message` or an assistant client-side notice. `top`
+/// selects `message`, `isApiErrorMessage`, `isCompactSummary`, `isMeta`, `scheduledTaskId`,
+/// `scheduledFireId`, `turnOrigin` and `origin`. Reads only the first 64 characters of a user record's leading text, and the `type` of each block.
+pub(crate) fn counts_as_turn(top: &Fields<'_>, ty: &str) -> Result<bool> {
+    let role = match ty {
+        "user" => Role::User,
+        "assistant" => Role::Assistant,
+        _ => return Ok(false),
+    };
+    let Some(message) = top.get("message") else {
+        return Ok(false);
+    };
+    let body = Fields::parse(message, &["model", "content"])?;
+    if role == Role::Assistant {
+        let api_error = top.get("isApiErrorMessage").map(|v| v.as_bool()).transpose()?.flatten() == Some(true);
+        let model = body.as_ref().map_or(Ok(None), |b| b.string("model"))?;
+        return Ok(is_turn(ty, api_error, model.as_deref()));
+    }
+    if top.get("isCompactSummary").map(|v| v.as_bool()).transpose()?.flatten() == Some(true) {
+        return Ok(false);
+    }
+    // Every other harness-written user record is injected context or a sub-agent's return.
+    let origin = user_origin(top)?;
+    if origin == Origin::Harness {
+        return Ok(false);
+    }
+    let mut head = String::new();
+    match body.as_ref().and_then(|b| b.get("content")) {
+        Some(content) if content.is_string()? => {
+            head = string_head(content, 64)?;
+            if head.starts_with("<command-name>") || head.starts_with("<local-command-stdout>") {
+                return Ok(false);
+            }
+        }
+        Some(content) => {
+            if anthropic::only_tool_results(Some(content), |item| anthropic::block_kind(item, &anthropic::ANTHROPIC))? {
+                return Ok(false);
+            }
+            if let Some(first) = content.array()?.and_then(|mut items| items.next()).transpose()? {
+                if let Some(text) = first.get("text")?.filter(|v| v.may_be_string()) {
+                    head = string_head(text, 64)?;
+                }
+            }
+        }
+        None => {}
+    }
+    Ok(user_kind_from_head(origin, &head).0 == MessageKind::Prompt)
+}
+
 /// A conversational turn by type: a user record, or an assistant record that is not one of
 /// Claude Code's client-side notices (`isApiErrorMessage`, or the `<synthetic>` model).
 pub(crate) fn is_turn(ty: &str, api_error: bool, model: Option<&str>) -> bool {
@@ -498,16 +580,14 @@ pub(crate) fn usage_context(usage: JsonView<'_>) -> Result<Option<u64>> {
 }
 
 /// One record: update `session` and hand its message (if any) to `sink`. `at` is the record's
-/// byte offset when the source has one. `sourced` is set when the delivered message holds a
-/// source descriptor, which obliges the reader to recheck the source before going on. Errors
+/// byte offset when the source has one. The shared driver owns source checks; errors here
 /// are source failures, never malformed records.
-pub(super) fn ingest(
+pub(super) fn record(
     session: &mut Session,
     view: JsonView<'_>,
     at: Option<u64>,
     opts: &crate::stream::Demand,
     sink: &mut dyn MessageSink,
-    sourced: &mut bool,
 ) -> Result<Flow> {
     // A record that is not an object carries nothing (Value's lookups all miss).
     let Some(Head { top, ty }) = Head::parse(view, opts.into())? else {
@@ -657,7 +737,7 @@ pub(super) fn ingest(
             return match r.attachment()? {
                 Some(mut m) => {
                     r.stamp(&mut m);
-                    Ok(deliver(m, sink, sourced))
+                    Ok(sink.message(m))
                 }
                 None => r.carry_or_skip(sink),
             };
@@ -693,18 +773,7 @@ pub(super) fn ingest(
     if session.model.is_none() && msg.model.as_deref() != Some(SYNTHETIC_MODEL) {
         session.model = msg.model.clone();
     }
-    Ok(deliver(msg, sink, sourced))
-}
-
-fn deliver(msg: Message, sink: &mut dyn MessageSink, sourced: &mut bool) -> Flow {
-    *sourced |= msg.content.iter().any(|block| match block {
-        Block::Text { text } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
-            matches!(text, Text::Source(_))
-        }
-        Block::ToolUse { input, .. } => matches!(input, Json::Source(_)),
-        _ => false,
-    });
-    sink.message(msg)
+    Ok(sink.message(msg))
 }
 
 /// One record under the read's [`stream::Demand`]. At [`Tier::Facts`] Claude builds only the
@@ -798,7 +867,7 @@ impl<'a> Record<'a, '_> {
         }
         let att_type = attachment
             .get("type")?
-            .filter(|v| v.is_string().unwrap_or(false))
+            .filter(|v| v.may_be_string())
             .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
             .transpose()?
             .unwrap_or_else(|| "attachment".into());
@@ -849,7 +918,7 @@ impl<'a> Record<'a, '_> {
             return Ok(Some(self.carrier()?));
         }
         let subtype = self.top.string("subtype")?.unwrap_or_default();
-        let content = self.top.get("content").filter(|v| v.is_string().unwrap_or(false));
+        let content = self.top.get("content").filter(|v| v.may_be_string());
         // `stop_hook_summary` carries no `content`, but it IS the record of a Stop-hook firing:
         // surface it as a readable line when there's something to show (output or an error).
         if subtype == "stop_hook_summary" {
@@ -945,7 +1014,7 @@ impl<'a> Record<'a, '_> {
                 .filter(|v| v.is_object().unwrap_or(false))
             {
                 let mut fields = Map::new();
-                if let Some(value) = meta.get("trigger")?.filter(|v| v.is_string().unwrap_or(false)) {
+                if let Some(value) = meta.get("trigger")?.filter(|v| v.may_be_string()) {
                     fields.insert("trigger".into(), value.resolve()?.into_owned());
                 }
                 for key in ["preTokens", "durationMs"] {
@@ -1010,18 +1079,7 @@ impl<'a> Record<'a, '_> {
             Some(usage) => Some(parse_usage(usage)?),
             None => None,
         };
-        let scheduled = self.top.get("scheduledTaskId").is_some()
-            || self.top.get("scheduledFireId").is_some()
-            || self.top.string("turnOrigin")?.as_deref() == Some("scheduled");
-        let origin_kind = match self.top.get("origin") {
-            Some(origin) => origin
-                .get("kind")?
-                .filter(|v| v.is_string().unwrap_or(false))
-                .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
-                .transpose()?,
-            None => None,
-        };
-        let user_origin = user_origin_from(scheduled, self.bool("isMeta")? == Some(true), origin_kind.as_deref());
+        let user_origin = user_origin(&self.top)?;
 
         let mut blocks = Vec::new();
         let mut head = None;
@@ -1039,7 +1097,7 @@ impl<'a> Record<'a, '_> {
                 for (index, item) in items.enumerate() {
                     let item = item?;
                     if index == 0 && role == Role::User {
-                        if let Some(text) = item.get("text")?.filter(|v| v.is_string().unwrap_or(false)) {
+                        if let Some(text) = item.get("text")?.filter(|v| v.may_be_string()) {
                             head = Some(classify_head(text, user_origin)?);
                         }
                     }
@@ -1080,7 +1138,7 @@ impl<'a> Record<'a, '_> {
                 sidecar.get("agentId")?.is_some()
                     && sidecar
                         .get("status")?
-                        .filter(|v| v.is_string().unwrap_or(false))
+                        .filter(|v| v.may_be_string())
                         .map(|v| v.resolve().map(|v| v.as_str() == Some("async_launched")))
                         .transpose()?
                         != Some(true)
@@ -1209,8 +1267,8 @@ fn block(item: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
         joined_over,
     )?;
     if let Some(Block::ToolResult { content, details, .. }) = &mut block {
-        let stub = match item.get("content")?.filter(|v| v.is_string().unwrap_or(false)) {
-            Some(raw) if head(raw, PERSISTED.len())? == PERSISTED => {
+        let stub = match item.get("content")?.filter(|v| v.may_be_string()) {
+            Some(raw) if string_head(raw, PERSISTED.len())? == PERSISTED => {
                 persisted_output(raw.resolve()?.as_str().unwrap_or_default())
             }
             Some(_) => None,
@@ -1254,7 +1312,7 @@ fn parse_usage(v: JsonView<'_>) -> Result<Usage> {
 
 /// The first `chars` characters of a string after its leading whitespace, decoded in place:
 /// classification never owns or windows a giant body.
-fn head(view: JsonView<'_>, chars: usize) -> Result<String> {
+fn string_head(view: JsonView<'_>, chars: usize) -> Result<String> {
     let mut head = String::new();
     let mut n = 0;
     view.for_each_char(|c| {
@@ -1271,14 +1329,14 @@ fn head(view: JsonView<'_>, chars: usize) -> Result<String> {
 /// harness `<task-notification>` is a sub-agent's return when its first `<summary>` names an agent
 /// or a workflow; that summary can follow a giant output, so it is found by streaming.
 fn classify_head(text: JsonView<'_>, origin: Origin) -> Result<(String, (MessageKind, Origin))> {
-    let prefix = head(text, 64)?;
+    let prefix = string_head(text, 64)?;
     let kind = if origin == Origin::Harness && prefix.starts_with("<task-notification>") {
         let mut summary = NotificationSummary::default();
         text.for_each_str_chunk(|chunk| {
             summary.push(chunk);
             Ok(())
         })?;
-        if summary.complete && ((summary.agent_possible && summary.agent == 6) || summary.workflow_found) {
+        if summary.is_agent_return() {
             (MessageKind::SubagentReturn, Origin::Subagent)
         } else {
             (MessageKind::InjectedContext, Origin::Harness)
@@ -1287,110 +1345,6 @@ fn classify_head(text: JsonView<'_>, origin: Origin) -> Result<(String, (Message
         user_kind_from_head(origin, &prefix)
     };
     Ok((prefix, kind))
-}
-
-/// tag_inner's first `<summary>` and its first following `</summary>`, across decoder windows,
-/// with bounded state: tag and word suffixes are carried, the summary itself never copied.
-struct NotificationSummary {
-    opened: bool,
-    complete: bool,
-    pending: String,
-    scratch: String,
-    leading: bool,
-    agent_possible: bool,
-    agent: usize,
-    workflow_found: bool,
-    workflow: usize,
-}
-impl Default for NotificationSummary {
-    fn default() -> Self {
-        Self {
-            opened: false,
-            complete: false,
-            pending: String::new(),
-            scratch: String::new(),
-            leading: true,
-            agent_possible: true,
-            agent: 0,
-            workflow_found: false,
-            workflow: 0,
-        }
-    }
-}
-impl NotificationSummary {
-    fn push(&mut self, chunk: &str) {
-        if self.complete {
-            return;
-        }
-        self.scratch.clear();
-        self.scratch.push_str(&self.pending);
-        self.scratch.push_str(chunk);
-        self.pending.clear();
-        let mut body = self.scratch.as_str();
-        if !self.opened {
-            if let Some(at) = body.find("<summary>") {
-                self.opened = true;
-                body = &body[at + 9..];
-            } else {
-                let n = suffix(body.as_bytes(), b"<summary>", false);
-                self.pending.push_str(&body[body.len() - n..]);
-                return;
-            }
-        }
-        if let Some(at) = body.find("</summary>") {
-            body = &body[..at];
-            self.complete = true;
-        } else {
-            let n = suffix(body.as_bytes(), b"</summary>", false);
-            self.pending.push_str(&body[body.len() - n..]);
-            body = &body[..body.len() - n];
-        }
-        if self.leading {
-            body = body.trim_start();
-            self.leading = body.is_empty();
-        }
-        if self.agent_possible && self.agent < 6 {
-            let n = body.len().min(6 - self.agent);
-            if body.as_bytes()[..n] == b"Agent "[self.agent..self.agent + n] {
-                self.agent += n;
-            } else {
-                self.agent_possible = false;
-            }
-        }
-        if !self.workflow_found {
-            const WORD: &[u8] = b"workflow";
-            // Only a proper suffix can bridge windows. Never copy the complete summary.
-            let mut bridge = [0; 14];
-            bridge[..self.workflow].copy_from_slice(&WORD[..self.workflow]);
-            let n = body.len().min(7);
-            bridge[self.workflow..self.workflow + n].copy_from_slice(&body.as_bytes()[..n]);
-            let bridge = &bridge[..self.workflow + n];
-            let contains = |bytes: &[u8]| {
-                memchr::memchr2_iter(b'w', b'W', bytes).any(|at| {
-                    bytes
-                        .get(at..at + 8)
-                        .is_some_and(|word| word.eq_ignore_ascii_case(WORD))
-                })
-            };
-            self.workflow_found = contains(bridge) || contains(body.as_bytes());
-            self.workflow = suffix(if body.len() < 7 { bridge } else { body.as_bytes() }, WORD, true);
-        }
-    }
-}
-
-/// Longest proper suffix matching an ASCII tag/word prefix (therefore a UTF-8 boundary).
-fn suffix(body: &[u8], wanted: &[u8], insensitive: bool) -> usize {
-    (1..wanted.len().min(body.len() + 1))
-        .rev()
-        .find(|&n| {
-            let end = &body[body.len() - n..];
-            if insensitive {
-                end.eq_ignore_ascii_case(&wanted[..n])
-            } else {
-                end == &wanted[..n]
-            }
-        })
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1462,7 +1416,9 @@ mod tests {
                     fs::write(&path, &encoded).unwrap();
                     let source = JsonSource::capture(&path).unwrap();
                     let actual = source
-                        .read_record(0, &encoded, |view| classify_head(view, origin))
+                        .read(ReadInput::Record(0, &encoded, None), Validation::Value, |view| {
+                            classify_head(view, origin)
+                        })
                         .unwrap();
                     assert_eq!(actual.1, expected, "{origin:?}");
                 }
@@ -1495,12 +1451,32 @@ mod tests {
                     summary.push(&body[start..end]);
                     start = end;
                 }
-                assert_eq!(
-                    summary.complete && ((summary.agent_possible && summary.agent == 6) || summary.workflow_found),
-                    expected,
-                    "width {width}"
-                );
+                assert_eq!(summary.is_agent_return(), expected, "width {width}");
             }
         }
+    }
+
+    /// The selection lists skip silently: a non-object line is `Ok(None)` under every demand (the
+    /// non-turn filter), and an object missing every selected key still parses — fields are
+    /// presence-selected, completeness is objecthood.
+    #[test]
+    fn selections_skip_non_objects_and_select_by_presence() -> Result<()> {
+        for demand in [
+            Demand::Message,
+            Demand::Metadata,
+            Demand::Facts,
+            Demand::Compact,
+            Demand::Tools,
+        ] {
+            for line in ["[1,2]", "\"scalar\"", "42", "null"] {
+                let value: serde_json::Value = serde_json::from_str(line)?;
+                let parsed = Head::parse(JsonView::from(&value), demand)?;
+                assert!(parsed.is_none(), "{line} parsed");
+            }
+            let value: serde_json::Value = serde_json::from_str(r#"{"unrelated":true}"#)?;
+            let head = Head::parse(JsonView::from(&value), demand)?;
+            assert!(head.is_some(), "object with none of the keys");
+        }
+        Ok(())
     }
 }

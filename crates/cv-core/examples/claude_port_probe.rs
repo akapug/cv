@@ -12,6 +12,10 @@ static ALLOCATOR: cv_testkit::heap::Allocator = cv_testkit::heap::Allocator;
 mod sqlite_heap;
 fn main() -> Result<()> {
     let mut args: Vec<_> = std::env::args().collect();
+    #[cfg(not(feature = "sqlite"))]
+    if args.iter().any(|a| a == "--sqlite-heap") {
+        anyhow::bail!("--sqlite-heap requires the sqlite feature");
+    }
     #[cfg(feature = "sqlite")]
     let sqlite_accounting = args
         .iter()
@@ -19,10 +23,14 @@ fn main() -> Result<()> {
         .then(sqlite_heap::Accounting::enable)
         .transpose()?;
     args.retain(|a| a != "--sqlite-heap");
-    let source = Harness::parse(&args[1]).context("unknown source harness")?;
+    let positional = |index: usize| -> Result<&String> {
+        args.get(index)
+            .with_context(|| format!("missing positional {index} (usage: <source> <path> <output> <mode> [target])"))
+    };
+    let source = Harness::parse(positional(1)?).context("unknown source harness")?;
     let adapter = cv_core::harness::for_harness(source).context("source adapter")?;
-    let reference = SessionRef::new("synthetic-source", source, &args[2]);
-    let mode = ThinkingMode::parse(&args[4]).context("unknown thinking mode")?;
+    let reference = SessionRef::new("synthetic-source", source, positional(2)?);
+    let mode = ThinkingMode::parse(positional(4)?).context("unknown thinking mode")?;
     let target = match args.get(5) {
         Some(value) => Harness::parse(value).context("unknown target harness")?,
         None => Harness::Claude,
@@ -35,7 +43,7 @@ fn main() -> Result<()> {
     let (result, report) = emit::emit_report(
         &session,
         target,
-        std::path::Path::new(&args[3]),
+        std::path::Path::new(positional(3)?.as_str()),
         &EmitOptions {
             new_id: Some("00000000-0000-0000-0000-000000000001".into()),
             thinking: mode,

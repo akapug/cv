@@ -1,5 +1,7 @@
 //! Exact equality with a bounded in-memory fast path and a portable disk hash table.
 use crate::harness::store::bytes::Spill as Owner;
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 use anyhow::{bail, Context, Result};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -44,9 +46,11 @@ impl ExactStrings {
     }
 
     pub(crate) fn contains(&mut self, text: &str) -> Result<bool> {
-        let hash = self.hash(text);
-        match &mut self.spill {
-            Some(disk) => Ok(disk.find(text.as_bytes(), hash)?.1),
+        match self.spill.as_mut() {
+            Some(disk) => {
+                let hash = Self::hash(&self.hashes, text);
+                Ok(disk.find(text.as_bytes(), hash)?.1)
+            }
             None => Ok(self.memory.contains(text)),
         }
     }
@@ -104,7 +108,7 @@ impl ExactStrings {
         }
         let mut disk = Disk::new(self.memory.len())?;
         for old in &self.memory {
-            disk.insert(old.as_bytes(), self.hash(old))?;
+            disk.insert(old.as_bytes(), Self::hash(&self.hashes, old))?;
         }
         self.spill = Some(disk);
         self.memory = HashSet::new();
@@ -125,9 +129,11 @@ impl ExactStrings {
         if self.spill.is_none() && estimated > self.limit {
             self.spill_memory()?;
         }
-        let hash = self.hash(&text);
-        match &mut self.spill {
-            Some(disk) => disk.insert(text.as_bytes(), hash),
+        match self.spill.as_mut() {
+            Some(disk) => {
+                let hash = Self::hash(&self.hashes, &text);
+                disk.insert(text.as_bytes(), hash)
+            }
             None => {
                 let text = text.into_owned();
                 self.bytes += text.capacity();
@@ -160,8 +166,8 @@ impl ExactStrings {
         self.bytes = 0;
     }
 
-    fn hash(&self, text: &str) -> u64 {
-        let mut hasher = self.hashes.build_hasher();
+    fn hash(hashes: &std::collections::hash_map::RandomState, text: &str) -> u64 {
+        let mut hasher = hashes.build_hasher();
         // Fixed write boundaries make even hashers whose write calls are significant
         // produce the same hash for arbitrary decoded source chunk partitions.
         for chunk in text.as_bytes().chunks(COMPARE_BYTES) {
@@ -774,7 +780,7 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"key":body})).unwrap()).unwrap();
             let source = crate::json::JsonSource::capture(&path).unwrap();
             let text = source
-                .read_document(|view| {
+                .read(ReadInput::Document, Validation::Value, |view| {
                     let crate::Json::Source(range) = view.get("key")?.unwrap().to_json()? else {
                         anyhow::bail!("fixture must retain checked source range");
                     };
@@ -821,7 +827,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"key":body})).unwrap()).unwrap();
         let source = crate::json::JsonSource::capture(&path).unwrap();
         let text = source
-            .read_document(|view| view.get("key")?.unwrap().source_text()?.context("key string"))
+            .read(ReadInput::Document, Validation::Value, |view| {
+                view.get("key")?.unwrap().source_text()?.context("key string")
+            })
             .unwrap();
         assert!(matches!(text, crate::Text::Source(_)));
         let resolver = crate::lazy::Resolver::new(Some(path.clone()));
@@ -941,5 +949,32 @@ mod tests {
             page.key = None;
         }
         assert!(disk.find(b"key", 1).is_err());
+    }
+    #[test]
+    fn many_small_strings_spill_and_keep_membership() {
+        let mut texts = ExactStrings::default();
+        for i in 0..40000 {
+            texts.insert(i.to_string()).unwrap();
+        }
+        assert!(texts.is_spilled(), "small strings still consume entry storage");
+        assert!(texts.contains("0").unwrap());
+        assert!(texts.contains("39999").unwrap());
+    }
+    #[test]
+    fn spilled_strings_keep_exact_equality_and_release_on_clear() {
+        let mut texts = ExactStrings::default();
+        texts.insert("first").unwrap();
+        let large = "x".repeat(1024 * 1024 + 1);
+        texts.insert(large.clone()).unwrap();
+        assert!(texts.contains("first").unwrap());
+        assert!(texts.contains(&large).unwrap());
+        assert!(!texts.contains("FIRST").unwrap());
+        assert!(!texts.contains(&(large.clone() + "x")).unwrap());
+        texts.insert("nul\0suffix").unwrap();
+        assert!(texts.contains("nul\0suffix").unwrap());
+        assert!(!texts.contains("nul").unwrap());
+        texts.clear();
+        assert!(!texts.is_spilled());
+        assert!(!texts.contains("first").unwrap());
     }
 }

@@ -3,6 +3,8 @@
 //! persist it verbatim; the claude.ai export, OpenClaw, Goose and Zed's legacy threads renamed a
 //! key or two, which a [`Quirks`] constant names so the adapter does not re-type the shape.
 
+#[cfg(test)]
+use crate::json::{ReadInput, Validation};
 pub(crate) mod write;
 use crate::ir::Block;
 use crate::lazy::Text;
@@ -68,6 +70,60 @@ pub const ZED: Quirks = Quirks {
     empty_signature_is_none: true,
     ..ANTHROPIC
 };
+
+/// What [`block_from_view_with`] makes of `view` under `q`, decided from its `type` (and, for a
+/// text block, whether `text` is a string) without decoding a body: `Some(true)` a tool result,
+/// `Some(false)` any other block, `None` no block. What the "a user turn carrying only tool
+/// results is a Tool turn" rule reads where a listing counts turns without building messages.
+pub(crate) fn block_kind(view: crate::json::JsonView<'_>, q: &Quirks) -> anyhow::Result<Option<bool>> {
+    use super::super::store::document::Fields;
+    let Some(record) = Fields::parse(view, &["type", "text"])? else {
+        return Ok(None);
+    };
+    let Some(ty) = record.string("type")? else {
+        return Ok(None);
+    };
+    Ok(match ty.as_str() {
+        "tool_result" => Some(true),
+        "text" => match record.get("text") {
+            Some(text) if text.is_string()? => {
+                let mut empty = true;
+                if q.skip_empty_text {
+                    text.for_each_char(|_| {
+                        empty = false;
+                        false
+                    })?;
+                }
+                (!(q.skip_empty_text && empty)).then_some(false)
+            }
+            _ => None,
+        },
+        "image" | "document" | "thinking" => Some(false),
+        ty if ty == q.tool_use.0 || Some(ty) == q.redacted_thinking => Some(false),
+        _ => None,
+    })
+}
+
+/// Whether `content` is an array whose blocks are all tool results (and there is one), each
+/// item kinded by `kind` as [`block_kind`] does: the "a user turn carrying only tool results is a
+/// Tool turn" rule, read without building a block.
+pub(crate) fn only_tool_results(
+    content: Option<crate::json::JsonView<'_>>,
+    mut kind: impl FnMut(crate::json::JsonView<'_>) -> anyhow::Result<Option<bool>>,
+) -> anyhow::Result<bool> {
+    let Some(items) = content.map(|c| c.array()).transpose()?.flatten() else {
+        return Ok(false);
+    };
+    let (mut results, mut others) = (0, 0);
+    for item in items {
+        match kind(item?)? {
+            Some(true) => results += 1,
+            Some(false) => others += 1,
+            None => {}
+        }
+    }
+    Ok(results > 0 && others == 0)
+}
 
 /// A content block from a view, with the caller's text rule for content strings, `spans` for tool
 /// arguments, and the size above which a source-backed tool-result array becomes checked joined
@@ -444,7 +500,9 @@ mod selected_media_tests {
         let raw = serde_json::to_vec(&"large text ".repeat(10000))?;
         std::fs::write(&path, &raw)?;
         let text = crate::json::JsonSource::capture(&path)?
-            .read_range_value(0, raw.len() as u64, |view| view.source_text())?
+            .read(ReadInput::Range(0, raw.len() as u64), Validation::Value, |view| {
+                view.source_text()
+            })?
             .unwrap();
         std::fs::write(&path, b"changed source")?;
         for block in [
@@ -485,7 +543,7 @@ mod selected_media_tests {
         std::fs::write(&path, serde_json::to_vec(&value)?)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let block = source
-            .read_range_value(0, source.len(), |view| {
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
                 block_from_view_with(view, &ANTHROPIC, true, &mut |v| v.text(true), 0)
             })?
             .unwrap();
@@ -511,7 +569,7 @@ mod selected_media_tests {
         std::fs::write(&path, serde_json::to_vec(&value)?)?;
         let source = crate::json::JsonSource::capture(&path)?;
         let block = source
-            .read_range_value(0, source.len(), |view| {
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
                 block_from_view_with(view, &ANTHROPIC, true, &mut |v| v.text(true), 0)
             })?
             .unwrap();
@@ -532,7 +590,7 @@ mod selected_media_tests {
             serde_json::to_value(block_from(&value, &ANTHROPIC))?
         );
         let block = source
-            .read_range_value(0, source.len(), |view| {
+            .read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
                 block_from_view_with(view, &ANTHROPIC, true, &mut |v| v.text(true), 0)
             })?
             .unwrap();
@@ -552,7 +610,7 @@ mod selected_media_tests {
                     let value = json!({"type":ty,"mimeType":"image/png","data":data,"name":"attachment","unknown":"x".repeat(200000)});
                     std::fs::write(&path, serde_json::to_vec(&value)?)?;
                     let source = crate::json::JsonSource::capture(&path)?;
-                    let selected = source.read_range_value(0, source.len(), |view| {
+                    let selected = source.read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
                         block_from_view_with(view, &quirks, true, &mut |v| v.text(true), 0)
                     })?;
                     assert_eq!(

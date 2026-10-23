@@ -59,6 +59,14 @@ impl Namespace {
             .filter(|root| {
                 private_directory(root, false)
                     .and_then(|()| check_private_root(root))
+                    .and_then(|()| {
+                        // An existing private namespace can have become unwritable. Test an
+                        // actual create, including ACLs, before selecting it over TMPDIR.
+                        let probe = root.join(format!(".probe-{}", uuid::Uuid::new_v4()));
+                        drop(new_file(&probe)?);
+                        drop(RemoveFile(Some(probe)));
+                        Ok(())
+                    })
                     .is_ok()
             });
         if let Some(root) = beside {
@@ -491,6 +499,28 @@ mod tests {
         let _scope = frozen.enter();
         assert!(Namespace::current().root.starts_with(std::env::temp_dir()));
         assert!(!Namespace::current().root.starts_with(&scratch.0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_existing_catalog_namespace_falls_back_to_temporary() {
+        use std::os::unix::fs::PermissionsExt;
+        let (scratch, _) = fixture();
+        let _env = crate::env::Env::from_vars([
+            ("HOME", scratch.0.join("home")),
+            ("CLUSTERVISION_HOME", scratch.0.join("catalog")),
+        ])
+        .enter();
+        let root = Namespace::current().root;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+        let writable = new_file(&root.join("permission-probe")).is_ok();
+        let selected = Namespace::current().root;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        if !writable {
+            // A privileged test runner may bypass directory permissions.
+            assert!(selected.starts_with(std::env::temp_dir()));
+            assert_ne!(selected, root);
+        }
     }
     fn abandon(owner: Arc<Owner>) {
         let mut owner = Arc::try_unwrap(owner).ok().unwrap();
