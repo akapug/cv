@@ -394,7 +394,9 @@ pub struct Operation {
 
 impl Operation {
     pub fn from_env(source: Option<&'static str>) -> Self {
-        let enabled = crate::env::var(SETTING).map_or(DEFAULT_ENABLED, |value| value == "1");
+        let enabled = crate::env::Env::current()
+            .value_is(SETTING, "1")
+            .unwrap_or(DEFAULT_ENABLED);
         let state = enabled.then(|| Arc::new(State::new()));
         let scope = state
             .as_ref()
@@ -466,8 +468,8 @@ mod tests {
     fn disabled_has_no_state_and_nested_scopes_restore() {
         let _env = crate::env::Env::default().enter();
         let before = CLOCK_READS.with(std::cell::Cell::get);
-        for value in [None, Some("0"), Some("true")] {
-            let env = crate::env::Env::from_vars(value.map(|v| (SETTING, v))).enter();
+        let check = |value: Option<std::ffi::OsString>| {
+            let _env = crate::env::Env::from_vars(value.map(|v| (SETTING, v))).enter();
             let operation = Operation::from_env(None);
             assert!(operation.state.is_none());
             {
@@ -476,9 +478,27 @@ mod tests {
                 assert!(Context::current().0.is_none());
             }
             drop(operation);
-            drop(env);
+        };
+        for value in [None, Some("0"), Some("true"), Some("")] {
+            check(value.map(Into::into));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            check(Some(std::ffi::OsString::from_vec(vec![0xff])));
         }
         assert_eq!(CLOCK_READS.with(std::cell::Cell::get), before);
+    }
+
+    #[test]
+    fn explicit_one_enables_the_operation_and_reads_clocks() {
+        let _env = crate::env::Env::from_vars([(SETTING, "1")]).enter();
+        let before = CLOCK_READS.with(std::cell::Cell::get);
+        let operation = Operation::from_env(None);
+        assert!(operation.state.is_some() && enabled());
+        assert!(CLOCK_READS.with(std::cell::Cell::get) > before);
+        operation.finish(true);
+        assert!(!enabled());
     }
 
     #[test]

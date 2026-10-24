@@ -316,6 +316,41 @@ mod tests {
         }
     }
 
+    /// Run alone: the existing heap probe observes the whole isolated test process.
+    #[cfg(feature = "probe-heap")]
+    #[test]
+    fn disabled_index_stage_work_gate_allocates_nothing() {
+        use cv_core::stage_work::{enabled, Operation, SETTING};
+        let _outer = cv_core::env::Env::default().enter();
+        let check = |value: Option<std::ffi::OsString>| {
+            let _env = cv_core::env::Env::from_vars(value.map(|v| (SETTING, v))).enter();
+            let baseline = cv_testkit::heap::begin();
+            let operation = Operation::from_env(None);
+            let disabled = !enabled();
+            drop(operation);
+            let snapshot = cv_testkit::heap::end(baseline);
+            assert!(disabled);
+            assert_eq!(snapshot.allocation_requests, 0);
+            assert_eq!(snapshot.requested_bytes, 0);
+        };
+        for value in [None, Some("0"), Some("true"), Some("")] {
+            check(value.map(Into::into));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            check(Some(std::ffi::OsString::from_vec(vec![0xff])));
+        }
+        let _env = cv_core::env::Env::from_vars([(SETTING, "1")]).enter();
+        let baseline = cv_testkit::heap::begin();
+        let operation = Operation::from_env(None);
+        let active = enabled();
+        let positive = cv_testkit::heap::end(baseline);
+        operation.finish(true);
+        assert!(active);
+        assert!(positive.allocation_requests > 0 && positive.requested_bytes > 0);
+    }
+
     #[test]
     fn streamed_search_json_is_the_pretty_hits_object_with_its_total() {
         for rows in [

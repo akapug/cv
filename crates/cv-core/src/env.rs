@@ -98,6 +98,11 @@ impl Env {
         self.vars.get(OsStr::new(key)).cloned()
     }
 
+    /// Compare a resolved value without cloning it or converting non-Unicode values.
+    pub(crate) fn value_is(&self, key: &str, value: &str) -> Option<bool> {
+        self.vars.get(OsStr::new(key)).map(|v| v == value)
+    }
+
     /// As `std::env::var`.
     pub fn var(&self, key: &str) -> Result<String, VarError> {
         match self.vars.get(OsStr::new(key)) {
@@ -342,6 +347,23 @@ pub(crate) fn within<R>(env: &Option<Arc<Env>>, f: impl FnOnce() -> R) -> R {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn borrowed_value_comparison_preserves_missing_and_exact_value_semantics() {
+        let env = Env::from_vars([("ON", "1"), ("OFF", "0"), ("INVALID", "true"), ("EMPTY", "")]);
+        assert_eq!(env.value_is("ON", "1"), Some(true));
+        for key in ["OFF", "INVALID", "EMPTY"] {
+            assert_eq!(env.value_is(key, "1"), Some(false));
+        }
+        assert_eq!(env.value_is("MISSING", "1"), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let env = Env::from_vars([("RAW", OsString::from_vec(vec![0xff]))]);
+            assert_eq!(env.value_is("RAW", "1"), Some(false));
+            assert_eq!(env.value_is("RAW", "\u{fffd}"), Some(false));
+        }
+    }
 
     /// The complement of `carry`: a spawned thread that does not carry sees the process
     /// environment, never the enterer's — the per-thread bound parallel test homes rely on.
