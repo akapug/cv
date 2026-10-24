@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Index and live-search planning read resume heads only for selected sessions, avoiding fleet-wide checkpoint I/O on unchanged or writer-busy refreshes.
+
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 
 **Breaking: commands, MCP, HTTP and JSON.** A removed name exits 2 with a pointer to its replacement.
