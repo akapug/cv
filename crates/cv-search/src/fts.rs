@@ -8586,7 +8586,7 @@ mod tests {
         let r2 = sref("s2", "two", p2.clone());
 
         // No index at all → unmeasurable → the caller runs.
-        assert_eq!(pass_needed_over(&dir, &[r1.clone()], false), None);
+        assert_eq!(pass_needed_over(&dir, std::slice::from_ref(&r1), false), None);
 
         index_refs(&dir, &[r1.clone(), r2.clone()], false).unwrap();
         assert_eq!(
@@ -8596,10 +8596,10 @@ mod tests {
         );
 
         // Removal: an indexed id the corpus no longer reports is reap work.
-        assert_eq!(pass_needed_over(&dir, &[r1.clone()], false), Some(true));
+        assert_eq!(pass_needed_over(&dir, std::slice::from_ref(&r1), false), Some(true));
 
         // Arrival: a live session no pass has stamped is work.
-        index_refs(&dir, &[r1.clone()], false).unwrap();
+        index_refs(&dir, std::slice::from_ref(&r1), false).unwrap();
         assert_eq!(pass_needed_over(&dir, &[r1.clone(), r2.clone()], false), Some(true));
 
         // Growth: an appended transcript's signature no longer matches its stamp.
@@ -8658,7 +8658,7 @@ mod tests {
         let sdir = tmpdir();
         let p = write_claude(&sdir, "s1", "alpha corpus seed");
         let r1 = sref("s1", "one", p); // updated_at = 2s
-        index_refs(&dir, &[r1.clone()], false).unwrap();
+        index_refs(&dir, std::slice::from_ref(&r1), false).unwrap();
 
         // An older duplicate at a different path loses preference → not drift.
         let p_old = write_claude(&sdir, "s1dup", "different, older copy");
