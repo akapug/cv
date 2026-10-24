@@ -1,0 +1,2 @@
+# Synthetic SQLite fixture construction in Rust source, not a database export.
+crates/cv-core/src/stage_work.rs helm-bulk=quotes

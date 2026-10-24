@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `CV_INDEX_STAGE_WORK=1 cv index` reports aggregate stage CPU and logical work on stderr, without session identifiers or content; disabled by default.
+
 - Index and live-search planning read resume heads only for selected sessions, avoiding fleet-wide checkpoint I/O on unchanged or writer-busy refreshes.
 
 ## 0.18.0 — 2026-10-23 — the release an agent can trust

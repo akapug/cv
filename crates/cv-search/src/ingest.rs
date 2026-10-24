@@ -154,6 +154,11 @@ impl Writer {
             fault: Fault::default(),
         })
     }
+    pub(super) fn commit(&mut self) -> tantivy::Result<Opstamp> {
+        let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::Commit);
+        (**self).commit()
+    }
+
     pub(super) fn add_admitted(&self, document: AdmittedDocument) -> Result<Opstamp> {
         self.fault.check()?;
         (**self).add_document(document).map_err(Into::into)
@@ -213,6 +218,7 @@ impl Writer {
 /// process could exit mid-GC. Every writer joins that work as it closes.
 impl Drop for Writer {
     fn drop(&mut self) {
+        let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::Writer);
         if let Some(inner) = self.inner.take() {
             let _ = inner.wait_merging_threads();
         }

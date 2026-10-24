@@ -258,7 +258,9 @@ pub(crate) fn open_ro(path: &Path) -> Result<ReadConnection> {
 }
 
 fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>) -> Result<ReadConnection> {
+    use crate::stage_work::{add, enter, Metric, Stage};
     use std::sync::Arc;
+    let _work = enter(Stage::SqliteSnapshot);
     let path = std::path::absolute(path)?;
     let mut reads = crate::source::ReadSet::default();
     reads.record(&path);
@@ -279,8 +281,10 @@ fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>
             .get(&path)
             .filter(|s| s.reads.fresh(&mut crate::source::Probe::default()))
         {
+            add(Metric::SnapshotHits, 1);
             Some(Arc::clone(snapshot))
         } else {
+            add(Metric::SnapshotMisses, 1);
             // A moved store's old backing goes once no reader holds it.
             cache.retained.remove(&path);
             let owner = {
@@ -310,11 +314,11 @@ fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>
             }
             // std::fs::copy uses clonefile on APFS and bounded OS copying elsewhere. Never copy
             // SHM: it contains live coordination state; SQLite rebuilds it only in our directory.
-            std::fs::copy(&path, &snapshot.database)?;
-            for suffix in ["-wal", "-journal"] {
+            add(Metric::DatabaseCopyBytes, std::fs::copy(&path, &snapshot.database)?);
+            for (suffix, metric) in [("-wal", Metric::WalCopyBytes), ("-journal", Metric::JournalCopyBytes)] {
                 let original = sidecar(&path, suffix);
                 if original.exists() {
-                    std::fs::copy(original, sidecar(&snapshot.database, suffix))?;
+                    add(metric, std::fs::copy(original, sidecar(&snapshot.database, suffix))?);
                 }
             }
             copied(&snapshot.database)?;
@@ -334,6 +338,9 @@ fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>
         Connection::open_with_flags(backing, flags)
     }
     .with_context(|| format!("opening {}", path.display()))?;
+    if immutable {
+        add(Metric::ImmutableOpens, 1);
+    }
     check_reads(&reads)?;
     Ok(ReadConnection {
         connection,

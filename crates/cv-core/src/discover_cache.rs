@@ -48,6 +48,7 @@ impl Payload {
     #[cfg(feature = "sqlite")]
     fn parsed(&mut self) -> Option<(&mut Vec<SessionRef>, &crate::source::ReadSet)> {
         if let Self::Encoded { refs, reads } = self {
+            let _work = crate::stage_work::enter(crate::stage_work::Stage::ScanCache);
             *self = serde_json::from_str(refs)
                 .and_then(|refs| serde_json::from_str(reads).map(|reads| Self::Parsed { refs, reads }))
                 .inspect_err(note)
@@ -165,6 +166,9 @@ fn load() -> Cache {
 
 #[cfg(feature = "sqlite")]
 fn load_entry(conn: &rusqlite::Connection, path: &Path, key: (u64, u64)) -> Option<Entry> {
+    use crate::stage_work::{add, enter, Metric, Stage};
+    let _work = enter(Stage::ScanCache);
+    add(Metric::Calls, 1);
     let mut statement = conn.prepare_cached("SELECT refs,source_reads,continuation FROM scan_cache WHERE path=?1 AND mtime_ns=?2 AND size=?3 AND interpretation_version=?4").inspect_err(note_sql).ok()?;
     let (refs, reads, continuation) = statement
         .query_row(
@@ -184,6 +188,11 @@ fn load_entry(conn: &rusqlite::Connection, path: &Path, key: (u64, u64)) -> Opti
         )
         .inspect_err(note_sql)
         .ok()?;
+    add(Metric::Rows, 1);
+    add(
+        Metric::InputBytes,
+        (refs.len() + reads.len() + continuation.as_ref().map_or(0, String::len)) as u64,
+    );
     Some(Entry {
         mtime_ns: key.0,
         size: key.1,
@@ -195,8 +204,14 @@ fn load_entry(conn: &rusqlite::Connection, path: &Path, key: (u64, u64)) -> Opti
 
 #[cfg(feature = "sqlite")]
 fn load_previous(conn: &rusqlite::Connection, path: &Path, size: u64) -> Option<(u64, String)> {
-    conn.prepare_cached("SELECT size,continuation FROM scan_cache WHERE path=?1 AND size<?2 AND interpretation_version=?3 AND continuation IS NOT NULL").inspect_err(note_sql).ok()?
-        .query_row(rusqlite::params![path.to_string_lossy(),size as i64,INTERPRETATION_VERSION], |row| Ok((row.get::<_, i64>(0)? as u64,row.get(1)?))).inspect_err(note_sql).ok()
+    use crate::stage_work::{add, enter, Metric, Stage};
+    let _work = enter(Stage::ScanCache);
+    add(Metric::Calls, 1);
+    let previous: (u64, String) = conn.prepare_cached("SELECT size,continuation FROM scan_cache WHERE path=?1 AND size<?2 AND interpretation_version=?3 AND continuation IS NOT NULL").inspect_err(note_sql).ok()?
+        .query_row(rusqlite::params![path.to_string_lossy(),size as i64,INTERPRETATION_VERSION], |row| Ok((row.get::<_, i64>(0)? as u64,row.get(1)?))).inspect_err(note_sql).ok()?;
+    add(Metric::Rows, 1);
+    add(Metric::InputBytes, previous.1.len() as u64);
+    Some(previous)
 }
 
 #[cfg(feature = "sqlite")]
@@ -362,19 +377,23 @@ where
     reads.record_as(path, version.is_some());
     #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))]
     let Some(key @ (_, size)) = reads.signature(path) else {
+        crate::stage_work::add(crate::stage_work::Metric::ScanMisses, 1);
         return Ok(scan(None)?.0);
     };
     let cache = context.cache();
     clear_invalidated(&cache);
     // Exact hit in this process.
     if let Some(refs) = fresh_candidate(in_process_candidate(&cache, path, &reads)) {
+        crate::stage_work::add(crate::stage_work::Metric::ScanHits, 1);
         return Ok(refs);
     }
     // Exact demand persisted by an earlier run.
     #[cfg(feature = "sqlite")]
     if let Some(refs) = fresh_loaded(&cache, context, path, key, &reads) {
+        crate::stage_work::add(crate::stage_work::Metric::ScanHits, 1);
         return Ok(refs);
     }
+    crate::stage_work::add(crate::stage_work::Metric::ScanMisses, 1);
     // The continuation a re-opened pass may resume from: the in-process entry's, or — for a
     // continuation demand with no process entry — sqlite's, which a newer process row overrides.
     #[allow(unused_mut)] // Persistence may replace the in-process candidate with a demanded row.
@@ -403,6 +422,8 @@ where
         if old_size > size {
             return None;
         }
+        let _work = crate::stage_work::enter(crate::stage_work::Stage::ScanCache);
+        crate::stage_work::add(crate::stage_work::Metric::CheckpointInputBytes, text.len() as u64);
         let prior: ScanContinuation = serde_json::from_str(&text).inspect_err(note).ok()?;
         (prior.dependencies.fresh(&mut crate::source::Probe::default())
             && prior.head.admit(path, version?, &prior.checkpoint).is_some())
@@ -548,6 +569,7 @@ pub(crate) fn persist_in(conn: &mut rusqlite::Connection, prune: bool) {
 
 #[cfg(feature = "sqlite")]
 fn flush(conn: &mut rusqlite::Connection, cache: &Cache, prune: bool) -> rusqlite::Result<()> {
+    let _work = crate::stage_work::enter(crate::stage_work::Stage::ScanCache);
     // Full discovery still checks every persisted path, including deferred or malformed
     // payloads. Pruning therefore keeps its existing completeness semantics.
     let mut prune_paths: std::collections::HashSet<String> = if prune {
@@ -569,6 +591,7 @@ fn flush(conn: &mut rusqlite::Connection, cache: &Cache, prune: bool) -> rusqlit
                 .map(|(path, _)| path.to_string_lossy().into_owned()),
         );
     }
+    crate::stage_work::add(crate::stage_work::Metric::ScanPrunePaths, prune_paths.len() as u64);
     let vanished: Vec<_> = prune_paths.into_iter().filter(|p| !Path::new(p).exists()).collect();
     if vanished.is_empty() && !g.values().any(|entry| entry.dirty) {
         return Ok(());

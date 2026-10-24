@@ -297,6 +297,7 @@ const DEAD_RATIO: f32 = 0.5;
 /// ~1.2 GB that ran ~11 s at ~1 GB resident — and `cv index` exited first, abandoning it, so the
 /// next run started it again. Merging is [`compact`]'s job, sized by bytes, run to completion.
 fn open_writer(index: &Index, heap: usize) -> Result<Writer> {
+    let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::Writer);
     let writer = Writer::new(index, heap)?;
     writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
     Ok(writer)
@@ -313,6 +314,7 @@ fn compaction_candidates_at_floor(
     index: &Index,
     floor: u64,
 ) -> Result<Option<Vec<tantivy::index::SegmentId>>> {
+    let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::CompactionPlan);
     let bytes = |m: &tantivy::index::SegmentMeta| -> u64 {
         m.list_files()
             .iter()
@@ -370,11 +372,31 @@ fn compact_with_candidates(
     writer: &mut Writer,
     mut candidates: impl FnMut(&Path, &Index) -> Result<Option<Vec<tantivy::index::SegmentId>>>,
 ) -> Result<usize> {
+    use cv_core::stage_work::{add, enter, Metric, Stage};
+    let _work = enter(Stage::Compaction);
     let mut merges = 0;
     loop {
         let pick = candidates(dir, index)?;
         let Some(ids) = pick else { break };
-        writer.merge(&ids).wait().context("merging segments")?;
+        if cv_core::stage_work::enabled() {
+            // Extents of the selected inputs, not bytes physically read by the async merge.
+            match index.searchable_segment_metas() {
+                Ok(metas) => {
+                    for meta in metas.iter().filter(|meta| ids.contains(&meta.id())) {
+                        note_merge_extent(dir, meta, Metric::MergeInputExtentBytes);
+                    }
+                }
+                Err(_) => add(Metric::ExtentUnknown, 1),
+            }
+        }
+        add(Metric::MergeAttempts, 1);
+        let merged = writer.merge(&ids).wait().context("merging segments")?;
+        add(Metric::MergeCompleted, 1);
+        if cv_core::stage_work::enabled() {
+            if let Some(meta) = merged {
+                note_merge_extent(dir, &meta, Metric::MergeOutputExtentBytes);
+            }
+        }
         merges += 1;
         // A merge tantivy declined leaves its inputs in place; stop rather than pick them forever.
         let after: HashSet<_> = index
@@ -393,6 +415,21 @@ fn compact_with_candidates(
             .context("collecting merged-away segment files")?;
     }
     Ok(merges)
+}
+
+/// Observe only a selected merge's listed file extents. An unavailable extent is not zero work
+/// and never changes the merge's success/error path. No directory enumeration or file reads.
+fn note_merge_extent(dir: &Path, meta: &tantivy::index::SegmentMeta, metric: cv_core::stage_work::Metric) {
+    for file in meta.list_files() {
+        match std::fs::metadata(dir.join(file)) {
+            Ok(metadata) => cv_core::stage_work::add(metric, metadata.len()),
+            // Tantivy lists optional components even when they do not exist (notably deletes).
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                cv_core::stage_work::add(cv_core::stage_work::Metric::ExtentAbsent, 1);
+            }
+            Err(_) => cv_core::stage_work::add(cv_core::stage_work::Metric::ExtentUnknown, 1),
+        }
+    }
 }
 
 /// Searchable bytes per tantivy document. A session's body is flushed into **multiple** docs (all
@@ -487,6 +524,7 @@ fn sweep_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<(Swept, Vec<c
 /// This early plan is provisional: the full sweep always follows and rechecks index metadata.
 /// Unlike its terminal cheap-skip path, this phase needs no separate meta.json recheck.
 fn sweep_decoded(dir: &Path, rebuild: bool, decoded: cv_core::codex_handoff::Receiver) -> Result<Option<Ran>> {
+    let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::EarlyPlanning);
     let Some(first) = decoded.recv() else {
         return Ok(None);
     };
@@ -499,6 +537,7 @@ fn sweep_decoded(dir: &Path, rebuild: bool, decoded: cv_core::codex_handoff::Rec
     let mut state = PlanState::load(&index, &f, dir, rebuild)?;
     let consumer = state.consumer.clone();
     let mut ran = run_fed(&mut writer, &f, &consumer, available_workers(), move |feed| {
+        let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::EarlyPlanning);
         let top = cv_core::events::Provenance::default();
         let mut ids = HashSet::new();
         let mut next = Some(first);
@@ -564,6 +603,9 @@ pub struct Indexed {
 /// Say what a sweep did. A session that cannot be read is a warning when the index committed
 /// the rest; an unwritable catalog, a pass that read nothing, or any failure under `strict` fail.
 fn report(swept: Swept, rebuild: bool, strict: bool) -> Result<Indexed> {
+    if swept.errors != 0 {
+        cv_core::stage_work::incomplete();
+    }
     if !rebuild {
         eprintln!(
             "  ↳ index: {} changed/new ({} read from where the last pass stopped), {} removed, {} unchanged, {} errors",
@@ -954,6 +996,7 @@ impl SweepPlanner<'_> {
     }
 
     fn plan(&self) -> Result<SweepPlan> {
+        let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::Planning);
         let Self {
             index,
             f,
@@ -1072,6 +1115,7 @@ impl PlanState {
             probe,
             ..
         } = self;
+        cv_core::stage_work::add(cv_core::stage_work::Metric::Candidates, 1);
         let source = probe.snapshot(r);
         let Freshness {
             mtime,
@@ -1191,6 +1235,7 @@ fn run_job(
     let Some(adapter) = cv_core::harness::for_harness(job.r.harness) else {
         return true;
     };
+    cv_core::stage_work::add(cv_core::stage_work::Metric::SelectedJobs, 1);
     // Bytes discovery decoded stay alive for this pass only.
     let out = match job.decoded.take() {
         Some(decoded) => decoded.run(|| job_out(job, f, tx, admission, marks, adapter.as_ref())),
@@ -1844,6 +1889,8 @@ impl<'w> ChunkSink<'w> {
         if self.failed || self.err.is_some() || self.buf.is_empty() {
             return;
         }
+        cv_core::stage_work::add(cv_core::stage_work::Metric::SearchBodyBytes, self.buf.len() as u64);
+        cv_core::stage_work::add(cv_core::stage_work::Metric::SearchDocuments, 1);
         let mut doc = self.doc(KIND_BODY);
         doc.add_text(if self.in_context { self.f.context } else { self.f.body }, &self.buf);
         doc.add_i64(self.f.first_msg, self.buf_first as i64);
@@ -2245,6 +2292,7 @@ type IndexedMetadata = (
 );
 
 fn read_indexed_metadata(index: &Index, f: &Fields, read_metadata: bool) -> Result<IndexedMetadata> {
+    let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::IndexedMetadata);
     use tantivy::collector::DocSetCollector;
     let reader = index.reader().context("opening index reader")?;
     let searcher = reader.searcher();
@@ -2256,6 +2304,7 @@ fn read_indexed_metadata(index: &Index, f: &Fields, read_metadata: bool) -> Resu
         .context("listing meta docs")?;
     for addr in metas {
         let doc: TantivyDocument = searcher.doc(addr).context("reading indexed metadata document")?;
+        cv_core::stage_work::add(cv_core::stage_work::Metric::Rows, 1);
         let id = doc
             .get_first(f.id)
             .and_then(|v| v.as_str())

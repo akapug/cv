@@ -157,6 +157,7 @@ pub(super) struct Ran {
 /// Publish the committed docs' baselines; a row that fails is an error of the pass (its session
 /// is read again next pass) and the rest stick.
 pub(super) fn publish_dependencies(ran: &mut Ran, consumer: &str) {
+    let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::Publication);
     for (r, why) in cv_core::source::update::<InIndex>(consumer, &std::mem::take(&mut ran.dependencies)) {
         let message = format!("search baseline publication failed for {} ({}): {why}", r.id, r.harness);
         eprintln!("cv: {message}");
@@ -239,6 +240,7 @@ pub(super) fn run_fed(
     feed: impl FnOnce(&Feed) -> Result<()> + Send,
 ) -> Result<Ran> {
     use std::sync::{mpsc, Condvar, Mutex};
+    let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::Writer);
     let queue = Mutex::new(Queue::new());
     let wake = Condvar::new();
     let (tx, rx) = mpsc::sync_channel::<Out>(2 * workers);
@@ -262,6 +264,7 @@ pub(super) fn run_fed(
             let admission = &admission;
             scope.spawn(cv_core::env::carry(move || {
                 let marks = cv_core::resume::Reader::default();
+                let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::SelectedParse);
                 sources.run(|| loop {
                     let group = {
                         let mut q = queue.lock().unwrap();
@@ -335,6 +338,7 @@ pub(super) fn run_fed(
                     #[cfg(test)]
                     callbacks,
                 } => {
+                    let _work = cv_core::stage_work::enter(cv_core::stage_work::Stage::Publication);
                     #[cfg(test)]
                     {
                         ran.observed.work.callbacks += callbacks;

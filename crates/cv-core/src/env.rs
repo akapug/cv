@@ -24,6 +24,7 @@ pub struct Env {
     home: Option<PathBuf>,
     cache: Option<PathBuf>,
     frozen: bool,
+    stage_work: crate::stage_work::Context,
     /// What the library keeps alive while this environment is in use: its current catalog's scan
     /// cache. Shared by the copies [`Scope::set`] makes, so a variable change keeps it.
     retained: Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>,
@@ -43,6 +44,7 @@ impl Env {
             home: dirs::home_dir(),
             cache: dirs::cache_dir(),
             frozen: std::env::var_os("CV_FROZEN").is_some_and(|v| v == "1"),
+            stage_work: Default::default(),
             retained: Default::default(),
         }
     }
@@ -201,6 +203,7 @@ pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
 #[must_use = "the environment is left when the scope drops"]
 pub struct Scope {
     prev: Option<Arc<Env>>,
+    _work: crate::stage_work::Entered,
     _thread: PhantomData<*const ()>,
 }
 
@@ -224,9 +227,11 @@ impl std::ops::DerefMut for Isolated {
 
 impl Scope {
     fn enter(env: Arc<Env>) -> Scope {
+        let work = env.stage_work.enter();
         let prev = SCOPED.with(|s| s.borrow_mut().replace(env));
         Scope {
             prev,
+            _work: work,
             _thread: PhantomData,
         }
     }
@@ -256,6 +261,12 @@ impl Drop for Scope {
         let prev = self.prev.take();
         SCOPED.with(|s| *s.borrow_mut() = prev);
     }
+}
+
+pub(crate) fn with_stage_work(context: crate::stage_work::Context) -> Scope {
+    let mut env = (*Env::current()).clone();
+    env.stage_work = context;
+    Env::reenter(Arc::new(env))
 }
 
 /// Whether this command must leave cv’s stores untouched (`--frozen` or `CV_FROZEN=1`).

@@ -276,14 +276,38 @@ impl Stamp {
     }
 
     fn entries(&self) -> Option<Vec<Entry>> {
-        serde_json::from_str(self.entries.get()).ok()
+        use crate::stage_work::Metric;
+        Self::decode_entries(
+            self.entries.get(),
+            [
+                Metric::StampInventoryCalls,
+                Metric::StampInventoryBytes,
+                Metric::StampInventoryEntries,
+            ],
+        )
+    }
+
+    fn decode_entries(text: &str, metrics: [crate::stage_work::Metric; 3]) -> Option<Vec<Entry>> {
+        use crate::stage_work::add;
+        add(metrics[0], 1);
+        add(metrics[1], text.len() as u64);
+        let entries: Vec<Entry> = serde_json::from_str(text).ok()?;
+        add(metrics[2], entries.len() as u64);
+        Some(entries)
     }
 
     /// The recorded reads: `Some(None)` for a before-pass inventory, `None` when malformed.
     fn reads(&self) -> Option<Option<Vec<Entry>>> {
         match &self.reads {
             None => Some(None),
-            Some(reads) => serde_json::from_str(reads.get()).ok().map(Some),
+            Some(reads) => {
+                use crate::stage_work::Metric;
+                Self::decode_entries(
+                    reads.get(),
+                    [Metric::StampReadCalls, Metric::StampReadBytes, Metric::StampReadEntries],
+                )
+                .map(Some)
+            }
         }
     }
 
@@ -352,6 +376,7 @@ pub(crate) use scope::{inventory, inventory_scoped};
 #[must_use]
 pub struct ReadScope {
     _inventory: scope::Context,
+    work: crate::stage_work::Context,
     #[cfg(feature = "sqlite")]
     _sqlite: crate::harness::store::sqlite::ReadScope,
 }
@@ -360,6 +385,7 @@ impl ReadScope {
     /// Run a worker under this operation's inventory owner, restoring its prior thread context
     /// even on panic. The guard remains owned by the caller for the complete operation.
     pub fn run<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let _work = self.work.enter();
         self._inventory.run(operation)
     }
 }
@@ -367,6 +393,7 @@ impl ReadScope {
 pub fn read_scope() -> ReadScope {
     ReadScope {
         _inventory: scope::Context::operation(),
+        work: crate::stage_work::Context::current(),
         #[cfg(feature = "sqlite")]
         _sqlite: crate::harness::store::sqlite::read_scope(),
     }
@@ -1193,6 +1220,14 @@ impl<T: Payload> Table<T> {
     /// Load alongside SQL consumer rows in the caller's read transaction.
     #[cfg(feature = "sqlite")]
     pub(crate) fn load_in(conn: &rusqlite::Connection, consumer: &str) -> Self {
+        use crate::stage_work::{add, enter, Metric, Stage};
+        let _work = enter(match T::TAG {
+            "counts" => Stage::BaselineCounts,
+            "events" => Stage::BaselineEvents,
+            "fts" => Stage::BaselineFts,
+            _ => Stage::BaselineOther,
+        });
+        add(Metric::Calls, 1);
         let load = || -> Option<_> {
             let mut stmt = conn
                 .prepare("SELECT harness,id,path,record FROM source_dependencies WHERE consumer=?1")
@@ -1204,7 +1239,13 @@ impl<T: Payload> Table<T> {
                 .ok()?;
             Some(
                 rows.flatten()
-                    .filter_map(|(key, record)| Some((key, Record::decode(&record)?)))
+                    .filter_map(|(key, record)| {
+                        add(Metric::Rows, 1);
+                        add(Metric::InputBytes, record.len() as u64);
+                        let record = Record::decode(&record)?;
+                        add(Metric::DecodedRows, 1);
+                        Some((key, record))
+                    })
                     .collect(),
             )
         };

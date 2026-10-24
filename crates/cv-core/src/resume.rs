@@ -155,12 +155,16 @@ mod imp {
     impl Reader {
         /// Demand only this session's head, after the caller has selected it for work.
         pub fn head(&self, r: &SessionRef) -> Option<MarkHead> {
+            let _work = crate::stage_work::enter(crate::stage_work::Stage::Resume);
+            crate::stage_work::add(crate::stage_work::Metric::HeadDemands, 1);
             #[cfg(feature = "probe-resume")]
             probe::note(|reads| reads.heads.push(r.clone()));
             self.0.with_connection(|conn| head_in(conn, r)).flatten()
         }
 
         pub fn state(&self, r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
+            let _work = crate::stage_work::enter(crate::stage_work::Stage::Resume);
+            crate::stage_work::add(crate::stage_work::Metric::StateDemands, 1);
             #[cfg(feature = "probe-resume")]
             probe::note(|reads| reads.states.push(r.clone()));
             self.0.with_connection(|conn| state_in(conn, r, head)).flatten()
@@ -187,6 +191,7 @@ mod imp {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .ok()?;
+        crate::stage_work::add(crate::stage_work::Metric::CheckpointInputBytes, text.len() as u64);
         let cp: Checkpoint = serde_json::from_str(&text).ok()?;
         (row_head(offset, hash, version, identity).as_ref() == Some(head) && cp.offset == head.offset()).then_some(cp)
     }
@@ -208,6 +213,7 @@ mod imp {
     /// Bring each session's mark up to date in one transaction: the new mark replaces the old,
     /// `None` drops it (the next pass over that file reads it whole).
     pub fn update(marks: &[MarkUpdate]) {
+        let _work = crate::stage_work::enter(crate::stage_work::Stage::Publication);
         if crate::env::frozen() || marks.is_empty() {
             return;
         }
@@ -228,6 +234,7 @@ mod imp {
                 let _ = match mark {
                     Some((head, cp)) => {
                         let Ok(text) = serde_json::to_string(cp) else { continue };
+                        crate::stage_work::add(crate::stage_work::Metric::CheckpointOutputBytes, text.len() as u64);
                         put.execute(params![
                             h,
                             i,

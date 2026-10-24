@@ -179,11 +179,16 @@ impl Read {
         mut visit: impl FnMut(Line<'_>) -> anyhow::Result<crate::stream::Flow>,
     ) -> anyhow::Result<()> {
         let len = self.len();
+        let bytes = std::cell::Cell::new(0u64);
+        let records = std::cell::Cell::new(0u64);
+        let previous = std::cell::Cell::new(from);
         let visit = |line: Line<'_>| {
             if !snapshot && !line.complete && to < len {
                 return Ok(crate::stream::Flow::Continue);
             }
             let end = line.end;
+            bytes.set(bytes.get().saturating_add(end.saturating_sub(previous.replace(end))));
+            records.set(records.get() + 1);
             let flow = visit(line)?;
             // After the visit's callbacks, before the framer touches its mapping again.
             self.check_backing_at(end)?;
@@ -193,6 +198,10 @@ impl Read {
             Some((backing, len)) => for_each_decoded_line(&self.source, backing, *len, from, visit),
             None => for_each_line(&self.source, &self.file, from, to, visit),
         };
+        // Framed representation presented to the codec, including failed visits, not mapped or
+        // physically read bytes. Decoded compressed sources contribute decoded representation.
+        crate::stage_work::add(crate::stage_work::Metric::JsonlVisitedBytes, bytes.get());
+        crate::stage_work::add(crate::stage_work::Metric::JsonlRecords, records.get());
         self.check()?;
         read
     }

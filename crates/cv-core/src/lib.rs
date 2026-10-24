@@ -57,6 +57,7 @@ pub mod scan;
 pub mod source;
 pub(crate) mod spill;
 pub mod splice;
+pub mod stage_work;
 pub mod stats;
 pub mod stream;
 pub mod task;
@@ -95,6 +96,7 @@ pub fn discover_all_handing_off(handoff: codex_handoff::Handoff) -> Vec<SessionR
 }
 
 fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<SessionRef> {
+    let _work = stage_work::enter(stage_work::Stage::Discovery);
     let _sources = source::read_scope();
     let _cache_scope = catalog.as_ref().map(catalog::Reader::discovery_scope);
     let discovery = discover_cache::read::Context::current();
@@ -140,6 +142,7 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<Sessio
         match a.discover() {
             Ok(found) => (h, roots, Some(found), before),
             Err(e) => {
+                stage_work::incomplete();
                 eprintln!("cv: discover failed for {h}: {e:#}");
                 (h, roots, None, before)
             }
@@ -151,9 +154,12 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<Sessio
     let handoff = codex_handoff::current();
     let run_job = |(a, known): (Box<dyn Adapter>, Vec<SessionRef>)| {
         let discover = || codex_handoff::within(&handoff, || discovery.run(|| run(a.as_ref(), known)));
-        env::within(&env, || match &inventory {
-            Some(context) => context.run(discover),
-            None => discover(),
+        env::within(&env, || {
+            let _work = stage_work::enter(stage_work::Stage::Discovery);
+            match &inventory {
+                Some(context) => context.run(discover),
+                None => discover(),
+            }
         })
     };
 
@@ -165,6 +171,7 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<Sessio
     #[cfg(not(feature = "parallel"))]
     let mut results: Vec<_> = jobs.into_iter().map(run_job).collect();
 
+    let _publication = stage_work::enter(stage_work::Stage::DiscoveryPublish);
     // Persist freshly-scanned metadata (pruning vanished files) so the next discovery reuses it.
     if catalog.is_none() {
         catalog = catalog::Reader::open();
@@ -214,6 +221,9 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<Sessio
 fn note_skipped(skipped: &[(Harness, &[Skipped])]) {
     static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let n: usize = skipped.iter().map(|(_, s)| s.len()).sum();
+    if n > 0 {
+        stage_work::incomplete();
+    }
     if n > 0 && !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!("cv: {n} source(s) could not be read and are missing from the listing; `cv doctor` names them");
     }
@@ -363,7 +373,19 @@ where
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        items.into_par_iter().filter_map(f).collect()
+        let work = stage_work::Context::current();
+        let stage = stage_work::current_stage();
+        items
+            .into_par_iter()
+            .map_init(
+                || {
+                    let context = work.enter();
+                    (stage.map(stage_work::enter), context)
+                },
+                |_, item| f(item),
+            )
+            .filter_map(std::convert::identity)
+            .collect()
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -417,7 +439,19 @@ where
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        items.into_par_iter().flat_map_iter(f).collect()
+        let work = stage_work::Context::current();
+        let stage = stage_work::current_stage();
+        items
+            .into_par_iter()
+            .map_init(
+                || {
+                    let context = work.enter();
+                    (stage.map(stage_work::enter), context)
+                },
+                |_, item| f(item),
+            )
+            .flatten_iter()
+            .collect()
     }
     #[cfg(not(feature = "parallel"))]
     {

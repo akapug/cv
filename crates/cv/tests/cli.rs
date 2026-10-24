@@ -46,6 +46,74 @@ fn pos(hay: &str, needle: &str) -> usize {
         .unwrap_or_else(|| panic!("expected {needle:?} in:\n{hay}"))
 }
 
+#[test]
+fn index_stage_work_is_opt_in_numeric_private_and_keeps_json_stdout() {
+    let w = World::new("index-stage-work");
+    standard_corpus(&w);
+    let summary = |err: &str| -> serde_json::Value {
+        let reports: Vec<_> = err
+            .lines()
+            .filter_map(|line| line.strip_prefix("cv-stage-work "))
+            .collect();
+        assert_eq!(reports.len(), 1, "expected one aggregate report");
+        assert!(!reports[0].contains(&w.base.to_string_lossy().to_string()));
+        assert!(!reports[0].contains("alphases") && !reports[0].contains("beta"));
+        serde_json::from_str(reports[0]).unwrap()
+    };
+    let metric = |report: &serde_json::Value, stage: &str, metric: &str| -> u64 {
+        let row = report["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["stage"] == stage)
+            .unwrap();
+        row["work"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pair| pair[0] == metric)
+            .unwrap()[1]
+            .as_u64()
+            .unwrap()
+    };
+    let (ok, _, _, err) = w.cv_env(&["index", "--json"], &[("CV_INDEX_STAGE_WORK", "1")]);
+    assert!(ok, "{err}");
+    let cold = summary(&err);
+    assert_eq!(cold["returned_success"], true);
+    assert!(metric(&cold, "selected_parse", "selected_jobs") > 0);
+    assert!(metric(&cold, "selected_parse", "jsonl_visited_bytes") > 0);
+    assert!(metric(&cold, "selected_parse", "search_body_bytes") > 0);
+    let (ok, _, ordinary, err) = w.cv_env(&["index", "--json"], &[("CV_INDEX_STAGE_WORK", "0")]);
+    assert!(ok, "{err}");
+    assert!(!err.contains("cv-stage-work "));
+    let invocation = "0123456789abcdef0123456789abcdef";
+    let (ok, _, measured, err) = w.cv_env(
+        &["index", "--json"],
+        &[("CV_INDEX_STAGE_WORK", "1"), ("INVOCATION_ID", invocation)],
+    );
+    assert!(ok, "{err}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&ordinary).unwrap(),
+        serde_json::from_str::<serde_json::Value>(&measured).unwrap()
+    );
+    let warm = summary(&err);
+    assert_eq!(warm["invocation"], invocation);
+    assert!(warm["metadata_input_bytes"].is_null() && warm["physical_read_bytes"].is_null());
+    assert_eq!(metric(&warm, "selected_parse", "selected_jobs"), 0);
+    assert_eq!(metric(&warm, "resume", "head_demands"), 0);
+    assert!(metric(&warm, "indexed_metadata", "rows") > 0);
+    assert!(metric(&warm, "baseline_fts", "input_bytes") > 0);
+    assert!(metric(&warm, "planning", "stamp_read_calls") > 0);
+    let (ok, code, out, err) = w.cv_env(
+        &["index", "--semantic", "--subagents", "--json"],
+        &[("CV_INDEX_STAGE_WORK", "1")],
+    );
+    assert!(!ok && code == 2 && out.is_empty());
+    let failed = summary(&err);
+    assert_eq!(failed["complete"], false);
+    assert_eq!(failed["returned_success"], false);
+}
+
 // ───────────────────────────── ls ─────────────────────────────
 
 #[test]

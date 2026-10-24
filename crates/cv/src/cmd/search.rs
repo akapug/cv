@@ -218,6 +218,20 @@ pub(crate) fn cmd_index(
     strict: bool,
     json: bool,
 ) -> Result<()> {
+    let work = cv_core::stage_work::Operation::from_env(option_env!("CV_BUILD_SHA"));
+    let result = index_command(semantic, rebuild, subagents, if_changed, strict, json);
+    work.finish(result.is_ok());
+    result
+}
+
+fn index_command(
+    semantic: bool,
+    rebuild: bool,
+    subagents: bool,
+    if_changed: bool,
+    strict: bool,
+    json: bool,
+) -> Result<()> {
     if semantic && subagents {
         return crate::util::usage("--semantic indexes top-level sessions; --subagents currently applies only to full-text indexing. Run `cv index --subagents` and `cv index --semantic` separately.");
     }
