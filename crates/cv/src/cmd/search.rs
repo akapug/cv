@@ -210,7 +210,14 @@ fn write_json_rows<T>(
     Ok(())
 }
 
-pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool, if_changed: bool, strict: bool, json: bool) -> Result<()> {
+pub(crate) fn cmd_index(
+    semantic: bool,
+    rebuild: bool,
+    subagents: bool,
+    if_changed: bool,
+    strict: bool,
+    json: bool,
+) -> Result<()> {
     if semantic && subagents {
         return crate::util::usage("--semantic indexes top-level sessions; --subagents currently applies only to full-text indexing. Run `cv index --subagents` and `cv index --semantic` separately.");
     }

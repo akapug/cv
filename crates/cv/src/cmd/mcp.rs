@@ -1398,7 +1398,9 @@ mod projection_tests {
             cursor = quiet["cursor"].as_str().unwrap().to_string();
         }
         assert_eq!(
-            ids.iter().filter(|id| READERS.contains(&format!("claude:{id}"))).count(),
+            ids.iter()
+                .filter(|id| READERS.contains(&format!("claude:{id}")))
+                .count(),
             12,
             "one reader state per observed session (READERS is process-wide: \
              a total count races with other tests' sessions)"
