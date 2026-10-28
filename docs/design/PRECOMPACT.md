@@ -105,10 +105,26 @@ for the sessions other seats started in those 5 minutes (an earlier build that w
 store root measured 0.00 s in the same 5 minutes).
 
 Everything above the plateau is the 2.28 GB transcript of the seat that ran the measurement,
-written to several times a minute: its read never completes (item 6 under "What v19's watching
-would need"), so each retry rereads it whole, 15-35 s of CPU. The retry doubles from 5 s to 10
-minutes, so that one session settles at one whole read per 10 minutes; every other session costs
+written to several times a minute: its read never completed (item 6 under "What v19's watching
+would need"), so each retry reread it whole, 15-35 s of CPU. The retry doubles from 5 s to 10
+minutes, so that one session settled at one whole read per 10 minutes; every other session cost
 a resumed read of its appended lines.
+
+**After the append-only read (item 6).** The same measurement, run again on the hub with both
+builds side by side over the same 10 minutes (each a dry run at nice 19 in its own warmed
+`CLUSTERVISION_HOME` under `/work`; 11 live sessions, the largest the same 2.28 GB transcript,
+which grew 759 KB in the window):
+
+| | before (5512ab3d) | after (ac4250d3) |
+|---|---|---|
+| at rest, nothing followed, 300 s | 0.59 s (0.20%), 48 MiB | 0.63 s (0.21%), 48 MiB |
+| priming: 11 live sessions read whole | 58 s CPU in 59 s | 61 s CPU in 62 s |
+| following 11 live sessions, 600 s | 160.5 s (26.7%), 70-92 MiB | 4.9 s (0.81%), 82-96 MiB |
+| reads refused ("changed during read") and retried | 8 | 0 |
+
+Following now costs the bytes appended: 4.9 s for 10 minutes of 11 sessions against 1.3 s for
+10 minutes at rest. The priming read of the large transcript is still one whole read per start
+of the watch.
 
 Two earlier shapes of the loop, for the record: polling in batches of 2,000 messages never
 finished priming the same fleet in 30 minutes (42% of a core throughout, item 8), and letting a
@@ -255,6 +271,9 @@ Built, because nothing upstream did it:
 - **`Adapter::native_precompaction`** and **`Adapter::compacted_copy`**, so the CLI names no
   harness.
 - `llm::complete`: a chat call with a caller-set timeout and token cap.
+- **An append-only watch read** (`watch::read::pass`, `source::held_from`,
+  `Dependencies::growing`): a pass a writer appended to ends where it began and the appended
+  bytes are the next pass's (item 6 below).
 
 ## Thresholds
 
@@ -290,16 +309,27 @@ These are what this work needed and built for itself; they are input, not demand
    defaults.
 5. **A byte-prefix read for replay** existed (`Start::Prefix`) and made the replay corpus cheap;
    it is worth keeping for every live feature's tests.
-6. **A read of an append-only transcript that grew while it was read.** `watch::read::pass`
-   refuses its whole pass when the primary file is not byte-identical at the end ("session
-   source changed during read"), although the reader stopped at the length it captured and the
-   adapter's prefix is immutable. A pass that takes longer than the gap between two appends
-   never completes: on our hub the active seat's own transcript is 2.28 GB, and a batched
-   `try_poll` re-read it from the start on every wake (18 GB read in 10 minutes, 42% of a core,
-   never primed in 30 minutes). Accepting growth past the captured length for an append-only
-   adapter, checked by the same `MarkHead` sample a resumed read uses, would let the first read
-   complete. Until then `watch` waits a doubling retry on such a session (`RETRY_FIRST`,
-   `RETRY_MAX`).
+6. **A read of an append-only transcript that grew while it was read** (built in this lane,
+   ac4250d3). `watch::read::pass` refused its whole pass when the primary file was not
+   byte-identical at the end ("session source changed during read"), although the reader stops
+   at the length it captured and the adapter's prefix is immutable. A pass that took longer than
+   the gap between two appends never completed: on our hub the active seat's own transcript is
+   2.28 GB, and a batched `try_poll` re-read it from the start on every wake (18 GB read in 10
+   minutes, 42% of a core, never primed in 30 minutes); with the streaming poll and a doubling
+   retry it still cost 26% of a core. The pass now samples an append-only log (`jsonl`,
+   `ndjson`: the rule `JsonSource` already reads by) when it opens it, with the `Prefix` a resume
+   mark uses (the first 4 KiB, the 4 KiB before the captured length, and that length), and at
+   its end admits growth past the captured length (`source::held_from`, `FileId::admits`); the
+   appended bytes are the next pass's, resumed from the pass's end mark. A shrink, another file,
+   or a rewrite of the sampled bytes still refuses it. Side files follow the same rule:
+   `Dependencies::growing` declares a directory a harness only adds write-once files to (Claude
+   Code's `<session>/tool-results/`, written before the record that names it), so a spill that
+   lands during a read, or between two, neither refuses the read nor sends the next one back to
+   byte 0; a removed or changed spill is still a change. Measured above: 26.7% of a core to
+   0.81%, the at-rest figure plus the appended bytes. Two consumers keep the strict check and
+   would gain from the same rule: a retained projection (`try_poll` with `retained`, "watched
+   source changed during retained projection") and the catalog's counts publication, which a
+   spill invalidates.
 7. **Delivered is not accepted, and a position is forgotten.** `try_poll_messages` hands a
    consumer each message as it is read, but a pass that fails at its end (6) is delivered again
    from the last accepted position; and a session that leaves the discovery list (a retry wait,
