@@ -26,6 +26,7 @@ fn test_world(tag: &str) -> cv_testkit::InProcess<cv_core::env::Isolated> {
 use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use cmd::hooks::{HookName, HooksCmd};
+use cmd::precompact::PrecompactCmd;
 use cmd::task::TaskCmd;
 use cmd::{
     archive, blame, browse, cat, config, doctor, events, formats, hooks, live, pack, port, recipes, reshape, schema,
@@ -82,7 +83,16 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ("Export", &["export", "dataset", "pack"]),
     (
         "Fleet & live",
-        &["task", "scry", "watch", "archive", "serve", "mcp", "share"],
+        &[
+            "task",
+            "scry",
+            "watch",
+            "precompact",
+            "archive",
+            "serve",
+            "mcp",
+            "share",
+        ],
     ),
     (
         "System",
@@ -1107,6 +1117,12 @@ enum Cmd {
         #[command(subcommand)]
         action: HooksCmd,
     },
+    /// Write a live session's compaction summary before its harness asks for it, and answer the
+    /// harness's compaction request from it (`watch`, `now`, `answer`, `check`, `swap`, `report`).
+    Precompact {
+        #[command(subcommand)]
+        action: PrecompactCmd,
+    },
     /// One hook's body, run by the harness: reads the hook JSON on stdin, prints a line or two of
     /// hook JSON (or nothing). `cv hooks install <harness>` writes the entries that call these.
     Hook {
@@ -1241,6 +1257,15 @@ fn run() -> Result<()> {
             | Cmd::Hook { .. }
             | Cmd::Watch { .. } => true,
             Cmd::Hooks { action } => !matches!(action, HooksCmd::Show { .. }),
+            Cmd::Precompact { action } => matches!(
+                action,
+                PrecompactCmd::Watch { dry_run: false, .. }
+                    | PrecompactCmd::Now { dry_run: false, .. }
+                    | PrecompactCmd::Swap { dry_run: false, .. }
+                    | PrecompactCmd::Profile {
+                        action: cmd::precompact::ProfileCmd::Import { .. }
+                    }
+            ),
             Cmd::Archive { action, .. } => matches!(action, ArchiveCmd::Sync),
             Cmd::Config { add_export, rm_export } => add_export.is_some() || rm_export.is_some(),
             Cmd::Pack { format, .. } => format == "session",
@@ -1267,6 +1292,9 @@ fn run() -> Result<()> {
         Cmd::Serve { .. }
             | Cmd::Mcp
             | Cmd::Watch { .. }
+            | Cmd::Precompact {
+                action: PrecompactCmd::Watch { .. }
+            }
             | Cmd::Scry { .. }
             | Cmd::Workflow { follow: true, .. }
             | Cmd::Workflow { for_: Some(_), .. }
@@ -1481,6 +1509,7 @@ fn run() -> Result<()> {
         } => formats::cmd_formats(harness, recent, json, legacy),
         Cmd::Recipes => recipes::cmd_recipes(),
         Cmd::Hooks { action } => hooks::cmd_hooks(action),
+        Cmd::Precompact { action } => cmd::precompact::cmd_precompact(action),
         Cmd::Hook { name, harness } => hooks::cmd_hook(name, harness),
         Cmd::Resume { id, harness, launch } => port::cmd_resume(&id, harness, launch),
         Cmd::Workflow {

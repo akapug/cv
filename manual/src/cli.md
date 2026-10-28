@@ -854,6 +854,33 @@ On a terminal it follows until Ctrl-C, announced within a second. On a pipe it p
 sessions once (`   ·` lines; `--existing`: the backlog) and exits 0 unless `--follow` or
 `--for 30s|5m|2h`. A negative `--interval` exits 2. Built on [`cv watch`](serving.md).
 
+### `cv precompact`
+
+A session's compaction summary, written before its harness asks for it, so compaction does not
+stall the session for minutes.
+
+```sh
+cv precompact watch                      # follow live sessions; write and extend summaries
+cv precompact watch --dry-run --for 10m  # say what would be written, write nothing
+cv precompact now da91                   # write one session's summary now
+cv precompact answer < request.json      # summary on stdout, or exit 3 with the reason
+cv precompact check request.json da91    # one request against one session, as JSON
+cv precompact profile import request.json
+cv precompact ls                         # each followed session: fill, auto-compact point, cut
+cv precompact report                     # stalls by method, served and missed, miss reasons
+cv precompact swap da91                  # a new session from the summary, to resume
+```
+
+`watch` starts a session's summary at 70% of its auto-compact point and extends it as the
+session grows or idles; the summary model is `cv-llm`'s (`LMSTUDIO_API_BASE`, with
+`LMSTUDIO_API_KEY` for a server that asks for a key), set in the `precompact` config block or
+with `--model`. `answer` reads a compaction request (the body, or
+`{"body", "headers", "instruction"}`) and serves the summary only when the request's own history
+holds every anchor the summary was cut at; anything after the cut gets one tail pass. A proxy runs
+it on a detected compaction request and falls through on exit 3. On a session whose harness
+precomputes its own compactions it writes nothing. Design and measurements:
+`docs/design/PRECOMPACT.md`.
+
 ### `cv share`
 
 A redacted, self-contained offline HTML file.

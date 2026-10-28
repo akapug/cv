@@ -100,7 +100,7 @@ The two tables below are generated from the clap tree, and a unit test
 | **Read** | `ls` `show` `cat` `search` `events` `touched` `tools` `workflow` `lanes` `deferrals` `stats` `blame` `doctor` |
 | **Reshape** | `prune` `rewind` `distill` `adopt` `splice` `port` `resume` |
 | **Export** | `export` `dataset` `pack` |
-| **Fleet & live** | `task` `scry` `watch` `archive` `serve` `mcp` `share` |
+| **Fleet & live** | `task` `scry` `watch` `archive` `serve` `mcp` `share` `precompact` |
 | **System** | `index` `config` `schema` `formats` `recipes` `hooks` `hook` |
 
 | command | subcommands |
@@ -108,6 +108,7 @@ The two tables below are generated from the clap tree, and a unit test
 | `task` | `open` `list` `show` `claim` `release` `note` `done` `status` `abandon` `supersede` `tag` `block` `decide` `resolve` `events` `sweep` `inbox` |
 | `archive` | `sync` `ls` `path` |
 | `hooks` | `install` `remove` `show` |
+| `precompact` | `watch` `now` `answer` `check` `profile` `profile import` `profile ls` `ls` `report` `swap` |
 <!-- end: cv schema --commands -->
 
 A removed or renamed name (`convert`, `query`, `recall`, `board`, `prune --retrieve`, `--to`, …) is

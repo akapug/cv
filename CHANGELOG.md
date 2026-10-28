@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `cv precompact` writes a live session's compaction summary before its harness asks for it, and answers the harness's compaction request from it (`watch`, `now`, `answer`, `check`, `profile`, `ls`, `report`, `swap`). A summary is served only when the request's own history holds every prose and tool-call anchor it was cut at, in order; anything after the cut gets one tail pass. It stays idle on a session whose harness precomputes its own compactions. Design and measurements: `docs/design/PRECOMPACT.md`.
+- `watch::wake`: an inotify + eventfd wake for resident followers (a timer off Linux).
+- `Adapter::native_precompaction` and `Adapter::compacted_copy` (Claude Code; `None` elsewhere).
+- `LMSTUDIO_API_KEY`: sent as a bearer token to the `LMSTUDIO_API_BASE` server when set, so an OpenAI-compatible proxy that asks for a key can be the model.
+
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 ClusterVision 0.18.0 is the release an agent can trust. Every listing, count and search answer
 is either exact or says what it skipped: counts are prompts and replies on every harness, a

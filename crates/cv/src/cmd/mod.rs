@@ -17,6 +17,7 @@ pub(crate) mod mcp;
 pub(crate) mod mcp_tools;
 pub(crate) mod pack;
 pub(crate) mod port;
+pub(crate) mod precompact;
 pub(crate) mod query;
 pub(crate) mod recipes;
 pub(crate) mod reshape;
