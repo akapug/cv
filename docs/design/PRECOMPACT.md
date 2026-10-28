@@ -25,22 +25,22 @@ the way (see "One method per seat").
 
 ## What we built
 
-`cv precompact` keeps a summary of every live session's current window, written early and kept
-current, and answers the harness's compaction request from it when the request proves to be the
-same conversation. Three parts:
+`cv watch --kind precompact` keeps a summary of every live session's current window, written
+early and kept current, and answers the harness's compaction request from it when the request
+proves to be the same conversation. Three parts:
 
 1. **`cv_core::precompact`** (`cv-core/src/precompact*`): pure and unit-tested. A record
    (`Record`: session, window, cut, anchors, instruction profile, model, text), a window tracker
    (`Window`) fed the IR message stream, the anchor fingerprint and `validate(request, record)`,
    the summary prompts, and a file store under `$CLUSTERVISION_HOME/precompact/`. No harness
    name appears in it; the two harness facts it needs are `Adapter` methods.
-2. **`cv precompact watch`** (`cv/src/cmd/precompact.rs`): one resident process on the existing
+2. **`cv watch --kind precompact`** (`cv/src/cmd/precompact.rs`): one resident process on the existing
    `Watcher`. It reads each live session's appended records, tracks its window and token fill,
    writes the first summary at 70% of the auto-compact point, and extends it as the session
    grows or goes idle. Summaries are written by `cv-llm` (the `LMSTUDIO_API_BASE` provider, so a
    local model or our proxy's OpenAI-compatible endpoint; the model is a setting, and cv-llm's
    egress notice is printed).
-3. **`cv precompact answer`**: the request on stdin, the summary on stdout, exit 3 with the reason
+3. **`cv watch --kind precompact answer`**: the request on stdin, the summary on stdout, exit 3 with the reason
    on stderr on a miss. A proxy (or any other caller) runs it on a detected compaction request
    and falls through to its normal route on a miss, an error or a timeout. Our CLIProxyAPI fork
    does this in one handler (`claude-code.compaction.precompact.command`).
@@ -48,6 +48,18 @@ same conversation. Three parts:
 Also: `now` (write one session's summary now), `check` (one request against one session, a JSON
 verdict, no model call), `profile import|ls`, `ls`, `report` (stall medians by method, served and
 missed counts, miss reasons) and `swap` (the fallback below).
+
+### The CLI follows 0.19's D4
+
+The first build had a top-level `cv precompact` verb (`watch`, `now`, `answer`, …). The 0.19
+design record's D4 says "no `cv precompact` verb; a `cv watch` consumer + `--kind precompact`",
+so the verb is gone and the same engine is `cv watch --kind precompact`: without an action it is
+the follower (`--dry-run`, `--for`, the threshold flags), and the one-shot tools are its actions
+(`cv watch --kind precompact answer`, `now`, `check`, `profile`, `ls`, `report`, `swap`).
+`cv watch` without `--kind` is the archive watch, as before. A proxy configured with the old
+command names `cv watch --kind precompact answer` now. The measurements below ran under the old
+spelling (`cv precompact check`, `cv precompact now`, …); only the name moved. `--kind precompact`
+on `show` and the API (the rest of D4) is not built.
 
 ### Never a stale summary
 
@@ -200,7 +212,7 @@ built:
    compactions")`). The flag is `Adapter::native_precompaction`, so a harness that gains a native
    path later says so in its adapter.
 2. **Native is the reference.** The same `durationMs` metric is reported for both
-   (`cv precompact report` splits stalls into "cv precompact", "native precompute" and "the
+   (`cv watch --kind precompact report` splits stalls into "cv precompact", "native precompute" and "the
    harness's own"), and the fallback below copies the native result's shape (a boundary record,
    then the summary as a user record).
 3. **cv's targets** are harnesses with no native path (Codex CLI, Devin, the other harnesses cv
@@ -208,7 +220,7 @@ built:
 
 ## The fallback: a compacted copy
 
-Where no proxy sits in the request path, `cv precompact swap <id>` writes a new session that
+Where no proxy sits in the request path, `cv watch --kind precompact swap <id>` writes a new session that
 starts at a compaction boundary with the precomputed summary and carries the records after the
 cut, and prints the command to resume it (`Adapter::compacted_copy`; Claude Code only today). It
 replaces the stall with a resume, at the cost of a new session id. Measured on a real 4.8 MB
@@ -258,7 +270,7 @@ Each is a named setting (`precompact` in the config file, or a flag), in COMPLEX
 | `jobs` | 2 | safety cap | summary calls at once; a due session waits its turn and says so |
 | `live_within_secs` | 7,200 | budget | sessions touched this recently at startup are followed; every new session after |
 | `TAIL_TIMEOUT` / `SUMMARY_TIMEOUT` | 120 s / 900 s | safety cap | a model call past it fails; a failed answer is a miss, a failed summary is retried at the next due point |
-| `RETRY_FIRST` / `RETRY_MAX` | 5 s / 600 s | cost-only | a session whose read failed (it changed while being read) is read again after 5 s, doubling to 600 s |
+| `RETRY_FIRST` / `RETRY_MAX` | 5 s / 600 s | cost-only | a session whose read failed (bytes it had read changed under it) is read again after 5 s, doubling to 600 s; growth during a read is not a failure |
 
 ## What v19's watching would need
 
@@ -315,7 +327,7 @@ checkpoints. This lane was built before it landed; where they meet:
 | §4d sidecar `version`, discard on mismatch; transcript never edited; the summarizer's answer recorded | `RECORD_VERSION`, a record of another version is a miss; cv never writes the harness's transcript; the record holds the summary text and model |
 | §4d incremental extension anchored to the parent | `Extend` summarizes from the cut on with the prior summary first |
 | REVIEW-ASTRA §1: a stale accepted swap rejects the key | here a summary is served only when every covered prose segment and tool call id is in the request in order; a tool output the harness shortened since is not checked (the summary is not stale because the harness cut a log) |
-| D4: no `cv precompact` verb; a `cv watch` consumer plus `--kind precompact` on `show` and the API | not followed yet: this lane has a top-level `cv precompact`. Folding `watch` into `cv watch` and `answer` behind the hook/proxy surface is a naming call for the 0.19 plan |
+| D4: no `cv precompact` verb; a `cv watch` consumer plus `--kind precompact` on `show` and the API | followed for the CLI: `cv watch --kind precompact`, its one-shot tools as actions of it (see "The CLI follows 0.19's D4"); `--kind precompact` on `show` and the API is not built |
 
 What this lane adds to §8's measurement plan: M1 for codex seats through the proxy (a baseline of
 2,996 harness-written compactions at a 335 s median, against 2.7-3.2 s on the served path inside

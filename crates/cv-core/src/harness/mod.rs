@@ -593,15 +593,17 @@ pub trait Adapter: Send + Sync {
 
     /// Whether the harness that writes `r` is set to precompute its own compactions (writing the
     /// summary in the background before the window fills), as its own configuration says.
-    /// `None`: the store has no such switch, or it cannot be read. `cv precompact` stays idle for
-    /// a session whose harness precomputes, so the two never both spend on one compaction.
+    /// `None`: the store has no such switch, or it cannot be read. `cv watch --kind precompact`
+    /// stays idle for a session whose harness precomputes, so the two never both spend on one
+    /// compaction.
     fn native_precompaction(&self, _r: &SessionRef) -> Option<bool> {
         None
     }
 
     /// A NEW session, resumable in this harness, that holds `summary` as its compaction of
-    /// everything up to the message `cut_id` and the source's records after it (`cv precompact
-    /// swap`, the fallback without a proxy). The source is untouched. `None`: no such writer.
+    /// everything up to the message `cut_id` and the source's records after it (`cv watch --kind
+    /// precompact swap`, the fallback without a proxy). The source is untouched. `None`: no such
+    /// writer.
     fn compacted_copy(
         &self,
         _r: &SessionRef,

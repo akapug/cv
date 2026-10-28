@@ -1,11 +1,12 @@
-//! `cv precompact`: write a live session's compaction summary before its harness asks for it,
-//! keep it current as the session grows, and answer the harness's compaction request from it.
+//! `cv watch --kind precompact`: write a live session's compaction summary before its harness
+//! asks for it, keep it current as the session grows, and answer the harness's compaction request
+//! from it. A `cv watch` consumer, not a verb of its own (the 0.19 design record, D4).
 //!
 //! The core (record, anchors, validation, profiles, prompts) is `cv_core::precompact`; this module
-//! is the thin driver around it: the resident follower (`watch`), one-shot writes (`now`), the
-//! lookup a proxy calls once per compaction (`answer`), the replay check (`check`), the no-proxy
-//! fallback (`swap`), and the measurements (`report`). Design and measurements:
-//! `docs/design/PRECOMPACT.md`.
+//! is the thin driver around it: the resident follower (`cv watch --kind precompact`), and its
+//! actions: one-shot writes (`now`), the lookup a proxy calls once per compaction (`answer`), the
+//! replay check (`check`), the no-proxy fallback (`swap`), and the measurements (`report`).
+//! Design and measurements: `docs/design/PRECOMPACT.md`.
 
 use crate::util::{fmt_int, parse_harness, short_id, usage, Wait};
 use anyhow::{Context, Result};
@@ -26,35 +27,40 @@ const SUMMARY_TIMEOUT: Duration = Duration::from_secs(900);
 /// How long the answer-time pass may take before the answer falls through to the harness's own
 /// compaction (exit 3): the stall it is meant to shorten.
 const TAIL_TIMEOUT: Duration = Duration::from_secs(120);
-/// The first retry of a session whose read failed (it changed while being read); each further
-/// failure doubles it, up to [`RETRY_MAX`]. Cost-only: a session written to faster than it can
-/// be read whole (a multi-GB transcript of an active seat) costs one whole read per interval.
+/// The first retry of a session whose read failed (bytes it had read changed under it, or it
+/// could not be read); each further failure doubles it, up to [`RETRY_MAX`]. Cost-only. A
+/// session appended to while it is read is not a failure: the read ends where it began, and the
+/// appended bytes are the next read's.
 const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(600);
 /// Exit code for a miss: the caller falls through to the harness's own compaction.
 pub(crate) const MISS_EXIT: i32 = 3;
 
+/// What `cv watch` keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum WatchKind {
+    /// Every session snapshotted as IR under the archive home.
+    Archive,
+    /// A compaction summary of each live session's window, kept current.
+    Precompact,
+}
+
+/// `cv watch --kind precompact`, as parsed: the follower's scope and thresholds, or one action.
+pub(crate) struct Watch {
+    pub harness: Option<String>,
+    pub cwd: Option<String>,
+    pub dry_run: bool,
+    pub for_: Option<String>,
+    pub knobs: Knobs,
+    pub action: Option<PrecompactCmd>,
+}
+
+/// The actions of `cv watch --kind precompact`; without one, it follows live sessions and keeps
+/// each one's summary current: it starts at a fraction of the harness's auto-compact point and
+/// extends by new tokens or when the session goes idle. It wakes on file changes (inotify on
+/// Linux), not a timer, and leaves alone a session whose harness precomputes its own compactions.
 #[derive(Subcommand)]
 pub(crate) enum PrecompactCmd {
-    /// Follow live sessions and keep each one's summary current: start at a fraction of the
-    /// harness's auto-compact point, extend by new tokens or when the session goes idle. Wakes on
-    /// file changes (inotify on Linux), not a timer. Sessions whose harness precomputes its own
-    /// compactions are left alone.
-    Watch {
-        #[arg(long)]
-        harness: Option<String>,
-        /// Only sessions whose cwd contains this substring.
-        #[arg(long)]
-        cwd: Option<String>,
-        /// Decide and log, but call no model and write no record.
-        #[arg(long)]
-        dry_run: bool,
-        /// Follow for this long (30s, 5m, 2h), then exit 0.
-        #[arg(id = "for", long = "for", value_name = "DURATION")]
-        for_: Option<String>,
-        #[command(flatten)]
-        knobs: Knobs,
-    },
     /// Write (or extend) one session's summary now, up to its newest message.
     Now {
         /// Session id, `harness:id`, or a transcript path.
@@ -137,9 +143,23 @@ pub(crate) enum ProfileCmd {
     Ls,
 }
 
+impl PrecompactCmd {
+    /// Whether the action writes a store (refused under `--frozen`).
+    pub(crate) fn writes(&self) -> bool {
+        matches!(
+            self,
+            PrecompactCmd::Now { dry_run: false, .. }
+                | PrecompactCmd::Swap { dry_run: false, .. }
+                | PrecompactCmd::Profile {
+                    action: ProfileCmd::Import { .. }
+                }
+        )
+    }
+}
+
 /// The threshold flags; each overrides `[precompact]` in the config, which overrides the named
 /// defaults in `cv_core::precompact`.
-#[derive(clap::Args, Default)]
+#[derive(clap::Args, Default, PartialEq)]
 pub(crate) struct Knobs {
     /// The harness's auto-compact point in tokens (default: learned from its own records).
     #[arg(long, value_name = "TOKENS")]
@@ -168,6 +188,11 @@ pub(crate) struct Knobs {
 }
 
 impl Knobs {
+    /// Whether any threshold flag was given.
+    pub(crate) fn is_set(&self) -> bool {
+        *self != Knobs::default()
+    }
+
     fn settings(&self) -> Settings {
         let mut s = cv_core::config::load().precompact.unwrap_or_default();
         if self.compact_at.is_some() {
@@ -192,21 +217,31 @@ impl Knobs {
     }
 }
 
-pub(crate) fn cmd_precompact(action: PrecompactCmd) -> Result<()> {
-    match action {
-        PrecompactCmd::Watch {
-            harness,
-            cwd,
-            dry_run,
-            for_,
-            knobs,
-        } => watch(
+pub(crate) fn cmd_watch(args: Watch) -> Result<()> {
+    let Watch {
+        harness,
+        cwd,
+        dry_run,
+        for_,
+        knobs,
+        action,
+    } = args;
+    let Some(action) = action else {
+        return watch(
             parse_harness(&harness)?,
             cwd,
             dry_run,
             for_.as_deref(),
             knobs.settings(),
-        ),
+        );
+    };
+    if harness.is_some() || cwd.is_some() || dry_run || for_.is_some() || knobs.is_set() {
+        return usage(
+            "`--harness`, `--cwd`, `--dry-run`, `--for` and the threshold flags before an action belong to \
+             the follower; give an action its own flags after its name",
+        );
+    }
+    match action {
         PrecompactCmd::Now {
             id,
             harness,
@@ -385,7 +420,7 @@ impl Live {
                     }),
                 );
                 eprintln!(
-                    "cv precompact: {} compacted ({}, {} ms{}{})",
+                    "precompact: {} compacted ({}, {} ms{}{})",
                     short_id(&self.r.id),
                     b.trigger.as_deref().unwrap_or("?"),
                     b.duration_ms.map_or("?".into(), fmt_int),
@@ -667,7 +702,7 @@ fn watch(
         move || follow.borrow().clone()
     });
     eprintln!(
-        "cv precompact watch: following {} live session(s) (touched within {}s), watching {} director{}{}",
+        "cv watch --kind precompact: following {} live session(s) (touched within {}s), watching {} director{}{}",
         follow.borrow().len(),
         settings.live_within_secs,
         wake.watched(),
@@ -741,7 +776,7 @@ fn watch(
                     },
                 );
                 for e in errors {
-                    eprintln!("cv precompact: {e}");
+                    eprintln!("precompact: {e}");
                 }
                 // A read stops at the first session that fails; every session read before it was
                 // accepted. The failed one is re-delivered from its accepted position, so what was
@@ -768,7 +803,7 @@ fn watch(
                             .collect();
                         gone.dedup_by(|a, b| a.harness == b.harness && a.id == b.id);
                         if gone.is_empty() {
-                            eprintln!("cv precompact: {why}");
+                            eprintln!("precompact: {why}");
                             break;
                         }
                         // Every path to the session waits, not only the one that failed: the same
@@ -779,11 +814,7 @@ fn watch(
                             let n = retries.entry(key.clone()).or_insert(0);
                             *n += 1;
                             let wait = RETRY_FIRST.saturating_mul(1 << (*n - 1).min(16)).min(RETRY_MAX);
-                            eprintln!(
-                                "cv precompact: {}: {why}; retried in {}s",
-                                short_id(&r.id),
-                                wait.as_secs()
-                            );
+                            eprintln!("precompact: {}: {why}; retried in {}s", short_id(&r.id), wait.as_secs());
                             held.insert(key, (r, Instant::now() + wait, *n));
                         }
                     }
@@ -808,7 +839,7 @@ fn watch(
         if first {
             first = false;
             eprintln!(
-                "cv precompact watch: primed {} session(s) in {:.1}s",
+                "cv watch --kind precompact: primed {} session(s) in {:.1}s",
                 lives.len(),
                 started.elapsed().as_secs_f64()
             );
@@ -825,11 +856,11 @@ fn watch(
                     let _ = store::event(&root, written_event(&record, secs, prompt_bytes, span_turns));
                     if same_window {
                         if let Err(e) = store::save_record(&root, &record) {
-                            eprintln!("cv precompact: saving {}: {e:#}", short_id(&record.session));
+                            eprintln!("precompact: saving {}: {e:#}", short_id(&record.session));
                             continue;
                         }
                         eprintln!(
-                            "cv precompact: {} summary to msg {} ({} tokens) in {:.1}s",
+                            "precompact: {} summary to msg {} ({} tokens) in {:.1}s",
                             short_id(&record.session),
                             record.cut.index,
                             record.cut.tokens.map_or("?".into(), fmt_int),
@@ -841,7 +872,7 @@ fn watch(
                     }
                 }
                 Err(e) => {
-                    eprintln!("cv precompact: {} summary failed: {e:#}", short_id(&live.r.id));
+                    eprintln!("precompact: {} summary failed: {e:#}", short_id(&live.r.id));
                     let _ = store::event(
                         &root,
                         json!({"event": "failed", "harness": live.r.harness.as_str(), "session": live.r.id, "error": format!("{e:#}")}),
@@ -861,7 +892,7 @@ fn watch(
                 if live.said != "native" {
                     live.said = "native";
                     eprintln!(
-                        "cv precompact: {}'s harness precomputes its own compactions; leaving it alone",
+                        "precompact: {}'s harness precomputes its own compactions; leaving it alone",
                         short_id(&live.r.id)
                     );
                 }
@@ -906,8 +937,8 @@ fn watch(
                 if live.said != "no profile" {
                     live.said = "no profile";
                     eprintln!(
-                        "cv precompact: {} is due but no {} compaction instruction is captured yet: the first compaction \
-                         answered through `cv precompact answer` captures it, or `cv precompact profile import`",
+                        "precompact: {} is due but no {} compaction instruction is captured yet: the first compaction \
+                         answered through `cv watch --kind precompact answer` captures it, or `cv watch --kind precompact profile import`",
                         short_id(&live.r.id),
                         live.r.harness
                     );
@@ -926,7 +957,7 @@ fn watch(
                            "compact_at": compact_at, "span_turns": span_turns, "prompt_bytes": prompt_bytes}),
                 );
                 eprintln!(
-                    "cv precompact: would {} {} to msg {} ({} tokens of {} compact point; {} turns, {} bytes)",
+                    "precompact: would {} {} to msg {} ({} tokens of {} compact point; {} turns, {} bytes)",
                     if extend { "extend" } else { "start" },
                     short_id(&job.session),
                     job.cut.index,
@@ -1028,7 +1059,7 @@ fn watch(
                 .collect();
             for r in &added {
                 dirs.watch_session(&mut wake, r);
-                eprintln!("cv precompact: following new session {}", short_id(&r.id));
+                eprintln!("precompact: following new session {}", short_id(&r.id));
             }
             follow.extend(added);
             // A followed file is known by the follow list; one let go later is looked up again.
@@ -1098,21 +1129,21 @@ fn now(id: &str, harness: Option<Harness>, dry_run: bool, settings: &Settings) -
     let mut live = read_live(&r, adapter.as_ref(), None, settings, &root, |_, _| {})?;
     if live.native() {
         eprintln!(
-            "cv precompact: note: {}'s harness precomputes its own compactions",
+            "precompact: note: {}'s harness precomputes its own compactions",
             short_id(&r.id)
         );
     }
     live.adopt_stored(&root);
     let Some(profile) = store::latest_profile(&root, r.harness.as_str())? else {
         return usage(format!(
-            "no {} compaction instruction is captured yet: `cv precompact profile import <request.json> --harness {}`",
+            "no {} compaction instruction is captured yet: `cv watch --kind precompact profile import <request.json> --harness {}`",
             r.harness, r.harness
         ));
     };
     let extend = live.record.is_some();
     let job = Job::take(&live, profile, extend).context("the session's window is empty")?;
     eprintln!(
-        "cv precompact: {} {} to msg {} ({} tokens): {} turns, {} bytes",
+        "precompact: {} {} to msg {} ({} tokens): {} turns, {} bytes",
         if extend { "extending" } else { "writing" },
         short_id(&r.id),
         job.cut.index,
@@ -1127,7 +1158,7 @@ fn now(id: &str, harness: Option<Harness>, dry_run: bool, settings: &Settings) -
     let (record, secs) = job.run(settings)?;
     store::event(&root, written_event(&record, secs, prompt_bytes, span_turns))?;
     let path = store::save_record(&root, &record)?;
-    eprintln!("cv precompact: wrote {} in {secs:.1}s", path.display());
+    eprintln!("precompact: wrote {} in {secs:.1}s", path.display());
     Ok(())
 }
 
@@ -1239,7 +1270,7 @@ fn miss(root: &Path, harness: Option<&str>, session: Option<&str>, reason: &str,
         json!({"event": "answer", "outcome": "miss", "harness": harness, "session": session,
                "reason": reason, "secs": started.elapsed().as_secs_f64()}),
     );
-    eprintln!("cv precompact answer: miss: {reason}");
+    eprintln!("precompact answer: miss: {reason}");
     std::process::exit(MISS_EXIT);
 }
 
@@ -1266,7 +1297,7 @@ fn answer(harness: Option<String>, no_tail_pass: bool, model: Option<String>) ->
             text: ins.text.clone(),
         };
         if let Ok(true) = store::save_profile(&root, &profile) {
-            eprintln!("cv precompact answer: captured {h} profile {}", profile.id);
+            eprintln!("precompact answer: captured {h} profile {}", profile.id);
         }
     }
     let record = match &harness {
@@ -1343,7 +1374,7 @@ fn answer(harness: Option<String>, no_tail_pass: bool, model: Option<String>) ->
                "text_bytes": text.len(), "secs": started.elapsed().as_secs_f64()}),
     );
     eprintln!(
-        "cv precompact answer: served {} ({} anchors, {} tail message(s){}) in {:.2}s",
+        "precompact answer: served {} ({} anchors, {} tail message(s){}) in {:.2}s",
         short_id(&session.id),
         matched.anchors,
         tail.len(),
@@ -1558,7 +1589,7 @@ fn swap(id: &str, harness: Option<Harness>, dry_run: bool) -> Result<()> {
     };
     let copy = copy?;
     eprintln!(
-        "cv precompact swap: {} -> {} (summary to msg {}, {} record(s) after the cut, {} bytes) in {:.2}s",
+        "precompact swap: {} -> {} (summary to msg {}, {} record(s) after the cut, {} bytes) in {:.2}s",
         short_id(&r.id),
         short_id(&copy.id),
         record.cut.index,

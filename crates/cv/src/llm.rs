@@ -589,7 +589,7 @@ pub(crate) fn generate(session: &cv_core::Session, opts: &GenerateOptions) -> Re
     )
 }
 
-/// A chat completion for `cv precompact`: `turns` as given, from the provider the environment
+/// A chat completion for `cv watch --kind precompact`: `turns` as given, from the provider the environment
 /// names (the egress notice printed as for every call). Returns the text and the model used.
 pub(crate) fn complete(
     model: Option<&str>,

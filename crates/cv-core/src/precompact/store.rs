@@ -5,7 +5,7 @@
 //!   extension (atomic publish, so a reader sees the old record or the new one);
 //! - `profiles/<id>.json`: each harness instruction ever captured ([`Profile`]);
 //! - `events.jsonl`: one line per summary written, request answered or missed, and compaction
-//!   observed: the measurements `cv precompact report` reads.
+//!   observed: the measurements `cv watch --kind precompact report` reads.
 
 use super::{Profile, Record, RECORD_VERSION};
 use anyhow::{Context, Result};

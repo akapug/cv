@@ -854,24 +854,24 @@ On a terminal it follows until Ctrl-C, announced within a second. On a pipe it p
 sessions once (`   ·` lines; `--existing`: the backlog) and exits 0 unless `--follow` or
 `--for 30s|5m|2h`. A negative `--interval` exits 2. Built on [`cv watch`](serving.md).
 
-### `cv precompact`
+### `cv watch --kind precompact`
 
 A session's compaction summary, written before its harness asks for it, so compaction does not
-stall the session for minutes.
+stall the session for minutes. A `cv watch` consumer: without an action it follows live sessions.
 
 ```sh
-cv precompact watch                      # follow live sessions; write and extend summaries
-cv precompact watch --dry-run --for 10m  # say what would be written, write nothing
-cv precompact now da91                   # write one session's summary now
-cv precompact answer < request.json      # summary on stdout, or exit 3 with the reason
-cv precompact check request.json da91    # one request against one session, as JSON
-cv precompact profile import request.json
-cv precompact ls                         # each followed session: fill, auto-compact point, cut
-cv precompact report                     # stalls by method, served and missed, miss reasons
-cv precompact swap da91                  # a new session from the summary, to resume
+cv watch --kind precompact                          # follow live sessions; write and extend summaries
+cv watch --kind precompact --dry-run --for 10m      # say what would be written, write nothing
+cv watch --kind precompact now da91                 # write one session's summary now
+cv watch --kind precompact answer < request.json    # summary on stdout, or exit 3 with the reason
+cv watch --kind precompact check request.json da91  # one request against one session, as JSON
+cv watch --kind precompact profile import request.json --harness claude
+cv watch --kind precompact ls                       # each followed session: fill, auto-compact point, cut
+cv watch --kind precompact report                   # stalls by method, served and missed, miss reasons
+cv watch --kind precompact swap da91                # a new session from the summary, to resume
 ```
 
-`watch` starts a session's summary at 70% of its auto-compact point and extends it as the
+The follower starts a session's summary at 70% of its auto-compact point and extends it as the
 session grows or idles; the summary model is `cv-llm`'s (`LMSTUDIO_API_BASE`, with
 `LMSTUDIO_API_KEY` for a server that asks for a key), set in the `precompact` config block or
 with `--model`. `answer` reads a compaction request (the body, or

@@ -1,7 +1,7 @@
 //! Precompaction replayed on real compactions: each fixture under `fixtures/precompact/` is a
 //! Claude Code session window and the compaction request the harness built from it, redacted
 //! together by `tools/precompact-fixture.py` (equal text stays equal on both sides, so what matched
-//! in the real pair matches in the fixture). `expected.json` holds what `cv precompact check` gave
+//! in the real pair matches in the fixture). `expected.json` holds what `cv watch --kind precompact check` gave
 //! on the real, unredacted pair.
 //!
 //! For each pair: a summary cut at the window's newest message matches the request with the tail

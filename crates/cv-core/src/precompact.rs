@@ -11,7 +11,7 @@
 //! instruction the summary was written to ([`Profile`]), how a window is tracked as messages
 //! stream past ([`window::Window`]), and the prompts for writing and extending a summary
 //! ([`prompt`]). No I/O policy lives here beyond the record store ([`store`]); the resident driver
-//! and the model calls are the CLI's (`cv precompact`).
+//! and the model calls are the CLI's (`cv watch --kind precompact`).
 //!
 //! Safety rule: a summary is served only when every anchor it was cut at appears, in order, in the
 //! request the harness actually sent (see [`validate`]). A stale summary is never served; a miss

@@ -26,7 +26,7 @@ fn test_world(tag: &str) -> cv_testkit::InProcess<cv_core::env::Isolated> {
 use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use cmd::hooks::{HookName, HooksCmd};
-use cmd::precompact::PrecompactCmd;
+use cmd::precompact::{PrecompactCmd, WatchKind};
 use cmd::task::TaskCmd;
 use cmd::{
     archive, blame, browse, cat, config, doctor, events, formats, hooks, live, pack, port, recipes, reshape, schema,
@@ -83,16 +83,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ("Export", &["export", "dataset", "pack"]),
     (
         "Fleet & live",
-        &[
-            "task",
-            "scry",
-            "watch",
-            "precompact",
-            "archive",
-            "serve",
-            "mcp",
-            "share",
-        ],
+        &["task", "scry", "watch", "archive", "serve", "mcp", "share"],
     ),
     (
         "System",
@@ -964,8 +955,15 @@ enum Cmd {
     },
     /// Follow live activity and archive every session as it changes, forever (archives what
     /// already exists on the first poll). `cv scry` is the same feed without the archive.
+    /// `--kind precompact` keeps a summary of each live session's window instead, written before
+    /// its harness compacts, and its actions answer the harness's compaction request from it.
     Watch {
-        /// Poll interval in seconds (0.25 minimum; negative is a usage error).
+        /// What the watch keeps: `archive` (every session as IR), or `precompact` (each live
+        /// session's compaction summary, written from 70% of its auto-compact point, before its
+        /// harness compacts; a session whose harness precomputes its own is left alone).
+        #[arg(long, value_enum, default_value_t = WatchKind::Archive)]
+        kind: WatchKind,
+        /// Poll interval in seconds (0.25 minimum; negative is a usage error). Archive only.
         #[arg(long, default_value_t = 3.0)]
         interval: f64,
         /// Only this harness (e.g. claude, codex, gemini).
@@ -977,6 +975,18 @@ enum Cmd {
         /// Archive home (default: $CLUSTERVISION_HOME or ~/.clustervision).
         #[arg(long, value_name = "DIR")]
         home: Option<PathBuf>,
+        /// Precompact: decide and log, but call no model and write no record.
+        #[arg(long)]
+        dry_run: bool,
+        /// Precompact: follow for this long (30s, 5m, 2h), then exit 0.
+        #[arg(id = "for", long = "for", value_name = "DURATION")]
+        for_: Option<String>,
+        #[command(flatten)]
+        knobs: cmd::precompact::Knobs,
+        /// Precompact: one action instead of following (`now`, `answer`, `check`, `profile`,
+        /// `ls`, `report`, `swap`).
+        #[command(subcommand)]
+        action: Option<PrecompactCmd>,
         // Removed in 0.15.0 with the task verifier — hidden so the old flag errors with a pointer.
         #[arg(long = "verify-interval", hide = true)]
         verify_interval: Option<u64>,
@@ -1117,12 +1127,6 @@ enum Cmd {
         #[command(subcommand)]
         action: HooksCmd,
     },
-    /// Write a live session's compaction summary before its harness asks for it, and answer the
-    /// harness's compaction request from it (`watch`, `now`, `answer`, `check`, `swap`, `report`).
-    Precompact {
-        #[command(subcommand)]
-        action: PrecompactCmd,
-    },
     /// One hook's body, run by the harness: reads the hook JSON on stdin, prints a line or two of
     /// hook JSON (or nothing). `cv hooks install <harness>` writes the entries that call these.
     Hook {
@@ -1254,18 +1258,15 @@ fn run() -> Result<()> {
             | Cmd::Distill { .. }
             | Cmd::Splice { .. }
             | Cmd::Task { .. }
-            | Cmd::Hook { .. }
-            | Cmd::Watch { .. } => true,
+            | Cmd::Hook { .. } => true,
+            Cmd::Watch {
+                kind, dry_run, action, ..
+            } => match (kind, action) {
+                (WatchKind::Archive, _) => true,
+                (WatchKind::Precompact, None) => !dry_run,
+                (WatchKind::Precompact, Some(action)) => action.writes(),
+            },
             Cmd::Hooks { action } => !matches!(action, HooksCmd::Show { .. }),
-            Cmd::Precompact { action } => matches!(
-                action,
-                PrecompactCmd::Watch { dry_run: false, .. }
-                    | PrecompactCmd::Now { dry_run: false, .. }
-                    | PrecompactCmd::Swap { dry_run: false, .. }
-                    | PrecompactCmd::Profile {
-                        action: cmd::precompact::ProfileCmd::Import { .. }
-                    }
-            ),
             Cmd::Archive { action, .. } => matches!(action, ArchiveCmd::Sync),
             Cmd::Config { add_export, rm_export } => add_export.is_some() || rm_export.is_some(),
             Cmd::Pack { format, .. } => format == "session",
@@ -1291,10 +1292,7 @@ fn run() -> Result<()> {
         &cli.cmd,
         Cmd::Serve { .. }
             | Cmd::Mcp
-            | Cmd::Watch { .. }
-            | Cmd::Precompact {
-                action: PrecompactCmd::Watch { .. }
-            }
+            | Cmd::Watch { action: None, .. }
             | Cmd::Scry { .. }
             | Cmd::Workflow { follow: true, .. }
             | Cmd::Workflow { for_: Some(_), .. }
@@ -1509,7 +1507,6 @@ fn run() -> Result<()> {
         } => formats::cmd_formats(harness, recent, json, legacy),
         Cmd::Recipes => recipes::cmd_recipes(),
         Cmd::Hooks { action } => hooks::cmd_hooks(action),
-        Cmd::Precompact { action } => cmd::precompact::cmd_precompact(action),
         Cmd::Hook { name, harness } => hooks::cmd_hook(name, harness),
         Cmd::Resume { id, harness, launch } => port::cmd_resume(&id, harness, launch),
         Cmd::Workflow {
@@ -1601,10 +1598,15 @@ fn run() -> Result<()> {
         Cmd::Task { action } => task::cmd_task(action),
         Cmd::Mcp => cmd::mcp::cmd_mcp(mcp_tree.expect("MCP retained its parsed command tree")),
         Cmd::Watch {
+            kind,
             interval,
             harness,
             cwd,
             home,
+            dry_run,
+            for_,
+            knobs,
+            action,
             verify_interval,
         } => {
             if verify_interval.is_some() {
@@ -1613,7 +1615,29 @@ fn run() -> Result<()> {
                      completion is self-reported and labeled so (`cv task done --observed`)",
                 );
             }
-            archive::cmd_watch(&archive::Archive::resolve(home)?, interval, harness, cwd)
+            match kind {
+                WatchKind::Archive => {
+                    if dry_run || for_.is_some() || knobs.is_set() || action.is_some() {
+                        return usage(
+                            "`--dry-run`, `--for`, the threshold flags and the actions belong to \
+                             `cv watch --kind precompact`",
+                        );
+                    }
+                    archive::cmd_watch(&archive::Archive::resolve(home)?, interval, harness, cwd)
+                }
+                WatchKind::Precompact if home.is_some() => usage(
+                    "`--home` is the archive's: `cv watch --kind precompact` keeps its records under \
+                     $CLUSTERVISION_HOME/precompact",
+                ),
+                WatchKind::Precompact => cmd::precompact::cmd_watch(cmd::precompact::Watch {
+                    harness,
+                    cwd,
+                    dry_run,
+                    for_,
+                    knobs,
+                    action,
+                }),
+            }
         }
         Cmd::Archive { home, action } => {
             let a = archive::Archive::resolve(home)?;
@@ -1908,6 +1932,42 @@ mod tests {
                 "{old} stub must exist"
             );
         }
+    }
+
+    /// Precompact is a `cv watch` consumer (0.19 design record, D4): `--kind precompact` follows,
+    /// its tools are actions of it, plain `cv watch` is the archive, and no `cv precompact` verb.
+    #[test]
+    fn precompact_is_a_watch_consumer() {
+        crate::on_main_sized_stack(|| {
+            let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.cmd);
+            let Ok(Cmd::Watch {
+                kind: WatchKind::Precompact,
+                dry_run: true,
+                for_: Some(_),
+                action: None,
+                ..
+            }) = parse(&["cv", "watch", "--kind", "precompact", "--dry-run", "--for", "5m"])
+            else {
+                panic!("the follower")
+            };
+            let Ok(Cmd::Watch {
+                kind: WatchKind::Precompact,
+                action: Some(PrecompactCmd::Answer { no_tail_pass: true, .. }),
+                ..
+            }) = parse(&["cv", "watch", "--kind", "precompact", "answer", "--no-tail-pass"])
+            else {
+                panic!("an action")
+            };
+            let Ok(Cmd::Watch {
+                kind: WatchKind::Archive,
+                action: None,
+                ..
+            }) = parse(&["cv", "watch"])
+            else {
+                panic!("the archive watch")
+            };
+            assert!(parse(&["cv", "precompact", "watch"]).is_err(), "no precompact verb");
+        });
     }
 
     /// `cv --help` lists the groups and ends with the recipes pointer.

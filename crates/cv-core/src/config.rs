@@ -17,7 +17,7 @@ pub struct Config {
     /// Dirs or `conversations.json` files holding account data exports to discover. Scanned ≤2 deep.
     #[serde(default)]
     pub exports: Vec<PathBuf>,
-    /// `[precompact]`: `cv precompact`'s thresholds; an absent key keeps its named default
+    /// `[precompact]`: `cv watch --kind precompact`'s thresholds; an absent key keeps its named default
     /// ([`crate::precompact::Settings`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precompact: Option<crate::precompact::Settings>,
