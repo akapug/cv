@@ -6,6 +6,8 @@
 
 - Index and live-search planning read resume heads only for selected sessions, avoiding fleet-wide checkpoint I/O on unchanged or writer-busy refreshes.
 
+- `cv search` no longer rereads, whole and on every query, each session it discovers by another path to a file the index holds (an agent's symlinked `$CLAUDE_CONFIG_DIR` or hard-linked `$CODEX_HOME`, beside a `cv index` run without them): unchanged it is fresh, grown it is read from where the index stopped.
+
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 
 **Breaking: commands, MCP, HTTP and JSON.** A removed name exits 2 with a pointer to its replacement.
