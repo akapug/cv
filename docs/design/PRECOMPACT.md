@@ -321,7 +321,8 @@ These are what this work needed and built for itself; they are input, not demand
    mark uses (the first 4 KiB, the 4 KiB before the captured length, and that length), and at
    its end admits growth past the captured length (`source::held_from`, `FileId::admits`); the
    appended bytes are the next pass's, resumed from the pass's end mark. A shrink, another file,
-   or a rewrite of the sampled bytes still refuses it. Side files follow the same rule:
+   a rewrite of the sampled bytes, or any change that left the length as captured (no growth to
+   admit, `FileId::grew_into`) still refuses it. Side files follow the same rule:
    `Dependencies::growing` declares a directory a harness only adds write-once files to (Claude
    Code's `<session>/tool-results/`, written before the record that names it), so a spill that
    lands during a read, or between two, neither refuses the read nor sends the next one back to
