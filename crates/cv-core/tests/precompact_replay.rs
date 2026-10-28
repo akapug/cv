@@ -110,14 +110,16 @@ fn real_compactions_replay_as_they_matched() {
             "{name}: the early cut's tail is no longer"
         );
 
-        // The history under the summary changed: the first assistant text it covers, and the
-        // first tool call (a seat whose model writes no prose between its calls has only those).
+        // The history under the summary changed: the last assistant text it covers, and the last
+        // tool call (a seat whose model writes no prose between its calls has only those). The
+        // request's head can hold calls from before the window, which no anchor covers.
         let mut edits = 0;
         for kind in ["text", "tool_use"] {
             let mut changed = input.clone();
             let messages = changed["body"]["messages"].as_array_mut().unwrap();
-            let Some(target) = messages
+            let Some(target) = messages[..m.tail_from]
                 .iter_mut()
+                .rev()
                 .filter(|m| m["role"] == "assistant")
                 .flat_map(|m| m["content"].as_array_mut().into_iter().flatten())
                 .find(|b| b["type"] == kind && (kind != "text" || b["text"].as_str().is_some_and(|t| t.len() >= 40)))
