@@ -135,10 +135,13 @@ fn context_window(provider: &Provider, model: &str) -> Result<usize> {
             let v = read_json(req.call(), "OpenRouter").with_context(|| ask("GET /api/v1/models"))?;
             openrouter_window(&v, model).with_context(|| ask("context_length"))
         }
-        Provider::LmStudio { base } => {
+        Provider::LmStudio { base, key } => {
             let root = base.strip_suffix("/v1").unwrap_or(base);
-            let v = read_json(agent.get(&format!("{root}/api/v0/models")).call(), "LM Studio")
-                .with_context(|| ask(&format!("GET {root}/api/v0/models")))?;
+            let v = read_json(
+                bearer(agent.get(&format!("{root}/api/v0/models")), key).call(),
+                "LM Studio",
+            )
+            .with_context(|| ask(&format!("GET {root}/api/v0/models")))?;
             lmstudio_window(&v, model).with_context(|| ask("max_context_length"))
         }
     }
@@ -191,6 +194,8 @@ enum Provider {
     /// does not restrict which compatible server can supply the endpoint.
     LmStudio {
         base: String,
+        /// `LMSTUDIO_API_KEY`, sent as a bearer token when set (a proxy that asks for a key).
+        key: Option<String>,
     },
 }
 
@@ -219,7 +224,7 @@ impl Provider {
 fn egress_notice(provider: &Provider, model: &str, approx_bytes: usize) {
     let kb = approx_bytes.div_ceil(1024);
     match provider {
-        Provider::LmStudio { base } => {
+        Provider::LmStudio { base, .. } => {
             eprintln!(
                 "✦ sending ~{kb} KB of transcript to model {model} at {base} (configured OpenAI-compatible server)"
             );
@@ -246,7 +251,10 @@ fn provider_from_env() -> Option<Provider> {
             } else {
                 base.trim_end_matches('/').to_string()
             };
-            return Some(Provider::LmStudio { base });
+            let key = cv_core::env::var("LMSTUDIO_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty());
+            return Some(Provider::LmStudio { base, key });
         }
     }
     if let Ok(key) = cv_core::env::var("OPENROUTER_API_KEY") {
@@ -418,6 +426,14 @@ fn agent(timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(timeout).build()
 }
 
+/// A configured OpenAI-compatible server's key, when it asks for one.
+fn bearer(req: ureq::Request, key: &Option<String>) -> ureq::Request {
+    match key {
+        Some(key) => req.set("Authorization", &format!("Bearer {key}")),
+        None => req,
+    }
+}
+
 /// OpenRouter asks callers to identify themselves; the two headers are harmless elsewhere.
 fn openrouter_headers(req: ureq::Request, key: &str) -> ureq::Request {
     req.set("Authorization", &format!("Bearer {key}"))
@@ -460,8 +476,9 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
             let v = read_json(req.send_json(body), "Anthropic")?;
             extract_anthropic_text(&v)
         }
-        Provider::LmStudio { base } => {
-            // OpenAI-compatible /chat/completions; LM Studio ignores auth, so we send none.
+        Provider::LmStudio { base, key } => {
+            // OpenAI-compatible /chat/completions; LM Studio ignores auth, so none is sent unless
+            // `LMSTUDIO_API_KEY` is set.
             let body = json!({
                 "model": model,
                 "max_tokens": DIGEST_MAX_TOKENS,
@@ -471,7 +488,7 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
                 ],
             });
             let v = read_json(
-                agent.post(&format!("{base}/chat/completions")).send_json(body),
+                bearer(agent.post(&format!("{base}/chat/completions")), key).send_json(body),
                 "LM Studio",
             )
             .with_context(|| format!("POST to LM Studio at {base} (is the local server running?)"))?;
@@ -568,7 +585,23 @@ pub(crate) fn generate(session: &cv_core::Session, opts: &GenerateOptions) -> Re
         opts.system.as_deref(),
         &messages,
         opts.max_tokens.unwrap_or(4096),
+        Duration::from_secs(180),
     )
+}
+
+/// A chat completion for `cv precompact`: `turns` as given, from the provider the environment
+/// names (the egress notice printed as for every call). Returns the text and the model used.
+pub(crate) fn complete(
+    model: Option<&str>,
+    turns: &[cv_core::precompact::prompt::Turn],
+    max_tokens: u32,
+    timeout: Duration,
+) -> Result<(String, String)> {
+    let provider = provider_from_env().ok_or_else(no_provider)?;
+    let model = model.map_or_else(|| provider.default_model().to_string(), str::to_owned);
+    let messages: Vec<ChatMessage> = turns.iter().map(|t| ChatMessage::new(t.role, &t.content)).collect();
+    let text = call_chat(&provider, &model, None, &messages, max_tokens, timeout)?;
+    Ok((text, model))
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -646,13 +679,14 @@ fn call_chat(
     system: Option<&str>,
     messages: &[ChatMessage],
     max_tokens: u32,
+    timeout: Duration,
 ) -> Result<String> {
     let approx: usize = messages.iter().map(|m| m.content.len()).sum();
     egress_notice(provider, model, approx);
-    let agent = agent(Duration::from_secs(180));
+    let agent = agent(timeout);
 
     // OpenAI-compatible providers (OpenRouter, LM Studio) share a body/parse shape.
-    let openai_call = |who: &str, url: String, bearer: Option<&str>| -> Result<String> {
+    let openai_call = |who: &str, url: String, auth: &dyn Fn(ureq::Request) -> ureq::Request| -> Result<String> {
         let mut msgs: Vec<ChatMessage> = Vec::new();
         if let Some(s) = system {
             if !s.is_empty() {
@@ -661,11 +695,7 @@ fn call_chat(
         }
         msgs.extend(messages.iter().cloned());
         let body = json!({ "model": model, "messages": msgs, "max_tokens": max_tokens });
-        let mut req = agent.post(&url);
-        if let Some(b) = bearer {
-            req = openrouter_headers(req, b);
-        }
-        let v = read_json(req.send_json(body), "chat").with_context(|| format!("POST to {url}"))?;
+        let v = read_json(auth(agent.post(&url)).send_json(body), "chat").with_context(|| format!("POST to {url}"))?;
         extract_openai_text(&v, who)
     };
 
@@ -673,9 +703,11 @@ fn call_chat(
         Provider::OpenRouter { key } => openai_call(
             "OpenRouter",
             "https://openrouter.ai/api/v1/chat/completions".into(),
-            Some(key),
+            &|req| openrouter_headers(req, key),
         ),
-        Provider::LmStudio { base } => openai_call("LM Studio", format!("{base}/chat/completions"), None),
+        Provider::LmStudio { base, key } => {
+            openai_call("LM Studio", format!("{base}/chat/completions"), &|req| bearer(req, key))
+        }
         Provider::Anthropic { key } => {
             let (sys, msgs) = normalize_for_anthropic(system, messages)?;
             let mut body = json!({ "model": model, "max_tokens": max_tokens, "messages": msgs });
