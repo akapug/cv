@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `cv search` no longer rereads, whole and on every query, each session it discovers by another path to a file the index holds (an agent's symlinked `$CLAUDE_CONFIG_DIR` or hard-linked `$CODEX_HOME`, beside a `cv index` run without them): unchanged it is fresh, grown it is read from where the index stopped.
+
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 ClusterVision 0.18.0 is the release an agent can trust. Every listing, count and search answer
 is either exact or says what it skipped: counts are prompts and replies on every harness, a
