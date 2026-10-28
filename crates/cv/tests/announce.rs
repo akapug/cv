@@ -160,7 +160,8 @@ fn every_command_on_a_pipe_exits_or_is_a_daemon_that_announced() {
     for cmd in &commands {
         let argv = argv_for(cmd);
         let mut run = Run::spawn(&w, &argv, Stdio::null());
-        if DAEMONS.contains(&argv[0].as_str()) {
+        // The daemon itself, not its one-shot actions (`watch now`, `watch answer`, …).
+        if DAEMONS.contains(&cmd["name"].as_str().unwrap()) {
             let line = run.announced(ANNOUNCE);
             assert!(
                 line.is_some(),
