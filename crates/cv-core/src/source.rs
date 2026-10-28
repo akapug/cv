@@ -197,6 +197,11 @@ struct Entry {
     /// stands ([`Baseline::fresh`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resumes: Option<Prefix>,
+    /// A declared [`Dependencies::growing`] directory: a file added to it since leaves a resume
+    /// mark usable ([`Baseline::dependencies_fresh`]), and the directory's own identity may move
+    /// with it, never its device and inode.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    gains: bool,
 }
 
 impl Entry {
@@ -305,16 +310,7 @@ impl Stamp {
             let (Some(old), Some(now)) = (self.entries(), current.entries()) else {
                 return false;
             };
-            let grown = |old: &Entry, now: &Entry| {
-                old.path == now.path
-                    && (old == now
-                        || old
-                            .resumes
-                            .zip(old.state)
-                            .zip(now.state)
-                            .is_some_and(|((sample, then), now)| then.admits(&sample, &now, &old.path)))
-            };
-            if old.len() != now.len() || !old.iter().zip(&now).all(|(old, now)| grown(old, now)) {
+            if !grown(&old, &now) {
                 return false;
             }
         }
@@ -341,6 +337,33 @@ impl Stamp {
         self.same_entries(current)
             && matches!(self.reads(), Some(Some(reads)) if reads.iter().all(|entry| entry.holds(probe)))
     }
+}
+
+/// Inventory `now` is `old`, or what it grew into: every old entry as it was, a declared
+/// [`Dependencies::resumable`] file grown with its sample holding, or a declared
+/// [`Dependencies::growing`] directory still the same directory; and every entry `old` lacks a
+/// file added to one of those directories. A removed or rewritten entry is a change.
+fn grown(old: &[Entry], now: &[Entry]) -> bool {
+    let mut added: HashMap<&Path, &Entry> = now.iter().map(|entry| (entry.path.as_path(), entry)).collect();
+    let kept = old.iter().all(|old| {
+        added.remove(old.path.as_path()).is_some_and(|now| {
+            old == now
+                || old
+                    .resumes
+                    .zip(old.state)
+                    .zip(now.state)
+                    .is_some_and(|((sample, then), now)| then.admits(&sample, &now, &old.path))
+                || old.gains
+                    && old
+                        .state
+                        .zip(now.state)
+                        .is_some_and(|(then, now)| (then.dev, then.ino) == (now.dev, now.ino))
+        })
+    });
+    kept && added.keys().all(|path| {
+        path.parent()
+            .is_some_and(|dir| old.iter().any(|entry| entry.gains && entry.path == dir))
+    })
 }
 
 mod scope;
@@ -802,6 +825,12 @@ pub struct Dependencies {
     /// (the adapter's resumed read declines when the growth revises its prefix) but never admits a
     /// record as it stands.
     pub resumable: Vec<PathBuf>,
+    /// Directories the harness adds write-once files to while a session is live (Claude Code's
+    /// `tool-results/`): enumerated like `directories`, but a file added since the inventory,
+    /// with the directory's own identity moving for it, keeps a resume mark usable and a read
+    /// that raced it whole. A read's prefix never consulted the new file (what a read consults
+    /// is in its read set); a removed or changed file, or another directory, is a change.
+    pub growing: Vec<PathBuf>,
 }
 
 /// The store file's identity, folded into each of its sessions' certificates: device, inode and
@@ -884,6 +913,7 @@ impl Probe {
             prefix: None,
             grows: None,
             resumes: None,
+            gains: false,
         })
     }
 
@@ -964,9 +994,12 @@ impl Probe {
         declared?;
         let Dependencies {
             files,
-            directories,
+            mut directories,
             resumable,
+            growing,
         } = deps;
+        let gains: Vec<PathBuf> = growing.iter().filter_map(|dir| absolute(dir)).collect();
+        directories.extend(growing);
         let mut entries = BTreeMap::new();
         for dir in directories {
             entries.insert(dir.clone(), self.entry(&dir)?.state);
@@ -1005,6 +1038,7 @@ impl Probe {
                 let path = if path.is_absolute() { path } else { absolute(&path)? };
                 Some(Entry {
                     resumes: samples.remove(&path).flatten(),
+                    gains: gains.contains(&path),
                     path,
                     state,
                     prefix: None,
@@ -1121,6 +1155,20 @@ pub fn unchanged(r: &SessionRef, baseline: &Baseline) -> bool {
 /// Publication guard against the concrete adapter's source path.
 pub fn unchanged_from(r: &SessionRef, primary: &Path, baseline: &Baseline) -> bool {
     unchanged_with(r, primary, baseline, &mut Probe::default())
+}
+
+/// [`unchanged_from`] for a read of an append-only `primary` that stopped at the length its
+/// `baseline` captured: the file may have grown past that length since, its bytes under it still
+/// sampling as `prefix` did ([`FileId::admits`]), and its inventory may have grown as a resumed
+/// read admits ([`Baseline::dependencies_fresh`]); every recorded read holds. What was appended
+/// is the next read's input, from where this one stopped. A shrink, another file, or a rewrite
+/// of the sampled head or of the bytes just before the captured length is a change.
+pub fn held_from(r: &SessionRef, primary: &Path, baseline: &Baseline, prefix: &Prefix) -> bool {
+    let mut probe = Probe::default();
+    let (Some(then), Some(now)) = (baseline.primary, probe.entry(primary).and_then(|entry| entry.state)) else {
+        return false;
+    };
+    then.admits(prefix, &now, primary) && baseline.dependencies_fresh(&probe.snapshot_from(r, primary), &mut probe)
 }
 
 /// [`unchanged_from`] on the publishing transaction's one probe: its rows' shared files are
