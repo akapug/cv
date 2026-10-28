@@ -32,7 +32,8 @@ const DEPENDENCY_ALLOWLIST: &[&str] = &[
     "dirs",
     "fs4",
     // Unix only: renamex_np/renameat2 and their errno values for publishing without hard links
-    // (src/publish.rs). Never reached by replay or wasm.
+    // (src/publish.rs), and inotify/eventfd/poll for a resident follower's wake
+    // (src/watch/wake.rs). Never reached by replay or wasm.
     "libc",
     "memchr",
     "memmap2",

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 mod read;
+pub mod wake;
 pub use read::{read as read_tail, read_session, read_session_into, Held, ReadPass, ReadState};
 
 /// What changed.

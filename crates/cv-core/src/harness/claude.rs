@@ -37,7 +37,7 @@ use chrono::{DateTime, Utc};
 pub(crate) use emit::verify_derived;
 pub use emit::{emit, verify_claude_resumable};
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -52,6 +52,131 @@ pub struct Claude {
 /// This adapter with no roots: it discovers nothing and answers every fact that does not depend on
 /// where the store lives ([`super::rootless`]).
 pub(crate) static ROOTLESS: Claude = Claude { entries: Vec::new() };
+
+/// A new transcript whose window begins with a compaction carrying `summary` (a
+/// `compact_boundary` record and its `isCompactSummary` user record, the pair Claude Code writes
+/// when it compacts), followed by the main-chain records after `cut_id`, restamped to the new
+/// session id. A kept record whose parent is not kept hangs off the summary, so the resumed chain
+/// is exactly summary then tail. Envelope fields (cwd, version, branch) come from the cut record.
+fn compacted_copy(source: &Path, cut_id: &str, summary: &str, pre_tokens: Option<u64>) -> Result<super::CompactedCopy> {
+    use std::io::BufRead;
+    let uuid_of = |l: &str| {
+        serde_json::from_str::<Value>(l)
+            .ok()?
+            .get("uuid")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    // One streaming pass; only the cut record and what follows its last occurrence are held.
+    let file = fs::File::open(source).with_context(|| format!("reading {}", source.display()))?;
+    let needle = format!("\"{cut_id}\"");
+    let mut cut: Option<String> = None;
+    let mut lines: Vec<String> = Vec::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("reading {}", source.display()))?;
+        if line.contains(&needle) && uuid_of(&line).as_deref() == Some(cut_id) {
+            cut = Some(line);
+            lines.clear();
+        } else if cut.is_some() {
+            lines.push(line);
+        }
+    }
+    let template: Value = serde_json::from_str(&cut.context("the cut message is not in the transcript")?)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let boundary_uuid = uuid::Uuid::new_v4().to_string();
+    let summary_uuid = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let envelope = |v: &mut Value| {
+        for k in ["cwd", "version", "gitBranch", "userType", "entrypoint", "slug"] {
+            if let Some(x) = template.get(k) {
+                v[k] = x.clone();
+            }
+        }
+        v["sessionId"] = Value::String(id.clone());
+        v["isSidechain"] = Value::Bool(false);
+        v["timestamp"] = Value::String(now.clone());
+    };
+    let mut boundary = serde_json::json!({
+        "parentUuid": null, "logicalParentUuid": cut_id, "type": "system", "subtype": "compact_boundary",
+        "content": "Conversation compacted", "isMeta": false, "level": "info", "uuid": boundary_uuid,
+        "compactMetadata": {"trigger": "manual", "preTokens": pre_tokens},
+    });
+    envelope(&mut boundary);
+    let mut seed = serde_json::json!({
+        "parentUuid": boundary_uuid, "type": "user", "isCompactSummary": true,
+        "isVisibleInTranscriptOnly": true, "uuid": summary_uuid,
+        "message": {"role": "user", "content": summary},
+    });
+    envelope(&mut seed);
+    let mut out = String::new();
+    for v in [&boundary, &seed] {
+        out.push_str(&serde_json::to_string(v)?);
+        out.push('\n');
+    }
+    let kept: HashSet<String> = lines.iter().filter_map(|l| uuid_of(l)).collect();
+    let mut carried = 0;
+    for line in &lines {
+        let Ok(mut v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let dangling = v
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .is_some_and(|p| !kept.contains(p));
+        let restamped = if dangling {
+            v["parentUuid"] = Value::String(summary_uuid.clone());
+            crate::restamp_line(&serde_json::to_string(&v)?, &id)
+        } else {
+            crate::restamp_line(line, &id)
+        };
+        out.push_str(restamped.as_deref().unwrap_or(line));
+        out.push('\n');
+        carried += 1;
+    }
+    Ok(super::CompactedCopy {
+        path: source.with_file_name(format!("{id}.jsonl")),
+        id,
+        bytes: out.into_bytes(),
+        carried,
+    })
+}
+
+/// Claude Code precomputes compactions (`tengu_sepia_moth`, cached from its feature service in
+/// the profile's `.claude.json` under `cachedGrowthBookFeatures`) unless a setting turns it off.
+/// The profile of a transcript at `<config>/projects/<slug>/<id>.jsonl` is `<config>/.claude.json`,
+/// or `~/.claude.json` for the default `~/.claude`. One read per profile state (path, size,
+/// mtime), however many sessions ask.
+pub fn native_precompaction(transcript: &Path) -> Option<bool> {
+    use std::sync::Mutex;
+    type Seen = HashMap<PathBuf, ((u64, Option<std::time::SystemTime>), Option<bool>)>;
+    static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
+    let config = transcript.parent()?.parent()?.parent()?;
+    let profile = match crate::env::home_dir() {
+        Some(home) if config == home.join(".claude") => home.join(".claude.json"),
+        _ => config.join(".claude.json"),
+    };
+    let md = fs::metadata(&profile).ok()?;
+    let stamp = (md.len(), md.modified().ok());
+    let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let seen = seen.get_or_insert_with(HashMap::new);
+    if let Some((at, value)) = seen.get(&profile) {
+        if *at == stamp {
+            return *value;
+        }
+    }
+    let value = fs::read(&profile)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| {
+            v.pointer("/cachedGrowthBookFeatures/tengu_sepia_moth")
+                .and_then(Value::as_bool)
+        });
+    seen.insert(profile, (stamp, value));
+    value
+}
 
 /// The newest `compact_boundary` record in the last `tail` bytes of a transcript: its
 /// `compactMetadata` `(trigger, preTokens)`. The tail is read through the one line reader from
@@ -348,6 +473,20 @@ impl Adapter for Claude {
 
     fn last_compact_boundary(&self, transcript: &Path, tail: u64) -> Result<Option<(Option<String>, Option<u64>)>> {
         last_compact_boundary(transcript, tail)
+    }
+
+    fn native_precompaction(&self, r: &SessionRef) -> Option<bool> {
+        native_precompaction(&r.path)
+    }
+
+    fn compacted_copy(
+        &self,
+        r: &SessionRef,
+        cut_id: &str,
+        summary: &str,
+        pre_tokens: Option<u64>,
+    ) -> Option<Result<super::CompactedCopy>> {
+        Some(compacted_copy(&r.path, cut_id, summary, pre_tokens))
     }
 
     fn identity(&self) -> Option<super::Identity> {

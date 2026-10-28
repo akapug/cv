@@ -17,6 +17,10 @@ pub struct Config {
     /// Dirs or `conversations.json` files holding account data exports to discover. Scanned ≤2 deep.
     #[serde(default)]
     pub exports: Vec<PathBuf>,
+    /// `[precompact]`: `cv precompact`'s thresholds; an absent key keeps its named default
+    /// ([`crate::precompact::Settings`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precompact: Option<crate::precompact::Settings>,
 }
 
 /// `$XDG_CONFIG_HOME/clustervision` (or `~/.config/clustervision`). `None` only if there's no home.
@@ -121,6 +125,7 @@ mod tests {
         std::os::unix::fs::symlink(&dotfile, &path).unwrap();
         let cfg = Config {
             exports: vec![PathBuf::from("/linked")],
+            ..Config::default()
         };
         save(&cfg).unwrap();
         assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
@@ -132,6 +137,7 @@ mod tests {
     fn round_trips_exports() {
         let cfg = Config {
             exports: vec![PathBuf::from("/a/exports"), PathBuf::from("/b/conversations.json")],
+            ..Config::default()
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();

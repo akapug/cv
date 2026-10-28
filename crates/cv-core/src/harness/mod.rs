@@ -591,6 +591,27 @@ pub trait Adapter: Send + Sync {
         Ok(None)
     }
 
+    /// Whether the harness that writes `r` is set to precompute its own compactions (writing the
+    /// summary in the background before the window fills), as its own configuration says.
+    /// `None`: the store has no such switch, or it cannot be read. `cv precompact` stays idle for
+    /// a session whose harness precomputes, so the two never both spend on one compaction.
+    fn native_precompaction(&self, _r: &SessionRef) -> Option<bool> {
+        None
+    }
+
+    /// A NEW session, resumable in this harness, that holds `summary` as its compaction of
+    /// everything up to the message `cut_id` and the source's records after it (`cv precompact
+    /// swap`, the fallback without a proxy). The source is untouched. `None`: no such writer.
+    fn compacted_copy(
+        &self,
+        _r: &SessionRef,
+        _cut_id: &str,
+        _summary: &str,
+        _pre_tokens: Option<u64>,
+    ) -> Option<Result<CompactedCopy>> {
+        None
+    }
+
     /// The native keys a derived copy of a session (`cv prune`, `cv rewind`, `cv adopt`) rewrites,
     /// for the shared writer in `derive`. Default: none; the harness has no derived copies.
     fn identity(&self) -> Option<Identity> {
@@ -738,6 +759,17 @@ pub(crate) fn ref_forest(
         .collect();
     forest.sort_by_key(|s| std::cmp::Reverse(s.session.created_at));
     select_forest(forest, workflow, select)
+}
+
+/// A session [`Adapter::compacted_copy`] built, not yet written.
+#[derive(Debug, Clone)]
+pub struct CompactedCopy {
+    pub id: String,
+    /// Where it belongs (beside the source).
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+    /// Source records carried after the cut.
+    pub carried: usize,
 }
 
 /// How a session's change shows on disk ([`Adapter::watch_policy`]).

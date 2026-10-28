@@ -1,0 +1,24 @@
+{
+ "codex-seat-1": {
+  "anchors": 106,
+  "tail_from": 139,
+  "tail_messages": 2,
+  "real": {
+   "verdict": "match",
+   "anchors": 107,
+   "tail_from": 139,
+   "tail_messages": 2
+  }
+ },
+ "codex-seat-2": {
+  "anchors": 75,
+  "tail_from": 113,
+  "tail_messages": 4,
+  "real": {
+   "verdict": "match",
+   "anchors": 75,
+   "tail_from": 113,
+   "tail_messages": 3
+  }
+ }
+}
