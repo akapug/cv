@@ -134,6 +134,14 @@ impl FileId {
     pub fn admits(&self, prefix: &Prefix, later: &FileId, path: &Path) -> bool {
         self == later || (later.dev, later.ino) == (self.dev, self.ino) && later.len >= self.len && prefix.holds(path)
     }
+
+    /// [`Self::admits`] for a read that stopped at this captured length: growth past it is
+    /// admitted by content, and a `later` of the same length must be this file unchanged, since
+    /// there is no growth to admit (a rewrite in place outside the samples, or a writer caught
+    /// between its timestamp and its length, which the retry reads).
+    pub fn grew_into(&self, prefix: &Prefix, later: &FileId, path: &Path) -> bool {
+        self == later || later.len > self.len && self.admits(prefix, later, path)
+    }
 }
 
 /// How many bytes a [`Prefix`] samples at the head of the file and again just before its end.
@@ -1161,14 +1169,15 @@ pub fn unchanged_from(r: &SessionRef, primary: &Path, baseline: &Baseline) -> bo
 /// `baseline` captured: the file may have grown past that length since, its bytes under it still
 /// sampling as `prefix` did ([`FileId::admits`]), and its inventory may have grown as a resumed
 /// read admits ([`Baseline::dependencies_fresh`]); every recorded read holds. What was appended
-/// is the next read's input, from where this one stopped. A shrink, another file, or a rewrite
-/// of the sampled head or of the bytes just before the captured length is a change.
+/// is the next read's input, from where this one stopped. A shrink, another file, a rewrite
+/// of the sampled head or of the bytes just before the captured length, or any change that left
+/// the length as captured ([`FileId::grew_into`]) is a change.
 pub fn held_from(r: &SessionRef, primary: &Path, baseline: &Baseline, prefix: &Prefix) -> bool {
     let mut probe = Probe::default();
     let (Some(then), Some(now)) = (baseline.primary, probe.entry(primary).and_then(|entry| entry.state)) else {
         return false;
     };
-    then.admits(prefix, &now, primary) && baseline.dependencies_fresh(&probe.snapshot_from(r, primary), &mut probe)
+    then.grew_into(prefix, &now, primary) && baseline.dependencies_fresh(&probe.snapshot_from(r, primary), &mut probe)
 }
 
 /// [`unchanged_from`] on the publishing transaction's one probe: its rows' shared files are

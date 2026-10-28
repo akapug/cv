@@ -520,7 +520,7 @@ pub(super) fn pass(
             (Some(prefix), false) => source
                 .primary
                 .zip(now())
-                .is_some_and(|(then, now)| then.admits(prefix, &now, &primary)),
+                .is_some_and(|(then, now)| then.grew_into(prefix, &now, &primary)),
             (None, true) => source::unchanged_from(r, &primary, &source),
             (None, false) => now() == source.primary,
         },
@@ -977,7 +977,8 @@ mod tests {
     }
 
     /// What an append-only reader still refuses: the bytes it read changed under it. A shrink, a
-    /// rewrite of the head it read, and a spilled output removed from beside the session.
+    /// rewrite of the head it read, a spilled output removed from beside the session, and a
+    /// same-length rewrite outside the samples (no growth to admit; refused before growth was).
     #[cfg(unix)]
     #[test]
     fn a_truncation_or_rewrite_during_a_read_still_rejects_it() {
@@ -997,7 +998,7 @@ mod tests {
             .collect();
         let r = SessionRef::new("live", Harness::Claude, &path);
         let adapter = harness::for_harness(r.harness).unwrap();
-        let changes: [(&str, &dyn Fn()); 3] = [
+        let changes: [(&str, &dyn Fn()); 4] = [
             // One byte: the mapped page the reader is in stays mapped.
             ("truncated", &|| {
                 let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -1010,6 +1011,14 @@ mod tests {
             }),
             ("spill removed", &|| {
                 std::fs::remove_file(spilled.join("kept.txt")).unwrap()
+            }),
+            // Same length, a byte outside both sampled windows: no growth to admit, so the whole
+            // identity holds the pass, as it did before growth was admitted.
+            ("middle rewritten in place", &|| {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                let at = body.len() as u64 / 2;
+                assert!(at > 2 * source::SAMPLE_SPAN && at + 2 * source::SAMPLE_SPAN < body.len() as u64);
+                file.write_all_at(b"y", at).unwrap();
             }),
         ];
         for (name, change) in changes {
@@ -1027,6 +1036,58 @@ mod tests {
                 "{name}: accepted"
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A capture that lands inside a record (the writer mid-line): the pass ends at the captured
+    /// length without that record, the writer finishes it during the pass, and the next pass
+    /// reads it whole, once.
+    #[test]
+    fn a_record_torn_at_the_capture_is_the_next_reads() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("cv-watch-torn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("live.jsonl");
+        let line = |i: usize| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"user","uuid":format!("u{i}"),"sessionId":"live",
+                "message":{"role":"user","content":format!("{i} {}", "x".repeat(256))}})
+            )
+        };
+        let torn = line(64);
+        let (head, rest) = torn.split_at(torn.len() / 2);
+        std::fs::write(&path, (0..64).map(line).collect::<String>() + head).unwrap();
+        let appended = format!("{rest}{}", line(65));
+        let r = SessionRef::new("live", Harness::Claude, &path);
+        let adapter = harness::for_harness(r.harness).unwrap();
+        let mut writer = Some(());
+        let mut output = stream::TryFnSink::new(|_| {
+            if writer.take().is_some() {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(appended.as_bytes())
+                    .unwrap();
+            }
+            Ok(stream::Flow::Continue)
+        });
+        let first = read_session_into(adapter.as_ref(), &r, None, 0, &mut output).expect("growth is not a change");
+        assert_eq!(first.total, 64, "the torn record is not the first pass's");
+        let state = first.accepted(first.total);
+        let next = read_session(adapter.as_ref(), &r, Some(&state), first.total).unwrap();
+        assert_eq!(next.total, 66);
+        let expected = adapter.parse(&r).unwrap();
+        assert_eq!(expected.messages.len(), 66);
+        assert_eq!(
+            serde_json::to_value(&next.messages[next.messages.len() - 2..]).unwrap(),
+            serde_json::to_value(&expected.messages[64..]).unwrap()
+        );
+        eprintln!(
+            "torn capture: resumed {}, suffix {} bytes, {} parsed",
+            next.resumed, next.suffix_bytes, next.parsed_messages
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
