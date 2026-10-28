@@ -1563,7 +1563,10 @@ fn swap(id: &str, harness: Option<Harness>, dry_run: bool) -> Result<()> {
     let Some(record) = store::load_record(&root, r.harness.as_str(), &r.id)? else {
         return usage(format!("no precomputed summary for {}", short_id(&r.id)));
     };
-    // The transcript's own check: the record's anchors are still this window's.
+    // The transcript's own check: the record's anchors are still this window's. The source's
+    // identity before it is the generation the copy must still describe when it is written.
+    let source = adapter.resume_source(&r);
+    let generation = cv_core::source::FileId::at(&source);
     let started = Instant::now();
     let live = read_live(&r, adapter.as_ref(), None, &Settings::default(), &root, |_, _| {})?;
     let holds = record.window.boundaries == live.window.boundaries.len()
@@ -1588,6 +1591,7 @@ fn swap(id: &str, harness: Option<Harness>, dry_run: bool) -> Result<()> {
         return usage(format!("{} has no compacted-copy writer yet", r.harness));
     };
     let copy = copy?;
+    same_generation(&source, generation)?;
     eprintln!(
         "precompact swap: {} -> {} (summary to msg {}, {} record(s) after the cut, {} bytes) in {:.2}s",
         short_id(&r.id),
@@ -1614,9 +1618,55 @@ fn swap(id: &str, harness: Option<Harness>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// The swap's commit check: `path` is still the file the anchor check read (`before`), unchanged,
+/// and ends on a whole record. A write since (the session went on) or a torn last line (a writer
+/// mid-record) leaves the copy short of the session, so the swap refuses it.
+fn same_generation(path: &Path, before: Option<cv_core::source::FileId>) -> Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let now = cv_core::source::FileId::at(path);
+    anyhow::ensure!(
+        now.is_some() && now == before,
+        "{} was written to during the swap; swap it when it is idle",
+        path.display()
+    );
+    if now.is_some_and(|id| id.len > 0) {
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8];
+        file.read_exact(&mut last)?;
+        anyhow::ensure!(
+            last[0] == b'\n',
+            "{} ends inside a record (a writer mid-line); swap it when it is idle",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A swap commits only the generation its anchor check read: a write since, a torn last
+    /// line or a missing file refuses it.
+    #[test]
+    fn a_swap_commits_only_the_generation_it_checked() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("cv-swap-generation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, "{\"a\":1}\n").unwrap();
+        let before = cv_core::source::FileId::at(&path);
+        assert!(same_generation(&path, before).is_ok());
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"a\":2}\n").unwrap();
+        assert!(same_generation(&path, before).is_err(), "written to since the check");
+        file.write_all(b"{\"a\":").unwrap();
+        let torn = cv_core::source::FileId::at(&path);
+        assert!(same_generation(&path, torn).is_err(), "a torn last line");
+        assert!(same_generation(&dir.join("gone.jsonl"), None).is_err(), "no file");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A read that fails after delivering messages is delivered again from the last accepted
     /// position; what was observed of it is skipped, and only the new messages are taken.
