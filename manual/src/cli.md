@@ -856,30 +856,36 @@ sessions once (`   ·` lines; `--existing`: the backlog) and exits 0 unless `--f
 
 ### `cv watch --kind precompact`
 
-A session's compaction summary, written before its harness asks for it, so compaction does not
-stall the session for minutes. A `cv watch` consumer: without an action it follows live sessions.
+A session's compaction summary, written before its harness compacts and handed to the harness
+inside its own compaction, so compaction neither stalls the session nor loses what it held. A
+`cv watch` consumer: without an action it follows live sessions.
 
 ```sh
 cv watch --kind precompact                          # follow live sessions; write and extend summaries
 cv watch --kind precompact --dry-run --for 10m      # say what would be written, write nothing
 cv watch --kind precompact now da91                 # write one session's summary now
-cv watch --kind precompact answer < request.json    # summary on stdout, or exit 3 with the reason
-cv watch --kind precompact check request.json da91  # one request against one session, as JSON
-cv watch --kind precompact profile import request.json --harness claude
-cv watch --kind precompact ls                       # each followed session: fill, auto-compact point, cut
-cv watch --kind precompact report                   # stalls by method, served and missed, miss reasons
+cv watch --kind precompact now da91 --upto-bytes 4800000 --print   # a recorded span, offline, as JSON
+cv watch --kind precompact commit < event.json      # inside the harness's compaction; exit 3 on a miss
+cv watch --kind precompact observe < row.json       # record one compaction, cv's or the harness's
+cv watch --kind precompact check request.json da91  # one captured request against one session, as JSON
+cv watch --kind precompact ls                       # the ready summaries and their keys
+cv watch --kind precompact report                   # compactions by method: stall, tokens before and after
 cv watch --kind precompact swap da91                # a new session from the summary, to resume
 ```
 
 The follower starts a session's summary at 70% of its auto-compact point and extends it as the
-session grows or idles; the summary model is `cv-llm`'s (`LMSTUDIO_API_BASE`, with
-`LMSTUDIO_API_KEY` for a server that asks for a key), set in the `precompact` config block or
-with `--model`. `answer` reads a compaction request (the body, or
-`{"body", "headers", "instruction"}`) and serves the summary only when the request's own history
-holds every anchor the summary was cut at; anything after the cut gets one tail pass. A proxy runs
-it on a detected compaction request and falls through on exit 3. On a session whose harness
-precomputes its own compactions it writes nothing. Design and measurements:
-`docs/design/PRECOMPACT.md`.
+session grows or idles, under a lease (one writer per session). A summary is a narrative that
+cites message ids, then sections carried verbatim between summaries (the person's rulings, open
+promises, terms, setup facts, live identifiers, pointers to the standing rules the work touched),
+then the person's own prompts. The models are `cv-llm`'s (`LMSTUDIO_API_BASE`), set in the
+`precompact` config block or with `--model`.
+
+On Claude Code the `cv-compact` plugin (`integrations/claude-code/cv-compact`) calls `commit` in
+the harness's `session.compact` event. `commit` serves the ready summary only when its checkpoint
+still admits the transcript and every covered message and tool call is in the conversation being
+compacted, in order; on any miss Claude Code compacts as its own. Which one serves is the
+plugin's `serve` option, else `precompact.serve` (`native` by default); `report` is the
+comparison to choose it by. Design: `docs/design/PRECOMPACT.md`.
 
 ### `cv share`
 

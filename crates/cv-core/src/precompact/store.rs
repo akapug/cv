@@ -3,9 +3,13 @@
 //!
 //! - `records/<harness>/<session>.json`: the session's current [`Record`], replaced whole on each
 //!   extension (atomic publish, so a reader sees the old record or the new one);
+//! - `carry/<harness>/<session>.json`: the sections a window's last record carried, which the
+//!   next window's first summary starts from ([`super::carry`]);
+//! - `leases/<harness>/<session>.json`: the owner of the summary being prepared ([`take_lease`]);
 //! - `profiles/<id>.json`: each harness instruction ever captured ([`Profile`]);
-//! - `events.jsonl`: one line per summary written, request answered or missed, and compaction
-//!   observed: the measurements `cv watch --kind precompact report` reads.
+//! - `events.jsonl`: one line per summary written, commit served or missed, and compaction
+//!   observed (cv's and the harness's own): the measurements `cv watch --kind precompact report`
+//!   reads.
 
 use super::{Profile, Record, RECORD_VERSION};
 use anyhow::{Context, Result};
@@ -109,6 +113,92 @@ pub fn remove_record(root: &Path, harness: &str, session: &str) -> Result<bool> 
     }
 }
 
+fn carry_path(root: &Path, harness: &str, session: &str) -> PathBuf {
+    root.join("carry")
+        .join(component(harness))
+        .join(format!("{}.json", component(session)))
+}
+
+/// Keep a session's carried sections past the window they were written in (its compaction).
+pub fn save_carry(root: &Path, harness: &str, session: &str, carry: &super::carry::Carry) -> Result<()> {
+    publish(&carry_path(root, harness, session), &serde_json::to_vec(carry)?)
+}
+
+/// The carried sections the session's last window ended with, if any.
+pub fn load_carry(root: &Path, harness: &str, session: &str) -> Option<super::carry::Carry> {
+    serde_json::from_slice(&std::fs::read(carry_path(root, harness, session)).ok()?).ok()
+}
+
+/// A prepare step's lease: who is writing the session's next summary, for which generation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Lease {
+    pub pid: u32,
+    /// `<compactions before the window>:<cut index>:<cut message id>`.
+    pub generation: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+pub fn lease_path(root: &Path, harness: &str, session: &str) -> PathBuf {
+    root.join("leases")
+        .join(component(harness))
+        .join(format!("{}.json", component(session)))
+}
+
+/// Take the lease on a session's next summary (the prepare step): one owner per context
+/// generation, across every follower on the host. `Ok(false)` when another owner holds a lease
+/// younger than `stale_after` (a summary call's own timeout); an older one, or this process's
+/// own, is taken over.
+pub fn take_lease(
+    root: &Path,
+    harness: &str,
+    session: &str,
+    generation: &str,
+    stale_after: std::time::Duration,
+) -> Result<bool> {
+    use std::io::Write as _;
+    anyhow::ensure!(!crate::env::frozen(), "--frozen forbids writing the precompact store");
+    let path = lease_path(root, harness, session);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let lease = Lease {
+        pid: std::process::id(),
+        generation: generation.to_owned(),
+        at: chrono::Utc::now(),
+    };
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(&serde_json::to_vec(&lease)?)?;
+                return Ok(true);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let held = std::fs::read(&path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Lease>(&b).ok());
+                let live = held.is_some_and(|h| {
+                    h.pid != lease.pid && (lease.at - h.at).to_std().is_ok_and(|age| age < stale_after)
+                });
+                if live {
+                    return Ok(false);
+                }
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+                }
+            }
+            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+        }
+    }
+    Ok(false)
+}
+
+/// Give a session's lease back (its summary is written, or failed).
+pub fn release_lease(root: &Path, harness: &str, session: &str) {
+    let _ = std::fs::remove_file(lease_path(root, harness, session));
+}
+
 /// Store a captured profile; `false` when that instruction was already stored.
 pub fn save_profile(root: &Path, profile: &Profile) -> Result<bool> {
     let path = root.join("profiles").join(format!("{}.json", component(&profile.id)));
@@ -167,6 +257,27 @@ pub fn event(root: &Path, mut value: serde_json::Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lease_has_one_owner_until_it_is_released_or_stale() {
+        let root = std::env::temp_dir().join(format!("cv-precompact-lease-{}", uuid::Uuid::new_v4()));
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(take_lease(&root, "claude", "s", "0:4:u", hour).unwrap());
+        // Another owner's lease, young: refused; this process's own: taken over.
+        let other = Lease {
+            pid: std::process::id() + 1,
+            generation: "0:4:u".into(),
+            at: chrono::Utc::now(),
+        };
+        std::fs::write(lease_path(&root, "claude", "s"), serde_json::to_vec(&other).unwrap()).unwrap();
+        assert!(!take_lease(&root, "claude", "s", "0:5:v", hour).unwrap());
+        // Stale: taken over.
+        assert!(take_lease(&root, "claude", "s", "0:5:v", std::time::Duration::ZERO).unwrap());
+        release_lease(&root, "claude", "s");
+        assert!(!lease_path(&root, "claude", "s").exists());
+        assert!(take_lease(&root, "claude", "s", "0:6:w", hour).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn ids_never_name_another_directory() {

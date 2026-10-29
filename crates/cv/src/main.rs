@@ -956,7 +956,7 @@ enum Cmd {
     /// Follow live activity and archive every session as it changes, forever (archives what
     /// already exists on the first poll). `cv scry` is the same feed without the archive.
     /// `--kind precompact` keeps a summary of each live session's window instead, written before
-    /// its harness compacts, and its actions answer the harness's compaction request from it.
+    /// its harness compacts, and its actions hand it to the harness inside its own compaction.
     Watch {
         /// What the watch keeps: `archive` (every session as IR), or `precompact` (each live
         /// session's compaction summary, written from 70% of its auto-compact point, before its
@@ -983,8 +983,8 @@ enum Cmd {
         for_: Option<String>,
         #[command(flatten)]
         knobs: cmd::precompact::Knobs,
-        /// Precompact: one action instead of following (`now`, `answer`, `check`, `profile`,
-        /// `ls`, `report`, `swap`).
+        /// Precompact: one action instead of following (`now`, `commit`, `observe`, `check`,
+        /// `profile`, `ls`, `report`, `swap`).
         #[command(subcommand)]
         action: Option<PrecompactCmd>,
         // Removed in 0.15.0 with the task verifier — hidden so the old flag errors with a pointer.
@@ -1952,9 +1952,9 @@ mod tests {
             };
             let Ok(Cmd::Watch {
                 kind: WatchKind::Precompact,
-                action: Some(PrecompactCmd::Answer { no_tail_pass: true, .. }),
+                action: Some(PrecompactCmd::Commit { serve: Some(_), .. }),
                 ..
-            }) = parse(&["cv", "watch", "--kind", "precompact", "answer", "--no-tail-pass"])
+            }) = parse(&["cv", "watch", "--kind", "precompact", "commit", "--serve", "cv"])
             else {
                 panic!("an action")
             };

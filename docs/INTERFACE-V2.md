@@ -106,7 +106,7 @@ The two tables below are generated from the clap tree, and a unit test
 | command | subcommands |
 |---|---|
 | `task` | `open` `list` `show` `claim` `release` `note` `done` `status` `abandon` `supersede` `tag` `block` `decide` `resolve` `events` `sweep` `inbox` |
-| `watch` | `now` `answer` `check` `profile` `profile import` `profile ls` `ls` `report` `swap` |
+| `watch` | `now` `commit` `observe` `check` `profile` `profile import` `profile ls` `ls` `report` `swap` |
 | `archive` | `sync` `ls` `path` |
 | `hooks` | `install` `remove` `show` |
 <!-- end: cv schema --commands -->

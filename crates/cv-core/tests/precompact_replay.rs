@@ -35,6 +35,7 @@ fn replay(path: &Path) -> Vec<(Option<u64>, Record)> {
                     v: RECORD_VERSION,
                     harness: "claude".into(),
                     session: r.id.clone(),
+                    key: None,
                     window: WindowRef {
                         boundaries: window.boundaries.len(),
                         start: window.start,
@@ -45,7 +46,10 @@ fn replay(path: &Path) -> Vec<(Option<u64>, Record)> {
                     model: String::new(),
                     created: chrono::Utc::now(),
                     base: None,
+                    compact_at: None,
                     bounds: Vec::new(),
+                    narrative: String::new(),
+                    carry: Default::default(),
                     text: String::new(),
                 },
             ));

@@ -22,6 +22,8 @@ pub struct Boundary {
     pub trigger: Option<String>,
     pub pre_tokens: Option<u64>,
     pub duration_ms: Option<u64>,
+    /// The window's size after it (Claude Code's `compactMetadata.postTokens`).
+    pub post_tokens: Option<u64>,
     /// The harness served it from its own precomputed summary (Claude Code's
     /// `compactMetadata.precomputed`).
     pub precomputed: bool,
@@ -38,6 +40,9 @@ pub struct Window {
     /// Index of the window's first message.
     pub start: usize,
     pub anchors: Vec<Placed>,
+    /// The person's prompts in the window, each with its message index: carried verbatim after a
+    /// summary ([`super::prompt::owner_words`]).
+    pub prompts: Vec<(usize, super::prompt::Prompt)>,
     /// Newest usage reading: `(tokens in the window, message index)`.
     reading: Option<(u64, usize)>,
     /// The newest message's id, index and time.
@@ -83,11 +88,13 @@ impl Window {
                     trigger: field("trigger").and_then(Value::as_str).map(str::to_owned),
                     pre_tokens: field("preTokens").and_then(Value::as_u64),
                     duration_ms: field("durationMs").and_then(Value::as_u64),
+                    post_tokens: field("postTokens").and_then(Value::as_u64),
                     precomputed: field("precomputed").and_then(Value::as_bool).unwrap_or(false),
                     at: m.timestamp,
                 });
                 self.start = index + 1;
                 self.anchors.clear();
+                self.prompts.clear();
                 self.reading = None;
                 self.newest = None;
                 self.after_last_anchor = false;
@@ -96,6 +103,25 @@ impl Window {
             }
             MessageKind::Prompt => {
                 self.open_prompt.get_or_insert(self.anchors.len());
+                let mut words = String::new();
+                for b in &m.content {
+                    if let Block::Text { text } = b {
+                        text.try_for_each_chunk(resolver, 64 * 1024, |part| {
+                            words.push_str(part);
+                            Ok(())
+                        })?;
+                    }
+                }
+                let words = super::anchor::without_markup(&words);
+                if !words.trim().is_empty() {
+                    self.prompts.push((
+                        index,
+                        super::prompt::Prompt {
+                            id: m.id.clone(),
+                            text: words,
+                        },
+                    ));
+                }
             }
             MessageKind::Reply => self.open_prompt = None,
             MessageKind::CompactionSummary => {}

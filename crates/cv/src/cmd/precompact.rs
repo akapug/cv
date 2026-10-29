@@ -1,12 +1,15 @@
 //! `cv watch --kind precompact`: write a live session's compaction summary before its harness
-//! asks for it, keep it current as the session grows, and answer the harness's compaction request
-//! from it. A `cv watch` consumer, not a verb of its own (the 0.19 design record, D4).
+//! asks for it, keep it current as the session grows, and hand it to the harness inside the
+//! harness's own compaction. A `cv watch` consumer, not a verb of its own (the 0.19 design record,
+//! D4).
 //!
-//! The core (record, anchors, validation, profiles, prompts) is `cv_core::precompact`; this module
-//! is the thin driver around it: the resident follower (`cv watch --kind precompact`), and its
-//! actions: one-shot writes (`now`), the lookup a proxy calls once per compaction (`answer`), the
-//! replay check (`check`), the no-proxy fallback (`swap`), and the measurements (`report`).
-//! Design and measurements: `docs/design/PRECOMPACT.md`.
+//! The core (record, key, commitments, the commit check, profiles, prompts) is
+//! `cv_core::precompact`; this module is the thin driver around it: the resident follower
+//! (`cv watch --kind precompact`: prepare under a lease, publish ready records), and its actions:
+//! one-shot writes (`now`), the commit a harness plugin calls inside its compaction (`commit`),
+//! the record of every compaction that plugin saw, cv's or the harness's own (`observe`), the
+//! replay check (`check`), the explicit new-session fallback (`swap`), and the measurements
+//! (`report`). No proxy sits in the path. Design: `docs/design/PRECOMPACT.md`.
 
 use crate::util::{fmt_int, parse_harness, short_id, usage, Wait};
 use anyhow::{Context, Result};
@@ -18,21 +21,21 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// The answer-time update's output cap: a short section, not a second summary.
-const TAIL_MAX_TOKENS: u32 = 4096;
 /// A summary's output cap. The harness's own summaries on our fleet ran 9-17k tokens.
 const SUMMARY_MAX_TOKENS: u32 = 20_000;
+/// The extraction pass's output cap: quotes, not prose.
+const EXTRACT_MAX_TOKENS: u32 = 8_000;
 /// How long one summary call may take before it is abandoned (the session keeps its old record).
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(900);
-/// How long the answer-time pass may take before the answer falls through to the harness's own
-/// compaction (exit 3): the stall it is meant to shorten.
-const TAIL_TIMEOUT: Duration = Duration::from_secs(120);
 /// The first retry of a session whose read failed (bytes it had read changed under it, or it
 /// could not be read); each further failure doubles it, up to [`RETRY_MAX`]. Cost-only. A
 /// session appended to while it is read is not a failure: the read ends where it began, and the
 /// appended bytes are the next read's.
 const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(600);
+/// A lease older than this is another owner's that died: the summary call's own timeout and a
+/// minute. Cost-only.
+const LEASE_STALE: Duration = Duration::from_secs(900 + 60);
 /// Exit code for a miss: the caller falls through to the harness's own compaction.
 pub(crate) const MISS_EXIT: i32 = 3;
 
@@ -70,22 +73,39 @@ pub(crate) enum PrecompactCmd {
         /// Print what would be sent and written, call nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Summarize the session as it stood when its transcript was this many bytes long: the
+        /// window then, up to its newest message (a recorded span, offline).
+        #[arg(long, value_name = "BYTES")]
+        upto_bytes: Option<u64>,
+        /// Print the record as JSON on stdout and write nothing: a fresh generation (no stored
+        /// summary or carry is read), no lease, no store.
+        #[arg(long)]
+        print: bool,
         #[command(flatten)]
         knobs: Knobs,
     },
-    /// Answer a compaction request: the request JSON (or an envelope `{body, headers, harness,
-    /// session, instruction}`) on stdin; the summary on stdout. A miss exits 3 with the reason on
-    /// stderr, and the caller sends the request on as it came.
-    Answer {
-        /// The harness that sent the request (default: found from the stored record).
+    /// The commit, called inside the harness's compaction (Claude Code's `session.compact` plugin
+    /// event): the event JSON `{session, trigger, instructions, messages}` on stdin; on a pass,
+    /// `{"outcome":"served","summary":…,"keep_from":N}` on stdout, and the harness replaces the
+    /// messages before `keep_from` with the summary. A miss exits 3 with the reason on stderr,
+    /// and the harness compacts as its own.
+    Commit {
+        /// Which compaction serves this seat (`native`, `cv`); default: `precompact.serve`.
+        #[arg(long, value_name = "SERVE")]
+        serve: Option<String>,
+        /// The harness compacting (default: `claude`).
         #[arg(long)]
         harness: Option<String>,
-        /// Serve only when nothing follows the cut; a tail is a miss instead of a model call.
-        #[arg(long)]
-        no_tail_pass: bool,
-        /// The model for the tail pass (default: `precompact.model`, else the provider's).
-        #[arg(long)]
-        model: Option<String>,
+    },
+    /// Record one compaction a harness plugin saw, cv's or the harness's own: a JSON object on
+    /// stdin (`{session, trigger, method, ms, tokens_before, tokens_after, kept, summary_bytes,
+    /// miss}`), appended to the measurements `report` reads.
+    Observe,
+    /// Removed with the proxy path: the harness hands cv its compaction in process (`commit`).
+    #[command(hide = true)]
+    Answer {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        rest: Vec<String>,
     },
     /// Check a captured compaction request against a session's fingerprint, with no store and no
     /// model: the replay behind the anchor match rate. Prints one JSON verdict.
@@ -114,7 +134,8 @@ pub(crate) enum PrecompactCmd {
         #[arg(long)]
         json: bool,
     },
-    /// What the measurements say: compaction stalls by method, answers served and missed.
+    /// What the measurements say: compactions by method (stall, tokens before and after), commits
+    /// served and missed by class: the comparison a seat's `serve` setting is chosen by.
     Report {
         #[arg(long)]
         json: bool,
@@ -148,8 +169,11 @@ impl PrecompactCmd {
     pub(crate) fn writes(&self) -> bool {
         matches!(
             self,
-            PrecompactCmd::Now { dry_run: false, .. }
-                | PrecompactCmd::Swap { dry_run: false, .. }
+            PrecompactCmd::Now {
+                dry_run: false,
+                print: false,
+                ..
+            } | PrecompactCmd::Swap { dry_run: false, .. }
                 | PrecompactCmd::Profile {
                     action: ProfileCmd::Import { .. }
                 }
@@ -185,6 +209,14 @@ pub(crate) struct Knobs {
     /// Follow sessions touched within this many seconds of startup (default 7200).
     #[arg(long, value_name = "SECS")]
     live_within_secs: Option<u64>,
+    /// Also prepare summaries where the harness precomputes its own (to serve cv's on such a
+    /// seat, and to compare the two).
+    #[arg(long)]
+    prepare_native: bool,
+    /// A regular expression finding a standing rule's id (its first capture group, else the
+    /// whole match) in what the session read; repeat for several. Replaces `rule_patterns`.
+    #[arg(long = "rule-pattern", value_name = "REGEX")]
+    rule_patterns: Vec<String>,
 }
 
 impl Knobs {
@@ -211,6 +243,12 @@ impl Knobs {
         );
         if self.model.is_some() {
             s.model = self.model.clone();
+        }
+        if self.prepare_native {
+            s.prepare_native = true;
+        }
+        if !self.rule_patterns.is_empty() {
+            s.rule_patterns = self.rule_patterns.clone();
         }
         s.jobs = s.jobs.max(1);
         s
@@ -246,13 +284,26 @@ pub(crate) fn cmd_watch(args: Watch) -> Result<()> {
             id,
             harness,
             dry_run,
+            upto_bytes,
+            print,
             knobs,
-        } => now(&id, parse_harness(&harness)?, dry_run, &knobs.settings()),
-        PrecompactCmd::Answer {
-            harness,
-            no_tail_pass,
-            model,
-        } => answer(harness, no_tail_pass, model),
+        } => now(
+            &id,
+            parse_harness(&harness)?,
+            Span {
+                dry_run,
+                upto_bytes,
+                print,
+            },
+            &knobs.settings(),
+        ),
+        PrecompactCmd::Commit { serve, harness } => commit(serve, harness),
+        PrecompactCmd::Observe => observe(),
+        PrecompactCmd::Answer { .. } => usage(
+            "`cv watch --kind precompact answer` was removed with the proxy path (the 0.19 design: no \
+             proxy in the critical path); a harness plugin calls `cv watch --kind precompact commit` \
+             inside its own compaction (integrations/claude-code/cv-compact)",
+        ),
         PrecompactCmd::Check {
             request,
             id,
@@ -278,8 +329,9 @@ fn text_of(t: &cv_core::Text, resolver: &cv_core::Resolver) -> Result<String> {
     Ok(s)
 }
 
-/// One message as the summary model reads it: prose whole, tool calls and results cut to
-/// `tool_bytes`, reasoning left out. `None` for what no window carries (boundaries, notices).
+/// One message as the summary model reads it: its id first (`[m:ID]`, which the summary cites),
+/// prose whole, tool calls and results cut to `tool_bytes`, reasoning left out. `None` for what
+/// no window carries (boundaries, notices).
 fn render(m: &Message, resolver: &cv_core::Resolver, tool_bytes: usize) -> Result<Option<Turn>> {
     if matches!(
         m.kind,
@@ -323,8 +375,28 @@ fn render(m: &Message, resolver: &cv_core::Resolver, tool_bytes: usize) -> Resul
     let out = out.trim();
     Ok((!out.is_empty()).then(|| Turn {
         role,
-        content: out.to_owned(),
+        content: match &m.id {
+            Some(id) => format!("[m:{id}] {out}"),
+            None => out.to_owned(),
+        },
     }))
+}
+
+/// The compiled `rule_patterns`, once per distinct list; an invalid pattern is left out (the
+/// follower says so when it starts).
+fn rule_regexes(patterns: &[String]) -> std::sync::Arc<Vec<regex::Regex>> {
+    use std::sync::{Arc, Mutex};
+    type Cache = Option<(Vec<String>, Arc<Vec<regex::Regex>>)>;
+    static CACHE: Mutex<Cache> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((key, compiled)) = cache.as_ref() {
+        if key.as_slice() == patterns {
+            return compiled.clone();
+        }
+    }
+    let compiled = Arc::new(patterns.iter().filter_map(|p| regex::Regex::new(p).ok()).collect());
+    *cache = Some((patterns.to_vec(), Arc::clone(&compiled)));
+    compiled
 }
 
 /// A session being followed: its window, the rendered span since the record's cut, its record.
@@ -342,6 +414,10 @@ struct Live {
     accepted: usize,
     /// Messages of a failed read still to come again, already observed: skipped.
     redelivered: usize,
+    /// The window's injected-context messages (index, id): a layer no carried item may quote.
+    injected: Vec<(usize, String)>,
+    /// Standing-rule ids the configured patterns found in the window: (index, message id, id).
+    found: Vec<(usize, String, String)>,
 }
 
 impl Live {
@@ -357,6 +433,8 @@ impl Live {
             delivered: 0,
             accepted: 0,
             redelivered: 0,
+            injected: Vec::new(),
+            found: Vec::new(),
         }
     }
 
@@ -402,6 +480,8 @@ impl Live {
         self.window.observe(m, &resolver)?;
         if self.window.boundaries.len() > before {
             self.span.clear();
+            self.injected.clear();
+            self.found.clear();
             let b = self.window.boundaries.last().expect("a boundary was just pushed");
             let record = self.record.take();
             if self.primed {
@@ -413,6 +493,7 @@ impl Live {
                         "session": self.r.id,
                         "trigger": b.trigger,
                         "pre_tokens": b.pre_tokens,
+                        "post_tokens": b.post_tokens,
                         "duration_ms": b.duration_ms,
                         "native": b.precomputed,
                         "had_record": record.is_some(),
@@ -428,10 +509,30 @@ impl Live {
                     if record.is_some() { ", cv held a summary" } else { "" },
                 );
             }
-            if record.is_some() && !dry_run {
+            if let Some(record) = record.filter(|_| !dry_run) {
+                // The carried sections outlive the window: the next window's first summary starts
+                // from them, so a compaction never re-summarizes what was carried verbatim.
+                let _ = store::save_carry(root, self.r.harness.as_str(), &self.r.id, &record.carry);
                 let _ = store::remove_record(root, self.r.harness.as_str(), &self.r.id);
             }
             return Ok(());
+        }
+        if let Some(id) = m.id.as_ref().filter(|_| m.kind == MessageKind::InjectedContext) {
+            self.injected.push((index, id.clone()));
+        }
+        let patterns = rule_regexes(&settings.rule_patterns);
+        if let (Some(id), false) = (&m.id, patterns.is_empty()) {
+            for b in &m.content {
+                let Block::Text { text } = b else { continue };
+                let text = text_of(text, &resolver)?;
+                for re in patterns.iter() {
+                    for c in re.captures_iter(&text) {
+                        if let Some(rule) = c.get(1).or_else(|| c.get(0)) {
+                            self.found.push((index, id.clone(), rule.as_str().to_owned()));
+                        }
+                    }
+                }
+            }
         }
         if let Some(turn) = render(m, &resolver, settings.tool_result_bytes)? {
             self.span.push((index, turn));
@@ -486,30 +587,75 @@ struct Job {
     key: String,
     harness: String,
     session: String,
+    /// The narrative so far, when extending.
     prior: Option<String>,
+    /// The sections carried from the previous generation (this window's record, else the last
+    /// window's).
+    carry: pc::carry::Carry,
     base: Option<pc::Cut>,
     turns: Vec<Turn>,
     cut: pc::Cut,
     anchors: Vec<pc::Anchor>,
     window: pc::WindowRef,
     profile: pc::Profile,
+    /// The ready record's key: the transcript's checkpoint now and the cut message's own id.
+    ready_key: Option<pc::Key>,
+    prompts: Vec<prompt::Prompt>,
+    /// Whose each message of the span is: what a carried item may quote.
+    layers: pc::carry::Layers,
+    /// Standing-rule ids found in the span: (message id, rule id).
+    found: Vec<(String, String)>,
+    compact_at: Option<u64>,
 }
 
 impl Job {
-    fn take(live: &Live, profile: pc::Profile, extend: bool) -> Option<Job> {
+    fn take(live: &Live, profile: pc::Profile, extend: bool, compact_at: Option<u64>, root: &Path) -> Option<Job> {
         let (cut, anchors) = live.window.cut_now()?;
         let record = live.record.as_ref().filter(|_| extend);
+        let ready_key = cut.id.clone().and_then(|id| pc::Key::take(&live.r.path, id));
         Some(Job {
             key: live.key(),
             harness: live.r.harness.as_str().to_owned(),
             session: live.r.id.clone(),
-            prior: record.map(|r| r.text.clone()),
+            prior: record.map(|r| r.narrative.clone()).filter(|n| !n.is_empty()),
+            carry: match record {
+                Some(r) => r.carry.clone(),
+                None => store::load_carry(root, live.r.harness.as_str(), &live.r.id).unwrap_or_default(),
+            },
             base: record.map(|r| r.cut.clone()),
             turns: live
                 .span
                 .iter()
                 .filter(|(i, _)| *i <= cut.index)
                 .map(|(_, t)| t.clone())
+                .collect(),
+            prompts: live
+                .window
+                .prompts
+                .iter()
+                .filter(|(i, _)| *i <= cut.index)
+                .map(|(_, p)| p.clone())
+                .collect(),
+            layers: pc::carry::Layers {
+                prompts: live
+                    .window
+                    .prompts
+                    .iter()
+                    .filter(|(i, _)| *i <= cut.index)
+                    .filter_map(|(_, p)| p.id.clone())
+                    .collect(),
+                injected: live
+                    .injected
+                    .iter()
+                    .filter(|(i, _)| *i <= cut.index)
+                    .map(|(_, id)| id.clone())
+                    .collect(),
+            },
+            found: live
+                .found
+                .iter()
+                .filter(|(i, _, _)| *i <= cut.index && record.is_none_or(|r| *i > r.cut.index))
+                .map(|(_, m, id)| (m.clone(), id.clone()))
                 .collect(),
             cut,
             anchors,
@@ -518,23 +664,93 @@ impl Job {
                 start: live.window.start,
             },
             profile,
+            ready_key,
+            compact_at,
         })
+    }
+
+    /// The context generation the job prepares: what its lease names.
+    fn generation(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.window.boundaries,
+            self.cut.index,
+            self.cut.id.as_deref().unwrap_or("")
+        )
     }
 
     fn prompt_bytes(&self) -> usize {
         self.turns.iter().map(|t| t.content.len()).sum::<usize>() + self.prior.as_ref().map_or(0, String::len)
     }
 
-    /// Call the summary model and build the record.
+    /// The two passes and the record: the narrative from the summary model, then the carried
+    /// sections from a separate extraction pass whose quotes are kept only where the message
+    /// they cite holds them, merged into the previous generation's; identifiers read by shape.
     fn run(self, settings: &Settings) -> Result<(Record, f64)> {
         let started = Instant::now();
+        // Each rendered turn opens with its message id: the texts the quotes are checked against.
+        let texts: Vec<(String, String)> = self
+            .turns
+            .iter()
+            .filter_map(|t| {
+                let rest = t.content.strip_prefix("[m:")?;
+                let (id, text) = rest.split_once("] ")?;
+                Some((id.to_owned(), text.to_owned()))
+            })
+            .collect();
+        let extract_turns = self.turns.clone();
         let turns = prompt::write(self.prior.as_deref(), self.turns, &self.profile.text);
-        let (text, model) =
+        let (narrative, model) =
             crate::llm::complete(settings.model.as_deref(), &turns, SUMMARY_MAX_TOKENS, SUMMARY_TIMEOUT)?;
-        anyhow::ensure!(!text.trim().is_empty(), "the summary model returned no text");
+        anyhow::ensure!(!narrative.trim().is_empty(), "the summary model returned no text");
+        let open: Vec<&str> = self.carry.promises().map(|i| i.quote.as_str()).collect();
+        let mut bounds = vec![format!(
+            "tool calls and results cut to {} bytes each",
+            settings.tool_result_bytes
+        )];
+        let extracted = crate::llm::complete(
+            Some(model.as_str()),
+            &prompt::extract(extract_turns, &open),
+            EXTRACT_MAX_TOKENS,
+            SUMMARY_TIMEOUT,
+        );
+        let (items, done, mut dropped) = match &extracted {
+            Ok((answer, _)) => pc::carry::parse(answer),
+            Err(e) => {
+                bounds.push(format!(
+                    "the extraction pass failed, the carry is the previous one: {e:#}"
+                ));
+                Default::default()
+            }
+        };
+        let by_id: HashMap<String, String> = texts.iter().cloned().collect();
+        let items = pc::carry::verify(items, &by_id, &self.layers, &mut dropped);
+        if dropped != pc::carry::Dropped::default() {
+            bounds.push(format!(
+                "extraction: dropped {} quote(s) not found verbatim in the message they cite, {} from a layer \
+                 cv does not re-introduce, {} malformed",
+                dropped.unverified, dropped.outside_layer, dropped.malformed
+            ));
+        }
+        let carry = self.carry.merge(
+            pc::carry::Span {
+                items,
+                ids: pc::carry::ids(&texts),
+                pointers: pc::carry::pointers(&self.found),
+            },
+            &done,
+            settings.carry_ids,
+        );
+        let text = format!(
+            "{}{}{}",
+            narrative.trim_end(),
+            carry.render(&self.session),
+            prompt::owner_words(&self.prompts, settings.owner_words_bytes, &self.session)
+        );
         let record = Record {
             v: pc::RECORD_VERSION,
             harness: self.harness,
+            key: self.ready_key,
             session: self.session,
             window: self.window,
             cut: self.cut,
@@ -543,13 +759,35 @@ impl Job {
             model,
             created: chrono::Utc::now(),
             base: self.base,
-            bounds: vec![format!(
-                "tool calls and results cut to {} bytes each",
-                settings.tool_result_bytes
-            )],
+            compact_at: self.compact_at,
+            bounds,
+            narrative,
+            carry,
             text,
         };
         Ok((record, started.elapsed().as_secs_f64()))
+    }
+}
+
+/// The instruction summaries are written to: the captured profile `precompact.profile` names,
+/// else cv's own ([`prompt::CV_INSTRUCTION`]).
+fn profile_for(root: &Path, settings: &Settings, harness: &str) -> Result<pc::Profile> {
+    match &settings.profile {
+        Some(id) => store::profiles(root)?
+            .into_iter()
+            .find(|p| &p.id == id)
+            .with_context(|| {
+                format!(
+                    "precompact.profile names {id}, which is not captured (`cv watch --kind precompact profile ls`)"
+                )
+            }),
+        None => Ok(pc::Profile {
+            id: pc::profile_id(prompt::CV_INSTRUCTION),
+            harness: harness.to_owned(),
+            client: None,
+            captured: chrono::Utc::now(),
+            text: prompt::CV_INSTRUCTION.to_owned(),
+        }),
     }
 }
 
@@ -565,6 +803,13 @@ fn written_event(record: &Record, secs: f64, prompt_bytes: usize, span_turns: us
         "span_turns": span_turns,
         "prompt_bytes": prompt_bytes,
         "text_bytes": record.text.len(),
+        // The selection, for scoring what was chosen: each carried item and pointer, and why.
+        "carried": record.carry.items.iter().map(|i| json!({"section": i.section, "m": i.m,
+                    "quote_bytes": i.quote.len(), "why": i.why})).collect::<Vec<_>>(),
+        "pointers": record.carry.pointers.iter().map(|p| json!({"id": p.id, "last": p.last,
+                    "hits": p.hits, "why": p.why})).collect::<Vec<_>>(),
+        "ids": record.carry.ids.len(),
+        "bounds": record.bounds,
         "model": record.model,
         "secs": (secs * 10.0).round() / 10.0,
     })
@@ -662,6 +907,11 @@ fn watch(
 
     let root = store::root()?;
     let wait = Wait::resolve(true, for_)?;
+    for p in &settings.rule_patterns {
+        if let Err(e) = regex::Regex::new(p) {
+            eprintln!("precompact: rule pattern {p:?} is left out: {e}");
+        }
+    }
     let filter = Filter {
         harness,
         cwd_contains: cwd,
@@ -850,6 +1100,7 @@ fn watch(
             running -= 1;
             let Some(live) = lives.get_mut(&key) else { continue };
             live.job = false;
+            store::release_lease(&root, live.r.harness.as_str(), &live.r.id);
             match outcome {
                 Ok((record, secs)) => {
                     let same_window = record.window.boundaries == live.window.boundaries.len();
@@ -883,12 +1134,11 @@ fn watch(
 
         // Decide, and start what is due.
         let mut next_idle: Option<u64> = None;
-        let mut profiles: HashMap<Harness, Option<pc::Profile>> = HashMap::new();
         for live in lives.values_mut() {
             if live.job {
                 continue;
             }
-            if live.native() {
+            if live.native() && !settings.prepare_native {
                 if live.said != "native" {
                     live.said = "native";
                     eprintln!(
@@ -929,23 +1179,17 @@ fn watch(
                 next_idle = Some(1);
                 continue;
             }
-            let profile = profiles
-                .entry(live.r.harness)
-                .or_insert_with(|| store::latest_profile(&root, live.r.harness.as_str()).ok().flatten())
-                .clone();
-            let Some(profile) = profile else {
-                if live.said != "no profile" {
-                    live.said = "no profile";
-                    eprintln!(
-                        "precompact: {} is due but no {} compaction instruction is captured yet: the first compaction \
-                         answered through `cv watch --kind precompact answer` captures it, or `cv watch --kind precompact profile import`",
-                        short_id(&live.r.id),
-                        live.r.harness
-                    );
+            let profile = match profile_for(&root, &settings, live.r.harness.as_str()) {
+                Ok(p) => p,
+                Err(e) => {
+                    if live.said != "no profile" {
+                        live.said = "no profile";
+                        eprintln!("precompact: {} is due, but {e:#}", short_id(&live.r.id));
+                    }
+                    continue;
                 }
-                continue;
             };
-            let Some(job) = Job::take(live, profile, extend) else {
+            let Some(job) = Job::take(live, profile, extend, compact_at, &root) else {
                 continue;
             };
             let (prompt_bytes, span_turns) = (job.prompt_bytes(), job.turns.len());
@@ -971,6 +1215,7 @@ fn watch(
                     v: pc::RECORD_VERSION,
                     harness: job.harness,
                     session: job.session,
+                    key: None,
                     window: job.window,
                     cut: job.cut.clone(),
                     anchors: Vec::new(),
@@ -978,12 +1223,34 @@ fn watch(
                     model: String::new(),
                     created: chrono::Utc::now(),
                     base: None,
+                    compact_at: None,
                     bounds: Vec::new(),
+                    narrative: String::new(),
+                    carry: Default::default(),
                     text: String::new(),
                 });
                 let cut = job.cut.index;
                 live.span.retain(|(i, _)| *i > cut);
                 continue;
+            }
+            // Prepare: one owner per context generation on this host. Another follower (or a
+            // `now`) holding a live lease on the session is left to it.
+            match store::take_lease(&root, &job.harness, &job.session, &job.generation(), LEASE_STALE) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if live.said != "leased" {
+                        live.said = "leased";
+                        eprintln!(
+                            "precompact: {} is being prepared by another owner; leaving it to it",
+                            short_id(&job.session)
+                        );
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("precompact: {}: no lease: {e:#}", short_id(&job.session));
+                    continue;
+                }
             }
             live.job = true;
             running += 1;
@@ -1123,25 +1390,36 @@ fn read_live(
     Ok(live)
 }
 
-fn now(id: &str, harness: Option<Harness>, dry_run: bool, settings: &Settings) -> Result<()> {
+/// How `now` reads and where it writes.
+struct Span {
+    dry_run: bool,
+    upto_bytes: Option<u64>,
+    print: bool,
+}
+
+/// Write one session's summary now: the window as it stands (or stood at `upto_bytes`). With
+/// `print`, the record goes to stdout as JSON and nothing is read from or written to the store:
+/// the seam an offline evaluation summarizes any recorded span through.
+fn now(id: &str, harness: Option<Harness>, span: Span, settings: &Settings) -> Result<()> {
     let (r, adapter) = crate::cmd::distill::resolve_source(id, harness)?;
     let root = store::root()?;
-    let mut live = read_live(&r, adapter.as_ref(), None, settings, &root, |_, _| {})?;
+    let mut live = read_live(&r, adapter.as_ref(), span.upto_bytes, settings, &root, |_, _| {})?;
     if live.native() {
         eprintln!(
             "precompact: note: {}'s harness precomputes its own compactions",
             short_id(&r.id)
         );
     }
-    live.adopt_stored(&root);
-    let Some(profile) = store::latest_profile(&root, r.harness.as_str())? else {
-        return usage(format!(
-            "no {} compaction instruction is captured yet: `cv watch --kind precompact profile import <request.json> --harness {}`",
-            r.harness, r.harness
-        ));
-    };
+    if !span.print {
+        live.adopt_stored(&root);
+    }
+    let profile = profile_for(&root, settings, r.harness.as_str())?;
     let extend = live.record.is_some();
-    let job = Job::take(&live, profile, extend).context("the session's window is empty")?;
+    let compact_at = live.compact_at(settings, &HashMap::new());
+    let mut job = Job::take(&live, profile, extend, compact_at, &root).context("the session's window is empty")?;
+    if span.print {
+        job.carry = Default::default();
+    }
     eprintln!(
         "precompact: {} {} to msg {} ({} tokens): {} turns, {} bytes",
         if extend { "extending" } else { "writing" },
@@ -1151,11 +1429,27 @@ fn now(id: &str, harness: Option<Harness>, dry_run: bool, settings: &Settings) -
         job.turns.len(),
         fmt_int(job.prompt_bytes() as u64)
     );
-    if dry_run {
+    if span.dry_run {
         return Ok(());
     }
+    if span.print {
+        let (record, secs) = job.run(settings)?;
+        println!("{}", serde_json::to_string(&record)?);
+        eprintln!("precompact: wrote the summary in {secs:.1}s");
+        return Ok(());
+    }
+    if !store::take_lease(&root, &job.harness, &job.session, &job.generation(), LEASE_STALE)? {
+        return usage(format!(
+            "{} is being prepared by another owner (its lease is under {})",
+            short_id(&r.id),
+            root.join("leases").display()
+        ));
+    }
     let (prompt_bytes, span_turns) = (job.prompt_bytes(), job.turns.len());
-    let (record, secs) = job.run(settings)?;
+    let (harness, session) = (job.harness.clone(), job.session.clone());
+    let outcome = job.run(settings);
+    store::release_lease(&root, &harness, &session);
+    let (record, secs) = outcome?;
     store::event(&root, written_event(&record, secs, prompt_bytes, span_turns))?;
     let path = store::save_record(&root, &record)?;
     eprintln!("precompact: wrote {} in {secs:.1}s", path.display());
@@ -1204,6 +1498,7 @@ fn check(
         v: pc::RECORD_VERSION,
         harness: r.harness.as_str().into(),
         session: r.id.clone(),
+        key: None,
         window: pc::WindowRef {
             boundaries: live.window.boundaries.len(),
             start: live.window.start,
@@ -1217,7 +1512,10 @@ fn check(
         model: String::new(),
         created: chrono::Utc::now(),
         base: None,
+        compact_at: None,
         bounds: Vec::new(),
+        narrative: String::new(),
+        carry: Default::default(),
         text: String::new(),
     };
     let verdict = pc::validate(&view, &record);
@@ -1262,126 +1560,118 @@ fn check(
     Ok(())
 }
 
-// ───────────────────────────── answer ─────────────────────────────
+// ───────────────────────────── commit / observe ─────────────────────────────
 
-fn miss(root: &Path, harness: Option<&str>, session: Option<&str>, reason: &str, started: Instant) -> Result<()> {
+fn miss(root: &Path, session: Option<&str>, class: &str, reason: &str, started: Instant) -> Result<()> {
     let _ = store::event(
         root,
-        json!({"event": "answer", "outcome": "miss", "harness": harness, "session": session,
+        json!({"event": "commit", "outcome": "miss", "session": session, "class": class,
                "reason": reason, "secs": started.elapsed().as_secs_f64()}),
     );
-    eprintln!("precompact answer: miss: {reason}");
+    eprintln!("precompact commit: miss ({class}): {reason}");
     std::process::exit(MISS_EXIT);
 }
 
-fn answer(harness: Option<String>, no_tail_pass: bool, model: Option<String>) -> Result<()> {
+/// The commit: inside the harness's compaction, check the session's ready record against the
+/// conversation the harness is about to compact, and hand back the summary and where the kept
+/// messages start. Every miss exits 3; the harness then compacts as its own.
+fn commit(serve: Option<String>, harness: Option<String>) -> Result<()> {
     let started = Instant::now();
     let root = store::root()?;
+    let settings = cv_core::config::load().precompact.unwrap_or_default();
+    let serve = match serve {
+        Some(s) => s.parse::<pc::Serve>().or_else(usage)?,
+        None => settings.serve,
+    };
     let mut text = String::new();
-    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).context("reading the request on stdin")?;
-    let input: Value = serde_json::from_str(&text).context("the request on stdin is not JSON")?;
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).context("reading the compaction on stdin")?;
+    let input: Value = serde_json::from_str(&text).context("the compaction on stdin is not JSON")?;
     drop(text);
     let view = pc::RequestView::parse(&input)?;
     drop(input);
-    let harness = harness.or_else(|| view.harness.clone());
-    let Some(session) = view.session.clone() else {
-        return miss(&root, harness.as_deref(), None, "the request names no session", started);
+    let Some(session) = view.session.as_ref().map(|s| s.id.clone()) else {
+        return miss(&root, None, "no_session", "the compaction names no session", started);
     };
-    // Every compaction request through here teaches cv its harness's instruction.
-    if let (Some(ins), Some(h)) = (&view.instruction, &harness) {
-        let profile = pc::Profile {
-            id: pc::profile_id(&ins.text),
-            harness: h.clone(),
-            client: view.client.clone(),
-            captured: chrono::Utc::now(),
-            text: ins.text.clone(),
-        };
-        if let Ok(true) = store::save_profile(&root, &profile) {
-            eprintln!("precompact answer: captured {h} profile {}", profile.id);
-        }
+    if serve == pc::Serve::Native {
+        return miss(
+            &root,
+            Some(&session),
+            "serve_native",
+            "this seat serves the harness's own compaction",
+            started,
+        );
     }
-    let record = match &harness {
-        Some(h) => store::load_record(&root, h, &session.id)?,
-        None => store::records(&root, None)?
-            .into_iter()
-            .map(|(_, r)| r)
-            .find(|r| r.session == session.id),
-    };
-    let Some(record) = record else {
+    let harness = harness
+        .or_else(|| view.harness.clone())
+        .unwrap_or_else(|| "claude".into());
+    let Some(record) = store::load_record(&root, &harness, &session)? else {
         return miss(
             &root,
-            harness.as_deref(),
-            Some(&session.id),
-            "no precomputed summary for this session",
+            Some(&session),
+            "no_record",
+            "no ready summary for this session",
             started,
         );
     };
-    let matched = match pc::validate(&view, &record) {
-        Ok(m) => m,
-        Err(why) => {
-            return miss(
-                &root,
-                Some(&record.harness),
-                Some(&session.id),
-                &why.to_string(),
-                started,
-            )
-        }
+    let budget = record
+        .compact_at
+        .or(settings.compact_at)
+        .map(|c| (c as f64 * settings.fit_fraction) as u64);
+    let c = match pc::commit(&view, &record, budget) {
+        Ok(c) => c,
+        Err(why) => return miss(&root, Some(&session), why.class(), &why.to_string(), started),
     };
-    let tail = view.tail(matched.tail_from);
-    let mut tail_secs = None;
-    let text = if tail.is_empty() {
-        record.text.clone()
-    } else if no_tail_pass {
-        return miss(
-            &root,
-            Some(&record.harness),
-            Some(&session.id),
-            &format!("{} message(s) follow the cut and --no-tail-pass is set", tail.len()),
-            started,
-        );
-    } else {
-        let settings = cv_core::config::load().precompact.unwrap_or_default();
-        let model = model.or(settings.model.clone());
-        let pass = Instant::now();
-        let turns = prompt::tail(&record.text, &tail, settings.tool_result_bytes);
-        match crate::llm::complete(model.as_deref(), &turns, TAIL_MAX_TOKENS, TAIL_TIMEOUT) {
-            Ok((update, _)) => {
-                tail_secs = Some(pass.elapsed().as_secs_f64());
-                prompt::splice(&record.text, &update)
-            }
-            Err(e) => {
-                return miss(
-                    &root,
-                    Some(&record.harness),
-                    Some(&session.id),
-                    &format!("the tail pass failed: {e:#}"),
-                    started,
-                )
-            }
-        }
-    };
+    let anchor = record.key.as_ref().map(|k| k.anchor.as_str()).unwrap_or("");
+    let summary = format!(
+        "This session continues from an earlier conversation that cv compacted (session {session}, \
+         summarized through message {anchor}). Any [m:ID] below opens in full with \
+         `cv show {session} --around ID`.\n\n{}",
+        record.text
+    );
+    let out = json!({"outcome": "served", "summary": summary, "keep_from": c.keep_from,
+                     "anchors": c.anchors, "tokens": c.tokens, "anchor": anchor,
+                     "created": record.created, "model": record.model});
     use std::io::Write as _;
-    let mut out = std::io::stdout().lock();
-    out.write_all(text.as_bytes())?;
-    out.flush()?;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &out)?;
+    stdout.flush()?;
     let _ = store::event(
         &root,
-        json!({"event": "answer", "outcome": "served", "harness": record.harness, "session": session.id,
-               "session_source": session.source, "anchors": matched.anchors, "tail_messages": tail.len(),
-               "tail_pass_secs": tail_secs, "record_cut_tokens": record.cut.tokens,
+        json!({"event": "commit", "outcome": "served", "harness": harness, "session": session,
+               "anchor": anchor, "anchors": c.anchors, "keep_from": c.keep_from,
+               "messages": view.messages.len(), "tokens": c.tokens,
+               "record_cut_tokens": record.cut.tokens, "summary_bytes": summary.len(),
                "record_age_secs": (chrono::Utc::now() - record.created).num_seconds(),
-               "text_bytes": text.len(), "secs": started.elapsed().as_secs_f64()}),
+               "secs": started.elapsed().as_secs_f64()}),
     );
     eprintln!(
-        "precompact answer: served {} ({} anchors, {} tail message(s){}) in {:.2}s",
-        short_id(&session.id),
-        matched.anchors,
-        tail.len(),
-        tail_secs.map_or(String::new(), |s| format!(", tail pass {s:.1}s")),
+        "precompact commit: served {} ({} commitments, {} of {} message(s) kept) in {:.2}s",
+        short_id(&session),
+        c.anchors,
+        view.messages.len().saturating_sub(c.keep_from),
+        view.messages.len(),
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// One compaction as a harness plugin saw it, appended as a `compacted` event: which method
+/// served (`cv` or `native`), its wall time, the tokens before and after, what was kept and
+/// carried, and the commit's miss when cv was asked and missed.
+fn observe() -> Result<()> {
+    let root = store::root()?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).context("reading the observation on stdin")?;
+    let Value::Object(mut row) = serde_json::from_str::<Value>(&text).context("the observation is not JSON")? else {
+        return usage("the observation on stdin is not a JSON object");
+    };
+    for key in ["session", "method"] {
+        if !row.get(key).is_some_and(Value::is_string) {
+            return usage(format!("the observation has no `{key}`"));
+        }
+    }
+    row.insert("event".into(), "compacted".into());
+    store::event(&root, Value::Object(row))
 }
 
 // ───────────────────────────── profiles, ls, report ─────────────────────────────
@@ -1434,6 +1724,7 @@ fn ls(json: bool) -> Result<()> {
             .iter()
             .map(|(path, r)| {
                 json!({"harness": r.harness, "session": r.session, "cut": r.cut, "window": r.window,
+                       "key": r.key, "ready": r.key.as_ref().is_some_and(pc::Key::admits_now),
                        "anchors": r.anchors.len(), "profile": r.profile, "model": r.model,
                        "created": r.created, "text_bytes": r.text.len(), "path": path})
             })
@@ -1468,6 +1759,10 @@ fn median(v: &mut [u64]) -> Option<u64> {
     Some(v[v.len() / 2])
 }
 
+/// The comparison the serve setting is chosen by: per method (cv's, the harness's precompute, the
+/// harness's own), the stall and the tokens before and after, from the transcript's own
+/// compaction records (the follower's `compaction` events, attributed to cv when a commit served
+/// the session since its last compaction) and from the harness plugin's `compacted` events.
 fn report(json_out: bool) -> Result<()> {
     let root = store::root()?;
     let text = match std::fs::read_to_string(root.join("events.jsonl")) {
@@ -1475,87 +1770,110 @@ fn report(json_out: bool) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
     };
-    // Per session, the newest answer outcome since its last compaction decides how the next
-    // compaction was served.
-    let mut last_answer: HashMap<String, String> = HashMap::new();
-    let mut stalls: HashMap<&'static str, Vec<u64>> = HashMap::new();
+    const METHODS: [&str; 3] = ["cv", "native precompute", "native"];
+    #[derive(Default)]
+    struct Col {
+        ms: Vec<u64>,
+        before: Vec<u64>,
+        after: Vec<u64>,
+        carried: Vec<u64>,
+    }
+    let take = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64);
+    // Per session, the newest commit outcome since its last compaction decides who served it.
+    let mut last_commit: HashMap<String, String> = HashMap::new();
+    let mut transcript: HashMap<&'static str, Col> = HashMap::new();
+    let mut plugin: HashMap<&'static str, Col> = HashMap::new();
     let (mut served, mut missed, mut written) = (0u64, 0u64, 0u64);
-    let mut reasons: HashMap<String, u64> = HashMap::new();
-    let mut tail_secs = Vec::new();
+    let mut classes: HashMap<String, u64> = HashMap::new();
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let session = v.get("session").and_then(Value::as_str).unwrap_or("").to_owned();
         match v.get("event").and_then(Value::as_str) {
-            Some("answer") => {
+            Some("commit") => {
                 let outcome = v.get("outcome").and_then(Value::as_str).unwrap_or("").to_owned();
                 if outcome == "served" {
                     served += 1;
-                    if let Some(s) = v.get("tail_pass_secs").and_then(Value::as_f64) {
-                        tail_secs.push((s * 1000.0) as u64);
-                    }
                 } else {
                     missed += 1;
-                    let reason = v.get("reason").and_then(Value::as_str).unwrap_or("");
-                    let class = reason
-                        .split(':')
-                        .next()
-                        .unwrap_or(reason)
-                        .chars()
-                        .take(60)
-                        .collect::<String>();
-                    *reasons.entry(class).or_default() += 1;
+                    let class = v.get("class").and_then(Value::as_str).unwrap_or("other");
+                    *classes.entry(class.to_owned()).or_default() += 1;
                 }
-                last_answer.insert(session, outcome);
+                last_commit.insert(session, outcome);
             }
             Some("written") => written += 1,
             Some("compaction") => {
-                let method = if v.get("native").and_then(Value::as_bool) == Some(true) {
-                    "native precompute"
-                } else if last_answer.get(&session).map(String::as_str) == Some("served") {
-                    "cv precompact"
+                let method = if last_commit.get(&session).map(String::as_str) == Some("served") {
+                    METHODS[0]
+                } else if v.get("native").and_then(Value::as_bool) == Some(true) {
+                    METHODS[1]
                 } else {
-                    "harness's own"
+                    METHODS[2]
                 };
-                last_answer.remove(&session);
-                if let Some(ms) = v.get("duration_ms").and_then(Value::as_u64) {
-                    stalls.entry(method).or_default().push(ms);
-                }
+                last_commit.remove(&session);
+                let col = transcript.entry(method).or_default();
+                col.ms.extend(take(&v, "duration_ms"));
+                col.before.extend(take(&v, "pre_tokens"));
+                col.after.extend(take(&v, "post_tokens"));
+            }
+            Some("compacted") => {
+                let method = match v.get("method").and_then(Value::as_str) {
+                    Some("cv") => METHODS[0],
+                    _ if v.get("precomputed").and_then(Value::as_bool) == Some(true) => METHODS[1],
+                    _ => METHODS[2],
+                };
+                let col = plugin.entry(method).or_default();
+                col.ms.extend(take(&v, "ms"));
+                col.before.extend(take(&v, "tokens_before"));
+                col.after.extend(take(&v, "tokens_after"));
+                col.carried.extend(take(&v, "summary_bytes"));
             }
             _ => {}
         }
     }
-    let rows: Vec<Value> = ["cv precompact", "native precompute", "harness's own"]
-        .iter()
-        .map(|m| {
-            let mut v = stalls.get(m).cloned().unwrap_or_default();
-            json!({"method": m, "compactions": v.len(), "median_ms": median(&mut v), "max_ms": v.iter().max()})
-        })
-        .collect();
-    let out = json!({"summaries_written": written, "answers_served": served, "answers_missed": missed,
-                     "miss_reasons": reasons, "tail_pass_median_ms": median(&mut tail_secs), "stalls": rows});
+    let rows = |source: &str, cols: &mut HashMap<&'static str, Col>| -> Vec<Value> {
+        METHODS
+            .iter()
+            .map(|m| {
+                let mut c = cols.remove(m).unwrap_or_default();
+                json!({"source": source, "method": m, "compactions": c.ms.len().max(c.after.len()),
+                       "median_ms": median(&mut c.ms), "max_ms": c.ms.iter().max(),
+                       "median_tokens_before": median(&mut c.before),
+                       "median_tokens_after": median(&mut c.after),
+                       "median_summary_bytes": median(&mut c.carried)})
+            })
+            .collect()
+    };
+    let mut stalls = rows("transcript", &mut transcript);
+    stalls.extend(rows("plugin", &mut plugin));
+    let out = json!({"summaries_written": written, "commits_served": served, "commits_missed": missed,
+                     "miss_classes": classes, "methods": stalls});
     if json_out {
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
-    println!("summaries written {written} · answers served {served} · missed {missed}");
-    for (reason, n) in &reasons {
-        println!("  miss {n}× {reason}");
+    println!("summaries written {written} · commits served {served} · missed {missed}");
+    for (class, n) in &classes {
+        println!("  miss {n}× {class}");
     }
-    for row in rows {
+    let num = |v: &Value| v.as_u64().map_or("-".into(), fmt_int);
+    for row in stalls {
         println!(
-            "{:<18} {:>4} compaction(s) · median {} · max {}",
+            "{:<10} {:<18} {:>4} compaction(s) · stall median {} · max {} · tokens {} -> {}",
+            row["source"].as_str().unwrap_or(""),
             row["method"].as_str().unwrap_or(""),
             row["compactions"],
             row["median_ms"].as_u64().map_or("-".into(), crate::util::fmt_duration),
             row["max_ms"].as_u64().map_or("-".into(), crate::util::fmt_duration),
+            num(&row["median_tokens_before"]),
+            num(&row["median_tokens_after"]),
         );
     }
     Ok(())
 }
 
-// ───────────────────────────── swap (no proxy) ─────────────────────────────
+// ───────────────────────────── swap: an explicit new session ─────────────────────────────
 
 fn swap(id: &str, harness: Option<Harness>, dry_run: bool) -> Result<()> {
     let (r, adapter) = crate::cmd::distill::resolve_source(id, harness)?;
@@ -1611,6 +1929,12 @@ fn swap(id: &str, harness: Option<Harness>, dry_run: bool) -> Result<()> {
         copy.bytes.as_slice(),
         cv_core::publish::Claim::New,
     )?;
+    // A swap is a new run: its lineage is recorded, or it is lost.
+    let _ = store::event(
+        &root,
+        json!({"event": "swap", "harness": r.harness.as_str(), "parent": r.id, "session": copy.id,
+               "anchor": cut_id, "carried": copy.carried}),
+    );
     println!("{}", copy.path.display());
     for line in crate::cmd::port::resume_lines(r.harness, &copy.id, r.cwd.as_deref()) {
         eprintln!("  {line}");

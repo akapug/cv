@@ -153,6 +153,27 @@ pub fn segments(text: &str) -> Vec<String> {
     out
 }
 
+/// `text` with its harness markup elements cut out (the elements [`segments`] cuts at), the rest
+/// as written: a prompt as the person typed it, without the reminders a harness put around it.
+pub fn without_markup(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut start, mut i) = (0, 0);
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some(end) = element_end(text, i) {
+                out.push_str(&text[start..i]);
+                start = end;
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&text[start..]);
+    out
+}
+
 /// When an element `<name ...>…</name>` opens at `at`, the byte after its close tag.
 fn element_end(text: &str, at: usize) -> Option<usize> {
     let rest = &text[at + 1..];
@@ -229,6 +250,10 @@ mod tests {
         // Short pieces are dropped.
         assert!(segments("ok").is_empty());
         assert!(segments("<task-notification><id>1</id></task-notification>").is_empty());
+        assert_eq!(
+            without_markup("ship it <system-reminder>noise</system-reminder>\n  today"),
+            "ship it \n  today"
+        );
     }
 
     #[test]

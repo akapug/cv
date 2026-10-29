@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- `cv watch --kind precompact` writes a live session's compaction summary before its harness asks for it, and its actions answer the harness's compaction request from it (`now`, `answer`, `check`, `profile`, `ls`, `report`, `swap`). A summary is served only when the request's own history holds every prose and tool-call anchor it was cut at, in order; anything after the cut gets one tail pass. It stays idle on a session whose harness precomputes its own compactions. Design and measurements: `docs/design/PRECOMPACT.md`.
+- `cv watch --kind precompact`: compaction summaries written before the harness compacts, served inside its own compaction (`commit`), compared by `report`.
+- Summaries carry the person's rulings, promises, terms, setup facts and identifiers verbatim between generations; quotes are checked against the cited message.
+- `integrations/claude-code/cv-compact`: a Claude Code plugin serving cv's summary on `session.compact`, Claude Code's own on any miss.
 - `watch::wake`: an inotify + eventfd wake for resident followers (a timer off Linux).
 - `Adapter::native_precompaction` and `Adapter::compacted_copy` (Claude Code; `None` elsewhere).
 - `LMSTUDIO_API_KEY`: sent as a bearer token to the `LMSTUDIO_API_BASE` server when set, so an OpenAI-compatible proxy that asks for a key can be the model.

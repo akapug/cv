@@ -51,6 +51,7 @@ fn record_at(w: &Window) -> Record {
         v: RECORD_VERSION,
         harness: "claude".into(),
         session: "s".into(),
+        key: None,
         window: WindowRef {
             boundaries: w.boundaries.len(),
             start: w.start,
@@ -61,7 +62,10 @@ fn record_at(w: &Window) -> Record {
         model: "m".into(),
         created: chrono::Utc::now(),
         base: None,
+        compact_at: None,
         bounds: Vec::new(),
+        narrative: String::new(),
+        carry: Default::default(),
         text: "<summary>S</summary>".into(),
     }
 }
@@ -317,4 +321,114 @@ fn a_turn_that_drew_an_error_leaves_the_fingerprint() {
     .unwrap();
     let m = validate(&view, &record).unwrap();
     assert_eq!(m.tail_from, 4);
+}
+
+/// The `session.compact` input for the conversation of [`session`], with the first reply's tool
+/// call `toolu_X` answered by the message after it.
+fn event(extra: serde_json::Value) -> RequestView {
+    let mut messages = vec![
+        json!({"role": "user", "text": "please refactor the parser module", "toolUses": []}),
+        json!({"role": "assistant", "text": "I will refactor the parser module now.",
+               "toolUses": [{"tool_use_id": "toolu_X", "tool": "Bash"}]}),
+        json!({"role": "user", "text": "", "toolUses": [], "toolResults": [{"tool_use_id": "toolu_X"}], "bytes": 400}),
+        json!({"role": "assistant", "text": "The parser is refactored and the tests pass.", "toolUses": []}),
+    ];
+    if let serde_json::Value::Array(more) = extra {
+        messages.extend(more);
+    }
+    RequestView::parse(&json!({"session": "s", "trigger": "auto", "messages": messages})).unwrap()
+}
+
+/// A record cut after the first reply's tool call, keyed by a transcript file in a scratch dir.
+fn keyed(dir: &std::path::Path) -> Record {
+    let mut a1 = reply("a1", "I will refactor the parser module now.", 1000);
+    call(&mut a1, "toolu_X");
+    let msgs = vec![
+        text(
+            Role::User,
+            MessageKind::Prompt,
+            "u1",
+            "please refactor the parser module",
+        ),
+        a1,
+    ];
+    let mut record = record_at(&window(&msgs));
+    let source = dir.join("s.jsonl");
+    std::fs::write(&source, "{\"uuid\":\"u1\"}\n{\"uuid\":\"a1\"}\n").unwrap();
+    record.key = Key::take(&source, "a1".into());
+    record
+}
+
+#[test]
+fn a_commit_keeps_whole_tool_groups() {
+    let dir = std::env::temp_dir().join(format!("cv-precompact-commit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = keyed(&dir);
+    assert!(record.cut.clean);
+    // The cut is the call; its result is the first message after the cut, so the kept
+    // messages start at the call, never at an answer to a call the summary covers.
+    let c = commit(&event(json!([])), &record, None).unwrap();
+    assert_eq!((c.keep_from, c.anchors), (1, 3));
+    // The transcript grew since the cut: still the same file, still committed.
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("s.jsonl"))
+        .unwrap()
+        .write_all(b"{\"uuid\":\"a2\"}\n")
+        .unwrap();
+    assert!(commit(&event(json!([])), &record, None).is_ok());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_commit_misses_on_each_stale_or_unfit_candidate() {
+    let dir = std::env::temp_dir().join(format!("cv-precompact-miss-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = keyed(&dir);
+    let view = event(json!([]));
+
+    let mut unkeyed = record.clone();
+    unkeyed.key = None;
+    assert_eq!(commit(&view, &unkeyed, None), Err(Miss::NoKey));
+
+    let mut old = record.clone();
+    old.created = chrono::Utc::now() - chrono::Duration::days(8);
+    assert!(matches!(commit(&view, &old, None), Err(Miss::TooOld { .. })));
+
+    let mut focused = event(json!([]));
+    focused.focus = Some("keep only the writer plan".into());
+    assert_eq!(commit(&focused, &record, None), Err(Miss::Focus));
+
+    // A covered message changed in the conversation the harness is compacting.
+    let mut changed = event(json!([]));
+    changed.messages[1].texts[0] = "An answer that was never given, after a rewind.".into();
+    assert!(matches!(commit(&changed, &record, None), Err(Miss::Anchor { .. })));
+
+    // The kept call, its 400-byte result and the reply do not fit in 10 tokens.
+    assert!(matches!(
+        commit(&view, &record, Some(10)),
+        Err(Miss::WouldNotFit { budget: 10, .. })
+    ));
+
+    // The transcript was rewritten under the sampled bytes: the checkpoint refuses it.
+    std::fs::write(dir.join("s.jsonl"), "{\"uuid\":\"zz\"}\n{\"uuid\":\"a1\"}\n").unwrap();
+    assert_eq!(commit(&view, &record, None), Err(Miss::Checkpoint));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn the_window_carries_the_persons_words_without_markup() {
+    let w = window(&[
+        text(
+            Role::User,
+            MessageKind::Prompt,
+            "u1",
+            "ship the port <system-reminder>noise</system-reminder>",
+        ),
+        reply("a1", "Shipping it.", 10),
+    ]);
+    assert_eq!(w.prompts.len(), 1);
+    assert_eq!(w.prompts[0].1.text, "ship the port ");
+    assert_eq!(w.prompts[0].1.id.as_deref(), Some("u1"));
 }

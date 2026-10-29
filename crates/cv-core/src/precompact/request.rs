@@ -1,9 +1,12 @@
-//! A model request as the harness sent it, read for what precompaction needs: whose session it
-//! is, which text is the compaction instruction, and the conversation's prose in order.
+//! The conversation a harness is about to compact, read for what precompaction needs: whose
+//! session it is, which text is the compaction instruction, and the conversation's prose in order.
 //!
-//! Three wire shapes are read by structure, not by vendor: Anthropic Messages (`messages[]` with
-//! string or block `content`), OpenAI Responses (`input[]` items) and OpenAI Chat Completions
-//! (`messages[]`). Tool calls, tool results and images are counted, never read as prose.
+//! The commit reads Claude Code's `session.compact` plugin event input (`{session, trigger,
+//! instructions, messages: [{role, text, toolUses, toolResults, bytes}]}`), which a cv plugin hands
+//! it inside the harness's compaction. The replay (`check`) also reads three captured wire shapes
+//! by structure, not by vendor: Anthropic Messages (`messages[]` with string or block `content`),
+//! OpenAI Responses (`input[]` items) and OpenAI Chat Completions (`messages[]`). Tool calls, tool
+//! results and images are counted, never read as prose.
 
 use serde_json::Value;
 
@@ -21,6 +24,11 @@ pub struct Message {
     pub notes: Vec<String>,
     /// Tool call ids in order, each with the number of `texts` before it.
     pub calls: Vec<(usize, String)>,
+    /// The call ids of the tool results it carries.
+    pub results: Vec<String>,
+    /// Its size in bytes as the caller counted it (the plugin's `bytes`), else its texts and
+    /// notes: what the commit's fit estimate adds up for the kept messages.
+    pub bytes: usize,
 }
 
 /// The compaction instruction: which text block of which message carries it.
@@ -49,6 +57,8 @@ pub struct RequestView {
     pub client: Option<String>,
     /// The harness the caller named, if it named one.
     pub harness: Option<String>,
+    /// The compaction's own instructions (`/compact <focus>`), when it is a compaction event.
+    pub focus: Option<String>,
 }
 
 /// The request's prose as one normalized stream, and which message each stretch came from.
@@ -125,6 +135,8 @@ fn blocks(role: String, content: &Value, text_types: &[&str]) -> Message {
         other: 0,
         notes: Vec::new(),
         calls: Vec::new(),
+        results: Vec::new(),
+        bytes: 0,
     };
     match content {
         Value::String(s) => m.texts.push(s.clone()),
@@ -154,6 +166,43 @@ impl Message {
         if let Some(id) = call_id(part, kind) {
             self.calls.push((self.texts.len(), id));
         }
+        let answered = match kind {
+            "tool_result" => part.get("tool_use_id"),
+            "function_call_output" | "custom_tool_call_output" => part.get("call_id"),
+            _ => None,
+        };
+        if let Some(id) = answered.and_then(Value::as_str) {
+            self.results.push(id.to_owned());
+        }
+    }
+
+    /// A `session.compact` message: `{role, text, toolUses: [{tool_use_id, tool}], toolResults:
+    /// [{tool_use_id}], bytes}`. Its text is one block; its calls follow it.
+    fn from_event(m: &Value) -> Message {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user").to_owned();
+        let mut message = blocks(role, &Value::Null, &[]);
+        if let Some(text) = m.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+            message.texts.push(text.to_owned());
+        }
+        for call in m.get("toolUses").and_then(Value::as_array).into_iter().flatten() {
+            message.other += 1;
+            let name = call.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            message.notes.push(format!("[tool call: {name}]"));
+            if let Some(id) = call.get("tool_use_id").and_then(Value::as_str) {
+                message.calls.push((message.texts.len(), id.to_owned()));
+            }
+        }
+        for result in m.get("toolResults").and_then(Value::as_array).into_iter().flatten() {
+            message.other += 1;
+            message.notes.push("[tool result]".into());
+            if let Some(id) = result.get("tool_use_id").and_then(Value::as_str) {
+                message.results.push(id.to_owned());
+            }
+        }
+        if let Some(bytes) = m.get("bytes").and_then(Value::as_u64) {
+            message.bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+        }
+        message
     }
 }
 
@@ -199,6 +248,10 @@ impl RequestView {
             }
         } else if let Some(messages) = body.get("messages").and_then(Value::as_array) {
             for m in messages {
+                if m.get("content").is_none() && (m.get("text").is_some() || m.get("toolUses").is_some()) {
+                    view.messages.push(Message::from_event(m));
+                    continue;
+                }
                 let role = m.get("role").and_then(Value::as_str).unwrap_or("user").to_owned();
                 let mut message = blocks(role, m.get("content").unwrap_or(&Value::Null), &["text"]);
                 // Chat Completions carries tool calls beside the content, after it.
@@ -210,10 +263,29 @@ impl RequestView {
                         message.calls.push((message.texts.len(), id.to_owned()));
                     }
                 }
+                if let Some(id) = m.get("tool_call_id").and_then(Value::as_str) {
+                    message.results.push(id.to_owned());
+                }
                 view.messages.push(message);
             }
         } else {
             anyhow::bail!("not a model request: neither `messages` nor `input` is an array");
+        }
+        for m in &mut view.messages {
+            if m.bytes == 0 {
+                m.bytes = m.texts.iter().chain(&m.notes).map(String::len).sum();
+            }
+        }
+        // A compaction event (it names its trigger) is the transcript itself: no instruction
+        // block is appended to it; its own instructions are the focus.
+        if body.get("trigger").and_then(Value::as_str).is_some() {
+            view.focus = body.get("instructions").and_then(Value::as_str).map(str::to_owned);
+            view.session = body.get("session").and_then(Value::as_str).map(|id| SessionId {
+                id: id.to_owned(),
+                source: "event".into(),
+            });
+            view.harness = body.get("harness").and_then(Value::as_str).map(str::to_owned);
+            return Ok(view);
         }
 
         let headers = envelope.and_then(|e| e.get("headers")).and_then(Value::as_object);
@@ -406,6 +478,32 @@ mod tests {
         let view = RequestView::parse(&enveloped).unwrap();
         assert_eq!(view.session.unwrap().source, "header:x-claude-code-session-id");
         assert_eq!(view.client.as_deref(), Some("claude-cli/2"));
+    }
+
+    #[test]
+    fn a_compaction_event_is_the_transcript_with_no_instruction() {
+        let event = json!({
+            "session": "s-2", "trigger": "auto", "instructions": "keep the parser plan",
+            "messages": [
+                {"role": "user", "text": "please refactor the parser", "toolUses": []},
+                {"role": "assistant", "text": "On it.", "toolUses": [{"tool_use_id": "t1", "tool": "Bash"}], "bytes": 900},
+                {"role": "user", "text": "", "toolUses": [], "toolResults": [{"tool_use_id": "t1"}]}
+            ]
+        });
+        let view = RequestView::parse(&event).unwrap();
+        assert!(
+            view.instruction.is_none(),
+            "the last user text is conversation, not an instruction"
+        );
+        assert_eq!(view.focus.as_deref(), Some("keep the parser plan"));
+        assert_eq!(view.session.as_ref().unwrap().id, "s-2");
+        assert_eq!(view.messages[1].calls, vec![(1, "t1".to_owned())]);
+        assert_eq!(view.messages[1].bytes, 900);
+        assert_eq!(view.messages[2].results, vec!["t1".to_owned()]);
+        assert_eq!(
+            String::from_utf8(view.prose().text).unwrap(),
+            "please refactor the parser On it. \u{1}call t1\u{1}"
+        );
     }
 
     #[test]

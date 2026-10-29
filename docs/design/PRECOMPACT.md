@@ -1,15 +1,22 @@
-# Precompaction: a compaction summary written before the harness asks
+# Precompaction: cv's compaction, inside the harness's own
 
-Status: built on a fork lane and measured on our own fleet (2026-10-28), offered as input for
-v19's watching and live ingestion. This page says what we built, why it has the shape it has,
-and what real use measured. Paths are relative to `crates/`.
+Status: built on akapug's fleet (2026-10-28, reshaped to the 0.19 design record 2026-10-29).
+Paths are relative to `crates/`. The 0.19 record is `docs/design/0.19/`; its REVIEW-ASTRA §3
+handoff (prepare, ready, commit, miss) is the shape this page follows.
+
+## The goal
+
+A compaction cv controls end to end, measured against the harness's own. Claude Code's native
+compaction (its background precompute included) is the baseline: it serves a seat for as long as
+it measures better. A per-seat setting chooses which one serves; `report` is the comparison that
+setting is chosen by. cv starts from what it alone has: the whole transcript, so a summary can
+carry pointers back into it (`[m:ID]`, opened with `cv show <session> --around ID`) instead of
+retelling it.
 
 ## The stall
 
-When a harness's context window fills, it stops the session, sends the whole window to a model
-with its own summary instruction, and waits. Measured from the `compact_boundary` records'
-`compactMetadata.durationMs` in 31 transcripts on our fleet (5,159 compactions, 2026-06-27 to
-2026-10-28):
+From the `compact_boundary` records' `compactMetadata.durationMs` in 31 transcripts on our fleet
+(5,159 compactions, 2026-06-27 to 2026-10-28):
 
 | Seats | Compactions | Median | p90 |
 |---|---|---|---|
@@ -18,358 +25,181 @@ with its own summary instruction, and waits. Measured from the `compact_boundary
 | Claude Code on Anthropic models, auto, `precomputed: true` | 212 | 0.12 s | 78 s |
 | Claude Code, manual `/compact` | 51 | 108 s (Anthropic), 168 s (codex) | |
 
-The third row is Claude Code's own precompute (feature `tengu_sepia_moth`): the summary is
-written in the background before the window fills, and the stall is gone when it is current. It
-is the reference this work measures itself against, and on a seat where it is on, cv stays out of
-the way (see "One method per seat").
+The third row is Claude Code's native precompute: the latency to beat is already near zero where
+it is on, so cv has to win on what the compaction keeps.
 
-## What we built
+## The handoff
 
-`cv watch --kind precompact` keeps a summary of every live session's current window, written
-early and kept current, and answers the harness's compaction request from it when the request
-proves to be the same conversation. Three parts:
-
-1. **`cv_core::precompact`** (`cv-core/src/precompact*`): pure and unit-tested. A record
-   (`Record`: session, window, cut, anchors, instruction profile, model, text), a window tracker
-   (`Window`) fed the IR message stream, the anchor fingerprint and `validate(request, record)`,
-   the summary prompts, and a file store under `$CLUSTERVISION_HOME/precompact/`. No harness
-   name appears in it; the two harness facts it needs are `Adapter` methods.
-2. **`cv watch --kind precompact`** (`cv/src/cmd/precompact.rs`): one resident process on the existing
-   `Watcher`. It reads each live session's appended records, tracks its window and token fill,
-   writes the first summary at 70% of the auto-compact point, and extends it as the session
-   grows or goes idle. Summaries are written by `cv-llm` (the `LMSTUDIO_API_BASE` provider, so a
-   local model or our proxy's OpenAI-compatible endpoint; the model is a setting, and cv-llm's
-   egress notice is printed).
-3. **`cv watch --kind precompact answer`**: the request on stdin, the summary on stdout, exit 3 with the reason
-   on stderr on a miss. A proxy (or any other caller) runs it on a detected compaction request
-   and falls through to its normal route on a miss, an error or a timeout. Our CLIProxyAPI fork
-   does this in one handler (`claude-code.compaction.precompact.command`).
-
-Also: `now` (write one session's summary now), `check` (one request against one session, a JSON
-verdict, no model call), `profile import|ls`, `ls`, `report` (stall medians by method, served and
-missed counts, miss reasons) and `swap` (the fallback below).
-
-### The CLI follows 0.19's D4
-
-The first build had a top-level `cv precompact` verb (`watch`, `now`, `answer`, …). The 0.19
-design record's D4 says "no `cv precompact` verb; a `cv watch` consumer + `--kind precompact`",
-so the verb is gone and the same engine is `cv watch --kind precompact`: without an action it is
-the follower (`--dry-run`, `--for`, the threshold flags), and the one-shot tools are its actions
-(`cv watch --kind precompact answer`, `now`, `check`, `profile`, `ls`, `report`, `swap`).
-`cv watch` without `--kind` is the archive watch, as before. A proxy configured with the old
-command names `cv watch --kind precompact answer` now. The measurements below ran under the old
-spelling (`cv precompact check`, `cv precompact now`, …); only the name moved. `--kind precompact`
-on `show` and the API (the rest of D4) is not built.
-
-### Never a stale summary
-
-A summary is served only when the request the harness actually sent contains, in order, every
-anchor the summary was cut at. Anchors are the parts of a conversation a harness does not
-rewrite when it builds a request:
-
-- **Prose**: what the person typed and what the model said, cut into segments at harness markup
-  (`<name …>…</name>` with a lowercase name, cut by shape, not by a tag list), whitespace
-  normalized, segments under 12 bytes dropped. Tool output, images, thinking, injected context
-  (system reminders, task notifications) and harness notices are not anchors: a harness
-  truncates, strips, injects and merges those.
-- **Tool call ids**: the id the provider gave each call, which every later request echoes
-  (`tool_use.id`, Responses `call_id`, Chat Completions `tool_calls[].id`). A window of tool work
-  with little prose would otherwise pin its cut only at the last sentence the model wrote; the
-  first replay below had a codex seat whose last anchor sat 116 messages before its cut.
-
-An anchor is kept as a length, a rolling hash and a SHA-256 prefix, never as text. Matching is
-Rabin-Karp over the request's normalized prose with the SHA confirming a hit, O(request prose +
-anchor bytes). The summary's instruction is part of the match too: a summary written to one
-instruction (a captured "profile") is not served for a request carrying another.
-
-On a match, the messages after the last anchor are the tail. An empty tail serves the summary as
-written. A non-empty tail gets one fast-model pass over the tail only, spliced into the summary
-under "Since the summary above". A miss names the first anchor that was not found.
-
-### What the watch costs
-
-Measured from `/proc` on our hub (a host at load 50-70, the watch at nice 19) with `--dry-run`,
-which reads and tracks exactly as a real watch and makes no model calls:
-
-| | wall | CPU | RSS |
-|---|---|---|---|
-| startup and priming: discovery in a fresh `CLUSTERVISION_HOME`, then 9 live sessions read whole (the largest 2.28 GB) | 71 s | 153 s | 84 MiB |
-| at rest, nothing followed (`--cwd` matching nothing), the rest of the fleet writing | 300 s | 0.41 s (0.14%) | 28 MiB |
-| following 9 live sessions, between retries of the largest | 120 s | 0.04 s | 90-95 MiB |
-| following 9 live sessions, 10 minutes | 600 s | 155 s (26%) | 84-107 MiB |
-
-The watch sleeps in `inotify` on 544 directories (each store root down to where sessions live,
-so a session in a new project is followed within a second). A write to a file it does not follow
-is looked up once and then costs a wake and a set lookup; the 0.41 s at rest is those lookups
-for the sessions other seats started in those 5 minutes (an earlier build that watched only the
-store root measured 0.00 s in the same 5 minutes).
-
-Everything above the plateau is the 2.28 GB transcript of the seat that ran the measurement,
-written to several times a minute: its read never completed (item 6 under "What v19's watching
-would need"), so each retry reread it whole, 15-35 s of CPU. The retry doubles from 5 s to 10
-minutes, so that one session settled at one whole read per 10 minutes; every other session cost
-a resumed read of its appended lines.
-
-**After the append-only read (item 6).** The same measurement, run again on the hub with both
-builds side by side over the same 10 minutes (each a dry run at nice 19 in its own warmed
-`CLUSTERVISION_HOME` under `/work`; 11 live sessions, the largest the same 2.28 GB transcript,
-which grew 759 KB in the window):
-
-| | before (5512ab3d) | after (ac4250d3) |
+| step | where | what it does |
 |---|---|---|
-| at rest, nothing followed, 300 s | 0.59 s (0.20%), 48 MiB | 0.63 s (0.21%), 48 MiB |
-| priming: 11 live sessions read whole | 58 s CPU in 59 s | 61 s CPU in 62 s |
-| following 11 live sessions, 600 s | 160.5 s (26.7%), 70-92 MiB | 4.9 s (0.81%), 82-96 MiB |
-| reads refused ("changed during read") and retried | 8 | 0 |
+| prepare | the follower, `cv watch --kind precompact` | at 70% of the learned auto-compact point, then every 20k tokens or 45 s idle: takes the session's lease (`store::take_lease`, one owner per context generation on the host) and cuts the window at its newest message |
+| ready | the same | writes the summary (two model passes, below) and publishes the `Record` whole, keyed by `Key`: a cv checkpoint of the transcript (`FileId` plus the sampled `Prefix`) and the harness's own id of the cut message (Claude Code's record uuid). Never a hash of the IR |
+| commit | `cv watch --kind precompact commit`, called by the harness plugin inside the harness's compaction | `precompact::commit`: the checkpoint still admits the transcript; the record is under 7 days old; the compaction has no `/compact` instructions of its own; every content commitment (prose segment, tool call id) is in the conversation being compacted, in order; the kept messages start on a whole tool call; summary plus kept messages fit `fit_fraction` (0.5) of the auto-compact point |
+| miss | the plugin | any miss, error or the deadline (5 s): `next(e)`, the harness compacts as its own, native precompute included. Nothing waits on cv |
 
-Following now costs the bytes appended: 4.9 s for 10 minutes of 11 sessions against 1.3 s for
-10 minutes at rest. The priming read of the large transcript is still one whole read per start
-of the watch.
+The checkpoint accelerates the check and never authorizes the swap alone: a rewrite outside the
+sampled bytes passes it, so the commitments are compared against the conversation the harness
+actually holds. Miss classes (what `report` counts): `no_record`, `no_key`, `checkpoint_refused`,
+`too_old`, `focus_instructions`, `covered_messages_changed`, `would_not_fit`, `serve_native`.
 
-Two earlier shapes of the loop, for the record: polling in batches of 2,000 messages never
-finished priming the same fleet in 30 minutes (42% of a core throughout, item 8), and letting a
-failed session go for good dropped the very sessions that compact most.
+No proxy sits in the path. The first build answered a proxy (`answer`, our CLIProxyAPI fork);
+that action is removed and names `commit` (exit 2).
 
-## Measurements
+## Serving on Claude Code
 
-### Probes
+`integrations/claude-code/cv-compact` is a Claude Code plugin (a hooks module, Claude Code
+2.1.312's `session.compact` event). On each compaction of the main conversation (trigger `auto`,
+`manual`, `plugin`) it reads its `serve` option:
 
-- **Session identification.** Claude Code names its session in the compaction request three
-  ways: the `X-Claude-Code-Session-Id` header, `metadata.user_id` (a JSON string with
-  `session_id`), and the transcript file name. Codex seats are Claude Code behind our proxy, so
-  their request is the same shape. The request carries no message ids, which is why matching is
-  by content.
-- **The response shape the harness accepts.** A Messages response or event stream with one text
-  block holding the summary (usage zero) is recorded by Claude Code 2.1.312 as an ordinary
-  compaction: a `compact_boundary` record and an `isCompactSummary` user record with the text.
-- **Claude Code's PreCompact hook cannot supply the summary.** In the 2.1.311 bundle the hook's
-  result carries new custom instructions, a display message and a block decision; nothing is read
-  as summary text. This matches `HARNESS-ASKS.md` K1. The answer has to come from the request
-  path (a proxy), or from the harness's own precompute.
-- **Codex CLI's own compaction request** was not probed: no Codex CLI seat has run on this fleet
-  since 2026-10-21. The request reader takes the Responses `input[]` shape by structure, and is
-  unit-tested on it, not on a captured request.
+- `native`: `next(e)`; cv only records the compaction.
+- `cv`: runs `commit` with the conversation (`role`, `text`, tool call and result ids, sizes; not
+  the bulk); on a pass returns the summary as one message followed by the kept messages, by their
+  handles; on a miss, `next(e)`.
+- `host` (default): `commit` without `--serve`, so cv's `[precompact] serve` decides.
 
-### Anchor replay
+`precompute` passes through untouched: the harness's own background summary stays the miss path's
+fast answer (it costs a second summary per window; a seat that never misses could skip it later).
+Subagent compactions pass through. A hook that throws is caught to `next(e)`. After every
+compaction, cv's or native, the plugin runs `observe` without waiting on it.
 
-28 real compactions picked from 4 codex seats and 3 sessions in `~/.claude`,
-each replayed by copying the transcript as it stood at the compaction into a scratch Claude
-config, resuming it with `claude --resume <id> -p /compact` against a local mock, and capturing
-the request Claude Code 2.1.312 built. Two failed to resume at offset 0, leaving 26 (23 distinct;
-three recur in a forked copy of the same session). `cv precompact check` then cut a summary at the
-window's newest message ("end", a summary written just before compaction) and at the last message
-under 70% of the compaction's `preTokens` ("70%", the earliest summary the watch writes):
+The plugin's tests (`claude plugin test`) cover serve, miss and native. Its `session.compact`
+answer path is exercised there, not yet on a live session (the dogfood step).
 
-| | match | tail after the last anchor, median | largest tail |
-|---|---|---|---|
-| end, prose anchors only, before the error fix | 22 / 26 | 36 messages, 78 KB | 674 KB |
-| end, prose + tool call ids | 24 / 26 | 2 messages, 2.9 KB | 40 KB |
-| 70%, prose + tool call ids | 26 / 26 | 126 messages, 192 KB | 368 KB |
+## What the summary carries
 
-The first row is the first build. The error fix below turned cases 22 and 26 from misses into
-matches with a 2-message tail; the two misses left are cases 17 and 19.
+Measured on our fleet over 7 days (2026-10-29): 34 times an agent lost something it had held, 27
+on one seat; by class, a settled rule broken again 15, built work claimed absent 6, our own terms
+lost 5, wrong self or setup facts 4 (once a summary planted a false "1M context"), in-flight work
+or a promise lost 4. Loss compounds over generations rather than spiking at a seam. Public
+evidence agrees: a compactor keeps about 17% of side constraints, a separate extractor appended
+after the summary over 90% (arXiv 2608.11242); anchored, incremental, fixed-section summaries
+score best (Factory).
 
-The misses:
+So a record is three parts, rendered in this order into the text served:
 
-- **A prompt that drew an API error** (cases 22 and 26, one session): a scheduled prompt hit a
-  usage limit, Claude Code parented the next turn above it, and the same prompt text came back
-  later, so its anchor matched there and every anchor after it was out of order. Fixed: an error
-  drops the anchors of the prompts no reply has answered yet (queued prompts are one turn).
-- **The replay resumed a different leaf** (cases 17 and 19, end cut only): the request ended at a
-  tool result before the transcript's newest assistant text, which was absent from the request.
-  The miss is right; it is an artifact of resuming a copy, not of a live compaction.
+1. **Narrative** (`prompt::CV_INSTRUCTION`): what the work is for, decisions with reasons, where it
+   stands, files, open questions, next step. Every line cites `[m:ID]`; an existence, absence or
+   pass claim cites the message holding its check or says "not verified: probe before claiming
+   this". Extended incrementally: an extension reads the previous narrative and the span since.
+2. **Carried sections** (`precompact::carry`), verbatim, never fed back to a summarizer: the
+   person's rulings, open promises, terms, self and setup facts. A separate extraction pass
+   (`prompt::EXTRACT_INSTRUCTION`) returns quotes with the message id each is copied from; a quote
+   is kept only when that message holds it, whitespace aside (`carry::verify`: an extractor cannot
+   plant a fact). Items merge into the previous generation's (`Carry::merge`); a promise leaves
+   only when the extractor quotes it as done. Live identifiers (commit shas, `task/N`, absolute
+   paths, URLs) are read by shape with no model, each with where it was last seen, under "not
+   verified now: probe before claiming one exists or is absent". The carry outlives the window
+   (`carry/<harness>/<session>.json`): the next window's first summary starts from it.
+3. **Pointers to the standing rules the work touched**: ids only, never text (below).
+4. **The person's words**, verbatim (`prompt::owner_words`): the window's prompts, harness markup
+   cut, newest kept within 16 KiB; the rest named by id.
 
-The tool call ids are what made the tail small: on codex seats the model writes little prose
-between tool calls, and with prose alone one seat's last anchor sat 116 messages and 674 KB
-before its cut. The 70% row is the worst case: the watch extends the summary every 20,000 tokens
-or 45 s of idle after that, so the tail at compaction is what accrued since the last extension.
+**Which rules come back.** Rules arrive in three layers, and cv re-introduces only the middle one.
+The base layer (instruction files, memory, skills) is re-injected by the harness after every
+compaction: cv copies none of it. The per-turn layer (rules a hook injects when a turn calls for
+them, stop guards) keeps firing after the seam: cv does not duplicate it. The contextual layer is
+what a compaction loses, and it is chosen by what the span was doing, deterministically:
 
-### End to end
+- the person's rulings in the span, verbatim: an extracted rule is kept only when it quotes a
+  prompt the person wrote, outside the harness markup in it (`carry::verify` with `Layers`); no
+  carried item may quote injected context. A ruling never filed anywhere exists only here;
+- pointers to the standing rules the span's work touched: the ids the configured `rule_patterns`
+  find in the span (in what hooks injected while the work ran, and in the agent's own words),
+  with hits and where last seen. A fleet names its own patterns; cv knows no rule store.
 
-No live seat was touched. A codex seat's real session (case 0, 4.8 MB, a window of 351k tokens)
-was copied into a scratch Claude config; `cv precompact now` wrote its summary (the summary model
-a local mock); the lane's proxy build, with `claude-code.compaction.precompact.command` set,
-answered Claude Code 2.1.312's `/compact` through `cv precompact answer`; Claude Code recorded the
-compaction. The stall is the boundary record's own `durationMs`:
+Each carried item and pointer records why it was chosen (said in this span at `[m:ID]`, carried
+from an earlier summary, touched N times), in the record and in the `written` event, so an
+evaluation can score the selection.
 
-| scenario | answer | `durationMs` | the seat's median, harness-written |
-|---|---|---|---|
-| summary at the newest message (2-message tail) | served, tail pass by the mock, 1.1 s | 2,709 | 335,011 |
-| summary 60 records early (8-message tail) | served, tail pass by the mock, 0.04 s | 3,155 | |
-| the same, tail pass by `gpt-6-luna` through a codex seat's proxy | served, 6.2 s | 7,286 | |
-| the same, tail pass by a local 1.9 GB qwen2 on CPU | served, 78.6 s | 79,948 | |
-| the same, the tail pass's endpoint refusing (no key, then nothing listening) | miss, fell through in 0.2-0.6 s | (the harness's own) | |
+A captured harness instruction (`profile import`, then `precompact.profile = <id>`) replaces the
+narrative instruction only.
 
-About 2.7 s of `durationMs` is Claude Code's own work around the call (the answer itself left the
-proxy in 0.4-1.2 s). The `gpt-6-luna` row is the real-model number: an 8-message tail updated in
-6.2 s, against the seat's 335 s median. The qwen2 row is the warning: the tail pass is as slow as
-its model, so it wants the fastest model the proxy can route, and the watch's extensions keep the
-tail short. The last row is the fail-open path: Claude Code retried its compaction three times,
-each answer missed in under a second, and each request went on to the proxy's own route.
-In every row the stored summary itself came from the mock. Written for real, it is the watch's
-background cost, not the stall: `cv precompact now` on the same window (350k tokens, rendered to
-731 KB with tool results cut to 2 KB each) had `gpt-6-luna` write an 18 KB summary in 89.5 s,
-where the harness's own compaction on that seat takes a median of 335 s with the stall on.
+**The seam for evaluation.** `cv watch --kind precompact now <id> --upto-bytes N --print` writes
+the summary of the window as it stood at byte N to stdout as a record, reading and writing no
+store: any recorded span, offline. The 0.19 record's M7 (probes from the dropped span, cv against
+the harness's default) runs through it.
 
-The fallback, on the same session: `cv precompact swap` wrote a 34-record, 18.5 KB compacted copy
-of the 4.8 MB transcript in 0.27 s (one streaming pass; only the records after the cut are held),
-and `claude --resume <copy>` started from it in 1.9 s (its first request carried the summary and 3
-messages).
+## Recording and comparing
+
+`events.jsonl` under the store holds: `written` (each summary: cut, tokens, bytes, model, seconds),
+`commit` (served or missed, with class, kept messages, estimated tokens, record age, seconds),
+`compaction` (the follower, from the transcript's own boundary: trigger, pre and post tokens,
+duration, native precompute), `compacted` (the plugin, per compaction: method, wall ms, tokens
+before and after, messages before and after, summary bytes, the miss that sent it native), and
+`swap` (lineage of an explicit new session). `cv watch --kind precompact report` folds them into
+one row per source and method (`cv`, `native precompute`, `native`): compactions, stall median and
+max, tokens before and after.
 
 ## One method per seat
 
-Claude Code's native precompute and cv's must never both run for one session. The rule, as
-built:
+`serve` picks who serves; `prepare_native` (default off) picks whether cv prepares where the
+harness precomputes its own (read from the newest compaction's `compactMetadata.precomputed` or
+the profile's `cachedGrowthBookFeatures.tengu_sepia_moth`, `Adapter::native_precompaction`). Off,
+cv stays idle on such sessions, as the 0.19 record's "observe native first" asks; on, a seat set
+to `cv` gets cv's summaries and the two can be compared on the same sessions.
 
-1. **Native first.** cv reads, per session, whether the harness precomputes: the newest
-   compaction's `compactMetadata.precomputed`, or the feature flag in the Claude Code profile's
-   `.claude.json` (`cachedGrowthBookFeatures.tengu_sepia_moth`, read once per file state). Either
-   one, and cv writes nothing for that session (`Due::Wait("the harness precomputes its own
-   compactions")`). The flag is `Adapter::native_precompaction`, so a harness that gains a native
-   path later says so in its adapter.
-2. **Native is the reference.** The same `durationMs` metric is reported for both
-   (`cv watch --kind precompact report` splits stalls into "cv precompact", "native precompute" and "the
-   harness's own"), and the fallback below copies the native result's shape (a boundary record,
-   then the summary as a user record).
-3. **cv's targets** are harnesses with no native path (Codex CLI, Devin, the other harnesses cv
-   reads) and Claude Code seats where the flag is off.
+## The fallback: an explicit new session
 
-## The fallback: a compacted copy
-
-Where no proxy sits in the request path, `cv watch --kind precompact swap <id>` writes a new session that
-starts at a compaction boundary with the precomputed summary and carries the records after the
-cut, and prints the command to resume it (`Adapter::compacted_copy`; Claude Code only today). It
-replaces the stall with a resume, at the cost of a new session id. Measured on a real 4.8 MB
-session at 350k tokens: the copy took 0.27 s and held 34 records (18.5 KB: the boundary, the
-summary and the 32 records after the cut), and `claude --resume` on it answered in 1.85 s with a
-3-message request that opened with the summary.
-
-## Primitives used, and what we had to build
-
-Used as they are on `upstream/main`:
-
-- `Watcher::with_discovery` with an emit-existing discovery closure, and
-  `try_poll_messages`: incremental per-session cursors, one message at a time, appended records
-  only.
-- `cv_core::sessions()` for discovery and rediscovery; `Adapter::try_stream` and
-  `Adapter::transcript(…, Start::Prefix(len))` (a session as it stood at a byte length, for
-  replay); `Demand::RICH`; `Resolver` for lazily held text.
-- `publish::publish_reader` / `Claim::New` and `port::resume_lines` for the compacted copy;
-  `restamp_line` for its records; `env::frozen` for `--frozen`.
-- `cv-llm`'s provider selection and egress notice (`llm.rs`).
-
-Built, because nothing upstream did it:
-
-- **A wake** (`watch/wake.rs`): inotify on each followed session's directory plus an eventfd a
-  job thread can poke, with a timer fallback off Linux. `Watcher` polls; a resident process that
-  must cost nothing at rest needs to sleep until a file changes. This is the piece v19's watching
-  most directly needs (below).
-- **A window tracker over the IR** (`precompact/window.rs`): compaction boundaries, the token fill
-  from the newest usage record (never an estimate), the learned auto-compact point
-  (`preTokens`), and anchors, all updated per message.
-- **A request reader** (`precompact/request.rs`) for three wire shapes by structure.
-- **`Adapter::native_precompaction`** and **`Adapter::compacted_copy`**, so the CLI names no
-  harness.
-- `llm::complete`: a chat call with a caller-set timeout and token cap.
-- **An append-only watch read** (`watch::read::pass`, `source::held_from`,
-  `Dependencies::growing`): a pass a writer appended to ends where it began and the appended
-  bytes are the next pass's (item 6 below).
+`swap <id>` writes a new session that starts at a compaction boundary with the record's summary
+and the records after the cut (`Adapter::compacted_copy`, Claude Code only), and records the
+lineage. It commits only the generation it checked: a write since, or a torn last line, refuses.
+Measured on a real 4.8 MB session at 350k tokens: 0.27 s, 34 records; `claude --resume` on it
+answered in 1.85 s.
 
 ## Thresholds
 
-Each is a named setting (`precompact` in the config file, or a flag), in COMPLEXITY's classes:
-
 | Setting | Default | Class | Effect |
 |---|---|---|---|
-| `start_fraction` | 0.70 | budget | first summary at 70% of the auto-compact point; `ls` shows each session's fill and point |
-| `compact_at` | learned | — | the auto-compact point: the session's own `preTokens`, else the lowest seen for its harness and model; unknown means wait, said in `ls` |
-| `extend_tokens` | 20,000 | budget | extend when the fill grew this much since the cut |
-| `idle_secs` | 45 | budget | or when the session has been idle this long with anything new |
-| `tool_result_bytes` | 2,048 | budget | each tool result's head and tail sent to the summary model, the cut named in the prompt |
-| `jobs` | 2 | safety cap | summary calls at once; a due session waits its turn and says so |
-| `live_within_secs` | 7,200 | budget | sessions touched this recently at startup are followed; every new session after |
-| `TAIL_TIMEOUT` / `SUMMARY_TIMEOUT` | 120 s / 900 s | safety cap | a model call past it fails; a failed answer is a miss, a failed summary is retried at the next due point |
-| `RETRY_FIRST` / `RETRY_MAX` | 5 s / 600 s | cost-only | a session whose read failed (bytes it had read changed under it) is read again after 5 s, doubling to 600 s; growth during a read is not a failure |
+| `serve` | `native` | policy | which compaction serves; a seat's plugin option wins |
+| `prepare_native` | false | policy | prepare where the harness precomputes its own |
+| `start_fraction` | 0.70 | budget | first summary at this fraction of the auto-compact point |
+| `compact_at` | learned | — | the session's own `preTokens`, else the lowest seen for its harness and model |
+| `extend_tokens` / `idle_secs` | 20,000 / 45 | budget | when to extend |
+| `tool_result_bytes` | 2,048 | budget | each tool result's head and tail the summary model reads |
+| `owner_words_bytes` | 16,384 | budget | the person's words carried verbatim |
+| `carry_ids` | 200 | budget | live identifiers carried, most recently seen kept |
+| `rule_patterns` | none | policy | regexes finding a standing rule's id (first capture group); `--rule-pattern` |
+| `fit_fraction` | 0.5 | safety cap | summary plus kept messages, of the auto-compact point |
+| `jobs` | 2 | safety cap | summary jobs at once |
+| `live_within_secs` | 7,200 | budget | sessions followed at startup |
+| `MAX_AGE_SECS` | 7 days | safety cap | Claude Code's own `too_old` |
+| `SUMMARY_TIMEOUT` | 900 s | safety cap | a model pass past it fails; the session keeps its old record |
+| `LEASE_STALE` | 960 s | cost-only | a lease older than this is a dead owner's |
+| `RETRY_FIRST` / `RETRY_MAX` | 5 s / 600 s | cost-only | a read refused for a changed source is retried, doubling |
 
-## What v19's watching would need
+## Measurements kept from the first build
 
-These are what this work needed and built for itself; they are input, not demands.
-
-1. **Sleep until something changes.** A resident reader has to cost nothing at rest. `Watcher`
-   polls; `wake.rs` is a working inotify + eventfd wake with a fallback timer, and it is
-   cheap to fold into `Watcher` itself so every follower gets it.
-2. **A per-message hook for incremental state.** The window tracker is a fold over messages as
-   they arrive. A watching API that hands a consumer each appended message, with the session's
-   cursor, makes that a few lines; today it is a `try_poll_messages` closure plus our own `Live`
-   map.
-3. **The token fill and the compaction point as first-class facts.** Every consumer that cares
-   about context pressure re-derives them from usage records and `compactMetadata`.
-4. **Harness facts behind the adapter.** Whether the harness precomputes its own compactions, and
-   how to write a compacted copy, are adapter questions; we added two methods with `None`
-   defaults.
-5. **A byte-prefix read for replay** existed (`Start::Prefix`) and made the replay corpus cheap;
-   it is worth keeping for every live feature's tests.
-6. **A read of an append-only transcript that grew while it was read** (built in this lane,
-   ac4250d3). `watch::read::pass` refused its whole pass when the primary file was not
-   byte-identical at the end ("session source changed during read"), although the reader stops
-   at the length it captured and the adapter's prefix is immutable. A pass that took longer than
-   the gap between two appends never completed: on our hub the active seat's own transcript is
-   2.28 GB, and a batched `try_poll` re-read it from the start on every wake (18 GB read in 10
-   minutes, 42% of a core, never primed in 30 minutes); with the streaming poll and a doubling
-   retry it still cost 26% of a core. The pass now samples an append-only log (`jsonl`,
-   `ndjson`: the rule `JsonSource` already reads by) when it opens it, with the `Prefix` a resume
-   mark uses (the first 4 KiB, the 4 KiB before the captured length, and that length), and at
-   its end admits growth past the captured length (`source::held_from`, `FileId::admits`); the
-   appended bytes are the next pass's, resumed from the pass's end mark. A shrink, another file,
-   a rewrite of the sampled bytes, or any change that left the length as captured (no growth to
-   admit, `FileId::grew_into`) still refuses it. Side files follow the same rule:
-   `Dependencies::growing` declares a directory a harness only adds write-once files to (Claude
-   Code's `<session>/tool-results/`, written before the record that names it), so a spill that
-   lands during a read, or between two, neither refuses the read nor sends the next one back to
-   byte 0; a removed or changed spill is still a change. Measured above: 26.7% of a core to
-   0.81%, the at-rest figure plus the appended bytes. Two consumers keep the strict check and
-   would gain from the same rule: a retained projection (`try_poll` with `retained`, "watched
-   source changed during retained projection") and the catalog's counts publication, which a
-   spill invalidates.
-7. **Delivered is not accepted, and a position is forgotten.** `try_poll_messages` hands a
-   consumer each message as it is read, but a pass that fails at its end (6) is delivered again
-   from the last accepted position; and a session that leaves the discovery list (a retry wait,
-   or idle past the live window) loses its position, so it is read from the start when it comes
-   back. A fold over messages has to count what it took and skip the repeat (`Live::take`,
-   `settle`, `restart`); before it did, one returning session logged 75 old compactions as new.
-   A per-session "accepted through N" callback, and positions kept for sessions a follower
-   pauses, would make that the watcher's job.
-8. **A batched poll is quadratic on a long session.** `try_poll(Poll { max })` streams each
-   session to EOF on every call and keeps `max` messages, so a session of N messages costs N/max
-   whole reads; `watch` primed nothing on the live fleet that way. The streaming
-   `try_poll_messages` reads it once.
+- **Commitment replay.** 26 real compactions from 4 codex seats and 3 Claude Code sessions,
+  resumed against a mock to capture the request Claude Code 2.1.312 built: a cut at the newest
+  message matched 24 of 26 with a median 2-message tail; a cut at 70% matched 26 of 26 (median 126
+  messages, 192 KB of tail). Tool call ids are what made the tail small on codex seats. The two
+  misses resumed a different leaf (a replay artifact). The redacted pairs are
+  `cv-core/tests/fixtures/precompact/` (`tools/precompact-fixture.py`), replayed by
+  `tests/precompact_replay.rs`.
+- **End to end (proxy era).** A served summary with an 8-message tail updated by `gpt-6-luna`
+  gave a 7.3 s `durationMs` against that seat's 335 s median. The tail pass is gone: the commit
+  keeps the tail as messages instead of summarizing it in the critical path.
+- **Watch cost.** On the hub (load 50-70, nice 19), 11 live sessions for 10 minutes: 160.5 s of
+  CPU before the append-only read (ac4250d3), 4.9 s after; 0.6 s per 5 minutes at rest, 48 MiB.
 
 ## Against the 0.19 design record
 
-`docs/design/0.19/` (b4674049, the same day) plans precompact as 0.19's first consumer of
-checkpoints. This lane was built before it landed; where they meet:
+| 0.19 record | the first build (fork lane, to 19e91340) | now |
+|---|---|---|
+| key: a cv checkpoint plus the harness's anchor id, never an IR hash | record keyed by session; validity by content anchors only | `Key { source, file, prefix, anchor }`; content anchors are the commit's commitments |
+| no proxy in the critical path | `answer` for a proxy, with a model tail pass at answer time | `commit` inside `session.compact`; no model call in the critical path; `answer` removed |
+| prepare, ready, commit, miss | write, serve on match | lease, atomic ready record, commit check, native on every miss within a deadline |
+| observe native first | idle where native precomputes | the same by default; `serve` and `prepare_native` per seat, `report` compares |
+| summary: fixed sections, identifiers verbatim, anchors | the harness's captured instruction | narrative with `[m:ID]` citations, verbatim carried sections, the person's words |
+| sidecar `version`, discard on mismatch | `RECORD_VERSION` 1 | 2 |
+| D4: a `cv watch` consumer | followed | followed |
 
-| 0.19 record | this lane |
-|---|---|
-| §4c trigger: fill fraction and idle | the same: 70% of the learned auto-compact point, then every 20k tokens or 45 s idle |
-| §4c handoff order: in-process first, proxy second (fails open), swap last | proxy and swap built; proxy fails open on a miss, an error or its timeout. The in-process `session.compact` plugin was not exercised |
-| REVIEW-ASTRA §3: observe native Claude first | cv stays idle where Claude's native precompute is on, and `report` measures both by the same `durationMs` |
-| §4b key: checkpoint plus the harness's anchor uuid | the record keeps the cut message's native id (`Cut::id`), but the proxy path matches by content: a compaction request carries no record ids, only the conversation |
-| §4d sidecar `version`, discard on mismatch; transcript never edited; the summarizer's answer recorded | `RECORD_VERSION`, a record of another version is a miss; cv never writes the harness's transcript; the record holds the summary text and model |
-| §4d incremental extension anchored to the parent | `Extend` summarizes from the cut on with the prior summary first |
-| REVIEW-ASTRA §1: a stale accepted swap rejects the key | here a summary is served only when every covered prose segment and tool call id is in the request in order; a tool output the harness shortened since is not checked (the summary is not stale because the harness cut a log) |
-| D4: no `cv precompact` verb; a `cv watch` consumer plus `--kind precompact` on `show` and the API | followed for the CLI: `cv watch --kind precompact`, its one-shot tools as actions of it (see "The CLI follows 0.19's D4"); `--kind precompact` on `show` and the API is not built |
+## What 0.19's watching would need
 
-What this lane adds to §8's measurement plan: M1 for codex seats through the proxy (a baseline of
-2,996 harness-written compactions at a 335 s median, against 2.7-3.2 s on the served path inside
-Claude Code), M6's first reason
-distribution (the replay's misses), and a replay corpus to run M7 against.
-
-## The corpus
-
-`cv-core/tests/fixtures/precompact/` holds real compactions redacted by
-`tools/precompact-fixture.py`: every run of letters and digits replaced by a keyed pseudo-word of
-the same shape, the same on both sides, ids shortened consistently, text blocks cut to 160
-characters and tool results to 48 on both sides. `tests/precompact_replay.rs` replays each: the
-newest cut matches with its tail, an earlier cut matches with a longer one, and an edited history
-misses.
+From building this: a wake for resident readers (`watch::wake`, inotify + eventfd); a
+per-message hook with an "accepted through N" callback and positions kept for paused sessions
+(today `Live::take`, `settle`, `restart`); the token fill and the compaction point as first-class
+facts; harness facts behind the adapter (`native_precompaction`, `compacted_copy`); a byte-prefix
+read for replay (`Start::Prefix`); a read of an append-only transcript that grew during the read
+(`watch::read::pass`, `source::held_from`, `Dependencies::growing`, built here: 26.7% of a core to
+0.81% on the hub); and a streaming poll (a batched `try_poll` is quadratic on a long session).

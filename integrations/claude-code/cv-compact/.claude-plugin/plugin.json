@@ -1,0 +1,31 @@
+{
+  "name": "cv-compact",
+  "version": "0.1.0",
+  "description": "Serves a session's compaction from cv's ready summary inside Claude Code's own compaction, falls back to Claude Code's on every miss, and records every compaction for comparison.",
+  "license": "MIT OR Apache-2.0",
+  "userConfig": {
+    "serve": {
+      "type": "string",
+      "title": "Which compaction serves this seat",
+      "description": "host: cv's [precompact] serve setting decides; native: Claude Code's own (cv only records); cv: cv's ready summary when its commit check passes, Claude Code's own on every miss.",
+      "options": [
+        "host",
+        "native",
+        "cv"
+      ],
+      "default": "host"
+    },
+    "cv": {
+      "type": "string",
+      "title": "The cv binary",
+      "description": "The cv executable the hook runs (a path, or a name on PATH).",
+      "default": "cv"
+    },
+    "deadline_ms": {
+      "type": "number",
+      "title": "Commit deadline (ms)",
+      "description": "How long the commit may take before Claude Code compacts as its own.",
+      "default": 5000
+    }
+  }
+}
