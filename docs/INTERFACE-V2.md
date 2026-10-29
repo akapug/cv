@@ -118,8 +118,8 @@ GONE: it errors with a pointer at its replacement and exits 2. The old → new t
 ## 2. Flags — the same word means the same thing everywhere
 
 **Windows** (on `show`, `export` and MCP `show`; all 0-based, end-exclusive): `--first N`,
-`--last N`, `--range A..B` (`A..` to the end, `..B` from the start), `--around N [--context K]`
-(default 5), `--max-bytes N` (a message-boundary budget, with the first selected message always admitted; print
+`--last N`, `--range A..B` (`A..` to the end, `..B` from the start), `--around N|ID [--context K]`
+(default 5; `ID` is a message's own id, the `[m:ID]` a precompact summary cites), `--max-bytes N` (a message-boundary budget, with the first selected message always admitted; print
 `… continue with --range <next>..` when more remain). Only one of `--first/--last/--range/--around` may be given. `prune --keep A..B`
 and `splice <id>:A..B` use the same `A..B` grammar.
 

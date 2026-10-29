@@ -686,6 +686,14 @@ fn show_range_windowing() {
     // …and context pulls in the neighbours either side.
     let (out, _) = w.cv_ok(&["show", "alphasess", "--around", "1", "--context", "1"]);
     assert!(out.contains("zebrafish") && out.contains("edited ok"), "{out}");
+    // `--around ID` centres on the message with that id: the `[m:ID]` a precompact summary cites.
+    let (by_id, _) = w.cv_ok(&["show", "alphasess", "--around", "a1", "--context", "0"]);
+    let (by_index, _) = w.cv_ok(&["show", "alphasess", "--around", "1", "--context", "0"]);
+    assert_eq!(by_id, by_index);
+    // An id the session does not hold is a usage error naming it, not an empty render.
+    let (ok, code, _, err) = w.cv(&["show", "alphasess", "--around", "nosuchmsg"]);
+    assert!(!ok && code == 2, "{err}");
+    assert!(err.contains("nosuchmsg"), "{err}");
     // --context without --around is a usage error (it has no centre to hang off).
     let (_, err) = w.cv_fails(&["show", "alphasess", "--context", "2"]);
     assert!(err.contains("--around"), "{err}");

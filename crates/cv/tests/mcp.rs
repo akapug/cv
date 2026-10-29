@@ -833,6 +833,12 @@ fn windowed_show_matches_cli_bytes_and_http_message_frames() {
             vec!["--around", "0", "--context", "0"],
             "start=0&end=1&extra=1",
         ),
+        (
+            "around",
+            json!("u1"),
+            vec!["--around", "u1", "--context", "0"],
+            "start=0&end=1&extra=1",
+        ),
     ] {
         let mut cli = vec!["show", "alphasess", "--json"];
         cli.extend(args);

@@ -204,15 +204,56 @@ pub(crate) struct WindowArgs {
     /// Messages A (inclusive) to B (exclusive), 0-based: `A..B`; `A..` to the end, `..B` from the start.
     #[arg(long, value_name = "A..B", allow_hyphen_values = true, conflicts_with = "around")]
     pub range: Option<String>,
-    /// Message N with --context K messages either side.
-    #[arg(long, value_name = "N")]
-    pub around: Option<usize>,
+    /// Message N, or the message whose id is ID (the `[m:ID]` a summary cites), with --context K
+    /// messages either side.
+    #[arg(long, value_name = "N|ID", value_parser = parse_around)]
+    pub around: Option<Around>,
     /// How many messages either side of --around N (default 5).
     #[arg(long, value_name = "K", default_value_t = 5, requires = "around")]
     pub context: usize,
     /// Stop after N bytes of rendered output and print `… continue with --range <next>..`.
     #[arg(long, value_name = "N")]
     pub max_bytes: Option<usize>,
+}
+
+/// Where `--around` centres: a message number, or a message's own id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Around {
+    Index(usize),
+    Id(String),
+}
+
+fn parse_around(spec: &str) -> std::result::Result<Around, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("expected a message number or a message id".into());
+    }
+    Ok(spec
+        .parse::<usize>()
+        .map_or_else(|_| Around::Id(spec.to_owned()), Around::Index))
+}
+
+/// The index of the message whose id is `id`, in the numbering every window uses (the lean
+/// stream [`count_messages`] counts); `None` when the session holds no such message.
+pub(crate) fn message_index(adapter: &dyn Adapter, r: &SessionRef, id: &str) -> Result<Option<usize>> {
+    struct Find<'a> {
+        id: &'a str,
+        at: usize,
+        found: Option<usize>,
+    }
+    impl MessageSink for Find<'_> {
+        fn message(&mut self, m: Message) -> Flow {
+            if m.id.as_deref() == Some(self.id) {
+                self.found = Some(self.at);
+                return Flow::Stop;
+            }
+            self.at += 1;
+            Flow::Continue
+        }
+    }
+    let mut find = Find { id, at: 0, found: None };
+    adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut find)?;
+    Ok(find.found)
 }
 
 /// One resolved selector. `Last` needs the message count, which the caller supplies lazily (a
@@ -226,9 +267,28 @@ pub(crate) enum Window {
 }
 
 impl WindowArgs {
-    /// The selector these flags spell, if any. clap already rejects two selectors at once; this
-    /// only parses `--range`.
+    /// The selector these flags spell with no session to resolve a message id against
+    /// (`--around ID` is refused). clap already rejects two selectors at once; this only parses
+    /// `--range`.
+    #[cfg(test)]
     pub(crate) fn window(&self) -> Result<Option<Window>> {
+        self.window_with(|id| usage(format!("`--around {id}`: a message id needs the session it is in")))
+    }
+
+    /// The selector over session `r`: `--around ID` becomes the number of the message with that id.
+    pub(crate) fn window_in(&self, adapter: &dyn Adapter, r: &SessionRef) -> Result<Option<Window>> {
+        self.window_with(|id| match message_index(adapter, r, id)? {
+            Some(at) => Ok(at),
+            None => usage(format!("no message {id:?} in session {}", r.id)),
+        })
+    }
+
+    /// Whether a selector is given, checked without reading a session (a bad `--range` errors).
+    pub(crate) fn selects(&self) -> Result<bool> {
+        Ok(self.window_with(|_| Ok(0))?.is_some())
+    }
+
+    fn window_with(&self, at: impl FnOnce(&str) -> Result<usize>) -> Result<Option<Window>> {
         if let Some(n) = self.first {
             return Ok(Some(Window::First(n)));
         }
@@ -239,7 +299,11 @@ impl WindowArgs {
             let (a, b) = parse_range(spec)?;
             return Ok(Some(Window::Range(a, b)));
         }
-        if let Some(center) = self.around {
+        if let Some(around) = &self.around {
+            let center = match around {
+                Around::Index(n) => *n,
+                Around::Id(id) => at(id)?,
+            };
             return Ok(Some(Window::Around {
                 center,
                 context: self.context,
@@ -600,11 +664,19 @@ mod tests {
         };
         assert_eq!(first.window().unwrap(), Some(Window::First(3)));
         let around = WindowArgs {
-            around: Some(9),
+            around: Some(Around::Index(9)),
             context: 2,
             ..Default::default()
         };
         assert_eq!(around.window().unwrap(), Some(Window::Around { center: 9, context: 2 }));
+        assert_eq!(parse_around(" 9 "), Ok(Around::Index(9)));
+        assert_eq!(parse_around("4d1dd21f-7a00"), Ok(Around::Id("4d1dd21f-7a00".into())));
+        let by_id = WindowArgs {
+            around: Some(Around::Id("u1".into())),
+            ..Default::default()
+        };
+        assert!(by_id.window().is_err(), "an id needs a session to resolve against");
+        assert!(by_id.selects().unwrap());
         let bad = WindowArgs {
             range: Some("1-2".into()),
             ..Default::default()

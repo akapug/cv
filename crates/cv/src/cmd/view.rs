@@ -149,7 +149,7 @@ pub(crate) fn cmd_show(
         summaries,
     } = view;
     // Parse the selector (and `--kind`) before any I/O so a bad value errors immediately.
-    let selector = window.window()?;
+    let selector = window.selects()?;
     let kind = kind.as_deref().map(parse_kinds).transpose()?;
     if summaries && !matches!(kind, Some(KindView::Compactions)) {
         return usage("`--summaries` goes with `--kind compaction_boundary,compaction_summary`");
@@ -164,7 +164,7 @@ pub(crate) fn cmd_show(
                 if window.max_bytes.is_some() {
                     return usage("`--max-bytes` cuts a transcript; `--kind prompt,answer` rows are printed whole");
                 }
-                let range = show_range(&r, window, pre_compaction)?
+                let range = show_range(&r, adapter.as_ref(), window, pre_compaction)?
                     .map(|w| w.bounds(|| count_messages(adapter.as_ref(), &r)))
                     .transpose()?;
                 crate::cmd::session_reports::print_prompts(&r, adapter.as_ref(), range, prompts, answers, json)
@@ -173,13 +173,13 @@ pub(crate) fn cmd_show(
                 if window.max_bytes.is_some() {
                     return usage("`--max-bytes` cuts a transcript; the affordance rows are printed whole");
                 }
-                let range = show_range(&r, window, pre_compaction)?
+                let range = show_range(&r, adapter.as_ref(), window, pre_compaction)?
                     .map(|w| w.bounds(|| count_messages(adapter.as_ref(), &r)))
                     .transpose()?;
                 print_affordances(&r, adapter.as_ref(), &kinds, range, json)
             }
             KindView::Compactions => {
-                if selector.is_some() || window.max_bytes.is_some() || pre_compaction.is_some() {
+                if selector || window.max_bytes.is_some() || pre_compaction.is_some() {
                     return usage("the compaction view covers the whole session; drop the window flags");
                 }
                 crate::cmd::compaction::print_compactions(&r, summaries, json)
@@ -187,7 +187,7 @@ pub(crate) fn cmd_show(
         };
     }
     if tree && !json {
-        if selector.is_some() || window.max_bytes.is_some() {
+        if selector || window.max_bytes.is_some() {
             return usage("`--tree` renders the whole session; drop the window flags (or add `--json` for the IR)");
         }
         let (r, adapter) = resolve(id, parse_harness(&harness)?)?;
@@ -232,7 +232,7 @@ pub(crate) fn cmd_show(
         return show_subagents(&r, json);
     }
 
-    let range = show_range(&r, window, pre_compaction)?;
+    let range = show_range(&r, adapter.as_ref(), window, pre_compaction)?;
     if json {
         return print_session_json(adapter.as_ref(), &r, range, window.max_bytes, false, None).map(|_| ());
     }
@@ -243,9 +243,14 @@ pub(crate) fn cmd_show(
 /// the Nth (1-based) compaction boundary, the context the continued agent lost, so it is
 /// retrieved by message range without the caller computing offsets by hand. Left unresolved:
 /// `--last N` is resolved by whichever pass reads the session, not by a counting pass first.
-fn show_range(r: &SessionRef, window: &WindowArgs, pre_compaction: Option<usize>) -> Result<Option<Window>> {
+fn show_range(
+    r: &SessionRef,
+    adapter: &dyn Adapter,
+    window: &WindowArgs,
+    pre_compaction: Option<usize>,
+) -> Result<Option<Window>> {
     let Some(n) = pre_compaction else {
-        return window.window();
+        return window.window_in(adapter, r);
     };
     if n == 0 {
         return usage("--pre-compaction is 1-based; use 1 for the first boundary");
@@ -568,7 +573,7 @@ fn show_one_subagent(
     window: &WindowArgs,
 ) -> Result<()> {
     let sub = resolve_subagent(parent, agent_id)?;
-    let range = window.window()?;
+    let range = window.window_in(adapter, &sub.session)?;
 
     if json {
         return print_session_json(adapter, &sub.session, range, window.max_bytes, false, None).map(|_| ());
@@ -645,7 +650,7 @@ pub(crate) fn cmd_export(
     use cv_core::redact::{redact_message, redact_text, RedactOptions, RedactStats};
     let want = parse_harness(&harness)?;
     let (r, adapter) = resolve(id, want)?;
-    let range = window.window()?;
+    let range = window.window_in(adapter.as_ref(), &r)?;
     // `--redact`: the same scrubber `cv share` runs (API keys, private keys, JWTs, emails,
     // assignments, high-entropy blobs), applied per block before anything is rendered; the
     // per-class counts go to stderr so stdout stays the document.
@@ -1457,7 +1462,8 @@ mod tests {
         let selected = agent_parents_for_harness(parents, Some(Harness::Codex));
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "codex-parent");
-        let error = show_range(&selected[0], &WindowArgs::default(), Some(0)).unwrap_err();
+        let adapter = cv_core::harness::for_harness(Harness::Codex).unwrap();
+        let error = show_range(&selected[0], adapter.as_ref(), &WindowArgs::default(), Some(0)).unwrap_err();
         assert!(error.downcast_ref::<crate::util::UsageError>().is_some());
     }
 

@@ -13,7 +13,7 @@ candidates as `harness:full-id` lines and exits 2. `--json` is machine output (s
 RFC 3339 timestamps); `cv schema --json` publishes every shape below.
 
 Windows (show, export): --first N · --last N · --range A..B (0-based, end-exclusive; A.. / ..B)
-· --around N [--context K] · --max-bytes N (prints `… continue with --range <next>..`).
+· --around N|ID [--context K] · --max-bytes N (prints `… continue with --range <next>..`).
 One selector at a time. Piped `cv show` with no selector over 200 KB prints the first and last
 20 messages with a hint between them — pick a window instead of paging the whole thing.
 
