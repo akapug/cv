@@ -119,3 +119,92 @@ fn a_ready_record_is_committed_inside_the_harness_compaction_and_every_miss_exit
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("commit"), "{err}");
 }
+
+/// A record written before a compaction no follower saw (a restarted follower, or `now` run
+/// once per window) still hands its carried sections to the next window: the next `now` folds
+/// them into the session's carry before it summarizes. A dry run folds nothing.
+#[test]
+fn a_record_from_an_earlier_window_becomes_the_next_windows_carry() {
+    use cv_core::precompact::carry::{Carry, Item, Section};
+    let w = World::new("precompact-fold");
+    let sid = "aaaaaaaa-0000-4000-8000-0000000000f1";
+    let line = |ty: &str, uuid: &str, parent: Option<&str>, message: Value| {
+        json!({"type": ty, "sessionId": sid, "uuid": uuid, "parentUuid": parent, "isSidechain": false,
+            "cwd": "/work/proj", "timestamp": "2026-10-29T10:00:00Z", "message": message})
+    };
+    let reply = |text: &str| {
+        json!({"role": "assistant", "model": "m", "content": [{"type": "text", "text": text}],
+        "usage": {"input_tokens": 10, "output_tokens": 5}})
+    };
+    w.write_session(
+        sid,
+        &[
+            line(
+                "user",
+                "u1",
+                None,
+                json!({"role": "user", "content": "never push main"}),
+            ),
+            line("assistant", "a1", Some("u1"), reply("Understood.")),
+            json!({"type": "system", "subtype": "compact_boundary", "sessionId": sid, "uuid": "b1",
+                "parentUuid": "a1", "isSidechain": false, "compactMetadata": {"trigger": "auto", "preTokens": 100}}),
+            line(
+                "user",
+                "u2",
+                Some("b1"),
+                json!({"role": "user", "content": "now ship the port"}),
+            ),
+            line("assistant", "a2", Some("u2"), reply("Shipping it.")),
+        ],
+    );
+    let ruling = Item {
+        section: Section::Rule,
+        quote: "never push main".into(),
+        m: "u1".into(),
+        why: String::new(),
+    };
+    let record = Record {
+        v: RECORD_VERSION,
+        harness: "claude".into(),
+        session: sid.into(),
+        key: None,
+        window: WindowRef {
+            boundaries: 0,
+            start: 0,
+        },
+        cut: Cut {
+            index: 1,
+            id: Some("a1".into()),
+            tokens: Some(15),
+            clean: true,
+        },
+        anchors: Vec::new(),
+        profile: String::new(),
+        model: "m".into(),
+        created: chrono::Utc::now(),
+        base: None,
+        compact_at: None,
+        bounds: Vec::new(),
+        narrative: "N".into(),
+        carry: Carry {
+            items: vec![ruling.clone()],
+            ..Default::default()
+        },
+        text: "N".into(),
+    };
+    let root = w.cv_home.join("precompact");
+    let path = store::record_path(&root, "claude", sid);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    // No model answers here: the summary pass fails, after the fold.
+    let none = [("LMSTUDIO_API_BASE", "http://127.0.0.1:9/v1")];
+    w.cv_env(&["watch", "--kind", "precompact", "now", sid, "--dry-run"], &none);
+    assert!(
+        store::load_record(&root, "claude", sid).unwrap().is_some(),
+        "a dry run folds nothing"
+    );
+    assert!(store::load_carry(&root, "claude", sid).is_none());
+    w.cv_env(&["watch", "--kind", "precompact", "now", sid], &none);
+    assert_eq!(store::load_carry(&root, "claude", sid).unwrap().items, vec![ruling]);
+    assert!(store::load_record(&root, "claude", sid).unwrap().is_none());
+}

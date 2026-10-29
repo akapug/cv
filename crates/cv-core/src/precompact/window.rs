@@ -5,7 +5,7 @@
 
 use super::anchor::{call_marker, segments, Anchor};
 use super::Cut;
-use crate::ir::{Block, Message, MessageKind};
+use crate::ir::{Block, Message, MessageKind, Origin};
 use serde_json::Value;
 
 /// An anchor and the message it came from.
@@ -64,6 +64,19 @@ fn bag_value<'a>(m: &'a Message, key: &str) -> Option<&'a Value> {
         .find_map(|bag| bag.get(key))
 }
 
+/// The words of a message the person sent while the agent was working, which the harness
+/// delivered as injected context: Claude Code's `queued_command` attachment whose origin is
+/// `human` (its record, kept under the rich demand). `None` for any other message, a task
+/// notification queued the same way included.
+pub fn queued_prompt(m: &Message) -> Option<&str> {
+    if m.kind != MessageKind::InjectedContext {
+        return None;
+    }
+    let a = bag_value(m, "attachment")?;
+    let human = a.get("type")?.as_str()? == "queued_command" && a.get("origin")?.get("kind")?.as_str()? == "human";
+    human.then(|| a.get("prompt")?.as_str()).flatten()
+}
+
 impl Window {
     /// Take the next message of the session. `resolver` resolves text left in the source.
     ///
@@ -113,7 +126,8 @@ impl Window {
                     }
                 }
                 let words = super::anchor::without_markup(&words);
-                if !words.trim().is_empty() {
+                // A scheduled wakeup (a cron or loop prompt) is the harness's, not the person's.
+                if !words.trim().is_empty() && m.origin != Origin::Scheduler {
                     self.prompts.push((
                         index,
                         super::prompt::Prompt {
@@ -134,6 +148,17 @@ impl Window {
                 return Ok(());
             }
             _ => {
+                if let Some(words) = queued_prompt(m).map(super::anchor::without_markup) {
+                    if !words.trim().is_empty() {
+                        self.prompts.push((
+                            index,
+                            super::prompt::Prompt {
+                                id: m.id.clone(),
+                                text: words,
+                            },
+                        ));
+                    }
+                }
                 self.newest = Some((m.id.clone(), index));
                 self.after_last_anchor = true;
                 return Ok(());

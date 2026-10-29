@@ -340,6 +340,18 @@ fn render(m: &Message, resolver: &cv_core::Resolver, tool_bytes: usize) -> Resul
         return Ok(None);
     }
     let role = if m.role == Role::Assistant { "assistant" } else { "user" };
+    // The person's message delivered mid-turn reads as their words, whole, not as the reminder
+    // the harness wrapped it in: the extraction quotes it, and a ruling is checked against it.
+    if let Some(words) = pc::window::queued_prompt(m) {
+        let words = words.trim();
+        return Ok((!words.is_empty()).then(|| Turn {
+            role,
+            content: match &m.id {
+                Some(id) => format!("[m:{id}] [sent while the agent was working] {words}"),
+                None => format!("[sent while the agent was working] {words}"),
+            },
+        }));
+    }
     let injected = m.kind == MessageKind::InjectedContext;
     let mut out = String::new();
     for b in &m.content {
@@ -416,6 +428,8 @@ struct Live {
     redelivered: usize,
     /// The window's injected-context messages (index, id): a layer no carried item may quote.
     injected: Vec<(usize, String)>,
+    /// The window's replies (index, id): a layer no self or setup fact may quote.
+    replies: Vec<(usize, String)>,
     /// Standing-rule ids the configured patterns found in the window: (index, message id, id).
     found: Vec<(usize, String, String)>,
 }
@@ -434,6 +448,7 @@ impl Live {
             accepted: 0,
             redelivered: 0,
             injected: Vec::new(),
+            replies: Vec::new(),
             found: Vec::new(),
         }
     }
@@ -481,6 +496,7 @@ impl Live {
         if self.window.boundaries.len() > before {
             self.span.clear();
             self.injected.clear();
+            self.replies.clear();
             self.found.clear();
             let b = self.window.boundaries.last().expect("a boundary was just pushed");
             let record = self.record.take();
@@ -517,8 +533,14 @@ impl Live {
             }
             return Ok(());
         }
-        if let Some(id) = m.id.as_ref().filter(|_| m.kind == MessageKind::InjectedContext) {
+        if let Some(id) =
+            m.id.as_ref()
+                .filter(|_| m.kind == MessageKind::InjectedContext && pc::window::queued_prompt(m).is_none())
+        {
             self.injected.push((index, id.clone()));
+        }
+        if let Some(id) = m.id.as_ref().filter(|_| m.kind == MessageKind::Reply) {
+            self.replies.push((index, id.clone()));
         }
         let patterns = rule_regexes(&settings.rule_patterns);
         if let (Some(id), false) = (&m.id, patterns.is_empty()) {
@@ -541,11 +563,20 @@ impl Live {
     }
 
     /// After the first full read: adopt a stored record of this same window whose anchors are
-    /// still the window's own (a restarted follower picks up where the last one stopped).
-    fn adopt_stored(&mut self, root: &Path) {
+    /// still the window's own (a restarted follower picks up where the last one stopped). A record
+    /// of an earlier window was written before a compaction no follower saw: with `fold`, its
+    /// carried sections become the carry the next summary starts from, as a follower that saw the
+    /// compaction would have kept them.
+    fn adopt_stored(&mut self, root: &Path, fold: bool) {
         let Ok(Some(record)) = store::load_record(root, self.r.harness.as_str(), &self.r.id) else {
             return;
         };
+        if fold && record.window.boundaries < self.window.boundaries.len() {
+            if store::save_carry(root, self.r.harness.as_str(), &self.r.id, &record.carry).is_ok() {
+                let _ = store::remove_record(root, self.r.harness.as_str(), &self.r.id);
+            }
+            return;
+        }
         let same_window = record.window.boundaries == self.window.boundaries.len()
             && record.cut.index < self.window.messages
             && record.anchors.len() <= self.window.anchors.len()
@@ -646,6 +677,12 @@ impl Job {
                     .collect(),
                 injected: live
                     .injected
+                    .iter()
+                    .filter(|(i, _)| *i <= cut.index)
+                    .map(|(_, id)| id.clone())
+                    .collect(),
+                replies: live
+                    .replies
                     .iter()
                     .filter(|(i, _)| *i <= cut.index)
                     .map(|(_, id)| id.clone())
@@ -1076,7 +1113,7 @@ fn watch(
             if !live.primed {
                 live.primed = true;
                 if !dry_run {
-                    live.adopt_stored(&root);
+                    live.adopt_stored(&root, true);
                 }
             }
             if let Some(point) = live.window.compact_point() {
@@ -1411,7 +1448,7 @@ fn now(id: &str, harness: Option<Harness>, span: Span, settings: &Settings) -> R
         );
     }
     if !span.print {
-        live.adopt_stored(&root);
+        live.adopt_stored(&root, !span.dry_run);
     }
     let profile = profile_for(&root, settings, r.harness.as_str())?;
     let extend = live.record.is_some();

@@ -85,14 +85,20 @@ So a record is three parts, rendered in this order into the text served:
    person's rulings, open promises, terms, self and setup facts. A separate extraction pass
    (`prompt::EXTRACT_INSTRUCTION`) returns quotes with the message id each is copied from; a quote
    is kept only when that message holds it, whitespace aside (`carry::verify`: an extractor cannot
-   plant a fact). Items merge into the previous generation's (`Carry::merge`); a promise leaves
+   plant a fact), and a self or setup fact never quotes the agent's own reply (where it was
+   assumed, not shown: a seat once carried its own wrong "I run with a 1M context"). Items merge into the previous generation's (`Carry::merge`); a promise leaves
    only when the extractor quotes it as done. Live identifiers (commit shas, `task/N`, absolute
    paths, URLs) are read by shape with no model, each with where it was last seen, under "not
    verified now: probe before claiming one exists or is absent". The carry outlives the window
-   (`carry/<harness>/<session>.json`): the next window's first summary starts from it.
+   (`carry/<harness>/<session>.json`): the next window's first summary starts from it. A record
+   no follower saw compacted (a restarted follower, or `now` run once per window) is folded into
+   that carry by the next read (`Live::adopt_stored`).
 3. **Pointers to the standing rules the work touched**: ids only, never text (below).
 4. **The person's words**, verbatim (`prompt::owner_words`): the window's prompts, harness markup
-   cut, newest kept within 16 KiB; the rest named by id.
+   cut, newest kept within 16 KiB; the rest named by id. They include what the person sent while
+   the agent worked (Claude Code's `queued_command` attachment with origin `human`,
+   `window::queued_prompt`), which the summary model also reads whole; a scheduled wakeup's
+   prompt (cron, loop) is the harness's, not the person's.
 
 **Which rules come back.** Rules arrive in three layers, and cv re-introduces only the middle one.
 The base layer (instruction files, memory, skills) is re-injected by the harness after every

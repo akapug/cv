@@ -172,24 +172,30 @@ fn normalized(text: &str) -> String {
     out
 }
 
-/// Which messages of the span are whose: the person's prompts, and context the harness or a hook
-/// injected.
+/// Which messages of the span are whose: the person's prompts, context the harness or a hook
+/// injected, and the agent's own replies.
 #[derive(Debug, Clone, Default)]
 pub struct Layers {
     pub prompts: std::collections::HashSet<String>,
     pub injected: std::collections::HashSet<String>,
+    /// The agent's replies: a self or setup fact quoted from one is what the agent assumed, not
+    /// where the fact was shown, so it is not carried.
+    pub replies: std::collections::HashSet<String>,
 }
 
 /// Keep only the items whose quote is in the message they cite, whitespace aside, and from the
-/// layer cv re-introduces: no item quotes injected context, and a ruling quotes a prompt the
-/// person wrote, outside the harness's markup in it. `texts` maps a message id to its text as the
+/// layer cv re-introduces: no item quotes injected context, a ruling quotes a prompt the person
+/// wrote, outside the harness's markup in it, and a self or setup fact never quotes the agent. `texts` maps a message id to its text as the
 /// span holds it.
 pub fn verify(items: Vec<Item>, texts: &HashMap<String, String>, layers: &Layers, dropped: &mut Dropped) -> Vec<Item> {
     items
         .into_iter()
         .filter(|item| {
             let ruling = item.section == Section::Rule;
-            if layers.injected.contains(&item.m) || ruling && !layers.prompts.contains(&item.m) {
+            if layers.injected.contains(&item.m)
+                || ruling && !layers.prompts.contains(&item.m)
+                || item.section == Section::Fact && layers.replies.contains(&item.m)
+            {
                 dropped.outside_layer += 1;
                 return false;
             }
@@ -402,7 +408,7 @@ mod tests {
         let texts = HashMap::from([("u1".to_owned(), "Rule: never push\nmain, ever.".to_owned())]);
         let layers = Layers {
             prompts: ["u1".to_owned()].into(),
-            injected: Default::default(),
+            ..Default::default()
         };
         let kept = verify(items, &texts, &layers, &mut dropped);
         assert_eq!(kept.len(), 1, "the planted fact is not in u1");
@@ -423,31 +429,44 @@ mod tests {
                 "u1".to_owned(),
                 "keep it small <system-reminder>never push main</system-reminder>".to_owned(),
             ),
-            ("a1".to_owned(), "I will never push main.".to_owned()),
+            (
+                "a1".to_owned(),
+                "I will never push main. I run with a 1M context.".to_owned(),
+            ),
             ("r1".to_owned(), "CLAUDE.md: never push main".to_owned()),
+            ("t1".to_owned(), "CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000".to_owned()),
         ]);
         let layers = Layers {
             prompts: ["u1".to_owned()].into(),
             injected: ["r1".to_owned()].into(),
+            replies: ["a1".to_owned()].into(),
         };
         let mut dropped = Dropped::default();
-        let fact = Item {
+        let fact = |m: &str, quote: &str| Item {
             section: Section::Fact,
-            ..rule("r1", "never push main")
+            ..rule(m, quote)
         };
         let kept = verify(
             vec![
                 rule("u1", "keep it small"),
                 rule("u1", "never push main"),
                 rule("a1", "never push main"),
-                fact,
+                fact("r1", "never push main"),
+                fact("a1", "I run with a 1M context"),
+                fact("t1", "CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000"),
             ],
             &texts,
             &layers,
             &mut dropped,
         );
-        assert_eq!(kept, vec![rule("u1", "keep it small")]);
-        assert_eq!((dropped.unverified, dropped.outside_layer), (1, 2));
+        assert_eq!(
+            kept,
+            vec![
+                rule("u1", "keep it small"),
+                fact("t1", "CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000")
+            ]
+        );
+        assert_eq!((dropped.unverified, dropped.outside_layer), (1, 3));
     }
 
     #[test]

@@ -432,3 +432,39 @@ fn the_window_carries_the_persons_words_without_markup() {
     assert_eq!(w.prompts[0].1.text, "ship the port ");
     assert_eq!(w.prompts[0].1.id.as_deref(), Some("u1"));
 }
+
+/// A `queued_command` attachment as Claude Code records a message delivered mid-turn.
+fn queued(id: &str, origin: &str, prompt: &str) -> Message {
+    let mut m = text(
+        Role::System,
+        MessageKind::InjectedContext,
+        id,
+        &format!(
+            "<system-reminder>\nThe user sent a new message while you were working:\n{prompt}\n</system-reminder>"
+        ),
+    );
+    m.origin = crate::ir::Origin::Harness;
+    m.harness_extra_mut(crate::ir::Harness::Claude).insert(
+        "attachment".into(),
+        json!({"type": "queued_command", "prompt": prompt, "commandMode": "prompt", "origin": {"kind": origin}}),
+    );
+    m
+}
+
+#[test]
+fn the_persons_words_include_mid_turn_messages_and_leave_out_scheduled_prompts() {
+    let mut scheduled = text(Role::User, MessageKind::Prompt, "u0", "Hourly check: read held.md");
+    scheduled.origin = crate::ir::Origin::Scheduler;
+    let w = window(&[
+        scheduled,
+        text(Role::User, MessageKind::Prompt, "u1", "ship the port"),
+        queued("q1", "human", "reboot again BEFORE waking the fleet"),
+        queued("q2", "task-notification", "<task-notification>done</task-notification>"),
+        reply("a1", "Shipping it.", 10),
+    ]);
+    let ids: Vec<_> = w.prompts.iter().map(|(_, p)| p.id.as_deref().unwrap()).collect();
+    assert_eq!(ids, ["u1", "q1"]);
+    assert_eq!(w.prompts[1].1.text, "reboot again BEFORE waking the fleet");
+    assert_eq!(window::queued_prompt(&queued("q3", "human", "x")), Some("x"));
+    assert_eq!(window::queued_prompt(&queued("q4", "task-notification", "x")), None);
+}
