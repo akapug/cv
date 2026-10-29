@@ -69,21 +69,26 @@ end;\n\
 - \"term\": a term the work uses with a meaning of its own, quoted where the meaning is given;\n\
 - \"fact\": a fact about the agent itself or its setup (its model, context size, seat, host, \
 paths, configuration), quoted where it was shown, not where it was assumed;\n\
-- \"done\": one of the open promises listed below that the conversation fulfilled; Q is the \
-promise exactly as listed, ID the message that fulfilled it.\n\
+- \"done\": one of the carried promises listed below that the conversation fulfilled; Q is the \
+promise exactly as listed, ID the message that fulfilled it;\n\
+- \"used\": one of the carried items listed below that the conversation said again, relied on or \
+acted on; Q is the item exactly as listed, ID the message that did;\n\
+- \"superseded\": one of the carried rules listed below that the person replaced or withdrew in a \
+later message of their own; Q is the rule exactly as listed, ID the person's message (give the \
+new ruling as a \"rule\" too).\n\
+A fact or term is a statement, never a line of output: do not copy log lines, timestamps, \
+process or timer listings, commit lists or status rows.\n\
 Return [] when there is nothing.";
 
-/// The input for the extraction pass: the span, then the instruction with the promises still
-/// open from earlier generations.
-pub fn extract(span: Vec<Turn>, open: &[&str]) -> Vec<Turn> {
+/// The input for the extraction pass: the span, then the instruction with the items carried
+/// from earlier generations (`carried`, one per line by section: [`super::carry::Carry::listing`]).
+pub fn extract(span: Vec<Turn>, carried: &str) -> Vec<Turn> {
     let mut instruction = EXTRACT_INSTRUCTION.to_owned();
-    instruction.push_str("\n\nOpen promises from before this conversation:\n");
-    if open.is_empty() {
+    instruction.push_str("\n\nCarried from before this conversation:\n");
+    if carried.trim().is_empty() {
         instruction.push_str("none\n");
     }
-    for p in open {
-        instruction.push_str(&format!("- {p}\n"));
-    }
+    instruction.push_str(carried);
     let mut out = span;
     out.push(Turn {
         role: "user",

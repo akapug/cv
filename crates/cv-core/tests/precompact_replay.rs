@@ -48,6 +48,7 @@ fn replay(path: &Path) -> Vec<(Option<u64>, Record)> {
                     base: None,
                     compact_at: None,
                     bounds: Vec::new(),
+                    unresolved_cites: 0,
                     narrative: String::new(),
                     carry: Default::default(),
                     text: String::new(),

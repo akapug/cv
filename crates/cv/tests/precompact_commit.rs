@@ -38,6 +38,7 @@ fn ready(w: &World) {
         base: None,
         compact_at: Some(200_000),
         bounds: Vec::new(),
+        unresolved_cites: 0,
         narrative: "N".into(),
         carry: Default::default(),
         text: "the cv summary [m:a1]".into(),
@@ -162,6 +163,7 @@ fn a_record_from_an_earlier_window_becomes_the_next_windows_carry() {
         quote: "never push main".into(),
         m: "u1".into(),
         why: String::new(),
+        seen: None,
     };
     let record = Record {
         v: RECORD_VERSION,
@@ -185,6 +187,7 @@ fn a_record_from_an_earlier_window_becomes_the_next_windows_carry() {
         base: None,
         compact_at: None,
         bounds: Vec::new(),
+        unresolved_cites: 0,
         narrative: "N".into(),
         carry: Carry {
             items: vec![ruling.clone()],

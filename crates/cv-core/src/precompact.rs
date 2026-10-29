@@ -139,6 +139,10 @@ pub struct Record {
     /// What the summary's input left out, stated (for example a per-tool-result byte budget).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bounds: Vec<String>,
+    /// The narrative's `[m:ID]` cites that named no message of the window and were removed
+    /// ([`carry::cites`]).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unresolved_cites: usize,
     /// The narrative part of the summary as the model wrote it: what the next extension reads
     /// as the summary so far. The carried sections are never fed back to be summarized again.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -148,6 +152,10 @@ pub struct Record {
     pub carry: carry::Carry,
     /// The summary as served: the narrative, the carried sections, then the person's words.
     pub text: String,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// A harness's own compaction instruction, captured verbatim from a real request. cv never
@@ -425,6 +433,11 @@ pub struct Settings {
     pub owner_words_bytes: usize,
     /// Identifiers carried in the live-identifier section, the most recently seen kept.
     pub carry_ids: usize,
+    /// Pointers to standing rules carried, the most recently used kept.
+    pub carry_pointers: usize,
+    /// A carried item no span has said or used again for this many windows retires (a ruling of
+    /// the person's retires only when a later ruling of theirs supersedes it).
+    pub retire_after: usize,
     /// Patterns (regular expressions) that find a standing rule's id in the span, the first
     /// capture group the id (else the whole match): what the summary's pointers to standing rules
     /// are chosen by ([`carry::Pointer`]). Empty: no pointers. A fleet's rule store names its own.
@@ -450,6 +463,10 @@ pub const LIVE_WITHIN_SECS: u64 = 7200;
 pub const OWNER_WORDS_BYTES: usize = 16 * 1024;
 /// [`Settings::carry_ids`].
 pub const CARRY_IDS: usize = 200;
+/// [`Settings::carry_pointers`].
+pub const CARRY_POINTERS: usize = 20;
+/// [`Settings::retire_after`].
+pub const RETIRE_AFTER: usize = 3;
 /// [`Settings::fit_fraction`]: half the auto-compact point, so the compacted window has room to
 /// work before it fills again.
 pub const FIT_FRACTION: f64 = 0.5;
@@ -470,6 +487,8 @@ impl Default for Settings {
             profile: None,
             owner_words_bytes: OWNER_WORDS_BYTES,
             carry_ids: CARRY_IDS,
+            carry_pointers: CARRY_POINTERS,
+            retire_after: RETIRE_AFTER,
             rule_patterns: Vec::new(),
             fit_fraction: FIT_FRACTION,
         }

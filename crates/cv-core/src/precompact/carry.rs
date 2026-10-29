@@ -19,6 +19,13 @@
 //! ([`verify`], so an extractor cannot plant a fact the transcript does not hold), and the kept
 //! items are merged into the previous generation's ([`Carry::merge`]) instead of being
 //! summarized again. Identifiers are read from the span by shape ([`ids`]), with no model.
+//!
+//! The carry is bounded. A pointer is made only from what the agent itself did with a rule (named
+//! it in a reply or a tool call, or drew a refusal naming it), never from a rule a hook merely
+//! injected, and only the most recently used are kept ([`Limits::pointers`]). An item no span
+//! has said or used again for [`Limits::retire_after`] windows retires; a ruling of the person's
+//! never retires by age, only when a later ruling of theirs supersedes it. Every `[m:ID]` the
+//! narrative cites must be a message of the window, written in full ([`cites`]).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -40,6 +47,15 @@ pub enum Section {
 impl Section {
     const ALL: [Section; 4] = [Section::Rule, Section::Promise, Section::Term, Section::Fact];
 
+    fn name(self) -> &'static str {
+        match self {
+            Section::Rule => "rule",
+            Section::Promise => "promise",
+            Section::Term => "term",
+            Section::Fact => "fact",
+        }
+    }
+
     fn heading(self) -> &'static str {
         match self {
             Section::Rule => "The person's rulings in force",
@@ -60,6 +76,10 @@ pub struct Item {
     /// Why it is carried: said in which generation's span.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub why: String,
+    /// The window (counted in compactions before it) a span last said or used the item in:
+    /// what its retirement is counted from. `None` in a record written before the count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen: Option<usize>,
 }
 
 /// A standing rule the span's work touched: its id as the configured patterns found it (a rule
@@ -89,6 +109,29 @@ pub struct Span {
     pub items: Vec<Item>,
     pub ids: Vec<Id>,
     pub pointers: Vec<Pointer>,
+    /// What the span did to carried items, each quoted as carried ([`Marks`], verified).
+    pub marks: Marks,
+    /// The window the span is in: compactions before it.
+    pub window: usize,
+}
+
+/// What a span did to the items carried into it, each quoted as carried: the promises it
+/// fulfilled, the items it said or used again, the person's rulings a later ruling of theirs
+/// replaced.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Marks {
+    pub done: Vec<String>,
+    pub used: Vec<String>,
+    pub superseded: Vec<String>,
+}
+
+/// How much a carry holds: the identifiers and pointers most recently seen, and how many windows
+/// an item stays without being said or used again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub ids: usize,
+    pub pointers: usize,
+    pub retire_after: usize,
 }
 
 /// The carried sections of one record.
@@ -111,10 +154,17 @@ pub struct Dropped {
     /// Quotes from the layers cv does not re-introduce: a ruling not in a message the person
     /// wrote (or inside harness markup there), any item quoting injected context.
     pub outside_layer: usize,
+    /// Quotes shaped like a log or listing line (a leading timestamp, a `unit[pid]:` tag, a
+    /// one-line commit): output the work read, not a statement to carry.
+    pub noise: usize,
+    /// Marks on carried items that name no carried item, or cite a message that cannot make
+    /// them (a supersession not from the person, a use outside the span).
+    pub marks: usize,
 }
 
 /// An extraction entry as the model writes it: `{"section", "quote", "m"}`, where `section` may
-/// also be `done` (a prior promise, quoted, that the span fulfilled).
+/// also mark a carried item, quoted as carried: `done` (a promise the span fulfilled), `used`
+/// (an item the span said or used again), `superseded` (a ruling a later one replaced).
 #[derive(Debug, Deserialize)]
 struct Raw {
     section: String,
@@ -122,9 +172,26 @@ struct Raw {
     m: String,
 }
 
+/// A mark on a carried item as the extraction pass returned it, before [`verify_marks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    pub kind: MarkKind,
+    /// The carried item, quoted as carried.
+    pub quote: String,
+    /// The message that fulfilled, used or superseded it.
+    pub m: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    Done,
+    Used,
+    Superseded,
+}
+
 /// The extraction pass's answer: the first JSON array in `text` (a model may wrap it in prose or
-/// a code fence). Returns the items and the quotes of promises marked done.
-pub fn parse(text: &str) -> (Vec<Item>, Vec<String>, Dropped) {
+/// a code fence). Returns the items and the marks on carried items.
+pub fn parse(text: &str) -> (Vec<Item>, Vec<Mark>, Dropped) {
     let mut dropped = Dropped::default();
     let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) else {
         return (Vec::new(), Vec::new(), dropped);
@@ -136,7 +203,7 @@ pub fn parse(text: &str) -> (Vec<Item>, Vec<String>, Dropped) {
         dropped.malformed += 1;
         return (Vec::new(), Vec::new(), dropped);
     };
-    let (mut items, mut done) = (Vec::new(), Vec::new());
+    let (mut items, mut marks) = (Vec::new(), Vec::new());
     for v in values {
         let Ok(raw) = serde_json::from_value::<Raw>(v) else {
             dropped.malformed += 1;
@@ -147,8 +214,16 @@ pub fn parse(text: &str) -> (Vec<Item>, Vec<String>, Dropped) {
             "promise" => Section::Promise,
             "term" => Section::Term,
             "fact" => Section::Fact,
-            "done" => {
-                done.push(raw.quote);
+            mark @ ("done" | "used" | "superseded") => {
+                marks.push(Mark {
+                    kind: match mark {
+                        "done" => MarkKind::Done,
+                        "used" => MarkKind::Used,
+                        _ => MarkKind::Superseded,
+                    },
+                    quote: raw.quote,
+                    m: raw.m,
+                });
                 continue;
             }
             _ => {
@@ -161,9 +236,10 @@ pub fn parse(text: &str) -> (Vec<Item>, Vec<String>, Dropped) {
             quote: raw.quote,
             m: raw.m,
             why: String::new(),
+            seen: None,
         });
     }
-    (items, done, dropped)
+    (items, marks, dropped)
 }
 
 fn normalized(text: &str) -> String {
@@ -192,6 +268,10 @@ pub fn verify(items: Vec<Item>, texts: &HashMap<String, String>, layers: &Layers
         .into_iter()
         .filter(|item| {
             let ruling = item.section == Section::Rule;
+            if !ruling && noise(&item.quote) {
+                dropped.noise += 1;
+                return false;
+            }
             if layers.injected.contains(&item.m)
                 || ruling && !layers.prompts.contains(&item.m)
                 || item.section == Section::Fact && layers.replies.contains(&item.m)
@@ -217,15 +297,125 @@ pub fn verify(items: Vec<Item>, texts: &HashMap<String, String>, layers: &Layers
         .collect()
 }
 
+/// A quote shaped like a line of output rather than a statement: it opens with a timestamp
+/// (`Thu 2026-10-29 00:05:00`, `2026-10-29T07:44`, `Oct 29 07:44:01`, `07:44:01`), carries a
+/// `unit[pid]:` tag, or is a one-line commit (`13439a7d13 fix(...): ...`).
+pub fn noise(quote: &str) -> bool {
+    use std::sync::OnceLock;
+    static SHAPE: OnceLock<regex::Regex> = OnceLock::new();
+    let shape = SHAPE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?x)
+            ^\[?(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+)?
+               (?:[0-9]{4}-[0-9]{2}-[0-9]{2}[T\s][0-9]{2}:[0-9]{2}
+                 | (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{1,2}\s+[0-9]{2}:[0-9]{2}
+                 | [0-9]{2}:[0-9]{2}:[0-9]{2})
+          | \b[A-Za-z0-9_.@-]+\[[0-9]+\]:
+          | ^[0-9a-f]{7,40}\s+[a-z]+(?:\([^)]*\))?!?:\s",
+        )
+        .expect("the noise shapes compile")
+    });
+    shape.is_match(quote.trim_start())
+}
+
+/// The marks the span can make: each names an item carried into it (quoted as carried, whitespace
+/// aside) and cites a message that can make it: a supersession is the person's own prompt, a use
+/// or a fulfilment a message of the span. The rest are counted in `dropped`.
+pub fn verify_marks(
+    marks: Vec<Mark>,
+    carried: &Carry,
+    texts: &HashMap<String, String>,
+    layers: &Layers,
+    dropped: &mut Dropped,
+) -> Marks {
+    let mut out = Marks::default();
+    for mark in marks {
+        let quote = normalized(&mark.quote);
+        let section = carried
+            .items
+            .iter()
+            .find(|i| normalized(&i.quote) == quote)
+            .map(|i| i.section);
+        let ok = match (mark.kind, section) {
+            (MarkKind::Done, Some(Section::Promise)) | (MarkKind::Used, Some(_)) => texts.contains_key(&mark.m),
+            (MarkKind::Superseded, Some(Section::Rule)) => layers.prompts.contains(&mark.m),
+            _ => false,
+        };
+        if !ok {
+            dropped.marks += 1;
+            continue;
+        }
+        match mark.kind {
+            MarkKind::Done => out.done.push(quote),
+            MarkKind::Used => out.used.push(quote),
+            MarkKind::Superseded => out.superseded.push(quote),
+        }
+    }
+    out
+}
+
+/// The carried items the span says again, word for word (whitespace aside): `texts` are the
+/// span's messages. A use the extraction pass did not mark still counts.
+pub fn said_again(carried: &Carry, texts: &[(String, String)]) -> Vec<String> {
+    let span: Vec<String> = texts.iter().map(|(_, t)| normalized(t)).collect();
+    carried
+        .items
+        .iter()
+        .map(|i| normalized(&i.quote))
+        .filter(|q| !q.is_empty() && span.iter().any(|t| t.contains(q.as_str())))
+        .collect()
+}
+
+/// What checking the narrative's citations found: cites kept as written, cites written as a
+/// prefix of one message's id and completed, and cites of no message of the window, removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cites {
+    pub kept: usize,
+    pub completed: usize,
+    pub unresolved: usize,
+}
+
+/// The narrative with every `[m:ID]` resolved against `known` (the window's message ids): a full
+/// id stays, a prefix of at least 8 characters that names exactly one message is completed, and
+/// anything else is removed, so no cite sends the reader to a message that is not there.
+pub fn cites(narrative: &str, known: &std::collections::HashSet<String>) -> (String, Cites) {
+    use std::sync::OnceLock;
+    static CITE: OnceLock<regex::Regex> = OnceLock::new();
+    let cite = CITE.get_or_init(|| regex::Regex::new(r"\[m:([^\]\s]*)\]").expect("the cite shape compiles"));
+    let mut sorted: Vec<&str> = known.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut counts = Cites::default();
+    let out = cite.replace_all(narrative, |c: &regex::Captures| {
+        let id = &c[1];
+        if known.contains(id) {
+            counts.kept += 1;
+            return c[0].to_owned();
+        }
+        if id.len() >= 8 {
+            let from = sorted.partition_point(|k| *k < id);
+            let mut hits = sorted[from..].iter().take_while(|k| k.starts_with(id));
+            if let (Some(full), None) = (hits.next(), hits.next()) {
+                counts.completed += 1;
+                return format!("[m:{full}]");
+            }
+        }
+        counts.unresolved += 1;
+        String::new()
+    });
+    (out.into_owned(), counts)
+}
+
 /// The pointers `found` (`(message id, rule id)`, oldest first) make: one per rule id, with its
-/// last message and count.
+/// last message and count, from the least to the most recently used.
 pub fn pointers(found: &[(String, String)]) -> Vec<Pointer> {
     let mut out: Vec<Pointer> = Vec::new();
     for (m, id) in found {
-        match out.iter_mut().find(|p| &p.id == id) {
-            Some(p) => {
+        match out.iter().position(|p| &p.id == id) {
+            Some(at) => {
+                let mut p = out.remove(at);
                 p.last = m.clone();
                 p.hits += 1;
+                out.push(p);
             }
             None => out.push(Pointer {
                 id: id.clone(),
@@ -284,26 +474,52 @@ pub fn ids(messages: &[(String, String)]) -> Vec<Id> {
 
 impl Carry {
     /// The next generation: this one's items and ids, then the span's new ones (an item already
-    /// carried, whitespace aside, is not repeated), less the promises `done` quotes; the id list
-    /// keeps the `max_ids` most recently seen. Nothing carried is rewritten.
-    pub fn merge(&self, span: Span, done: &[String], max_ids: usize) -> Carry {
-        let Span { items, ids, pointers } = span;
-        let done: Vec<String> = done.iter().map(|d| normalized(d)).collect();
+    /// carried, whitespace aside, is not repeated), less the promises the span fulfilled, the
+    /// rulings a later ruling superseded, and the items no span has said or used for
+    /// `limits.retire_after` windows (a ruling never retires by age); the id and pointer lists keep
+    /// the most recently seen. Nothing carried is rewritten.
+    pub fn merge(&self, span: Span, limits: &Limits) -> Carry {
+        let Span {
+            items,
+            ids,
+            pointers,
+            marks,
+            window,
+        } = span;
         let mut seen: std::collections::HashSet<(Section, String)> = std::collections::HashSet::new();
         let mut next = Vec::new();
-        let fresh = items.into_iter().map(|mut i| {
-            i.why = format!("said in this span at [m:{}]", i.m);
-            i
-        });
+        let fresh: Vec<Item> = items
+            .into_iter()
+            .map(|mut i| {
+                i.why = format!("said in this span at [m:{}]", i.m);
+                i.seen = Some(window);
+                i
+            })
+            .collect();
+        let again: std::collections::HashSet<String> = fresh
+            .iter()
+            .map(|i| normalized(&i.quote))
+            .chain(marks.used.iter().cloned())
+            .collect();
         let carried = self.items.iter().cloned().map(|mut i| {
             if !i.why.starts_with("carried") {
                 i.why = format!("carried from an earlier summary; first said at [m:{}]", i.m);
+            }
+            if i.seen.is_none() || again.contains(&normalized(&i.quote)) {
+                i.seen = Some(window);
             }
             i
         });
         for item in carried.chain(fresh) {
             let key = (item.section, normalized(&item.quote));
-            if item.section == Section::Promise && done.iter().any(|d| d == &key.1) {
+            let gone = match item.section {
+                Section::Promise if marks.done.contains(&key.1) => true,
+                Section::Rule => marks.superseded.contains(&key.1),
+                _ => item
+                    .seen
+                    .is_some_and(|s| window.saturating_sub(s) >= limits.retire_after),
+            };
+            if gone {
                 continue;
             }
             if seen.insert(key) {
@@ -318,8 +534,8 @@ impl Carry {
             }
             all.push(id);
         }
-        if all.len() > max_ids {
-            all.drain(..all.len() - max_ids);
+        if all.len() > limits.ids {
+            all.drain(..all.len() - limits.ids);
         }
         let mut rules: Vec<Pointer> = self
             .pointers
@@ -335,10 +551,14 @@ impl Carry {
                 "the work in this span touched it {} time(s), last at [m:{}]",
                 p.hits, p.last
             );
-            match rules.iter().position(|r| r.id == p.id) {
-                Some(at) => rules[at] = p,
-                None => rules.push(p),
+            // A pointer used again moves to the end: the list runs from least to most recently used.
+            if let Some(at) = rules.iter().position(|r| r.id == p.id) {
+                rules.remove(at);
             }
+            rules.push(p);
+        }
+        if rules.len() > limits.pointers {
+            rules.drain(..rules.len() - limits.pointers);
         }
         Carry {
             items: next,
@@ -384,15 +604,262 @@ impl Carry {
         out
     }
 
-    /// The open promises, for the extraction pass to mark done.
+    /// The open promises.
     pub fn promises(&self) -> impl Iterator<Item = &Item> {
         self.items.iter().filter(|i| i.section == Section::Promise)
+    }
+
+    /// The carried items as the extraction pass is shown them, by section, each on one line: what
+    /// it marks done, used or superseded, quoting the line.
+    pub fn listing(&self) -> String {
+        let mut out = String::new();
+        for section in Section::ALL {
+            let mut items = self.items.iter().filter(|i| i.section == section).peekable();
+            if items.peek().is_none() {
+                continue;
+            }
+            out.push_str(&format!("{}:\n", section.name()));
+            for item in items {
+                let mut line = String::new();
+                super::anchor::normalize_into(&mut line, &item.quote);
+                out.push_str(&format!("- {line}\n"));
+            }
+        }
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LIMITS: Limits = Limits {
+        ids: 10,
+        pointers: 10,
+        retire_after: 3,
+    };
+
+    fn item(section: Section, quote: &str, m: &str) -> Item {
+        Item {
+            section,
+            quote: quote.into(),
+            m: m.into(),
+            why: String::new(),
+            seen: None,
+        }
+    }
+
+    /// An item retires after `retire_after` windows in which no span said or used it; a use
+    /// (marked by the extraction pass, or the quote said again) restarts the count. A ruling
+    /// never retires by age: only a later ruling of the person's supersedes it.
+    #[test]
+    fn unused_items_retire_and_rulings_leave_only_when_superseded() {
+        let at = |window, items, marks| Span {
+            items,
+            marks,
+            window,
+            ..Default::default()
+        };
+        let carry = Carry::default().merge(
+            at(
+                10,
+                vec![
+                    item(Section::Rule, "never push main", "u1"),
+                    item(Section::Term, "a lane is a worktree", "u1"),
+                    item(Section::Fact, "the seat runs opus", "t1"),
+                ],
+                Marks::default(),
+            ),
+            &LIMITS,
+        );
+        assert!(carry.items.iter().all(|i| i.seen == Some(10)));
+        // Window 12: the term is used again; the fact is not.
+        let used = Marks {
+            used: vec!["a lane is a worktree".into()],
+            ..Default::default()
+        };
+        let carry = carry.merge(at(12, Vec::new(), used), &LIMITS);
+        assert_eq!(carry.items.len(), 3);
+        // Window 13: three windows since the fact was last said, so it retires; the term was
+        // used in 12, the ruling never retires by age.
+        let carry = carry.merge(at(13, Vec::new(), Marks::default()), &LIMITS);
+        let quotes: Vec<&str> = carry.items.iter().map(|i| i.quote.as_str()).collect();
+        assert_eq!(quotes, ["never push main", "a lane is a worktree"]);
+        let carry = carry.merge(at(40, Vec::new(), Marks::default()), &LIMITS);
+        assert_eq!(carry.items.len(), 1, "the ruling outlives any age");
+        // A later ruling supersedes it; the new one is carried in its place.
+        let superseded = Marks {
+            superseded: vec!["never push main".into()],
+            ..Default::default()
+        };
+        let carry = carry.merge(
+            at(
+                41,
+                vec![item(Section::Rule, "push main after the review", "u9")],
+                superseded,
+            ),
+            &LIMITS,
+        );
+        let quotes: Vec<&str> = carry.items.iter().map(|i| i.quote.as_str()).collect();
+        assert_eq!(quotes, ["push main after the review"]);
+        // A record written before the count: its items start counting from this window.
+        let mut old = Carry::default();
+        old.items.push(item(Section::Fact, "the host is odie", "t2"));
+        let carry = old.merge(at(50, Vec::new(), Marks::default()), &LIMITS);
+        assert_eq!(carry.items[0].seen, Some(50));
+    }
+
+    /// A mark counts only when it names a carried item and cites a message that can make it:
+    /// a supersession is the person's own prompt, a use or fulfilment a message of the span.
+    #[test]
+    fn marks_name_carried_items_from_messages_that_can_make_them() {
+        let carried = Carry {
+            items: vec![
+                item(Section::Rule, "never push main", "u1"),
+                item(Section::Promise, "I will run the tests", "a1"),
+                item(Section::Fact, "the seat runs opus", "t1"),
+            ],
+            ..Default::default()
+        };
+        let texts = HashMap::from([
+            ("u9".to_owned(), "push main after the review".to_owned()),
+            ("a9".to_owned(), "tests pass; the seat   runs opus".to_owned()),
+        ]);
+        let layers = Layers {
+            prompts: ["u9".to_owned()].into(),
+            ..Default::default()
+        };
+        let mark = |kind, quote: &str, m: &str| Mark {
+            kind,
+            quote: quote.into(),
+            m: m.into(),
+        };
+        let mut dropped = Dropped::default();
+        let marks = verify_marks(
+            vec![
+                mark(MarkKind::Superseded, "never  push main", "u9"),
+                mark(MarkKind::Superseded, "never push main", "a9"),
+                mark(MarkKind::Done, "I will run the tests", "a9"),
+                mark(MarkKind::Done, "the seat runs opus", "a9"),
+                mark(MarkKind::Used, "the seat runs opus", "zz"),
+                mark(MarkKind::Used, "something never carried", "a9"),
+            ],
+            &carried,
+            &texts,
+            &layers,
+            &mut dropped,
+        );
+        assert_eq!(marks.superseded, ["never push main"]);
+        assert_eq!(marks.done, ["I will run the tests"]);
+        assert!(marks.used.is_empty());
+        assert_eq!(dropped.marks, 4);
+        let pairs: Vec<(String, String)> = texts.into_iter().collect();
+        assert_eq!(said_again(&carried, &pairs), ["the seat runs opus"]);
+        let listing = carried.listing();
+        assert!(listing.contains("rule:\n- never push main\n"), "{listing}");
+        assert!(listing.contains("promise:\n- I will run the tests\n"), "{listing}");
+    }
+
+    /// Output lines are not facts: a leading timestamp, a `unit[pid]:` tag or a one-line commit
+    /// marks a quote as noise; a statement with a date inside it is not.
+    #[test]
+    fn output_lines_are_noise_and_statements_are_not() {
+        for line in [
+            "Thu 2026-10-29 00:05:00 PDT 49min - meta-kimi-window-wake.timer",
+            "2026-10-29T07:44:01Z precompact: wrote",
+            "Oct 29 07:44:01 hub systemd[1]: Started fab.service.",
+            "07:44:01 build finished",
+            "hub fleet-bus[2211]: seat woke",
+            "13439a7d13 fix(autoswitch): retarget decodes the leading --json reading",
+        ] {
+            assert!(noise(line), "{line}");
+        }
+        for line in [
+            "the seat has a 1M context",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000",
+            "the land fix shipped on 2026-10-23",
+            "I am meta-claude, fleet integrator and lead.",
+        ] {
+            assert!(!noise(line), "{line}");
+        }
+        let texts = HashMap::from([(
+            "t1".to_owned(),
+            "Thu 2026-10-29 00:05:00 PDT 49min - x.timer".to_owned(),
+        )]);
+        let mut dropped = Dropped::default();
+        let kept = verify(
+            vec![item(Section::Fact, "Thu 2026-10-29 00:05:00 PDT 49min - x.timer", "t1")],
+            &texts,
+            &Layers::default(),
+            &mut dropped,
+        );
+        assert!(kept.is_empty());
+        assert_eq!(dropped.noise, 1);
+    }
+
+    /// Pointers run from least to most recently used, and only the newest `pointers` are kept.
+    #[test]
+    fn pointers_keep_the_most_recently_used() {
+        let found: Vec<(String, String)> = [("a1", "x-a"), ("a2", "x-b"), ("a3", "x-a"), ("a4", "x-c")]
+            .iter()
+            .map(|(m, id)| ((*m).into(), (*id).into()))
+            .collect();
+        let made = pointers(&found);
+        let names: Vec<&str> = made.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(names, ["x-b", "x-a", "x-c"], "x-a was used again after x-b");
+        assert_eq!(made[1].hits, 2);
+        let first = Carry::default().merge(
+            Span {
+                pointers: made,
+                ..Default::default()
+            },
+            &Limits { pointers: 2, ..LIMITS },
+        );
+        let names: Vec<&str> = first.pointers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(names, ["x-a", "x-c"]);
+        let second = first.merge(
+            Span {
+                pointers: pointers(&[("a9".into(), "x-a".into())]),
+                ..Default::default()
+            },
+            &Limits { pointers: 2, ..LIMITS },
+        );
+        let names: Vec<&str> = second.pointers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(names, ["x-c", "x-a"], "a pointer used again moves to the newest end");
+    }
+
+    /// Every cite names a message of the window in full: a unique prefix of 8 or more characters
+    /// is completed, and a cite of no such message is removed and counted.
+    #[test]
+    fn cites_resolve_to_window_messages_in_full_or_are_removed() {
+        let known: std::collections::HashSet<String> = [
+            "4d1dd21f-7a00-4c1e-9d1f-000000000001",
+            "4d1dd21f-7a00-4c1e-9d1f-000000000002",
+            "f9f71650-1111-4222-8333-444444444444",
+            "u1",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let (text, counts) = cites(
+            "ruled [m:u1]; kept [m:f9f71650]; both [m:4d1dd21f]; made up [m:991de80a-0000]; \
+             full [m:4d1dd21f-7a00-4c1e-9d1f-000000000002]; short [m:f9f7]",
+            &known,
+        );
+        assert_eq!(
+            text,
+            "ruled [m:u1]; kept [m:f9f71650-1111-4222-8333-444444444444]; both ; made up ; \
+             full [m:4d1dd21f-7a00-4c1e-9d1f-000000000002]; short "
+        );
+        assert_eq!(
+            counts,
+            Cites {
+                kept: 2,
+                completed: 1,
+                unresolved: 3
+            }
+        );
+    }
 
     #[test]
     fn a_quote_is_kept_only_where_its_message_holds_it() {
@@ -403,7 +870,14 @@ mod tests {
              {\"section\":\"done\",\"quote\":\"I will run the tests\",\"m\":\"a2\"},\
              {\"section\":\"mood\",\"quote\":\"x\",\"m\":\"u1\"}]\n```",
         );
-        assert_eq!(done, vec!["I will run the tests".to_owned()]);
+        assert_eq!(
+            done,
+            vec![Mark {
+                kind: MarkKind::Done,
+                quote: "I will run the tests".into(),
+                m: "a2".into()
+            }]
+        );
         assert_eq!(dropped.malformed, 1);
         let texts = HashMap::from([("u1".to_owned(), "Rule: never push\nmain, ever.".to_owned())]);
         let layers = Layers {
@@ -423,6 +897,7 @@ mod tests {
             quote: quote.into(),
             m: m.into(),
             why: String::new(),
+            seen: None,
         };
         let texts = HashMap::from([
             (
@@ -476,6 +951,7 @@ mod tests {
             quote: quote.into(),
             m: m.into(),
             why: String::new(),
+            seen: None,
         };
         let span = |items| Span {
             items,
@@ -486,8 +962,7 @@ mod tests {
                 item(Section::Rule, "never push main", "u1"),
                 item(Section::Promise, "I will run the tests", "a1"),
             ]),
-            &[],
-            10,
+            &LIMITS,
         );
         assert_eq!(first.items[0].why, "said in this span at [m:u1]");
         let second = first.merge(
@@ -500,10 +975,13 @@ mod tests {
                     ("a4".into(), "lane-commits".into()),
                     ("a5".into(), "lane-commits".into()),
                 ]),
+                marks: Marks {
+                    done: vec!["I will run the tests".to_owned()],
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            &["I will run the tests".to_owned()],
-            10,
+            &LIMITS,
         );
         assert_eq!(second.items.len(), 2);
         assert_eq!(
@@ -548,8 +1026,7 @@ mod tests {
                 ids: found,
                 ..Default::default()
             },
-            &[],
-            2,
+            &Limits { ids: 2, ..LIMITS },
         );
         assert_eq!(carry.ids.len(), 2, "the newest kept");
         assert!(carry

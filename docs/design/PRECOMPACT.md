@@ -81,13 +81,22 @@ So a record is three parts, rendered in this order into the text served:
    stands, files, open questions, next step. Every line cites `[m:ID]`; an existence, absence or
    pass claim cites the message holding its check or says "not verified: probe before claiming
    this". Extended incrementally: an extension reads the previous narrative and the span since.
+   Every cite must name a message of the window in full (`carry::cites`): a unique prefix of 8 or
+   more characters is completed, any other cite is removed and counted in the record
+   (`unresolved_cites`), so no cite sends the reader to a message that is not there.
 2. **Carried sections** (`precompact::carry`), verbatim, never fed back to a summarizer: the
    person's rulings, open promises, terms, self and setup facts. A separate extraction pass
    (`prompt::EXTRACT_INSTRUCTION`) returns quotes with the message id each is copied from; a quote
    is kept only when that message holds it, whitespace aside (`carry::verify`: an extractor cannot
    plant a fact), and a self or setup fact never quotes the agent's own reply (where it was
-   assumed, not shown: a seat once carried its own wrong "I run with a 1M context"). Items merge into the previous generation's (`Carry::merge`); a promise leaves
-   only when the extractor quotes it as done. Live identifiers (commit shas, `task/N`, absolute
+   assumed, not shown: a seat once carried its own wrong "I run with a 1M context"). Items merge into the previous generation's (`Carry::merge`). The extraction
+   pass is shown the carried items and marks the ones the span fulfilled (`done`), said or relied
+   on again (`used`) or, for a ruling, replaced by a later ruling of the person's
+   (`superseded`); a mark counts only when it names a carried item and cites a message that can
+   make it (`carry::verify_marks`), and a carried quote the span repeats word for word counts as
+   used without one. An item no span has said or used for `retire_after` windows retires; a
+   ruling never retires by age, only by supersession. A quote shaped like an output line (a
+   leading timestamp, a `unit[pid]:` tag, a one-line commit: `carry::noise`) is not carried. Live identifiers (commit shas, `task/N`, absolute
    paths, URLs) are read by shape with no model, each with where it was last seen, under "not
    verified now: probe before claiming one exists or is absent". The carry outlives the window
    (`carry/<harness>/<session>.json`): the next window's first summary starts from it. A record
@@ -109,9 +118,12 @@ what a compaction loses, and it is chosen by what the span was doing, determinis
 - the person's rulings in the span, verbatim: an extracted rule is kept only when it quotes a
   prompt the person wrote, outside the harness markup in it (`carry::verify` with `Layers`); no
   carried item may quote injected context. A ruling never filed anywhere exists only here;
-- pointers to the standing rules the span's work touched: the ids the configured `rule_patterns`
-  find in the span (in what hooks injected while the work ran, and in the agent's own words),
-  with hits and where last seen. A fleet names its own patterns; cv knows no rule store.
+- pointers to the standing rules the span's work acted on: the ids the configured
+  `rule_patterns` find in what the agent did (its replies and tool calls, so a rule it fetched,
+  quoted or named, and the refusals its calls drew), with hits and where last used. A rule a hook
+  only injected is the per-turn layer and makes no pointer. The `carry_pointers` most recently
+  used are kept. A fleet names its own patterns (a fetch verb among them); cv knows no rule
+  store.
 
 Each carried item and pointer records why it was chosen (said in this span at `[m:ID]`, carried
 from an earlier summary, touched N times), in the record and in the `written` event, so an
@@ -164,6 +176,8 @@ answered in 1.85 s.
 | `tool_result_bytes` | 2,048 | budget | each tool result's head and tail the summary model reads |
 | `owner_words_bytes` | 16,384 | budget | the person's words carried verbatim |
 | `carry_ids` | 200 | budget | live identifiers carried, most recently seen kept |
+| `carry_pointers` | 20 | budget | standing-rule pointers carried, most recently used kept |
+| `retire_after` | 3 | budget | windows an unused carried item stays (rulings leave only when superseded) |
 | `rule_patterns` | none | policy | regexes finding a standing rule's id (first capture group); `--rule-pattern` |
 | `fit_fraction` | 0.5 | safety cap | summary plus kept messages, of the auto-compact point |
 | `jobs` | 2 | safety cap | summary jobs at once |

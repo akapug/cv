@@ -64,6 +64,7 @@ fn record_at(w: &Window) -> Record {
         base: None,
         compact_at: None,
         bounds: Vec::new(),
+        unresolved_cites: 0,
         narrative: String::new(),
         carry: Default::default(),
         text: "<summary>S</summary>".into(),

@@ -430,8 +430,11 @@ struct Live {
     injected: Vec<(usize, String)>,
     /// The window's replies (index, id): a layer no self or setup fact may quote.
     replies: Vec<(usize, String)>,
-    /// Standing-rule ids the configured patterns found in the window: (index, message id, id).
+    /// Standing-rule ids the configured patterns found in what the agent did in the window: its
+    /// replies and tool calls, and the refusals its calls drew (index, message id, id).
     found: Vec<(usize, String, String)>,
+    /// The window's message ids (index, id): what a narrative cite may name.
+    ids: Vec<(usize, String)>,
 }
 
 impl Live {
@@ -450,6 +453,7 @@ impl Live {
             injected: Vec::new(),
             replies: Vec::new(),
             found: Vec::new(),
+            ids: Vec::new(),
         }
     }
 
@@ -498,6 +502,7 @@ impl Live {
             self.injected.clear();
             self.replies.clear();
             self.found.clear();
+            self.ids.clear();
             let b = self.window.boundaries.last().expect("a boundary was just pushed");
             let record = self.record.take();
             if self.primed {
@@ -542,11 +547,29 @@ impl Live {
         if let Some(id) = m.id.as_ref().filter(|_| m.kind == MessageKind::Reply) {
             self.replies.push((index, id.clone()));
         }
+        if let Some(id) = &m.id {
+            self.ids.push((index, id.clone()));
+        }
+        // A pointer is what the agent did with a rule: named it in its reply or a tool call, or
+        // drew a refusal naming it. A rule a hook only injected is the per-turn layer, not a use.
         let patterns = rule_regexes(&settings.rule_patterns);
         if let (Some(id), false) = (&m.id, patterns.is_empty()) {
+            let agent = m.role == Role::Assistant;
             for b in &m.content {
-                let Block::Text { text } = b else { continue };
-                let text = text_of(text, &resolver)?;
+                let text = match b {
+                    Block::Text { text } if agent => text_of(text, &resolver)?,
+                    Block::ToolUse { input, .. } if agent => {
+                        let mut args = String::new();
+                        cv_core::projection::append_json(&mut args, input)?;
+                        args
+                    }
+                    Block::ToolResult {
+                        content,
+                        is_error: true,
+                        ..
+                    } => text_of(content, &resolver)?,
+                    _ => continue,
+                };
                 for re in patterns.iter() {
                     for c in re.captures_iter(&text) {
                         if let Some(rule) = c.get(1).or_else(|| c.get(0)) {
@@ -636,6 +659,8 @@ struct Job {
     layers: pc::carry::Layers,
     /// Standing-rule ids found in the span: (message id, rule id).
     found: Vec<(String, String)>,
+    /// The window's message ids up to the cut: what a narrative cite may name.
+    known: std::collections::HashSet<String>,
     compact_at: Option<u64>,
 }
 
@@ -694,6 +719,12 @@ impl Job {
                 .filter(|(i, _, _)| *i <= cut.index && record.is_none_or(|r| *i > r.cut.index))
                 .map(|(_, m, id)| (m.clone(), id.clone()))
                 .collect(),
+            known: live
+                .ids
+                .iter()
+                .filter(|(i, _)| *i <= cut.index)
+                .map(|(_, id)| id.clone())
+                .collect(),
             cut,
             anchors,
             window: pc::WindowRef {
@@ -740,18 +771,24 @@ impl Job {
         let (narrative, model) =
             crate::llm::complete(settings.model.as_deref(), &turns, SUMMARY_MAX_TOKENS, SUMMARY_TIMEOUT)?;
         anyhow::ensure!(!narrative.trim().is_empty(), "the summary model returned no text");
-        let open: Vec<&str> = self.carry.promises().map(|i| i.quote.as_str()).collect();
         let mut bounds = vec![format!(
             "tool calls and results cut to {} bytes each",
             settings.tool_result_bytes
         )];
+        let (narrative, cites) = pc::carry::cites(&narrative, &self.known);
+        if cites.completed + cites.unresolved > 0 {
+            bounds.push(format!(
+                "citations: {} kept, {} completed from a unique prefix, {} naming no message of the window removed",
+                cites.kept, cites.completed, cites.unresolved
+            ));
+        }
         let extracted = crate::llm::complete(
             Some(model.as_str()),
-            &prompt::extract(extract_turns, &open),
+            &prompt::extract(extract_turns, &self.carry.listing()),
             EXTRACT_MAX_TOKENS,
             SUMMARY_TIMEOUT,
         );
-        let (items, done, mut dropped) = match &extracted {
+        let (items, marks, mut dropped) = match &extracted {
             Ok((answer, _)) => pc::carry::parse(answer),
             Err(e) => {
                 bounds.push(format!(
@@ -762,11 +799,13 @@ impl Job {
         };
         let by_id: HashMap<String, String> = texts.iter().cloned().collect();
         let items = pc::carry::verify(items, &by_id, &self.layers, &mut dropped);
+        let mut marks = pc::carry::verify_marks(marks, &self.carry, &by_id, &self.layers, &mut dropped);
+        marks.used.extend(pc::carry::said_again(&self.carry, &texts));
         if dropped != pc::carry::Dropped::default() {
             bounds.push(format!(
                 "extraction: dropped {} quote(s) not found verbatim in the message they cite, {} from a layer \
-                 cv does not re-introduce, {} malformed",
-                dropped.unverified, dropped.outside_layer, dropped.malformed
+                 cv does not re-introduce, {} shaped like output lines, {} marks on no carried item, {} malformed",
+                dropped.unverified, dropped.outside_layer, dropped.noise, dropped.marks, dropped.malformed
             ));
         }
         let carry = self.carry.merge(
@@ -774,9 +813,14 @@ impl Job {
                 items,
                 ids: pc::carry::ids(&texts),
                 pointers: pc::carry::pointers(&self.found),
+                marks,
+                window: self.window.boundaries,
             },
-            &done,
-            settings.carry_ids,
+            &pc::carry::Limits {
+                ids: settings.carry_ids,
+                pointers: settings.carry_pointers,
+                retire_after: settings.retire_after,
+            },
         );
         let text = format!(
             "{}{}{}",
@@ -798,6 +842,7 @@ impl Job {
             base: self.base,
             compact_at: self.compact_at,
             bounds,
+            unresolved_cites: cites.unresolved,
             narrative,
             carry,
             text,
@@ -1262,6 +1307,7 @@ fn watch(
                     base: None,
                     compact_at: None,
                     bounds: Vec::new(),
+                    unresolved_cites: 0,
                     narrative: String::new(),
                     carry: Default::default(),
                     text: String::new(),
@@ -1551,6 +1597,7 @@ fn check(
         base: None,
         compact_at: None,
         bounds: Vec::new(),
+        unresolved_cites: 0,
         narrative: String::new(),
         carry: Default::default(),
         text: String::new(),
@@ -2027,6 +2074,82 @@ mod tests {
         assert!(same_generation(&path, torn).is_err(), "a torn last line");
         assert!(same_generation(&dir.join("gone.jsonl"), None).is_err(), "no file");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A pointer is what the agent did with a rule: named it in a reply or a tool call, or drew a
+    /// refusal naming it. A rule a hook only injected, or ordinary tool output naming one, makes
+    /// none.
+    #[test]
+    fn pointers_come_from_what_the_agent_did_with_a_rule() {
+        let message = |role, kind, id: &str, block| {
+            let mut m = Message::new(role);
+            m.kind = kind;
+            m.id = Some(id.into());
+            m.content.push(block);
+            m
+        };
+        let text = |t: &str| Block::Text {
+            text: t.to_string().into(),
+        };
+        let result = |t: &str, is_error| Block::ToolResult {
+            tool_use_id: "t1".into(),
+            content: t.to_string().into(),
+            is_error,
+            tool_name: None,
+            status: None,
+            details: None,
+        };
+        let settings = Settings {
+            rule_patterns: vec![r"store `([a-z-]+)`".into(), r"store get ([a-z-]+)".into()],
+            ..Default::default()
+        };
+        let mut live = Live::new(SessionRef::new("s", Harness::Claude, Path::new("/s.jsonl")));
+        for m in [
+            message(
+                Role::User,
+                MessageKind::InjectedContext,
+                "i1",
+                text("PREMISE: see store `injected-rule`"),
+            ),
+            message(
+                Role::Assistant,
+                MessageKind::Reply,
+                "a1",
+                text("per store `named-rule` I stop here"),
+            ),
+            message(
+                Role::Assistant,
+                MessageKind::Reply,
+                "a2",
+                Block::ToolUse {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "arc store get fetched-rule"}).into(),
+                    namespace: None,
+                },
+            ),
+            message(
+                Role::Tool,
+                MessageKind::ToolResult,
+                "r1",
+                result("refused: store `refusal-rule`", true),
+            ),
+            message(
+                Role::Tool,
+                MessageKind::ToolResult,
+                "r2",
+                result("listing: store `output-rule`", false),
+            ),
+        ] {
+            live.observe(&m, &settings, Path::new("/nonexistent"), true).unwrap();
+        }
+        let found: Vec<(&str, &str)> = live.found.iter().map(|(_, m, id)| (m.as_str(), id.as_str())).collect();
+        assert_eq!(
+            found,
+            [("a1", "named-rule"), ("a2", "fetched-rule"), ("r1", "refusal-rule")]
+        );
+        let ids: Vec<&str> = live.ids.iter().map(|(_, id)| id.as_str()).collect();
+        assert_eq!(ids, ["i1", "a1", "a2", "r1", "r2"], "every message id is citable");
     }
 
     /// A read that fails after delivering messages is delivered again from the last accepted
