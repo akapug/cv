@@ -175,7 +175,7 @@ answered in 1.85 s.
 | `extend_tokens` / `idle_secs` | 20,000 / 45 | budget | when to extend |
 | `tool_result_bytes` | 2,048 | budget | each tool result's head and tail the summary model reads |
 | `owner_words_bytes` | 16,384 | budget | the person's words carried verbatim |
-| `carry_ids` | 200 | budget | live identifiers carried, most recently seen kept |
+| `carry_ids` | 25 | budget | live identifiers carried, most recently seen kept |
 | `carry_pointers` | 20 | budget | standing-rule pointers carried, most recently used kept |
 | `retire_after` | 3 | budget | windows an unused carried item stays (rulings leave only when superseded) |
 | `rule_patterns` | none | policy | regexes finding a standing rule's id (first capture group); `--rule-pattern` |

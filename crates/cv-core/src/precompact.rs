@@ -461,8 +461,9 @@ pub const JOBS: usize = 2;
 pub const LIVE_WITHIN_SECS: u64 = 7200;
 /// [`Settings::owner_words_bytes`].
 pub const OWNER_WORDS_BYTES: usize = 16 * 1024;
-/// [`Settings::carry_ids`].
-pub const CARRY_IDS: usize = 200;
+/// [`Settings::carry_ids`]: each id carries the message it was last seen in, about 50 tokens a
+/// line, so 200 cost about 10k tokens of a summary; 25 cost about 1.5k.
+pub const CARRY_IDS: usize = 25;
 /// [`Settings::carry_pointers`].
 pub const CARRY_POINTERS: usize = 20;
 /// [`Settings::retire_after`].
