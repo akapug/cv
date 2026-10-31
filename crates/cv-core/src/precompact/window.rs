@@ -126,8 +126,10 @@ impl Window {
                     }
                 }
                 let words = super::anchor::without_markup(&words);
-                // A scheduled wakeup (a cron or loop prompt) is the harness's, not the person's.
-                if !words.trim().is_empty() && m.origin != Origin::Scheduler {
+                // A scheduled wakeup (a cron or loop prompt) is the harness's, not the person's,
+                // and a summary cv served comes back as a plain message of theirs.
+                let served = words.trim_start().starts_with(super::SERVED_PREAMBLE);
+                if !words.trim().is_empty() && m.origin != Origin::Scheduler && !served {
                     self.prompts.push((
                         index,
                         super::prompt::Prompt {

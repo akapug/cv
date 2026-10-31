@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 /// A summary's output cap. The harness's own summaries on our fleet ran 9-17k tokens.
 const SUMMARY_MAX_TOKENS: u32 = 20_000;
 /// The extraction pass's output cap: quotes, not prose.
-const EXTRACT_MAX_TOKENS: u32 = 8_000;
+const EXTRACT_MAX_TOKENS: u32 = 12_000;
 /// How long one summary call may take before it is abandoned (the session keeps its old record).
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(900);
 /// The first retry of a session whose read failed (bytes it had read changed under it, or it
@@ -430,6 +430,8 @@ struct Live {
     injected: Vec<(usize, String)>,
     /// The window's replies (index, id): a layer no self or setup fact may quote.
     replies: Vec<(usize, String)>,
+    /// The window's summaries the harness wrote itself (index, id): what a standing line quotes.
+    summaries: Vec<(usize, String)>,
     /// Standing-rule ids the configured patterns found in what the agent did in the window: its
     /// replies and tool calls, and the refusals its calls drew (index, message id, id).
     found: Vec<(usize, String, String)>,
@@ -452,6 +454,7 @@ impl Live {
             redelivered: 0,
             injected: Vec::new(),
             replies: Vec::new(),
+            summaries: Vec::new(),
             found: Vec::new(),
             ids: Vec::new(),
         }
@@ -501,6 +504,7 @@ impl Live {
             self.span.clear();
             self.injected.clear();
             self.replies.clear();
+            self.summaries.clear();
             self.found.clear();
             self.ids.clear();
             let b = self.window.boundaries.last().expect("a boundary was just pushed");
@@ -546,6 +550,9 @@ impl Live {
         }
         if let Some(id) = m.id.as_ref().filter(|_| m.kind == MessageKind::Reply) {
             self.replies.push((index, id.clone()));
+        }
+        if let Some(id) = m.id.as_ref().filter(|_| m.kind == MessageKind::CompactionSummary) {
+            self.summaries.push((index, id.clone()));
         }
         if let Some(id) = &m.id {
             self.ids.push((index, id.clone()));
@@ -712,6 +719,12 @@ impl Job {
                     .filter(|(i, _)| *i <= cut.index)
                     .map(|(_, id)| id.clone())
                     .collect(),
+                summaries: live
+                    .summaries
+                    .iter()
+                    .filter(|(i, _)| *i <= cut.index)
+                    .map(|(_, id)| id.clone())
+                    .collect(),
             },
             found: live
                 .found
@@ -757,6 +770,8 @@ impl Job {
     fn run(self, settings: &Settings) -> Result<(Record, f64)> {
         let started = Instant::now();
         // Each rendered turn opens with its message id: the texts the quotes are checked against.
+        // A summary cv served is left out: it holds every carried quote, so nothing would ever
+        // read as unused, and what it says is already carried.
         let texts: Vec<(String, String)> = self
             .turns
             .iter()
@@ -765,6 +780,7 @@ impl Job {
                 let (id, text) = rest.split_once("] ")?;
                 Some((id.to_owned(), text.to_owned()))
             })
+            .filter(|(_, text)| !text.starts_with(pc::SERVED_PREAMBLE))
             .collect();
         let extract_turns = self.turns.clone();
         let turns = prompt::write(self.prior.as_deref(), self.turns, &self.profile.text);
@@ -820,6 +836,7 @@ impl Job {
                 ids: settings.carry_ids,
                 pointers: settings.carry_pointers,
                 retire_after: settings.retire_after,
+                standing_bytes: settings.standing_bytes,
             },
         );
         let text = format!(
@@ -899,6 +916,9 @@ fn written_event(record: &Record, secs: f64, prompt_bytes: usize, span_turns: us
 
 // ───────────────────────────── watch ─────────────────────────────
 
+/// How often a follower on a home with no session yet looks for the first one.
+const EMPTY_HOME_RESCAN: Duration = Duration::from_secs(3);
+
 /// The directories to watch so a change to any followed session, or a new session beside them,
 /// wakes the loop: every directory from a store root down to each session's parent. A new
 /// directory at a depth where sessions live (or above it) is watched when it appears.
@@ -908,6 +928,14 @@ struct Dirs {
 }
 
 impl Dirs {
+    /// The roots `refs` live under, in the harnesses they name.
+    fn of(refs: &[SessionRef]) -> Dirs {
+        let mut harnesses: Vec<Harness> = refs.iter().map(|r| r.harness).collect();
+        harnesses.sort_by_key(|h| h.as_str());
+        harnesses.dedup();
+        Dirs::new(&harnesses, refs)
+    }
+
     fn new(harnesses: &[Harness], refs: &[SessionRef]) -> Dirs {
         let mut roots = Vec::new();
         for h in harnesses {
@@ -1011,10 +1039,7 @@ fn watch(
             .or(r.created_at)
             .is_some_and(|t| chrono::Utc::now() - t <= live_within)
     };
-    let mut harnesses: Vec<Harness> = all.iter().map(|r| r.harness).collect();
-    harnesses.sort_by_key(|h| h.as_str());
-    harnesses.dedup();
-    let dirs = Dirs::new(&harnesses, &all);
+    let mut dirs = Dirs::of(&all);
     let mut followed: Vec<SessionRef> = Vec::new();
     for r in all.iter().filter(|r| filter.matches(r) && recent(r)) {
         // One session reached through linked project directories is followed once.
@@ -1369,12 +1394,31 @@ fn watch(
             (Some(t), Some(r)) => Some(t.min(r)),
             (t, r) => t.or(r),
         };
+        // A home with no session yet places no root, so nothing would ever wake the loop: look
+        // again on the fallback tick until the first session places them.
+        let unplaced = dirs.roots.is_empty();
+        let timeout = if unplaced {
+            Some(timeout.map_or(EMPTY_HOME_RESCAN, |t| t.min(EMPTY_HOME_RESCAN)))
+        } else {
+            timeout
+        };
         let woke = wake.wait(timeout)?;
         // A new directory where sessions live is watched; a new file in one may be a new session.
         // A file is looked up once: a session cv does not follow (filtered out, waiting a retry,
         // or the same transcript under a linked directory) is a write in a watched directory on
         // every append, and must not cost a discovery each time.
         let mut rediscover = woke.overflow;
+        if unplaced {
+            let all: Vec<SessionRef> = cv_core::sessions()
+                .into_iter()
+                .filter(|r| filter.harness.is_none_or(|h| h == r.harness))
+                .collect();
+            dirs = Dirs::of(&all);
+            if !dirs.roots.is_empty() {
+                dirs.watch_all(&mut wake);
+                rediscover = true;
+            }
+        }
         let known: std::collections::HashSet<PathBuf> = follow.borrow().iter().map(|r| r.path.clone()).collect();
         let mut new_files = Vec::new();
         for path in &woke.paths {
@@ -1707,9 +1751,9 @@ fn commit(serve: Option<String>, harness: Option<String>) -> Result<()> {
     };
     let anchor = record.key.as_ref().map(|k| k.anchor.as_str()).unwrap_or("");
     let summary = format!(
-        "This session continues from an earlier conversation that cv compacted (session {session}, \
-         summarized through message {anchor}). Any [m:ID] below opens in full with \
-         `cv show {session} --around ID`.\n\n{}",
+        "{} (session {session}, summarized through message {anchor}). Any [m:ID] below opens in \
+         full with `cv show {session} --around ID`.\n\n{}",
+        pc::SERVED_PREAMBLE,
         record.text
     );
     let out = json!({"outcome": "served", "summary": summary, "keep_from": c.keep_from,
@@ -1847,6 +1891,15 @@ fn median(v: &mut [u64]) -> Option<u64> {
 /// harness's own), the stall and the tokens before and after, from the transcript's own
 /// compaction records (the follower's `compaction` events, attributed to cv when a commit served
 /// the session since its last compaction) and from the harness plugin's `compacted` events.
+/// A stall as the report shows it: a served one is milliseconds, and would round to `0s`.
+fn fmt_stall(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        crate::util::fmt_duration(ms)
+    }
+}
+
 fn report(json_out: bool) -> Result<()> {
     let root = store::root()?;
     let text = match std::fs::read_to_string(root.join("events.jsonl")) {
@@ -1916,6 +1969,16 @@ fn report(json_out: bool) -> Result<()> {
             _ => {}
         }
     }
+    // The harness records no tokens for a compaction a hook answered, so a served row reads them
+    // from the transcript's records of the same compactions.
+    if let (Some(col), Some(seen)) = (plugin.get_mut(METHODS[0]), transcript.get(METHODS[0])) {
+        if col.before.is_empty() {
+            col.before.clone_from(&seen.before);
+        }
+        if col.after.is_empty() {
+            col.after.clone_from(&seen.after);
+        }
+    }
     let rows = |source: &str, cols: &mut HashMap<&'static str, Col>| -> Vec<Value> {
         METHODS
             .iter()
@@ -1948,8 +2011,8 @@ fn report(json_out: bool) -> Result<()> {
             row["source"].as_str().unwrap_or(""),
             row["method"].as_str().unwrap_or(""),
             row["compactions"],
-            row["median_ms"].as_u64().map_or("-".into(), crate::util::fmt_duration),
-            row["max_ms"].as_u64().map_or("-".into(), crate::util::fmt_duration),
+            row["median_ms"].as_u64().map_or("-".into(), fmt_stall),
+            row["max_ms"].as_u64().map_or("-".into(), fmt_stall),
             num(&row["median_tokens_before"]),
             num(&row["median_tokens_after"]),
         );

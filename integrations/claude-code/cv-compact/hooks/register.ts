@@ -14,7 +14,8 @@ import type { Register, SessionCompactInput, SessionCompactResult, SessionMessag
 
 type Commit = { outcome: 'served'; summary: string; keep_from: number }
 
-// What the commit reads of a message: its text, its tool call and result ids, and its size.
+// What the commit reads of a message: its text, its tool call and result ids, and its size. A
+// tool's output is counted once, on the message that holds its result; a call's `text` repeats it.
 const slim = (m: SessionMessage) => ({
   role: m.role,
   text: m.text,
@@ -22,7 +23,7 @@ const slim = (m: SessionMessage) => ({
   toolResults: (m.toolResults ?? []).map((r) => ({ tool_use_id: r.tool_use_id })),
   bytes:
     m.text.length +
-    m.toolUses.reduce((n, u) => n + JSON.stringify(u.input ?? {}).length + (u.text?.length ?? 0), 0) +
+    m.toolUses.reduce((n, u) => n + JSON.stringify(u.input ?? {}).length, 0) +
     (m.toolResults ?? []).reduce((n, r) => n + (r.text?.length ?? 0), 0),
 })
 
@@ -56,7 +57,7 @@ export const register: Register = (on, options) => {
           result = { messages: [{ role: 'user', text: c.summary, toolUses: [] }, ...kept] }
           method = 'cv'
         } else {
-          miss = run.stderr.trim().split('\n').pop() ?? `exit ${run.exitCode}`
+          miss = run.stderr.trim().split('\n').pop() || `exit ${run.exitCode}`
         }
       } catch (err) {
         miss = `cv commit did not answer: ${String(err)}`

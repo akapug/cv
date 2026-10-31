@@ -20,6 +20,12 @@
 //! items are merged into the previous generation's ([`Carry::merge`]) instead of being
 //! summarized again. Identifiers are read from the span by shape ([`ids`]), with no model.
 //!
+//! A session that moves to cv from its harness's own compaction brings a summary cv never wrote,
+//! with nothing of it in any carry: rulings, schedules, handles and balances the harness kept,
+//! which the narrative is told not to list and a ruling may not quote. So the extraction also
+//! copies out the lines of that summary that still bind ([`Section::Standing`]), verified against
+//! it, bounded in bytes ([`Limits::standing_bytes`]), and marked as of that summary.
+//!
 //! The carry is bounded. A pointer is made only from what the agent itself did with a rule (named
 //! it in a reply or a tool call, or drew a refusal naming it), never from a rule a hook merely
 //! injected, and only the most recently used are kept ([`Limits::pointers`]). An item no span
@@ -42,10 +48,19 @@ pub enum Section {
     Term,
     /// A fact about the agent itself or its setup (model, context size, seat, host, paths).
     Fact,
+    /// A line of the harness's own earlier summary that still binds the work: what a session
+    /// that moved to cv kept from before cv ran.
+    Standing,
 }
 
 impl Section {
-    const ALL: [Section; 4] = [Section::Rule, Section::Promise, Section::Term, Section::Fact];
+    const ALL: [Section; 5] = [
+        Section::Rule,
+        Section::Promise,
+        Section::Term,
+        Section::Fact,
+        Section::Standing,
+    ];
 
     fn name(self) -> &'static str {
         match self {
@@ -53,6 +68,7 @@ impl Section {
             Section::Promise => "promise",
             Section::Term => "term",
             Section::Fact => "fact",
+            Section::Standing => "standing",
         }
     }
 
@@ -62,6 +78,9 @@ impl Section {
             Section::Promise => "Open promises",
             Section::Term => "Terms",
             Section::Fact => "Self and setup facts",
+            Section::Standing => {
+                "From the harness's own earlier summary, as of that summary (probe before relying on one)"
+            }
         }
     }
 }
@@ -132,6 +151,8 @@ pub struct Limits {
     pub ids: usize,
     pub pointers: usize,
     pub retire_after: usize,
+    /// Bytes of [`Section::Standing`] lines carried, the most recently seen kept.
+    pub standing_bytes: usize,
 }
 
 /// The carried sections of one record.
@@ -214,6 +235,7 @@ pub fn parse(text: &str) -> (Vec<Item>, Vec<Mark>, Dropped) {
             "promise" => Section::Promise,
             "term" => Section::Term,
             "fact" => Section::Fact,
+            "standing" => Section::Standing,
             mark @ ("done" | "used" | "superseded") => {
                 marks.push(Mark {
                     kind: match mark {
@@ -249,7 +271,7 @@ fn normalized(text: &str) -> String {
 }
 
 /// Which messages of the span are whose: the person's prompts, context the harness or a hook
-/// injected, and the agent's own replies.
+/// injected, the agent's own replies, and the harness's own summaries.
 #[derive(Debug, Clone, Default)]
 pub struct Layers {
     pub prompts: std::collections::HashSet<String>,
@@ -257,23 +279,28 @@ pub struct Layers {
     /// The agent's replies: a self or setup fact quoted from one is what the agent assumed, not
     /// where the fact was shown, so it is not carried.
     pub replies: std::collections::HashSet<String>,
+    /// The summaries the harness wrote itself: the one layer a [`Section::Standing`] line quotes.
+    pub summaries: std::collections::HashSet<String>,
 }
 
 /// Keep only the items whose quote is in the message they cite, whitespace aside, and from the
 /// layer cv re-introduces: no item quotes injected context, a ruling quotes a prompt the person
-/// wrote, outside the harness's markup in it, and a self or setup fact never quotes the agent. `texts` maps a message id to its text as the
+/// wrote, outside the harness's markup in it, a self or setup fact never quotes the agent, and a
+/// standing line quotes a summary the harness wrote. `texts` maps a message id to its text as the
 /// span holds it.
 pub fn verify(items: Vec<Item>, texts: &HashMap<String, String>, layers: &Layers, dropped: &mut Dropped) -> Vec<Item> {
     items
         .into_iter()
         .filter(|item| {
             let ruling = item.section == Section::Rule;
-            if !ruling && noise(&item.quote) {
+            let standing = item.section == Section::Standing;
+            if !ruling && !standing && noise(&item.quote) {
                 dropped.noise += 1;
                 return false;
             }
             if layers.injected.contains(&item.m)
                 || ruling && !layers.prompts.contains(&item.m)
+                || standing && !layers.summaries.contains(&item.m)
                 || item.section == Section::Fact && layers.replies.contains(&item.m)
             {
                 dropped.outside_layer += 1;
@@ -472,12 +499,37 @@ pub fn ids(messages: &[(String, String)]) -> Vec<Id> {
     out
 }
 
+/// `items` less the standing lines past `budget` bytes: the most recently seen stay, the order of
+/// the rest kept. What falls out stays one `cv show` away at the message each line cites.
+fn within_standing_budget(items: Vec<Item>, budget: usize) -> Vec<Item> {
+    let mut standing: Vec<usize> = (0..items.len())
+        .filter(|&i| items[i].section == Section::Standing)
+        .collect();
+    standing.sort_by_key(|&i| std::cmp::Reverse(items[i].seen));
+    let mut used = 0usize;
+    let mut out_of_budget = std::collections::HashSet::new();
+    for i in standing {
+        let cost = items[i].quote.len();
+        if used + cost > budget {
+            out_of_budget.insert(i);
+        } else {
+            used += cost;
+        }
+    }
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !out_of_budget.contains(i))
+        .map(|(_, item)| item)
+        .collect()
+}
+
 impl Carry {
     /// The next generation: this one's items and ids, then the span's new ones (an item already
     /// carried, whitespace aside, is not repeated), less the promises the span fulfilled, the
     /// rulings a later ruling superseded, and the items no span has said or used for
-    /// `limits.retire_after` windows (a ruling never retires by age); the id and pointer lists keep
-    /// the most recently seen. Nothing carried is rewritten.
+    /// `limits.retire_after` windows (a ruling never retires by age); the id and pointer lists and
+    /// the standing lines keep the most recently seen. Nothing carried is rewritten.
     pub fn merge(&self, span: Span, limits: &Limits) -> Carry {
         let Span {
             items,
@@ -526,6 +578,7 @@ impl Carry {
                 next.push(item);
             }
         }
+        let next = within_standing_budget(next, limits.standing_bytes);
         // An id seen again moves to the end: the list runs from least to most recently seen.
         let mut all = self.ids.clone();
         for mut id in ids {
@@ -637,6 +690,7 @@ mod tests {
         ids: 10,
         pointers: 10,
         retire_after: 3,
+        standing_bytes: 64,
     };
 
     fn item(section: Section, quote: &str, m: &str) -> Item {
@@ -647,6 +701,62 @@ mod tests {
             why: String::new(),
             seen: None,
         }
+    }
+
+    /// A line of the harness's own summary is carried only from that summary, verbatim; a log-shaped
+    /// line is fine there, since the harness chose to keep it.
+    #[test]
+    fn a_standing_line_quotes_only_the_harness_summary() {
+        let texts: HashMap<String, String> = [
+            (
+                "s1".into(),
+                "## Goal\n2026-10-29T07:44 the cron runs hourly\n".to_owned(),
+            ),
+            ("u1".into(), "the cron runs hourly".to_owned()),
+        ]
+        .into();
+        let layers = Layers {
+            prompts: ["u1".into()].into(),
+            summaries: ["s1".into()].into(),
+            ..Default::default()
+        };
+        let mut dropped = Dropped::default();
+        let kept = verify(
+            vec![
+                item(Section::Standing, "2026-10-29T07:44 the cron runs hourly", "s1"),
+                item(Section::Standing, "the cron runs hourly", "u1"),
+                item(Section::Standing, "the cron runs daily", "s1"),
+            ],
+            &texts,
+            &layers,
+            &mut dropped,
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].m, "s1");
+        assert_eq!((dropped.outside_layer, dropped.unverified), (1, 1));
+    }
+
+    /// The standing lines stay within their budget, the newest kept, and retire like any item.
+    #[test]
+    fn standing_lines_keep_the_newest_within_their_budget_and_retire_unused() {
+        let line = |c: char| c.to_string().repeat(40);
+        let at = |window, items| Span {
+            items,
+            window,
+            ..Default::default()
+        };
+        let first = Carry::default().merge(at(1, vec![item(Section::Standing, &line('a'), "s1")]), &LIMITS);
+        let second = first.merge(at(2, vec![item(Section::Standing, &line('b'), "s2")]), &LIMITS);
+        let quotes = |c: &Carry| c.items.iter().map(|i| i.quote.clone()).collect::<Vec<_>>();
+        assert_eq!(quotes(&second), vec![line('b')], "64 bytes hold one line, the newer");
+        let wide = Limits {
+            standing_bytes: 1024,
+            ..LIMITS
+        };
+        let both = first.merge(at(2, vec![item(Section::Standing, &line('b'), "s2")]), &wide);
+        assert_eq!(quotes(&both), vec![line('a'), line('b')]);
+        assert!(both.merge(at(5, Vec::new()), &wide).items.iter().all(|i| i.m == "s2"));
+        assert!(both.render("s").contains("as of that summary"));
     }
 
     /// An item retires after `retire_after` windows in which no span said or used it; a use
@@ -915,6 +1025,7 @@ mod tests {
             prompts: ["u1".to_owned()].into(),
             injected: ["r1".to_owned()].into(),
             replies: ["a1".to_owned()].into(),
+            ..Default::default()
         };
         let mut dropped = Dropped::default();
         let fact = |m: &str, quote: &str| Item {

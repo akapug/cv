@@ -10,19 +10,21 @@ const conversation = [
 // The engine beneath the plugin: its session, its clock, its compaction, and the cv it runs.
 function engine(on: On, cv: { exitCode: number; stdout: string; stderr: string }) {
   const runs: string[][] = []
+  const stdins: string[] = []
   const native = { compacted: 0 }
   on('session.id', () => ({ value: 's-1' }))
   on('clock.now', () => ({ value: 1000 }))
   on('session.messages', () => ({ value: conversation }))
   on('process.run', (_, e) => {
     runs.push([...e.argv])
+    stdins.push(String(e.init?.stdin))
     return { value: e.argv.includes('commit') ? cv : { exitCode: 0, stdout: '', stderr: '' } }
   })
   on('session.compact', () => {
     native.compacted += 1
     return { messages: [{ role: 'user', text: 'the native summary', toolUses: [] }], tokensBefore: 900, tokensAfter: 90 }
   })
-  return { runs, native }
+  return { runs, stdins, native }
 }
 
 // A test raises the event with its whole input, as the engine would.
@@ -54,4 +56,25 @@ test('a seat serving native never asks cv to commit', { options: { serve: 'nativ
   await $.session.compact(auto)
   expect(native.compacted).toBe(1)
   expect(runs.some((argv) => argv.includes('commit'))).toBe(false)
+})
+
+test('a miss with nothing on stderr still names why', { options: { serve: 'cv' } }, async ($, on) => {
+  const { runs, stdins, native } = engine(on, { exitCode: 7, stdout: '', stderr: '' })
+  await $.session.compact(auto)
+  expect(native.compacted).toBe(1)
+  const observed = runs.findIndex((argv) => argv.includes('observe'))
+  expect(JSON.parse(stdins[observed] ?? '{}').miss).toBe('exit 7')
+})
+
+test('a tool result is counted once in a message size', { options: { serve: 'cv' } }, async ($, on) => {
+  const { stdins } = engine(on, missed)
+  const call = { tool_use_id: 't', tool: 'Bash', input: {}, text: 'x'.repeat(100) }
+  const result = { tool_use_id: 't', text: 'x'.repeat(100), isError: false }
+  const messages = [
+    { role: 'assistant', text: '', toolUses: [call] },
+    { role: 'user', text: '', toolUses: [], toolResults: [result] },
+  ]
+  await $.session.compact({ trigger: 'auto', messages } as unknown as SessionCompactArgs)
+  const sizes = JSON.parse(stdins[0] ?? '{}').messages.map((m: { bytes: number }) => m.bytes)
+  expect(sizes).toEqual([2, 100])
 })

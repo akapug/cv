@@ -456,7 +456,12 @@ fn queued(id: &str, origin: &str, prompt: &str) -> Message {
 fn a_scheduled_prompt_anchors_nothing_the_harness_compaction_leaves_it_out() {
     // Claude Code's `session.compact` messages omit a scheduled prompt that the transcript holds;
     // on a real window this was the first anchor to miss (`covered_messages_changed`).
-    let mut scheduled = text(Role::User, MessageKind::Prompt, "c", "the hourly held-list check, by the clock");
+    let mut scheduled = text(
+        Role::User,
+        MessageKind::Prompt,
+        "c",
+        "the hourly held-list check, by the clock",
+    );
     scheduled.origin = crate::ir::Origin::Scheduler;
     let w = window(&[
         text(Role::User, MessageKind::Prompt, "a", "the person's first request"),
@@ -482,6 +487,25 @@ fn a_scheduled_prompt_anchors_nothing_the_harness_compaction_leaves_it_out() {
     record.key = Key::take(&source, "d".into());
     assert_eq!(commit(&view, &record, None).map(|c| c.anchors), Ok(3));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_served_summary_coming_back_is_not_the_persons_words() {
+    // The harness stores a summary a plugin handed it as a plain message; carried as owner words
+    // it doubled the record, and a ruling could cite it as something the person said.
+    let served = format!("{SERVED_PREAMBLE} (session s, summarized through message x).\n\nthe summary");
+    let w = window(&[
+        text(Role::User, MessageKind::Prompt, "a", &served),
+        reply("b", "a reply worth anchoring on", 1000),
+        text(Role::User, MessageKind::Prompt, "c", "the person's next request"),
+    ]);
+    let ids: Vec<_> = w.prompts.iter().map(|(_, p)| p.id.as_deref()).collect();
+    assert_eq!(ids, vec![Some("c")]);
+    assert_eq!(
+        w.anchors.first().map(|p| p.index),
+        Some(0),
+        "still a message the harness holds"
+    );
 }
 
 #[test]

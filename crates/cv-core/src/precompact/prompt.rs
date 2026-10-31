@@ -69,6 +69,12 @@ end;\n\
 - \"term\": a term the work uses with a meaning of its own, quoted where the meaning is given;\n\
 - \"fact\": a fact about the agent itself or its setup (its model, context size, seat, host, \
 paths, configuration), quoted where it was shown, not where it was assumed;\n\
+- \"standing\": a whole line of the summary the harness itself wrote of an earlier part of the \
+session (the message saying the session is continued from an earlier conversation; never a \
+summary that opens by naming cv) that still holds at the end: the goal, schedules and timers, \
+running work and its handles, ids, counts and balances, pending tasks, open promises, the \
+person's words it quotes. Take every such line, not a sample; ID is that summary's id, and what \
+the messages after it finished or replaced stays out;\n\
 - \"done\": one of the carried promises listed below that the conversation fulfilled; Q is the \
 promise exactly as listed, ID the message that fulfilled it;\n\
 - \"used\": one of the carried items listed below that the conversation said again, relied on or \

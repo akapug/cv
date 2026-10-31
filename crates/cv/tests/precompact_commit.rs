@@ -121,6 +121,30 @@ fn a_ready_record_is_committed_inside_the_harness_compaction_and_every_miss_exit
     assert!(err.contains("commit"), "{err}");
 }
 
+/// The harness records no tokens for a compaction a hook answered: a served row in `report` reads
+/// them from the transcript's record of it, and a served stall shows in milliseconds.
+#[test]
+fn report_joins_a_served_rows_tokens_and_shows_its_stall_in_milliseconds() {
+    let w = World::new("precompact-report");
+    let events = w.cv_home.join("precompact/events.jsonl");
+    std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+    let lines = [
+        json!({"event": "commit", "outcome": "served", "session": "s"}),
+        json!({"event": "compaction", "session": "s", "duration_ms": 41, "pre_tokens": 117_000, "post_tokens": 26_000}),
+    ];
+    let lines: Vec<String> = lines.iter().map(Value::to_string).collect();
+    std::fs::write(&events, lines.join("\n") + "\n").unwrap();
+    let row = json!({"session": "s", "trigger": "auto", "method": "cv", "ms": 40, "summary_bytes": 900});
+    w.cv_stdin(&["watch", "--kind", "precompact", "observe"], &row.to_string());
+    let (out, _) = w.cv_ok(&["watch", "--kind", "precompact", "report"]);
+    assert!(out.contains("stall median 40 ms"), "{out}");
+    let plugin = out
+        .lines()
+        .find(|l| l.starts_with("plugin") && l.contains(" cv "))
+        .unwrap();
+    assert!(plugin.contains("117,000 -> 26,000"), "{plugin}");
+}
+
 /// A record written before a compaction no follower saw (a restarted follower, or `now` run
 /// once per window) still hands its carried sections to the next window: the next `now` folds
 /// them into the session's carry before it summarizes. A dry run folds nothing.

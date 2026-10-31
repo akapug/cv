@@ -438,6 +438,8 @@ pub struct Settings {
     /// A carried item no span has said or used again for this many windows retires (a ruling of
     /// the person's retires only when a later ruling of theirs supersedes it).
     pub retire_after: usize,
+    /// Bytes of lines carried from the harness's own earlier summary, the most recently seen kept.
+    pub standing_bytes: usize,
     /// Patterns (regular expressions) that find a standing rule's id in the span, the first
     /// capture group the id (else the whole match): what the summary's pointers to standing rules
     /// are chosen by ([`carry::Pointer`]). Empty: no pointers. A fleet's rule store names its own.
@@ -446,6 +448,11 @@ pub struct Settings {
     /// point, or the commit misses.
     pub fit_fraction: f64,
 }
+
+/// The opening of every summary cv serves, shared with what reads it back: the harness stores a
+/// served summary as a plain message of the person's role, so this is how the next window tells
+/// it from something the person said.
+pub const SERVED_PREAMBLE: &str = "This session continues from an earlier conversation that cv compacted";
 
 /// [`Settings::start_fraction`]: 70% of the auto-compact point.
 pub const START_FRACTION: f64 = 0.70;
@@ -468,6 +475,9 @@ pub const CARRY_IDS: usize = 25;
 pub const CARRY_POINTERS: usize = 20;
 /// [`Settings::retire_after`].
 pub const RETIRE_AFTER: usize = 3;
+/// [`Settings::standing_bytes`]: about 3k tokens of a summary, the size of what the 2026-10-31
+/// probes on real windows found the narrative and the other sections had lost.
+pub const STANDING_BYTES: usize = 12 * 1024;
 /// [`Settings::fit_fraction`]: half the auto-compact point, so the compacted window has room to
 /// work before it fills again.
 pub const FIT_FRACTION: f64 = 0.5;
@@ -490,6 +500,7 @@ impl Default for Settings {
             carry_ids: CARRY_IDS,
             carry_pointers: CARRY_POINTERS,
             retire_after: RETIRE_AFTER,
+            standing_bytes: STANDING_BYTES,
             rule_patterns: Vec::new(),
             fit_fraction: FIT_FRACTION,
         }
