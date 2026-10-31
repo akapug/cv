@@ -453,6 +453,38 @@ fn queued(id: &str, origin: &str, prompt: &str) -> Message {
 }
 
 #[test]
+fn a_scheduled_prompt_anchors_nothing_the_harness_compaction_leaves_it_out() {
+    // Claude Code's `session.compact` messages omit a scheduled prompt that the transcript holds;
+    // on a real window this was the first anchor to miss (`covered_messages_changed`).
+    let mut scheduled = text(Role::User, MessageKind::Prompt, "c", "the hourly held-list check, by the clock");
+    scheduled.origin = crate::ir::Origin::Scheduler;
+    let w = window(&[
+        text(Role::User, MessageKind::Prompt, "a", "the person's first request"),
+        reply("b", "a reply worth anchoring on", 1000),
+        scheduled,
+        reply("d", "the reply to the scheduled check", 1100),
+    ]);
+    let dir = std::env::temp_dir().join(format!("cv-precompact-scheduled-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("s.jsonl");
+    std::fs::write(&source, "{\"uuid\":\"d\"}\n").unwrap();
+    let view = RequestView::parse(&json!({
+        "session": "s",
+        "trigger": "auto",
+        "messages": [
+            {"role": "user", "text": "the person's first request", "toolUses": [], "toolResults": []},
+            {"role": "assistant", "text": "a reply worth anchoring on", "toolUses": [], "toolResults": []},
+            {"role": "assistant", "text": "the reply to the scheduled check", "toolUses": [], "toolResults": []},
+        ],
+    }))
+    .unwrap();
+    let mut record = record_at(&w);
+    record.key = Key::take(&source, "d".into());
+    assert_eq!(commit(&view, &record, None).map(|c| c.anchors), Ok(3));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn the_persons_words_include_mid_turn_messages_and_leave_out_scheduled_prompts() {
     let mut scheduled = text(Role::User, MessageKind::Prompt, "u0", "Hourly check: read held.md");
     scheduled.origin = crate::ir::Origin::Scheduler;

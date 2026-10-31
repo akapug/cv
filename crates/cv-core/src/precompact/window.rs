@@ -178,10 +178,16 @@ impl Window {
                 }
             }
         }
+        // A scheduled prompt (a cron or loop wakeup) is in the wire request but not in the
+        // conversation Claude Code hands `session.compact`, so its text anchors nothing: one in a
+        // window made a live commit miss `covered_messages_changed`. A shorter fingerprint can
+        // only pin less, never miss more.
+        let scheduled = m.kind == MessageKind::Prompt && m.origin == Origin::Scheduler;
         let mut anchored = false;
         let mut other = false;
         for b in &m.content {
             match b {
+                Block::Text { .. } if scheduled => other = true,
                 Block::Text { text } => {
                     let mut s = String::new();
                     text.try_for_each_chunk(resolver, 64 * 1024, |part| {
