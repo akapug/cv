@@ -210,9 +210,22 @@ fn write_json_rows<T>(
     Ok(())
 }
 
-pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool, strict: bool, json: bool) -> Result<()> {
+pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool, if_changed: bool, strict: bool, json: bool) -> Result<()> {
     if semantic && subagents {
         return crate::util::usage("--semantic indexes top-level sessions; --subagents currently applies only to full-text indexing. Run `cv index --subagents` and `cv index --semantic` separately.");
+    }
+
+    if if_changed {
+        // The timer gate: a stat-only probe (catalog inventory + one stat per session + the
+        // index's own stamps) answers whether a pass would find work at all.
+        match cv_search::fts::pass_needed(&cv_search::default_tantivy_dir(), subagents) {
+            Some(true) => eprintln!("  ↳ corpus moved since the last pass — indexing"),
+            Some(false) => {
+                println!("index already current — nothing changed since the last pass (skipped)");
+                return Ok(());
+            }
+            None => eprintln!("  ↳ index unreadable — running the pass"),
+        }
     }
 
     eprintln!(
@@ -274,7 +287,7 @@ mod tests {
     #[test]
     fn unsupported_semantic_forest_combination_fails_before_index_work() {
         for rebuild in [false, true] {
-            let error = cmd_index(true, rebuild, true, false, false).unwrap_err();
+            let error = cmd_index(true, rebuild, true, false, false, false).unwrap_err();
             assert!(error.is::<crate::util::UsageError>());
             assert!(error.to_string().contains("top-level"));
             assert!(error.to_string().contains("cv index --subagents"));

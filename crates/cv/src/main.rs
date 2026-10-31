@@ -96,6 +96,19 @@ pub(crate) fn group_of(name: &str) -> Option<&'static str> {
     GROUPS.iter().find(|(_, cmds)| cmds.contains(&name)).map(|(g, _)| *g)
 }
 
+/// `--skills` values. `--skills-policy` and `drop-all` are the fork's earlier spellings, still
+/// accepted so callers written against them keep working; each parses to its canonical name.
+fn skills_values() -> impl clap::builder::TypedValueParser<Value = String> {
+    use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
+    const VALUES: [(&str, Option<&str>); 3] = [("keep", None), ("drop", Some("drop-all")), ("drop-stale", None)];
+    PossibleValuesParser::new(VALUES.map(|(name, old)| PossibleValue::new(name).aliases(old))).map(|given: String| {
+        VALUES
+            .iter()
+            .find(|(_, old)| *old == Some(given.as_str()))
+            .map_or(given.clone(), |(name, _)| name.to_string())
+    })
+}
+
 const RECIPES_FOOTER: &str = "run `cv recipes` for the agent quickstart";
 
 /// The grouped command listing that replaces clap's flat `Commands:` block — every visible
@@ -581,7 +594,7 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         declassify_tokens_file: Option<PathBuf>,
         /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
-        #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
+        #[arg(long = "skills", alias = "skills-policy", value_parser = skills_values(), default_value = "keep")]
         skills: String,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
@@ -633,7 +646,7 @@ enum Cmd {
         #[arg(long, value_parser = ["native", "portable"])]
         thinking: Option<String>,
         /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
-        #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
+        #[arg(long = "skills", alias = "skills-policy", value_parser = skills_values(), default_value = "keep")]
         skills: String,
         /// Report the window that would be written without writing anything.
         #[arg(long)]
@@ -815,7 +828,7 @@ enum Cmd {
         #[arg(long, value_parser = ["native", "text", "drop", "portable"])]
         thinking: Option<String>,
         /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
-        #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
+        #[arg(long = "skills", alias = "skills-policy", value_parser = skills_values(), default_value = "keep")]
         skills: String,
     },
     /// Print (or with --launch, run) the resume incantation for a session in its native harness.
@@ -1068,6 +1081,11 @@ enum Cmd {
         /// hundreds of transcripts to ingest. Without it, only top-level sessions are indexed.
         #[arg(long)]
         subagents: bool,
+        /// Skip the pass when a stat-only probe shows nothing changed since the last index —
+        /// for timers and other scheduled callers that fire whether or not the corpus moved.
+        /// An explicit bare `cv index` still means "run now".
+        #[arg(long, conflicts_with = "rebuild")]
+        if_changed: bool,
         /// Fail (exit 1) when any session cannot be read. By default such sessions are warnings:
         /// the index commits the rest and a later pass retries them.
         #[arg(long)]
@@ -1401,9 +1419,10 @@ fn run() -> Result<()> {
             semantic,
             rebuild,
             subagents,
+            if_changed,
             strict,
             json,
-        } => search::cmd_index(semantic, rebuild, subagents, strict, json),
+        } => search::cmd_index(semantic, rebuild, subagents, if_changed, strict, json),
         Cmd::Events {
             id,
             harness,
@@ -1814,6 +1833,28 @@ mod tests {
         let err = resolve_declassify_tokens(None, Some(dir.join("nope.txt"))).unwrap_err();
         assert!(err.to_string().contains("declassify-tokens-file"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn skills_policy_spelling_parses_to_the_canonical_skills_value() {
+        on_main_sized_stack(|| {
+            for (argv, want) in [
+                (["cv", "rewind", "s", "--skills-policy", "keep"], "keep"),
+                (["cv", "prune", "s", "--skills-policy", "drop-all"], "drop"),
+                (["cv", "port", "s", "--skills", "drop-stale"], "drop-stale"),
+            ] {
+                let m = build_cli().try_get_matches_from(argv).unwrap();
+                let (_, sub) = m.subcommand().unwrap();
+                assert_eq!(
+                    sub.get_one::<String>("skills").map(String::as_str),
+                    Some(want),
+                    "{argv:?}"
+                );
+            }
+            assert!(build_cli()
+                .try_get_matches_from(["cv", "rewind", "s", "--skills", "bogus"])
+                .is_err());
+        });
     }
 
     #[test]

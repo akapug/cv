@@ -48,6 +48,9 @@ Codex as well as Claude, and `cv doctor` reports a harness release cv has not ve
 - `cv workflow` exits 2 on flags it dropped: run-only flags without a run, `--revive-all` without `--revive`, `--revive` with `--json`.
 - `-q text:` without an index reads live; past `--live-bytes` or under `--frozen` it exits 2 naming `cv index` (`/api/stats`: 503).
 - `cv events`, `cv touched`, `cv blame` and their HTTP routes fail on an event-catalog error instead of answering empty.
+- Cold WAL store copies stage beside the catalog instead of `/tmp`; an unchanged Hermes or Devin store answers sub-agent forests without being copied. (akapug fork)
+- `cv rewind` counts tool calls only on top-level turns; a request snapshot replaying a closed call no longer reopens it. (akapug fork)
+- `--skills-policy` and `drop-all` still parse as `--skills` and `drop`. (akapug fork)
 
 **Breaking (library): cv-core, cv-search and cv-testkit.**
 - `ParseOptions`/`ExtraProjection` → `Demand { tier, spans, offsets }`; `MessageSink::extra_projection` → `tier`; the five `Watcher` poll methods → `poll`/`try_poll(Poll { .. })`.
