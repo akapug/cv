@@ -824,6 +824,13 @@ impl Job {
                 dropped.unverified, dropped.outside_layer, dropped.noise, dropped.marks, dropped.malformed
             ));
         }
+        let standing = |items: &[pc::carry::Item]| {
+            items
+                .iter()
+                .filter(|i| i.section == pc::carry::Section::Standing)
+                .count()
+        };
+        let offered = standing(&items) + standing(&self.carry.items);
         let carry = self.carry.merge(
             pc::carry::Span {
                 items,
@@ -839,6 +846,13 @@ impl Job {
                 standing_bytes: settings.standing_bytes,
             },
         );
+        let left_out = offered.saturating_sub(standing(&carry.items));
+        if left_out > 0 {
+            bounds.push(format!(
+                "{left_out} line(s) of the harness's own summary left out: past {} bytes, retired or repeated",
+                settings.standing_bytes
+            ));
+        }
         let text = format!(
             "{}{}{}",
             narrative.trim_end(),
