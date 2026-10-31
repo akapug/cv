@@ -1,6 +1,7 @@
 # Precompaction: cv's compaction, inside the harness's own
 
-Status: built on akapug's fleet (2026-10-28, reshaped to the 0.19 design record 2026-10-29).
+Status: built on akapug's fleet (2026-10-28, reshaped to the 0.19 design record 2026-10-29); first
+served live on throwaway sessions 2026-10-31, on no seat yet.
 Paths are relative to `crates/`. The 0.19 record is `docs/design/0.19/`; its REVIEW-ASTRA §3
 handoff (prepare, ready, commit, miss) is the shape this page follows.
 
@@ -62,8 +63,8 @@ fast answer (it costs a second summary per window; a seat that never misses coul
 Subagent compactions pass through. A hook that throws is caught to `next(e)`. After every
 compaction, cv's or native, the plugin runs `observe` without waiting on it.
 
-The plugin's tests (`claude plugin test`) cover serve, miss and native. Its `session.compact`
-answer path is exercised there, not yet on a live session (the dogfood step).
+The plugin's tests (`claude plugin test`) cover serve, miss and native; the live trial is under
+Measurements.
 
 ## What the summary carries
 
@@ -186,6 +187,29 @@ answered in 1.85 s.
 | `SUMMARY_TIMEOUT` | 900 s | safety cap | a model pass past it fails; the session keeps its old record |
 | `LEASE_STALE` | 960 s | cost-only | a lease older than this is a dead owner's |
 | `RETRY_FIRST` / `RETRY_MAX` | 5 s / 600 s | cost-only | a read refused for a changed source is retried, doubling |
+
+## First live trial (2026-10-31, Claude Code 2.1.316, throwaway sessions, never a seat)
+
+| | stall (`durationMs`) | tokens after |
+|---|---|---|
+| cv served, 118-133k window, 3 auto compactions | 35, 47, 63 ms | 26.6-29.8k |
+| cv served, a real 354k window resumed | 46 ms | 13.0k |
+| native on a miss, or set native, 114-131k window, 7 compactions | 31-75 s | 8.7-29.6k |
+| native on a miss, the same 354k window | 83.8 s | 32.2k |
+
+Misses seen live, each falling through to native: `no_record` (a window filled faster than a 55 s
+summary), `would_not_fit`, `covered_messages_changed` (a scheduled prompt, now not anchored), a
+hung cv (the 5 s deadline, added to the stall), unparsable output, a crash.
+
+What the trial found about serving: Claude Code's classic `PreCompact` hook does not fire on a
+served compaction (`PostCompact` and `SessionStart` `compact` do), and the base layer's rows
+(`instructions`, `session_context`, `date`) return at the next prompt, not at the boundary, so a
+compaction in the middle of a long turn runs without those rows until the turn ends.
+
+Fidelity, probes answered with no tools: on the 354k window, things said in the span 8 of 9, native
+8 of 9; things an earlier generation carried 0 of 5 with 2 partial, native 4 of 5, so a session
+moving from native to cv loses most of what only the previous native summary held (cause not yet
+read). On a fresh session with planted items, 9 of 10 against 10 of 10.
 
 ## Measurements kept from the first build
 
