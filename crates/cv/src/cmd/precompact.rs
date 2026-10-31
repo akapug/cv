@@ -931,7 +931,7 @@ fn written_event(record: &Record, secs: f64, prompt_bytes: usize, span_turns: us
 // ───────────────────────────── watch ─────────────────────────────
 
 /// How often a follower on a home with no session yet looks for the first one.
-const EMPTY_HOME_RESCAN: Duration = Duration::from_secs(3);
+const EMPTY_HOME_RESCAN: Duration = Duration::from_secs(10);
 
 /// The directories to watch so a change to any followed session, or a new session beside them,
 /// wakes the loop: every directory from a store root down to each session's parent. A new

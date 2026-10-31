@@ -8,11 +8,10 @@ handoff (prepare, ready, commit, miss) is the shape this page follows.
 ## The goal
 
 A compaction cv controls end to end, measured against the harness's own. Claude Code's native
-compaction (its background precompute included) is the baseline: it serves a seat for as long as
-it measures better. A per-seat setting chooses which one serves; `report` is the comparison that
-setting is chosen by. cv starts from what it alone has: the whole transcript, so a summary can
-carry pointers back into it (`[m:ID]`, opened with `cv show <session> --around ID`) instead of
-retelling it.
+compaction (its background precompute included) is the baseline: it serves a seat for as long as it
+measures better. A per-seat setting chooses which one serves, by `report`. cv starts from what it
+alone has: the whole transcript, so a summary can carry pointers back into it (`[m:ID]`, opened with
+`cv show <session> --around ID`) instead of retelling it.
 
 ## The stall
 
@@ -43,8 +42,7 @@ sampled bytes passes it, so the commitments are compared against the conversatio
 actually holds. Miss classes (what `report` counts): `no_record`, `no_key`, `checkpoint_refused`,
 `too_old`, `focus_instructions`, `covered_messages_changed`, `would_not_fit`, `serve_native`.
 
-No proxy sits in the path. The first build answered a proxy (`answer`, our CLIProxyAPI fork);
-that action is removed and names `commit` (exit 2).
+No proxy sits in the path; the first build's `answer` action is removed and names `commit` (exit 2).
 
 ## Serving on Claude Code
 
@@ -59,22 +57,19 @@ that action is removed and names `commit` (exit 2).
 - `host` (default): `commit` without `--serve`, so cv's `[precompact] serve` decides.
 
 `precompute` passes through untouched: the harness's own background summary stays the miss path's
-fast answer (it costs a second summary per window; a seat that never misses could skip it later).
+fast answer (a second summary per window, and a served compaction waits for it: see the trial).
 Subagent compactions pass through. A hook that throws is caught to `next(e)`. After every
 compaction, cv's or native, the plugin runs `observe` without waiting on it.
 
-The plugin's tests (`claude plugin test`) cover serve, miss and native; the live trial is under
-Measurements.
+The plugin's tests (`claude plugin test`) cover serve, miss and native.
 
 ## What the summary carries
 
-Measured on our fleet over 7 days (2026-10-29): 34 times an agent lost something it had held, 27
-on one seat; by class, a settled rule broken again 15, built work claimed absent 6, our own terms
-lost 5, wrong self or setup facts 4 (once a summary planted a false "1M context"), in-flight work
-or a promise lost 4. Loss compounds over generations rather than spiking at a seam. Public
-evidence agrees: a compactor keeps about 17% of side constraints, a separate extractor appended
-after the summary over 90% (arXiv 2608.11242); anchored, incremental, fixed-section summaries
-score best (Factory).
+Measured on our fleet over 7 days (2026-10-29): 34 times an agent lost something it had held; by
+class, a settled rule broken again 15, built work claimed absent 6, our own terms lost 5, wrong
+self or setup facts 4, in-flight work or a promise lost 4. Loss compounds over generations rather
+than spiking at a seam. Public evidence agrees: a compactor keeps about 17% of side constraints, a
+separate extractor appended after the summary over 90% (arXiv 2608.11242).
 
 So a record is three parts, rendered in this order into the text served:
 
@@ -90,16 +85,21 @@ So a record is three parts, rendered in this order into the text served:
    (`prompt::EXTRACT_INSTRUCTION`) returns quotes with the message id each is copied from; a quote
    is kept only when that message holds it, whitespace aside (`carry::verify`: an extractor cannot
    plant a fact), and a self or setup fact never quotes the agent's own reply (where it was
-   assumed, not shown: a seat once carried its own wrong "I run with a 1M context"). Items merge into the previous generation's (`Carry::merge`). The extraction
-   pass is shown the carried items and marks the ones the span fulfilled (`done`), said or relied
+   assumed, not shown: a seat once carried its own wrong "I run with a 1M context"). Items merge
+   into the previous generation's (`Carry::merge`). The extraction pass is shown the carried items and marks the ones the span fulfilled (`done`), said or relied
    on again (`used`) or, for a ruling, replaced by a later ruling of the person's
    (`superseded`); a mark counts only when it names a carried item and cites a message that can
    make it (`carry::verify_marks`), and a carried quote the span repeats word for word counts as
    used without one. An item no span has said or used for `retire_after` windows retires; a
    ruling never retires by age, only by supersession. A quote shaped like an output line (a
-   leading timestamp, a `unit[pid]:` tag, a one-line commit: `carry::noise`) is not carried. Live identifiers (commit shas, `task/N`, absolute
-   paths, URLs) are read by shape with no model, each with where it was last seen, under "not
-   verified now: probe before claiming one exists or is absent". The carry outlives the window
+   leading timestamp, a `unit[pid]:` tag, a one-line commit: `carry::noise`) is not carried. Live
+   identifiers (commit shas, `task/N`, absolute paths, URLs) are read by shape with no model, each
+   with where it was last seen, under "not verified now: probe before claiming one exists or is
+   absent". A session moving to cv from the harness's own compaction brings a summary no carry
+   holds, so the extraction also copies the lines of it that still bind (`standing`): only from a
+   summary the harness wrote, within `standing_bytes`, marked as of that summary. A summary cv
+   served comes back as a plain message of the person's; its opening (`SERVED_PREAMBLE`) keeps it
+   out of the person's words and out of what counts as said again. The carry outlives the window
    (`carry/<harness>/<session>.json`): the next window's first summary starts from it. A record
    no follower saw compacted (a restarted follower, or `now` run once per window) is folded into
    that carry by the next read (`Live::adopt_stored`).
@@ -134,35 +134,30 @@ A captured harness instruction (`profile import`, then `precompact.profile = <id
 narrative instruction only.
 
 **The seam for evaluation.** `cv watch --kind precompact now <id> --upto-bytes N --print` writes
-the summary of the window as it stood at byte N to stdout as a record, reading and writing no
-store: any recorded span, offline. The 0.19 record's M7 (probes from the dropped span, cv against
-the harness's default) runs through it.
+the summary of the window as it stood at byte N to stdout, touching no store: the 0.19 record's M7
+(probes from the dropped span, cv against the harness's default) runs through it.
 
 ## Recording and comparing
 
-`events.jsonl` under the store holds: `written` (each summary: cut, tokens, bytes, model, seconds),
-`commit` (served or missed, with class, kept messages, estimated tokens, record age, seconds),
-`compaction` (the follower, from the transcript's own boundary: trigger, pre and post tokens,
-duration, native precompute), `compacted` (the plugin, per compaction: method, wall ms, tokens
-before and after, messages before and after, summary bytes, the miss that sent it native), and
-`swap` (lineage of an explicit new session). `cv watch --kind precompact report` folds them into
-one row per source and method (`cv`, `native precompute`, `native`): compactions, stall median and
-max, tokens before and after.
+`events.jsonl` under the store holds: `written` (each summary), `commit` (served or missed, with
+class, kept messages, estimated tokens, record age), `compaction` (the follower, from the
+transcript's own boundary), `compacted` (the plugin: method, wall ms, tokens and messages before and
+after, summary bytes, the miss that sent it native), and `swap` (lineage of an explicit new session).
+`cv watch --kind precompact report` folds them into one row per source and method (`cv`, `native
+precompute`, `native`): compactions, stall median and max, tokens before and after.
 
 ## One method per seat
 
 `serve` picks who serves; `prepare_native` (default off) picks whether cv prepares where the
 harness precomputes its own (read from the newest compaction's `compactMetadata.precomputed` or
 the profile's `cachedGrowthBookFeatures.tengu_sepia_moth`, `Adapter::native_precompaction`). Off,
-cv stays idle on such sessions, as the 0.19 record's "observe native first" asks; on, a seat set
-to `cv` gets cv's summaries and the two can be compared on the same sessions.
+cv stays idle on such sessions, as "observe native first" asks; on, a seat set to `cv` gets cv's.
 
 ## The fallback: an explicit new session
 
 `swap <id>` writes a new session that starts at a compaction boundary with the record's summary
-and the records after the cut (`Adapter::compacted_copy`, Claude Code only), and records the
-lineage. It commits only the generation it checked: a write since, or a torn last line, refuses.
-Measured on a real 4.8 MB session at 350k tokens: 0.27 s, 34 records; `claude --resume` on it
+and the records after the cut (Claude Code only), and records the lineage. It commits only the
+generation it checked. On a real 4.8 MB session at 350k tokens: 0.27 s; `claude --resume` on it
 answered in 1.85 s.
 
 ## Thresholds
@@ -178,6 +173,7 @@ answered in 1.85 s.
 | `owner_words_bytes` | 16,384 | budget | the person's words carried verbatim |
 | `carry_ids` | 25 | budget | live identifiers carried, most recently seen kept |
 | `carry_pointers` | 20 | budget | standing-rule pointers carried, most recently used kept |
+| `standing_bytes` | 12,288 | budget | lines carried from the harness's own summary, newest kept |
 | `retire_after` | 3 | budget | windows an unused carried item stays (rulings leave only when superseded) |
 | `rule_patterns` | none | policy | regexes finding a standing rule's id (first capture group); `--rule-pattern` |
 | `fit_fraction` | 0.5 | safety cap | summary plus kept messages, of the auto-compact point |
@@ -197,34 +193,40 @@ answered in 1.85 s.
 | native on a miss, or set native, 114-131k window, 7 compactions | 31-75 s | 8.7-29.6k |
 | native on a miss, the same 354k window | 83.8 s | 32.2k |
 
-Misses seen live, each falling through to native: `no_record` (a window filled faster than a 55 s
-summary), `would_not_fit`, `covered_messages_changed` (a scheduled prompt, now not anchored), a
-hung cv (the 5 s deadline, added to the stall), unparsable output, a crash.
+Misses seen live, each falling through to native: `no_record`, `would_not_fit`,
+`covered_messages_changed` (a scheduled prompt, now not anchored), a hung cv (the 5 s deadline, added
+to the stall), unparsable output, a crash.
 
-What the trial found about serving: Claude Code's classic `PreCompact` hook does not fire on a
-served compaction (`PostCompact` and `SessionStart` `compact` do), and the base layer's rows
-(`instructions`, `session_context`, `date`) return at the next prompt, not at the boundary, so a
-compaction in the middle of a long turn runs without those rows until the turn ends.
+What the trial found about serving: `PreCompact` runs beneath `next(e)`, so a served compaction
+never fires it (`PostCompact` and `SessionStart` `compact` do, in that order, the reverse of
+native's); with the flag on it fires instead when the precompute starts, a minute or more before.
+The base layer's rows (`instructions`, `session_context`, `date`) return at the next prompt, not at
+the boundary, so a compaction in the middle of a long turn runs without them until the turn ends.
 
-Fidelity, probes answered with no tools: on the 354k window, things said in the span 8 of 9, native
-8 of 9; things an earlier generation carried 0 of 5 with 2 partial, native 4 of 5, so a session
-moving from native to cv loses most of what only the previous native summary held (cause not yet
-read). On a fresh session with planted items, 9 of 10 against 10 of 10.
+Fidelity, probes answered with no tools. On the 354k window the first build held the span 8 of 9
+(native 8) but what only the previous native summary held 0 of 5 (native 4): the narrative is told
+not to list it, a ruling may not quote a summary, and a first generation has no carry. With
+`standing`, 4 of 5 and the span 8 of 9, at 16.5k tokens after. Blind on a second window (343k; 18
+items sampled by seed before either summary was read): earlier generation cv 6 of 12 with 2
+partial, native 2 with 1; this window's items cv 2 of 6, native 4; tokens after 9.0k against 31.1k,
+stall 165 ms against 61.0 s. So cv keeps more of the old at a third of the size and thins the
+span's shas and counts. Planted items on a fresh session (first build): 9 of 10 against 10.
+
+With `tengu_sepia_moth` on (one run each, one 190-198k compaction, 9 turns): off 44.9 s, 10.8k
+after, $3.96; on 43 ms, 32.1k after, $3.85; on with `serve = cv` 10.6 s, 18.0k after, $4.11 plus
+$1.51 of cv's summaries: `commit` took 31 ms, but the harness first waited out its in-flight
+precompute, then threw it away. It never arms under a 200k window, which is why 150k arms show
+nothing.
 
 ## Measurements kept from the first build
 
 - **Commitment replay.** 26 real compactions from 4 codex seats and 3 Claude Code sessions,
   resumed against a mock to capture the request Claude Code 2.1.312 built: a cut at the newest
-  message matched 24 of 26 with a median 2-message tail; a cut at 70% matched 26 of 26 (median 126
-  messages, 192 KB of tail). Tool call ids are what made the tail small on codex seats. The two
-  misses resumed a different leaf (a replay artifact). The redacted pairs are
-  `cv-core/tests/fixtures/precompact/` (`tools/precompact-fixture.py`), replayed by
-  `tests/precompact_replay.rs`.
-- **End to end (proxy era).** A served summary with an 8-message tail updated by `gpt-6-luna`
-  gave a 7.3 s `durationMs` against that seat's 335 s median. The tail pass is gone: the commit
-  keeps the tail as messages instead of summarizing it in the critical path.
-- **Watch cost.** On the hub (load 50-70, nice 19), 11 live sessions for 10 minutes: 160.5 s of
-  CPU before the append-only read (ac4250d3), 4.9 s after; 0.6 s per 5 minutes at rest, 48 MiB.
+  message matched 24 of 26 (the two resumed a different leaf) with a median 2-message tail; a cut
+  at 70% matched 26 of 26 (median 126 messages, 192 KB of tail). The redacted pairs are
+  `cv-core/tests/fixtures/precompact/`, replayed by `tests/precompact_replay.rs`.
+- **Watch cost.** On the hub, 11 live sessions for 10 minutes: 160.5 s of CPU before the append-only
+  read, 4.9 s after; 0.6 s per 5 minutes at rest, 48 MiB.
 
 ## Against the 0.19 design record
 
@@ -240,10 +242,8 @@ read). On a fresh session with planted items, 9 of 10 against 10 of 10.
 
 ## What 0.19's watching would need
 
-From building this: a wake for resident readers (`watch::wake`, inotify + eventfd); a
-per-message hook with an "accepted through N" callback and positions kept for paused sessions
-(today `Live::take`, `settle`, `restart`); the token fill and the compaction point as first-class
-facts; harness facts behind the adapter (`native_precompaction`, `compacted_copy`); a byte-prefix
-read for replay (`Start::Prefix`); a read of an append-only transcript that grew during the read
-(`watch::read::pass`, `source::held_from`, `Dependencies::growing`, built here: 26.7% of a core to
-0.81% on the hub); and a streaming poll (a batched `try_poll` is quadratic on a long session).
+A wake for resident readers (`watch::wake`); a per-message hook with an "accepted through N"
+callback and positions kept for paused sessions (`Live::take`, `settle`, `restart`); the token fill
+and the compaction point as first-class facts; harness facts behind the adapter; a byte-prefix read
+for replay (`Start::Prefix`); a read of an append-only transcript that grew during the read (built
+here: 26.7% of a core to 0.81% on the hub); a streaming poll (a batched one is quadratic).
