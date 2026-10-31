@@ -8,6 +8,7 @@
 - `watch::wake`: an inotify + eventfd wake for resident followers (a timer off Linux).
 - `Adapter::native_precompaction` and `Adapter::compacted_copy` (Claude Code; `None` elsewhere).
 - `LMSTUDIO_API_KEY`: sent as a bearer token to the `LMSTUDIO_API_BASE` server when set, so an OpenAI-compatible proxy that asks for a key can be the model.
+- `cv prune --plan <plan.json>` replaces size/age snipping with a per-result plan (keep, précis, excerpt) and drops attachment kinds; originals stay retrievable with `cv cat`.
 
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 ClusterVision 0.18.0 is the release an agent can trust. Every listing, count and search answer
