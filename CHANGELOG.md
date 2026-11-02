@@ -1,18 +1,24 @@
 # Changelog
 
+## Unreleased
+- `cv prune --plan <plan.json>` replaces size/age snipping with a per-result plan (keep, précis, excerpt) and drops attachment kinds; originals stay retrievable with `cv cat`.
+- Reshaping a live, growing transcript publishes the prefix read, noting "as of message N / byte offset O"; a rewritten prefix still refuses.
+
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
+ClusterVision 0.18.0 is the release an agent can trust. Every listing, count and search answer
+is either exact or says what it skipped: counts are prompts and replies on every harness, a
+session the store has not counted shows a dash, and search reads what the index has not seen.
+One stored-format version replaces five; upgrading reads every session once. A write to a store
+costs the session it touched, not the store: SQLite stores carry per-session certificates and
+transcripts resume from their last mark, so `cv index` is cheap enough to run hourly or not at
+all. No hidden limit decides what you get; the bounds that remain are flags you set or caps that
+never change a result. Removed names exit 2 with a pointer; stored logs keep reading. Hooks cover
+Codex as well as Claude, and `cv doctor` reports a harness release cv has not verified.
 
 **Breaking: commands, MCP, HTTP and JSON.** A removed name exits 2 with a pointer to its replacement.
-**Breaking: commands, MCP, HTTP and JSON.**
-- `cv index` holds a few open files per worker, not two per compressed Codex rollout, so a cold index stays under macOS's 256-file limit.
-- `cv index` defers a session whose old search baseline cannot be invalidated (catalog unopenable), names it, and completes the pass instead of aborting.
 - `cv search --json` (and MCP `search`) prints `{"hits": [...], "total": M}`, not an array; the table footer reads `N of M matches`.
 - `/api/search` adds `X-Cv-Search-Total`, every session that matched; its note says `N of M matches` when `limit` cut it.
-- `cv pack --excerpt-bytes N` (default 1600) bounds each excerpt message; the bundle's `Bounds:` line names every bound and what it cut.
-- `CV_PACK_LLM` digests send up to the model's provider-reported context window (was 60K chars), or `--context-bytes N`; the bundle states bytes sent and the limit.
-- A plain `.json` OpenSession document is discovered wherever its top-level version key sits, not only within the first 64 KiB.
 - `cv events --json` (`/api/events`, MCP) holds whole commands and error texts, newlines kept; the table marks cuts with `…`, and `--wide` prints them whole.
-- `cv search`, `/api/search`, MCP search and `-q text:` read every session the index has not seen; `--live-bytes` (`live_bytes`) now only bounds it when given.
 - `cv search --scan` (`scan=1`, `cv pack` without an index) matches each session's whole exchange, streamed, instead of its first 256 KiB.
 - `cv index --semantic` reads each session as far as the model embeds (512 tokens × median token length) and prints it; the 64 KiB head is gone.
 - The full-text index holds a persisted tool output whole, not its first MiB, and snippets find a term anywhere; `source::VERSION` 9 rereads once.
@@ -77,6 +83,7 @@
 - The first `cv index` rebuilds the full-text index whole.
 
 **Listing and counts.**
+- A plain `.json` OpenSession document is discovered wherever its top-level version key sits, not only within the first 64 KiB.
 - A first `cv ls` leaves Codex, Grok, Kimi, Kimi Code, Qwen, Hermes, Goose, Zed, Continue and OpenCode uncounted until a read or `cv index`.
 - `cv stats` reports "N not counted yet" (`uncounted` in `--json`, `/api/stats`); `--sort-by messages` ranks uncounted last.
 - A count survives refreshes of an unchanged source and is dropped when it changes; rewound or superseded Hermes rows no longer inflate it.
@@ -108,6 +115,8 @@
 - `cv show --tree` indents once per fork above a message, so a straight chain prints flat.
 
 **Reading.**
+- `cv index` holds a few open files per worker, not two per compressed Codex rollout, so a cold index stays under macOS's 256-file limit.
+- `cv search`, `/api/search`, MCP search and `-q text:` read every session the index has not seen; `--live-bytes` (`live_bytes`) now only bounds it when given.
 - Global `--frozen` (`CV_FROZEN=1`) reads without updating cv stores, streaming stale events; commands that write stores or sessions exit 2.
 - Boundaries carry no invented text (Claude, OpenClaw, Goose, Hermes, Kimi, Kimi Code, Qwen); `show` labels them by kind and marks inferred ones synthesized.
 - Cursor and LM Studio (Harmony) tool calls without native ids get `cv:<format>:<position>`.
@@ -136,6 +145,8 @@
 - Tool-filtered histograms keep edit counts; native edits reconcile by call and resolved path, never guessing relative paths in compound shell commands.
 
 **Reshaping.**
+- `cv pack --excerpt-bytes N` (default 1600) bounds each excerpt message; the bundle's `Bounds:` line names every bound and what it cut.
+- `CV_PACK_LLM` digests send up to the model's provider-reported context window (was 60K chars), or `--context-bytes N`; the bundle states bytes sent and the limit.
 - `cv port --strict` help names the actual `⚠ lossy:` output marker for losses the target format cannot hold.
 - `prune`, `rewind` and `port` take `--skills keep|drop|drop-stale` (default `keep`), legacy command-file skills included.
 - `cv prune`, `cv rewind`, `cv adopt` and Claude ports check the staged session resumes before publishing; else they refuse and leave nothing.
@@ -176,6 +187,7 @@
 - MCP errors for removed properties name their replacements.
 
 **Skips: counted, reported, or warned once.**
+- `cv index` defers a session whose old search baseline cannot be invalidated (catalog unopenable), names it, and completes the pass instead of aborting.
 - A source discovery cannot open (unreadable dir, locked or corrupt database, bad export or `sessions.json`) is named by `cv doctor`, not silently empty.
 - `cv doctor --json` gains `skipped_sources`; per-file `cv: skipping` lines become one stderr summary.
 - An unreadable session file errors instead of reading empty: Continue, OpenCode, Cline, Roo, Devin, Hermes, Goose, legacy Codex `.json`.
