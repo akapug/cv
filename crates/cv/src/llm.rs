@@ -589,19 +589,75 @@ pub(crate) fn generate(session: &cv_core::Session, opts: &GenerateOptions) -> Re
     )
 }
 
-/// A chat completion for `cv watch --kind precompact`: `turns` as given, from the provider the environment
-/// names (the egress notice printed as for every call). Returns the text and the model used.
+/// Where `cv watch --kind precompact`'s summary passes go: an OpenAI-compatible server of its own
+/// (`base_url`, its key in the variable `api_key_env` names), else the provider the environment
+/// names; `model` unset is that provider's default.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Route<'a> {
+    pub model: Option<&'a str>,
+    pub base_url: Option<&'a str>,
+    pub api_key_env: Option<&'a str>,
+}
+
+/// The tokens one call used, as the provider reported them (0 when it reported none).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Usage {
+    pub input: u64,
+    pub output: u64,
+}
+
+impl Usage {
+    fn of(v: &Value) -> Usage {
+        let n = |keys: [&str; 2]| keys.iter().find_map(|k| v["usage"][*k].as_u64()).unwrap_or(0);
+        Usage {
+            input: n(["prompt_tokens", "input_tokens"]),
+            output: n(["completion_tokens", "output_tokens"]),
+        }
+    }
+}
+
+/// One chat completion's answer.
+#[derive(Debug, Clone)]
+pub(crate) struct Completion {
+    pub text: String,
+    pub model: String,
+    pub usage: Usage,
+}
+
+fn route_provider(route: &Route) -> Result<Provider> {
+    let Some(base) = route.base_url.map(str::trim).filter(|b| !b.is_empty()) else {
+        return provider_from_env().ok_or_else(no_provider);
+    };
+    let key = match route.api_key_env {
+        Some(name) => Some(
+            cv_core::env::var(name)
+                .ok()
+                .filter(|k| !k.trim().is_empty())
+                .with_context(|| format!("precompact.api_key_env names {name}, which is not set"))?,
+        ),
+        None => None,
+    };
+    Ok(Provider::LmStudio {
+        base: base.trim_end_matches('/').to_owned(),
+        key,
+    })
+}
+
+/// A chat completion for `cv watch --kind precompact`: `turns` as given, along `route` (the egress
+/// notice printed as for every call).
 pub(crate) fn complete(
-    model: Option<&str>,
+    route: &Route,
     turns: &[cv_core::precompact::prompt::Turn],
     max_tokens: u32,
     timeout: Duration,
-) -> Result<(String, String)> {
-    let provider = provider_from_env().ok_or_else(no_provider)?;
-    let model = model.map_or_else(|| provider.default_model().to_string(), str::to_owned);
+) -> Result<Completion> {
+    let provider = route_provider(route)?;
+    let model = route
+        .model
+        .map_or_else(|| provider.default_model().to_string(), str::to_owned);
     let messages: Vec<ChatMessage> = turns.iter().map(|t| ChatMessage::new(t.role, &t.content)).collect();
-    let text = call_chat(&provider, &model, None, &messages, max_tokens, timeout)?;
-    Ok((text, model))
+    let (text, usage) = call_chat_usage(&provider, &model, None, &messages, max_tokens, timeout)?;
+    Ok(Completion { text, model, usage })
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -681,23 +737,36 @@ fn call_chat(
     max_tokens: u32,
     timeout: Duration,
 ) -> Result<String> {
+    call_chat_usage(provider, model, system, messages, max_tokens, timeout).map(|(text, _)| text)
+}
+
+fn call_chat_usage(
+    provider: &Provider,
+    model: &str,
+    system: Option<&str>,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    timeout: Duration,
+) -> Result<(String, Usage)> {
     let approx: usize = messages.iter().map(|m| m.content.len()).sum();
     egress_notice(provider, model, approx);
     let agent = agent(timeout);
 
     // OpenAI-compatible providers (OpenRouter, LM Studio) share a body/parse shape.
-    let openai_call = |who: &str, url: String, auth: &dyn Fn(ureq::Request) -> ureq::Request| -> Result<String> {
-        let mut msgs: Vec<ChatMessage> = Vec::new();
-        if let Some(s) = system {
-            if !s.is_empty() {
-                msgs.push(ChatMessage::new("system", s));
+    let openai_call =
+        |who: &str, url: String, auth: &dyn Fn(ureq::Request) -> ureq::Request| -> Result<(String, Usage)> {
+            let mut msgs: Vec<ChatMessage> = Vec::new();
+            if let Some(s) = system {
+                if !s.is_empty() {
+                    msgs.push(ChatMessage::new("system", s));
+                }
             }
-        }
-        msgs.extend(messages.iter().cloned());
-        let body = json!({ "model": model, "messages": msgs, "max_tokens": max_tokens });
-        let v = read_json(auth(agent.post(&url)).send_json(body), "chat").with_context(|| format!("POST to {url}"))?;
-        extract_openai_text(&v, who)
-    };
+            msgs.extend(messages.iter().cloned());
+            let body = json!({ "model": model, "messages": msgs, "max_tokens": max_tokens });
+            let v =
+                read_json(auth(agent.post(&url)).send_json(body), "chat").with_context(|| format!("POST to {url}"))?;
+            Ok((extract_openai_text(&v, who)?, Usage::of(&v)))
+        };
 
     match provider {
         Provider::OpenRouter { key } => openai_call(
@@ -719,7 +788,7 @@ fn call_chat(
                 .set("x-api-key", key)
                 .set("anthropic-version", "2023-06-01");
             let v = read_json(req.send_json(body), "Anthropic")?;
-            extract_anthropic_text(&v)
+            Ok((extract_anthropic_text(&v)?, Usage::of(&v)))
         }
     }
 }
@@ -776,6 +845,38 @@ fn normalize_for_anthropic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_routes_key_comes_from_the_variable_it_names_and_an_unset_one_is_refused() {
+        let route = Route {
+            base_url: Some("http://127.0.0.1:9/v1/"),
+            api_key_env: Some("CV_TEST_PRECOMPACT_ROUTE_KEY_UNSET"),
+            ..Route::default()
+        };
+        let refused = route_provider(&route).err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(refused.contains("CV_TEST_PRECOMPACT_ROUTE_KEY_UNSET"), "{refused}");
+
+        let keyless = Route {
+            api_key_env: None,
+            ..route
+        };
+        match route_provider(&keyless) {
+            Ok(Provider::LmStudio { base, key }) => {
+                assert_eq!(base, "http://127.0.0.1:9/v1");
+                assert_eq!(key, None);
+            }
+            _ => panic!("a base_url is an OpenAI-compatible server"),
+        }
+    }
+
+    #[test]
+    fn usage_reads_both_providers_spellings_and_defaults_to_zero() {
+        let chat = json!({"usage": {"prompt_tokens": 7, "completion_tokens": 2}});
+        let messages = json!({"usage": {"input_tokens": 5, "output_tokens": 3}});
+        assert_eq!(Usage::of(&chat), Usage { input: 7, output: 2 });
+        assert_eq!(Usage::of(&messages), Usage { input: 5, output: 3 });
+        assert_eq!(Usage::of(&json!({})), Usage::default());
+    }
     use cv_core::ir::{Block, Harness, Message, Role, Session};
 
     /// A test's transcript limit; a digest derives its own from the model ([`TranscriptLimit`]).

@@ -1003,7 +1003,7 @@ enum Cmd {
         #[arg(id = "for", long = "for", value_name = "DURATION")]
         for_: Option<String>,
         #[command(flatten)]
-        knobs: cmd::precompact::Knobs,
+        knobs: Box<cmd::precompact::Knobs>,
         /// Precompact: one action instead of following (`now`, `commit`, `observe`, `check`,
         /// `profile`, `ls`, `report`, `swap`).
         #[command(subcommand)]
@@ -1662,7 +1662,7 @@ fn run() -> Result<()> {
                     cwd,
                     dry_run,
                     for_,
-                    knobs,
+                    knobs: *knobs,
                     action,
                 }),
             }

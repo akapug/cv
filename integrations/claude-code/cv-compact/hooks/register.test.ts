@@ -78,3 +78,28 @@ test('a tool result is counted once in a message size', { options: { serve: 'cv'
   const sizes = JSON.parse(stdins[0] ?? '{}').messages.map((m: { bytes: number }) => m.bytes)
   expect(sizes).toEqual([2, 100])
 })
+
+const precompute = { trigger: 'precompute', messages: conversation } as unknown as SessionCompactArgs
+
+test('a seat serving cv vetoes the background summary when cv would serve', { options: { serve: 'cv' } }, async ($, on) => {
+  const { runs, native } = engine(on, { exitCode: 0, stdout: '{"outcome":"would_serve"}', stderr: '' })
+  const result = await $.session.compact(precompute)
+  expect(native.compacted).toBe(0)
+  expect(typeof result.skip).toBe('string')
+  expect(runs[0]).toEqual(['cv', 'watch', '--kind', 'precompact', 'commit', '--check', '--serve', 'cv'])
+})
+
+test('a seat serving cv keeps the background summary when cv would miss', { options: { serve: 'cv' } }, async ($, on) => {
+  const { runs, native } = engine(on, missed)
+  const result = await $.session.compact(precompute)
+  expect(native.compacted).toBe(1)
+  expect(result.skip).toBeUndefined()
+  expect(runs.some((argv) => argv.includes('observe'))).toBe(false)
+})
+
+test('a seat serving native never asks cv about the background summary', { options: { serve: 'native' } }, async ($, on) => {
+  const { runs, native } = engine(on, served)
+  await $.session.compact(precompute)
+  expect(native.compacted).toBe(1)
+  expect(runs.length).toBe(0)
+})

@@ -82,7 +82,7 @@ pub(crate) enum PrecompactCmd {
         #[arg(long)]
         print: bool,
         #[command(flatten)]
-        knobs: Knobs,
+        knobs: Box<Knobs>,
     },
     /// The commit, called inside the harness's compaction (Claude Code's `session.compact` plugin
     /// event): the event JSON `{session, trigger, instructions, messages}` on stdin; on a pass,
@@ -93,6 +93,11 @@ pub(crate) enum PrecompactCmd {
         /// Which compaction serves this seat (`native`, `cv`); default: `precompact.serve`.
         #[arg(long, value_name = "SERVE")]
         serve: Option<String>,
+        /// Only say whether this compaction would be served now, serving nothing: a plugin asks
+        /// this before the harness starts its own background summary, and vetoes that summary
+        /// when the answer is yes. Exit 0 yes, exit 3 no, and the reason is not counted as a miss.
+        #[arg(long)]
+        check: bool,
         /// The harness compacting (default: `claude`).
         #[arg(long)]
         harness: Option<String>,
@@ -203,6 +208,12 @@ pub(crate) struct Knobs {
     /// The summary model.
     #[arg(long)]
     model: Option<String>,
+    /// The OpenAI-compatible server the summary passes go to (`https://host/v1`).
+    #[arg(long, value_name = "URL")]
+    base_url: Option<String>,
+    /// The environment variable holding that server's key (its name, never the key).
+    #[arg(long, value_name = "NAME")]
+    api_key_env: Option<String>,
     /// Summary jobs at once (default 2).
     #[arg(long, value_name = "N")]
     jobs: Option<usize>,
@@ -243,6 +254,12 @@ impl Knobs {
         );
         if self.model.is_some() {
             s.model = self.model.clone();
+        }
+        if self.base_url.is_some() {
+            s.base_url = self.base_url.clone();
+        }
+        if self.api_key_env.is_some() {
+            s.api_key_env = self.api_key_env.clone();
         }
         if self.prepare_native {
             s.prepare_native = true;
@@ -297,7 +314,7 @@ pub(crate) fn cmd_watch(args: Watch) -> Result<()> {
             },
             &knobs.settings(),
         ),
-        PrecompactCmd::Commit { serve, harness } => commit(serve, harness),
+        PrecompactCmd::Commit { serve, check, harness } => commit(serve, check, harness),
         PrecompactCmd::Observe => observe(),
         PrecompactCmd::Answer { .. } => usage(
             "`cv watch --kind precompact answer` was removed with the proxy path (the 0.19 design: no \
@@ -767,8 +784,19 @@ impl Job {
     /// The two passes and the record: the narrative from the summary model, then the carried
     /// sections from a separate extraction pass whose quotes are kept only where the message
     /// they cite holds them, merged into the previous generation's; identifiers read by shape.
-    fn run(self, settings: &Settings) -> Result<(Record, f64)> {
+    fn run(self, settings: &Settings) -> Result<(Record, f64, crate::llm::Usage)> {
         let started = Instant::now();
+        let lines = {
+            let turns: Vec<(&str, String, String)> = self
+                .turns
+                .iter()
+                .filter_map(|t| {
+                    let (id, text) = t.content.strip_prefix("[m:")?.split_once("] ")?;
+                    (!text.starts_with(pc::SERVED_PREAMBLE)).then(|| (t.role, id.to_owned(), text.to_owned()))
+                })
+                .collect();
+            pc::carry::lines(&turns, self.window.boundaries)
+        };
         // Each rendered turn opens with its message id: the texts the quotes are checked against.
         // A summary cv served is left out: it holds every carried quote, so nothing would ever
         // read as unused, and what it says is already carried.
@@ -784,8 +812,14 @@ impl Job {
             .collect();
         let extract_turns = self.turns.clone();
         let turns = prompt::write(self.prior.as_deref(), self.turns, &self.profile.text);
-        let (narrative, model) =
-            crate::llm::complete(settings.model.as_deref(), &turns, SUMMARY_MAX_TOKENS, SUMMARY_TIMEOUT)?;
+        let route = crate::llm::Route {
+            model: settings.model.as_deref(),
+            base_url: settings.base_url.as_deref(),
+            api_key_env: settings.api_key_env.as_deref(),
+        };
+        let written = crate::llm::complete(&route, &turns, SUMMARY_MAX_TOKENS, SUMMARY_TIMEOUT)?;
+        let (narrative, model) = (written.text, written.model);
+        let mut used = written.usage;
         anyhow::ensure!(!narrative.trim().is_empty(), "the summary model returned no text");
         let mut bounds = vec![format!(
             "tool calls and results cut to {} bytes each",
@@ -799,13 +833,20 @@ impl Job {
             ));
         }
         let extracted = crate::llm::complete(
-            Some(model.as_str()),
+            &crate::llm::Route {
+                model: Some(model.as_str()),
+                ..route
+            },
             &prompt::extract(extract_turns, &self.carry.listing()),
             EXTRACT_MAX_TOKENS,
             SUMMARY_TIMEOUT,
         );
         let (items, marks, mut dropped) = match &extracted {
-            Ok((answer, _)) => pc::carry::parse(answer),
+            Ok(answer) => {
+                used.input += answer.usage.input;
+                used.output += answer.usage.output;
+                pc::carry::parse(&answer.text)
+            }
             Err(e) => {
                 bounds.push(format!(
                     "the extraction pass failed, the carry is the previous one: {e:#}"
@@ -835,6 +876,7 @@ impl Job {
             pc::carry::Span {
                 items,
                 ids: pc::carry::ids(&texts),
+                lines,
                 pointers: pc::carry::pointers(&self.found),
                 marks,
                 window: self.window.boundaries,
@@ -844,6 +886,7 @@ impl Job {
                 pointers: settings.carry_pointers,
                 retire_after: settings.retire_after,
                 standing_bytes: settings.standing_bytes,
+                lines_bytes: settings.lines_bytes,
             },
         );
         let left_out = offered.saturating_sub(standing(&carry.items));
@@ -878,7 +921,7 @@ impl Job {
             carry,
             text,
         };
-        Ok((record, started.elapsed().as_secs_f64()))
+        Ok((record, started.elapsed().as_secs_f64(), used))
     }
 }
 
@@ -904,9 +947,13 @@ fn profile_for(root: &Path, settings: &Settings, harness: &str) -> Result<pc::Pr
     }
 }
 
-fn written_event(record: &Record, secs: f64, prompt_bytes: usize, span_turns: usize) -> Value {
+fn written_event(record: &Record, secs: f64, prompt_bytes: usize, span_turns: usize, used: crate::llm::Usage) -> Value {
     json!({
         "event": "written",
+        "model": record.model,
+        "input_tokens": used.input,
+        "output_tokens": used.output,
+        "lines": record.carry.lines.len(),
         "harness": record.harness,
         "session": record.session,
         "cut_index": record.cut.index,
@@ -1087,7 +1134,7 @@ fn watch(
 
     let mut lives: HashMap<String, Live> = HashMap::new();
     let mut learned: HashMap<(Harness, Option<String>), u64> = HashMap::new();
-    let (tx, rx) = std::sync::mpsc::channel::<(String, Result<(Record, f64)>, usize, usize)>();
+    let (tx, rx) = std::sync::mpsc::channel::<(String, Result<(Record, f64, crate::llm::Usage)>, usize, usize)>();
     let waker = wake.waker();
     let mut running = 0usize;
     let mut first = true;
@@ -1223,9 +1270,9 @@ fn watch(
             live.job = false;
             store::release_lease(&root, live.r.harness.as_str(), &live.r.id);
             match outcome {
-                Ok((record, secs)) => {
+                Ok((record, secs, used)) => {
                     let same_window = record.window.boundaries == live.window.boundaries.len();
-                    let _ = store::event(&root, written_event(&record, secs, prompt_bytes, span_turns));
+                    let _ = store::event(&root, written_event(&record, secs, prompt_bytes, span_turns, used));
                     if same_window {
                         if let Err(e) = store::save_record(&root, &record) {
                             eprintln!("precompact: saving {}: {e:#}", short_id(&record.session));
@@ -1574,7 +1621,7 @@ fn now(id: &str, harness: Option<Harness>, span: Span, settings: &Settings) -> R
         return Ok(());
     }
     if span.print {
-        let (record, secs) = job.run(settings)?;
+        let (record, secs, _) = job.run(settings)?;
         println!("{}", serde_json::to_string(&record)?);
         eprintln!("precompact: wrote the summary in {secs:.1}s");
         return Ok(());
@@ -1590,8 +1637,8 @@ fn now(id: &str, harness: Option<Harness>, span: Span, settings: &Settings) -> R
     let (harness, session) = (job.harness.clone(), job.session.clone());
     let outcome = job.run(settings);
     store::release_lease(&root, &harness, &session);
-    let (record, secs) = outcome?;
-    store::event(&root, written_event(&record, secs, prompt_bytes, span_turns))?;
+    let (record, secs, used) = outcome?;
+    store::event(&root, written_event(&record, secs, prompt_bytes, span_turns, used))?;
     let path = store::save_record(&root, &record)?;
     eprintln!("precompact: wrote {} in {secs:.1}s", path.display());
     Ok(())
@@ -1704,20 +1751,25 @@ fn check(
 
 // ───────────────────────────── commit / observe ─────────────────────────────
 
-fn miss(root: &Path, session: Option<&str>, class: &str, reason: &str, started: Instant) -> Result<()> {
-    let _ = store::event(
-        root,
+fn miss(root: &Path, session: Option<&str>, class: &str, reason: &str, started: Instant, check: bool) -> Result<()> {
+    let event = if check {
+        json!({"event": "precheck", "outcome": "pass_through", "session": session, "class": class,
+               "secs": started.elapsed().as_secs_f64()})
+    } else {
         json!({"event": "commit", "outcome": "miss", "session": session, "class": class,
-               "reason": reason, "secs": started.elapsed().as_secs_f64()}),
-    );
+               "reason": reason, "secs": started.elapsed().as_secs_f64()})
+    };
+    let _ = store::event(root, event);
     eprintln!("precompact commit: miss ({class}): {reason}");
     std::process::exit(MISS_EXIT);
 }
 
 /// The commit: inside the harness's compaction, check the session's ready record against the
 /// conversation the harness is about to compact, and hand back the summary and where the kept
-/// messages start. Every miss exits 3; the harness then compacts as its own.
-fn commit(serve: Option<String>, harness: Option<String>) -> Result<()> {
+/// messages start. Every miss exits 3; the harness then compacts as its own. With `check`, the
+/// same check serves nothing and counts no miss: the plugin asks it before the harness starts its
+/// own background summary, which a pass vetoes.
+fn commit(serve: Option<String>, check: bool, harness: Option<String>) -> Result<()> {
     let started = Instant::now();
     let root = store::root()?;
     let settings = cv_core::config::load().precompact.unwrap_or_default();
@@ -1732,7 +1784,14 @@ fn commit(serve: Option<String>, harness: Option<String>) -> Result<()> {
     let view = pc::RequestView::parse(&input)?;
     drop(input);
     let Some(session) = view.session.as_ref().map(|s| s.id.clone()) else {
-        return miss(&root, None, "no_session", "the compaction names no session", started);
+        return miss(
+            &root,
+            None,
+            "no_session",
+            "the compaction names no session",
+            started,
+            check,
+        );
     };
     if serve == pc::Serve::Native {
         return miss(
@@ -1741,6 +1800,7 @@ fn commit(serve: Option<String>, harness: Option<String>) -> Result<()> {
             "serve_native",
             "this seat serves the harness's own compaction",
             started,
+            check,
         );
     }
     let harness = harness
@@ -1753,6 +1813,7 @@ fn commit(serve: Option<String>, harness: Option<String>) -> Result<()> {
             "no_record",
             "no ready summary for this session",
             started,
+            check,
         );
     };
     let budget = record
@@ -1761,8 +1822,17 @@ fn commit(serve: Option<String>, harness: Option<String>) -> Result<()> {
         .map(|c| (c as f64 * settings.fit_fraction) as u64);
     let c = match pc::commit(&view, &record, budget) {
         Ok(c) => c,
-        Err(why) => return miss(&root, Some(&session), why.class(), &why.to_string(), started),
+        Err(why) => return miss(&root, Some(&session), why.class(), &why.to_string(), started, check),
     };
+    if check {
+        println!("{}", json!({"outcome": "would_serve", "tokens": c.tokens}));
+        let _ = store::event(
+            &root,
+            json!({"event": "precheck", "outcome": "veto", "harness": harness, "session": session,
+                   "tokens": c.tokens, "secs": started.elapsed().as_secs_f64()}),
+        );
+        return Ok(());
+    }
     let anchor = record.key.as_ref().map(|k| k.anchor.as_str()).unwrap_or("");
     let summary = format!(
         "{} (session {session}, summarized through message {anchor}). Any [m:ID] below opens in \
@@ -1936,6 +2006,9 @@ fn report(json_out: bool) -> Result<()> {
     let mut plugin: HashMap<&'static str, Col> = HashMap::new();
     let (mut served, mut missed, mut written) = (0u64, 0u64, 0u64);
     let mut classes: HashMap<String, u64> = HashMap::new();
+    let (mut vetoed, mut passed_through) = (0u64, 0u64);
+    // Per summary model: summaries written, input tokens, output tokens.
+    let mut models: std::collections::BTreeMap<String, (u64, u64, u64)> = Default::default();
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -1953,7 +2026,19 @@ fn report(json_out: bool) -> Result<()> {
                 }
                 last_commit.insert(session, outcome);
             }
-            Some("written") => written += 1,
+            Some("written") => {
+                written += 1;
+                let row = models
+                    .entry(v.get("model").and_then(Value::as_str).unwrap_or("").to_owned())
+                    .or_default();
+                row.0 += 1;
+                row.1 += take(&v, "input_tokens").unwrap_or(0);
+                row.2 += take(&v, "output_tokens").unwrap_or(0);
+            }
+            Some("precheck") => match v.get("outcome").and_then(Value::as_str) {
+                Some("veto") => vetoed += 1,
+                _ => passed_through += 1,
+            },
             Some("compaction") => {
                 let method = if last_commit.get(&session).map(String::as_str) == Some("served") {
                     METHODS[0]
@@ -2008,13 +2093,27 @@ fn report(json_out: bool) -> Result<()> {
     };
     let mut stalls = rows("transcript", &mut transcript);
     stalls.extend(rows("plugin", &mut plugin));
+    let model_rows: Vec<Value> = models
+        .iter()
+        .map(|(m, (n, i, o))| json!({"model": m, "summaries": n, "input_tokens": i, "output_tokens": o}))
+        .collect();
     let out = json!({"summaries_written": written, "commits_served": served, "commits_missed": missed,
-                     "miss_classes": classes, "methods": stalls});
+                     "miss_classes": classes, "precompute_vetoed": vetoed,
+                     "precompute_passed_through": passed_through, "summary_models": model_rows,
+                     "methods": stalls});
     if json_out {
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
     println!("summaries written {written} · commits served {served} · missed {missed}");
+    println!("native precompute vetoed {vetoed} · passed through {passed_through}");
+    for (m, (n, i, o)) in &models {
+        println!(
+            "  summary model {m}: {n} written · {} in · {} out",
+            fmt_int(*i),
+            fmt_int(*o)
+        );
+    }
     for (class, n) in &classes {
         println!("  miss {n}× {class}");
     }

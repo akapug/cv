@@ -124,6 +124,29 @@ fn a_ready_record_is_committed_inside_the_harness_compaction_and_every_miss_exit
 /// The harness records no tokens for a compaction a hook answered: a served row in `report` reads
 /// them from the transcript's record of it, and a served stall shows in milliseconds.
 #[test]
+fn a_check_says_whether_cv_would_serve_and_is_counted_apart_from_commits() {
+    let w = World::new("precompact-check");
+    let check = ["watch", "--kind", "precompact", "commit", "--check", "--serve", "cv"];
+    let (_, code, _, err) = w.cv_stdin(&check, &event("Done."));
+    assert_eq!(code, 3, "no record: the background summary runs: {err}");
+    assert!(err.contains("(no_record)"), "{err}");
+
+    ready(&w);
+    let (ok, code, out, err) = w.cv_stdin(&check, &event("Done."));
+    assert!(ok, "exit {code}: {err}");
+    let said: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(said["outcome"], "would_serve");
+    assert!(said.get("summary").is_none(), "a check serves nothing: {out}");
+
+    let (out, _) = w.cv_ok(&["watch", "--kind", "precompact", "report", "--json"]);
+    let report: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["precompute_vetoed"], 1);
+    assert_eq!(report["precompute_passed_through"], 1);
+    assert_eq!(report["commits_served"], 0);
+    assert_eq!(report["commits_missed"], 0);
+}
+
+#[test]
 fn report_joins_a_served_rows_tokens_and_shows_its_stall_in_milliseconds() {
     let w = World::new("precompact-report");
     let events = w.cv_home.join("precompact/events.jsonl");

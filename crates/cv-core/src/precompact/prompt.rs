@@ -47,7 +47,7 @@ claiming this' with the message that raised it. Leave out what is finished and n
 more. Use these sections, in this order, each short (write 'none' under an empty one):\n\
 ## What the work is for\n\
 ## What happened: the decisions taken, each with its reason\n\
-## Where the work stands: what is done and checked, what is in progress\n\
+## Where the work stands: what is done and checked, each with its sha, row or count, what is in progress\n\
 ## Files: the files the work still depends on, and why\n\
 ## Open questions and blockers\n\
 ## Next step: the very next action, as the agent was about to take it\n\

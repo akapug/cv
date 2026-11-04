@@ -18,7 +18,10 @@
 //! pass returns quotes, each quote is kept only when it is found verbatim in the message it cites
 //! ([`verify`], so an extractor cannot plant a fact the transcript does not hold), and the kept
 //! items are merged into the previous generation's ([`Carry::merge`]) instead of being
-//! summarized again. Identifiers are read from the span by shape ([`ids`]), with no model.
+//! summarized again. Identifiers are read from the span by shape ([`ids`]), with no model, and so
+//! are the lines of the span that state a sha, a row or a count ([`lines`]): a blind probe found
+//! the narrative thins them (this window's items 2 of 6, native 4), and a line copied whole keeps
+//! the number with what it counts.
 //!
 //! A session that moves to cv from its harness's own compaction brings a summary cv never wrote,
 //! with nothing of it in any carry: rulings, schedules, handles and balances the harness kept,
@@ -122,11 +125,36 @@ pub struct Id {
     pub last: String,
 }
 
+/// Where a [`Line`] was copied from, in the order a tight budget keeps them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// The agent's own prose.
+    Said,
+    /// A command or a tool call's arguments the agent wrote (a message it posted, a commit).
+    Ran,
+    /// What a tool answered (the head and tail the summary model reads).
+    Read,
+}
+
+/// One line of a span that states a sha, a row or a count, copied whole with no model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Line {
+    pub line: String,
+    /// The id of the message it is from.
+    pub m: String,
+    pub from: Source,
+    /// The window (counted in compactions before it) the line was read in.
+    pub window: usize,
+}
+
 /// What one span adds to the carry, before the merge.
 #[derive(Debug, Clone, Default)]
 pub struct Span {
     pub items: Vec<Item>,
     pub ids: Vec<Id>,
+    /// The span's lines stating a sha, a row or a count ([`lines`]).
+    pub lines: Vec<Line>,
     pub pointers: Vec<Pointer>,
     /// What the span did to carried items, each quoted as carried ([`Marks`], verified).
     pub marks: Marks,
@@ -153,6 +181,9 @@ pub struct Limits {
     pub retire_after: usize,
     /// Bytes of [`Section::Standing`] lines carried, the most recently seen kept.
     pub standing_bytes: usize,
+    /// Bytes of [`Line`]s carried: this window's first, the agent's own words before its commands
+    /// before what tools answered, the newest of each kept.
+    pub lines_bytes: usize,
 }
 
 /// The carried sections of one record.
@@ -164,6 +195,8 @@ pub struct Carry {
     pub ids: Vec<Id>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pointers: Vec<Pointer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<Line>,
 }
 
 /// What the extraction pass returned that was not kept: quotes not found verbatim in the message
@@ -499,6 +532,119 @@ pub fn ids(messages: &[(String, String)]) -> Vec<Id> {
     out
 }
 
+/// The longest line [`lines`] copies: past it a line is a dump, not a statement.
+const LINE_MAX: usize = 400;
+
+/// Whether a line states a sha, a row (`fleet/204`) or a count: `9 of 12`, `130 tests`, `$1.51`,
+/// `42%`, `61 ms`.
+fn states_a_measure(line: &str) -> bool {
+    use std::sync::OnceLock;
+    static SHAPE: OnceLock<regex::Regex> = OnceLock::new();
+    let shape = SHAPE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?xi)
+            \b[a-z][a-z0-9-]*/[0-9]+\b
+          | \b[0-9][0-9,.]*\s*(?:of|/)\s*[0-9]
+          | \b[0-9][0-9,.]*\s?(?:pass(?:ed|es)?|fail(?:ed|s|ures?)?|tests?|reds?|rows?|modules?|lands?|errors?|miss(?:es)?|seats?|ms|min|kb|mb|gb|k\b)
+          | [0-9]%
+          | \$[0-9]",
+        )
+        .expect("the measure shapes compile")
+    });
+    shape.is_match(line) || is_sha_in(line)
+}
+
+/// Whether a line holds a commit sha: 7 to 40 hex digits holding a digit and a letter.
+fn is_sha_in(line: &str) -> bool {
+    line.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
+        (7..=40).contains(&w.len())
+            && w.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && w.bytes().any(|b| b.is_ascii_digit())
+            && w.bytes().any(|b| b.is_ascii_alphabetic())
+    })
+}
+
+/// A rendered tool call's arguments as text: the JSON string escapes for a newline and a quote
+/// undone, so a command or a posted message splits into its lines.
+fn unescaped(args: &str) -> String {
+    args.replace("\\n", "\n").replace("\\\"", "\"")
+}
+
+/// The lines of `turns` (`(role, id, text)`, rendered and oldest first: the agent's prose and
+/// `[tool call: …]` blocks, and each `[tool result] …`) that state a sha, a row or a count, by
+/// shape and with no model. The person's prompts and injected context are not read: their words
+/// are carried whole elsewhere, and a hook's numbers are not this work's. A repeated line keeps its
+/// newest place.
+pub fn lines(turns: &[(&str, String, String)], window: usize) -> Vec<Line> {
+    let mut out: Vec<Line> = Vec::new();
+    let mut take = |text: &str, m: &str, from: Source| {
+        for raw in text.lines() {
+            let line = raw
+                .trim()
+                .trim_start_matches(['-', '*', '|', '#', ' '])
+                .trim_end_matches(['|', ' ', '"', '}', ']']);
+            if line.is_empty()
+                || line.len() > LINE_MAX
+                || !line.bytes().any(|b| b.is_ascii_alphabetic())
+                || noise(line)
+                || !states_a_measure(line)
+            {
+                continue;
+            }
+            out.retain(|l| l.line != line);
+            out.push(Line {
+                line: line.to_owned(),
+                m: m.to_owned(),
+                from,
+                window,
+            });
+        }
+    };
+    for (role, m, text) in turns {
+        if *role == "assistant" {
+            // A rendered call is one line of JSON, or two around the cut `prompt::clip` marks.
+            let mut in_call = false;
+            for raw in text.lines() {
+                if let Some(call) = raw.strip_prefix("[tool call: ") {
+                    let args = call.split_once("\":\"").map_or(call, |(_, value)| value);
+                    take(&unescaped(args), m, Source::Ran);
+                    in_call = true;
+                } else if in_call && (raw.starts_with("[… ") || raw.ends_with("\"}]")) {
+                    take(&unescaped(raw), m, Source::Ran);
+                    in_call = raw.starts_with("[… ");
+                } else {
+                    take(raw, m, Source::Said);
+                    in_call = false;
+                }
+            }
+        } else if let Some(result) = text.strip_prefix("[tool result] ") {
+            take(result, m, Source::Read);
+        }
+    }
+    out
+}
+
+/// `lines` within `budget` bytes, in their order: this window's before earlier ones, then the
+/// agent's own words before its commands before what tools answered, the newest of each kept.
+fn within_lines_budget(lines: Vec<Line>, budget: usize, window: usize) -> Vec<Line> {
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by_key(|&i| (lines[i].window != window, lines[i].from, std::cmp::Reverse(i)));
+    let mut used = 0usize;
+    let mut keep = vec![false; lines.len()];
+    for i in order {
+        let cost = lines[i].line.len() + lines[i].m.len() + 8;
+        if used + cost <= budget {
+            used += cost;
+            keep[i] = true;
+        }
+    }
+    lines
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(line, keep)| keep.then_some(line))
+        .collect()
+}
+
 /// `items` less the standing lines past `budget` bytes: the most recently seen stay, the order of
 /// the rest kept. What falls out stays one `cv show` away at the message each line cites.
 fn within_standing_budget(items: Vec<Item>, budget: usize) -> Vec<Item> {
@@ -534,6 +680,7 @@ impl Carry {
         let Span {
             items,
             ids,
+            lines,
             pointers,
             marks,
             window,
@@ -613,10 +760,16 @@ impl Carry {
         if rules.len() > limits.pointers {
             rules.drain(..rules.len() - limits.pointers);
         }
+        let mut kept = self.lines.clone();
+        for line in lines {
+            kept.retain(|l| l.line != line.line);
+            kept.push(line);
+        }
         Carry {
             items: next,
             ids: all,
             pointers: rules,
+            lines: within_lines_budget(kept, limits.lines_bytes, window),
         }
     }
 
@@ -643,6 +796,15 @@ impl Carry {
             );
             for p in &self.pointers {
                 out.push_str(&format!("- `{}` ({})\n", p.id, p.why));
+            }
+        }
+        if !self.lines.is_empty() {
+            out.push_str(
+                "\n\n## What the work stated (lines copied whole, by shape: each holds a sha, a row or a count; \
+                 not verified now: probe before relying on one)\n\n",
+            );
+            for l in &self.lines {
+                out.push_str(&format!("- [m:{}] {}\n", l.m, l.line));
             }
         }
         if !self.ids.is_empty() {
@@ -691,7 +853,111 @@ mod tests {
         pointers: 10,
         retire_after: 3,
         standing_bytes: 64,
+        lines_bytes: 256,
     };
+
+    fn turn(role: &'static str, m: &str, text: &str) -> (&'static str, String, String) {
+        (role, m.to_owned(), text.to_owned())
+    }
+
+    #[test]
+    fn lines_keep_the_shas_and_counts_the_agent_stated_by_shape() {
+        let found = lines(
+            &[
+                turn("user", "p", "land 0e4c8385a9 please, 130 tests"),
+                turn(
+                    "assistant",
+                    "a",
+                    "Landed 0e4c8385a9 with 130 tests passing.\nNothing else here.\n[tool call: Bash {\"command\":\"fleet chat post 'held fleet/204 open'\\nls\"}]",
+                ),
+                turn("user", "r", "[tool result] 2 of 9 modules red\ndone"),
+            ],
+            4,
+        );
+        let got: Vec<(&str, &str, Source)> = found.iter().map(|l| (l.m.as_str(), l.line.as_str(), l.from)).collect();
+        assert_eq!(
+            got,
+            [
+                ("a", "Landed 0e4c8385a9 with 130 tests passing.", Source::Said),
+                ("a", "fleet chat post 'held fleet/204 open'", Source::Ran),
+                ("r", "2 of 9 modules red", Source::Read),
+            ]
+        );
+        assert!(found.iter().all(|l| l.window == 4));
+    }
+
+    #[test]
+    fn lines_refuse_bare_hex_output_shapes_and_dumps() {
+        let long = format!("{} 12 tests", "x".repeat(LINE_MAX));
+        let found = lines(
+            &[turn(
+                "assistant",
+                "a",
+                &format!("deadbeef is a word here\n{long}\n2026-10-31T09:10:32Z unit[12]: 4 tests\n1234567"),
+            )],
+            0,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_tight_lines_budget_keeps_this_window_then_the_agents_own_words() {
+        let line = |line: &str, from, window| Line {
+            line: line.to_owned(),
+            m: "m".to_owned(),
+            from,
+            window,
+        };
+        let cost = |s: &str| s.len() + 1 + 8;
+        let kept = within_lines_budget(
+            vec![
+                line("old said 1 of 2", Source::Said, 0),
+                line("new read 3 of 4", Source::Read, 1),
+                line("new said 5 of 6", Source::Said, 1),
+                line("new said 7 of 8", Source::Said, 1),
+            ],
+            cost("new read 3 of 4") * 2,
+            1,
+        );
+        let got: Vec<&str> = kept.iter().map(|l| l.line.as_str()).collect();
+        assert_eq!(got, ["new said 5 of 6", "new said 7 of 8"]);
+    }
+
+    #[test]
+    fn a_line_said_again_moves_to_its_newest_place_and_a_merge_stays_in_budget() {
+        let line = |s: &str, m: &str, window| Line {
+            line: s.to_owned(),
+            m: m.to_owned(),
+            from: Source::Said,
+            window,
+        };
+        let first = Carry::default().merge(
+            Span {
+                lines: vec![line("a 1 of 2", "m1", 0), line("b 3 of 4", "m2", 0)],
+                ..Span::default()
+            },
+            &LIMITS,
+        );
+        let next = first.merge(
+            Span {
+                lines: vec![line("a 1 of 2", "m3", 1)],
+                window: 1,
+                ..Span::default()
+            },
+            &LIMITS,
+        );
+        let got: Vec<(&str, &str)> = next.lines.iter().map(|l| (l.line.as_str(), l.m.as_str())).collect();
+        assert_eq!(got, [("b 3 of 4", "m2"), ("a 1 of 2", "m3")]);
+        assert!(next.render("s").contains("- [m:m3] a 1 of 2\n"));
+        let tight = next.merge(
+            Span::default(),
+            &Limits {
+                lines_bytes: 0,
+                ..LIMITS
+            },
+        );
+        assert!(tight.lines.is_empty());
+    }
 
     fn item(section: Section, quote: &str, m: &str) -> Item {
         Item {

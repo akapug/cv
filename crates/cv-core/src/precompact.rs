@@ -416,6 +416,14 @@ pub struct Settings {
     pub tool_result_bytes: usize,
     /// The summary model (a provider model id). Unset: the provider's default.
     pub model: Option<String>,
+    /// The OpenAI-compatible server the summary passes go to (`https://host/v1`). Unset: the
+    /// provider the environment names (`LMSTUDIO_API_BASE`, `OPENROUTER_API_KEY`,
+    /// `ANTHROPIC_API_KEY`). A route of this setting's own, so a seat's summaries need no
+    /// credential of the harness's, whichever account it runs on.
+    pub base_url: Option<String>,
+    /// The name of the environment variable holding `base_url`'s key; never the key. Unset: no
+    /// key is sent.
+    pub api_key_env: Option<String>,
     /// Summary jobs running at once.
     pub jobs: usize,
     /// Follow sessions touched within this many seconds of startup (and every new one after).
@@ -440,6 +448,8 @@ pub struct Settings {
     pub retire_after: usize,
     /// Bytes of lines carried from the harness's own earlier summary, the most recently seen kept.
     pub standing_bytes: usize,
+    /// Bytes of the lines stating a sha, a row or a count carried whole ([`carry::lines`]).
+    pub lines_bytes: usize,
     /// Patterns (regular expressions) that find a standing rule's id in the span, the first
     /// capture group the id (else the whole match): what the summary's pointers to standing rules
     /// are chosen by ([`carry::Pointer`]). Empty: no pointers. A fleet's rule store names its own.
@@ -478,6 +488,10 @@ pub const RETIRE_AFTER: usize = 3;
 /// [`Settings::standing_bytes`]: about 3k tokens of a summary, the size of what the 2026-10-31
 /// probes on real windows found the narrative and the other sections had lost.
 pub const STANDING_BYTES: usize = 12 * 1024;
+/// [`Settings::lines_bytes`]: about 6k tokens. The window a blind probe scored held about 5 KiB of
+/// such lines in the agent's prose, 31 KiB in its commands and 38 KiB in the tool results the
+/// summary model reads.
+pub const LINES_BYTES: usize = 24 * 1024;
 /// [`Settings::fit_fraction`]: half the auto-compact point, so the compacted window has room to
 /// work before it fills again.
 pub const FIT_FRACTION: f64 = 0.5;
@@ -491,6 +505,8 @@ impl Default for Settings {
             idle_secs: IDLE_SECS,
             tool_result_bytes: TOOL_RESULT_BYTES,
             model: None,
+            base_url: None,
+            api_key_env: None,
             jobs: JOBS,
             live_within_secs: LIVE_WITHIN_SECS,
             serve: Serve::Native,
@@ -501,6 +517,7 @@ impl Default for Settings {
             carry_pointers: CARRY_POINTERS,
             retire_after: RETIRE_AFTER,
             standing_bytes: STANDING_BYTES,
+            lines_bytes: LINES_BYTES,
             rule_patterns: Vec::new(),
             fit_fraction: FIT_FRACTION,
         }

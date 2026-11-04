@@ -8,8 +8,11 @@
 // included). Every compaction, cv's or Claude Code's, is recorded with
 // `cv watch --kind precompact observe`, so `cv watch --kind precompact report` compares them.
 //
-// The `precompute` trigger always passes through: Claude Code's own background summary stays
-// the miss path's fast answer. No proxy sits in the path; cv is never waited on past the deadline.
+// The `precompute` trigger: a seat that serves cv's asks cv first (`commit --check`). When cv
+// would serve right now the background summary is vetoed (`{ skip }`, which also holds it off
+// until the next real prompt, when it is asked again): the compaction need not wait out a summary
+// it throws away, or pay for it. When cv would not serve, it runs and stays the miss path's fast
+// answer. No proxy sits in the path; cv is never waited on past the deadline.
 import type { Register, SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
 
 type Commit = { outcome: 'served'; summary: string; keep_from: number }
@@ -34,14 +37,23 @@ export const register: Register = (on, options) => {
   const precompact = [cv, 'watch', '--kind', 'precompact']
 
   on('session.compact', async ($, e: SessionCompactInput, next): Promise<SessionCompactResult> => {
-    if (e.trigger === 'precompute' || e.agentId !== undefined) return next(e)
+    if (e.agentId !== undefined) return next(e)
     const session = await $.session.id()
+    const serving = serve === 'cv' ? ['--serve', 'cv'] : []
+    if (e.trigger === 'precompute') {
+      if (serve === 'native') return next(e)
+      const input = JSON.stringify({ session, harness: 'claude', trigger: e.trigger, messages: e.messages.map(slim) })
+      const asked = await $.process
+        .run([...precompact, 'commit', '--check', ...serving], { stdin: input, timeoutMs: deadline })
+        .catch(() => undefined)
+      return asked?.exitCode === 0 ? { skip: 'cv holds a ready summary for this compaction' } : next(e)
+    }
     const started = await $.clock.now()
     let miss: string | undefined
     let result: SessionCompactResult | undefined
     let method = 'native'
     if (serve !== 'native') {
-      const argv = [...precompact, 'commit', ...(serve === 'cv' ? ['--serve', 'cv'] : [])]
+      const argv = [...precompact, 'commit', ...serving]
       const input = JSON.stringify({
         session,
         harness: 'claude',
