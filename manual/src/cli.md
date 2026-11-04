@@ -884,7 +884,11 @@ On Claude Code the `cv-compact` plugin (`integrations/claude-code/cv-compact`) c
 the harness's `session.compact` event. `commit` serves the ready summary only when its checkpoint
 still admits the transcript and every covered message and tool call is in the conversation being
 compacted, in order; on any miss Claude Code compacts as its own. Which one serves is the
-plugin's `serve` option, else `precompact.serve` (`native` by default); `report` is the
+plugin's `serve` option, else `precompact.serve` (`native` by default). A summary may go to any
+OpenAI-compatible route: `--base-url`, `--model` and `--api-key-env` (or `base_url`, `model`,
+`api_key_env` in the block), the key read from that variable alone. On a seat that serves cv's the
+plugin asks `commit --check` before the harness's background summary, and skips it where cv would
+serve. `report` is the
 comparison to choose it by. Design: `docs/design/PRECOMPACT.md`.
 
 ### `cv share`

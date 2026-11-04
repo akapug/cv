@@ -4,6 +4,7 @@
 
 - `cv watch --kind precompact`: compaction summaries written before the harness compacts, served inside its own compaction (`commit`), compared by `report`.
 - Summaries carry the person's rulings, promises, terms, setup facts and identifiers verbatim between generations; quotes are checked against the cited message.
+- `cv watch --kind precompact`: a summary carries whole lines holding a sha, a row or a count, read by shape with no model; its model is a setting, on any OpenAI-compatible route (`--base-url`, `--api-key-env`), with tokens recorded per summary; `commit --check` says whether cv would serve, and the plugin skips Claude Code's background summary where it would.
 - `integrations/claude-code/cv-compact`: a Claude Code plugin serving cv's summary on `session.compact`, Claude Code's own on any miss.
 - `watch::wake`: an inotify + eventfd wake for resident followers (a timer off Linux).
 - `Adapter::native_precompaction` and `Adapter::compacted_copy` (Claude Code; `None` elsewhere).

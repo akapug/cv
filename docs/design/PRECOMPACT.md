@@ -1,7 +1,8 @@
 # Precompaction: cv's compaction, inside the harness's own
 
-Status: built on akapug's fleet (2026-10-28, reshaped to the 0.19 design record 2026-10-29); first
-served live on throwaway sessions 2026-10-31, on no seat yet.
+Status: built on akapug's fleet (2026-10-28, reshaped to the 0.19 design record 2026-10-29); served
+live on throwaway sessions 2026-10-31 and 2026-11-04 (`PRECOMPACT-TRIALS.md`), on no seat yet; one
+is armed to take it at its next relaunch.
 Paths are relative to `crates/`. The 0.19 record is `docs/design/0.19/`; its REVIEW-ASTRA §3
 handoff (prepare, ready, commit, miss) is the shape this page follows.
 
@@ -56,12 +57,21 @@ No proxy sits in the path; the first build's `answer` action is removed and name
   handles; on a miss, `next(e)`.
 - `host` (default): `commit` without `--serve`, so cv's `[precompact] serve` decides.
 
-`precompute` passes through untouched: the harness's own background summary stays the miss path's
-fast answer (a second summary per window, and a served compaction waits for it: see the trial).
-Subagent compactions pass through. A hook that throws is caught to `next(e)`. After every
+`precompute`, on a seat that serves cv's, runs `commit --check`. Where cv would serve, the plugin
+returns `{ skip }`: the harness's background summary never runs and the compaction waits for none
+(its debug log: `session.compact (precompute): skipped ...; core never ran`; it asks again after the
+next real prompt). Where cv would not serve, the summary runs and stays the miss path's fast answer.
+`report` counts both (`precompute_vetoed`, `precompute_passed_through`). The check and the commit
+are two reads: a check that passes and a commit that misses compacts as native with no summary
+ready, the same as a seat with no flag. Subagent compactions pass through. A hook that throws is caught to `next(e)`. After every
 compaction, cv's or native, the plugin runs `observe` without waiting on it.
 
-The plugin's tests (`claude plugin test`) cover serve, miss and native.
+The plugin's tests (`claude plugin test`) cover serve, miss, native and the veto.
+
+A served compaction never fires `PreCompact`, which runs beneath `next(e)`. A consumer tells the two
+apart from `PostCompact`'s `compact_summary`: empty where a hook served (then `SessionStart`
+`compact`, at the same transcript length), the summary where the harness wrote one (`SessionStart`
+first). Measured on 2.1.318 on flag off, flag on and manual native.
 
 ## What the summary carries
 
@@ -71,7 +81,7 @@ self or setup facts 4, in-flight work or a promise lost 4. Loss compounds over g
 than spiking at a seam. Public evidence agrees: a compactor keeps about 17% of side constraints, a
 separate extractor appended after the summary over 90% (arXiv 2608.11242).
 
-So a record is three parts, rendered in this order into the text served:
+So a record is five parts, rendered in this order into the text served:
 
 1. **Narrative** (`prompt::CV_INSTRUCTION`): what the work is for, decisions with reasons, where it
    stands, files, open questions, next step. Every line cites `[m:ID]`; an existence, absence or
@@ -103,8 +113,12 @@ So a record is three parts, rendered in this order into the text served:
    (`carry/<harness>/<session>.json`): the next window's first summary starts from it. A record
    no follower saw compacted (a restarted follower, or `now` run once per window) is folded into
    that carry by the next read (`Live::adopt_stored`).
-3. **Pointers to the standing rules the work touched**: ids only, never text (below).
-4. **The person's words**, verbatim (`prompt::owner_words`): the window's prompts, harness markup
+3. **What the work stated** (`carry::lines`): whole lines holding a sha, a row or a count, read by
+   shape with no model from the agent's prose, its tool arguments and its tool results, never from
+   the person's prompts or injected context. This window's come first, then prose, arguments,
+   results, newest first, within `lines_bytes`, under "not verified now: probe before relying on one".
+4. **Pointers to the standing rules the work touched**: ids only, never text (below).
+5. **The person's words**, verbatim (`prompt::owner_words`): the window's prompts, harness markup
    cut, newest kept within 16 KiB; the rest named by id. They include what the person sent while
    the agent worked (Claude Code's `queued_command` attachment with origin `human`,
    `window::queued_prompt`), which the summary model also reads whole; a scheduled wakeup's
@@ -166,11 +180,14 @@ answered in 1.85 s.
 |---|---|---|---|
 | `serve` | `native` | policy | which compaction serves; a seat's plugin option wins |
 | `prepare_native` | false | policy | prepare where the harness precomputes its own |
+| `model` | none | policy | the summary model; a seat with none set uses cv's default route |
+| `base_url` / `api_key_env` | none | policy | an OpenAI-compatible route for the summary, and the variable holding its key; a named variable that is unset is refused, never read from elsewhere |
 | `start_fraction` | 0.70 | budget | first summary at this fraction of the auto-compact point |
 | `compact_at` | learned | — | the session's own `preTokens`, else the lowest seen for its harness and model |
 | `extend_tokens` / `idle_secs` | 20,000 / 45 | budget | when to extend |
 | `tool_result_bytes` | 2,048 | budget | each tool result's head and tail the summary model reads |
 | `owner_words_bytes` | 16,384 | budget | the person's words carried verbatim |
+| `lines_bytes` | 24,576 | budget | lines the work stated, carried whole |
 | `carry_ids` | 25 | budget | live identifiers carried, most recently seen kept |
 | `carry_pointers` | 20 | budget | standing-rule pointers carried, most recently used kept |
 | `standing_bytes` | 12,288 | budget | lines carried from the harness's own summary, newest kept |
@@ -184,49 +201,10 @@ answered in 1.85 s.
 | `LEASE_STALE` | 960 s | cost-only | a lease older than this is a dead owner's |
 | `RETRY_FIRST` / `RETRY_MAX` | 5 s / 600 s | cost-only | a read refused for a changed source is retried, doubling |
 
-## First live trial (2026-10-31, Claude Code 2.1.316, throwaway sessions, never a seat)
+## Trials
 
-| | stall (`durationMs`) | tokens after |
-|---|---|---|
-| cv served, 118-133k window, 3 auto compactions | 35, 47, 63 ms | 26.6-29.8k |
-| cv served, a real 354k window resumed | 46 ms | 13.0k |
-| native on a miss, or set native, 114-131k window, 7 compactions | 31-75 s | 8.7-29.6k |
-| native on a miss, the same 354k window | 83.8 s | 32.2k |
-
-Misses seen live, each falling through to native: `no_record`, `would_not_fit`,
-`covered_messages_changed` (a scheduled prompt, now not anchored), a hung cv (the 5 s deadline, added
-to the stall), unparsable output, a crash.
-
-What the trial found about serving: `PreCompact` runs beneath `next(e)`, so a served compaction
-never fires it (`PostCompact` and `SessionStart` `compact` do, in that order, the reverse of
-native's); with the flag on it fires instead when the precompute starts, a minute or more before.
-The base layer's rows (`instructions`, `session_context`, `date`) return at the next prompt, not at
-the boundary, so a compaction in the middle of a long turn runs without them until the turn ends.
-
-Fidelity, probes answered with no tools. On the 354k window the first build held the span 8 of 9
-(native 8) but what only the previous native summary held 0 of 5 (native 4): the narrative is told
-not to list it, a ruling may not quote a summary, and a first generation has no carry. With
-`standing`, 4 of 5 and the span 8 of 9, at 16.5k tokens after. Blind on a second window (343k; 18
-items sampled by seed before either summary was read): earlier generation cv 6 of 12 with 2
-partial, native 2 with 1; this window's items cv 2 of 6, native 4; tokens after 9.0k against 31.1k,
-stall 165 ms against 61.0 s. So cv keeps more of the old at a third of the size and thins the
-span's shas and counts. Planted items on a fresh session (first build): 9 of 10 against 10.
-
-With `tengu_sepia_moth` on (one run each, one 190-198k compaction, 9 turns): off 44.9 s, 10.8k
-after, $3.96; on 43 ms, 32.1k after, $3.85; on with `serve = cv` 10.6 s, 18.0k after, $4.11 plus
-$1.51 of cv's summaries: `commit` took 31 ms, but the harness first waited out its in-flight
-precompute, then threw it away. It never arms under a 200k window, which is why 150k arms show
-nothing.
-
-## Measurements kept from the first build
-
-- **Commitment replay.** 26 real compactions from 4 codex seats and 3 Claude Code sessions,
-  resumed against a mock to capture the request Claude Code 2.1.312 built: a cut at the newest
-  message matched 24 of 26 (the two resumed a different leaf) with a median 2-message tail; a cut
-  at 70% matched 26 of 26 (median 126 messages, 192 KB of tail). The redacted pairs are
-  `cv-core/tests/fixtures/precompact/`, replayed by `tests/precompact_replay.rs`.
-- **Watch cost.** On the hub, 11 live sessions for 10 minutes: 160.5 s of CPU before the append-only
-  read, 4.9 s after; 0.6 s per 5 minutes at rest, 48 MiB.
+`PRECOMPACT-TRIALS.md`: stall, tokens after, misses, fidelity probes against native, the veto and
+the summary routes, by date.
 
 ## Against the 0.19 design record
 
