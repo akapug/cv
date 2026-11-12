@@ -7705,6 +7705,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decoded_baseline_checkpoints_follow_eight_changed_sessions_and_match_a_full_sweep() {
+        use std::io::Write;
+        let home = IsolatedHome::new();
+        home._scope.set("CV_INDEX_STAGE_WORK", "1");
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let refs: Vec<_> = (0..32)
+            .map(|n| {
+                let id = format!("fold{n}");
+                sref(&id, &id, write_claude(&sdir, &id, "zqoriginal"))
+            })
+            .collect();
+        let initial = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!((initial.changed, initial.errors), (32, 0));
+        // The first follow-up establishes per-consumer decoded checkpoints, not new output.
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 0);
+        let counters = |op: &cv_core::stage_work::Operation| -> Vec<(String, u64, u64)> {
+            op.snapshot().unwrap()["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s["stage"].as_str(),
+                        Some("baseline_counts" | "baseline_events" | "baseline_fts")
+                    )
+                })
+                .map(|s| {
+                    let metric = |name| {
+                        s["work"].as_array().unwrap().iter().find(|m| m[0] == name).unwrap()[1]
+                            .as_u64()
+                            .unwrap()
+                    };
+                    (
+                        s["stage"].as_str().unwrap().to_owned(),
+                        metric("decoded_rows"),
+                        metric("checkpoint_input_bytes"),
+                    )
+                })
+                .collect()
+        };
+        let op = cv_core::stage_work::Operation::from_env(None);
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 0);
+        for (stage, decoded, bytes) in counters(&op) {
+            assert_eq!(decoded, 0, "{stage}");
+            assert!(bytes > 0, "the checkpoint verifier must see real {stage} input");
+        }
+        op.finish(true);
+        for (n, r) in refs.iter().take(8).enumerate() {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&r.path).unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type":"user","uuid":format!("append{n}"),"sessionId":r.id,
+                "message":{"role":"user","content":"zqdelta"}})
+            )
+            .unwrap();
+        }
+        let op = cv_core::stage_work::Operation::from_env(None);
+        let changed = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!((changed.changed, changed.errors), (8, 0));
+        for (stage, decoded, _) in counters(&op) {
+            assert_eq!(decoded, 0, "unchanged canonical envelope {stage}");
+        }
+        op.finish(true);
+        // Publications invalidate eight checkpoints per consumer. Only those deltas decode
+        // next time; the other 24 session copies retain their cross-operation folds.
+        let op = cv_core::stage_work::Operation::from_env(None);
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 0);
+        for (stage, decoded, _) in counters(&op) {
+            assert_eq!(decoded, 8, "delta-only {stage}");
+        }
+        op.finish(true);
+        let op = cv_core::stage_work::Operation::from_env(None);
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 0);
+        for (stage, decoded, _) in counters(&op) {
+            assert_eq!(decoded, 0, "settled {stage}");
+        }
+        op.finish(true);
+        let words = ["zqoriginal", "zqdelta"].map(str::to_owned);
+        assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
+    }
+
     #[cfg(unix)]
     #[test]
     fn primary_identity_restored_rewrite_refreshes_index_events_and_counts() {

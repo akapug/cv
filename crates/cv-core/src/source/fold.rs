@@ -57,6 +57,8 @@ pub(super) struct Reader {
     consumer: String,
     checkpoint: String,
     folds: bool,
+    work: Stage,
+    pending: crate::spill::Ordered<Pending>,
 }
 
 impl Reader {
@@ -67,6 +69,8 @@ impl Reader {
             consumer: consumer.into(),
             checkpoint: format!("{PREFIX}{consumer}"),
             folds: false,
+            work: Stage::BaselineOther,
+            pending: Default::default(),
         }
     }
 
@@ -75,6 +79,9 @@ impl Reader {
             self.attempted = true;
             self.conn = super::open();
             if let Some(conn) = &mut self.conn {
+                // This is an optional read accelerator: cache writes must never wait for a
+                // canonical publisher's writer lock. Failed writes simply miss next time.
+                let _ = conn.busy_timeout(std::time::Duration::ZERO);
                 // DDL and admission are atomic. Missing invalidators make every retained
                 // fold untrustworthy; discard them before installing all three together.
                 // Equipped and frozen/read-only catalogs never acquire a DDL writer lock.
@@ -100,7 +107,8 @@ impl Reader {
 
     /// Outer None is an unavailable catalog. Inner None is a missing, malformed or old record.
     pub(super) fn read<T: Payload>(&mut self, r: &SessionRef) -> Option<Option<Record<T>>> {
-        let _work = enter(stage::<T>());
+        self.work = stage::<T>();
+        let _work = enter(self.work);
         add(Metric::Calls, 1);
         self.open()?;
         let conn = self.conn.as_ref()?;
@@ -113,6 +121,8 @@ impl Reader {
                     "SELECT coalesce(f.record,s.record),f.record IS NOT NULL
                      FROM source_dependencies s LEFT JOIN source_dependencies f
                      ON f.consumer=?5 AND f.harness=s.harness AND f.id=s.id AND f.path=s.path
+                     AND (SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN
+                         ('cv_baseline_fold_insert_v1','cv_baseline_fold_delete_v1','cv_baseline_fold_update_v1'))=3
                      WHERE s.consumer=?1 AND s.harness=?2 AND s.id=?3 AND s.path=?4",
                 )?
                 .query_row(params![self.consumer, h, id, path, self.checkpoint], |row| {
@@ -145,22 +155,116 @@ impl Reader {
         };
         add(Metric::DecodedRows, 1);
         if self.folds && !crate::env::frozen() {
-            let checkpoint = encode(&record);
-            // A concurrent publication wins: never certify an old decode for a new record.
-            // One statement atomically checks canonical bytes and replaces the checkpoint.
-            if conn
-                .execute(
-                    "INSERT OR REPLACE INTO source_dependencies(consumer,harness,id,path,record)
-                 SELECT ?5,harness,id,path,?6 FROM source_dependencies
-                 WHERE consumer=?1 AND harness=?2 AND id=?3 AND path=?4 AND record=?7",
-                    params![self.consumer, h, id, path, self.checkpoint, checkpoint, bytes],
-                )
-                .is_ok_and(|written| written == 1)
-            {
-                add(Metric::CheckpointOutputBytes, checkpoint.len() as u64);
-            }
+            // Native ordered staging bounds cold-start retention and batches durability into
+            // one transaction per table, not one fsync per discovered session.
+            let _ = self.pending.push(Pending {
+                key: (h, id, path),
+                canonical: bytes,
+                checkpoint: encode(&record),
+            });
         }
         Some(Some(record))
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        if self.pending.len() == 0 || crate::env::frozen() {
+            return;
+        }
+        let _work = enter(self.work);
+        let Some(conn) = self.conn.as_mut() else { return };
+        let Ok(rows) = std::mem::take(&mut self.pending).rows() else {
+            return;
+        };
+        let flush = || -> anyhow::Result<()> {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // A lost invalidator makes queued snapshots inadmissible too.
+            if !equipped(&tx) {
+                return Ok(());
+            }
+            let mut output_bytes = 0;
+            {
+                let mut put = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO source_dependencies(consumer,harness,id,path,record)
+                     SELECT ?5,harness,id,path,?6 FROM source_dependencies
+                     WHERE consumer=?1 AND harness=?2 AND id=?3 AND path=?4 AND record=?7",
+                )?;
+                for row in rows {
+                    let Pending {
+                        key: (h, id, path),
+                        canonical,
+                        checkpoint,
+                    } = row?;
+                    // A concurrent publication wins: bind the decode to the exact canonical
+                    // bytes, under the writer transaction, before publishing a checkpoint.
+                    if put.execute(params![
+                        self.consumer,
+                        h,
+                        id,
+                        path,
+                        self.checkpoint,
+                        checkpoint,
+                        canonical
+                    ])? == 1
+                    {
+                        output_bytes += checkpoint.len() as u64;
+                    }
+                }
+            }
+            tx.commit()?;
+            add(Metric::CheckpointOutputBytes, output_bytes);
+            Ok(())
+        };
+        let _ = flush(); // Optional acceleration never changes the canonical read's result.
+    }
+}
+
+struct Pending {
+    key: Key,
+    canonical: Vec<u8>,
+    checkpoint: Vec<u8>,
+}
+
+impl crate::spill::Record for Pending {
+    type ReadState = ();
+    fn heap_bytes(&self) -> usize {
+        self.key.0.capacity()
+            + self.key.1.capacity()
+            + self.key.2.capacity()
+            + self.canonical.capacity()
+            + self.checkpoint.capacity()
+    }
+    fn write(&self, writer: &mut impl std::io::Write) -> anyhow::Result<()> {
+        for bytes in [
+            self.key.0.as_bytes(),
+            self.key.1.as_bytes(),
+            self.key.2.as_bytes(),
+            &self.canonical,
+            &self.checkpoint,
+        ] {
+            writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
+            writer.write_all(bytes)?;
+        }
+        Ok(())
+    }
+    fn read(reader: &mut impl std::io::BufRead, _: &mut ()) -> anyhow::Result<Self> {
+        let mut bytes = || -> anyhow::Result<Vec<u8>> {
+            let mut len = [0; 8];
+            reader.read_exact(&mut len)?;
+            let mut bytes = vec![0; usize::try_from(u64::from_le_bytes(len))?];
+            reader.read_exact(&mut bytes)?;
+            Ok(bytes)
+        };
+        Ok(Self {
+            key: (
+                String::from_utf8(bytes()?)?,
+                String::from_utf8(bytes()?)?,
+                String::from_utf8(bytes()?)?,
+            ),
+            canonical: bytes()?,
+            checkpoint: bytes()?,
+        })
     }
 }
 
@@ -470,6 +574,42 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_batch_does_not_wait_for_writers_or_publish_a_raced_decode() {
+        let _world = crate::test_world("baseline-fold-race");
+        let conn = super::super::open().unwrap();
+        let r = reference("one");
+        put(&conn, "counts", &r, &record(1).encode());
+        let mut reader = Reader::new("counts");
+        assert_eq!(reader.read::<Count>(&r).unwrap().unwrap().payload, Count(1));
+        assert!(reader.pending.len() > 0);
+        put(&conn, "counts", &r, &record(2).encode());
+        drop(reader);
+        assert!(
+            canonical(&conn, &format!("{PREFIX}counts"), &r).unwrap().is_none(),
+            "raced decode must not publish"
+        );
+        assert_eq!(read("counts", &r).unwrap().payload, Count(2));
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        conn.execute(
+            "UPDATE source_dependencies SET record=?1 WHERE consumer='counts'",
+            [record(3).encode()],
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            read("counts", &r).unwrap().payload,
+            Count(2),
+            "reader sees last committed canonical state"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "optional checkpoint waited for writer"
+        );
+        conn.execute_batch("COMMIT;").unwrap();
+        assert_eq!(read("counts", &r).unwrap().payload, Count(3));
+    }
+
+    #[test]
     fn checkpoint_survives_an_actual_process_restart() {
         let world = crate::test_world("baseline-fold-process");
         let conn = super::super::open().unwrap();
@@ -507,7 +647,7 @@ mod tests {
         op.finish(true);
     }
 
-    fn growth(archived: usize) {
+    fn growth(archived: usize, active: usize) {
         let world = crate::test_world("baseline-fold-growth");
         world.scope.set("CV_INDEX_STAGE_WORK", "1");
         let mut conn = super::super::open().unwrap();
@@ -523,20 +663,40 @@ mod tests {
             }
         }
         tx.commit().unwrap();
-        let refs: Vec<_> = (0..64).map(|n| reference(&format!("active{n}"))).collect();
+        let refs: Vec<_> = (0..active).map(|n| reference(&format!("active{n}"))).collect();
+        // Active records carry a nontrivial conditional-read inventory, not empty stamps.
+        let dependencies: Vec<_> = (0..32)
+            .map(|n| Entry {
+                path: format!("/fixture/outputs/{n:04}/{}", "x".repeat(96)).into(),
+                state: Some(FileId::default()),
+                prefix: None,
+                grows: None,
+                resumes: None,
+            })
+            .collect();
+        let active_record = |value| {
+            let mut current = record(value);
+            current.baseline.stamp = Stamp::new(&[], Some(&dependencies));
+            current
+        };
+        let active_bytes = active_record(1).encode();
+        let tx = conn.transaction().unwrap();
         for r in &refs {
-            put(&conn, "counts", r, &bytes);
+            put(&tx, "counts", r, &active_bytes);
         }
-        // Warm the decoded fold, then measure brand-new operation-owned readers each time.
+        tx.commit().unwrap();
+        // Warm the decoded fold in one bounded, batched reader, then start fresh readers.
+        let mut warm = Table::<Count>::demanded("counts");
         for r in &refs {
-            read("counts", r).unwrap();
+            assert!(warm.demand(r));
         }
+        drop(warm);
         let idle = Table::<Count>::demanded("counts");
         assert!(idle.rows.is_empty());
         drop(idle); // no demand means no connection, probes or checkpoint writes
         for changed in [0, 8] {
             for r in refs.iter().take(changed) {
-                put(&conn, "counts", r, &record(2).encode());
+                put(&conn, "counts", r, &active_record(2).encode());
             }
             let op = crate::stage_work::Operation::from_env(None);
             let start = std::time::Instant::now();
@@ -547,10 +707,10 @@ mod tests {
             }
             assert_eq!(metric(&op, "decoded_rows"), changed as u64);
             assert_eq!(metric(&op, "rows"), changed as u64);
-            assert_eq!(metric(&op, "input_bytes"), changed as u64 * bytes.len() as u64);
-            println!("baseline-fold-growth archived={archived} active=64 changed={changed} canonical_rows={} canonical_bytes={} checkpoint_bytes={} wall_us={}",
-                metric(&op, "rows"), metric(&op, "input_bytes"), metric(&op, "checkpoint_input_bytes"), start.elapsed().as_micros());
-            drop(table);
+            assert_eq!(metric(&op, "input_bytes"), changed as u64 * active_bytes.len() as u64);
+            drop(table); // Include checkpoint publication, not merely the reads, in cost.
+            println!("baseline-fold-growth archived={archived} active={active} changed={changed} canonical_rows={} canonical_bytes={} checkpoint_bytes={} cpu_ns={} wall_us={}",
+                metric(&op, "rows"), metric(&op, "input_bytes"), metric(&op, "checkpoint_input_bytes"), op.snapshot().unwrap()["process_cpu_ns"], start.elapsed().as_micros());
             op.finish(true);
         }
         // Deliberate old full-table path: prove counters see the unchanged archived input.
@@ -568,7 +728,7 @@ mod tests {
     #[test]
     fn checkpoint_changed_work_is_independent_of_archived_growth() {
         for archived in [256, 2560] {
-            growth(archived);
+            growth(archived, 64);
         }
     }
 
@@ -576,7 +736,7 @@ mod tests {
     #[ignore = "realistic 250k/2.5m-row cost qualification; run explicitly on a Fab node"]
     fn checkpoint_realistic_today_and_tenfold_growth() {
         for archived in [250_000, 2_500_000] {
-            growth(archived);
+            growth(archived, 8400);
         }
     }
 }
