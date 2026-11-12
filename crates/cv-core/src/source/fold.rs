@@ -12,6 +12,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 const PREFIX: &str = "baseline-fold-v1/";
 const MAGIC: &[u8] = b"CVBF\x01";
+const LOOKUP: &str = "SELECT coalesce(f.record,s.record),f.record IS NOT NULL
+ FROM source_dependencies s LEFT JOIN source_dependencies f
+ ON f.consumer=?5 AND f.harness=s.harness AND f.id=s.id AND f.path=s.path
+ AND (SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN
+     ('cv_baseline_fold_insert_v1','cv_baseline_fold_delete_v1','cv_baseline_fold_update_v1'))=3
+ WHERE s.consumer=?1 AND s.harness=?2 AND s.id=?3 AND s.path=?4";
 const TRIGGERS: &str = "
 CREATE TRIGGER IF NOT EXISTS cv_baseline_fold_insert_v1 AFTER INSERT ON source_dependencies
 WHEN substr(NEW.consumer,1,17) != 'baseline-fold-v1/' BEGIN
@@ -117,18 +123,11 @@ impl Reader {
             if self.folds {
                 // Coalesce is lazy: a checkpoint hit never fetches the canonical record's
                 // overflow pages. Both rows belong to this one SQLite statement snapshot.
-                conn.prepare_cached(
-                    "SELECT coalesce(f.record,s.record),f.record IS NOT NULL
-                     FROM source_dependencies s LEFT JOIN source_dependencies f
-                     ON f.consumer=?5 AND f.harness=s.harness AND f.id=s.id AND f.path=s.path
-                     AND (SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN
-                         ('cv_baseline_fold_insert_v1','cv_baseline_fold_delete_v1','cv_baseline_fold_update_v1'))=3
-                     WHERE s.consumer=?1 AND s.harness=?2 AND s.id=?3 AND s.path=?4",
-                )?
-                .query_row(params![self.consumer, h, id, path, self.checkpoint], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
-                .optional()
+                conn.prepare_cached(LOOKUP)?
+                    .query_row(params![self.consumer, h, id, path, self.checkpoint], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .optional()
             } else {
                 canonical(conn, &self.consumer, r).map(|row| row.map(|bytes| (bytes, false)))
             }
@@ -364,9 +363,9 @@ fn decode<T: Payload>(bytes: &[u8]) -> Option<Record<T>> {
     };
     let stamp = if input.flag()? {
         Some(Stamp {
-            entries: RawStamp(input.text()?),
+            entries: RawStamp::Folded(input.text()?.into_boxed_str()),
             reads: if input.flag()? {
-                Some(RawStamp(input.text()?))
+                Some(RawStamp::Folded(input.text()?.into_boxed_str()))
             } else {
                 None
             },
@@ -553,14 +552,24 @@ mod tests {
         let r = reference("one");
         put(&conn, "counts", &r, &record(1).encode());
         assert_eq!(read("counts", &r).unwrap().payload, Count(1));
+        let mut retained = Reader::new("counts");
+        retained.open().unwrap();
         conn.execute_batch("DROP TRIGGER cv_baseline_fold_update_v1;").unwrap();
         conn.execute(
             "UPDATE source_dependencies SET record=?1 WHERE consumer='counts'",
             [record(2).encode()],
         )
         .unwrap();
+        assert_eq!(
+            retained.read::<Count>(&r).unwrap().unwrap().payload,
+            Count(2),
+            "even an open reader must stop trusting a lost invalidator"
+        );
+        drop(retained);
         // Reopening repairs missing invalidators and discards all potentially stale folds.
         assert_eq!(read("counts", &r).unwrap().payload, Count(2));
+        let cold = reference("cold");
+        put(&conn, "counts", &cold, &record(8).encode());
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
         drop(conn);
         world.scope.set("CV_FROZEN", "1");
@@ -568,9 +577,55 @@ mod tests {
         let op = crate::stage_work::Operation::from_env(None);
         assert_eq!(read("counts", &r).unwrap().payload, Count(2));
         assert_eq!(metric(&op, "decoded_rows"), 0);
+        assert_eq!(read("counts", &cold).unwrap().payload, Count(8));
+        assert_eq!(
+            metric(&op, "decoded_rows"),
+            1,
+            "frozen cold misses use canonical rows without installing folds"
+        );
         assert_eq!(metric(&op, "checkpoint_output_bytes"), 0);
         assert_eq!(std::fs::read(world.cv_home.join("catalog.db")).unwrap(), before);
         op.finish(true);
+    }
+
+    #[test]
+    fn checkpoint_lookup_uses_exact_indexes_not_an_archived_baseline_scan() {
+        let _world = crate::test_world("baseline-fold-plan");
+        let conn = super::super::open().unwrap();
+        let r = reference("one");
+        put(&conn, "counts", &r, &record(1).encode());
+        assert_eq!(read("counts", &r).unwrap().payload, Count(1));
+        let mut explain = conn.prepare(&format!("EXPLAIN QUERY PLAN {LOOKUP}")).unwrap();
+        let plan: Vec<String> = explain
+            .query_map(
+                params!["counts", "claude", "one", "/fixture/one", format!("{PREFIX}counts")],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter().any(|line| line.starts_with("SEARCH s USING INDEX")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().any(|line| line.starts_with("SEARCH f USING INDEX")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|line| line.starts_with("SCAN s ") || line.starts_with("SCAN f ")),
+            "{plan:?}"
+        );
+        let mut statement = conn.prepare(LOOKUP).unwrap();
+        let (_, cached): (Vec<u8>, bool) = statement
+            .query_row(
+                params!["counts", "claude", "one", "/fixture/one", format!("{PREFIX}counts")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(cached, "query-plan proof must exercise a real persisted fold");
     }
 
     #[test]
@@ -589,6 +644,11 @@ mod tests {
             "raced decode must not publish"
         );
         assert_eq!(read("counts", &r).unwrap().payload, Count(2));
+        conn.execute(
+            "DELETE FROM source_dependencies WHERE consumer=?1",
+            [format!("{PREFIX}counts")],
+        )
+        .unwrap();
         conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
         conn.execute(
             "UPDATE source_dependencies SET record=?1 WHERE consumer='counts'",

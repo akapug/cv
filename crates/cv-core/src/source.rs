@@ -257,26 +257,39 @@ pub struct Stamp {
 /// Keep the canonical JSON spelling, but do not re-parse checkpointed stamp text just to load
 /// it. Admission decodes the paths it probes; serialization still writes the original raw JSON.
 #[derive(Debug, Clone)]
-struct RawStamp(String);
+enum RawStamp {
+    Json(Box<serde_json::value::RawValue>),
+    #[cfg(feature = "sqlite")]
+    Folded(Box<str>),
+}
 
 impl RawStamp {
     fn get(&self) -> &str {
-        &self.0
+        match self {
+            Self::Json(raw) => raw.get(),
+            #[cfg(feature = "sqlite")]
+            Self::Folded(text) => text,
+        }
     }
 }
 
 impl Serialize for RawStamp {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let raw = serde_json::value::RawValue::from_string(self.0.clone()).map_err(serde::ser::Error::custom)?;
-        raw.serialize(serializer)
+        match self {
+            Self::Json(raw) => raw.serialize(serializer),
+            #[cfg(feature = "sqlite")]
+            Self::Folded(text) => {
+                let raw =
+                    serde_json::value::RawValue::from_string(text.to_string()).map_err(serde::ser::Error::custom)?;
+                raw.serialize(serializer)
+            }
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for RawStamp {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
-        let text: Box<str> = raw.into();
-        Ok(Self(text.into_string()))
+        Box::<serde_json::value::RawValue>::deserialize(deserializer).map(Self::Json)
     }
 }
 
@@ -291,7 +304,7 @@ impl Eq for Stamp {}
 impl Stamp {
     fn new(entries: &[Entry], reads: Option<&[Entry]>) -> Option<Self> {
         // A boxed str: retained across publication checks without the serializer's spare capacity.
-        let raw = |entries: &[Entry]| serde_json::to_string(entries).ok().map(RawStamp);
+        let raw = |entries: &[Entry]| serde_json::value::to_raw_value(entries).ok().map(RawStamp::Json);
         Some(Self {
             entries: raw(entries)?,
             reads: match reads {
@@ -1259,10 +1272,9 @@ impl<T: Payload> Table<T> {
     pub fn demand(&mut self, r: &SessionRef) -> bool {
         #[cfg(feature = "sqlite")]
         if let Some(reader) = self.reader.as_mut() {
-            let key = key(r);
-            if !self.rows.contains_key(&key) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.rows.entry(key(r)) {
                 let Some(record) = reader.read(r) else { return false };
-                self.rows.insert(key, record);
+                slot.insert(record);
             }
         }
         #[cfg(not(feature = "sqlite"))]
