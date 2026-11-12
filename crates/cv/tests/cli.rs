@@ -102,7 +102,10 @@ fn index_stage_work_is_opt_in_numeric_private_and_keeps_json_stdout() {
     assert_eq!(metric(&warm, "selected_parse", "selected_jobs"), 0);
     assert_eq!(metric(&warm, "resume", "head_demands"), 0);
     assert!(metric(&warm, "indexed_metadata", "rows") > 0);
-    assert!(metric(&warm, "baseline_fts", "input_bytes") > 0);
+    // A warm pass verifies real decoded checkpoints without decoding canonical baselines again.
+    assert_eq!(metric(&warm, "baseline_fts", "input_bytes"), 0);
+    assert_eq!(metric(&warm, "baseline_fts", "decoded_rows"), 0);
+    assert!(metric(&warm, "baseline_fts", "checkpoint_input_bytes") > 0);
     assert!(metric(&warm, "planning", "stamp_read_calls") > 0);
     let (ok, code, out, err) = w.cv_env(
         &["index", "--semantic", "--subagents", "--json"],
