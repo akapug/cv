@@ -793,7 +793,7 @@ mod db {
         /// Retain only the baselines the index planner actually compares.
         pub fn demanded() -> Self {
             Self {
-                baselines: Some(crate::source::Table::demanded("events")),
+                baselines: open().map(|conn| crate::source::Table::demanded_in("events", conn)),
             }
         }
 
@@ -2128,6 +2128,45 @@ mod tests {
                 db::collect_sources(parents.into_iter().rev().collect(), true).unwrap()
             )
         );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn demanded_events_preserve_unavailable_schema_degrade_and_initialize_fresh_schema() {
+        let world = crate::test_world("events-demand-schema");
+        let path = world.cv_home.join("empty.jsonl");
+        std::fs::write(&path, []).unwrap();
+        let r = SessionRef::new("empty", crate::Harness::Claude, &path);
+        let mut probe = crate::source::Probe::default();
+        let source = probe.snapshot(&r);
+        let provenance = Provenance::default();
+        let conn = crate::catalog::open_db().unwrap();
+
+        // The base catalog remains readable, but the event schema cannot initialize.
+        conn.execute_batch("CREATE VIEW events AS SELECT 1 AS session, NULL AS target_id;")
+            .unwrap();
+        assert!(!needs_ingest(&r));
+        assert!(!SyncTable::load().needs_ingest(&r, &source, &provenance, &mut probe));
+        let mut demanded = SyncTable::demanded();
+        demanded.demand(&r);
+        assert!(
+            !demanded.needs_ingest(&r, &source, &provenance, &mut probe),
+            "a readable source catalog must not mask an unavailable event schema"
+        );
+        drop(demanded);
+
+        conn.execute_batch("DROP VIEW events;").unwrap();
+        let mut demanded = SyncTable::demanded();
+        demanded.demand(&r);
+        assert!(demanded.needs_ingest(&r, &source, &provenance, &mut probe));
+        let initialized: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(initialized, "demand planning initializes the native event schema once");
     }
 
     #[cfg(feature = "sqlite")]

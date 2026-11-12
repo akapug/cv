@@ -80,10 +80,17 @@ impl Reader {
         }
     }
 
+    pub(super) fn with_connection(consumer: &str, conn: Connection) -> Self {
+        Self {
+            conn: Some(conn),
+            ..Self::new(consumer)
+        }
+    }
+
     fn open(&mut self) -> Option<&Connection> {
         if !self.attempted {
             self.attempted = true;
-            self.conn = super::open();
+            self.conn = self.conn.take().or_else(super::open);
             if let Some(conn) = &mut self.conn {
                 // This is an optional read accelerator: cache writes must never wait for a
                 // canonical publisher's writer lock. Failed writes simply miss next time.

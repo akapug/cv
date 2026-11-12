@@ -1266,6 +1266,15 @@ impl<T: Payload> Table<T> {
         }
     }
 
+    /// Demand through a connection whose consumer-specific schema has already been opened.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn demanded_in(consumer: &str, conn: rusqlite::Connection) -> Self {
+        Self {
+            reader: Some(fold::Reader::with_connection(consumer, conn)),
+            ..Self::default()
+        }
+    }
+
     /// Demand one exact session copy. Persistent decoded folds avoid re-decoding unchanged
     /// envelopes across processes; only a missing/invalidated checkpoint reads the canonical
     /// record. False means the catalog could not be opened, not that this record is absent.
