@@ -1171,6 +1171,17 @@ mod imp {
     }
 
     impl AffordanceTable {
+        /// No corpus scan: the index planner demands only its candidate session copies.
+        pub fn demanded() -> Self {
+            Self {
+                records: crate::source::Table::demanded(Counted::TAG),
+            }
+        }
+
+        pub fn demand(&mut self, r: &SessionRef) {
+            self.records.demand(r);
+        }
+
         pub fn load() -> AffordanceTable {
             AffordanceTable {
                 records: crate::source::Table::load(Counted::TAG),
@@ -2353,6 +2364,10 @@ pub(crate) fn note_counted_with_source(
 pub struct AffordanceTable;
 #[cfg(not(feature = "sqlite"))]
 impl AffordanceTable {
+    pub fn demanded() -> Self {
+        Self
+    }
+    pub fn demand(&mut self, _r: &SessionRef) {}
     pub fn load() -> AffordanceTable {
         AffordanceTable
     }

@@ -318,8 +318,8 @@ fn plan(
         Some(i) => read_indexed_metadata(i.index, i.f, true).context("reading index metadata")?,
         None => Default::default(),
     };
-    let dependencies = match indexed_consumer(&dir.join("cv-index-id"))? {
-        Some(consumer) if indexed.is_some() => cv_core::source::Table::<InIndex>::load(&consumer),
+    let mut dependencies = match indexed_consumer(&dir.join("cv-index-id"))? {
+        Some(consumer) if indexed.is_some() => cv_core::source::Table::<InIndex>::demanded(&consumer),
         _ => Default::default(),
     };
     let reader = cv_core::resume::Reader::default();
@@ -338,6 +338,7 @@ fn plan(
             continue;
         };
         let r = &*as_indexed(r, &metadata);
+        dependencies.demand(r);
         let source = probe.snapshot(r);
         let fresh = Freshness::of(&existing, &metadata, &dependencies, &mut probe, r, &prov, &source);
         newest_on_disk = newest_on_disk.max(fresh.mtime);

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Index and live-search planning demand decoded baseline checkpoints by session copy; unchanged envelopes survive process restarts, and publications invalidate only affected checkpoints.
+
 - `CV_INDEX_STAGE_WORK=1 cv index` reports aggregate stage CPU and logical work on stderr, without session identifiers or content; disabled by default.
 
 - Index and live-search planning read resume heads only for selected sessions, avoiding fleet-wide checkpoint I/O on unchanged or writer-busy refreshes.

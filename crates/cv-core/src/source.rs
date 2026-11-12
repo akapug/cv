@@ -249,9 +249,35 @@ pub(crate) fn consumer_version(consumer: impl std::fmt::Display) -> String {
 /// stamps of one inventory are equal as text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stamp {
-    entries: Box<serde_json::value::RawValue>,
+    entries: RawStamp,
     #[serde(default)]
-    reads: Option<Box<serde_json::value::RawValue>>,
+    reads: Option<RawStamp>,
+}
+
+/// Keep the canonical JSON spelling, but do not re-parse checkpointed stamp text just to load
+/// it. Admission decodes the paths it probes; serialization still writes the original raw JSON.
+#[derive(Debug, Clone)]
+struct RawStamp(String);
+
+impl RawStamp {
+    fn get(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for RawStamp {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let raw = serde_json::value::RawValue::from_string(self.0.clone()).map_err(serde::ser::Error::custom)?;
+        raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawStamp {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        let text: Box<str> = raw.into();
+        Ok(Self(text.into_string()))
+    }
 }
 
 impl PartialEq for Stamp {
@@ -265,7 +291,7 @@ impl Eq for Stamp {}
 impl Stamp {
     fn new(entries: &[Entry], reads: Option<&[Entry]>) -> Option<Self> {
         // A boxed str: retained across publication checks without the serializer's spare capacity.
-        let raw = |entries: &[Entry]| serde_json::value::to_raw_value(entries).ok();
+        let raw = |entries: &[Entry]| serde_json::to_string(entries).ok().map(RawStamp);
         Some(Self {
             entries: raw(entries)?,
             reads: match reads {
@@ -1191,19 +1217,57 @@ fn key(r: &SessionRef) -> Key {
 /// without one, reread once; even an empty complete read set has a record, so an old consumer
 /// cannot silently certify unresolved paths.
 pub struct Table<T> {
-    rows: HashMap<Key, Record<T>>,
+    #[cfg(feature = "sqlite")]
+    reader: Option<fold::Reader>,
+    rows: HashMap<Key, Option<Record<T>>>,
 }
+
+#[cfg(feature = "sqlite")]
+mod fold;
 
 impl<T> Default for Table<T> {
     fn default() -> Self {
-        Self { rows: HashMap::new() }
+        Self {
+            #[cfg(feature = "sqlite")]
+            reader: None,
+            rows: HashMap::new(),
+        }
     }
 }
 
 impl<T: Payload> Table<T> {
     /// `r`'s record, for [`Baseline::dependencies_fresh`] across growth and resume decisions.
     pub fn get(&self, r: &SessionRef) -> Option<&Record<T>> {
-        self.rows.get(&key(r))
+        self.rows.get(&key(r))?.as_ref()
+    }
+
+    /// An operation-owned reader with no corpus scan. Call [`Self::demand`] before examining
+    /// a candidate; its decoded record (including absence) is retained for this plan.
+    pub fn demanded(consumer: &str) -> Self {
+        #[cfg(not(feature = "sqlite"))]
+        let _ = consumer;
+        Self {
+            #[cfg(feature = "sqlite")]
+            reader: Some(fold::Reader::new(consumer)),
+            ..Self::default()
+        }
+    }
+
+    /// Demand one exact session copy. Persistent decoded folds avoid re-decoding unchanged
+    /// envelopes across processes; only a missing/invalidated checkpoint reads the canonical
+    /// record. False means the catalog could not be opened, not that this record is absent.
+    pub fn demand(&mut self, r: &SessionRef) -> bool {
+        #[cfg(feature = "sqlite")]
+        if let Some(reader) = self.reader.as_mut() {
+            let key = key(r);
+            if !self.rows.contains_key(&key) {
+                let Some(record) = reader.read(r) else { return false };
+                self.rows.insert(key, record);
+            }
+        }
+        #[cfg(not(feature = "sqlite"))]
+        let _ = r;
+        true
     }
 
     /// [`Record::admit_for`] of `r`'s record.
@@ -1244,13 +1308,14 @@ impl<T: Payload> Table<T> {
                         add(Metric::InputBytes, record.len() as u64);
                         let record = Record::decode(&record)?;
                         add(Metric::DecodedRows, 1);
-                        Some((key, record))
+                        Some((key, Some(record)))
                     })
                     .collect(),
             )
         };
         Self {
             rows: load().unwrap_or_default(),
+            ..Self::default()
         }
     }
 

@@ -164,6 +164,10 @@ The contract is the doc comment on `SessionRef::message_count`, held over every 
    view, discovery interpretation and embedding store share it): a bump rereads every consumer once. Catalog DB watches include
    WAL appearance, modification and disappearance. SQL output and stamps publish atomically; FTS
    invalidates its old baseline before changes and publishes a revalidated one after commit.
+   Index/live planning demand exact-copy records and retain each answer for the plan. Decoded
+   envelopes checkpoint under reserved `baseline-fold-v1/` consumers in the same table; triggers
+   invalidate only the changed record, even for older writers. Missing/corrupt folds read canonical
+   records; frozen/read-only stores need no cache writes. Raw stamp text is decoded only on admission.
    Operation-local probes share file stats. Consumers capture conditional Claude fork siblings and
    resolved external output paths before reading them, including absent files. Complete read sets
    survive prefix checkpoints and are revalidated at publication.

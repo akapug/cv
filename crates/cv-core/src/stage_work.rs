@@ -408,6 +408,14 @@ impl Operation {
         }
     }
 
+    /// Numeric snapshot for focused cross-crate cost regressions; no session data or IO.
+    #[cfg(any(test, feature = "probe-resume"))]
+    pub fn snapshot(&self) -> Option<serde_json::Value> {
+        self.state
+            .as_ref()
+            .map(|state| serde_json::to_value(report(state, self.source, true)).expect("aggregate report"))
+    }
+
     pub fn finish(mut self, success: bool) {
         self.emit(success);
     }

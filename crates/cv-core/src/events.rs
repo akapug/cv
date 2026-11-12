@@ -790,6 +790,21 @@ mod db {
     }
 
     impl SyncTable {
+        /// Retain only the baselines the index planner actually compares.
+        pub fn demanded() -> Self {
+            Self {
+                baselines: Some(crate::source::Table::demanded("events")),
+            }
+        }
+
+        pub fn demand(&mut self, r: &SessionRef) {
+            if self.baselines.as_mut().is_some_and(|table| !table.demand(r)) {
+                // Preserve the unavailable-catalog degrade: never re-stream a corpus into a
+                // catalog that cannot be opened.
+                self.baselines = None;
+            }
+        }
+
         pub fn load() -> SyncTable {
             SyncTable {
                 baselines: open().map(|conn| crate::source::Table::load_in(&conn, "events")),
@@ -1377,6 +1392,10 @@ mod db_stub {
     /// No-op twin of the sqlite [`SyncTable`]: nothing is ever stale.
     pub struct SyncTable;
     impl SyncTable {
+        pub fn demanded() -> Self {
+            Self
+        }
+        pub fn demand(&mut self, _r: &SessionRef) {}
         pub fn load() -> SyncTable {
             SyncTable
         }

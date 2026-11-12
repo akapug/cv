@@ -1094,10 +1094,10 @@ impl PlanState {
             existing,
             folded,
             metadata,
-            // One query each for the event skip-table and the affordance counts `has:<kind>` reads.
-            event_sync: cv_core::events::SyncTable::load(),
-            affordances: cv_core::catalog::AffordanceTable::load(),
-            dependencies: cv_core::source::Table::load(&consumer),
+            // No all-baseline scan: each candidate demands its own decoded checkpoint.
+            event_sync: cv_core::events::SyncTable::demanded(),
+            affordances: cv_core::catalog::AffordanceTable::demanded(),
+            dependencies: cv_core::source::Table::demanded(&consumer),
             consumer,
             probe: cv_core::source::Probe::default(),
         })
@@ -1116,6 +1116,9 @@ impl PlanState {
             ..
         } = self;
         cv_core::stage_work::add(cv_core::stage_work::Metric::Candidates, 1);
+        dependencies.demand(r);
+        event_sync.demand(r);
+        affordances.demand(r);
         let source = probe.snapshot(r);
         let Freshness {
             mtime,
