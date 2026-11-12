@@ -81,10 +81,9 @@ impl Reader {
     }
 
     pub(super) fn with_connection(consumer: &str, conn: Connection) -> Self {
-        Self {
-            conn: Some(conn),
-            ..Self::new(consumer)
-        }
+        let mut reader = Self::new(consumer);
+        reader.conn = Some(conn);
+        reader
     }
 
     fn open(&mut self) -> Option<&Connection> {
