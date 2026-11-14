@@ -7765,13 +7765,8 @@ mod tests {
         }
         let op = cv_core::stage_work::Operation::from_env(None);
         let changed = sweep(&dir, refs.clone(), false, false).unwrap();
-        assert_eq!((changed.changed, changed.errors), (8, 0));
-        for (stage, decoded, _) in counters(&op) {
-            assert_eq!(decoded, 0, "unchanged canonical envelope {stage}");
-        }
-        op.finish(true);
-        // Staleness direction: the tick's new text answers on the very next read, and only the
-        // eight changed sessions carry it — a delta fold that kept an old answer fails here.
+        // Staleness direction first: the tick's new text answers on the very next read, and only
+        // the eight changed sessions carry it — a fold that kept an old answer fails here.
         let mut appended: Vec<String> = text_search(&dir, "zqdelta", 100)
             .unwrap()
             .into_iter()
@@ -7782,6 +7777,11 @@ mod tests {
         expected.sort();
         assert_eq!(appended, expected, "next read did not see exactly the changed sessions");
         assert_eq!(text_search(&dir, "zqoriginal", 100).unwrap().len(), 32);
+        assert_eq!((changed.changed, changed.errors), (8, 0));
+        for (stage, decoded, _) in counters(&op) {
+            assert_eq!(decoded, 0, "unchanged canonical envelope {stage}");
+        }
+        op.finish(true);
         // Publications invalidate eight checkpoints per consumer. Only those deltas decode
         // next time; the other 24 session copies retain their cross-operation folds.
         let op = cv_core::stage_work::Operation::from_env(None);
