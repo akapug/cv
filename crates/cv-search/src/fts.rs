@@ -7841,15 +7841,17 @@ mod tests {
         }
         let op = cv_core::stage_work::Operation::from_env(None);
         assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 1);
-        let decoded = |stage: &str| {
-            op.snapshot().unwrap()["stages"]
+        let decoded = |stage: &str| -> u64 {
+            let report = op.snapshot().unwrap();
+            let stages = report["stages"].as_array().unwrap();
+            let entry = stages.iter().find(|s| s["stage"] == stage).unwrap();
+            entry["work"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|s| s["stage"] == stage)
-                .and_then(|s| {
-                    s["work"].as_array().unwrap().iter().find(|m| m[0] == "decoded_rows")[1].as_u64()
-                })
+                .find(|m| m[0] == "decoded_rows")
+                .unwrap()[1]
+                .as_u64()
                 .unwrap()
         };
         for stage in ["baseline_counts", "baseline_events", "baseline_fts"] {
