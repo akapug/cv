@@ -7770,6 +7770,18 @@ mod tests {
             assert_eq!(decoded, 0, "unchanged canonical envelope {stage}");
         }
         op.finish(true);
+        // Staleness direction: the tick's new text answers on the very next read, and only the
+        // eight changed sessions carry it — a delta fold that kept an old answer fails here.
+        let mut appended: Vec<String> = text_search(&dir, "zqdelta", 100)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect();
+        appended.sort();
+        let mut expected: Vec<String> = refs.iter().take(8).map(|r| r.id.clone()).collect();
+        expected.sort();
+        assert_eq!(appended, expected, "next read did not see exactly the changed sessions");
+        assert_eq!(text_search(&dir, "zqoriginal", 100).unwrap().len(), 32);
         // Publications invalidate eight checkpoints per consumer. Only those deltas decode
         // next time; the other 24 session copies retain their cross-operation folds.
         let op = cv_core::stage_work::Operation::from_env(None);
@@ -7785,6 +7797,92 @@ mod tests {
         }
         op.finish(true);
         let words = ["zqoriginal", "zqdelta"].map(str::to_owned);
+        assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
+    }
+
+    /// An index that cannot tell what changed must decode the canonical baseline and answer
+    /// fresh — never trust a fold whose invalidation surface was damaged or is missing.
+    #[test]
+    fn damaged_or_uninvalidated_folds_fall_back_to_canonical_and_never_answer_stale() {
+        use std::io::Write;
+        let home = IsolatedHome::new();
+        home._scope.set("CV_INDEX_STAGE_WORK", "1");
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let refs: Vec<_> = (0..4)
+            .map(|n| {
+                let id = format!("foldfallback{n}");
+                sref(&id, &id, write_claude(&sdir, &id, "zqbase"))
+            })
+            .collect();
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 4);
+        // Settle: every consumer now has a decoded checkpoint and nothing is pending.
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 0);
+        // Damage every derived checkpoint and change one file. The fold cannot answer, so the
+        // plan re-decodes canonical rows: the pass costs decoded baselines, not stale reuse.
+        let db = home.home.join("catalog.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let damaged = conn
+            .execute(
+                "UPDATE source_dependencies SET record=X'00' WHERE consumer GLOB 'baseline-fold-v1/*'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(damaged, 12, "one checkpoint per consumer copy");
+        drop(conn);
+        {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&refs[0].path).unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type":"user","uuid":"append-fallback","sessionId":refs[0].id,
+                "message":{"role":"user","content":"zqfallback"}})
+            )
+            .unwrap();
+        }
+        let op = cv_core::stage_work::Operation::from_env(None);
+        assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 1);
+        let decoded = |stage: &str| {
+            op.snapshot().unwrap()["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["stage"] == stage)
+                .and_then(|s| {
+                    s["work"].as_array().unwrap().iter().find(|m| m[0] == "decoded_rows")[1].as_u64()
+                })
+                .unwrap()
+        };
+        for stage in ["baseline_counts", "baseline_events", "baseline_fts"] {
+            assert_eq!(decoded(stage), 4, "damaged {stage} folds did not fall back to canonical");
+        }
+        op.finish(true);
+        let words = ["zqbase", "zqfallback"].map(str::to_owned);
+        assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
+        let mut hits: Vec<String> = text_search(&dir, "zqfallback", 100)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect();
+        hits.sort();
+        assert_eq!(hits, [refs[0].id.clone()]);
+        // A lost invalidator is the other "cannot tell what changed" case: an old writer moved a
+        // canonical row without deleting its fold. The next plan discards the folds wholesale.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TRIGGER cv_baseline_fold_insert_v1; DROP TRIGGER cv_baseline_fold_delete_v1; DROP TRIGGER cv_baseline_fold_update_v1;")
+            .unwrap();
+        conn.execute(
+            "DELETE FROM source_dependencies WHERE consumer='counts' AND id=?1",
+            [&refs[1].id],
+        )
+        .unwrap();
+        drop(conn);
+        let op = cv_core::stage_work::Operation::from_env(None);
+        sweep(&dir, refs.clone(), false, false).unwrap();
+        assert!(
+            decoded("baseline_counts") >= 3,
+            "lost invalidators must re-decode, not reuse the retained fold"
+        );
+        op.finish(true);
         assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
     }
 
