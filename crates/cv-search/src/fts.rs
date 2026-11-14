@@ -7841,7 +7841,7 @@ mod tests {
         }
         let op = cv_core::stage_work::Operation::from_env(None);
         assert_eq!(sweep(&dir, refs.clone(), false, false).unwrap().changed, 1);
-        let decoded = |stage: &str| -> u64 {
+        let decoded = |op: &cv_core::stage_work::Operation, stage: &str| -> u64 {
             let report = op.snapshot().unwrap();
             let stages = report["stages"].as_array().unwrap();
             let entry = stages.iter().find(|s| s["stage"] == stage).unwrap();
@@ -7855,7 +7855,11 @@ mod tests {
                 .unwrap()
         };
         for stage in ["baseline_counts", "baseline_events", "baseline_fts"] {
-            assert_eq!(decoded(stage), 4, "damaged {stage} folds did not fall back to canonical");
+            assert_eq!(
+                decoded(&op, stage),
+                4,
+                "damaged {stage} folds did not fall back to canonical"
+            );
         }
         op.finish(true);
         let words = ["zqbase", "zqfallback"].map(str::to_owned);
@@ -7881,7 +7885,7 @@ mod tests {
         let op = cv_core::stage_work::Operation::from_env(None);
         sweep(&dir, refs.clone(), false, false).unwrap();
         assert!(
-            decoded("baseline_counts") >= 3,
+            decoded(&op, "baseline_counts") >= 3,
             "lost invalidators must re-decode, not reuse the retained fold"
         );
         op.finish(true);
